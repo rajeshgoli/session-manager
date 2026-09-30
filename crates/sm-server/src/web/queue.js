@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { html, api, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
+import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
@@ -9,7 +9,8 @@ const title = (job) => job.label || job.id;
 const errorText = (error) => error ? html`<p class="err" role="alert">${error.message}</p>` : null;
 
 export function QueuePage() {
-  const [queue, error] = usePoll(async () => { const q = await api('/client/queue'); setShared('queue', q); return q; }, 5000);
+  const [queue, error, reloadQueue] = usePoll(async () => { const q = await api('/client/queue'); setShared('queue', q); return q; }, 5000);
+  useEffect(() => bus.on('queue-changed', reloadQueue), [reloadQueue]);
   const [stats] = usePoll(() => api('/client/queue/stats?hours=24'), 60000);
   const now = useNow(5000);
   if (!queue) return html`<div class="content">${errorText(error) || 'Loading queue…'}</div>`;
@@ -100,7 +101,13 @@ const QUESTION_DONE = ['completed', 'failed', 'timed_out'];
 function JobPanel({ id, controls }) {
   const encoded = encodeURIComponent(id);
   const [job, error, reload] = usePoll(() => api(`/queue-jobs/${encoded}`), 5000, [id]);
-  const [log, logError] = usePoll(() => api(`/queue-jobs/${encoded}/log?lines=40`), 5000, [id]);
+  const [log, logError] = usePoll(async () => {
+    try { return await api(`/queue-jobs/${encoded}/log?lines=40`); }
+    catch (error) {
+      if (error.status === 404) return { text: '' };
+      throw error;
+    }
+  }, 5000, [id]);
   const [before, setBefore] = useState(null);
   const usageInterval = !before && job?.state === 'running' ? 5000 : 0;
   const [usage, usageError] = usePoll(() => api(`/client/queue/jobs/${encoded}/usage${before ? `?before_ms=${before}` : ''}`), usageInterval, [id, before, usageInterval]);
@@ -150,7 +157,7 @@ function JobPanel({ id, controls }) {
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
       ${check && job.state === 'pending' ? html`<section class="q-card"><h3>Start this job now?</h3>${check.warnings.map((warning) => html`<p class="amber">${warning}</p>`)}<p>Memory available ${gb(check.memory_available_bytes)} · reserve ${gb(check.memory_reserve_bytes)} · estimate ${gb(check.memory_estimate_bytes)} (${check.memory_estimate_source || 'unknown'})</p><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/start`, { method: 'POST', body: {} }); setCheck(null); })}>Start anyway</button> <button class="btn" onClick=${() => setCheck(null)}>Keep waiting</button></section>` : null}
-      ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); setCancel(false); })}>Cancel job</button></section>` : null}
+      ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>Cancel job</button></section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}
         ${request?.status === 'completed' ? html`<div class="summary">${request.result}</div>` : null}
@@ -160,7 +167,7 @@ function JobPanel({ id, controls }) {
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
       <div class="q-actions">${usage?.next_before_ms ? html`<button class="btn sm" onClick=${() => setBefore(usage.next_before_ms)}>Earlier samples</button>` : null}${before ? html`<button class="btn sm" onClick=${() => setBefore(null)}>Latest samples</button>` : null}</div>
-      <h3>Last 40 log lines</h3><pre class="q-log">${log?.text || logError?.message || 'Loading log…'}</pre>
+      <h3>Last 40 log lines</h3><pre class="q-log">${logError?.message || (log ? log.text || 'No log yet' : 'Loading log…')}</pre>
     </div>`;
 }
 registerPanel('job', JobPanel);
