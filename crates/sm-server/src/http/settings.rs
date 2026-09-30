@@ -32,14 +32,38 @@ pub(super) async fn put_settings(
     board::owner_guard(&state, &headers, peer_addr, "PUT", &uri, true)?;
     ensure_core_writes_enabled(&state)?;
     let settings = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
+        let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+        // Store and apply under the live policy's lock, so overlapping PUTs
+        // cannot leave admission on older limits than the stored ones.
+        let mut live = state
+            .queue_admission
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = *live;
+        let mut next = current;
         let settings = state
             .session_store
-            .update_owner_settings(&body)?
+            .update_owner_settings(&body, |settings| {
+                next = crate::owner_settings::queue_admission_policy(&state.config, settings);
+                if next == current {
+                    return Ok(Ok(()));
+                }
+                Ok(
+                    match crate::queue::queue_admission_policy_refusal(&queue_state_dir, next)? {
+                        Some(refusal) => Err(refusal),
+                        None => Ok(()),
+                    },
+                )
+            })?
             .map_err(|detail| ApiError::Status {
                 status: StatusCode::BAD_REQUEST,
                 detail,
             })?;
-        apply_queue_limits(&state, &settings);
+        *live = next;
+        drop(live);
+        if next != current && state.config.rust_core.runtime_enabled {
+            admit_now(&state, &queue_state_dir, next);
+        }
         Ok(settings)
     })
     .await
@@ -47,25 +71,12 @@ pub(super) async fn put_settings(
     Ok(Json(settings))
 }
 
-/// Rebuild the shared admission policy from `settings`, then run an
-/// admission pass so a raised limit starts waiting jobs now. Lowering a
-/// limit never stops a running job; it only holds new starts.
-fn apply_queue_limits(state: &AppState, settings: &Value) {
-    let policy = crate::owner_settings::queue_admission_policy(&state.config, settings);
-    let previous = std::mem::replace(
-        &mut *state
-            .queue_admission
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        policy,
-    );
-    if previous == policy || !state.config.rust_core.runtime_enabled {
-        return;
-    }
-    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+/// Run an admission pass so a raised limit starts waiting jobs now.
+/// Lowering a limit never stops a running job; it only holds new starts.
+fn admit_now(state: &AppState, queue_state_dir: &std::path::Path, policy: QueueAdmissionPolicy) {
     if let Err(error) =
         RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
-            &queue_state_dir,
+            queue_state_dir,
             &expand_home(&state.config.sm_send.db_path),
             state.config.queue_runner.cancel_grace_seconds,
             policy,

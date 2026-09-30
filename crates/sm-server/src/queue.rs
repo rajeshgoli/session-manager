@@ -4138,6 +4138,36 @@ pub fn set_live_queue_admission_policy(
     shared
 }
 
+/// Why admission could not run under `policy` with the jobs now running in
+/// `state_dir`, if it could not. Changing limits is refused rather than
+/// stored when every pass would fail (sm#1718).
+pub fn queue_admission_policy_refusal(
+    state_dir: &Path,
+    policy: QueueAdmissionPolicy,
+) -> Result<Option<String>> {
+    let service_cap = policy.service_max_concurrent;
+    let global_cap = usize::try_from(policy.max_running_jobs).unwrap_or(0);
+    if service_cap != 0 && service_cap >= global_cap {
+        return Ok(Some(format!(
+            "queue_limits.service ({service_cap}) must be below queue_limits.max_running \
+             ({global_cap}), leaving a slot for other jobs"
+        )));
+    }
+    let db_path = state_dir.join("queue_runner.db");
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_queue_jobs_connection(&db_path)?;
+    let jobs = list_queue_job_runtime_records_conn(&conn)?;
+    let running_services = running_queue_job_count(&jobs, Some("service"));
+    Ok((running_services > service_cap).then(|| {
+        format!(
+            "queue_limits.service ({service_cap}) is below the {running_services} service \
+             jobs running now; stop one first"
+        )
+    }))
+}
+
 fn live_admission_policy(state_dir: &Path, captured: QueueAdmissionPolicy) -> QueueAdmissionPolicy {
     live_admission_policies()
         .lock()

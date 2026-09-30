@@ -22856,6 +22856,23 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         );
         assert_eq!(background_max().await, 3);
 
+        // A service limit that would take every slot is refused, because
+        // every admission pass would then fail.
+        let (status, body) = put(
+            json!({"queue_limits": {"max_running": 3, "service": 3}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["detail"],
+            "queue_limits.service (3) must be below queue_limits.max_running (3), leaving a slot for other jobs"
+        );
+        let (_, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
+        assert_eq!(body["queue_limits"]["service"], Value::Null);
+        assert_eq!(background_max().await, 3);
+
         // Other origins and agents cannot write; nobody unsigned can read.
         for (origin, agent) in [
             ("https://evil.example", false),

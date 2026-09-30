@@ -31,11 +31,14 @@ impl SessionStore {
         Ok(owner_settings::effective(stored))
     }
 
-    /// Merge a `PUT /client/settings` body. The inner error is a validation
-    /// message naming the field. Returns the effective settings object.
+    /// Merge a `PUT /client/settings` body. `check` sees the effective
+    /// settings before they are stored and may refuse them. The inner error
+    /// is a validation message naming the field. Returns the effective
+    /// settings object.
     pub fn update_owner_settings(
         &self,
         patch: &Value,
+        check: impl FnOnce(&Value) -> Result<std::result::Result<(), String>>,
     ) -> Result<std::result::Result<Value, String>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -44,8 +47,12 @@ impl SessionStore {
             Err(error) => return Ok(Err(error)),
         };
         set_owner_settings(&mut state, changed)?;
+        let settings = owner_settings::effective(state.get(STORE_KEY));
+        if let Err(error) = check(&settings)? {
+            return Ok(Err(error));
+        }
         self.write_raw_json_value(&state)?;
-        Ok(Ok(owner_settings::effective(state.get(STORE_KEY))))
+        Ok(Ok(settings))
     }
 }
 
