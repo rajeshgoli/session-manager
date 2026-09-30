@@ -1,3 +1,5 @@
+pub mod quiet;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
@@ -150,6 +152,7 @@ pub struct QueueJobFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueJobRecord {
+    pub quiet_alerted_at: Option<String>,
     pub id: String,
     #[serde(rename = "type")]
     pub job_type: String,
@@ -3347,6 +3350,13 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_column(conn, "queue_jobs", "quiet_alerted_at", "TEXT")?;
+    ensure_column(
+        conn,
+        "queue_jobs",
+        "quiet_log_bytes",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(conn, "queue_jobs", "queued_notified_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "started_notified_at", "TEXT")?;
     ensure_column(
@@ -4362,6 +4372,9 @@ pub fn queue_job_ended_reason(job: &QueueJobRecord) -> Option<(&'static str, Str
 /// A pending or running job as the utilization recorder sees it (sm#1609).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveQueueJob {
+    pub started_at: Option<String>,
+    pub log_path: Option<String>,
+    pub log_notice_bytes: i64,
     pub id: String,
     pub job_type: String,
     pub state: String,
@@ -4381,7 +4394,7 @@ pub fn active_queue_jobs_for_sampling(db_path: &Path) -> Result<Vec<ActiveQueueJ
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut statement = conn.prepare(
         r#"
-        SELECT id, type, state, holding_reason, process_group_id
+        SELECT id, type, state, holding_reason, process_group_id, started_at, log_path, quiet_log_bytes
         FROM queue_jobs
         WHERE state IN ('pending', 'running')
         ORDER BY queued_at, id
@@ -4394,6 +4407,9 @@ pub fn active_queue_jobs_for_sampling(db_path: &Path) -> Result<Vec<ActiveQueueJ
             state: row.get(2)?,
             holding_reason: row.get(3)?,
             process_group_id: row.get(4)?,
+            started_at: row.get(5)?,
+            log_path: row.get(6)?,
+            log_notice_bytes: row.get(7)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -7395,12 +7411,17 @@ fn list_queue_jobs_conn(
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
     let rank_column = queue_job_rank_projection(conn)?;
+    let quiet_column = if queue_job_columns(conn)?.contains("quiet_alerted_at") {
+        "quiet_alerted_at"
+    } else {
+        "NULL AS quiet_alerted_at"
+    };
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}
         FROM queue_jobs
     "#
     );
@@ -7431,12 +7452,17 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
     let rank_column = queue_job_rank_projection(conn)?;
+    let quiet_column = if queue_job_columns(conn)?.contains("quiet_alerted_at") {
+        "quiet_alerted_at"
+    } else {
+        "NULL AS quiet_alerted_at"
+    };
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -7592,6 +7618,7 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         peak_process_count: row.get(24)?,
         owner_forced_at: row.get(25)?,
         rank_tickets: parse_rank_tickets(row.get(26)?),
+        quiet_alerted_at: row.get(27)?,
     })
 }
 
@@ -9707,6 +9734,7 @@ mod tests {
     #[test]
     fn queue_hold_context_names_other_jobs_and_explains_global_and_type_gates() {
         let record = |id: &str, kind: &str, state: &str, reason: Option<&str>| QueueJobRecord {
+            quiet_alerted_at: None,
             id: id.into(),
             label: format!("friendly-{id}"),
             job_type: kind.into(),

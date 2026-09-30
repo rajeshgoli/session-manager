@@ -145,6 +145,9 @@ async fn main() -> Result<()> {
                 queue_db_path: queue_state_dir.join("queue_runner.db"),
                 interval: Duration::from_secs(config.utilization.sample_interval_seconds),
                 retention_days: config.utilization.retention_days,
+                quiet_minutes: config.queue_runner.quiet_minutes,
+                quiet_alert_repeat_minutes: config.queue_runner.quiet_alert_repeat_minutes,
+                message_queue_db_path: expand_home(&config.sm_send.db_path),
             });
         } else {
             eprintln!("utilization recorder: host sampling is only available on macOS");

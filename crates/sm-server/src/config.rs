@@ -1487,6 +1487,10 @@ fn default_codex_observability_db_path() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueRunnerConfig {
+    #[serde(default = "default_quiet_minutes")]
+    pub quiet_minutes: u64,
+    #[serde(default = "default_quiet_alert_repeat_minutes")]
+    pub quiet_alert_repeat_minutes: u64,
     #[serde(default = "default_queue_runner_state_dir")]
     pub state_dir: String,
     #[serde(default = "default_queue_runner_cancel_grace_seconds")]
@@ -1647,10 +1651,19 @@ where
     }))
 }
 
+fn default_quiet_minutes() -> u64 {
+    10
+}
+fn default_quiet_alert_repeat_minutes() -> u64 {
+    120
+}
+
 impl Default for QueueRunnerConfig {
     fn default() -> Self {
         Self {
             state_dir: default_queue_runner_state_dir(),
+            quiet_minutes: default_quiet_minutes(),
+            quiet_alert_repeat_minutes: default_quiet_alert_repeat_minutes(),
             cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
             max_running_jobs: default_queue_runner_max_running_jobs(),
             perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
@@ -1731,6 +1744,8 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
             .to_string_lossy()
             .into_owned(),
         cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
+        quiet_minutes: default_quiet_minutes(),
+        quiet_alert_repeat_minutes: default_quiet_alert_repeat_minutes(),
         max_running_jobs: default_queue_runner_max_running_jobs(),
         perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
         memory: QueueRunnerMemoryConfig::default(),

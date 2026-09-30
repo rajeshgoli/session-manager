@@ -197,6 +197,7 @@ Log: ~/.local/share/claude-sessions/queue-runner/logs/job_4489b0dcd0d9.log. ID: 
 <p>One ticket, #1716, for a mid-tier agent (Opus 1M, high effort). It adds the log-size reading to the 5-second recorder, the quiet detector, the alert, the quiet line in <code>sm queue status</code> and <code>sm queue list</code>, and the quiet fields that the web Queue page reads. #1723 (the web Queue page) then only draws the job red, and it starts after #1716. #1719 (ticket clock, already in progress) already ships its "job quiet" rule only once those fields exist, so it needs no change.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
+<p><b>Implementation clarification.</b> sm’s own alert line does not count as job output. Otherwise the alert would reset the quiet clock and could cause a second message about the same pause. Samples record notice bytes separately so replay gives the same answer.</p>
 <p><b>Revision 2, after your review.</b> A job now counts as quiet after 10 minutes, not 20, for both the alert and the red marker on the Board and Queue page. The 1710 memo changes with it. The alerts on 29 September move 10 minutes earlier, to 4:02, 4:11 and 4:35 pm. The history count rises from at most 5 alerts a day to at most 10. The five new ones are jobs waiting on downloads or remote GPUs, and the log check should hold most of them back (decision 3).</p>
 
 <hr class="appendix-divider">
@@ -215,8 +216,9 @@ Log: ~/.local/share/claude-sessions/queue-runner/logs/job_4489b0dcd0d9.log. ID: 
 
 <h3 id="a">A. Quiet: exact rule</h3>
 
-<p><b>Inputs.</b> The utilization recorder (<code>crates/sm-server/src/utilization.rs</code>) already writes one <code>job_samples</code> row per running job every 5 seconds, carrying <code>cpu_seconds_total</code> and <code>gpu_seconds_total</code> summed over the job's process group. Add one nullable column:</p>
-<pre>ALTER TABLE job_samples ADD COLUMN log_bytes INTEGER;  -- size of queue_jobs.log_path at the sample; NULL if it cannot be read</pre>
+<p><b>Inputs.</b> The utilization recorder (<code>crates/sm-server/src/utilization.rs</code>) already writes one <code>job_samples</code> row per running job every 5 seconds, carrying <code>cpu_seconds_total</code> and <code>gpu_seconds_total</code> summed over the job's process group. The sample carries these additional columns:</p>
+<pre>ALTER TABLE job_samples ADD COLUMN log_bytes INTEGER;  -- size of queue_jobs.log_path at the sample; NULL if it cannot be read
+ALTER TABLE job_samples ADD COLUMN log_notice_bytes INTEGER NOT NULL DEFAULT 0; -- cumulative sm quiet-notice bytes</pre>
 <p>Add it with the same <code>ensure_column</code> pattern the table already uses for <code>gpu_seconds_total</code>. Rows written before the column exists have NULL.</p>
 
 <p><b>Steps.</b> For two consecutive running samples <i>p</i> and <i>c</i> of the same job, let <i>Δt</i> be <code>(c.sampled_at_ms − p.sampled_at_ms) / 1000</code>. The step is <b>active</b> if any of these hold:</p>
@@ -225,7 +227,7 @@ Log: ~/.local/share/claude-sessions/queue-runner/logs/job_4489b0dcd0d9.log. ID: 
 <li><code>p.cpu_seconds_total</code> or <code>c.cpu_seconds_total</code> is NULL (unknown counts as active).</li>
 <li><code>max(0, c.cpu − p.cpu) ≥ 0.01 × Δt</code>. A drop, which means a process exited, counts as 0. This matches how <code>job_usage</code> already floors a drop at zero.</li>
 <li>Both GPU values are non-NULL and <code>c.gpu &gt; p.gpu</code>. If either is NULL, GPU counts as no growth.</li>
-<li>Both <code>log_bytes</code> values are non-NULL and differ. Growth or truncation both count. If either is NULL, the log counts as no growth.</li>
+<li>Both <code>log_bytes</code> values are non-NULL and their difference differs from the change in <code>log_notice_bytes</code>. Growth or truncation from the job counts; sm’s own alert line does not. If either is NULL, the log counts as no growth.</li>
 </ol>
 <p>Otherwise the step is <b>idle</b>.</p>
 
@@ -249,7 +251,7 @@ Log: ~/.local/share/claude-sessions/queue-runner/logs/job_4489b0dcd0d9.log. ID: 
 <li>the job has a non-empty <code>notify_session_id</code>.</li>
 </ul>
 
-<p><b>Persisted shape.</b> Add <code>queue_jobs.quiet_alerted_at TEXT</code> (RFC 3339 UTC, nullable) with <code>ensure_column</code>. Set it when the message is enqueued. The 2-hour limit survives restarts because the value is on disk.</p>
+<p><b>Persisted shape.</b> Add <code>queue_jobs.quiet_log_bytes INTEGER NOT NULL DEFAULT 0</code>, the cumulative byte count of appended quiet notices, copied into each sample as <code>log_notice_bytes</code>. Add <code>queue_jobs.quiet_alerted_at TEXT</code> (RFC 3339 UTC, nullable) with <code>ensure_column</code>. Set it when the message is enqueued. The 2-hour limit survives restarts because the value is on disk.</p>
 
 <p><b>Delivery.</b> Use <code>RetainedQueueStore::enqueue_message_once_with_metadata</code>, as the owner-forced requeue notice in <code>queue.rs</code> does. Pass message id <code>queue-quiet-{job_id}-{quiet_since_ms}</code>, the target <code>notify_session_id</code>, mode <code>"sequential"</code>, and <code>message_category: "queue-completion"</code>. The once-only id guarantees at most one message per quiet stretch even if the tick runs twice. Also append the first line of the message to the job's log file, prefixed with a blank line. The requeue notice already writes to the log this way.</p>
 
@@ -311,6 +313,7 @@ Log: {log_path}. ID: {id}</pre>
 <p><b>Live check.</b> Queue a background job running <code>python3 -c "import time; print('x', flush=True); time.sleep(3600)"</code> with <code>quiet_minutes</code> set to 2 on a scratch server. Confirm one message arrives about 2 minutes after start, that <code>sm queue status</code> shows the quiet line, and that cancelling the job clears it.</p>
 
 <h3 id="g">G. Requirement trace</h3>
+<p><b>Implementation.</b> Sample persistence and schema upgrades: <code>crates/sm-server/src/utilization.rs</code>. Step rules, replay and shared status: <code>utilization/quiet.rs</code>, tested by <code>quiet_step_rules</code>, <code>quiet_window_boundary_activity_and_disabled_detection</code>, <code>quiet_historical_replay_stalled_and_busy_workers</code>, and <code>quiet_replay_and_incremental_updates_agree</code>. Alert delivery and text: <code>queue/quiet.rs</code>, tested by <code>quiet_alert_is_once_per_stretch_and_cooldown_survives_restart</code>, <code>quiet_service_and_missing_target_never_alert</code>, <code>quiet_recovers_enqueue_before_timestamp_write</code>, and <code>quiet_message_text_tail_and_fallbacks</code>. Config: <code>config.rs</code>; startup: <code>main.rs</code>. HTTP projection: <code>http.rs::queue_job_response_with_names</code>; Board: <code>http/board_clock.rs::ticket_jobs</code>; CLI: <code>bin/sm.rs::queue_quiet_lines</code> and <code>queue_state_text</code>. Paths without a prefix are relative to <code>crates/sm-server/src/</code>.</p>
 <table>
 <thead><tr><th>Memo requirement</th><th>Appendix</th><th>Test</th></tr></thead>
 <tbody>
@@ -319,7 +322,7 @@ Log: {log_path}. ID: {id}</pre>
 <tr><td>Message carries memory, slot, waiting count, log tail, cancel command</td><td>B text</td><td>F.6</td></tr>
 <tr><td>Service jobs never alerted</td><td>B</td><td>F.4</td></tr>
 <tr><td>Once per stretch, at most every 2 hours</td><td>B</td><td>F.4, F.5</td></tr>
-<tr><td>No owner message</td><td>B (no owner target)</td><td>Not tested: behaviour is absence</td></tr>
+<tr><td>No owner message</td><td>B (no owner target)</td><td>F.4 checks the sole message targets the job’s agent</td></tr>
 <tr><td><code>sm queue status</code> and list show quiet</td><td>C</td><td>Live check</td></tr>
 <tr><td>Web page and Board read one server value</td><td>C, E</td><td>#1723 rendering test</td></tr>
 <tr><td>Ticket's 8 GB gate and 15-minute window</td><td colspan="2">Dropped: decisions 2 and 3</td></tr>
