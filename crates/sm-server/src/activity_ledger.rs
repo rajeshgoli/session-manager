@@ -106,6 +106,45 @@ impl ActivityRecorder {
     }
 }
 
+/// Recent recorded spans for the session Activity view, across all providers.
+/// A missing database/table is expected before the recorder's first scan.
+pub fn list_recent_tool_calls_from_path(
+    db_path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<crate::tool_usage::ToolCallRow>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'activity_spans')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare(
+        "SELECT started_at_ms, COALESCE(NULLIF(tool, ''), kind)
+         FROM activity_spans WHERE seat_id = ?1
+         ORDER BY started_at_ms DESC, source_ref DESC, item_id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![session_id, limit as i64], |row| {
+        let started_at_ms: i64 = row.get(0)?;
+        Ok(crate::tool_usage::ToolCallRow {
+            timestamp: OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(started_at_ms) * 1_000_000,
+            )
+            .ok()
+            .and_then(|value| value.format(&Rfc3339).ok()),
+            tool_name: row.get(1)?,
+            hook_type: "ActivitySpan".to_owned(),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn open_for_write(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

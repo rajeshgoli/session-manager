@@ -142,11 +142,9 @@ use crate::sessions::{
 };
 use crate::work_attribution::git_origin_github_repo;
 
+use crate::activity_ledger::list_recent_tool_calls_from_path;
 use crate::studio_ssh::{self, StudioSshStatus};
-use crate::tool_usage::{
-    list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
-    log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
-};
+use crate::tool_usage::{log_tool_usage_to_path, ToolCallRow, ToolUsageEvent};
 use crate::usage_burn::UsageBurnStore;
 use crate::usage_identity::UsageIdentityStore;
 use crate::usage_ledger::{ScanSummary, UsageLedgerStore, UsageModelDefaults};
@@ -10698,16 +10696,22 @@ async fn session_tool_calls(
             detail: "limit must be between 1 and 100".to_owned(),
         });
     };
-    if session.provider == "codex-fork" {
+    let tool_calls = if state.config.usage.enabled {
+        let db_path = expand_home(&state.config.activity.db_path);
+        list_recent_tool_calls_from_path(&db_path, &session.id, limit)?
+    } else if session.provider == "codex-fork" {
+        // Usage scanning also owns the activity recorder. Preserve the event-backed
+        // view on deployments where that recorder is intentionally disabled.
         let db_path = expand_home(&state.config.codex_observability.db_path);
-        let tool_calls = list_recent_codex_fork_tool_calls_from_path(&db_path, &session.id, limit)?;
-        return Ok(Json(ToolCallsResponse {
-            session_id: session.id,
-            tool_calls,
-        }));
-    }
-    let db_path = expand_home(&state.config.tool_logging.db_path);
-    let tool_calls = list_recent_tool_calls_from_path(&db_path, &session.id, limit)?;
+        crate::tool_usage::list_recent_codex_fork_tool_calls_from_path(
+            &db_path,
+            &session.id,
+            limit,
+        )?
+    } else {
+        let db_path = expand_home(&state.config.tool_logging.db_path);
+        crate::tool_usage::list_recent_tool_calls_from_path(&db_path, &session.id, limit)?
+    };
     Ok(Json(ToolCallsResponse {
         session_id: session.id,
         tool_calls,
