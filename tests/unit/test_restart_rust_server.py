@@ -380,6 +380,9 @@ def _make_runner(
             "SM_LOCK": str(binary_dir_lock),
             "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
             "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
+            # The script's own repo is a real checkout; the main-containment
+            # check (sm#1751) is exercised against the `checkout` fixture's origin.
+            "SM_ALLOW_BEHIND_MAIN": "1",
             # The default launchd log dir is under $HOME, and the preflight creates it.
             "HOME": str(installed.parent.parent / "home"),
         }
@@ -1468,7 +1471,7 @@ def checkout(env):
 
     def run(*args, **overrides):
         # Same stubs and paths as env["run"], but the script copy in `deployed`.
-        environ = {**GIT_ENV, **overrides}
+        environ = {**GIT_ENV, "SM_ALLOW_BEHIND_MAIN": "0", **overrides}
         return env["run"](*args, _script=deployed / "scripts" / "restart-rust-server.sh", **environ)
 
     return {"origin": origin, "upstream": seed, "deployed": deployed, "run": run}
@@ -1566,7 +1569,8 @@ def test_source_moving_during_the_build_blocks_the_install(env, checkout):
         executable=True,
     )
 
-    result = checkout["run"]()
+    # The checkout is behind main from the start, which is not what this tests.
+    result = checkout["run"](SM_ALLOW_BEHIND_MAIN="1")
 
     assert result.returncode != 0
     assert "changed while this restart was building" in result.stderr
@@ -1600,6 +1604,89 @@ def test_untracked_files_appearing_during_the_build_are_ignored(env, checkout):
 
     assert result.returncode == 0, result.stderr
     assert "source unchanged" in result.stdout
+
+
+# --- the build must contain main (sm#1751) ----------------------------------
+
+
+def test_build_behind_main_is_refused_before_building(env, checkout):
+    """A ticket branch cut before someone else's merge would remove that merged
+    work from the shared live service."""
+    git(checkout["deployed"], "checkout", "-q", "-b", "feature")
+    commit_file(checkout["deployed"], "crates/feature.rs", "\n", "feature work")
+    landed = land_on_main(checkout, rel="crates/merged.rs")
+
+    result = checkout["run"]()
+
+    assert result.returncode != 0
+    assert "lacks commits that are on" in result.stderr
+    assert "land crates/merged.rs" in result.stderr
+    assert landed[:7] in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+    assert not env["lock"].exists()
+
+
+def test_branch_containing_main_builds(env, checkout):
+    land_on_main(checkout, rel="crates/merged.rs")
+    git(checkout["deployed"], "pull", "-q", "--ff-only", "origin", "main")
+    git(checkout["deployed"], "checkout", "-q", "-b", "feature")
+    commit_file(checkout["deployed"], "crates/feature.rs", "\n", "feature work")
+
+    result = checkout["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "contains origin/main" in result.stdout
+    assert "MARKER=REBUILT" in env["installed"].read_text()
+
+
+def test_allow_behind_main_deploys_with_a_warning(env, checkout):
+    land_on_main(checkout)
+
+    result = checkout["run"]("--allow-behind-main")
+
+    assert result.returncode == 0, result.stderr
+    assert "not checking that this build contains origin/main" in result.stderr
+    assert "MARKER=REBUILT" in env["installed"].read_text()
+
+
+def test_unreachable_origin_is_refused_before_building(env, checkout):
+    git(checkout["deployed"], "remote", "set-url", "origin", str(env["tmp"] / "missing.git"))
+
+    result = checkout["run"]()
+
+    assert result.returncode != 0
+    assert "could not fetch origin main" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_skip_build_does_not_require_main(env, checkout):
+    """Reinstalling the binary already live cannot drop anything."""
+    git(checkout["deployed"], "remote", "set-url", "origin", str(env["tmp"] / "missing.git"))
+
+    result = checkout["run"]("--skip-build")
+
+    assert result.returncode == 0, result.stderr
+    assert "Checking the build contains" not in result.stdout
+
+
+def test_update_does_not_check_main_twice(env, checkout):
+    land_on_main(checkout)
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode == 0, result.stderr
+    assert "Checking the build contains" not in result.stdout
+
+
+@pytest.mark.parametrize("value", ["yes", "2"])
+def test_rejects_bad_allow_behind_main(env, value):
+    result = env["run"](SM_ALLOW_BEHIND_MAIN=value)
+
+    assert result.returncode == 2
+    assert "SM_ALLOW_BEHIND_MAIN must be 0 or 1" in result.stderr
+    assert_service_untouched(env)
 
 
 def test_lock_handoff_is_refused_unless_this_process_holds_the_lock(env):

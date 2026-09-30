@@ -107,6 +107,8 @@ SM_ALLOW_SESSION_DROP="${SM_ALLOW_SESSION_DROP:-0}"
 # What --update fast-forwards the checkout to.
 SM_DEPLOY_REMOTE="${SM_DEPLOY_REMOTE:-origin}"
 SM_DEPLOY_BRANCH="${SM_DEPLOY_BRANCH:-main}"
+# 1 skips the check that the build contains $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH.
+SM_ALLOW_BEHIND_MAIN="${SM_ALLOW_BEHIND_MAIN:-0}"
 DOMAIN="gui/$(id -u)"
 
 usage() {
@@ -130,6 +132,13 @@ Options:
                         the source tree under another agent's build. Refuses a
                         checkout that is not on $SM_DEPLOY_BRANCH, has uncommitted changes to
                         tracked files, or has commits $SM_DEPLOY_REMOTE does not.
+  --allow-behind-main   Build and deploy this checkout even though it lacks commits
+                        that are on $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH. Without it, every build is
+                        refused unless HEAD contains the freshly fetched
+                        $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH, because the live service is shared:
+                        deploying a branch cut before a merge removes that merged
+                        work from production for everyone. Only for a deliberate
+                        rollback, or when $SM_DEPLOY_REMOTE cannot be reached.
   --allow-drop N        Tolerate N fewer sessions after the restart (default: 0).
                         Sessions can retire on their own between the before and
                         after samples; raise this only if that is expected.
@@ -153,7 +162,7 @@ SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
 SM_SIGN_IDENTITY, SM_SIGN_DESIGNATED_REQUIREMENT, SM_SIGNING_CONFIG,
 SM_QUEUE_AUTHORITY_SOCKET, SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS,
 SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK, SM_DEPLOY_REMOTE,
-SM_DEPLOY_BRANCH.
+SM_DEPLOY_BRANCH, SM_ALLOW_BEHIND_MAIN (1 = --allow-behind-main).
 
 Whatever the options, the restart refuses to stop the service if the checkout's
 commit or tracked contents changed while it was building.
@@ -191,6 +200,11 @@ while [[ $# -gt 0 ]]; do
       SM_ALLOW_SESSION_DROP="${2:?missing --allow-drop value}"
       PASSTHROUGH_ARGS+=("$1" "$2")
       shift 2
+      ;;
+    --allow-behind-main)
+      SM_ALLOW_BEHIND_MAIN=1
+      PASSTHROUGH_ARGS+=("$1")
+      shift
       ;;
     --allow-plist-change)
       ALLOW_PLIST_CHANGE=1
@@ -234,6 +248,10 @@ require_non_negative_integer --allow-drop "$SM_ALLOW_SESSION_DROP"
 require_non_negative_integer SM_HEALTH_TIMEOUT "$SM_HEALTH_TIMEOUT"
 require_non_negative_integer SM_PID_SETTLE_SECONDS "$SM_PID_SETTLE_SECONDS"
 require_non_negative_integer SM_UNLOAD_TIMEOUT "$SM_UNLOAD_TIMEOUT"
+if [[ "$SM_ALLOW_BEHIND_MAIN" != 0 && "$SM_ALLOW_BEHIND_MAIN" != 1 ]]; then
+  echo "SM_ALLOW_BEHIND_MAIN must be 0 or 1, got: $SM_ALLOW_BEHIND_MAIN" >&2
+  exit 2
+fi
 
 # Pin base 10 now that they are known to be digits. Bash reads a leading zero as
 # octal, so `08` would abort the arithmetic in phase 2 with "value too great for
@@ -595,6 +613,37 @@ update_checkout() {
   UPDATED_HEAD="$head"
 }
 
+# sm#1751: agents restart the one shared service from their own ticket
+# worktrees to check their work live. A branch cut before someone else's merge
+# then silently removes that merged feature from production. So every build
+# must contain what is on $SM_DEPLOY_BRANCH right now; a branch that is behind
+# has to merge or rebase first. Runs under the lock, before the build.
+require_source_contains_main() {
+  local remote_head missing
+  git_repo rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "$REPO_ROOT is not a git checkout, so there is no way to tell whether it
+       contains $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH. Deploy from a checkout, or pass
+       --allow-behind-main to deploy it anyway. The running service was not touched."
+  git_repo fetch --quiet "$SM_DEPLOY_REMOTE" "$SM_DEPLOY_BRANCH" \
+    || fail "could not fetch $SM_DEPLOY_REMOTE $SM_DEPLOY_BRANCH to check that this build
+       contains it. Retry, or pass --allow-behind-main if $SM_DEPLOY_REMOTE is
+       unreachable and this restart cannot wait. The running service was not touched."
+  remote_head="$(git_repo rev-parse FETCH_HEAD)"
+  if ! git_repo merge-base --is-ancestor "$remote_head" HEAD; then
+    missing="$(git_repo log -n 10 --oneline --no-decorate "HEAD..$remote_head")"
+    fail "$REPO_ROOT ($(git_repo rev-parse --short HEAD)) lacks commits that are on
+       $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH ($(git_repo rev-parse --short "$remote_head")).
+       Deploying it would remove that merged work from the live service,
+       which every agent shares. Most recent missing commits:
+$(sed 's/^/         /' <<<"$missing")
+       Merge or rebase onto $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH and re-run, or deploy
+       $SM_DEPLOY_BRANCH itself with --update from the deployed checkout. Pass
+       --allow-behind-main only for a deliberate rollback. The running service
+       was not touched."
+  fi
+  echo "contains $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH at $(git_repo rev-parse --short "$remote_head")"
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1: everything that can fail without consequence.
 # Nothing below this line may touch the running service, and nothing may write
@@ -627,6 +676,17 @@ if [[ -n "${SM_UPDATE_EXPECTED_HEAD:-}" ]]; then
        The running service was not touched."
   fi
   unset SM_UPDATE_EXPECTED_HEAD
+  # HEAD is exactly the $SM_DEPLOY_BRANCH that --update just fetched.
+  SOURCE_IS_FETCHED_MAIN=1
+fi
+
+if [[ "$SKIP_BUILD" -eq 0 && "${SOURCE_IS_FETCHED_MAIN:-0}" -eq 0 ]]; then
+  if [[ "$SM_ALLOW_BEHIND_MAIN" -eq 1 ]]; then
+    echo "WARNING: not checking that this build contains $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH (--allow-behind-main)" >&2
+  else
+    step "Checking the build contains $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH"
+    require_source_contains_main
+  fi
 fi
 
 # Taken under the lock, so any change to the source from here on is somebody
