@@ -171,6 +171,24 @@ pub fn valid_computer_name(name: &str) -> bool {
 /// response or failed local import. Revoked names stay reserved so an old
 /// certificate cannot become valid again through replacement enrollment.
 pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str) -> Result<String> {
+    enroll_computer_with_sync(config, user_id, name, csr, |ca_cert| {
+        ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, ca_cert)?;
+        sync_device_common_name(&config.cloudflare_access, name, DevicePolicyAction::Allow)
+    })
+}
+
+fn enroll_computer_with_sync(
+    config: &AppConfig,
+    user_id: &str,
+    name: &str,
+    csr: &str,
+    sync: impl FnOnce(&Path) -> Result<()>,
+) -> Result<String> {
+    if !config.cloudflare_access.browser.enabled || !config.cloudflare_access.browser.device_policy
+    {
+        bail!("Enable cloudflare_access.browser.enabled and browser.device_policy before enrolling a computer");
+    }
+    ensure_device_policy_sync_configured(&config.cloudflare_access)?;
     if !valid_computer_name(name) {
         bail!("Device name must match [a-z0-9-]{{1,32}}");
     }
@@ -182,10 +200,6 @@ pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str)
     if !ca_cert.is_file() || !ca_key.is_file() {
         bail!("Device CA is not configured");
     }
-    if config.cloudflare_access.browser.enabled && !config.cloudflare_access.browser.device_policy {
-        bail!("Enable cloudflare_access.browser.device_policy before enrolling a computer");
-    }
-    ensure_device_policy_sync_configured(&config.cloudflare_access)?;
     let mut connection = open_device_db(&mobile_device_db_path(config))?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -217,11 +231,7 @@ pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str)
         )?;
     }
     transaction.commit()?;
-    let result =
-        ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, &ca_cert).and_then(|()| {
-            sync_device_common_name(&config.cloudflare_access, name, DevicePolicyAction::Allow)
-        });
-    if let Err(error) = result {
+    if let Err(error) = sync(&ca_cert) {
         if !same_device {
             // No certificate was returned. A failed edge update must not
             // permanently consume the name; an absent row still fails closed.
@@ -1996,6 +2006,16 @@ mod tests {
 
     #[test]
     fn browser_certificate_signing_and_unique_names() {
+        // Exercise signing and storage without contacting Cloudflare. Keep all
+        // production configuration validation enabled.
+        fn enroll_computer(
+            config: &AppConfig,
+            user: &str,
+            name: &str,
+            csr: &str,
+        ) -> Result<String> {
+            enroll_computer_with_sync(config, user, name, csr, |_| Ok(()))
+        }
         let dir = temporary_dir("sm-computer-enroll-test").unwrap();
         let mut config = AppConfig::default();
         config.mobile_terminal.device_enrollment_db_path =
@@ -2031,6 +2051,23 @@ mod tests {
             .status
             .success());
         let csr = fs::read_to_string(csr_path).unwrap();
+        // Disabled browser/policy must not consume a name or even open the DB.
+        for (enabled, device_policy) in [(false, false), (false, true), (true, false)] {
+            config.cloudflare_access.browser.enabled = enabled;
+            config.cloudflare_access.browser.device_policy = device_policy;
+            let error = super::enroll_computer(&config, "owner", "macbook", &csr).unwrap_err();
+            assert!(error.to_string().contains("browser.enabled"));
+            assert!(!mobile_device_db_path(&config).exists());
+        }
+        config.cloudflare_access.browser.enabled = true;
+        config.cloudflare_access.browser.device_policy = true;
+        assert!(super::enroll_computer(&config, "owner", "macbook", &csr).is_err());
+        assert!(!mobile_device_db_path(&config).exists());
+        config.cloudflare_access.browser.app_id = Some("app".into());
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".into());
+        config.cloudflare_access.mobile_device_policy_id = Some("policy".into());
+        config.cloudflare_access.account_id = Some("account".into());
+        config.cloudflare_access.api_token = Some("test-token".into());
         let chain = enroll_computer(&config, "owner", "macbook", &csr).unwrap();
         fs::write(dir.join("device.pem"), chain).unwrap();
         let output = Command::new("openssl")
