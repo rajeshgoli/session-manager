@@ -1250,7 +1250,6 @@ fn codex_comment_reports_review_failure(comment: &Value, request_comment_id: Opt
         && github_actor_is_codex(comment)
         && !body.starts_with("@codex review")
         && !body.contains("reviewed commit:")
-        && (body.contains("something went wrong") || codex_comment_reports_quota(&body))
 }
 
 fn codex_comment_reports_quota(body: &str) -> bool {
@@ -5701,13 +5700,36 @@ async fn poll_github_review_step(
             CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS,
         );
         if repost_at.as_deref().is_some_and(codex_review_datetime_due) {
-            let comment = github_post_review_request(
+            // Persist the one retry before posting so a failed response or a
+            // watcher restart cannot issue duplicate GitHub comments.
+            RetainedQueueStore::mark_github_review_step_in_path(
+                db_path,
+                &request.id,
+                "retry_posting",
+                request.step_failures,
+                &now,
+            )
+            .map_err(|error| error.to_string())?;
+            let comment = match github_post_review_request(
                 state.github_review_poster.clone(),
                 &request.repo,
                 request.pr_number,
                 request.steer.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(comment) => comment,
+                Err(error) => {
+                    finish_github_review_step(
+                        state,
+                        db_path,
+                        request,
+                        &format!("failed to repost after Codex error: {error}"),
+                        &now,
+                    )?;
+                    return Ok(true);
+                }
+            };
             RetainedQueueStore::mark_github_review_posted_in_path(
                 db_path,
                 &request.id,
@@ -23615,6 +23637,23 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             .lock()
             .unwrap()
             .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn codex_error_reply_does_not_depend_on_its_wording() {
+        let failure = json!({
+            "id": 78,
+            "body": "To use Codex here, create an environment for this repo.",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(codex_comment_reports_review_failure(&failure, Some(77)));
+        assert!(!codex_comment_reports_review_failure(&failure, Some(78)));
+        let review = json!({
+            "id": 79,
+            "body": "Reviewed commit: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(!codex_comment_reports_review_failure(&review, Some(77)));
     }
 
     #[test]

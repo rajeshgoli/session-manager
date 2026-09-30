@@ -2453,6 +2453,59 @@ async fn github_quota_pauses_channel_and_skips_the_next_request() {
 }
 
 #[tokio::test]
+async fn ending_a_reserved_quota_probe_allows_the_next_request_to_check() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-probe-release.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, first) = post_json(
+        app.clone(),
+        "/review-requests",
+        json!({
+            "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap();
+    let conn = Connection::open(&queue_db).unwrap();
+    conn.execute(
+        "INSERT INTO review_channels (name, state, next_check_at, check_request_id, updated_at) VALUES ('github_codex', 'paused', '2020-01-01T00:00:00Z', ?1, '2020-01-01T00:00:00Z')",
+        [first_id],
+    ).unwrap();
+    RetainedQueueStore::cancel_codex_review_request_in_path(&queue_db, first_id).unwrap();
+    let check_id: Option<String> = conn
+        .query_row(
+            "SELECT check_request_id FROM review_channels WHERE name = 'github_codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(check_id.is_none());
+    let (status, second) = post_json(
+        app,
+        "/review-requests",
+        json!({
+            "pr_number": 972, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["state"], "active");
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
 async fn github_error_reposts_once_then_stops() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("review-error-twice.db");
@@ -2515,6 +2568,73 @@ async fn github_error_reposts_once_then_stops() {
             Some("reported an error twice".to_owned())
         ))
     );
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_codex_error_repost_ends_without_repeating_comments() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-repost-fails.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_review_failure(codex_review_failure_comment(), usize::MAX);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, response) = post_json(app, "/review-requests", json!({
+        "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345", "poll_interval_seconds": 1
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = response["id"].as_str().unwrap();
+    for _ in 0..30 {
+        let step: String = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT step_state FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if step == "error_wait" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    *poster.result.lock().unwrap() = Err("post failed".to_owned());
+    Connection::open(&queue_db).unwrap().execute(
+        "UPDATE codex_review_request_registrations SET step_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 minutes') WHERE id = ?1", [id]
+    ).unwrap();
+    let mut final_state = None;
+    for _ in 0..50 {
+        let row: (String, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if row.0 == "no_reviewer" {
+            final_state = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        final_state,
+        Some((
+            "no_reviewer".to_owned(),
+            Some("failed to repost after Codex error: post failed".to_owned())
+        ))
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(poster.calls().len(), 2);
 }
 

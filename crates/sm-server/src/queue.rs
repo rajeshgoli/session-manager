@@ -3733,6 +3733,25 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
     ] {
         ensure_column(conn, "codex_review_request_registrations", name, kind)?;
     }
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS release_finished_github_review_check
+        AFTER UPDATE OF is_active ON codex_review_request_registrations
+        WHEN OLD.is_active = 1 AND NEW.is_active = 0
+        BEGIN
+            UPDATE review_channels
+            SET check_request_id = NULL, updated_at = COALESCE(NEW.last_polled_at, updated_at)
+            WHERE check_request_id = NEW.id;
+        END;
+        UPDATE review_channels
+        SET check_request_id = NULL
+        WHERE check_request_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM codex_review_request_registrations
+              WHERE id = review_channels.check_request_id AND is_active = 1
+          );
+        "#,
+    )?;
     Ok(())
 }
 
