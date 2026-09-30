@@ -30,8 +30,20 @@ func trustedChrome() throws -> SecTrustedApplication {
     guard let chrome = chrome else { throw Failure.message("Google Chrome identity unavailable") }
     return chrome
 }
-// Change signing entries only. Preserve other applications, operations, and
-// password requirements; never turn a restricted list into all-app access.
+func applicationPath(_ application: SecTrustedApplication) throws -> String {
+    var data: CFData?
+    try check(SecTrustedApplicationCopyData(application, &data), "Read trusted application path")
+    guard let data = data, let path = String(data: (data as Data).prefix { $0 != 0 }, encoding: .utf8), path.hasPrefix("/") else {
+        throw Failure.message("Trusted application path unavailable")
+    }
+    return path
+}
+func isSwiftInterpreter(_ application: SecTrustedApplication) throws -> Bool {
+    let name = URL(fileURLWithPath: try applicationPath(application)).lastPathComponent
+    return ["swift", "swift-frontend", "swift-driver", "swiftc"].contains(name)
+}
+// Change signing entries only. Remove legacy interpreter trust, preserving
+// other applications, operations, and password requirements.
 func repairSigningAccess(_ access: SecAccess, _ label: String) throws -> Bool {
     let chrome = try trustedChrome()
     var chromeData: CFData?
@@ -50,13 +62,16 @@ func repairSigningAccess(_ access: SecAccess, _ label: String) throws -> Bool {
         guard var trusted = applications as? [SecTrustedApplication] else {
             throw Failure.message("Refusing to modify a key that allows all applications")
         }
+        let previousCount = trusted.count
+        trusted = try trusted.filter { try !isSwiftInterpreter($0) }
+        let removedInterpreter = trusted.count != previousCount
         let hasChrome = try trusted.contains { application in
             var data: CFData?
             try check(SecTrustedApplicationCopyData(application, &data), "Read trusted application")
             return data == chromeData
         }
         if !hasChrome { trusted.append(chrome) }
-        if !hasChrome || description as String? != label {
+        if removedInterpreter || !hasChrome || description as String? != label {
             try check(SecACLSetContents(entry, trusted as CFArray, label as CFString, prompt), "Repair signing permissions")
             changed = true
         }
@@ -65,6 +80,11 @@ func repairSigningAccess(_ access: SecAccess, _ label: String) throws -> Bool {
     return changed
 }
 func run() throws {
+    var caller: SecTrustedApplication?
+    try check(SecTrustedApplicationCreateFromPath(nil, &caller), "Identify Keychain helper")
+    guard let caller = caller, try !isSwiftInterpreter(caller) else {
+        throw Failure.message("Run this helper as a compiled executable, not through the Swift interpreter")
+    }
     guard (3...4).contains(CommandLine.arguments.count) else { throw Failure.message("Expected prepare|import|repair and device name") }
     let operation = CommandLine.arguments[1], name = CommandLine.arguments[2]
     guard name.range(of: "^[a-z0-9-]{1,32}$", options: .regularExpression) != nil else { throw Failure.message("Invalid device name") }

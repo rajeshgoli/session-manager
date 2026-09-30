@@ -1,10 +1,11 @@
 // Inspect only a disposable test keychain; no production keychain defaults.
 import Foundation
+import Darwin
 import Security
 func require(_ condition: Bool, _ message: String) {
     if !condition { fputs(message + "\n", stderr); exit(1) }
 }
-require(CommandLine.arguments.count == 2, "Pass the disposable keychain path")
+require(CommandLine.arguments.count == 3, "Pass the disposable keychain and compiled helper paths")
 var chain: SecKeychain?
 require(SecKeychainOpen(CommandLine.arguments[1], &chain) == errSecSuccess, "Open test keychain")
 let label = "li.rajeshgo.sm.device.qa-device"
@@ -38,6 +39,21 @@ for entry in entries as! [SecACL] {
         var actual: CFData?
         return SecTrustedApplicationCopyData($0, &actual) == errSecSuccess && actual == expected
     }, "Chrome must be explicitly trusted for signing")
+    var helper: SecTrustedApplication?
+    // SecTrustedApplicationCreateFromPath(nil) records the executable's real
+    // path; macOS TMPDIR commonly uses /var, a symlink to /private/var.
+    guard let resolvedPath = realpath(CommandLine.arguments[2], nil) else {
+        require(false, "Resolve compiled helper path"); exit(1)
+    }
+    let helperPath = String(cString: resolvedPath)
+    free(resolvedPath)
+    require(SecTrustedApplicationCreateFromPath(helperPath, &helper) == errSecSuccess, "Identify compiled helper")
+    var helperData: CFData?
+    require(SecTrustedApplicationCopyData(helper!, &helperData) == errSecSuccess, "Read compiled helper identity")
+    require(trusted.contains {
+        var actual: CFData?
+        return SecTrustedApplicationCopyData($0, &actual) == errSecSuccess && actual == helperData
+    }, "The second trusted app must be the compiled helper, not Swift")
     checked = true
 }
 require(checked, "No signing permission entry found")

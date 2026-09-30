@@ -346,9 +346,12 @@ Verify email-based access as well before treating a rollout as complete.
 For a previously enrolled key whose prompt says `<key>` or repeatedly requests
 Chrome signing permission, run `sm device repair-key-access <name>`. Authorize the
 macOS permission-change dialog locally. This repairs only the existing key's
-signing access entries and display description; it preserves its key material,
-certificate, unrelated permissions, and non-exportability. New enrollments name
-the signing prompt and trust the installed Chrome from key creation.
+signing access entries and display description, and removes legacy Swift
+interpreter signing trust. It preserves key material, certificates, unrelated
+permissions, and non-exportability. The CLI compiles and signs a dedicated helper
+before running Keychain operations; new keys trust that executable and installed
+Chrome, never the general Swift interpreter. Retrying enrollment may request
+approval for the newly compiled helper.
 
 If the rollout fails, disable browser enrollment in the installed config, remove
 only the browser hostname from the Cloudflare client-certificate authority's

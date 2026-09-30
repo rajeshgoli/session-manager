@@ -20,9 +20,13 @@ func snapshot(_ access: SecAccess) throws -> [(SecACL, [String], [Data]?, String
     }
 }
 do {
-    var creator: SecTrustedApplication?, access: SecAccess?
-    try check(SecTrustedApplicationCreateFromPath(nil, &creator), "Identify fixture creator")
-    try check(SecAccessCreate("<key>" as CFString, [creator!] as CFArray, &access), "Create legacy permissions")
+    var creator: SecTrustedApplication?, other: SecTrustedApplication?, access: SecAccess?
+    try check(SecTrustedApplicationCreateFromPath(nil, &creator), "Identify fixture interpreter")
+    try check(SecTrustedApplicationCreateFromPath("/usr/bin/true", &other), "Identify unrelated trusted app")
+    try expect(try isSwiftInterpreter(creator!), "Legacy fixture must run through Swift")
+    var interpreterData: CFData?
+    try check(SecTrustedApplicationCopyData(creator!, &interpreterData), "Read interpreter identity")
+    try check(SecAccessCreate("<key>" as CFString, [creator!, other!] as CFArray, &access), "Create legacy permissions")
     let legacy = access!, label = "li.rajeshgo.sm.device.qa-device"
     let before = try snapshot(legacy)
     try expect(try repairSigningAccess(legacy, label), "Legacy permissions must need repair")
@@ -32,8 +36,10 @@ do {
         try expect(old.1 == new.1 && old.4 == new.4, "Preserve operations and password requirements")
         if old.1.contains(kSecACLAuthorizationSign as String) {
             try expect(new.3 == label, "Use the device label in signing prompts")
-            try expect(new.2?.count == (old.2!.count + 1), "Add exactly one trusted app")
-            try expect(old.2!.allSatisfy { new.2!.contains($0) }, "Preserve existing trusted apps")
+            try expect(new.2?.count == old.2!.count, "Replace interpreter with Chrome")
+            try expect(!new.2!.contains(interpreterData! as Data), "Remove legacy interpreter trust")
+            let retained = old.2!.filter { $0 != interpreterData! as Data }
+            try expect(retained.allSatisfy { new.2!.contains($0) }, "Preserve unrelated trusted apps")
             var chromeData: CFData?
             try check(SecTrustedApplicationCopyData(try trustedChrome(), &chromeData), "Read expected Chrome identity")
             try expect(new.2!.contains(chromeData! as Data), "Trust the installed Chrome")

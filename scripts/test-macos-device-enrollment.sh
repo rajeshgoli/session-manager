@@ -16,7 +16,8 @@ sed '/^do { try run() } catch {/,$d' crates/sm-server/src/bin/device/device_keyc
 cat scripts/test-device-key-access-repair.swift >> "$qa_dir/access-repair.swift"
 swift "$qa_dir/access-repair.swift"
 target/device-qa/keychain-helper prepare qa-device "$qa_keychain" > "$qa_dir/device.csr"
-swift scripts/check-device-key-access.swift "$qa_keychain"
+swift scripts/check-device-key-access.swift "$qa_keychain" "$PWD/target/device-qa/keychain-helper"
+swift scripts/check-device-interpreter-denial.swift "$qa_keychain"
 target/device-qa/keychain-helper repair qa-device "$qa_keychain"
 openssl req -in "$qa_dir/device.csr" -verify -noout
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$qa_dir/ca.key" -out "$qa_dir/ca.pem" -subj /CN=sm-test-ca -days 1 >/dev/null 2>&1

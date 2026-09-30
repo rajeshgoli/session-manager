@@ -105,10 +105,50 @@ fn with_keychain_helper(run: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         process::id(),
         OffsetDateTime::now_utc().unix_timestamp_nanos()
     ));
-    fs::create_dir(&temp)?;
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(&temp)?;
     let result = (|| -> Result<()> {
-        let helper = temp.join("device.swift");
-        fs::write(&helper, include_str!("device_keychain.swift"))?;
+        let source = temp.join("device.swift");
+        let helper = temp.join("sm-device-keychain-helper");
+        fs::write(&source, include_str!("device_keychain.swift"))?;
+        // Keychain trusts the calling executable, not an interpreted script.
+        // Give this restricted helper its own signed identity on every run.
+        let output = ProcessCommand::new("/usr/bin/swiftc")
+            .args(["-O", "-module-name", "SMDeviceKeychain", "-o"])
+            .arg(&helper)
+            .arg(&source)
+            .output()
+            .context("Compile macOS Keychain helper (requires Apple command line tools)")?;
+        if !output.status.success() {
+            bail!(
+                "Compile Keychain helper: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = ProcessCommand::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--options",
+                "runtime",
+                "--identifier",
+                "li.rajeshgo.sm.device-keychain-helper",
+            ])
+            .arg(&helper)
+            .output()
+            .context("Sign macOS Keychain helper")?;
+        if !output.status.success() {
+            bail!(
+                "Sign Keychain helper: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         run(&helper)
     })();
     let _ = fs::remove_dir_all(temp);
@@ -143,9 +183,19 @@ fn enrollment_browser_origin(client: &ApiClient, response: &Value) -> Result<Str
 }
 
 fn helper_call(helper: &Path, operation: &str, name: &str, input: Option<&str>) -> Result<String> {
-    let mut child = ProcessCommand::new("/usr/bin/swift")
-        .arg(helper)
+    helper_call_in_keychain(helper, operation, name, input, None)
+}
+
+fn helper_call_in_keychain(
+    helper: &Path,
+    operation: &str,
+    name: &str,
+    input: Option<&str>,
+    keychain: Option<&Path>,
+) -> Result<String> {
+    let mut child = ProcessCommand::new(helper)
         .args([operation, name])
+        .args(keychain)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -204,6 +254,73 @@ fn owner_assertion(url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Use the production compiler/launcher path, not a separately compiled
+    // fixture: interpreter execution previously escaped the macOS shell tests.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_helper_blocks_unrelated_swift_signing() {
+        struct DisposableKeychain(PathBuf);
+        impl Drop for DisposableKeychain {
+            fn drop(&mut self) {
+                let _ = ProcessCommand::new("/usr/bin/security")
+                    .arg("delete-keychain")
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+        with_keychain_helper(|helper| {
+            let keychain = DisposableKeychain(helper.parent().unwrap().join("test.keychain-db"));
+            for command in ["create-keychain", "unlock-keychain"] {
+                let output = ProcessCommand::new("/usr/bin/security")
+                    .args([command, "-p", "sm-test-only"])
+                    .arg(&keychain.0)
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "test Keychain setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let csr =
+                helper_call_in_keychain(helper, "prepare", "qa-device", None, Some(&keychain.0))?;
+            anyhow::ensure!(
+                csr.contains("BEGIN CERTIFICATE REQUEST"),
+                "helper did not sign a CSR"
+            );
+            for (filename, source, check_identity) in [
+                (
+                    "check-access.swift",
+                    include_str!("../../../../../scripts/check-device-key-access.swift"),
+                    true,
+                ),
+                (
+                    "unrelated.swift",
+                    include_str!("../../../../../scripts/check-device-interpreter-denial.swift"),
+                    false,
+                ),
+            ] {
+                let script = helper.parent().unwrap().join(filename);
+                fs::write(&script, source)?;
+                let mut command = ProcessCommand::new("/usr/bin/swift");
+                command.arg(&script).arg(&keychain.0);
+                if check_identity {
+                    command.arg(helper);
+                }
+                let output = command.output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Keychain boundary check failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            // The narrow helper remains usable after the unrelated caller fails.
+            helper_call_in_keychain(helper, "prepare", "qa-device", None, Some(&keychain.0))?;
+            helper_call_in_keychain(helper, "repair", "qa-device", None, Some(&keychain.0))?;
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn chrome_selection_uses_selected_remote_origin_without_api_path() {
