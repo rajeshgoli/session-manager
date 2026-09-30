@@ -3518,7 +3518,16 @@ async fn get_app_artifact_metadata(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_app_artifact_read_allowed(&state, &request)?;
+    if owner_web_guard(
+        &state,
+        request.headers(),
+        request_peer_addr(&request),
+        "GET",
+    )?
+    .is_none()
+    {
+        ensure_app_artifact_read_allowed(&state, &request)?;
+    }
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact metadata not found"));
     }
@@ -19576,6 +19585,14 @@ mod tests {
         let (status, body) = browser_host_get(&app, "/client/push/status", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["devices"], json!([{"device_name": "Owner phone"}]));
+        let (status, _) = browser_host_get(
+            &app,
+            "/apps/session-manager-android/meta.json",
+            Some(&owner),
+        )
+        .await;
+        // Missing artifact is a data absence, not an authentication rejection.
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!body.to_string().contains("secret-"));
         let (status, _) = browser_host_get(&app, "/client/push/status", None).await;
         assert!(is_auth_denial_status(status.as_u16()));
