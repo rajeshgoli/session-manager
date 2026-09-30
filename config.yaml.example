@@ -496,9 +496,3 @@ board:
   # Where Start runs a new agent, per owner/name. Without an entry sm uses
   # ~/projects/<name> when its origin names the same repo.
   checkouts: {}
-  # What the Start sheet preselects. The model must be an identifier the
-  # model catalog returns (GET /client/session-models).
-  start_defaults:
-    provider: claude
-    model: opus[1m]
-    reasoning_effort: high

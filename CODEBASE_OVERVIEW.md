@@ -9,12 +9,12 @@ jobs, hooks, audit data, mobile access, and restart recovery.
 ```text
 session-manager/
 ├── crates/sm-server/       # Rust server, CLI, and tests
+│   └── src/web/            # Browser web app, embedded in the server
 ├── android-app/            # Native Android operator app
 ├── hooks/                  # Claude Code lifecycle and audit hooks
 ├── scripts/                # Install, restart, smoke, and maintenance tools
 ├── scripts/rust_migration/ # Cutover evidence and state safety tools
-├── specs/                  # Current design and working documents
-└── web/sm-watch/           # Browser dashboard assets
+└── specs/                  # Current design and working documents
 ```
 
 ## Rust Components

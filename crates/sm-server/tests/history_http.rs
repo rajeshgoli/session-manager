@@ -344,9 +344,8 @@ async fn history_html_is_a_card_page_with_escaped_text() {
     assert!(html.contains("1 Codex"));
     assert!(html.contains("Memo &lt;draft&gt;"));
     assert!(html.contains(r#"href="/history?agent=eng00001""#));
-    // Only the shared shell's Board badge poller; the page itself needs no script.
-    assert_eq!(html.matches("<script").count(), 1);
-    assert!(html.contains("'/client/board/badge'"));
+    // The page needs no script.
+    assert_eq!(html.matches("<script").count(), 0);
 }
 
 #[tokio::test]

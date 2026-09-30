@@ -4,31 +4,13 @@
 //! per settings key, `{value, updated_at}`, holding only what the owner set.
 
 use super::*;
-use crate::config::BoardStartDefaults;
 use crate::owner_settings::{self, STORE_KEY};
 
 impl SessionStore {
-    /// The effective settings object (`GET /client/settings`). With no
-    /// stored `new_agent`, the first read seeds it from `seed`
-    /// (`board.start_defaults`) when config has one.
-    pub fn owner_settings(&self, seed: Option<&BoardStartDefaults>) -> Result<Value> {
+    /// The effective settings object (`GET /client/settings`).
+    pub fn owner_settings(&self) -> Result<Value> {
         let state = self.load_parsed_state()?;
-        let stored = state.raw.get(STORE_KEY);
-        if let Some(seed) =
-            seed.filter(|_| owner_settings::stored_value(stored, "new_agent").is_none())
-        {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            if owner_settings::stored_value(state.get(STORE_KEY), "new_agent").is_none() {
-                // A seed that fails every check stores nothing set, so it
-                // is not retried on every read.
-                let seed = owner_settings::seed_new_agent(seed).unwrap_or_else(|| json!({}));
-                set_owner_settings(&mut state, [("new_agent".to_owned(), seed)])?;
-                self.write_raw_json_value(&state)?;
-            }
-            return Ok(owner_settings::effective(state.get(STORE_KEY)));
-        }
-        Ok(owner_settings::effective(stored))
+        Ok(owner_settings::effective(state.raw.get(STORE_KEY)))
     }
 
     /// Merge a `PUT /client/settings` body. `check` sees the effective

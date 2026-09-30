@@ -386,8 +386,6 @@ pub(super) struct BoardQuery {
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
-    html: bool,
-    #[serde(default)]
     clock_hours: Option<i64>,
 }
 
@@ -405,7 +403,8 @@ fn lane_filter(query: &BoardQuery) -> Result<Option<Key>, ApiError> {
     }
 }
 
-/// `GET /board`: the owner page, or board JSON when explicitly requested.
+/// `GET /board`: the web app on the browser hostname, or board JSON when
+/// explicitly requested.
 pub(super) async fn get_board(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -431,20 +430,17 @@ pub(super) async fn get_board(
     if let Some(shell) = super::web::shell_page(&state, &request) {
         return Ok(shell);
     }
+    // The Board page is the web app's; the phone shows its own Board tab.
+    if !wants_json {
+        return Err(ApiError::NotFound("Not found"));
+    }
     let filter = lane_filter(&query)?;
     let hours = super::board_clock::clock_hours(query.clock_hours)?;
     let payload = blocking(&state, move |state| {
         Ok(board_payload(state, filter.as_ref(), Some(hours))?)
     })
     .await?;
-    if wants_json {
-        Ok(Json(payload).into_response())
-    } else {
-        Ok(super::history::html_response(
-            StatusCode::OK,
-            super::board_page::page(&payload),
-        ))
-    }
+    Ok(Json(payload).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,13 +677,10 @@ pub(super) async fn client_board(
 ) -> Result<Json<Value>, ApiError> {
     owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let hours = super::board_clock::clock_hours(query.clock_hours)?;
-    let mut payload = blocking(&state, move |state| {
+    let payload = blocking(&state, move |state| {
         Ok(board_payload(state, None, Some(hours))?)
     })
     .await?;
-    if query.html {
-        payload["html"] = json!(super::board_page::render(&payload));
-    }
     Ok(Json(payload))
 }
 
@@ -878,9 +871,7 @@ pub(super) struct StartOptionsQuery {
 }
 
 fn new_agent_settings(state: &AppState) -> anyhow::Result<NewAgentSettings> {
-    let settings = state
-        .session_store
-        .owner_settings(state.config.board.start_defaults.as_ref())?;
+    let settings = state.session_store.owner_settings()?;
     Ok(OwnerSettings::from_effective(&settings)?.new_agent)
 }
 
