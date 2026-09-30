@@ -69,9 +69,12 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
             .context("Server returned no certificate")?;
         let browser_origin = enrollment_browser_origin(&client, &response)?;
         helper_call(&helper, "import", &name, Some(chain))?;
-        let selection =
-            json!({ "pattern": browser_origin, "filter": { "SUBJECT": { "CN": name } } })
-                .to_string();
+        // defaults parses -array-add values as property-list literals. Quote
+        // the JSON as a string; bare JSON braces are parsed as a dictionary.
+        let selection = serde_json::to_string(
+            &json!({ "pattern": browser_origin, "filter": { "SUBJECT": { "CN": name } } })
+                .to_string(),
+        )?;
         let status = ProcessCommand::new("/usr/bin/defaults")
             .args([
                 "write",
