@@ -1335,34 +1335,45 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
     }))
 }
 
-/// A job's retained, unbucketed recorder samples. Percent is of one CPU
-/// core (or one GPU second per second); counter drops count as no growth.
-/// Missing samples remain missing rather than drawing activity across gaps.
-pub fn job_series(db_path: &Path, job_id: &str, quiet_minutes: u64) -> Result<Value> {
+/// At most eight hours of five-second samples per chart page. The extra
+/// boundary sample supplies the first delta and indicates an earlier page.
+const JOB_SERIES_PAGE_SIZE: usize = 5760;
+
+pub fn job_series(db_path: &Path, job_id: &str, before_ms: Option<i64>) -> Result<Value> {
     let Some(conn) = open_for_read(db_path)? else {
         return Ok(json!({"available": false}));
     };
     let mut statement = conn.prepare(
         "SELECT sampled_at_ms, cpu_seconds_total, gpu_seconds_total, footprint_bytes
-         FROM job_samples WHERE job_id = ?1 AND state = 'running' ORDER BY sampled_at_ms",
+         FROM job_samples WHERE job_id = ?1 AND state = 'running' AND sampled_at_ms < ?2
+         ORDER BY sampled_at_ms DESC LIMIT ?3",
     )?;
-    let rows = statement
-        .query_map([job_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<f64>>(1)?,
-                row.get::<_, Option<f64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?
+    let mut rows = statement
+        .query_map(
+            params![
+                job_id,
+                before_ms.unwrap_or(i64::MAX),
+                JOB_SERIES_PAGE_SIZE as i64 + 1
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut samples = Vec::with_capacity(rows.len());
-    for (index, &(at, cpu, gpu, memory)) in rows.iter().enumerate() {
+    rows.reverse();
+    let skip = usize::from(rows.len() > JOB_SERIES_PAGE_SIZE);
+    let mut samples = Vec::with_capacity(rows.len() - skip);
+    for (index, &(at, cpu, gpu, memory)) in rows.iter().enumerate().skip(skip) {
         let previous = index.checked_sub(1).map(|i| rows[i]);
         let rate = |current: Option<f64>, old: Option<f64>, elapsed: i64| {
             current
                 .zip(old)
-                .filter(|_| elapsed > 0 && elapsed <= 15_000)
+                .filter(|_| elapsed > 0 && elapsed <= 60_000)
                 .map(|(c, p)| (c - p).max(0.0) * 100_000.0 / elapsed as f64)
         };
         samples.push(json!({
@@ -1372,32 +1383,37 @@ pub fn job_series(db_path: &Path, job_id: &str, quiet_minutes: u64) -> Result<Va
             "gpu_percent": previous.and_then(|p| rate(gpu, p.2, at - p.0)),
         }));
     }
-    let window = quiet_minutes
-        .max(1)
-        .saturating_mul(60_000)
-        .min(i64::MAX as u64) as i64;
-    let low_cpu = rows.last().is_some_and(|last| {
-        let start = last.0.saturating_sub(window);
-        let first = rows.partition_point(|row| row.0 <= start).checked_sub(1);
-        first.is_some_and(|first| {
-            let mut growth = 0.0;
-            for pair in rows[first..].windows(2) {
-                let (p, c) = (pair[0], pair[1]);
-                if c.0 - p.0 > 15_000 || p.1.is_none() || c.1.is_none() {
-                    return false;
-                }
-                growth += (c.1.unwrap() - p.1.unwrap()).max(0.0);
-            }
-            growth / ((last.0 - rows[first].0) as f64 / 1000.0) < 0.01
-        })
-    });
     Ok(json!({"available": !samples.is_empty(), "job_id": job_id,
-        "samples": samples, "low_cpu": low_cpu}))
+        "samples": samples, "next_before_ms": (skip > 0).then(|| rows[skip].0)}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_job_usage_pages_are_bounded_and_keep_boundary_deltas() {
+        let (_dir, path, conn) = temp_db();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 6000)
+            INSERT INTO job_samples(sampled_at_ms, job_id, job_type, state, cpu_seconds_total)
+            SELECT 1700000000000 + i*5000, 'long-service', 'service', 'running', i FROM n;",
+        )
+        .unwrap();
+        let newest = job_series(&path, "long-service", None).unwrap();
+        assert_eq!(
+            newest["samples"].as_array().unwrap().len(),
+            JOB_SERIES_PAGE_SIZE
+        );
+        assert_eq!(newest["samples"][0]["cpu_percent"], 20.0);
+        let before = newest["next_before_ms"].as_i64().unwrap();
+        let earlier = job_series(&path, "long-service", Some(before)).unwrap();
+        assert_eq!(earlier["samples"].as_array().unwrap().len(), 241);
+        assert!(earlier["next_before_ms"].is_null());
+        assert_eq!(newest["samples"][0]["at"], rfc3339_ms(before));
+        assert_eq!(earlier["samples"][240]["at"], rfc3339_ms(before - 5000));
+        assert!(!earlier["samples"][240]["cpu_percent"].is_null());
+    }
 
     #[test]
     fn web_queue_series_preserves_optional_queue_shares() {
@@ -1430,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn web_job_usage_uses_step_growth_and_requires_coverage() {
+    fn web_job_usage_uses_step_growth_and_preserves_missing_data() {
         let (_dir, path, mut conn) = temp_db();
         let base = 1_700_000_000_000;
         for i in 0..=120 {
@@ -1445,18 +1461,28 @@ mod tests {
             };
             write_sample(&mut conn, &sample, &[job]).unwrap();
         }
-        let usage = job_series(&path, "job-a", 10).unwrap();
+        let usage = job_series(&path, "job-a", None).unwrap();
         assert_eq!(usage["samples"].as_array().unwrap().len(), 121);
         assert_eq!(usage["samples"][60]["cpu_percent"], 0.0);
         assert_eq!(usage["samples"][60]["gpu_percent"], 20.0);
-        assert_eq!(usage["low_cpu"], true);
-        assert_eq!(job_series(&path, "job-b", 10).unwrap()["available"], false);
+
+        assert_eq!(
+            job_series(&path, "job-b", None).unwrap()["available"],
+            false
+        );
         conn.execute(
             "DELETE FROM job_samples WHERE sampled_at_ms > ?1 AND sampled_at_ms < ?2",
             params![base + 200_000, base + 300_000],
         )
         .unwrap();
-        assert_eq!(job_series(&path, "job-a", 10).unwrap()["low_cpu"], false);
+        let usage = job_series(&path, "job-a", None).unwrap();
+        let after_gap = usage["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sample| sample["at"] == rfc3339_ms(base + 300_000))
+            .unwrap();
+        assert!(after_gap["cpu_percent"].is_null());
     }
 
     const GIB: i64 = 1024 * 1024 * 1024;

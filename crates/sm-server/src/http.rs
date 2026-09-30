@@ -2730,10 +2730,16 @@ async fn client_queue_stats(
     .await
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct JobUsageQuery {
+    before_ms: Option<i64>,
+}
+
 /// Recorded five-second samples for one retained job (sm#1723).
 async fn client_queue_job_usage(
     State(state): State<Arc<AppState>>,
     Path(identifier): Path<String>,
+    Query(query): Query<JobUsageQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_client_read(&state, &request)?;
@@ -2744,9 +2750,8 @@ async fn client_queue_job_usage(
     )
     .map_err(queue_lookup_error)?
     .ok_or(ApiError::NotFound("Queue job not found"))?;
-    let minutes = state.config.queue_runner.quiet_minutes;
     read_utilization(&state, move |path| {
-        crate::utilization::job_series(path, &job.id, minutes)
+        crate::utilization::job_series(path, &job.id, query.before_ms)
     })
     .await
 }

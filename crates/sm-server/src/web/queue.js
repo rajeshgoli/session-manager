@@ -84,13 +84,12 @@ export function HeldBack({ stats, insightOnly = false }) {
 }
 
 function JobRow({ job, now }) {
-  const [usage] = usePoll(() => job.state === 'running' ? api(`/client/queue/jobs/${encodeURIComponent(job.id)}/usage`) : null, 30000, [job.id, job.state]);
   const deadline = Date.parse(job.wait_deadline_at) - now;
   return html`<button class="q-job" type="button" onClick=${() => openPanel(`job:${job.id}`)}>
     <span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${job.requester_name || job.notify_name || ''}</small></span>
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}
-      ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : usage?.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
+      ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : job.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
       ${job.state === 'pending' && deadline < 21600000 && Number.isFinite(deadline) ? ` · gives up in ${duration(deadline / 1000)}` : ''}</span>
   </button>`;
 }
@@ -99,7 +98,9 @@ function JobPanel({ id, controls }) {
   const encoded = encodeURIComponent(id);
   const [job, error, reload] = usePoll(() => api(`/queue-jobs/${encoded}`), 5000, [id]);
   const [log, logError] = usePoll(() => api(`/queue-jobs/${encoded}/log?lines=40`), 5000, [id]);
-  const [usage, usageError] = usePoll(() => api(`/client/queue/jobs/${encoded}/usage`), 5000, [id]);
+  const [before, setBefore] = useState(null);
+  const usageInterval = !before && job?.state === 'running' ? 5000 : 0;
+  const [usage, usageError] = usePoll(() => api(`/client/queue/jobs/${encoded}/usage${before ? `?before_ms=${before}` : ''}`), usageInterval, [id, before, usageInterval]);
   const [follows, , reloadFollows] = usePoll(() => api('/client/follows'), 30000, [id]);
   const [check, setCheck] = useState(null), [cancel, setCancel] = useState(false), [note, setNote] = useState('');
   const [ask, setAsk] = useState(false), [question, setQuestion] = useState(''), [busy, setBusy] = useState(false), [failure, setFailure] = useState('');
@@ -130,6 +131,7 @@ function JobPanel({ id, controls }) {
       <dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
+      <div class="q-actions">${usage?.next_before_ms ? html`<button class="btn sm" onClick=${() => setBefore(usage.next_before_ms)}>Earlier samples</button>` : null}${before ? html`<button class="btn sm" onClick=${() => setBefore(null)}>Latest samples</button>` : null}</div>
       <h3>Last 40 log lines</h3><pre class="q-log">${log?.text || logError?.message || 'Loading log…'}</pre>
     </div>`;
 }
