@@ -111,7 +111,7 @@ pub(super) async fn put_handoff_defaults(
     )?;
     ensure_core_writes_enabled(&state)?;
     match state.session_store.update_handoff_defaults(&body)? {
-        Ok(defaults) => Ok(Json(defaults.to_json())),
+        Ok(_) => Ok(Json(state.session_store.handoff_defaults()?.to_json())),
         Err(detail) => Err(status(StatusCode::BAD_REQUEST, detail)),
     }
 }
@@ -161,6 +161,52 @@ pub(super) async fn put_handoff_policy(
         HandoffPolicyOutcome::Updated(view) => Ok(Json(view)),
         HandoffPolicyOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         HandoffPolicyOutcome::Conflict(detail) => Err(status(StatusCode::CONFLICT, detail)),
+    }
+}
+
+pub(super) async fn get_ticket_handoff_policy(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_owner(&state, &headers, peer_addr, "/handoff-policy/ticket", None)?;
+    if number <= 0 || owner.is_empty() || repo.is_empty() {
+        return Err(status(StatusCode::BAD_REQUEST, "invalid ticket"));
+    }
+    Ok(Json(state.session_store.ticket_handoff_policy_view(
+        &format!("{owner}/{repo}"),
+        number,
+    )?))
+}
+
+pub(super) async fn put_ticket_handoff_policy(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_owner(
+        &state,
+        &headers,
+        peer_addr,
+        "/handoff-policy/ticket",
+        Some(&body),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    if number <= 0 || owner.is_empty() || repo.is_empty() {
+        return Err(status(StatusCode::BAD_REQUEST, "invalid ticket"));
+    }
+    let update =
+        PolicyUpdate::parse(&body).map_err(|detail| status(StatusCode::BAD_REQUEST, detail))?;
+    match state.session_store.update_ticket_handoff_policy(
+        &format!("{owner}/{repo}"),
+        number,
+        &update,
+    )? {
+        Ok(view) => Ok(Json(view)),
+        Err(detail) => Err(status(StatusCode::BAD_REQUEST, detail)),
     }
 }
 

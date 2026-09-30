@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::handoff::policy::{
-    self, ask_text, claims_text, effective_policy, reminder_text, AskReason, EffectivePolicy,
-    HandoffDefaults, HandoffOverride, HandoffPhase, HandoffRecord, HandoffTrigger, PolicyUpdate,
-    SessionRef,
+    self, ask_text, claims_text, effective_policy_with_ticket, reminder_text, AskReason,
+    EffectivePolicy, HandoffDefaults, HandoffOverride, HandoffPhase, HandoffRecord, HandoffTrigger,
+    PolicyUpdate, SessionRef,
 };
 
 /// What `PUT /sessions/{id}/handoff-policy` did.
@@ -40,15 +40,20 @@ struct RawHandoffContext {
     stopped: bool,
 }
 
-fn raw_handoff_context(state: &Value, session_id: &str) -> Option<RawHandoffContext> {
+fn raw_handoff_context(
+    state: &Value,
+    session_id: &str,
+    ticket: Option<&HandoffOverride>,
+) -> Option<RawHandoffContext> {
     let session = raw_session_object(state, session_id)?;
     let defaults = HandoffDefaults::from_stored(state.get(policy::DEFAULTS_KEY));
     let provider = raw_session_provider(session);
     let override_ = HandoffOverride::from_stored(session.get(policy::OVERRIDE_KEY));
-    let policy = effective_policy(
+    let policy = effective_policy_with_ticket(
         &defaults,
         &provider,
         override_.as_ref(),
+        ticket,
         provider_has_measured_context_gauge(&provider),
     );
     Some(RawHandoffContext {
@@ -102,13 +107,15 @@ pub(super) fn handoff_view_for_record(
     session: &SessionRecord,
     defaults: &HandoffDefaults,
     session_refs: &BTreeMap<String, SessionRef>,
+    ticket: Option<&HandoffOverride>,
 ) -> Value {
     let provider = non_empty_or(session.provider.clone(), "claude");
     let override_ = HandoffOverride::from_stored(session.handoff_policy_override.as_ref());
-    let policy = effective_policy(
+    let policy = effective_policy_with_ticket(
         defaults,
         &provider,
         override_.as_ref(),
+        ticket,
         provider_has_measured_context_gauge(&provider),
     );
     let record = session
@@ -139,12 +146,103 @@ pub(super) fn handoff_view_for_record(
 }
 
 impl SessionStore {
+    fn ticket_claim_store(&self) -> Option<crate::work_claims::WorkClaimStore> {
+        self.queue_store
+            .as_ref()
+            .map(|queue| crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf()))
+    }
+
+    pub fn ticket_handoff_policy_view(&self, repo: &str, number: i64) -> Result<Value> {
+        let override_ = self
+            .ticket_claim_store()
+            .map(|store| store.handoff_ticket_override(repo, number))
+            .transpose()?
+            .flatten();
+        Ok(override_.map_or_else(
+            || HandoffOverride::default().to_json(),
+            |value| value.to_json(),
+        ))
+    }
+
+    pub fn update_ticket_handoff_policy(
+        &self,
+        repo: &str,
+        number: i64,
+        update: &PolicyUpdate,
+    ) -> Result<std::result::Result<Value, String>> {
+        if update.ask_now {
+            return Ok(Err("ask_now is available only for an agent".to_owned()));
+        }
+        let Some(claims) = self.ticket_claim_store() else {
+            return Ok(Err("ticket claims are unavailable".to_owned()));
+        };
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let current = claims.handoff_ticket_override(repo, number)?;
+        let next = update.apply(current.as_ref(), &now_rfc3339());
+        let holders = claims
+            .claims_for_item(repo, number)?
+            .into_iter()
+            .filter(|claim| {
+                claim.kind == "ticket" && claim.ended_at.is_none() && claim.reserved_at.is_none()
+            })
+            .map(|claim| claim.session_id)
+            .collect::<Vec<_>>();
+        let was_enabled = holders
+            .iter()
+            .map(|id| {
+                raw_handoff_context(
+                    &state,
+                    id,
+                    self.ticket_handoff_override_for_session(id).as_ref(),
+                )
+                .is_some_and(|context| context.policy.enabled)
+            })
+            .collect::<Vec<_>>();
+        claims.set_handoff_ticket_override(repo, number, next.as_ref())?;
+        let runtime = self.delivery_runtime.clone();
+        for (id, enabled) in holders.iter().zip(was_enabled) {
+            self.recheck_handoff_policy(&mut state, id, enabled, runtime.as_ref())?;
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(Ok(next.map_or_else(
+            || HandoffOverride::default().to_json(),
+            |value| value.to_json(),
+        )))
+    }
+
+    fn ticket_handoff_override_for_session(&self, session_id: &str) -> Option<HandoffOverride> {
+        let queue = self.queue_store.as_ref()?;
+        let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf());
+        let (repo, number) = claims.first_ticket_for_session(session_id).ok()??;
+        claims.handoff_ticket_override(&repo, number).ok().flatten()
+    }
     /// The default policy, starting values filled in (`GET /handoff-defaults`).
     pub fn handoff_defaults(&self) -> Result<HandoffDefaults> {
         let state = self.load_raw_json_value()?;
-        Ok(HandoffDefaults::from_stored(
-            state.get(policy::DEFAULTS_KEY),
-        ))
+        let mut defaults = HandoffDefaults::from_stored(state.get(policy::DEFAULTS_KEY));
+        let mut latest = BTreeMap::<String, String>::new();
+        if let Some(sessions) = state.get("sessions").and_then(Value::as_array) {
+            for session in sessions.iter().filter_map(Value::as_object) {
+                let provider = raw_session_provider(session);
+                let Some(window) = session
+                    .get("context_window_tokens")
+                    .and_then(Value::as_i64)
+                    .filter(|window| *window > 0)
+                else {
+                    continue;
+                };
+                let sampled_at = json_text(session.get("context_sampled_at")).unwrap_or_default();
+                if latest
+                    .get(&provider)
+                    .is_none_or(|previous| sampled_at > *previous)
+                {
+                    latest.insert(provider.clone(), sampled_at);
+                    defaults.window_tokens.insert(provider, window);
+                }
+            }
+        }
+        Ok(defaults)
     }
 
     /// Merge `patch` into the default policy, then re-run the withdrawal and
@@ -168,7 +266,14 @@ impl SessionStore {
             .collect::<Vec<_>>();
         let was_enabled = session_ids
             .iter()
-            .map(|id| raw_handoff_context(&state, id).is_some_and(|context| context.policy.enabled))
+            .map(|id| {
+                raw_handoff_context(
+                    &state,
+                    id,
+                    self.ticket_handoff_override_for_session(id).as_ref(),
+                )
+                .is_some_and(|context| context.policy.enabled)
+            })
             .collect::<Vec<_>>();
         state
             .as_object_mut()
@@ -199,7 +304,12 @@ impl SessionStore {
         {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
-            let Some(context) = raw_handoff_context(&state, session_id) else {
+            let Some(context) = raw_handoff_context(
+                &state,
+                session_id,
+                self.ticket_handoff_override_for_session(session_id)
+                    .as_ref(),
+            ) else {
                 return Ok(HandoffPolicyOutcome::NotFound);
             };
             // Validate Hand off now before changing anything, so a refused
@@ -284,7 +394,12 @@ impl SessionStore {
     ) -> Result<Option<String>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let Some(context) = raw_handoff_context(&state, session_id) else {
+        let Some(context) = raw_handoff_context(
+            &state,
+            session_id,
+            self.ticket_handoff_override_for_session(session_id)
+                .as_ref(),
+        ) else {
             return Ok(None);
         };
         let switch = match ask {
@@ -296,7 +411,17 @@ impl SessionStore {
         }
         let percent = if context.policy.has_gauge {
             match context.used_percentage {
-                Some(used) if used >= context.defaults.review_floor_percent => Some(used),
+                Some(used)
+                    if used
+                        >= context
+                            .defaults
+                            .thresholds(&raw_session_provider(
+                                raw_session_object(&state, session_id).expect("session exists"),
+                            ))
+                            .review_floor_percent =>
+                {
+                    Some(used)
+                }
                 // Below the floor, or a gauge provider with no reading yet.
                 _ => return Ok(None),
             }
@@ -333,7 +458,12 @@ impl SessionStore {
         used_percentage: f64,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<bool> {
-        let Some(context) = raw_handoff_context(state, session_id) else {
+        let Some(context) = raw_handoff_context(
+            state,
+            session_id,
+            self.ticket_handoff_override_for_session(session_id)
+                .as_ref(),
+        ) else {
             return Ok(false);
         };
         if context.stopped || !context.policy.enabled {
@@ -390,7 +520,12 @@ impl SessionStore {
         was_enabled: bool,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<bool> {
-        let Some(context) = raw_handoff_context(state, session_id) else {
+        let Some(context) = raw_handoff_context(
+            state,
+            session_id,
+            self.ticket_handoff_override_for_session(session_id)
+                .as_ref(),
+        ) else {
             return Ok(false);
         };
         if context.stopped {
@@ -544,6 +679,20 @@ mod tests {
         SessionStore::new_with_queue(state_file, temp_path(&format!("{label}-queue.db")))
     }
 
+    fn ticket_claim(store: &SessionStore, session_id: &str, number: i64) {
+        let db_path = store.queue_store.as_ref().unwrap().db_path().to_path_buf();
+        crate::work_claims::WorkClaimStore::new(db_path.clone())
+            .ensure_schema()
+            .unwrap();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO work_claims (id, repo, number, kind, session_id, source, claimed_at)
+            VALUES (?1, 'acme/widgets', ?2, 'ticket', ?3, 'explicit', '2026-09-29T00:00:00Z')",
+            rusqlite::params![format!("claim-{session_id}-{number}"), number, session_id],
+        )
+        .unwrap();
+    }
+
     fn sample(store: &SessionStore, session_id: &str, percent: f64) {
         store
             .apply_context_usage_event(
@@ -643,14 +792,78 @@ mod tests {
         assert!(queued(&store, "fork0001").is_empty());
         assert_eq!(display(&store, "fork0001"), "handoff off");
 
-        // Switching it on asks immediately: it is already past 35%.
+        // Switching it on leaves a 60% session below Codex's 80% threshold.
         update(&store, "fork0001", json!({"enabled": true}));
+        assert!(queued(&store, "fork0001").is_empty());
+        sample(&store, "fork0001", 81.0);
         assert_eq!(
             queued(&store, "fork0001"),
             vec![format!(
-                "[sm context management] Your context is at 60%.{ASK_TAIL}"
+                "[sm context management] Your context is at 81%.{ASK_TAIL}"
             )]
         );
+    }
+
+    #[test]
+    fn ticket_override_applies_to_each_holder_and_agent_fields_win() {
+        let store = store("ticket-policy");
+        ticket_claim(&store, "agent001", 1782);
+        ticket_claim(&store, "fork0001", 1782);
+        sample(&store, "agent001", 25.0);
+        sample(&store, "fork0001", 25.0);
+        store
+            .update_ticket_handoff_policy(
+                "acme/widgets",
+                1782,
+                &PolicyUpdate::parse(&json!({"enabled": true, "threshold_percent": 30})).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let claude = store.handoff_policy_view("agent001").unwrap().unwrap();
+        let codex = store.handoff_policy_view("fork0001").unwrap().unwrap();
+        assert_eq!(claude["source"], "ticket");
+        assert_eq!(codex["source"], "ticket");
+        assert_eq!(codex["enabled"], true);
+        assert_eq!(codex["threshold_percent"], 30);
+        sample(&store, "fork0001", 31.0);
+        assert_eq!(
+            record(&store, "fork0001").unwrap().trigger,
+            HandoffTrigger::Context
+        );
+        update(&store, "agent001", json!({"threshold_percent": 55}));
+        let agent = store.handoff_policy_view("agent001").unwrap().unwrap();
+        assert_eq!(agent["source"], "override");
+        assert_eq!(agent["threshold_percent"], 55);
+        assert_eq!(agent["enabled"], true);
+        assert_eq!(
+            store
+                .ticket_handoff_policy_view("acme/widgets", 1782)
+                .unwrap()["threshold_percent"],
+            30
+        );
+    }
+
+    #[test]
+    fn latest_measured_window_is_reported_for_each_provider() {
+        let store = store("windows");
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "agent001")
+            .unwrap()
+            .insert("context_window_tokens".into(), json!(200_000));
+        session_object_mut(sessions, "agent001")
+            .unwrap()
+            .insert("context_sampled_at".into(), json!("2026-09-30T01:00:00Z"));
+        session_object_mut(sessions, "fork0001")
+            .unwrap()
+            .insert("context_window_tokens".into(), json!(258_400));
+        session_object_mut(sessions, "fork0001")
+            .unwrap()
+            .insert("context_sampled_at".into(), json!("2026-09-30T02:00:00Z"));
+        store.write_raw_json_value(&state).unwrap();
+        let defaults = store.handoff_defaults().unwrap().to_json();
+        assert_eq!(defaults["window_tokens"]["claude"], 200_000);
+        assert_eq!(defaults["window_tokens"]["codex-fork"], 258_400);
     }
 
     #[test]

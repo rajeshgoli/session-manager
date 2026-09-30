@@ -6422,6 +6422,20 @@ impl SessionStore {
                 return Ok(ContextUsageOutcome::UnknownSession);
             };
             let tokens_used = event.total_input_tokens.unwrap_or(0);
+            let context_window_tokens = event
+                .context_window_tokens
+                .filter(|window| *window > 0)
+                .unwrap_or_else(|| {
+                    if event
+                        .model_id
+                        .as_deref()
+                        .is_some_and(|id| id.ends_with("[1m]"))
+                    {
+                        1_000_000
+                    } else {
+                        200_000
+                    }
+                });
             let sampled_at = event
                 .emitted_at
                 .as_deref()
@@ -6442,6 +6456,8 @@ impl SessionStore {
             let mut changed = previous_used != Some(tokens_used)
                 || previous_pct != Some(used_percentage)
                 || previous_context_tokens != Some(tokens_used)
+                || session.get("context_window_tokens").and_then(Value::as_i64)
+                    != Some(context_window_tokens)
                 || json_text(session.get("context_sampled_at")).is_none()
                 || event.emitted_at.is_some()
                     && json_text(session.get("context_sampled_at")).as_deref()
@@ -6451,6 +6467,10 @@ impl SessionStore {
                 session.insert("tokens_used".to_owned(), json!(tokens_used));
                 session.insert("context_used_percentage".to_owned(), json!(used_percentage));
                 session.insert("context_total_input_tokens".to_owned(), json!(tokens_used));
+                session.insert(
+                    "context_window_tokens".to_owned(),
+                    json!(context_window_tokens),
+                );
                 session.insert("context_sampled_at".to_owned(), Value::String(sampled_at));
                 session.insert("context_compaction_active".to_owned(), Value::Bool(false));
             }
@@ -7723,12 +7743,12 @@ impl SessionStore {
         if !state_file.exists() {
             return Ok(StateSnapshot::default());
         }
-        match self.parsed_state_at(&state_file).and_then(|parsed| {
+        let mut snapshot = match self.parsed_state_at(&state_file).and_then(|parsed| {
             parsed.snapshot().with_context(|| {
                 format!("failed to parse session records {}", state_file.display())
             })
         }) {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => snapshot,
             Err(primary_error) => {
                 if state_file == self.state_file {
                     if let Some(legacy_state_file) = &self.legacy_state_file {
@@ -7742,9 +7762,14 @@ impl SessionStore {
                         }
                     }
                 }
-                Err(primary_error)
+                return Err(primary_error);
             }
+        };
+        if let Some(queue) = &self.queue_store {
+            let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf());
+            snapshot.handoff_ticket_overrides = claims.handoff_ticket_overrides_by_session()?;
         }
+        Ok(snapshot)
     }
 
     fn readable_state_file(&self) -> PathBuf {
@@ -8104,6 +8129,8 @@ impl SessionStore {
                 let snapshot_changed = previous_used != Some(usage.tokens_used)
                     || previous_pct != Some(usage.used_percentage)
                     || previous_context_tokens != Some(usage.tokens_used)
+                    || session.get("context_window_tokens").and_then(Value::as_i64)
+                        != Some(usage.context_window)
                     || json_text(session.get("context_sampled_at")).is_none();
                 if snapshot_changed {
                     session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
@@ -8114,6 +8141,10 @@ impl SessionStore {
                     session.insert(
                         "context_total_input_tokens".to_owned(),
                         json!(usage.tokens_used),
+                    );
+                    session.insert(
+                        "context_window_tokens".to_owned(),
+                        json!(usage.context_window),
                     );
                     session.insert(
                         "context_sampled_at".to_owned(),
@@ -8974,6 +9005,7 @@ fn codex_fork_restore_status_confirms_root(
 struct CodexContextUsage {
     tokens_used: i64,
     used_percentage: f64,
+    context_window: i64,
 }
 
 /// Read context occupancy out of a `thread/tokenUsage/updated` event.
@@ -9009,6 +9041,7 @@ fn codex_fork_context_usage(event: &Map<String, Value>) -> Option<CodexContextUs
     Some(CodexContextUsage {
         tokens_used,
         used_percentage: (tokens_used as f64 / context_window as f64) * 100.0,
+        context_window,
     })
 }
 
@@ -9334,6 +9367,10 @@ pub struct ContextUsageEvent {
     pub used_percentage: Option<f64>,
     #[serde(default)]
     pub total_input_tokens: Option<i64>,
+    #[serde(default)]
+    pub context_window_tokens: Option<i64>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     #[serde(default)]
     pub five_hour_percent: Option<f64>,
     #[serde(default)]
@@ -14698,6 +14735,8 @@ struct StateSnapshot {
     sessions: Vec<SessionRecord>,
     #[serde(default)]
     handoff_defaults: Option<Value>,
+    #[serde(skip)]
+    handoff_ticket_overrides: BTreeMap<String, crate::handoff::policy::HandoffOverride>,
     #[serde(default)]
     maintainer_session_id: Option<String>,
     #[serde(default)]
@@ -14733,6 +14772,7 @@ impl TryFrom<RawStateSnapshot> for StateSnapshot {
         }
         Ok(Self {
             sessions,
+            handoff_ticket_overrides: BTreeMap::new(),
             maintainer_session_id: raw.maintainer_session_id,
             handoff_defaults: raw.handoff_defaults,
             agent_registrations: raw.agent_registrations,
@@ -14776,7 +14816,12 @@ impl StateSnapshot {
             .map(|session| (session.id.clone(), handoff_session_ref(session)))
             .collect::<BTreeMap<_, _>>();
         for session in &mut self.sessions {
-            session.handoff_view = Some(handoff_view_for_record(session, &defaults, &session_refs));
+            session.handoff_view = Some(handoff_view_for_record(
+                session,
+                &defaults,
+                &session_refs,
+                self.handoff_ticket_overrides.get(&session.id),
+            ));
         }
 
         self.sessions
@@ -22061,6 +22106,7 @@ sleep 30
     fn snapshot_projects_aliases_and_pending_adoption_proposals() {
         let snapshot = StateSnapshot {
             handoff_defaults: None,
+            handoff_ticket_overrides: BTreeMap::new(),
             sessions: vec![
                 SessionRecord {
                     id: "em123456".to_owned(),
@@ -22125,6 +22171,7 @@ sleep 30
     fn snapshot_prunes_stopped_aliases_even_when_restorable() {
         let snapshot = StateSnapshot {
             handoff_defaults: None,
+            handoff_ticket_overrides: BTreeMap::new(),
             sessions: vec![
                 SessionRecord {
                     id: "dead001".to_owned(),
