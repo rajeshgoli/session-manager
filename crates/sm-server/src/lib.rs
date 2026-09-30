@@ -24,6 +24,7 @@ pub mod owner_docs;
 pub mod owner_inbox;
 pub mod owner_messages;
 pub mod owner_push;
+pub mod owner_settings;
 pub mod push_fcm;
 pub mod queue;
 pub mod queue_authority;

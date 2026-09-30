@@ -920,7 +920,7 @@ pub(super) async fn queue_job_start_check(
     let check = RetainedQueueStore::start_check_in_state_dir(
         &queue_state_dir,
         &job.id,
-        queue_admission_policy(&state.config),
+        queue_admission_policy(&state),
         |earlier| {
             crate::utilization::peak_running_rss(&utilization_db, earlier).unwrap_or_else(|error| {
                 eprintln!("start check could not read past runs: {error:#}");
@@ -967,7 +967,7 @@ pub(super) async fn force_start_queue_job(
         &message_queue_db_path,
         &job.id,
         state.config.queue_runner.cancel_grace_seconds,
-        queue_admission_policy(&state.config),
+        queue_admission_policy(&state),
     )?
     .ok_or(ApiError::NotFound("Queue job not found"))?;
     if !by_this_call {

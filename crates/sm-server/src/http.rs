@@ -333,6 +333,7 @@ mod history;
 mod inbox;
 mod merge_holds;
 mod messages;
+mod settings;
 mod watch;
 mod worktrees;
 pub use docs::{
@@ -506,6 +507,9 @@ pub struct AppState {
     /// FCM sender for owner follows; `None` when push is not configured
     /// (sm#1569), and follows then notify by email.
     push_sender: Option<Arc<dyn crate::owner_push::PushSender>>,
+    /// Queue admission with the owner's slot limits; `PUT /client/settings`
+    /// changes it and the queue runner reads it every pass (sm#1718).
+    queue_admission: crate::queue::SharedQueueAdmissionPolicy,
 }
 
 impl AppState {
@@ -609,6 +613,14 @@ impl AppState {
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
         let studio_ssh_enabled = studio_ssh::status(&config.external_access.studio_ssh).enabled;
+        let settings = session_store.owner_settings(None).unwrap_or_else(|error| {
+            eprintln!("owner settings unreadable, using config queue limits: {error:#}");
+            crate::owner_settings::defaults()
+        });
+        let queue_admission = crate::queue::set_live_queue_admission_policy(
+            &expand_home(&config.queue_runner_state_dir().to_string_lossy()),
+            crate::owner_settings::queue_admission_policy(&config, &settings),
+        );
         Ok(Self {
             config,
             session_store,
@@ -640,6 +652,7 @@ impl AppState {
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
             push_sender,
+            queue_admission,
         })
     }
 
@@ -1599,6 +1612,10 @@ pub fn router(state: AppState) -> Router {
         .route("/client/board", get(board::client_board))
         .route("/client/board/start", post(board::client_start))
         .route("/client/board/start-options", get(board::start_options))
+        .route(
+            "/client/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
         .route("/client/board/order", put(board::put_order))
         .route("/client/board/lanes", post(board::client_post_lane))
         .route(
@@ -7009,7 +7026,7 @@ async fn client_queue(
         .cloned()
         .collect();
     let (names, _) = queue_session_names(&state, true)?;
-    let policy = queue_admission_policy(&state.config);
+    let policy = queue_admission_policy(&state);
 
     let mut running: Vec<&QueueJobRecord> =
         active.iter().filter(|job| job.state == "running").collect();
@@ -7420,7 +7437,7 @@ async fn create_queue_job(
             &queue_state_dir,
             &message_queue_db_path,
             state.config.queue_runner.cancel_grace_seconds,
-            queue_admission_policy(&state.config),
+            queue_admission_policy(&state),
         )?;
         RetainedQueueStore::get_queue_job_from_path(
             &queue_state_dir.join("queue_runner.db"),
@@ -7510,7 +7527,7 @@ fn cancel_queue_job_inner(
         &message_queue_db_path,
         &job_id,
         state.config.queue_runner.cancel_grace_seconds,
-        queue_admission_policy(&state.config),
+        queue_admission_policy(state),
         state.config.rust_core.runtime_enabled,
         detail,
     )?
@@ -7545,24 +7562,11 @@ fn resolve_session_or_registry_role(
     Ok(state.session_store.get_session(&registration.session_id)?)
 }
 
-fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
-    QueueAdmissionPolicy {
-        max_running_jobs: config.queue_runner.max_running_jobs,
-        perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
-        tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
-        perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
-        background_max_concurrent: config.queue_runner.types.background.max_concurrent,
-        service_max_concurrent: config
-            .queue_runner
-            .types
-            .service
-            .as_ref()
-            .map_or(0, |service| service.max_concurrent),
-        memory_min_free_bytes: config.queue_runner.memory.min_free_bytes,
-        resource_retry_interval_seconds: config.queue_runner.memory.retry_interval_seconds,
-        process_reserve: config.queue_runner.processes.reserve,
-        job_process_limit: config.queue_runner.processes.job_max,
-    }
+fn queue_admission_policy(state: &AppState) -> QueueAdmissionPolicy {
+    *state
+        .queue_admission
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn reserved_human_names(config: &AppConfig) -> anyhow::Result<BTreeSet<String>> {
@@ -14313,6 +14317,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/board"
         || path == "/client/board/badge"
         || path == "/client/board/start-options"
+        || path == "/client/settings"
         || path == "/history"
         || path == "/history/agents"
         || path == "/guestbook"
@@ -15982,7 +15987,7 @@ fn queue_job_response_with_names(
         "gpu_percent": job.gpu_percent,
         "memory_bytes": job.memory_bytes,
         "state": job.state,
-        "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
+        "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(state)),
         "holding_reason": job.holding_reason,
         "owner_forced_at": job.owner_forced_at,
         "lane_rank": lane.as_ref().map(|lane| lane.rank),
@@ -22753,6 +22758,153 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             let (status, _) = browser_host_get(&app, "/client/board", Some(&token)).await;
             assert_eq!(status, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn owner_settings_seed_merge_validate_and_move_queue_limits() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.paths.state_file = write_session_state("settings-browser", "running");
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        config.queue_runner.types.background.max_concurrent = 2;
+        config.board.start_defaults = Some(crate::config::BoardStartDefaults {
+            provider: "claude".into(),
+            model: Some("opus".into()),
+            reasoning_effort: "high".into(),
+        });
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let put = |body: Value, origin: &str, agent: bool| {
+            let mut headers = vec![
+                ("cf-access-jwt-assertion", owner.as_str()),
+                ("origin", origin),
+            ];
+            if agent {
+                headers.push(("x-sm-session", "settings-browser"));
+            }
+            let request = handoff_json_request(
+                public_request_with_host(
+                    Method::PUT,
+                    "/client/settings",
+                    Body::from(body.to_string()),
+                    "sm.example.com",
+                ),
+                &headers,
+            );
+            let app = app.clone();
+            async move { response_json(app.oneshot(request).await.unwrap()).await }
+        };
+        let background_max = || {
+            let app = app.clone();
+            async move {
+                let (status, body) = response_json(
+                    app.oneshot(local_request(Method::GET, "/client/queue", Body::empty()))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body["slots"]["by_type"]["background"]["max"].clone()
+            }
+        };
+
+        // The first read seeds new_agent from board.start_defaults.
+        let (status, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["new_agent"]["provider"], "claude");
+        assert_eq!(
+            body["new_agent"]["claude"],
+            json!({"model": "opus", "effort": "high"})
+        );
+        assert_eq!(body["new_agent"]["name_pattern"], "{repo_short}-{number}");
+        assert_eq!(body["queue_limits"]["background"], Value::Null);
+        assert_eq!(background_max().await, 2);
+
+        // A partial PUT merges; null restores the default; the limit applies
+        // to the queue without a restart.
+        let (status, body) = put(
+            json!({"new_agent": {"claude": {"model": null}}, "queue_limits": {"background": 3}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["new_agent"]["claude"],
+            json!({"model": null, "effort": "high"})
+        );
+        assert_eq!(body["queue_limits"]["background"], 3);
+        assert_eq!(background_max().await, 3);
+        let (_, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
+        assert_eq!(body["queue_limits"]["background"], 3);
+
+        // A failed check is a 400 naming the field, and changes nothing.
+        let (status, body) = put(
+            json!({"queue_limits": {"background": 20}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["detail"],
+            "queue_limits.background must be an integer from 0 to 16, or null"
+        );
+        assert_eq!(background_max().await, 3);
+
+        // Other origins and agents cannot write; nobody unsigned can read.
+        for (origin, agent) in [
+            ("https://evil.example", false),
+            ("https://sm.example.com", true),
+        ] {
+            let (status, body) = put(json!({"queue_limits": null}), origin, agent).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{origin} {agent}: {body}");
+        }
+        let (status, _) = browser_host_get(&app, "/client/settings", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = put(
+            json!({"queue_limits": null}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(background_max().await, 2);
+    }
+
+    #[test]
+    fn start_options_render_name_and_brief_from_settings_and_leave_model_to_the_provider() {
+        let settings = crate::owner_settings::OwnerSettings::from_effective(
+            &crate::owner_settings::defaults(),
+        )
+        .unwrap()
+        .new_agent;
+        let options = board::start_options_json(
+            &settings,
+            crate::owner_settings::Ticket {
+                repo: "rajeshgoli/session-manager",
+                number: 1706,
+                title: "Board Start preselects Fable",
+                url: "https://github.com/rajeshgoli/session-manager/issues/1706",
+            },
+            "/Users/rajesh/projects/session-manager".into(),
+        );
+        assert_eq!(options["name"], "sm-1706");
+        assert!(options["brief"].as_str().unwrap().starts_with(
+            "Work ticket #1706 in rajeshgoli/session-manager: Board Start preselects Fable\n"
+        ));
+        assert_eq!(options["provider"], "claude");
+        assert_eq!(options["model"], Value::Null);
+        assert_eq!(options["reasoning_effort"], Value::Null);
+        assert_eq!(
+            options["working_dir"],
+            "/Users/rajesh/projects/session-manager"
+        );
     }
 
     #[tokio::test]

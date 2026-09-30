@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
     time::{Duration as StdDuration, Instant},
 };
@@ -3724,6 +3724,7 @@ fn admit_pending_queue_jobs_conn(
     let _admission_guard = QUEUE_ADMISSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let admission_policy = live_admission_policy(state_dir, admission_policy);
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
     // Validate before clearing any existing holds: after a restart, preserved
@@ -4105,6 +4106,48 @@ fn schedule_queue_admission_retry(
                 admission_policy,
             );
     });
+}
+
+/// An admission policy the owner can change without a restart (sm#1718).
+pub type SharedQueueAdmissionPolicy = Arc<RwLock<QueueAdmissionPolicy>>;
+
+fn live_admission_policies() -> &'static Mutex<BTreeMap<PathBuf, SharedQueueAdmissionPolicy>> {
+    static POLICIES: OnceLock<Mutex<BTreeMap<PathBuf, SharedQueueAdmissionPolicy>>> =
+        OnceLock::new();
+    POLICIES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Make `policy` the live policy of the queue in `state_dir`, and return the
+/// shared handle. Every admission pass on that queue reads the handle's
+/// current value in place of the policy its caller captured, so a writer
+/// changes admission from the next pass on.
+pub fn set_live_queue_admission_policy(
+    state_dir: &Path,
+    policy: QueueAdmissionPolicy,
+) -> SharedQueueAdmissionPolicy {
+    let mut policies = live_admission_policies()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let shared = policies
+        .entry(state_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(RwLock::new(policy)))
+        .clone();
+    *shared
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    shared
+}
+
+fn live_admission_policy(state_dir: &Path, captured: QueueAdmissionPolicy) -> QueueAdmissionPolicy {
+    live_admission_policies()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(state_dir)
+        .map_or(captured, |shared| {
+            *shared
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
 }
 
 fn queue_admission_retry_delay(delay_seconds: u64) -> StdDuration {
@@ -8939,6 +8982,83 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_raised_live_limit_starts_a_waiting_job_on_the_next_pass() {
+        let state_dir = unique_temp_path("live-queue-limit");
+        let message_queue_db = state_dir.join("messages.db");
+        let jobs: Vec<_> = (0..3)
+            .map(|index| pending_job(&state_dir, "background", &format!("job {index}")))
+            .collect();
+        let two = QueueAdmissionPolicy {
+            max_running_jobs: 8,
+            background_max_concurrent: 2,
+            ..QueueAdmissionPolicy::default()
+        };
+        let running = || {
+            jobs.iter()
+                .filter_map(|job| {
+                    RetainedQueueStore::get_queue_job_from_path(
+                        &state_dir.join("queue_runner.db"),
+                        &job.id,
+                    )
+                    .unwrap()
+                })
+                .filter(|job| job.state == "running")
+                .collect::<Vec<_>>()
+        };
+        set_live_queue_admission_policy(&state_dir, two);
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &message_queue_db,
+            0,
+            two,
+        )
+        .unwrap();
+        assert_eq!(running().len(), 2);
+
+        // The owner raises the limit. A pass whose caller captured the old
+        // policy (a completion monitor, a retry) still admits under the new one.
+        set_live_queue_admission_policy(
+            &state_dir,
+            QueueAdmissionPolicy {
+                background_max_concurrent: 3,
+                ..two
+            },
+        );
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &message_queue_db,
+            0,
+            two,
+        )
+        .unwrap();
+        let started = running();
+        assert_eq!(started.len(), 3);
+
+        // Lowering it again holds new starts but stops nothing.
+        set_live_queue_admission_policy(
+            &state_dir,
+            QueueAdmissionPolicy {
+                background_max_concurrent: 1,
+                ..two
+            },
+        );
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &message_queue_db,
+            0,
+            two,
+        )
+        .unwrap();
+        assert_eq!(running().len(), 3);
+        for job in started {
+            if let Some(pgid) = job.process_group_id {
+                terminate_process_group(pgid, true);
+            }
+        }
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

@@ -1,0 +1,76 @@
+//! Owner settings over HTTP (sm#1718, spec 1710 appendix D4):
+//! `GET /client/settings` and `PUT /client/settings`. The phone and the
+//! browser share them; a `PUT` that changes queue limits applies them from
+//! the queue's next admission pass (appendix D5).
+
+use super::*;
+
+pub(super) async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
+    let settings = tokio::task::spawn_blocking(move || {
+        state
+            .session_store
+            .owner_settings(state.config.board.start_defaults.as_ref())
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(settings))
+}
+
+pub(super) async fn put_settings(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "PUT", &uri, true)?;
+    ensure_core_writes_enabled(&state)?;
+    let settings = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
+        let settings = state
+            .session_store
+            .update_owner_settings(&body)?
+            .map_err(|detail| ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail,
+            })?;
+        apply_queue_limits(&state, &settings);
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(settings))
+}
+
+/// Rebuild the shared admission policy from `settings`, then run an
+/// admission pass so a raised limit starts waiting jobs now. Lowering a
+/// limit never stops a running job; it only holds new starts.
+fn apply_queue_limits(state: &AppState, settings: &Value) {
+    let policy = crate::owner_settings::queue_admission_policy(&state.config, settings);
+    let previous = std::mem::replace(
+        &mut *state
+            .queue_admission
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        policy,
+    );
+    if previous == policy || !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    if let Err(error) =
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &queue_state_dir,
+            &expand_home(&state.config.sm_send.db_path),
+            state.config.queue_runner.cancel_grace_seconds,
+            policy,
+        )
+    {
+        eprintln!("queue admission after a settings change failed: {error:#}");
+    }
+}

@@ -252,6 +252,28 @@ impl AppConfig {
         PathBuf::from(&self.queue_runner.state_dir)
     }
 
+    /// Queue admission as config sets it. Owner settings may lower or raise
+    /// the slot limits (`owner_settings::queue_admission_policy`).
+    pub fn queue_admission_policy(&self) -> crate::queue::QueueAdmissionPolicy {
+        let runner = &self.queue_runner;
+        crate::queue::QueueAdmissionPolicy {
+            max_running_jobs: runner.max_running_jobs,
+            perf_cooldown_seconds: runner.perf_cooldown_seconds,
+            tests_max_concurrent: runner.types.tests.max_concurrent,
+            perf_max_concurrent: runner.types.perf.max_concurrent,
+            background_max_concurrent: runner.types.background.max_concurrent,
+            service_max_concurrent: runner
+                .types
+                .service
+                .as_ref()
+                .map_or(0, |service| service.max_concurrent),
+            memory_min_free_bytes: runner.memory.min_free_bytes,
+            resource_retry_interval_seconds: runner.memory.retry_interval_seconds,
+            process_reserve: runner.processes.reserve,
+            job_process_limit: runner.processes.job_max,
+        }
+    }
+
     /// Redirect production-shaped durable paths below `root`. Explicit fixture
     /// paths outside the production state directory are retained, while every
     /// default AppState receives a unique state-file sibling and therefore a
@@ -1846,9 +1868,10 @@ pub struct BoardConfig {
     /// Where Start runs a new agent, per `owner/name`.
     #[serde(default)]
     pub checkouts: BTreeMap<String, String>,
-    /// What the Start sheet preselects.
+    /// Seeds owner settings' `new_agent` on first read when present
+    /// (sm#1718); owner settings are what Start fills in.
     #[serde(default)]
-    pub start_defaults: BoardStartDefaults,
+    pub start_defaults: Option<BoardStartDefaults>,
     /// Minutes a live holder idles, with nothing running or waited on,
     /// before its ticket's clock turns stalled (sm#1710, D7).
     #[serde(default = "default_board_stall_minutes")]
@@ -1881,7 +1904,7 @@ impl Default for BoardConfig {
             repos: Vec::new(),
             sync_interval_seconds: default_board_sync_interval_seconds(),
             checkouts: BTreeMap::new(),
-            start_defaults: BoardStartDefaults::default(),
+            start_defaults: None,
             stall_minutes: default_board_stall_minutes(),
         }
     }
