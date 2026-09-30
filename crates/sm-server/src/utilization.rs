@@ -164,6 +164,11 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             .optional()?;
         if exists.is_none() {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            if column == "queue_mem_bytes" {
+                // Older rows counted the file cache as used; blank them so
+                // charts never mix the two definitions.
+                conn.execute_batch("UPDATE host_samples SET mem_used_bytes = NULL")?;
+            }
         }
     }
     Ok(())
@@ -1508,7 +1513,8 @@ mod tests {
 
     #[test]
     fn schema_upgrade_adds_queue_columns_to_an_existing_db() {
-        let (_dir, path, conn) = temp_db();
+        let (_dir, path, mut conn) = temp_db();
+        write_sample(&mut conn, &host(500, Some(10.0), 10 * GIB, 1), &[]).unwrap();
         drop(conn);
         {
             let conn = Connection::open(&path).unwrap();
@@ -1537,6 +1543,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (GIB, 7));
+        let used: Vec<Option<i64>> = conn
+            .prepare("SELECT mem_used_bytes FROM host_samples ORDER BY sampled_at_ms")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            used,
+            vec![None, Some(100 * GIB)],
+            "old definition blanked once"
+        );
     }
 
     #[test]
