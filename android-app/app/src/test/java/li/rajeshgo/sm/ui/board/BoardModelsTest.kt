@@ -2,7 +2,11 @@ package li.rajeshgo.sm.ui.board
 
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.BoardResponse
+import li.rajeshgo.sm.data.model.BoardHolder
 import li.rajeshgo.sm.data.model.BoardTicket
+import li.rajeshgo.sm.data.model.QueueOverview
+import li.rajeshgo.sm.data.model.SessionJob
+import java.time.OffsetDateTime
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -103,5 +107,36 @@ class BoardModelsTest {
         assertEquals(3L, boardLaneForLink("https://sm.example.com/board#lane-3", "sm.example.com"))
         assertNull(boardLaneForLink("https://other.example.com/board#lane-3", "sm.example.com"))
         assertNull(boardLaneForLink("https://sm.example.com/history", "sm.example.com"))
+    }
+
+    /** 1844-engineer idle on 29 Sep: its one job 6th to start, 1854's two running. */
+    @Test fun agentQueueSummarisesRunningAndWaitingJobs() {
+        val now = OffsetDateTime.parse("2026-09-30T00:23:00Z")
+        val queue = QueueOverview(
+            running = listOf(
+                SessionJob(id = "a", requesterSessionId = "e1854", startedAt = "2026-09-29T22:50:00Z"),
+                SessionJob(id = "b", requesterSessionId = "e1854", startedAt = "2026-09-29T23:16:00Z"),
+            ),
+            queued = listOf(
+                SessionJob(id = "c", requesterSessionId = "e1854", queuedAt = "2026-09-29T22:02:00Z", position = 1),
+                SessionJob(id = "d", requesterSessionId = "e1844", queuedAt = "2026-09-29T22:54:00Z", position = 6),
+                // Jobs count for the agent they notify, as the Queue tab assigns them.
+                SessionJob(id = "e", requesterSessionId = "helper", notifySessionId = "e1844", queuedAt = "2026-09-29T23:30:00Z", position = 7),
+            ),
+        )
+        val idle = agentQueue(queue, "e1844", now)!!
+        assertEquals("queue: 2 waiting 1h 29m, #6 to start", agentQueueText(idle))
+        assertEquals("queue: 2 running 1h 33m · 1 waiting 2h 21m, #1 to start", agentQueueText(agentQueue(queue, "e1854", now)!!))
+        assertNull(agentQueue(queue, "nobody", now))
+        assertNull(agentQueue(null, "e1844", now))
+
+        val lane = board.lanes.single().copy(
+            tickets = listOf(
+                BoardTicket(number = 1844, holder = BoardHolder(sessionId = "e1844")),
+                BoardTicket(number = 1854, holder = BoardHolder(sessionId = "e1854")),
+            ),
+        )
+        assertEquals("Queue: 2 running · 3 waiting", laneQueueLine(lane, queue))
+        assertNull(laneQueueLine(board.lanes.single().copy(tickets = emptyList()), queue))
     }
 }

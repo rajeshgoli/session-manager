@@ -76,6 +76,7 @@ import li.rajeshgo.sm.data.model.BoardRef
 import li.rajeshgo.sm.data.model.BoardResponse
 import li.rajeshgo.sm.data.model.BoardStartRequest
 import li.rajeshgo.sm.data.model.BoardTicket
+import li.rajeshgo.sm.data.model.QueueOverview
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
@@ -83,6 +84,7 @@ import li.rajeshgo.sm.ui.navigation.AppMenuActions
 import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.queue.rememberResumed
+import li.rajeshgo.sm.ui.queue.secondsBetween
 import li.rajeshgo.sm.ui.queue.shortDuration
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
@@ -142,6 +144,52 @@ fun laneCountsLine(lane: BoardLane): String {
     parts += "${c.blocked} blocked"
     if (lane.longestChain.isNotEmpty()) parts += "chain ${lane.longestChain.size}"
     return parts.joinToString(" · ")
+}
+
+/** An agent's queue jobs: what runs and what waits, with the longest times. */
+data class AgentQueue(
+    val running: Int,
+    val longestRunSeconds: Long,
+    val waiting: Int,
+    val oldestWaitSeconds: Long,
+    /** Start-order position of the agent's next waiting job, as the Queue tab numbers it. */
+    val nextPosition: Int?,
+)
+
+/** The jobs [sessionId] waits on, as the Queue tab assigns them; null when it has none. */
+fun agentQueue(overview: QueueOverview?, sessionId: String, now: OffsetDateTime): AgentQueue? {
+    if (overview == null || sessionId.isBlank()) return null
+    val running = overview.running.filter { it.isAwaitedBy(sessionId) }
+    val waiting = overview.queued.filter { it.isAwaitedBy(sessionId) }
+    if (running.isEmpty() && waiting.isEmpty()) return null
+    return AgentQueue(
+        running = running.size,
+        longestRunSeconds = running.mapNotNull { secondsBetween(it.startedAt, now) }.maxOrNull() ?: 0,
+        waiting = waiting.size,
+        oldestWaitSeconds = waiting.mapNotNull { secondsBetween(it.queuedAt, now) }.maxOrNull() ?: 0,
+        nextPosition = waiting.mapNotNull { it.position }.minOrNull(),
+    )
+}
+
+/** "queue: 1 running 1h33m · 1 waiting 1h29m, #6 to start". */
+fun agentQueueText(queue: AgentQueue): String {
+    val parts = mutableListOf<String>()
+    if (queue.running > 0) parts += "${queue.running} running ${shortDuration(queue.longestRunSeconds)}"
+    if (queue.waiting > 0) {
+        parts += "${queue.waiting} waiting ${shortDuration(queue.oldestWaitSeconds)}" +
+            (queue.nextPosition?.let { ", #$it to start" } ?: "")
+    }
+    return "queue: " + parts.joinToString(" · ")
+}
+
+/** The lane's jobs across its agents: "Queue: 4 running · 6 waiting", or null when none. */
+fun laneQueueLine(lane: BoardLane, overview: QueueOverview?): String? {
+    if (overview == null) return null
+    val holders = lane.tickets.mapNotNull { it.holder?.sessionId?.takeIf(String::isNotBlank) }.toSet()
+    val running = overview.running.count { job -> holders.any(job::isAwaitedBy) }
+    val waiting = overview.queued.count { job -> holders.any(job::isAwaitedBy) }
+    if (running == 0 && waiting == 0) return null
+    return "Queue: $running running · $waiting waiting"
 }
 
 /** When sm last read GitHub: the newest successful read over every repo. */
@@ -215,6 +263,9 @@ fun BoardScreen(
             }
         },
         onShowLane = { laneId -> showLane(laneId).takeIf { it >= 0 }?.let { scrollTo = it } },
+        onOpenQueue = onNavigateToQueue,
+        queue = state.queue,
+        now = now,
     )
 
     Box(
@@ -397,6 +448,10 @@ private class BoardRowActions(
     val onOpenAgent: (BoardTicket) -> Unit,
     val onOpenNeedsYou: (BoardTicket) -> Unit,
     val onShowLane: (Long) -> Unit,
+    val onOpenQueue: () -> Unit,
+    /** The queue as last read, for each agent's jobs; null until the first read. */
+    val queue: QueueOverview?,
+    val now: OffsetDateTime,
 )
 
 @Composable
@@ -421,7 +476,7 @@ private fun LaneCard(
         Row(Modifier.height(IntrinsicSize.Min)) {
             if (lane.unseen) Box(Modifier.width(4.dp).fillMaxHeight().background(Orange))
             Column(Modifier.weight(1f).padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp)) {
-                LaneHeader(lane, canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd)
+                LaneHeader(lane, laneQueueLine(lane, actions.queue), canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd, actions.onOpenQueue)
                 if (expanded) LaneBody(lane, actions)
             }
         }
@@ -431,12 +486,14 @@ private fun LaneCard(
 @Composable
 private fun LaneHeader(
     lane: BoardLane,
+    queueLine: String?,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     busy: Boolean,
     onToggle: () -> Unit,
     onMove: (Int) -> Unit,
     onEnd: () -> Unit,
+    onOpenQueue: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.Top) {
@@ -468,6 +525,14 @@ private fun LaneHeader(
                     color = if (lane.counts.needsYou > 0) Amber else TextSecondary,
                     modifier = Modifier.padding(top = 2.dp),
                 )
+                queueLine?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Cyan,
+                        modifier = Modifier.padding(top = 2.dp).clickable(onClick = onOpenQueue),
+                    )
+                }
                 if (lane.stale) Text("stale — GitHub reads are failing", style = MaterialTheme.typography.labelSmall, color = Amber)
             }
         }
@@ -673,6 +738,10 @@ private fun ticketDetails(
             "${holder.name} (${holder.state})",
             if (holder.state == "stopped") Rose else TextSecondary,
         ) { actions.onOpenAgent(ticket) }
+        agentQueue(actions.queue, holder.sessionId, actions.now)?.let { queue ->
+            // Waiting with nothing running is what leaves an agent idle.
+            details += Detail(agentQueueText(queue), if (queue.running == 0) Amber else Cyan, actions.onOpenQueue)
+        }
     }
     val waiting = ticket.waitsOn.filter { it.state != "done" }
     if (waiting.isNotEmpty()) {

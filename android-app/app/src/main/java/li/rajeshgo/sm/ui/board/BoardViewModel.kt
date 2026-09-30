@@ -89,6 +89,8 @@ data class BoardUiState(
     /** A lane move, add or end in flight. */
     val busy: Boolean = false,
     val start: BoardStartState? = null,
+    /** The queue, read with the board, so rows can show each agent's jobs. */
+    val queue: li.rajeshgo.sm.data.model.QueueOverview? = null,
 )
 
 class BoardViewModel(application: Application) : AndroidViewModel(application) {
@@ -151,6 +153,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun load(url: String, token: String) {
+        // Best effort: the rows keep the last queue if this read fails.
+        runCatching { repository.fetchQueue(url, token) }
+            .onSuccess { queue -> _uiState.update { it.copy(queue = queue) } }
+            .onFailure { if (it is CancellationException) throw it }
         runCatching { repository.fetchBoard(url, token) }
             .onSuccess { board -> show(board) }
             .onFailure { error ->
