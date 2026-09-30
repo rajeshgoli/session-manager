@@ -25,7 +25,7 @@ export function TerminalPage({ id, open }) {
     const fit = new window.FitAddon.FitAddon();
     terminal.loadAddon(fit);
     terminal.open(host.current);
-    let socket = null, stopped = false, live = false, timer = null, retries = 0;
+    let socket = null, stopped = false, live = false, timer = null, handshakeTimer = null, retries = 0;
     const send = (frame) => {
       if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
     };
@@ -48,6 +48,13 @@ export function TerminalPage({ id, open }) {
     const retry = () => {
       if (stopped) return;
       live = false;
+      // A failed TLS handshake can trigger another Keychain prompt on every
+      // attempt. Stop after three retries; the user can explicitly reconnect.
+      if (retries >= 3) {
+        setConnection('Ended');
+        setError('Terminal connection failed. Check any sign-in or Keychain prompt. If device certificates were just enabled, quit and reopen your browser; otherwise choose Reconnect.');
+        return;
+      }
       setConnection('Reconnecting');
       timer = setTimeout(connect, Math.min(10000, 500 * 2 ** Math.min(retries++, 5)));
     };
@@ -62,8 +69,17 @@ export function TerminalPage({ id, open }) {
         const ws = new WebSocket(url);
         socket = ws;
         let ended = false;
+        // A pending Keychain dialog may never produce onclose. Stop this
+        // attempt without another automatic signing request after 30 seconds.
+        handshakeTimer = setTimeout(() => {
+          if (stopped || socket !== ws || live) return;
+          ended = true; socket = null;
+          setConnection('Ended');
+          setError('Terminal connection timed out. Check any sign-in or Keychain prompt. If device certificates were just enabled, quit and reopen your browser; otherwise choose Reconnect.');
+          ws.close();
+        }, 30000);
         ws.onopen = () => {
-          if (stopped) { ws.close(); return; }
+          if (stopped || socket !== ws) { ws.close(); return; }
           terminal.reset();
           send({ type: 'auth', ticket_id: ticket.ticket_id, ticket_secret: ticket.ticket_secret, output_ack: true });
           resize();
@@ -73,6 +89,7 @@ export function TerminalPage({ id, open }) {
           let frame;
           try { frame = JSON.parse(event.data); } catch { return; }
           if (frame.type === 'status' && frame.state === 'attached') {
+            clearTimeout(handshakeTimer);
             live = true; retries = 0; setConnection('Live'); terminal.focus();
           } else if (frame.type === 'output') {
             const bytes = Uint8Array.from(atob(frame.data), (c) => c.charCodeAt(0));
@@ -80,6 +97,7 @@ export function TerminalPage({ id, open }) {
               if (!stopped && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'output_ack', sequence: frame.sequence }));
             });
           } else if (frame.type === 'exit' || frame.type === 'error') {
+            clearTimeout(handshakeTimer);
             ended = true; live = false; setConnection('Ended');
             setError(frame.message || frame.reason || '');
             ws.close();
@@ -87,6 +105,7 @@ export function TerminalPage({ id, open }) {
         };
         ws.onclose = (event) => {
           if (stopped || socket !== ws) return;
+          clearTimeout(handshakeTimer);
           live = false;
           if (ended || event.code === 1000 || event.code === 1008) setConnection('Ended');
           else retry();
@@ -109,7 +128,7 @@ export function TerminalPage({ id, open }) {
     const observer = new ResizeObserver(resize);
     observer.observe(host.current);
     const detach = () => { live = false; send({ type: 'detach' }); if (socket) socket.close(); };
-    const pagehide = () => { stopped = true; clearTimeout(timer); detach(); };
+    const pagehide = () => { stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); detach(); };
     const pageshow = (event) => { if (event.persisted) setAttempt((n) => n + 1); };
     window.addEventListener('pagehide', pagehide);
     window.addEventListener('pageshow', pageshow);
@@ -117,7 +136,7 @@ export function TerminalPage({ id, open }) {
     resize();
     connect();
     return () => {
-      stopped = true; clearTimeout(timer); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
+      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
   }, [id, attempt]);

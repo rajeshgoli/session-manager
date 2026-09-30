@@ -321,9 +321,41 @@ sm all
 | `sm watch` | Agent dashboard with queue ages, hold reasons, and live job logs |
 | `sm review` | Run local synchronous PR review flows |
 | `sm request-codex-review` | Request async Codex review tracking |
+| `sm device enroll <name>` | Enroll a Mac certificate for Chrome sign-in |
+| `sm device repair-key-access <name>` | Repair Chrome signing access and the prompt name for an existing Mac key |
 | `sm enroll-device` | Enroll an Android app device certificate |
 | `sm list-devices` | List enrolled mobile devices |
 | `sm remove-device <id>` | Revoke an enrolled mobile device |
+
+### Mac browser certificate setup
+
+Browser device certificates are opt-in (`cloudflare_access.browser.device_policy`,
+false by default). Before enabling them, turn **HTTP/3 off** for the Cloudflare
+zone under Speed → Settings → Protocol Optimization. This is a zone-wide
+performance setting; HTTPS and HTTP/2 remain enabled. The configured Cloudflare
+API token also needs **Zone Settings Read** permission so enrollment can verify
+that prerequisite before adding the browser hostname to the certificate authority.
+Retain the existing email Access policy as the fallback.
+
+Run `sm device enroll <name>` on each Mac, then **quit Chrome completely and reopen
+it**. Reloading a tab can retain an older connection and leave terminals unable
+to connect. A fresh Incognito session can be used for verification: Settings →
+Devices & access should show the certificate name, and a terminal must reach Live.
+Verify email-based access as well before treating a rollout as complete.
+
+For a previously enrolled key whose prompt says `<key>` or repeatedly requests
+Chrome signing permission, run `sm device repair-key-access <name>`. Authorize the
+macOS permission-change dialog locally. This repairs only the existing key's
+signing access entries and display description; it preserves its key material,
+certificate, unrelated permissions, and non-exportability. New enrollments name
+the signing prompt and trust the installed Chrome from key creation.
+
+If the rollout fails, disable browser enrollment in the installed config, remove
+only the browser hostname from the Cloudflare client-certificate authority's
+hostname associations, and restart with `scripts/restart-rust-server.sh` if the
+config changed. Keep the phone hostname and existing Access policies. Remove the
+browser association **before** re-enabling HTTP/3. Merely disabling enrollment
+in the config does not remove an already-established Cloudflare association.
 
 Message delivery modes:
 

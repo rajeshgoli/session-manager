@@ -56,7 +56,7 @@ export function DevicesList() {
       </li>`)}</ul>
       <div class="device-enroll"><h3>Add a computer</h3>
         <p>On that computer, run <code>sm device enroll ${'<name>'}</code>, using a unique name such as <code>macbook</code> or <code>studio</code>.
-          Open the address printed by the command in Chrome. Email sign-in remains available.</p></div>
+          Quit Chrome completely and reopen it, then open the address printed by the command. Email sign-in remains available.</p></div>
     `}
   </section>`;
 }
