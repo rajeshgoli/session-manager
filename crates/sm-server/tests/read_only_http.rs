@@ -135,7 +135,9 @@ async fn delete_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCod
 
 async fn wait_for_queue_job_state(app: axum::Router, job_id: &str, states: &[&str]) -> Value {
     let mut last = Value::Null;
-    for _ in 0..80 {
+    // Generous deadline: a loaded machine can take many seconds to spawn a job.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let (status, payload) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
         assert_eq!(status, StatusCode::OK);
         if payload["state"]
@@ -151,6 +153,16 @@ async fn wait_for_queue_job_state(app: axum::Router, job_id: &str, states: &[&st
         "queue job {job_id} did not reach one of {states:?}; last state={} holding_reason={}",
         last["state"], last["holding_reason"]
     );
+}
+
+/// Queue job script that blocks until the test creates `gate` in the job's cwd,
+/// so a job stays running for exactly as long as the test needs.
+fn gated_script(gate: &str, body: &str) -> String {
+    format!("while [ ! -e {gate} ]; do sleep 0.05; done; {body}")
+}
+
+fn release_gate(working_dir: &Path, gate: &str) {
+    fs::write(working_dir.join(gate), "").unwrap();
 }
 
 fn queued_message_texts(db_path: &PathBuf, target_session_id: &str) -> Vec<String> {
@@ -5619,11 +5631,11 @@ async fn queue_job_runtime_respects_configured_max_running_jobs() {
         json!({
             "type": "tests",
             "label": "configured cap first",
-            "script": "printf first-start; sleep 1; printf first-end",
+            "script": gated_script("first.release", "printf first-end"),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 5
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -5651,6 +5663,7 @@ async fn queue_job_runtime_respects_configured_max_running_jobs() {
     assert_eq!(second["state"], "pending");
     assert_eq!(second["holding_reason"], "concurrency_cap");
 
+    release_gate(&working_dir, "first.release");
     let first_final = wait_for_queue_job_state(app.clone(), &first_id, &["succeeded"]).await;
     assert_eq!(first_final["exit_code"], 0);
     let second_final = wait_for_queue_job_state(app, &second_id, &["succeeded"]).await;
@@ -5683,7 +5696,7 @@ async fn queue_job_runtime_applies_configured_type_cap_and_default_timeout() {
     };
     config.queue_runner.types.tests = QueueRunnerTypeConfig {
         max_concurrent: 1,
-        default_timeout_seconds: 7,
+        default_timeout_seconds: 60,
     };
     config.rust_core.runtime_enabled = true;
     let app = router(AppState::new(config));
@@ -5694,7 +5707,7 @@ async fn queue_job_runtime_applies_configured_type_cap_and_default_timeout() {
         json!({
             "type": "tests",
             "label": "configured type first",
-            "script": "sleep 1; printf first",
+            "script": gated_script("first.release", "printf first"),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345"
@@ -5702,7 +5715,7 @@ async fn queue_job_runtime_applies_configured_type_cap_and_default_timeout() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(first["timeout_seconds"], 7);
+    assert_eq!(first["timeout_seconds"], 60);
     let first_id = first["id"].as_str().unwrap().to_owned();
     wait_for_queue_job_state(app.clone(), &first_id, &["running"]).await;
 
@@ -5720,11 +5733,12 @@ async fn queue_job_runtime_applies_configured_type_cap_and_default_timeout() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(second["timeout_seconds"], 7);
+    assert_eq!(second["timeout_seconds"], 60);
     assert_eq!(second["state"], "pending");
     assert_eq!(second["holding_reason"], "concurrency_cap");
 
     let second_id = second["id"].as_str().unwrap().to_owned();
+    release_gate(&working_dir, "first.release");
     wait_for_queue_job_state(app.clone(), &first_id, &["succeeded"]).await;
     wait_for_queue_job_state(app, &second_id, &["succeeded"]).await;
 }
@@ -6268,7 +6282,7 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 10
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -6280,11 +6294,11 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
         json!({
             "type": "background",
             "label": "second background",
-            "script": "printf second-start; sleep 2; printf second-end",
+            "script": gated_script("second.release", "printf second-end"),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 10
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -6559,11 +6573,22 @@ async fn queue_runtime_recovery_retries_perf_after_cooldown_expires() {
         5,
     )
     .await;
+    let perf_id = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "perf",
+        "perf after cooldown",
+        "printf perf-after-cooldown",
+        5,
+    )
+    .await;
+    // Backdate the seed just before admission, leaving 5 s of the 30 s cooldown,
+    // so a slow machine still sees the hold before it expires.
     let now = time::OffsetDateTime::now_utc();
-    let started_at = (now - time::Duration::seconds(29))
+    let started_at = (now - time::Duration::seconds(26))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
-    let finished_at = (now - time::Duration::seconds(28))
+    let finished_at = (now - time::Duration::seconds(25))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     mark_queue_job_terminal(
@@ -6574,15 +6599,6 @@ async fn queue_runtime_recovery_retries_perf_after_cooldown_expires() {
         &finished_at,
         0,
     );
-    let perf_id = create_pending_queue_job_of_type(
-        app.clone(),
-        &working_dir,
-        "perf",
-        "perf after cooldown",
-        "printf perf-after-cooldown",
-        5,
-    )
-    .await;
 
     RetainedQueueStore::admit_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
         .unwrap();
@@ -7907,11 +7923,11 @@ async fn queue_job_cancel_admits_next_pending_job() {
         json!({
             "type": "tests",
             "label": "cancel admits first",
-            "script": "printf first-start; sleep 2; printf first-end",
+            "script": gated_script("first.release", "printf first-end"),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 10
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -7923,11 +7939,11 @@ async fn queue_job_cancel_admits_next_pending_job() {
         json!({
             "type": "tests",
             "label": "cancel admits second",
-            "script": "printf second-start; sleep 2; printf second-end",
+            "script": gated_script("second.release", "printf second-end"),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 10
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -7967,6 +7983,7 @@ async fn queue_job_cancel_admits_next_pending_job() {
         fs::read_to_string(queue_state_dir.join(format!("logs/{third_id}.log"))).unwrap(),
         "third-started"
     );
+    release_gate(&working_dir, "second.release");
     let second_final = wait_for_queue_job_state(app, &second_id, &["succeeded"]).await;
     assert_eq!(second_final["exit_code"], 0);
     assert!(queue_job_completion_notified_at(&queue_state_dir, &first_id).is_some());
