@@ -222,6 +222,7 @@ pub struct QueueAdmissionPolicy {
     pub perf_max_concurrent: usize,
     pub background_max_concurrent: usize,
     pub service_max_concurrent: usize,
+    pub review_max_concurrent: usize,
     pub memory_min_free_bytes: i64,
     pub resource_retry_interval_seconds: u64,
     /// Process slots below the user's ceiling that queue jobs may not take (#1516).
@@ -239,6 +240,7 @@ impl Default for QueueAdmissionPolicy {
             perf_max_concurrent: 1,
             background_max_concurrent: 2,
             service_max_concurrent: 0,
+            review_max_concurrent: 4,
             memory_min_free_bytes: 8 * 1024 * 1024 * 1024,
             resource_retry_interval_seconds: 10,
             process_reserve: 1024,
@@ -265,6 +267,7 @@ pub struct QueueRecoverySummary {
 
 #[derive(Debug, Clone)]
 struct QueueJobRuntimeRecord {
+    owner: Option<String>,
     id: String,
     label: String,
     job_type: String,
@@ -674,6 +677,32 @@ impl RetainedQueueStore {
         Ok(())
     }
 
+    pub fn initialize_review_chain(db_path: &Path, id: &str, chain: &[JsonValue]) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET chain_json=?2, step_state='ready', reviewer_label=?3 WHERE id=?1 AND is_active=1",params![id,serde_json::to_string(chain)?,crate::review::label(&chain[0])])?;
+        Ok(())
+    }
+
+    pub fn attach_review_job(
+        db_path: &Path,
+        id: &str,
+        index: i64,
+        job: &QueueJobRecord,
+    ) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET run_job_id=?3,step_state=?4 WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,job.id,match job.state.as_str() {"running" => "running", "pending" => "queued", _ => "finished"}])?;
+        Ok(())
+    }
+
+    pub fn record_review_findings(db_path: &Path, id: &str, findings: &JsonValue) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            "UPDATE codex_review_request_registrations SET findings_json=?2 WHERE id=?1",
+            params![id, findings.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_github_review_step_in_path(
         db_path: &Path,
         request_id: &str,
@@ -747,7 +776,16 @@ impl RetainedQueueStore {
                 .step_started_at
                 .as_deref()
                 .unwrap_or(&registration.requested_at);
-            let log = serde_json::json!([{"index": 0, "label": "GitHub Codex", "started_at": started_at, "ended_at": now, "outcome": "failed", "reason": reason}]);
+            let mut log: Vec<JsonValue> =
+                serde_json::from_str(registration.steps_log_json.as_deref().unwrap_or("[]"))?;
+            log.push(serde_json::json!({"index":registration.step_index,"label":registration.reviewer_label,"started_at":started_at,"ended_at":now,"outcome":"failed","reason":reason}));
+            let log = serde_json::json!(log);
+            let chain: Vec<JsonValue> =
+                serde_json::from_str(registration.chain_json.as_deref().unwrap_or("[]"))?;
+            if let Some(step) = chain.get((registration.step_index + 1) as usize) {
+                conn.execute("UPDATE codex_review_request_registrations SET steps_log_json=?2, step_index=step_index+1, step_state='ready', step_started_at=?3, step_failures=0, run_job_id=NULL, reviewer_label=?4, last_error=?5 WHERE id=?1 AND is_active=1",params![request_id,log.to_string(),now,crate::review::label(step),reason])?;
+                return Ok(None);
+            }
             conn.execute("UPDATE codex_review_request_registrations SET steps_log_json = ?2, step_state = 'finished', state = 'no_reviewer', is_active = 0, last_polled_at = ?3, last_error = ?4, next_retry_at = NULL WHERE id = ?1 AND is_active = 1", params![request_id, log.to_string(), now, reason])?;
             let finished = get_codex_review_request_conn(&conn, request_id)?
                 .ok_or_else(|| anyhow::anyhow!("finished review request disappeared"))?;
@@ -1427,6 +1465,54 @@ impl RetainedQueueStore {
                     .join(", ")
             ),
         }
+    }
+
+    /// Creates an application-owned job atomically. Owner callbacks replace
+    /// agent wakes; the owner reconciles persisted terminal jobs after restart.
+    pub fn create_owned_queue_job(
+        state_dir: &Path,
+        request: CreateQueueJob,
+        owner: &str,
+    ) -> Result<QueueJobRecord> {
+        std::fs::create_dir_all(state_dir)?;
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+        init_queue_jobs_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut request = request;
+            request.notify_session_id.clear();
+            let job = create_queue_job_conn(&conn, state_dir, request, 0)?;
+            conn.execute(
+                "UPDATE queue_jobs SET owner=?2 WHERE id=?1",
+                params![job.id, owner],
+            )?;
+            Ok(job)
+        })();
+        match result {
+            Ok(job) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(job)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn owned_queue_job(state_dir: &Path, owner: &str) -> Result<Option<QueueJobRecord>> {
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+        init_queue_jobs_schema(&conn)?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM queue_jobs WHERE owner=?1 ORDER BY queued_at DESC LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| get_queue_job_conn(&conn, &id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn create_queue_job_in_state_dir(
@@ -3624,6 +3710,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "queue_jobs", "completion_notified_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "owner", "TEXT")?;
     ensure_column(conn, "queue_jobs", "cpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "gpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
@@ -3928,7 +4015,7 @@ fn get_queue_job_runtime_conn(
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets
+               rank_tickets, owner
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3945,6 +4032,7 @@ fn get_queue_job_runtime_conn(
     statement
         .query_row(params![job_id], |row| {
             Ok(QueueJobRuntimeRecord {
+                owner: row.get(27)?,
                 id: row.get(0)?,
                 job_type: row.get(1)?,
                 state: row.get(2)?,
@@ -3988,7 +4076,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets
+               rank_tickets, owner
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3996,6 +4084,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
     let rows = statement
         .query_map([], |row| {
             Ok(QueueJobRuntimeRecord {
+                owner: row.get(27)?,
                 id: row.get(0)?,
                 job_type: row.get(1)?,
                 state: row.get(2)?,
@@ -4115,7 +4204,7 @@ fn admit_pending_queue_jobs_conn(
         let perf_waiting_for_quiet_window =
             ready_perf.is_some() && !perf_blocked_by_tests_after_perf(&jobs);
         if perf_waiting_for_quiet_window {
-            if running_queue_job_count(&jobs, Some("tests")) > 0 {
+            if perf_has_finite_blockers(&jobs) {
                 summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
                 break;
             }
@@ -4139,10 +4228,6 @@ fn admit_pending_queue_jobs_conn(
             )?
         {
             continue;
-        }
-        if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
-            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "concurrency_cap")?;
-            break;
         }
         let Some(candidate_id) =
             next_admissible_queue_job_id_conn(conn, &jobs, admission_policy, &mut summary)?
@@ -4236,6 +4321,9 @@ fn schedule_pending_queue_deadline_retry(
 }
 
 fn queue_job_wait_remaining_seconds(job: &QueueJobRuntimeRecord) -> Option<i64> {
+    if job.job_type == "review" {
+        return None;
+    }
     let elapsed = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())?;
     Some(job.max_wait_seconds.saturating_sub(elapsed))
 }
@@ -4298,7 +4386,8 @@ fn concurrency_cap_wait_detail(
     jobs: &[QueueJobRuntimeRecord],
     admission_policy: QueueAdmissionPolicy,
 ) -> JsonValue {
-    let global = running_queue_job_count(jobs, None) as i64 >= admission_policy.max_running_jobs;
+    let global = job.job_type != "review"
+        && running_queue_job_count(jobs, None) as i64 >= admission_policy.max_running_jobs;
     let summary = |other: &QueueJobRuntimeRecord| serde_json::json!({"id": other.id, "label": other.label, "type": other.job_type});
     let running = jobs
         .iter()
@@ -4554,7 +4643,7 @@ fn release_queue_admission_retry(state_dir: &Path) {
 const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
 const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
 pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
-const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
+const QUEUE_JOB_TYPE_ORDER: [&str; 5] = ["perf", "review", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pending job ids in the order admission examines them: perf, tests,
@@ -4745,8 +4834,10 @@ fn next_admissible_queue_job_id_conn(
         let Some(oldest) = oldest_pending_queue_job(jobs, job_type) else {
             continue;
         };
-        if running_queue_job_count(jobs, Some(job_type))
-            >= admission_policy.max_concurrent_jobs(job_type)
+        if (job_type != "review"
+            && running_queue_job_count(jobs, None) as i64 >= admission_policy.max_running_jobs)
+            || running_queue_job_count(jobs, Some(job_type))
+                >= admission_policy.max_concurrent_jobs(job_type)
         {
             // Hold every queued job of the type, not only the oldest: an
             // unmarked job reports no reason and expires as not_admitted (sm#1600).
@@ -4921,6 +5012,11 @@ fn parse_linux_meminfo(text: &str) -> Option<(i64, i64)> {
     ))
 }
 
+fn perf_has_finite_blockers(jobs: &[QueueJobRuntimeRecord]) -> bool {
+    jobs.iter()
+        .any(|job| job.state == "running" && matches!(job.job_type.as_str(), "tests" | "review"))
+}
+
 fn displace_background_for_perf_conn(
     conn: &Connection,
     jobs: &[QueueJobRuntimeRecord],
@@ -4937,7 +5033,7 @@ fn displace_background_for_perf_conn(
     if perf_cooldown_active(jobs, admission_policy) || perf_blocked_by_tests_after_perf(jobs) {
         return Ok(false);
     }
-    if running_queue_job_count(jobs, Some("tests")) > 0 {
+    if perf_has_finite_blockers(jobs) {
         return Ok(false);
     }
     let Some(background) = jobs
@@ -5036,7 +5132,7 @@ fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str
             job.state == "running"
                 && match job_type {
                     Some(expected) => job.job_type == expected,
-                    None => true,
+                    None => job.job_type != "review",
                 }
         })
         .count()
@@ -5049,6 +5145,7 @@ impl QueueAdmissionPolicy {
             "perf" => self.perf_max_concurrent,
             "background" => self.background_max_concurrent,
             "service" => self.service_max_concurrent,
+            "review" => self.review_max_concurrent,
             _ => 1,
         }
     }
@@ -6735,6 +6832,13 @@ fn record_queue_job_completion_notification_conn(
     Ok(changed == 1)
 }
 
+/// Application owners re-read their durable jobs when notified. The durable
+/// terminal row is the recovery mechanism if no listener is present.
+pub fn owned_job_terminal_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
 fn queue_job_completion_notified_at(
     job: &QueueJobRuntimeRecord,
     state: &str,
@@ -6745,6 +6849,10 @@ fn queue_job_completion_notified_at(
 ) -> Result<Option<String>> {
     if job.completion_notified_at.is_some() {
         return Ok(None);
+    }
+    if job.owner.is_some() {
+        owned_job_terminal_notify().notify_waiters();
+        return Ok(Some(now_rfc3339()));
     }
     let Some(target_session_id) = job
         .notify_session_id
@@ -6857,7 +6965,7 @@ fn queue_start_check(
     let mut warnings = Vec::new();
     if job.state == "pending" {
         let running = running_queue_job_count(jobs, None);
-        if running as i64 >= policy.max_running_jobs {
+        if job.job_type != "review" && running as i64 >= policy.max_running_jobs {
             warnings.push(format!(
                 "All {} job slots are in use ({running} running).",
                 policy.max_running_jobs
@@ -6877,7 +6985,10 @@ fn queue_start_check(
             ));
         }
         if job.job_type == "perf" {
-            if running_queue_job_count(jobs, Some("tests")) > 0 {
+            if running_queue_job_count(jobs, Some("tests"))
+                + running_queue_job_count(jobs, Some("review"))
+                > 0
+            {
                 warnings.push(
                     "Tests are running; perf jobs normally wait for a quiet machine.".to_owned(),
                 );
@@ -7015,7 +7126,7 @@ pub fn queue_hold_explanation(
             format!("The scheduler is enforcing the {}-second performance cooldown between runs. Admission retries automatically when the cooldown ends.", policy.perf_cooldown_seconds),
         ),
         "concurrency_cap" => {
-            let global = running.len() as i64 >= policy.max_running_jobs;
+            let global = job.job_type != "review" && running.iter().filter(|j|j.job_type != "review").count() as i64 >= policy.max_running_jobs;
             blockers = running.iter().copied().filter(|j| global || j.job_type == job.job_type).collect();
             let limit = if global { format!("global limit of {} running jobs", policy.max_running_jobs) }
                 else { format!("{} limit of {} running jobs", job.job_type, policy.max_concurrent_jobs(&job.job_type)) };
@@ -9955,6 +10066,7 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            owner: None,
             label: "ceiling".into(),
             id: "job-process-ceiling".to_owned(),
             job_type: "tests".to_owned(),
@@ -10278,6 +10390,7 @@ mod tests {
     #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job_missing_exit".to_owned(),
             job_type: "tests".to_owned(),
@@ -10335,6 +10448,7 @@ mod tests {
         let log_path = unique_temp_path("completion-log");
         fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
         let job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job_completion_log".to_owned(),
             job_type: "tests".to_owned(),
@@ -10398,6 +10512,7 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job-missing-executable".to_owned(),
             job_type: "tests".to_owned(),
@@ -10465,6 +10580,7 @@ mod tests {
         )));
         assert!(!wrapper.contains("source \"$1\""));
         let job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job-missing-script-executable".to_owned(),
             job_type: "tests".to_owned(),
@@ -10508,6 +10624,7 @@ mod tests {
     #[test]
     fn zero_timeout_never_expires() {
         let mut job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job_unbounded".to_owned(),
             job_type: "background".to_owned(),
@@ -11684,6 +11801,7 @@ mod tests {
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
+            owner: None,
             label: "friendly-job".into(),
             id: "job-naive-timeout".to_owned(),
             job_type: "tests".to_owned(),
@@ -12129,5 +12247,87 @@ mod tests {
         assert_eq!(next_job(&state_dir, &claims_db), Some(top.id.clone()));
         TEST_HOST_MEMORY.with(|host| host.set(None));
         fs::remove_dir_all(state_dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod review_queue_tests {
+    use super::*;
+
+    #[test]
+    fn reviews_have_independent_slots_and_perf_waits_for_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        for (id, kind, state) in [
+            ("test", "tests", "running"),
+            ("r1", "review", "running"),
+            ("r2", "review", "pending"),
+            ("r3", "review", "pending"),
+        ] {
+            conn.execute("INSERT INTO queue_jobs(id,type,label,cwd,env_json,timeout_seconds,state,queued_at,notify_session_id) VALUES(?1,?2,?1,'/tmp','{}',2700,?3,'2026-09-30T00:00:00Z','')",params![id,kind,state]).unwrap();
+        }
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 1,
+            review_max_concurrent: 2,
+            ..QueueAdmissionPolicy::default()
+        };
+        assert_eq!(running_queue_job_count(&jobs, None), 1);
+        assert_eq!(
+            next_admissible_queue_job_id_conn(
+                &conn,
+                &jobs,
+                policy,
+                &mut QueueAdmissionSummary::default()
+            )
+            .unwrap()
+            .as_deref(),
+            Some("r2")
+        );
+        assert_eq!(queue_job_wait_remaining_seconds(&jobs[2]), None);
+        conn.execute("UPDATE queue_jobs SET state='running' WHERE id='r2'", [])
+            .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(
+                &conn,
+                &jobs,
+                policy,
+                &mut QueueAdmissionSummary::default()
+            )
+            .unwrap(),
+            None
+        );
+        conn.execute(
+            "UPDATE queue_jobs SET state='succeeded' WHERE type='tests'",
+            [],
+        )
+        .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        // Perf cannot start merely because reviews are outside max_running.
+        assert!(jobs
+            .iter()
+            .any(|j| j.job_type == "review" && j.state == "running"));
+        assert_eq!(running_queue_job_count(&jobs, None), 0);
+        assert!(perf_has_finite_blockers(&jobs));
+    }
+
+    #[test]
+    fn owned_job_terminal_hook_never_sends_an_agent_queue_wake() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        conn.execute("INSERT INTO queue_jobs(id,type,label,cwd,env_json,timeout_seconds,state,queued_at,notify_session_id,owner) VALUES('r','review','r','/tmp','{}',2700,'succeeded','2026-09-30T00:00:00Z','author','review_request:request:0')",[]).unwrap();
+        let job = get_queue_job_runtime_conn(&conn, "r").unwrap().unwrap();
+        // No message DB was supplied; an ordinary agent wake would stay owed.
+        assert!(queue_job_completion_notified_at(
+            &job,
+            "succeeded",
+            Some(0),
+            "2026-09-30T00:01:00Z",
+            None,
+            None
+        )
+        .unwrap()
+        .is_some());
     }
 }

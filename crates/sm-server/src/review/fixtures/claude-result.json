@@ -1,0 +1,25 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "structured_output": {
+    "findings": [
+      {
+        "title": "[P1] Swap the empty/non-empty branches in average()",
+        "body": "The condition is inverted relative to the docstring. For an empty input (`average([])`), `not values` is true, so the function runs `sum(values) / len(values)` and raises `ZeroDivisionError` instead of returning 0. For any non-empty input (e.g. `average([2, 4])`), it returns `0` instead of the mean (3.0). Return `0` when `not values`, and compute `sum(values) / len(values)` otherwise.",
+        "confidence_score": 0.98,
+        "priority": 1,
+        "code_location": {
+          "absolute_file_path": "/fixture/checkout/review_smoke_1777.py",
+          "line_range": {
+            "start": 3,
+            "end": 5
+          }
+        }
+      }
+    ],
+    "overall_correctness": "patch is incorrect",
+    "overall_explanation": "`average()` has its branches inverted. An empty input raises ZeroDivisionError, and every non-empty input returns 0, which contradicts the docstring. The PR description says this is a deliberate smoke fixture that will not be merged.",
+    "overall_confidence_score": 0.97
+  }
+}

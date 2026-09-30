@@ -622,7 +622,7 @@ enum QueueCommand {
 #[derive(Args)]
 #[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueRunArgs {
-    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"], default_value = "tests")]
+    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service", "review"], default_value = "tests")]
     job_type: String,
     #[arg(long)]
     label: Option<String>,
@@ -683,7 +683,7 @@ struct QueueListArgs {
         help = "Include terminal history; without --notify, show every notify target"
     )]
     all: bool,
-    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"])]
+    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service", "review"])]
     job_type: Option<String>,
     #[arg(
         long,

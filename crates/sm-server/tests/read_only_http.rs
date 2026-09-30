@@ -2428,7 +2428,7 @@ async fn github_quota_pauses_channel_and_skips_the_next_request() {
     }
     assert!(
         completed,
-        "quota refusal should end the GitHub-only chain promptly"
+        "quota refusal and disabled local runtime should exhaust the chain promptly"
     );
     let channel: (String, Option<String>) = Connection::open(&queue_db)
         .unwrap()
@@ -2444,7 +2444,8 @@ async fn github_quota_pauses_channel_and_skips_the_next_request() {
     let second = json!({"pr_number": 972, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"});
     let (status, second) = post_json(app, "/review-requests", second).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(second["state"], "no_reviewer");
+    assert_eq!(second["state"], "active");
+    assert_eq!(second["step_index"], 1);
     assert_eq!(
         poster.calls().len(),
         1,
@@ -2551,7 +2552,7 @@ async fn github_error_reposts_once_then_stops() {
     let mut outcome = None;
     for _ in 0..50 {
         let row: (String, i64, Option<String>) = Connection::open(&queue_db).unwrap().query_row(
-            "SELECT state, attempt_count, last_error FROM codex_review_request_registrations WHERE id = ?1", [id],
+            "SELECT state, attempt_count, json_extract(steps_log_json, '$[0].reason') FROM codex_review_request_registrations WHERE id = ?1", [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         if row.0 == "no_reviewer" {
@@ -2616,7 +2617,7 @@ async fn failed_codex_error_repost_ends_without_repeating_comments() {
         let row: (String, Option<String>) = Connection::open(&queue_db)
             .unwrap()
             .query_row(
-                "SELECT state, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                "SELECT state, json_extract(steps_log_json, '$[0].reason') FROM codex_review_request_registrations WHERE id = ?1",
                 [id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4190,7 +4191,8 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["state"], "no_reviewer");
+    assert_eq!(payload["state"], "active");
+    assert_eq!(payload["step_index"], 1);
     assert_eq!(
         payload["last_error"],
         "failed to start: gh pr comment failed: denied"
@@ -4250,7 +4252,8 @@ async fn codex_review_request_create_surfaces_transport_failure_as_bad_gateway()
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["state"], "no_reviewer");
+    assert_eq!(payload["state"], "active");
+    assert_eq!(payload["step_index"], 1);
     assert!(payload["last_error"]
         .as_str()
         .unwrap()

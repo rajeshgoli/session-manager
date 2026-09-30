@@ -258,6 +258,7 @@ impl AppConfig {
             max_running_jobs: runner.max_running_jobs,
             perf_cooldown_seconds: runner.perf_cooldown_seconds,
             tests_max_concurrent: runner.types.tests.max_concurrent,
+            review_max_concurrent: 4,
             perf_max_concurrent: runner.types.perf.max_concurrent,
             background_max_concurrent: runner.types.background.max_concurrent,
             service_max_concurrent: runner

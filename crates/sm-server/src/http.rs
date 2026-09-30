@@ -343,6 +343,7 @@ mod history;
 mod inbox;
 mod merge_holds;
 mod messages;
+mod review_runs;
 mod settings;
 mod watch;
 mod web;
@@ -5008,78 +5009,25 @@ async fn create_review_request_core(
                 codex_review_store_error(error)
             }
         })?;
-        let now = now_rfc3339();
-        let allowed = RetainedQueueStore::reserve_github_review_check_in_path(
+        let settings = state.session_store.owner_settings()?;
+        RetainedQueueStore::initialize_review_chain(
             &queue_db_path,
             &registration.id,
-            &now,
-        )
-        .map_err(codex_review_store_error)?;
-        let registration = if allowed {
-            match github_post_review_request(
-                state.github_review_poster.clone(),
-                &repo,
-                payload.pr_number,
-                payload.steer.as_deref(),
-            )
-            .await
-            {
-                Ok(comment) => {
-                    let posted = RetainedQueueStore::mark_github_review_posted_in_path(
-                        &queue_db_path,
-                        &registration.id,
-                        comment.comment_id,
-                        comment.comment_url.as_deref(),
-                        &comment.posted_at,
-                    )
-                    .map_err(codex_review_store_error)?
-                    .unwrap_or(registration);
-                    // GitHub can show a just-pushed head only after accepting the comment.
-                    if let Ok(GitHubPullRequestState::Open { head_sha }) = github_current_pr_state(
-                        state.github_review_poster.clone(),
-                        &repo,
-                        payload.pr_number,
-                    )
-                    .await
-                    {
-                        RetainedQueueStore::reconcile_initial_review_head_in_path(
-                            &queue_db_path,
-                            &posted.id,
-                            &head_sha,
-                        )
-                        .map_err(codex_review_store_error)?;
-                    }
-                    posted
-                }
-                Err(error) => {
-                    finish_github_review_step(
-                        &state,
-                        &queue_db_path,
-                        &registration,
-                        &format!("failed to start: {error}"),
-                        &now,
-                    )
-                    .map_err(|error| ApiError::Status {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        detail: error,
-                    })?;
-                    registration
-                }
-            }
-        } else {
-            let channel = RetainedQueueStore::github_review_channel_from_path(&queue_db_path)
-                .map_err(codex_review_store_error)?;
-            let reason = format!(
-                "paused (out of quota since {})",
-                channel.paused_at.as_deref().unwrap_or("unknown")
-            );
-            finish_github_review_step(&state, &queue_db_path, &registration, &reason, &now)
-                .map_err(|error| ApiError::Status {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    detail: error,
-                })?;
-            registration
-        };
+            &crate::review::chain(&settings["reviews"]["reviewer"]),
+        )?;
+        let initialized = RetainedQueueStore::get_codex_review_request_from_path(
+            &queue_db_path,
+            &registration.id,
+        )?
+        .unwrap_or(registration.clone());
+        if review_runs::current_step(&initialized).map_err(anyhow::Error::msg)?["kind"]
+            == "github_codex"
+        {
+            review_runs::start_github(&state, &queue_db_path, &initialized)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        // Local checkout preparation belongs to the watcher, not this response.
         let registration = RetainedQueueStore::get_codex_review_request_from_path(
             &queue_db_path,
             &registration.id,
@@ -5383,6 +5331,7 @@ fn terminate_codex_review_request_for_closed_pr(
 }
 
 fn recover_codex_review_request_watchers(state: Arc<AppState>) {
+    review_runs::start_sweeper(state.clone());
     if !state.config.rust_core.runtime_enabled {
         return;
     }
@@ -5435,6 +5384,12 @@ fn spawn_codex_review_request_watcher(state: Arc<AppState>, request_id: String) 
         {
             eprintln!("Codex review request watcher {request_id} stopped with error: {error}");
         }
+        let cleanup_state = state.clone();
+        let cleanup_id = request_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            review_runs::cleanup_request(&cleanup_state, &cleanup_id)
+        })
+        .await;
         state
             .codex_review_watcher_ids
             .lock()
@@ -5474,7 +5429,10 @@ async fn wait_for_codex_review_poll_or_terminal(
                 codex_review_request_ttl_remaining(registration),
             ),
         );
-        tokio::time::sleep(sleep_for).await;
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {},
+            _ = crate::queue::owned_job_terminal_notify().notified() => return Ok(Some(registration.clone())),
+        }
 
         let Some(current) =
             RetainedQueueStore::get_codex_review_request_from_path(queue_db_path, request_id)
@@ -5535,8 +5493,11 @@ fn finish_github_review_step(
             .map(session_display_name)
             .unwrap_or_else(|| author.to_owned());
         let body = format!(
-            "GitHub Codex: {reason}\n\nPR: https://github.com/{}/pull/{}\nRequest: {}",
-            finished.repo, finished.pr_number, finished.id
+            "{}\n\nPR: https://github.com/{}/pull/{}\nRequest: {}",
+            review_runs::failure_lines(&finished),
+            finished.repo,
+            finished.pr_number,
+            finished.id
         );
         let result = crate::owner_messages::OwnerMessageStore::new(db_path.to_path_buf())
             .create_once(
@@ -5582,7 +5543,7 @@ fn push_review_notice(state: &AppState, kind: &str, title: &str, body: &str, rea
     }
 }
 
-/// One poll of the GitHub-only chain. A later ticket adds local review steps.
+/// One poll of a durable review chain, including any late GitHub result.
 async fn poll_github_review_step(
     state: &AppState,
     db_path: &StdPath,
@@ -5643,6 +5604,30 @@ async fn poll_github_review_step(
         }
         return Ok(false);
     }
+    if request.latest_request_comment_id.is_some() {
+        if let Some(review) = github_find_fresh_review(
+            state.github_review_poster.clone(),
+            &request.repo,
+            request.pr_number,
+            &request.requested_at,
+            Some(head),
+            request.latest_request_comment_id,
+        )
+        .await?
+        {
+            complete_codex_review_request(state, db_path, &request.id, request, review, &now)?;
+            RetainedQueueStore::mark_github_review_available_in_path(db_path, &request.id, &now)
+                .map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+    }
+    let step = review_runs::current_step(request)?;
+    if step["kind"] != "github_codex" {
+        return review_runs::poll_run(state, db_path, request, &step).await;
+    }
+    if request.step_state.as_deref() == Some("ready") {
+        return review_runs::start_github(state, db_path, request).await;
+    }
     let Some(comment_id) = request.latest_request_comment_id else {
         finish_github_review_step(
             state,
@@ -5653,21 +5638,6 @@ async fn poll_github_review_step(
         )?;
         return Ok(true);
     };
-    if let Some(review) = github_find_fresh_review(
-        state.github_review_poster.clone(),
-        &request.repo,
-        request.pr_number,
-        &request.requested_at,
-        Some(head),
-        Some(comment_id),
-    )
-    .await?
-    {
-        complete_codex_review_request(state, db_path, &request.id, request, review, &now)?;
-        RetainedQueueStore::mark_github_review_available_in_path(db_path, &request.id, &now)
-            .map_err(|error| error.to_string())?;
-        return Ok(true);
-    }
     let since = request
         .latest_request_posted_at
         .as_deref()
@@ -5842,7 +5812,7 @@ async fn run_codex_review_request_watcher(
         }
         if registration.chain_json.is_some() {
             match poll_github_review_step(&state, &queue_db_path, &registration).await {
-                Ok(true) => return Ok(()),
+                Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
                     RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
@@ -6727,16 +6697,32 @@ async fn client_review_status(
     let recent = requests.iter().filter(|request| {
         codex_review_request_requested_at(&request.requested_at).is_some_and(|at| at >= cutoff)
     });
-    let (github_codex, no_reviewer) = recent.fold((0, 0), |(reviewed, missing), request| {
-        (
-            reviewed
-                + i64::from(
-                    request.state == "completed"
-                        && request.review_source.as_deref() != Some("owner"),
-                ),
-            missing + i64::from(request.state == "no_reviewer"),
-        )
-    });
+    let (github_codex, codex_runs, claude_runs, no_reviewer) = recent.fold(
+        (0, 0, 0, 0),
+        |(reviewed, codex, claude, missing), request| {
+            (
+                reviewed
+                    + i64::from(
+                        request.state == "completed"
+                            && !matches!(
+                                request.review_source.as_deref(),
+                                Some("owner" | "codex_run" | "claude_run")
+                            ),
+                    ),
+                codex
+                    + i64::from(
+                        request.state == "completed"
+                            && request.review_source.as_deref() == Some("codex_run"),
+                    ),
+                claude
+                    + i64::from(
+                        request.state == "completed"
+                            && request.review_source.as_deref() == Some("claude_run"),
+                    ),
+                missing + i64::from(request.state == "no_reviewer"),
+            )
+        },
+    );
     let running = requests
         .into_iter()
         .filter(|request| request.is_active)
@@ -6751,9 +6737,9 @@ async fn client_review_status(
     Ok(Json(json!({
         "github_codex": { "state": channel.state, "paused_at": channel.paused_at,
             "next_check_at": channel.next_check_at, "refusal_url": channel.refusal_url },
-        "last_24h": { "github_codex": github_codex, "codex_runs": 0, "claude_runs": 0,
+        "last_24h": { "github_codex": github_codex, "codex_runs": codex_runs, "claude_runs": claude_runs,
             "no_reviewer": no_reviewer },
-        "running": running, "meters": { "codex": null, "claude": null },
+        "running": running, "meters": { "codex": crate::review::meter(&expand_home(&state.config.usage.db_path), "codex")?, "claude": crate::review::meter(&expand_home(&state.config.usage.db_path), "claude")? },
     })))
 }
 
@@ -15822,6 +15808,7 @@ fn queue_job_default_timeout_seconds(
     job_type: &str,
 ) -> std::result::Result<i64, String> {
     match job_type {
+        "review" => Ok(2700),
         "tests" => Ok(config.queue_runner.types.tests.default_timeout_seconds),
         "perf" => Ok(config.queue_runner.types.perf.default_timeout_seconds),
         "background" => Ok(config.queue_runner.types.background.default_timeout_seconds),
@@ -16338,10 +16325,16 @@ fn codex_review_request_response(
         "state": registration.state,
         "is_active": registration.is_active,
     });
-    let steps =
-        serde_json::from_str::<Value>(registration.steps_log_json.as_deref().unwrap_or("[]"))
-            .unwrap_or_else(|_| json!([]));
-    response["steps"] = steps;
+    let mut steps: Vec<Value> =
+        serde_json::from_str(registration.steps_log_json.as_deref().unwrap_or("[]"))
+            .unwrap_or_default();
+    let chain: Vec<Value> =
+        serde_json::from_str(registration.chain_json.as_deref().unwrap_or("[]"))
+            .unwrap_or_default();
+    for (index, step) in chain.iter().enumerate().skip(steps.len()) {
+        steps.push(json!({"index":index,"label":crate::review::label(step),"outcome":if index as i64 == registration.step_index {registration.step_state.as_deref().unwrap_or("pending")} else {"pending"}}));
+    }
+    response["steps"] = json!(steps);
     response["chain_json"] = json!(registration.chain_json);
     response["policy_source"] = json!(registration.policy_source);
     response["step_index"] = json!(registration.step_index);
