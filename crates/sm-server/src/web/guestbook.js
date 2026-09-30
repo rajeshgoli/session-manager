@@ -5,7 +5,7 @@ export function GuestbookPage() {
   const [repo, setRepo] = useState('');
   const [before, setBefore] = useState('');
   const [data, error] = usePoll(() => api(`/guestbook?format=json&repo=${encodeURIComponent(repo)}&before=${encodeURIComponent(before)}`), 30000, [repo,before]);
-  return html`<div class="content"><label class="list-filter">Repository <input placeholder="All repositories" value=${repo} onInput=${e => {setRepo(e.target.value);setBefore('');}} /></label>
+  return html`<div class="content history-page"><label class="list-filter">Repository <input placeholder="All repositories" value=${repo} onInput=${e => {setRepo(e.target.value);setBefore('');}} /></label>
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     ${!data ? html`<p>Loading…</p>` : !data.entries.length ? html`<p class="empty">No guestbook entries.</p>` : null}
     ${(data?.entries || []).map(entry => html`<article class="history-card">

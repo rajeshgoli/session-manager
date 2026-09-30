@@ -355,11 +355,13 @@ select.inp { padding: 3px 6px; }
 .thread-compose { padding:12px; border-top:1px solid var(--line); background:var(--panel); max-height:45%; overflow:auto; }
 .thread-compose textarea { display:block; width:100%; min-height:70px; resize:vertical; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; margin-bottom:8px; }
 .thread-compose blockquote { border-left:3px solid var(--magenta); padding:4px 8px; margin:4px 0; display:flex; justify-content:space-between; }
-.history-card { border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:14px; }
+.history-page > * { flex-shrink:0; }
+.history-card { min-width:0; overflow-wrap:anywhere; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:14px; }
 .history-heading,.work-links,.list-pagination { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
 .history-heading span,.history-card small { color:var(--ink-3); }
 .text-button { padding:0; color:var(--accent); border:0; background:none; cursor:pointer; font-weight:600; text-align:left; }
 .work-links { margin-top:8px; }
+.work-links .btn { max-width:100%; white-space:normal; overflow-wrap:anywhere; text-align:left; }
 .guestbook-text { white-space:pre-wrap; }
 .list-filter input { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 10px; margin-left:8px; max-width:60%; }
 @media(max-width:600px) {

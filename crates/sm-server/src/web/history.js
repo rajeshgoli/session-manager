@@ -9,7 +9,7 @@ export function WorkLinks({ work = {} }) {
 }
 export function HistoryPage({ path }) {
   const agents = path === '/history/agents';
-  return html`<div class="content">
+  return html`<div class="content history-page">
     <${Seg} label="History" value=${agents ? 'agents' : 'tickets'} onChange=${value => navigate(value === 'agents' ? '/history/agents' : '/history')}
       options=${[{value:'tickets',label:'Tickets'},{value:'agents',label:'Agents'}]} />
     <${HistoryList} key=${path} agents=${agents} />
