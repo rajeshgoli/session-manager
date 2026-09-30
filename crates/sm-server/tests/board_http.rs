@@ -991,7 +991,7 @@ fn start_body(number: i64) -> Value {
 }
 
 #[tokio::test]
-async fn board_html_is_the_web_apps_and_nav_keeps_its_board_tab() {
+async fn board_html_is_the_web_apps_alone() {
     let f = fixture();
     add_goal(&f).await;
     let page = |uri: &str| {
@@ -1004,7 +1004,7 @@ async fn board_html_is_the_web_apps_and_nav_keeps_its_board_tab() {
     // Off the browser hostname `/board` has no page; the phone has its own tab.
     let response = f.app.clone().oneshot(page("/board")).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    // The remaining server pages still link the Board and show its badge.
+    // The remaining server pages no longer link to a Board page.
     let response = f.app.clone().oneshot(page("/history")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(
@@ -1014,8 +1014,8 @@ async fn board_html_is_the_web_apps_and_nav_keeps_its_board_tab() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("href=\"/board\""));
-    assert!(html.contains("id=board-badge"));
+    assert!(!html.contains("href=\"/board\""));
+    assert!(!html.contains("board-badge"));
     let (_, json) = request_json_board(&f).await;
     assert_eq!(json["lanes"][0]["goal"]["number"], 1);
 }
