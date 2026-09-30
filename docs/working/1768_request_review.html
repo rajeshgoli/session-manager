@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1768 — One review command</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<style>
+  /* Figures for this memo. */
+  .fg-box { fill: var(--surface-2); stroke: var(--ink-3); stroke-width: 1.2; }
+  .fg-ok { fill: var(--surface); stroke: var(--green); stroke-width: 2; }
+  .fg-bad { fill: var(--surface); stroke: var(--red); stroke-width: 2; }
+  .fg-you { fill: var(--surface); stroke: var(--violet); stroke-width: 2; }
+  .fg-t { font: 600 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); }
+  .fg-s { font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink-2); }
+  .fg-m { font: 10.5px ui-monospace, Menlo, monospace; fill: var(--ink-2); }
+  .fg-line { stroke: var(--ink-2); stroke-width: 1.4; fill: none; }
+  .fg-red { stroke: var(--red); stroke-width: 1.4; fill: none; }
+  .fg-grid { stroke: var(--rule); stroke-width: 1; }
+  .fg-today { fill: var(--red); opacity: .85; }
+  .fg-new { fill: var(--green); }
+  .fg-post { stroke: var(--surface); stroke-width: 1.6; stroke-dasharray: 1.6 20.2; }
+  /* Screen mockups use the sm web palette from the web redesign (docs/working/1710_web_redesign.html). */
+  :root {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9;
+    --m-term:#0E0F14; --m-termink:#D7DAE3;
+  }
+  :root[data-theme="dark"] {
+    --m-bg:#09090D; --m-panel:#121219; --m-panel2:#1A1A23; --m-line:#2B2B37;
+    --m-ink:#F5F7FA; --m-ink2:#ADB2C2; --m-ink3:#777C8B; --m-accent:#5EE7FF; --m-sel:#143744;
+    --m-green:#4ADE80; --m-amber:#FBBF24; --m-mag:#F0ABFC; --m-red:#FB7185;
+    --m-cyan:#5EE7FF; --m-slate:#8B93A7; --m-claude:#FB923C; --m-codex:#A78BFA;
+    --m-term:#050507; --m-termink:#D7DAE3;
+  }
+  @media print { :root[data-theme="dark"] {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9; } }
+  .scrwrap { overflow-x: auto; margin: 1rem 0 .4rem; width: min(68rem, calc(100vw - 2rem)); position: relative; left: 50%; transform: translateX(-50%); }
+  .scr { min-width: 46rem; background: var(--m-bg); color: var(--m-ink); border: 1px solid var(--m-line);
+    border-radius: 10px; overflow: hidden; font: 12.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: grid; grid-template-columns: 8.2rem 1fr; }
+  .scr.pane { grid-template-columns: 8.2rem 1fr 19rem; }
+  .cards.one { grid-template-columns: 1fr; }
+  .scr * { box-sizing: border-box; }
+  .scr code, .scr .mono { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: none; padding: 0; }
+  .rail { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .15rem; }
+  .rail .brand { font: 700 14px ui-monospace, Menlo, monospace; color: var(--m-accent); padding: 0 .5rem .6rem; }
+  .rail a { display: flex; justify-content: space-between; padding: .32rem .5rem; border-radius: 6px; color: var(--m-ink2); text-decoration: none; }
+  .rail a.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .rail a b { font-weight: 600; font-size: 11px; color: var(--m-ink3); }
+  .rail a b.hot { color: var(--m-amber); }
+  .rail .grow { flex: 1; }
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .bar { display: flex; align-items: center; gap: .8rem; padding: .55rem .9rem; border-bottom: 1px solid var(--m-line); background: var(--m-panel); }
+  .bar h5 { margin: 0; font-size: 13.5px; font-weight: 650; }
+  .bar .sp { flex: 1; }
+  .btn { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .6rem; color: var(--m-ink); background: var(--m-panel); white-space: nowrap; }
+  .btn.pri { background: var(--m-accent); border-color: var(--m-accent); color: var(--m-panel); font-weight: 600; }
+  .btn.sm { padding: .1rem .45rem; font-size: 11.5px; }
+  .body { padding: .8rem .9rem; display: flex; flex-direction: column; gap: .7rem; }
+  .sum { display: flex; gap: 1.1rem; color: var(--m-ink2); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .sum b { color: var(--m-ink); }
+  .grp { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .5rem; }
+  .card { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .55rem .6rem; display: grid; grid-template-columns: 2.1rem 1fr; gap: .1rem .55rem; align-items: center; }
+  .card.sel { outline: 2px solid var(--m-accent); outline-offset: -1px; }
+  .card .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ln { grid-column: 2; font-size: 11.5px; }
+  .card .ring { grid-row: span 3; }
+  .ring { width: 2.1rem; height: 2.1rem; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 600; color: var(--m-ink2);
+    background: radial-gradient(closest-side, var(--m-panel) 76%, transparent 78%), conic-gradient(var(--rc) calc(var(--p) * 1%), var(--m-panel2) 0); }
+  .prov { font-size: 10.5px; font-weight: 600; }
+  .prov.cl { color: var(--m-claude); } .prov.cx { color: var(--m-codex); } .prov.gh { color: var(--m-ink2); }
+  .tk { font: 11px ui-monospace, Menlo, monospace; color: var(--m-ink2); }
+  .ball { font-weight: 550; }
+  .ball::before { content: ""; display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; margin-right: .35rem; background: currentColor; vertical-align: .02rem; }
+  .gr { color: var(--m-green); } .am { color: var(--m-amber); } .mg { color: var(--m-mag); } .rd { color: var(--m-red); } .cy { color: var(--m-cyan); } .sl { color: var(--m-slate); } .mu { color: var(--m-ink3); }
+  .chip { display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; border-radius: 999px; padding: .08rem .45rem; background: color-mix(in srgb, currentColor 14%, transparent); white-space: nowrap; }
+  .rv { display: inline-block; font-size: 11px; line-height: 1.5; border: 1px solid var(--m-line); border-radius: 999px; padding: .02rem .5rem; color: var(--m-ink2); background: var(--m-panel); }
+  .rv b { color: var(--m-ink); font-weight: 600; }
+  .rv.pol { border-color: var(--m-codex); }
+  .rv.pol.cl { border-color: var(--m-claude); }
+  .lane { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; overflow: visible; position: relative; }
+  .lanehd { display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem; border-bottom: 1px solid var(--m-line); flex-wrap: wrap; }
+  .lanehd .rk { font: 700 11px ui-monospace, Menlo, monospace; color: var(--m-ink3); }
+  .lanehd .t { font-weight: 650; }
+  .lanehd .sp { flex: 1; }
+  .row { display: grid; grid-template-columns: 4.6rem minmax(0,1fr) 8.5rem 10.5rem; gap: .6rem; align-items: center; padding: .42rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .row:last-child { border-bottom: 0; }
+  .row .ti { min-width: 0; }
+  .row .who { font-size: 11.5px; color: var(--m-ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fold { padding: .42rem .7rem; color: var(--m-ink2); font-size: 11.5px; border-top: 1px solid var(--m-line); }
+  .side { border-left: 1px solid var(--m-line); background: var(--m-panel); display: flex; flex-direction: column; min-width: 0; }
+  .side .hd { padding: .65rem .8rem; border-bottom: 1px solid var(--m-line); display: grid; grid-template-columns: 2.6rem 1fr; gap: .1rem .6rem; align-items: center; }
+  .side .hd .ring { width: 2.6rem; height: 2.6rem; grid-row: span 2; font-size: 12px; }
+  .kv { padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); display: grid; grid-template-columns: 5.5rem 1fr; gap: .2rem .6rem; font-size: 11.5px; }
+  .kv .l { color: var(--m-ink3); }
+  .term { margin: .6rem .8rem; background: var(--m-term); color: var(--m-termink); border-radius: 6px; padding: .55rem .65rem; font: 10.8px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+  .term .d { color: #8a8f9c; } .term .p { color: #9fb7ff; } .term .y { color: #e8c15a; } .term .gg { color: #57d38c; } .term .rr { color: #f47b8a; }
+  .term.solo { margin: 1rem 0 .4rem; font-size: 11.5px; }
+  .pop { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.16); padding: .7rem .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .pop.float { position: absolute; right: .7rem; top: calc(100% + .5rem); width: 25rem; z-index: 2; }
+  .pop h6 { margin: 0; font-size: 12.5px; }
+  .seg { display: inline-flex; border: 1px solid var(--m-line); border-radius: 7px; overflow: hidden; }
+  .seg span { padding: .18rem .7rem; color: var(--m-ink2); font-size: 11.5px; }
+  .seg span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .step { display: grid; grid-template-columns: 1.1rem minmax(0,1fr) auto; gap: .5rem; align-items: center; border: 1px solid var(--m-line); border-radius: 7px; padding: .35rem .5rem; background: var(--m-panel); }
+  .step .n { font: 700 11px ui-monospace, Menlo, monospace; color: var(--m-ink3); text-align: center; }
+  .step .x { color: var(--m-ink3); font-size: 11px; white-space: nowrap; }
+  .step.off { background: var(--m-panel2); }
+  .step.off .who2 { text-decoration: line-through; color: var(--m-ink3); }
+  .add { color: var(--m-accent); font-size: 11.5px; }
+  .note { font-size: 11px; color: var(--m-ink3); line-height: 1.4; }
+  .set { display: grid; grid-template-columns: 8.5rem 1fr; }
+  .setnav { border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .1rem; }
+  .setnav span { padding: .28rem .5rem; border-radius: 6px; color: var(--m-ink2); }
+  .setnav span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .setbody { min-width: 0; padding: .8rem 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .sgrp { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; }
+  .sgrp > div { display: grid; grid-template-columns: 8rem minmax(0,1fr); gap: .8rem; padding: .5rem .75rem; border-bottom: 1px solid var(--m-line); align-items: center; }
+  .sgrp > div:last-child { border-bottom: 0; }
+  .sgrp > div.wide { grid-template-columns: 1fr; }
+  .sgrp .l { color: var(--m-ink2); }
+  .sgrp h6 { margin: 0; padding: .5rem .75rem; font-size: 12px; border-bottom: 1px solid var(--m-line); display: flex; justify-content: space-between; align-items: center; }
+  .steps { display: flex; flex-direction: column; gap: .3rem; }
+  .alert { border: 1px solid color-mix(in srgb, var(--m-amber) 45%, var(--m-line)); background: color-mix(in srgb, var(--m-amber) 8%, var(--m-panel)); border-radius: 8px; padding: .55rem .7rem; display: flex; gap: .8rem; align-items: center; }
+  .alert .sp { flex: 1; }
+  .alert > span { min-width: 0; }
+  .alert .chip, .alert .btn { flex-shrink: 0; }
+  .mini { display: flex; height: 8px; border-radius: 3px; overflow: hidden; background: var(--m-panel2); width: 100%; }
+  .mini s { display: block; }
+  .phones { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .8rem; align-items: start; margin: 1rem 0 .4rem; }
+  .phone { background: var(--m-bg); color: var(--m-ink); border: 2px solid var(--m-line); border-radius: 18px; overflow: hidden; font: 11.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .phone * { box-sizing: border-box; }
+  .phone .top { display: flex; justify-content: space-between; padding: .45rem .8rem .2rem; font-size: 10px; color: var(--m-ink3); }
+  .phone .ttl { padding: .1rem .8rem .5rem; font-size: 15px; font-weight: 700; display: flex; gap: .4rem; align-items: baseline; }
+  .phone .ttl small { font-size: 11px; font-weight: 500; color: var(--m-ink3); }
+  .phone .pb { padding: 0 .6rem .6rem; display: flex; flex-direction: column; gap: .45rem; }
+  .phone .sgrp > div { grid-template-columns: 1fr; gap: .15rem; padding: .45rem .6rem; }
+  .phone .step { padding: .3rem .45rem; }
+  .phone .nav { display: flex; justify-content: space-around; border-top: 1px solid var(--m-line); background: var(--m-panel); padding: .45rem 0; color: var(--m-ink3); font-size: 10px; }
+  .phone .nav u { text-decoration: none; color: var(--m-accent); font-weight: 700; }
+  .phone .sheet { background: var(--m-panel); border-top-left-radius: 14px; border-top-right-radius: 14px; box-shadow: 0 -6px 20px rgba(0,0,0,.12); padding: .6rem .7rem .7rem; display: flex; flex-direction: column; gap: .45rem; }
+  .phone .grab { width: 2.2rem; height: 4px; border-radius: 2px; background: var(--m-line); margin: 0 auto .2rem; }
+  .phone .dim { opacity: .45; padding: 0 .6rem .5rem; }
+  .phone .push { margin: .3rem .5rem .5rem; background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 12px; padding: .45rem .6rem; box-shadow: 0 4px 14px rgba(0,0,0,.1); }
+  .phone .it { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .45rem .55rem; display: flex; flex-direction: column; gap: .2rem; }
+  .phones .cap { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; color: var(--ink-2); margin: .35rem .2rem 0; line-height: 1.4; }
+  .ghc { font: 12.5px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; border: 1px solid var(--m-line); border-radius: 8px; background: var(--m-panel); color: var(--m-ink); overflow: hidden; margin: 1rem 0 .4rem; }
+  .ghc .h { background: var(--m-panel2); border-bottom: 1px solid var(--m-line); padding: .45rem .8rem; color: var(--m-ink2); display: flex; gap: .5rem; align-items: center; }
+  .ghc .h b { color: var(--m-ink); }
+  .ghc .h .av { width: 1.3rem; height: 1.3rem; border-radius: 50%; background: var(--m-slate); display: inline-block; }
+  .ghc .c { padding: .6rem .9rem; }
+  .ghc .c p { margin: .3rem 0; }
+  .ghc .c h6 { margin: .7rem 0 .2rem; font-size: 13px; }
+  .ghc code { font: 11.5px ui-monospace, Menlo, monospace; background: var(--m-panel2); padding: .05em .3em; border-radius: 3px; }
+  .scen { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-top: 2.2rem; }
+  .scen + h3 { margin-top: .2rem; }
+  ul.does { margin: .3rem 0 0; padding-left: 1.2rem; }
+  ul.does li { margin: .15rem 0; }
+  @media (max-width: 44rem) { .phones { grid-template-columns: 1fr; } }
+  @media print { #fig2 svg { max-height: 2.7in; margin: 0 auto; } .scrwrap, .phones, .ghc, .term.solo { break-inside: avoid; } .scrwrap, .phones { zoom: .86; } .scrwrap { overflow: visible; width: 100%; left: 0; transform: none; } .scr { min-width: 0; font-size: 10.5px; } .phones { gap: .5rem; } }
+</style>
+
+<h1>1768 — One review command: sm picks the reviewer and moves on when one can't review</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>8c778c66</code> (sm-1768) · Ticket #1768 · 30 September 2026 · Revision 3 · figures use live sm data from 30 September; screens are illustrative</small></p>
+
+<h2>Memo</h2>
+<p><b>Agents ask for a review with one command, <code>sm request-review</code>, and never learn how the review gets done.</b> sm reads a <i>review policy</i> that you set in Settings, and optionally per repo, per lane or per ticket. The policy names one reviewer, usually GitHub Codex, which answers in about four minutes and costs almost nothing. When that reviewer refuses or goes quiet, sm moves to a fallback within seconds, instead of re-posting <code>@codex review</code> until the request expires. That next reviewer is a <i>review run</i>: Codex's own built-in reviewer, or Claude given the same rubric, started by sm on this machine in a clean checkout of the PR. sm posts the run's findings on the PR the way GitHub Codex does, with comments on the lines they concern. The author is woken once, when a review is on the PR, with the same <code>[sm review]</code> message it gets today.</p>
+<p>This fixes today's failure. Since 11:06 pm last night, GitHub Codex has refused every review because the account is out of Codex code-review quota. sm kept posting <code>@codex review</code> every 20 minutes and told each author, 60 minutes later, only that the request "expired". Seven PRs waited a combined 22 hours, and GitHub got 66 identical requests. Under this design, the first refusal pauses GitHub Codex for every repo, tells you once on your phone, and every one of those PRs gets a local Codex review within roughly 20 minutes of asking.</p>
+<p>It also answers your two other complaints. <code>sm request-codex-review</code> and <code>sm review</code> merge into the one command. You choose one reviewer per repo, lane or ticket, such as Codex Astra on high effort or Claude Fable for important work. sm handles the fallback itself, and no agent knows any of it.</p>
+
+<dl class="vocab">
+  <dt>Review request</dt><dd>What <code>sm request-review 1851</code> creates: "review PR #1851 at its current head commit and wake me when it is done". This is what <code>sm request-codex-review</code> creates today.</dd>
+  <dt>GitHub Codex</dt><dd>OpenAI's review bot on GitHub. It reviews a PR when someone comments <code>@codex review</code>. It runs in OpenAI's cloud and draws on a separate Codex code-review allowance, about 0.05% of a Codex week per review.</dd>
+  <dt>Review run</dt><dd>A one-off review that sm runs on this machine, in a fresh read-only checkout of the PR's head. A <b>Codex run</b> is Codex's built-in reviewer (<code>codex exec review</code>): a separate reviewer with a fixed bug-finding rubric that returns findings ranked P0 to P3, each with a file and line. A <b>Claude run</b> gives Claude the same rubric and output format. The run returns its findings to sm, and sm posts them. It is a job in sm's queue, so it shows on the Queue page with its log.</dd>
+  <dt>Review policy</dt><dd>The one reviewer to use: GitHub Codex, a Codex run or a Claude run, with its model and effort. You never list fallbacks.</dd>
+  <dt>Fallback</dt><dd>What sm uses when the chosen reviewer can't review. For a run, it is the same tier on the other provider, per the tier table in CLAUDE.md: Codex Astra ↔ Claude Fable, Codex Sol ↔ Claude Opus, Codex Luna ↔ Claude Sonnet. GitHub Codex falls back to a Codex Sol run, which is the same review engine on a separate allowance, and then to a Claude Opus run.</dd>
+  <dt>Paired reviewer</dt><dd>For a high-stakes ticket only: a reviewer agent that works in the author's own checkout, so it can build the code and run the tests. It starts at the ticket's first review request and stays for every round, remembering its earlier findings. It hands off like any agent and retires when the PR merges.</dd>
+  <dt>Scope</dt><dd>Where a policy applies. The four scopes are the default (everything), a repo, a lane on the board, and a single ticket. The most specific scope wins.</dd>
+  <dt>Paused</dt><dd>GitHub Codex's state after it refuses for lack of quota. While paused, sm skips it for every repo, and tries it again once every two hours.</dd>
+</dl>
+
+<h3>How a review request runs</h3>
+<figure id="fig2">
+<svg viewBox="0 0 760 282" role="img" aria-label="sm request-review resolves the policy, then tries each reviewer in order until one posts a review">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <rect class="fg-box" x="8" y="120" width="150" height="60" rx="8"/><text class="fg-t" x="18" y="144">sm request-review</text><text class="fg-s" x="18" y="163">the one command agents use</text>
+  <rect class="fg-box" x="180" y="120" width="160" height="60" rx="8"/><text class="fg-t" x="190" y="144">sm picks the policy</text><text class="fg-s" x="190" y="163">ticket › lane › repo › default</text>
+  <text class="fg-s" x="190" y="200">skips a paused reviewer</text><text class="fg-s" x="190" y="215">policy fixed per request</text>
+  <rect class="fg-box" x="362" y="10" width="205" height="58" rx="8"/><text class="fg-t" x="372" y="33">1 · GitHub Codex</text><text class="fg-s" x="372" y="52">posts @codex review · usually 4 min</text>
+  <rect class="fg-box" x="362" y="112" width="205" height="58" rx="8"/><text class="fg-t" x="372" y="135">2 · Codex review run</text><text class="fg-s" x="372" y="154">codex exec review · gpt-6-sol</text>
+  <rect class="fg-box" x="362" y="214" width="205" height="58" rx="8"/><text class="fg-t" x="372" y="237">3 · Claude review run</text><text class="fg-s" x="372" y="256">same rubric · opus, high effort</text>
+  <rect class="fg-ok" x="600" y="10" width="152" height="160" rx="8"/><text class="fg-t" x="610" y="33">Review is on the PR</text><text class="fg-s" x="610" y="52">sm wakes the author once</text><text class="fg-s" x="610" y="68">the first review to land wins</text>
+  <rect class="fg-you" x="600" y="214" width="152" height="58" rx="8"/><text class="fg-t" x="610" y="237">Nobody could review</text><text class="fg-s" x="610" y="256">author told; you: Needs you</text>
+  <path class="fg-line" d="M158,150 L178,150" marker-end="url(#ar)"/>
+  <path class="fg-line" d="M340,140 C352,140 350,39 360,39" marker-end="url(#ar)"/>
+  <path class="fg-line" d="M567,39 L598,39" marker-end="url(#ar)"/>
+  <path class="fg-line" d="M567,141 L598,141" marker-end="url(#ar)"/>
+  <path class="fg-line" d="M567,236 C584,236 582,164 598,160" marker-end="url(#ar)"/>
+  <path class="fg-red" d="M567,258 L598,258" marker-end="url(#ar)"/>
+  <path class="fg-red" d="M380,68 L380,110" marker-end="url(#ar)"/>
+  <text class="fg-s" x="390" y="86">refused · no 👀 in 5 min</text><text class="fg-s" x="390" y="101">error twice · no review in 60 min</text>
+  <path class="fg-red" d="M380,170 L380,212" marker-end="url(#ar)"/>
+  <text class="fg-s" x="390" y="188">can't start · fails · meter at 95%</text><text class="fg-s" x="390" y="203">no result in 45 min</text>
+</svg>
+<figcaption><b>Figure 1.</b> The default policy, GitHub Codex, with its fallback. Red arrows are the only reasons sm moves to the next reviewer. The first review to reach the PR completes the request, and sm cancels any run still working on it. "Meter at 95%" means that provider's weekly meter, which sm already records, is at 95% or more, so sm does not spend your last 5% on a review.</figcaption>
+</figure>
+
+<h3>Today, replayed</h3>
+<figure>
+<svg viewBox="0 0 760 252" role="img" aria-label="Seven PRs waited 1 to 9 hours for a review that never came; under this design each gets a local review run about 20 minutes after asking">
+  <text class="fg-t" x="10" y="16">Waiting for a review, night of 29–30 September (Pacific time)</text>
+  <rect x="10" y="23" width="22" height="8" class="fg-today"/><text class="fg-s" x="37" y="31">today: waiting; each white tick is one <tspan class="fg-m">@codex review</tspan> post</text>
+  <rect x="400" y="24" width="22" height="6" class="fg-new"/><text class="fg-s" x="427" y="31">this design: a local review run (about 20 min)</text>
+  <g>
+    <line class="fg-grid" x1="120" y1="38" x2="120" y2="222"/><line class="fg-grid" x1="250.5" y1="38" x2="250.5" y2="222"/>
+    <line class="fg-grid" x1="381" y1="38" x2="381" y2="222"/><line class="fg-grid" x1="511.6" y1="38" x2="511.6" y2="222"/>
+    <line class="fg-grid" x1="642.1" y1="38" x2="642.1" y2="222"/>
+    <text class="fg-s" x="120" y="238" text-anchor="middle">11 pm</text><text class="fg-s" x="250.5" y="238" text-anchor="middle">1 am</text>
+    <text class="fg-s" x="381" y="238" text-anchor="middle">3 am</text><text class="fg-s" x="511.6" y="238" text-anchor="middle">5 am</text>
+    <text class="fg-s" x="642.1" y="238" text-anchor="middle">7 am</text>
+  </g>
+  <g>
+    <text class="fg-m" x="10" y="54">sm #1764</text>
+    <rect class="fg-today" x="128.7" y="46" width="590.3" height="9"/><line class="fg-post" x1="128.7" y1="50.5" x2="719" y2="50.5"/><rect class="fg-new" x="128.7" y="57" width="22" height="6"/>
+    <text class="fg-s" x="724" y="54">9 h</text>
+    <text class="fg-m" x="10" y="80">sm #1765</text>
+    <rect class="fg-today" x="129.8" y="72" width="130.5" height="9"/><line class="fg-post" x1="129.8" y1="76.5" x2="260.3" y2="76.5"/><rect class="fg-new" x="129.8" y="83" width="22" height="6"/>
+    <text class="fg-s" x="265" y="80">2 h</text>
+    <text class="fg-m" x="10" y="106">sm #1766</text>
+    <rect class="fg-today" x="145" y="98" width="130.5" height="9"/><line class="fg-post" x1="145" y1="102.5" x2="275.5" y2="102.5"/><rect class="fg-new" x="145" y="109" width="22" height="6"/>
+    <text class="fg-s" x="280" y="106">2 h</text>
+    <text class="fg-m" x="10" y="132">sm #1767</text>
+    <rect class="fg-today" x="151.5" y="124" width="262.2" height="9"/><line class="fg-post" x1="151.5" y1="128.5" x2="413.7" y2="128.5"/><rect class="fg-new" x="151.5" y="135" width="22" height="6"/>
+    <text class="fg-s" x="418" y="132">4 h</text>
+    <text class="fg-m" x="10" y="158">far #1851</text>
+    <rect class="fg-today" x="214.6" y="150" width="131.9" height="9"/><line class="fg-post" x1="214.6" y1="154.5" x2="346.5" y2="154.5"/><rect class="fg-new" x="214.6" y="161" width="22" height="6"/>
+    <text class="fg-s" x="351" y="158">2 h, then the author diagnosed it by hand</text>
+    <text class="fg-m" x="10" y="184">far #1875</text>
+    <rect class="fg-today" x="504" y="176" width="65.2" height="9"/><line class="fg-post" x1="504" y1="180.5" x2="569.2" y2="180.5"/><rect class="fg-new" x="504" y="187" width="22" height="6"/>
+    <text class="fg-s" x="574" y="184">1 h</text>
+    <text class="fg-m" x="10" y="210">far #1876</text>
+    <rect class="fg-today" x="519.2" y="202" width="130.5" height="9"/><line class="fg-post" x1="519.2" y1="206.5" x2="649.7" y2="206.5"/><rect class="fg-new" x="519.2" y="213" width="22" height="6"/>
+    <text class="fg-s" x="654" y="210">2 h</text>
+  </g>
+</svg>
+<figcaption><b>Figure 2.</b> Every review request that expired between 11:08 pm and 7:11 am. GitHub Codex replied within ten seconds each time: "You have reached your Codex usage limits for code reviews." sm does not recognise that reply, so it re-posted every 20 minutes and expired each request after an hour. Agents re-asked; #1764 has asked nine times. In total: 21 expired requests, 66 posts, 22 PR-hours of waiting. The green bars assume a review run takes about 20 minutes, an estimate that the first week will measure. The same night, 20 reviews before 11:06 pm landed normally.</figcaption>
+</figure>
+
+<p>Normally GitHub Codex is fast and dependable. In the last two weeks it picked up (put 👀 on the request) within 95 seconds on all 697 first requests, and 672 of 677 reviews landed within 10 minutes. That record sets the rules below: five quiet minutes is already abnormal, so sm moves on instead of re-posting.</p>
+
+<p class="scen">Scenario 1 · GitHub Codex runs out of quota at night</p>
+<h3>"Why did #1851 wait two hours for a review that was never coming?"</h3>
+<p>With this design, the far-1848 agent's session on PR #1851 looks like this. The agent learns only that the request was accepted, and later that the review is on the PR. It hears nothing about which reviewer ran, or about GitHub Codex's trouble, unless nobody at all can review.</p>
+<div class="term solo"><span class="d">far-1848 · ~/worktrees/far-1848-market-data · 12:27 am</span>
+<span class="p">$</span> sm request-review 1851
+Review requested for PR #1851 at f9d61b2. sm wakes you when it lands.
+<span class="d">… the agent ends its turn and goes idle …</span>
+
+<span class="y">[sm review]</span> Review of PR #1851 @ f9d61b2 is here: https://github.com/rajeshgoli/fractal-algo-rust/pull/1851#pullrequestreview-3391</div>
+<p>Behind the scenes, GitHub Codex first refused at 11:06 pm, on sm #1764. sm paused GitHub Codex for every repo, started a Codex review run for #1764 within seconds, and sent you one push: "GitHub Codex is out of review quota. Reviews go to local runs until it recovers; sm checks every 2 hours." So when far-1848 asked at 12:27 am, sm skipped GitHub Codex and started a Codex run at once; its review landed at 12:49 am. Requests skip GitHub Codex until a two-hourly check finds it working again. You can also press <b>Try now</b> in Settings after adding credits.</p>
+
+<p class="scen">Scenario 2 · Choosing how reviews run</p>
+<h3>"Pick one reviewer. sm handles the rest."</h3>
+<p>Settings gets a <b>Reviews</b> section, shared by the web and the phone. It shows GitHub Codex's state, the default reviewer and its fallback, and every narrower policy in force, with a link to where it was set.</p>
+<div class="scrwrap"><div class="scr">
+  <div class="rail"><div class="brand">sm</div><a>Agents <b>14</b></a><a>Board <b class="hot">1</b></a><a>Queue <b>6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a class="on">Settings</a></div>
+  <div class="main">
+    <div class="bar"><h5>Settings</h5><span class="sp"></span><span class="mu">saved on the server · phone and web share these</span></div>
+    <div class="set">
+      <div class="setnav"><span>Appearance</span><span>New agents</span><span>Context handoff</span><span class="on">Reviews</span><span>Queue limits</span><span>Terminals</span><span>Notifications</span><span>Devices &amp; access</span><span>About</span></div>
+      <div class="setbody">
+        <div class="alert"><span class="chip am">Paused</span><span><b>GitHub Codex is out of code-review quota</b> since 11:06 pm. Reviews go to local runs. The 7:06 am check failed; the next is after 9:06 am.</span><span class="sp"></span><span class="btn sm">Try now</span></div>
+        <div class="sgrp">
+          <h6>Default reviewer <span class="mu" style="font-weight:400">every repo, lane and ticket without its own</span></h6>
+          <div><span class="l">Reviewer</span><span class="seg"><span class="on">GitHub Codex</span><span>Codex run</span><span>Claude run</span></span></div>
+          <div><span class="l">Model and effort</span><span class="mu">GitHub Codex chooses its own · about 0.05% of a Codex week per review</span></div>
+          <div><span class="l">If it can't review</span><span><span class="rv pol"><b>Codex run</b> gpt-6-sol · medium</span> then <span class="rv pol cl"><b>Claude run</b> opus · high</span> <span class="mu">· set by sm, not editable</span></span></div>
+        </div>
+        <div class="sgrp">
+          <h6>Narrower policies</h6>
+          <div><span class="l">Repo · fractal-algo-rust</span><span class="mu">Uses the default <span class="btn sm" style="margin-left:.4rem">Set</span></span></div>
+          <div><span class="l">Repo · session-manager</span><span class="mu">Uses the default <span class="btn sm" style="margin-left:.4rem">Set</span></span></div>
+          <div><span class="l">Lane 1 · Iteration 8</span><span><span class="rv pol"><b>Codex run</b> gpt-6-astra · high</span> <span class="mu">set by you on the Board · falls back to Claude fable</span></span></div>
+          <div><span class="l">Ticket far #1848</span><span><span class="rv pol cl"><b>Claude run</b> fable · max</span> <span class="mu">set by far-1843-planner · falls back to Codex gpt-6-astra</span></span></div>
+        </div>
+        <div class="sgrp">
+          <h6>Limits and today</h6>
+          <div><span class="l">Review runs at once</span><span>4 <span class="mu">· queue type "review"; a fifth waits for a slot</span></span></div>
+          <div><span class="l">Skip a provider at</span><span>95% of its weekly meter <span class="mu">· Codex 41% · Claude 63% now</span></span></div>
+          <div><span class="l">Last 24 hours</span><span><span class="mini"><s style="width:46.5%;background:var(--m-ink3)"></s><s style="width:50%;background:var(--m-codex)"></s><s style="width:3.5%;background:var(--m-claude)"></s></span><span class="mu">58 · GitHub Codex 27 · Codex runs 29 · Claude runs 2 · none left unreviewed</span></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 3. Settings › Reviews on the web at 7:12 am, with the lane and ticket policies of scenarios 3 and 4 already set.</p>
+
+<p class="scen">Scenario 3 · A lane that deserves a stronger reviewer</p>
+<h3>"Every Iteration 8 PR gets reviewed by Astra."</h3>
+<p>Each lane header on the Board shows its review policy as a small pill. Clicking it opens a one-line editor: the reviewer, then the model and effort. The fallback is shown, not chosen. Every run of the lane also reads the lane's goal ticket, so each review knows the plan the PR serves.</p>
+<div class="scrwrap"><div class="scr">
+  <div class="rail"><div class="brand">sm</div><a>Agents <b>14</b></a><a class="on">Board <b class="hot">1</b></a><a>Queue <b>6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></div>
+  <div class="main">
+    <div class="bar"><h5>Board</h5><span class="mu">2 lanes · read from GitHub 20 s ago</span><span class="sp"></span><span class="btn sm">+ Add lane</span></div>
+    <div class="body" style="padding-bottom:17rem">
+      <div class="lane">
+        <div class="lanehd"><span class="rk">1</span><span class="mu">fractal-algo-rust</span><span class="t">#1843 Iteration 8: predict two turns</span><span class="sp"></span><span class="rv pol">Reviews: <b>Codex run · gpt-6-astra · high</b> ▾</span><span class="btn sm">↑</span><span class="btn sm">↓</span><span class="btn sm">End</span>
+          <div class="pop float">
+            <h6>Reviews for lane 1 · Iteration 8</h6>
+            <span class="seg"><span>Use the default</span><span class="on">Set for this lane</span></span>
+            <span class="seg"><span>GitHub Codex</span><span class="on">Codex run</span><span>Claude run</span></span>
+            <div class="step"><span class="n">⚙</span><span><span class="prov cx">Codex run</span> · gpt-6-astra ▾ · high ▾</span><span class="x">top tier</span></div>
+            <span class="note">If Codex can't review, sm uses a <b>Claude run · fable · xhigh</b>, the same tier. Changes apply to the next request.</span>
+            <span style="display:flex;gap:.4rem;justify-content:flex-end"><span class="btn sm">Cancel</span><span class="btn sm pri">Save</span></span>
+          </div>
+        </div>
+        <div class="row"><span class="chip am">Review</span><span class="ti">#1848 buy iteration 8 data <span class="rv pol cl" style="margin-left:.2rem">Review: <b>Claude fable · max</b></span></span><span class="who">far-1848 · PR #1851</span><span class="am ball">Claude run, 12 min</span></div>
+        <div class="row"><span class="chip am">Review</span><span class="ti">#1873 score the two-turn target</span><span class="who">far-1873 · PR #1875</span><span class="am ball">Codex run, 6 min</span></div>
+        <div class="row"><span class="chip gr">Working</span><span class="ti">#1874 three and a half times the data</span><span class="who">far-1874 · PR #1876</span><span class="mu">no review yet</span></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 4. The Board with the lane's review editor open. #1848 has its own ticket policy, so its PR gets a Claude Fable run even inside this lane.</p>
+
+<p class="scen">Scenario 4 · One ticket spends real money</p>
+<h3>"#1848 buys market data. I want its reviewer to run the code."</h3>
+<p>The Start popover on the Board is where you already pick the author's model and effort. It gains a <b>Reviewer</b> row, which starts on the lane's policy. Choosing a reviewer there stores a ticket policy, the same one the ticket row's menu sets. It also offers the one reviewer only a ticket can have: a <b>paired reviewer</b>. That is an agent in the author's own checkout, so it can build the code and run the tests, which a review run cannot.</p>
+<div class="scrwrap"><div style="background:var(--m-bg);color:var(--m-ink);border:1px solid var(--m-line);border-radius:10px;padding:.9rem;display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start;font:12.5px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;min-width:46rem">
+  <div class="pop">
+    <h6>Start #1848 · buy, verify and build iteration 8 data</h6>
+    <div style="display:grid;grid-template-columns:4.5rem 1fr;gap:.45rem;align-items:center">
+      <span class="mu">Author</span><span class="seg"><span class="on">Claude</span><span>Codex</span></span>
+      <span class="mu">Model</span><span>opus ▾ · high ▾</span>
+      <span class="mu">Name</span><span class="mono">far-1848</span>
+    </div>
+    <div class="grp" style="border-top:1px solid var(--m-line);padding-top:.5rem">Reviewer for this ticket</div>
+    <span class="seg"><span>Lane default</span><span>GitHub</span><span>Codex run</span><span>Claude run</span><span class="on">Paired</span></span>
+    <div class="step"><span class="n">⚙</span><span><span class="prov cx">Codex</span> · gpt-6-astra ▾ · high ▾</span><span class="x">top tier</span></div>
+    <span class="note">Starts at the first review request, in far-1848's checkout, as <b>far-1848-reviewer</b>. It may build and run tests, never edit. If it can't review: a Codex run with the same model, then a Claude run with fable.</span>
+    <span style="display:flex;gap:.4rem;justify-content:flex-end"><span class="btn sm">Cancel</span><span class="btn sm pri">Start</span></span>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:.5rem">
+    <div class="grp">Agents, at the first review of PR #1851</div>
+    <div class="card"><div class="ring" style="--p:33;--rc:var(--m-amber)">33%</div><div class="nm">far-1848 <span class="prov cl">Claude opus</span></div><div class="ln am ball">Waiting on review by far-1848-reviewer · 18 min</div><div class="ln tk">#1848 · PR #1851</div></div>
+    <div class="card sel"><div class="ring" style="--p:21;--rc:var(--m-green)">21%</div><div class="nm">far-1848-reviewer <span class="prov cx">Codex astra</span></div><div class="ln gr ball">Reviewing PR #1851 for far-1848 · round 1</div><div class="ln tk">paired · queue job: cargo test -p purchase</div></div>
+    <span class="note">The reviewer's tests go through sm's queue like any agent's. The author is idle while it waits, so the two never build at the same time.</span>
+  </div>
+</div></div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 4b. Left: the Start popover with the new Reviewer row, choosing a paired reviewer. Right: the Agents page once the author first asks for a review.</p>
+<p>A paired reviewer is started only at the ticket's first <code>sm request-review</code>, so a ticket that never reaches a PR costs nothing. It stays for every later round and remembers what it found, so it checks the fixes rather than starting over. It hands off at high context like any agent, and retires when the PR merges. It returns its findings with <code>sm review submit</code>, and sm posts them exactly as it posts a run's. Before posting, sm checks that the reviewer left the author's checkout as it found it.</p>
+<p>A planning agent can set a ticket's policy as well, when it files a ticket it judges risky, for example <code>sm review-policy set ticket 1848 paired/codex/gpt-6-astra/high</code>. The pill shows who set it. An agent can never set the policy for a ticket it holds itself, so an author cannot choose its own reviewer. Only you set the default, repo and lane policies.</p>
+
+<p class="scen">Scenario 5 · Watching a review run</p>
+<h3>"What is reviewing #1851, and what did it say?"</h3>
+<p>Back to last night, under the default policy. A review run is a job in sm's queue, of a new type, <code>review</code>, with its own four slots. It appears on the Queue page with its log, like any job, and can be cancelled there. The author's card on the Agents page turns amber, "waiting on review", which is the colour the web redesign gave to waiting on a Codex review.</p>
+<div class="scrwrap"><div class="scr pane">
+  <div class="rail"><div class="brand">sm</div><a>Agents <b>14</b></a><a>Board <b class="hot">1</b></a><a class="on">Queue <b>6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></div>
+  <div class="main">
+    <div class="bar"><h5>Queue</h5><span class="mu">review 2 of 4 · tests 1 of 2 · background 1 of 4</span></div>
+    <div class="body">
+      <div class="grp">Running</div>
+      <div class="cards one">
+        <div class="card sel"><div class="ring" style="--p:40;--rc:var(--m-green)">9m</div><div class="nm">review · far #1851 <span class="prov cx">Codex run</span></div><div class="ln gr ball">gpt-6-sol · medium · round 1 · for far-1848</div><div class="ln tk">GitHub Codex paused → fallback</div></div>
+        <div class="card"><div class="ring" style="--p:18;--rc:var(--m-green)">4m</div><div class="nm">review · sm #1764 <span class="prov cx">Codex run</span></div><div class="ln gr ball">gpt-6-sol · medium · round 3 · for sm-1764</div><div class="ln tk">rounds 1–2 found 1 P1, 3 P2</div></div>
+        <div class="card"><div class="ring" style="--p:60;--rc:var(--m-green)">22m</div><div class="nm">tests · far-1874</div><div class="ln gr ball">cargo test --workspace</div><div class="ln tk">2 h limit</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="side">
+    <div class="hd"><div class="ring" style="--p:40;--rc:var(--m-green)">9m</div><b>review · far #1851 · round 1</b><span class="mu">Codex run · gpt-6-sol · medium</span></div>
+    <div class="kv"><span class="l">Reviews</span><span>PR #1851 at f9d61b2</span><span class="l">For</span><span>far-1848 (#1848)</span><span class="l">Why</span><span>Default policy · GitHub Codex paused, so its fallback</span><span class="l">Checkout</span><span class="mono">~/worktrees/far-1851-review-r1</span></div>
+    <div class="term"><span class="d">codex exec review · read-only</span>
+exec git diff 3f2a91c --stat
+read crates/purchase/src/batch.rs
+read crates/purchase/src/resume.rs
+exec rg -n "receipt" crates/purchase
+<span class="gg">review done: 3 findings · patch is incorrect</span>
+sm: posted review on PR #1851 (1 P1 · 2 P2)
+sm: woke far-1848</div>
+  </div>
+</div></div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 5. The Queue page with a review run's panel open. A run never edits, commits or comments; it returns findings, and sm posts them.</p>
+
+<p><b>sm posts the review, not the reviewer.</b> An agent that reviews usually posts with its own <code>gh</code>. Here the run has no GitHub access at all: Codex's reviewer runs read-only by design, and a Claude run gets read-only tools. The run returns structured findings, each with a priority, a file and a line range. sm turns them into one GitHub review from your account, with a comment on each line concerned, as GitHub Codex's reviews have. The review carries a hidden tag naming the request and the reviewed commit. That tag is how sm knows the review landed and which request it answers, and it lets sm refuse to post a review of a commit that is no longer the PR's head.</p>
+<div class="ghc">
+  <div class="h"><span class="av"></span><b>rajeshgoli</b> reviewed · 12:49 am</div>
+  <div class="c">
+    <p><b>sm review</b> · Codex run (gpt-6-sol, medium) · round 1 · default policy, fallback from GitHub Codex</p>
+    <p><b>Reviewed commit:</b> <code>f9d61b2d48</code> · <b>Findings:</b> 1 P1 · 2 P2 · <b>Verdict:</b> patch is incorrect</p>
+    <p>The resume path can charge twice for the euro suffix; the two P2s are gaps in holiday handling.</p>
+  </div>
+  <div class="h" style="border-top:1px solid var(--m-line)"><code>crates/purchase/src/batch.rs</code> <span class="mu">lines 210–214</span></div>
+  <div class="c">
+    <p><b>[P1] Resume after an interrupted batch can re-buy the euro suffix</b></p>
+    <p>A missing receipt file is treated as "not purchased", so a crash between the charge and the receipt write re-submits the purchase on resume…</p>
+  </div>
+</div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 6. A Codex run's review on the PR: a summary, then one comment per finding on its lines (content illustrative).</p>
+
+<p>When the author pushes a fix and asks again, sm starts a fresh run at the new head. Its prompt includes the PR's description, the tickets it closes, the lane's goal, the earlier reviews and the author's replies. So it does not re-raise what the author already answered unless it disagrees, and then it must say why. Each run starts clean, so a reviewer never runs out of context and nothing needs handing off. sm deletes the run's checkout when the run ends.</p>
+
+<p class="scen">Scenario 6 · On the phone, and when nobody can review</p>
+<h3>"Tell me only when I have to do something."</h3>
+<div class="phones">
+<div>
+<div class="phone">
+  <div class="top"><span>7:12</span><span>●●● 82%</span></div>
+  <div class="ttl">Reviews <small>Settings</small></div>
+  <div class="pb">
+    <div class="alert" style="padding:.4rem .5rem;gap:.4rem"><span class="chip am">Paused</span><span style="font-size:10.5px">GitHub Codex out of quota since 11:06 pm</span></div>
+    <span class="btn sm" style="align-self:flex-start">Try GitHub Codex now</span>
+    <div class="grp">Default reviewer</div>
+    <span class="seg"><span class="on">GitHub</span><span>Codex</span><span>Claude</span></span>
+    <span class="note">If it can't review: Codex run gpt-6-sol · medium, then Claude run opus · high</span>
+    <div class="grp">Narrower</div>
+    <div class="sgrp"><div><span>Lane 1 · Iteration 8</span><span class="mu">Codex run · astra · high</span></div><div><span>Ticket far #1848</span><span class="mu">Claude run · fable · max</span></div></div>
+  </div>
+  <div class="nav"><span>Inbox</span><span>Watch</span><span>Board</span><span>Queue</span><u>Settings</u></div>
+</div>
+<p class="cap"><b>A. Settings › Reviews.</b> The same settings as the web, stacked. Tap the reviewer to change it, then pick model and effort.</p>
+</div>
+<div>
+<div class="phone">
+  <div class="top"><span>7:14</span><span>●●● 82%</span></div>
+  <div class="ttl">Board</div>
+  <div class="dim"><div class="it"><b>1 · #1843 Iteration 8</b><span class="mu">2 in review · 1 working · 4 blocked</span></div></div>
+  <div class="sheet">
+    <div class="grab"></div>
+    <b>Reviews for lane 1 · Iteration 8</b>
+    <span class="seg"><span>Default</span><span class="on">This lane</span></span>
+    <span class="seg"><span>GitHub</span><span class="on">Codex</span><span>Claude</span></span>
+    <div class="step"><span class="n">⚙</span><span><span class="prov cx">Codex run</span> gpt-6-astra · high</span><span class="x">▾</span></div>
+    <span class="note">Falls back to Claude run · fable · xhigh</span>
+    <span class="btn pri" style="text-align:center">Save</span>
+  </div>
+  <div class="nav"><span>Inbox</span><span>Watch</span><u>Board</u><span>Queue</span><span>Settings</span></div>
+</div>
+<p class="cap"><b>B. A lane's policy.</b> From the lane's ⋮ menu on the Board tab. A ticket's menu opens the same sheet for that ticket.</p>
+</div>
+<div>
+<div class="phone">
+  <div class="top"><span>7:40</span><span>●●● 81%</span></div>
+  <div class="push"><b>sm · Needs you</b><br>No reviewer could take PR #1851 (far-1848). Codex paused, Codex meter 96%, Claude run failed.</div>
+  <div class="ttl">Inbox</div>
+  <div class="pb">
+    <div class="it" style="border-color:var(--m-mag)"><span><span class="chip mg">Needs you</span> <b>PR #1851 has no reviewer</b></span>
+      <span class="mu">GitHub Codex: out of quota since 11:06 pm<br>Codex run: weekly meter at 96%<br>Claude run: failed (exit 1)</span>
+      <span style="display:flex;gap:.4rem;flex-wrap:wrap"><span class="btn sm pri">Retry now</span><span class="btn sm">Change policy</span><span class="btn sm">Review it myself</span></span></div>
+  </div>
+  <div class="nav"><u>Inbox</u><span>Watch</span><span>Board</span><span>Queue</span><span>Settings</span></div>
+</div>
+<p class="cap"><b>C. The only push you must act on</b>, on a hypothetical morning when all three reviewers fail. "Retry now" runs the policy again. "Review it myself" wakes the author when your PR review arrives, as <code>sm doc publish --review</code> does.</p>
+</div>
+</div>
+<p class="note" style="font-family:-apple-system,sans-serif">Figure 7. The Android app: Settings, a lane's sheet on the Board tab, and the one push that needs you.</p>
+<p>You get two kinds of push. The first says GitHub Codex has paused, once per pause, so you can decide whether to buy credits. The second, "Needs you", comes only when the chosen reviewer and its fallbacks have all failed. At that point the author is told the same thing and told to stand by. Nothing else about reviews reaches your phone.</p>
+
+<h3>What goes away</h3>
+<ul class="does">
+  <li><b><code>sm request-codex-review</code></b> is renamed, not aliased. Ticket 1 changes sm's own messages and opens one PR per repo for the instruction files, merged as soon as the new server is live. An agent still working from the old text gets "unrecognized subcommand", with the tip naming <code>request-review</code>.</li>
+  <li><b><code>sm review</code></b> goes, in all three forms, but its engine stays. <code>--pr</code> posted <code>@codex review</code> once with no retry. <code>--new</code> and the bare form typed <code>/review</code> into a live Codex screen, then waited on fixed timers. Codex's <code>/review</code> is worth keeping: it runs a separate reviewer with a purpose-built rubric, reports only bugs the change introduces, ranks each P0 to P3 with a file and line, and gives a verdict. The Codex run uses that same reviewer through its headless form, <code>codex exec review</code>, so there is no screen, no typing and no timer. No repo's instructions mention <code>sm review</code>.</li>
+  <li><b>The manual fallback in CLAUDE.md §4</b> (post <code>@codex review</code> yourself, check at five and ten minutes, re-post at twenty) goes. If sm cannot take a request, the agent tells you. Nobody needs to post <code>@codex review</code> by hand.</li>
+</ul>
+
+<h3>Decisions</h3>
+<table>
+<thead><tr><th style="width:26%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. One command for agents?</td><td><b>Yes: <code>sm request-review [PR]</code></b>, with <code>--steer</code> for a focus note. It replies only "requested; sm wakes you", and the wake says only that the review is on the PR. <code>sm request-codex-review</code> and <code>sm review</code> are deleted, not aliased.</td><td>The author needs to know when to look, not how the review happened.</td></tr>
+<tr><td>2. How does a local review run?</td><td><b>As a one-off review run in sm's queue.</b> A Codex run is Codex's own <code>codex exec review</code>. A Claude run uses the same rubric and output. Each run starts fresh with the PR's context and the earlier reviews in its prompt. sm posts the findings. The alternative is a standing reviewer agent kept per PR or per lane, which I don't recommend.</td><td>Codex's reviewer is purpose-built and returns findings sm can place on lines. A fresh run never needs a context handoff, a nudge or a retirement.</td></tr>
+<tr><td>3. Fallbacks?</td><td><b>You choose one reviewer; sm falls back by itself.</b> A run falls back to the same tier on the other provider. GitHub Codex falls back to a Codex Sol run, then a Claude Opus run.</td><td>Last night local Codex worked while GitHub Codex refused; they draw on different allowances. Claude covers an outage of Codex as a whole.</td></tr>
+<tr><td>4. Where can a policy be set?</td><td><b>Default, repo, lane, ticket; the most specific wins.</b> A PR that closes tickets in two lanes follows the higher-ranked lane. The default is GitHub Codex.</td><td>These are the units you already think in, and each takes one record.</td></tr>
+<tr><td>5. When GitHub Codex refuses for quota?</td><td><b>Pause it for every repo, push you once, and check it again every 2 hours</b>, or when you press Try now. The check uses the next real request, and that request moves on within seconds if the check fails.</td><td>Quota is per account, so one refusal predicts every other request. Checking costs one comment on a PR.</td></tr>
+<tr><td>6. When GitHub Codex goes quiet or errors?</td><td><b>No 👀 in 5 minutes: move on, and do not re-post. "Something went wrong": re-post once after 2 minutes, then move on. 👀 but no review in 60 minutes: move on.</b></td><td>All 697 pickups in two weeks came within 95 seconds, so waiting longer only adds delay.</td></tr>
+<tr><td>7. Who may set policies?</td><td><b>You set all of them</b>, on the web, the phone or the CLI outside a session. <b>Agents set ticket policies only, and never for a ticket they hold.</b> Every policy shows who set it.</td><td>Planners know which tickets are risky; authors must not pick their own reviewers.</td></tr>
+<tr><td>8. Guard rails on runs?</td><td><b>At most 4 review runs at once, and skip a provider whose weekly meter is at 95%.</b> Both are editable in Settings.</td><td>Tokens matter more than wall-clock. Last night's seven PRs never needed more than four runs at once.</td></tr>
+<tr><td>9. Instruction files?</td><td><b>Replace the review paragraphs in each repo's CLAUDE.md and AGENTS.md with the text in appendix H</b>, one PR per repo, in ticket 1. You approve each.</td><td>Those files are yours, and four repos carry the old instructions.</td></tr>
+<tr><td>10. A reviewer that runs the code?</td><td><b>Yes, as a paired reviewer, on tickets only.</b> You choose it in the Start popover or the ticket's menu. It starts at the first review request, works in the author's checkout, may build and test but never edit, and posts through sm like a run. If it can't review, a run of the same model takes over.</td><td>Running the code catches what reading misses. Starting at the first review spends nothing until there is a PR.</td></tr>
+</tbody>
+</table>
+
+<h3>The build</h3>
+<p>The build is six tickets, in order. <b>1</b> adds the new command, deletes the old two, handles GitHub Codex's refusals, and opens the instruction-file PRs. On its own it ends last night's pattern: a refusal reaches the author and you at once instead of after an hour. <b>2</b> adds Codex and Claude review runs and the fallback, which gets the review done. <b>3</b> adds repo, lane and ticket policies. <b>4</b> adds paired reviewers. <b>5</b> (web, including the Start popover's Reviewer row) and <b>6</b> (Android, needs an APK install) follow in parallel and move this document to <code>docs/specs/</code>. Appendix J lists what each ticket must deliver and how it is checked.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>A ticket can have a reviewer that runs the code.</b> The Board's Start popover gains a Reviewer row, and a ticket's policy may be a paired reviewer: an agent in the author's checkout (scenario 4, decision 10). Every other decision stands as you accepted it. The build grows from five tickets to six; paired reviewers are ticket 4.</p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<div class="toc">
+  <div><a href="#a">A. What exists today</a></div>
+  <div><a href="#b">B. Commands</a></div>
+  <div><a href="#c">C. Policies: shape, storage, resolution</a></div>
+  <div><a href="#d">D. How a request runs</a></div>
+  <div><a href="#e">E. Review runs: prompts and output</a></div>
+  <div><a href="#f">F. The posted review</a></div>
+  <div><a href="#g">G. Wakes, pushes and inbox items</a></div>
+  <div><a href="#h">H. Instruction-file text</a></div>
+  <div><a href="#i">I. Routes, payloads and screens</a></div>
+  <div><a href="#j">J. Tickets</a></div>
+  <div><a href="#k">K. Requirement trace</a></div>
+  <div><a href="#z">Z. FAQ</a></div>
+</div>
+<p>Paths are relative to <code>crates/sm-server/</code> unless they start with <code>android-app/</code> or <code>docs/</code>. <code>http.rs</code> is <code>src/http.rs</code>; <code>sm.rs</code> is <code>src/bin/sm.rs</code>. Line numbers are at <code>origin/main</code> 9d9dd29.</p>
+
+<h3 id="a">A. What exists today</h3>
+<h4>A1. <code>sm request-codex-review</code></h4>
+<ul>
+  <li>CLI: variant <code>sm.rs:91</code>, args <code>RequestCodexReviewArgs</code> <code>sm.rs:793</code>, create <code>run_request_codex_review_create</code> <code>sm.rs:2410</code>, subcommands <code>list</code>, <code>status</code>, <code>cancel</code> <code>sm.rs:2397-2548</code>. Flags <code>--notify --repo --steer --all --inactive --json --pr --poll-interval</code> (30 s) <code>--retry-interval</code> (1200 s).</li>
+  <li>Routes <code>GET/POST /codex-review-requests</code>, <code>GET/DELETE /codex-review-requests/{id}</code> (<code>http.rs:1617-1624</code>); create handler <code>create_codex_review_request</code> <code>http.rs:5063</code>.</li>
+  <li>Table <code>codex_review_request_registrations</code> in the queue database (<code>config.sm_send.db_path</code>, live file <code>message_queue.db</code>), schema <code>queue.rs:3387-3440</code>, create logic <code>queue.rs:7171</code> (one active request per PR; same owner and head returns the existing row; a new head supersedes).</li>
+  <li>Posting uses the <code>gh</code> CLI through trait <code>GitHubReviewPoster</code> (<code>http.rs:358</code>, production <code>GhCliReviewPoster</code> <code>http.rs:417</code>).</li>
+  <li>Watcher <code>run_codex_review_request_watcher</code> <code>http.rs:5841</code>, recovered at start <code>http.rs:5724</code>. Pickup is a 👀 reaction from a Codex actor (<code>github_actor_is_codex</code> <code>http.rs:1340</code>). A review counts if it is a Codex PR review on the requested head, or a Codex comment whose "Reviewed commit" matches (<code>http.rs:1104</code>, <code>1177</code>).</li>
+  <li>Constants <code>http.rs:162-168</code>: TTL 3600 s; failure retry 120 s; at most 3 attempts. With no 👀, it re-posts every retry interval until the TTL.</li>
+  <li>Only one failure reply is recognised: a Codex comment containing "something went wrong" (<code>http.rs:1152</code>). The quota reply ("You have reached your Codex usage limits for code reviews…") matches nothing, so the request re-posts every 20 minutes and expires at 60.</li>
+  <li>Wakes: landed <code>http.rs:6582</code>, expired <code>http.rs:5633</code>, head changed <code>http.rs:6343</code>, failed <code>http.rs:5672</code>. Enqueued with the state change in one transaction (<code>queue.rs:989-1050</code>), then drained (<code>sessions.rs:5120</code>).</li>
+  <li>Handoff re-points <code>notify_session_id</code> and <code>requester_session_id</code> (<code>queue.rs:2524-2527</code>). A request can trigger the review handoff ask (<code>http.rs:5181</code>, <code>5262</code>; <code>store.rs:280</code>). It also records an implicit PR claim (<code>http.rs:5285</code>).</li>
+  <li>History and analytics read the table: <code>work_history.rs:409, 1218, 1228</code>, <code>analytics_time.rs:902</code>, <code>analytics_spend.rs:1097</code>.</li>
+</ul>
+<h4>A2. <code>sm review</code></h4>
+<ul>
+  <li>Variant <code>sm.rs:90</code>, <code>run_review</code> <code>sm.rs:2122</code>. There are three forms:
+    <ul>
+      <li>an existing Codex agent, via <code>POST /sessions/{id}/review</code> (<code>http.rs:1787</code>, <code>start_session_review</code> <code>http.rs:4496</code>), which types <code>/review</code> through tmux (<code>runtime.rs:718</code>);</li>
+      <li><code>--new</code>, via <code>POST /sessions/review</code> (<code>http.rs:1767</code>, <code>spawn_review_session</code> <code>http.rs:4546</code>), which starts a Codex child;</li>
+      <li><code>--pr</code>, via <code>POST /reviews/pr</code> (<code>http.rs:1692</code>, <code>start_pr_review</code> <code>http.rs:5335</code>), which posts <code>@codex review</code> once with no retry.</li>
+    </ul></li>
+  <li>Config <code>[codex_review]</code> (<code>CodexReviewConfig</code> <code>config.rs:1185</code>). No repo's CLAUDE.md or AGENTS.md mentions <code>sm review</code>.</li>
+</ul>
+<h4>A3. Things the design builds on</h4>
+<ul>
+  <li>Owner settings: keys <code>new_agent</code>, <code>queue_limits</code>, <code>terminal_limits</code> (<code>owner_settings.rs:24</code>), stored as JSON in the session-store state (<code>owner_settings/store.rs:13-70</code>), served by <code>GET/PUT /client/settings</code> (<code>http.rs:1642</code>, <code>http/settings.rs</code>). Web <code>src/web/settings.js</code> (section list line 6); Android <code>ui/settings/SettingsScreen.kt</code>.</li>
+  <li>Board: lanes <code>board_lanes</code> (<code>board.rs:46</code>), members <code>board_members</code>, PR links <code>board_prs</code>, ticket ranks <code>board_ticket_ranks</code>, events <code>board_events</code>. PR-to-ticket links: <code>work_links</code> (<code>work_claims.rs:91</code>).</li>
+  <li>Spawning: <code>POST /sessions</code> / <code>CreateCoreSessionRequest</code> (<code>sessions.rs:9367</code>); models from <code>GET /client/session-models</code>. Today that returns Claude <code>fable sonnet opus opus[1m] haiku</code> and Codex <code>gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-5.5</code>. Name rule: 1–32 characters of <code>[A-Za-z0-9_-]</code> (<code>http.rs:14567</code>).</li>
+  <li>Handoff: <code>hand_off_rows</code> <code>queue.rs:2511</code>; successor naming <code>x → x-h2</code> (<code>handoff/execute.rs:94</code>).</li>
+  <li>Weekly meters: <code>burn_samples</code> in <code>usage.db</code> (<code>usage_burn.rs:56</code>), window <code>codex_10080</code> / Claude's weekly window, per <code>account_key</code>.</li>
+  <li>Owner push: <code>owner_push.rs</code>; inbox "needs you" items as used by the board.</li>
+</ul>
+<h4>A4. Numbers behind the thresholds</h4>
+<table>
+<thead><tr><th>Measure (16–30 September, first attempt only)</th><th>Value</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>Time from <code>@codex review</code> to 👀</td><td>697 of 697 within 95 s; 689 within 60 s; mean 31 s</td><td><code>pickup_detected_at − latest_request_posted_at</code></td></tr>
+<tr><td>Time from request to review landing</td><td>mean 4.2 min; 672 of 677 within 10 min; longest 43.7 min</td><td><code>review_landed_at − requested_at</code>, state completed</td></tr>
+<tr><td>Quota outage 29–30 Sep</td><td>21 expired requests on 7 PRs, 66 posts, 22 PR-hours</td><td>state <code>expired</code>, requested after 06:00 UTC</td></tr>
+<tr><td>Local Codex during the outage</td><td>169 Astra and Sol turns between 11:10 pm and 7 am; weekly meter 52%</td><td><code>usage.db</code> <code>message_ledger</code>, <code>burn_samples</code></td></tr>
+<tr><td>Request volume</td><td>3,020 since June; 30–126 per day in late September</td><td>same table</td></tr>
+</tbody>
+</table>
+
+<h4>A5. Codex's built-in reviewer</h4>
+<p>These are in codex-fork at <code>76b5f12dd7</code>, under <code>codex-rs/</code>.</p>
+<ul>
+  <li><code>/review</code> and <code>codex exec review</code> start a separate one-shot review thread (<code>core/src/tasks/review.rs:103-140</code>). Its base instructions are the rubric <code>prompts/templates/review/rubric.md</code> (95 lines). Web search and multi-agent tools are disabled, and approvals are set to never. The rubric flags only discrete, provable bugs that the change introduces, tags each finding P0 to P3, and ends with a verdict: "patch is correct" or "patch is incorrect".</li>
+  <li>The output is JSON: <code>ReviewOutputEvent {findings[], overall_correctness, overall_explanation, overall_confidence_score}</code>. Each <code>ReviewFinding</code> has <code>title</code>, <code>body</code>, <code>confidence_score</code>, <code>priority</code> (0–3) and <code>code_location {absolute_file_path, line_range {start, end}}</code> (<code>protocol/src/protocol.rs:3499-3532</code>). It is parsed at <code>core/src/tasks/review.rs:190</code>.</li>
+  <li>It is recorded as an <code>ExitedReviewMode</code> event in the session's rollout file (<code>rollout/src/policy.rs:128</code>).</li>
+  <li><code>codex exec review</code> takes <code>--base BRANCH</code>, <code>--commit SHA</code>, <code>--uncommitted</code> or a custom prompt, with <code>-</code> reading it from stdin (<code>exec/src/cli.rs:274-306</code>). The four are mutually exclusive, so sm uses the custom prompt and states the base itself, in Codex's own wording (<code>prompts/src/review_request.rs:21</code>). <code>--ephemeral</code> would skip the rollout, so sm never passes it.</li>
+  <li>Claude Code's headless mode has <code>-p</code>, <code>--model</code>, <code>--effort</code> (low, medium, high, xhigh, max), <code>--output-format json</code>, <code>--json-schema</code>, <code>--allowedTools</code> and <code>--append-system-prompt</code> (<code>claude --help</code>, 30 September).</li>
+</ul>
+
+<h3 id="b">B. Commands</h3>
+<h4>B1. <code>sm request-review [PR] [--repo OWNER/NAME] [--steer TEXT] [--notify TARGET] [--json]</code></h4>
+<ul>
+  <li><b>PR</b>: optional. Without it, sm uses the open PR of the current branch (<code>gh pr view --json number</code> in the working directory, as <code>sm pr</code> does). With no open PR, it exits 2 with <code>No open PR for this branch. Pass the PR number.</code></li>
+  <li><b>Repo</b>, <b>notify target</b>, conflicts with another owner's active request, same-head reuse, and new-head supersede all behave exactly as <code>sm request-codex-review</code> does today (A1).</li>
+  <li><b>Steer</b>: at most 2,000 characters. GitHub Codex gets it after <code>Steer:</code> in the comment, as today. A review run gets it in its prompt (E1).</li>
+  <li>Subcommands <code>list [--all] [--inactive]</code>, <code>status [ID]</code> and <code>cancel [ID]</code> behave as today's. <code>status</code> is where the detail lives: the policy, its source, and one line per reviewer tried, with its outcome.</li>
+  <li>Success output, exact, and nothing else except today's <code>handoff_ask</code> and <code>claim_warning</code> lines when they apply: <code>Review requested for PR #{n} at {sha7}. sm wakes you when it lands.</code> <code>--json</code> prints the request object (I1).</li>
+</ul>
+<h4>B2. <code>sm review-policy</code></h4>
+<pre><code>sm review-policy show [--pr N | --ticket N | --lane GOAL] [--repo OWNER/NAME]
+sm review-policy set   SCOPE REVIEWER
+sm review-policy clear SCOPE
+SCOPE    := default | repo [OWNER/NAME] | lane GOAL | ticket N      (repo from --repo or the cwd)
+REVIEWER := github-codex | codex/MODEL/EFFORT | claude/MODEL/EFFORT
+          | paired/codex/MODEL/EFFORT | paired/claude/MODEL/EFFORT      (ticket scope only)</code></pre>
+<ul>
+  <li><code>show</code> with no flag prints every stored policy. With a flag, it prints the resolved policy, its source and its fallback, as a request would use them.</li>
+  <li><code>set</code> validates with C1 and prints the stored policy with its fallback.</li>
+  <li>Permissions (decision 7):
+    <ul>
+      <li>From a managed session (<code>CLAUDE_SESSION_MANAGER_ID</code> set), only <code>ticket</code> scope may be set or cleared. It is refused when that session, or its handoff successor or predecessor, holds the ticket's claim or the claim of a PR linked to it: <code>You hold #{n}; an author cannot choose its own reviewer.</code></li>
+      <li>Any other scope from a session gives <code>Only {owner} sets default, repo and lane review policies.</code></li>
+      <li>Without a session id, the CLI acts as the owner.</li>
+    </ul></li>
+</ul>
+<p>Examples: <code>sm review-policy set ticket 1848 claude/fable/max</code>; <code>sm review-policy set lane 1843 codex/gpt-6-astra/high</code>; <code>sm review-policy show --pr 1851</code> prints <code>ticket #1848: Claude run fable (max); falls back to Codex run gpt-6-astra (high)</code>.</p>
+<h4>B4. <code>sm review submit [--file PATH]</code></h4>
+<p>This is for paired reviewers only. The body is a <code>ReviewOutputEvent</code> JSON document (A5), read from stdin when <code>--file</code> is absent. Checks, in order, each exit 1 with the quoted text:</p>
+<ol>
+  <li>If the caller is not the paired reviewer of an active request: <code>You are not reviewing an active request.</code></li>
+  <li>If the JSON fails E4: <code>The review is not valid: {first problem}. The schema is in the brief.</code></li>
+  <li>If the PR head is no longer the request's head: <code>PR #{n} moved to {new7}; your review of {old7} is not posted. Stay idle.</code> sm then treats the request as head-moved (D5).</li>
+  <li>If the author's checkout has a different <code>HEAD</code>, or different <code>git status --porcelain --untracked-files=no</code> output, from the snapshot sm took when it sent the round: <code>You changed {files, or HEAD} in {author}'s checkout. Restore it, then submit again.</code></li>
+</ol>
+<p>On success sm posts the review (F), completes the request, wakes the author with G1, and prints <code>Posted review on PR #{n} at {sha7}: {counts}</code>, then <code>{url}</code>, then <code>Stay idle; sm sends you the next round if the author pushes.</code></p>
+<h4>B3. Removed in ticket 1</h4>
+<p>Ticket 1 removes:</p>
+<ul>
+  <li><code>sm request-codex-review</code>: the CLI variant, <code>RequestCodexReviewArgs</code>, and the <code>/codex-review-requests</code> routes (replaced by <code>/review-requests</code>);</li>
+  <li><code>sm review</code> and <code>run_review</code>;</li>
+  <li>routes <code>POST /sessions/{id}/review</code>, <code>POST /sessions/review</code> and <code>POST /reviews/pr</code>, with their handlers, monitors and <code>review_config</code> on session records;</li>
+  <li><code>CodexReviewConfig</code>.</li>
+</ul>
+<p>A config file that still has <code>[codex_review]</code> loads, with one warning at start: <code>config: [codex_review] is no longer used and is ignored</code>. Every sm message that names <code>sm request-codex-review</code> now names <code>sm request-review</code>. Clap's unknown-command tip already suggests similar names (checked on 30 September: <code>sm request-codex-reviews</code> prints <code>tip: some similar subcommands exist: 'roster', 'request-codex-review'</code>).</p>
+<p>The deploy order: the instruction-file PRs (H) are opened with ticket 1 and merged right after the restart that ships it. Before that restart, ticket 1 checks that no agent-facing text sm sends names the removed command.</p>
+
+<h3 id="c">C. Policies: shape, storage, resolution</h3>
+<h4>C1. Shape and validation</h4>
+<pre><code>{ "kind": "github_codex" }
+{ "kind": "codex",  "model": "gpt-6-astra", "effort": "high" }
+{ "kind": "claude", "model": "fable",       "effort": "max" }
+{ "kind": "paired", "provider": "codex", "model": "gpt-6-astra", "effort": "high" }   // ticket scope only</code></pre>
+<p>A <code>paired</code> reviewer at any scope other than a ticket is refused with 400, <code>A paired reviewer can only be set on a ticket.</code>, because it needs one author's checkout.</p>
+<ul>
+  <li><code>model</code> must be in <code>GET /client/session-models</code> for that provider (<code>codex-fork</code> for <code>codex</code>).</li>
+  <li><code>effort</code> must be one of Codex's <code>medium high xhigh</code> or Claude's <code>low medium high xhigh max</code>. Claude Code accepts <code>xhigh</code> (A5), which <code>owner_settings.rs</code> <code>CLAUDE_EFFORTS</code> does not list yet; ticket 2 adds it.</li>
+  <li>A failed check returns 400 and names the field, as owner settings do.</li>
+</ul>
+<h4>C2. Fallback and storage</h4>
+<p><b>Fallback</b> is computed, never stored. Tiers follow the table in CLAUDE.md §2.</p>
+<table>
+<thead><tr><th>Chosen</th><th>Tier</th><th>Fallback 1</th><th>Fallback 2</th></tr></thead>
+<tbody>
+<tr><td>GitHub Codex</td><td>—</td><td>Codex run gpt-6-sol, medium</td><td>Claude run opus, high</td></tr>
+<tr><td>Codex run gpt-6-astra (any effort)</td><td>top</td><td>Claude run fable, xhigh</td><td>—</td></tr>
+<tr><td>Codex run gpt-6-sol, gpt-5.6-sol, gpt-5.6-terra, gpt-5.5</td><td>mid</td><td>Claude run opus, high</td><td>—</td></tr>
+<tr><td>Codex run gpt-6-luna, gpt-5.6-luna</td><td>low</td><td>Claude run sonnet, high</td><td>—</td></tr>
+<tr><td>Claude run fable</td><td>top</td><td>Codex run gpt-6-astra, high</td><td>—</td></tr>
+<tr><td>Claude run opus, opus[1m]</td><td>mid</td><td>Codex run gpt-6-sol, medium</td><td>—</td></tr>
+<tr><td>Claude run sonnet, haiku</td><td>low</td><td>Codex run gpt-6-luna, high</td><td>—</td></tr>
+<tr><td>Paired, provider P, model M, effort E</td><td>of M</td><td>P run M, E</td><td>the other provider's run at M's tier, per the rows above</td></tr>
+</tbody>
+</table>
+<p>A model that is not in the table is treated as mid tier. The map is a constant in the review module. It changes with CLAUDE.md's tier table, and is not a setting.</p>
+<ul>
+  <li><b>Default</b>: a new owner-settings key <code>reviews</code> (added to the key list at <code>owner_settings.rs:24</code>):
+<pre><code>"reviews": {
+  "reviewer": { "kind": "github_codex" },
+  "skip_meter_percent": 95          // 50–100; 100 means never skip
+}</code></pre>
+  The number of runs at once is the new queue type's limit, <code>queue_limits.review</code> (default 4, range 0–16). It is set in Settings › Reviews and shown in Settings › Queue limits.</li>
+  <li><b>Repo, lane, ticket</b>: a new table in the queue database:
+<pre><code>CREATE TABLE review_policies (
+  scope TEXT NOT NULL,            -- 'repo' | 'lane' | 'ticket'
+  repo TEXT NOT NULL,             -- owner/name; for a lane, the goal's repo
+  number INTEGER NOT NULL,        -- 0 for repo; goal number for lane; ticket number
+  reviewer_json TEXT NOT NULL,    -- C1
+  set_by_session_id TEXT,         -- NULL when set by the owner
+  set_by_name TEXT NOT NULL,      -- 'Rajesh' or the agent's name at the time
+  set_at TEXT NOT NULL,
+  PRIMARY KEY (scope, repo, number));</code></pre>
+  A lane policy is keyed by its goal ticket, so it survives the lane being ended and re-added. Every set and clear appends a <code>board_events</code> row (<code>kind='review_policy'</code>), so it shows in the lane's recent changes.</li>
+  <li><b>GitHub Codex state</b>: a new single-row table:
+<pre><code>CREATE TABLE review_channels (
+  name TEXT PRIMARY KEY,          -- 'github_codex'
+  state TEXT NOT NULL,            -- 'available' | 'paused'
+  paused_at TEXT, refusal_url TEXT,
+  next_check_at TEXT, check_request_id TEXT,
+  updated_at TEXT NOT NULL);</code></pre></li>
+</ul>
+<h4>C3. Resolution</h4>
+<p>This runs at request time, for PR <i>P</i> in repo <i>R</i>:</p>
+<ol>
+  <li>Collect <i>P</i>'s tickets: the union of <code>work_links</code> rows for (<i>R</i>, <i>P</i>) and <code>board_prs</code> rows whose <code>pr_repo</code>/<code>pr_number</code> is <i>P</i>.</li>
+  <li>If any of those tickets has a ticket policy, use it. With several, use the ticket that sorts first by (lane rank, ticket rank in <code>board_ticket_ranks</code>, ticket number). A ticket in no lane sorts after every lane.</li>
+  <li>Otherwise, take the active lanes those tickets belong to (<code>board_members</code> joined to <code>board_lanes</code> where <code>ended_at IS NULL</code>). Among lanes that have a lane policy, use the one with the lowest rank number.</li>
+  <li>Otherwise, use the repo policy for <i>R</i>, if one is set.</li>
+  <li>Otherwise, use the default.</li>
+</ol>
+<table>
+<thead><tr><th>PR</th><th>Its tickets</th><th>Policies set</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>far #1851</td><td>#1848 (lane 1)</td><td>ticket #1848; lane 1843</td><td>ticket #1848</td></tr>
+<tr><td>far #1875</td><td>#1873 (lane 1)</td><td>lane 1843</td><td>lane 1 · Iteration 8 (#1843)</td></tr>
+<tr><td>sm #1780</td><td>#1768 (lane 2), #1770 (no lane)</td><td>repo session-manager</td><td>repo rajeshgoli/session-manager</td></tr>
+<tr><td>far #1890</td><td>#1885 (lane 3), #1886 (lane 1)</td><td>lane 1843 (rank 1); lane of #1885 (rank 3)</td><td>lane 1 (higher-ranked)</td></tr>
+<tr><td>sm #1790</td><td>none linked</td><td>none</td><td>default</td></tr>
+</tbody>
+</table>
+<p>The resolved policy and its source text are copied onto the request (D1). A later change to any policy affects only later requests.</p>
+
+<h3 id="d">D. How a request runs</h3>
+<h4>D1. Persisted request</h4>
+<p>The table keeps the name <code>codex_review_request_registrations</code>, so history and analytics keep working. Existing columns keep their meaning. A <i>step</i> is one reviewer in the chain: the chosen one, then each fallback. Added columns:</p>
+<table>
+<thead><tr><th>Column</th><th>Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>chain_json</code></td><td>TEXT</td><td>The chosen reviewer then its fallbacks (C1 objects), fixed at request time. NULL on rows from before this change.</td></tr>
+<tr><td><code>policy_source</code></td><td>TEXT</td><td><code>default</code>, <code>repo {owner/name}</code>, <code>lane {rank} · {goal title} (#{goal})</code> or <code>ticket #{n}</code>.</td></tr>
+<tr><td><code>step_index</code></td><td>INTEGER</td><td>0-based index into <code>chain_json</code>.</td></tr>
+<tr><td><code>step_state</code></td><td>TEXT</td><td><code>posted</code>, <code>picked_up</code>, <code>error_wait</code> (GitHub Codex); <code>queued</code>, <code>running</code> (run); <code>waiting_reviewer</code>, <code>reviewing</code>, <code>nudged</code> (paired); <code>owner</code> (you chose to review).</td></tr>
+<tr><td><code>reviewer_session_id</code></td><td>TEXT</td><td>The paired reviewer working the current step.</td></tr>
+<tr><td><code>checkout_snapshot</code></td><td>TEXT</td><td><code>HEAD</code> and <code>git status --porcelain --untracked-files=no</code> of the author's checkout when the round was sent (paired only).</td></tr>
+<tr><td><code>step_started_at</code></td><td>TEXT</td><td>When the current step started, or restarted after an error re-post.</td></tr>
+<tr><td><code>step_failures</code></td><td>INTEGER</td><td>Error replies seen in this step.</td></tr>
+<tr><td><code>steps_log_json</code></td><td>TEXT</td><td>An array of <code>{index, label, started_at, ended_at, outcome, reason}</code>; <code>reason</code> uses the vocabulary in G.</td></tr>
+<tr><td><code>run_job_id</code></td><td>TEXT</td><td>The queue job of the current run step.</td></tr>
+<tr><td><code>reviewer_label</code></td><td>TEXT</td><td><code>GitHub Codex</code>, <code>Codex run (gpt-6-sol, medium)</code>, <code>Claude run (opus, high)</code> or <code>{owner}</code>.</td></tr>
+<tr><td><code>round</code></td><td>INTEGER</td><td>1 plus the number of earlier completed requests on this PR.</td></tr>
+<tr><td><code>findings_json</code></td><td>TEXT</td><td><code>{"p0":0,"p1":1,"p2":2,"p3":0,"unrated":0,"verdict":"patch is incorrect"}</code> for runs; NULL for GitHub Codex.</td></tr>
+</tbody>
+</table>
+<p>New terminal state <code>no_reviewer</code>; states <code>expired</code> and <code>failed</code> are no longer written, and old rows keep them. <code>poll_interval_seconds</code> stays 30. <code>retry_interval_seconds</code> and <code>next_retry_at</code> are no longer used.</p>
+<h4>D2. GitHub Codex step</h4>
+<table>
+<thead><tr><th>Event, checked every 30 s poll</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td>GitHub Codex is paused and now &lt; <code>next_check_at</code>, or a check is already in flight on another request</td><td>Skip at once. Reason <code>paused (out of quota since {time})</code>.</td></tr>
+<tr><td>Paused and now ≥ <code>next_check_at</code>, with no check in flight</td><td>This request is the check: set <code>check_request_id</code>, then post as below.</td></tr>
+<tr><td>Step starts</td><td>Post <code>@codex review</code> (with <code>Steer:</code>), state <code>posted</code>.</td></tr>
+<tr><td>A bound review on the requested head (today's rule, A1)</td><td>Complete (D6). If this was the check: set state <code>available</code>, clear <code>check_request_id</code>.</td></tr>
+<tr><td>👀 from a Codex actor</td><td>State <code>picked_up</code>. If this was the check: set <code>available</code>.</td></tr>
+<tr><td>A Codex-authored comment after the post, not starting <code>@codex review</code>, whose lower-cased body contains <code>usage limits</code> or <code>add credits</code></td><td><b>Quota.</b> Set <code>paused</code>, <code>paused_at</code> (first time only), <code>refusal_url</code>, and <code>next_check_at = now + 7200 s</code>; clear <code>check_request_id</code>. Push G5 only on a change from <code>available</code> to <code>paused</code>. Advance, reason <code>out of code-review quota</code>.</td></tr>
+<tr><td>Any other Codex-authored comment after the post, not starting <code>@codex review</code>, with no <code>Reviewed commit:</code> line</td><td><b>Error.</b> First time in this step: state <code>error_wait</code>, re-post after 120 s and restart the timers. Second time: advance, reason <code>reported an error twice</code>.</td></tr>
+<tr><td>No 👀 and no Codex reply 300 s after the latest post</td><td>Advance, reason <code>no response in 5 minutes</code>. No re-post. If this was the check, move <code>next_check_at</code> 7200 s on.</td></tr>
+<tr><td><code>picked_up</code> and no review 3600 s after the latest post</td><td>Advance, reason <code>picked up but no review in 60 minutes</code>.</td></tr>
+</tbody>
+</table>
+<p>After it advances, the watcher keeps looking for a bound GitHub Codex review for this request until the request ends. If one lands first, it completes the request (D6). "Try now" (I3) sets <code>next_check_at = now</code>.</p>
+<h4>D3. Run step</h4>
+<ol>
+  <li><b>Meter.</b> Read the newest weekly sample (window <code>codex_10080</code> for Codex, Claude's weekly window for Claude) for the account that provider's new sessions use, which is its most recently observed <code>account_key</code>. If <code>percent ≥ skip_meter_percent</code>, advance with reason <code>{Provider} weekly meter at {p}%</code>. A missing sample never skips.</li>
+  <li><b>Checkout.</b>
+    <ul>
+      <li>Find the repo's checkout from <code>board.checkouts[repo]</code>, else <code>~/projects/{repo_name}</code>. Missing: advance, reason <code>no local checkout of {repo}</code>.</li>
+      <li>Run <code>git -C {checkout} fetch origin pull/{n}/head {base}</code>.</li>
+      <li>Take <code>{merge_base} = git merge-base {sha} origin/{base}</code>.</li>
+      <li>Run <code>git worktree add --detach ~/worktrees/{repo_short}-{n}-review-r{round} {sha}</code>. <code>{repo_short}</code> comes from owner settings <code>new_agent.repo_short</code>, else the repo name.</li>
+      <li>Any failure: advance, reason <code>failed to start: {first line of the error}</code>.</li>
+    </ul></li>
+  <li><b>Prompt.</b> sm writes <code>~/.local/share/claude-sessions/reviews/{request_id}/r{round}-s{step}/prompt.md</code> (E1), plus <code>rubric.md</code> and <code>schema.json</code> for a Claude run.</li>
+  <li><b>Queue job.</b> sm submits a job of the new type <code>review</code>. Its fields:
+    <ul>
+      <li>label: <code>review {repo_short} #{n} r{round}</code>;</li>
+      <li>cwd: the checkout;</li>
+      <li>command: E2 or E3;</li>
+      <li>wall-clock limit: 45 minutes;</li>
+      <li>owner: <code>review_request:{id}</code>.</li>
+    </ul>
+    Queue changes this needs:
+    <ul>
+      <li>The <code>review</code> type has its own limit, <code>queue_limits.review</code>. It does not count toward <code>max_running</code>, and it waits for <code>perf</code> jobs as every type does.</li>
+      <li>A job with an owner sends no <code>[sm queue]</code> wake. Its terminal state calls the review handler instead.</li>
+    </ul>
+    Time spent waiting for a slot does not count toward the 45 minutes.</li>
+  <li><b>Result.</b> When the job ends:
+    <ul>
+      <li>If it exited 0 and E4 yields a valid review, post it (F), then complete the request (D6).</li>
+      <li>If it exited 0 but no valid review came back: advance, reason <code>failed: no review output</code>.</li>
+      <li>On any other exit code: advance, reason <code>failed: exit {code}</code>.</li>
+      <li>If it hit the limit: advance, reason <code>no result in 45 minutes</code>.</li>
+    </ul>
+    The checkout is removed in every case (D8).</li>
+</ol>
+<h4>D3b. Paired step</h4>
+<ol>
+  <li><b>Meter.</b> As D3.</li>
+  <li><b>Author's checkout.</b> Use the <code>worktree_path</code> of the active claim on the PR, else on the ticket (<code>work_claims</code>). If it is missing, or not a directory: advance, reason <code>no author checkout</code>.</li>
+  <li><b>Reviewer.</b> Reuse the live paired reviewer registered for (repo, ticket) if its provider, model and effort match. If they differ, retire it (step 7) and start a new one. To start one, create a session with:
+    <ul>
+      <li>provider, model and <code>reasoning_effort</code> from the policy;</li>
+      <li><code>working_dir</code> the author's checkout;</li>
+      <li>no parent;</li>
+      <li>name <code>{repo_short}-{ticket}-reviewer</code>, cut to 32 characters, with a numeric suffix if taken;</li>
+      <li>no initial message; the round message follows.</li>
+    </ul>
+    Register it in a new table <code>paired_reviewers(session_id PK, repo, ticket, pr_number, provider, model, effort, checkout, created_at, retired_at)</code>. Any failure: advance, reason <code>failed to start: {error}</code>.</li>
+  <li><b>Round.</b> Wait until the reviewer is idle (state <code>waiting_reviewer</code>). Then store <code>checkout_snapshot</code> and send E5 for its first request, or E6 after that (state <code>reviewing</code>). If the checkout's <code>HEAD</code> is not the requested head, the message says so and forbids running code for this round.</li>
+  <li><b>Watch.</b>
+    <ul>
+      <li>60 minutes after the round is sent with no submit, and the reviewer idle: send E8, state <code>nudged</code>.</li>
+      <li>At 90 minutes: advance, reason <code>no review after 90 minutes</code>. The reviewer stays for later rounds.</li>
+      <li>If the reviewer is killed or crashes: advance, reason <code>stopped unexpectedly</code>.</li>
+    </ul></li>
+  <li><b>Submit</b> (B4) posts (F) and completes the request (D6).</li>
+  <li><b>Lifetime.</b>
+    <ul>
+      <li>The reviewer follows its provider's handoff defaults. <code>hand_off_rows</code> (<code>queue.rs:2511</code>) also re-points <code>reviewer_session_id</code> and <code>paired_reviewers.session_id</code> to the successor. The review handoff ask (<code>store.rs:280</code>) is not sent to reviewers.</li>
+      <li>Every 10 minutes sm retires the reviewer if its PR is merged or closed, if the author's claim on the ticket has ended, or if the ticket's policy is no longer this paired reviewer. Retiring kills the session as <code>sm kill</code> does; the checkout belongs to the author and is left alone.</li>
+      <li>Paired reviewers do not use <code>review</code> queue slots. Their tests go through the queue like any agent's.</li>
+    </ul></li>
+</ol>
+<h4>D4. Fallback</h4>
+<p>"Advance" means moving to the next entry of <code>chain_json</code> (C2), which gives at most three steps for GitHub Codex and two for a run. A step can also be skipped at once, for a paused channel or the meter. When nothing is left, the request becomes <code>no_reviewer</code> (D7).</p>
+<h4>D5. Head moves</h4>
+<ul>
+  <li>A new <code>sm request-review</code> at a new head supersedes the active request, as today (<code>queue.rs:7171</code>). A running review job for the old request is cancelled and its checkout removed. A paired reviewer working on it gets E7 with reason <code>the PR head moved to {new7}</code>. The new request resolves its policy again, and a paired reviewer is reused.</li>
+  <li>If the watcher sees the head move with no new request, the request is superseded and the author gets G3. That check runs before any post, any run start and any posting of a run's result.</li>
+</ul>
+<h4>D6. Completion</h4>
+<p>The first review to reach the PR completes the request: a bound GitHub Codex review, a run's review posted by sm (F), or your review (D7). This happens in one transaction with the author's wake (G1), as today (<code>queue.rs:989-1050</code>). A review run still working on the request is cancelled, and its checkout removed.</p>
+<h4>D7. No reviewer</h4>
+<p>When the last step advances, the request becomes <code>no_reviewer</code>. The author gets G4 and you get the G6 push and inbox item. Its actions:</p>
+<ul>
+  <li><b>Retry now</b> creates a fresh request for the same PR, head and author, resolving the policy again. The old row stays <code>no_reviewer</code>.</li>
+  <li><b>Change policy</b> opens Settings › Reviews.</li>
+  <li><b>Review it myself</b> reopens the request with state <code>owner</code>. The author gets G7. The request completes when a PR review arrives from your GitHub login (<code>gh api user</code>) after that moment and without the <code>sm-review-request</code> marker. There is no timeout.</li>
+</ul>
+<p>A <code>no_reviewer</code> request never retries on its own.</p>
+<h4>D8. Checkouts</h4>
+<p>When a run's job reaches any terminal state, sm runs <code>git -C {checkout} worktree remove --force {worktree}</code>. On server start, and every 10 minutes, sm also removes any <code>~/worktrees/*-review-r*</code> worktree whose request is not active. Runs never commit, so nothing is lost. The prompt and output files under <code>reviews/{request_id}/</code> are kept for 14 days, for debugging.</p>
+<h4>D9. Restart safety</h4>
+<p>The server restarts the watcher for every active request, as <code>recover_codex_review_request_watchers</code> does today. All timers are absolute times on the row. Review runs are queue jobs, so the queue recovers them as it recovers any job. A run that ended while the server was down is processed when the watcher restarts.</p>
+
+<h3 id="e">E. Review runs: prompts and output</h3>
+<h4>E1. Prompt (both providers)</h4>
+<p>The first paragraph is Codex's own base-branch prompt (A5), with this PR's values. Values are filled exactly. A block in braces is left out when empty, and each block is cut to the stated length.</p>
+<pre><code>Review the code changes against the base branch '{base}'. The merge base commit for this comparison is {merge_base}. Run `git diff {merge_base}` to inspect the changes relative to {base}. The head of PR #{n} in {repo}, "{title}", is checked out here at {sha}. Provide prioritized, actionable findings.
+
+## What this PR is for
+{PR description, first 6,000 characters}
+{for each linked ticket: ### #{t} {title}  +  first 4,000 characters of its body}
+{lane: ### Lane goal #{goal} {title}  +  first 4,000 characters of its body}
+
+## Earlier reviews on this PR, and the author's replies
+{newest first, first 20,000 characters in all: each earlier sm or GitHub Codex review (summary and findings), each followed by the PR comments posted after it}
+Do not repeat a finding that the author has answered unless you disagree with the answer. If you disagree, say why in the finding.
+
+{steer: ## The author asks you to focus on
+{steer}}</code></pre>
+<p>sm fetches all of this with <code>gh</code> before the run starts, so the run needs no network or GitHub access.</p>
+<h4>E2. Codex run</h4>
+<pre><code>{codex-fork command from config} exec -m {model} -c model_reasoning_effort="{effort}" \
+  -s read-only --json review - &lt; prompt.md &gt; events.jsonl</code></pre>
+<p>Output: the <code>thread_id</code> of the first <code>thread.started</code> event in <code>events.jsonl</code> names the session. sm reads that session's rollout file, the file under the fork's <code>CODEX_HOME</code> <code>sessions/</code> tree whose name ends in <code>{thread_id}.jsonl</code>. It takes the <code>review_output</code> of the last <code>exited_review_mode</code> event: a <code>ReviewOutputEvent</code> (A5).</p>
+<h4>E3. Claude run</h4>
+<pre><code>claude -p --model {model} --effort {effort} --output-format json \
+  --json-schema "$(cat schema.json)" --append-system-prompt "$(cat rubric.md)" \
+  --allowedTools "Read" "Grep" "Glob" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" \
+  --disallowedTools "Edit" "Write" "NotebookEdit" "WebFetch" "WebSearch" \
+  &lt; prompt.md &gt; result.json</code></pre>
+<ul>
+  <li><code>rubric.md</code> is a copy of Codex's rubric, kept at <code>crates/sm-server/src/review/rubric.md</code> with its Apache-2.0 notice.</li>
+  <li><code>schema.json</code> is the JSON Schema of <code>ReviewOutputEvent</code>, at <code>crates/sm-server/src/review/schema.json</code>.</li>
+  <li>Output: the structured output in <code>result.json</code>.</li>
+</ul>
+<h4>E5. Paired reviewer: first round</h4>
+<pre><code>You are {name}, the paired reviewer for ticket #{ticket} in {repo}. You work in the author's checkout, {checkout}, so that you can build the code and run its tests. You must not edit, commit, push, or change branches there, and you must not comment on GitHub. The author, {author}, is idle while you review.
+
+{the rubric: crates/sm-server/src/review/rubric.md}
+
+{E1's prompt for this PR}
+{if HEAD differs: The checkout is at {head7}, not the PR head {sha7}. Read the PR's diff with git this round, and do not build or run anything.}
+
+You may build and run tests. Run anything longer than a minute with `sm queue run --type tests --cwd {checkout}`.
+
+When done, write your review as JSON matching this schema, and run `sm review submit --file <path>`:
+{crates/sm-server/src/review/schema.json}
+Then stay idle. If the author pushes and asks again, sm sends you the next round.</code></pre>
+<h4>E6. Paired reviewer: later rounds</h4>
+<pre><code>[sm review] Round {k} of PR #{n}: the author pushed and asked again. The head is now {sha}{, and the checkout is at it | ; the checkout is at {head7}, so do not build or run anything this round}. Read the author's replies to your last review first ({last_review_url}). Then review the whole PR again. Do not raise a finding the author has answered unless you disagree, and then say why.
+{steer: The author asks you to focus on: {steer}}
+Submit with `sm review submit` as before.</code></pre>
+<h4>E7. Stop</h4>
+<pre><code>[sm review] Stop reviewing PR #{n} @ {sha7}: {reason}. Do not submit. Stay idle.</code></pre>
+<p>Reasons: <code>the PR head moved to {new7}</code>, <code>{reviewer_label} already posted a review</code>, <code>the author cancelled the request</code>.</p>
+<h4>E8. Nudge</h4>
+<pre><code>[sm review] You have not submitted your review of PR #{n} after 60 minutes. Submit what you have with `sm review submit` within 30 minutes, or sm gives this round to another reviewer.</code></pre>
+<h4>E4. Validating the output</h4>
+<p>A valid review has a <code>findings</code> array, which may be empty, and a non-empty <code>overall_correctness</code>. Each finding is checked:</p>
+<ul>
+  <li><code>priority</code> must be 0 to 3, or null, which counts as unrated;</li>
+  <li><code>code_location.absolute_file_path</code> must lie inside the checkout;</li>
+  <li><code>line_range</code> must have 1 ≤ start ≤ end.</li>
+</ul>
+<p>A finding that fails a check is kept, but placed in the review body without a line comment. A title's leading <code>[Pn]</code> tag is removed and re-added from <code>priority</code>.</p>
+
+<h3 id="f">F. The posted review</h3>
+<p>sm checks that the PR head is still <code>{sha}</code> (D5). Then it posts one review with <code>gh api repos/{owner}/{repo}/pulls/{n}/reviews --method POST --input review.json</code>:</p>
+<pre><code>{ "commit_id": "{sha}", "event": "COMMENT", "body": "{body}",
+  "comments": [ { "path": "{path relative to the checkout}", "side": "RIGHT", "line": {end},
+                  "start_line": {start, only when start &lt; end}, "start_side": "RIGHT",
+                  "body": "**[P{p}] {title}**\n\n{finding body}" } ] }</code></pre>
+<ul>
+  <li>A finding gets a line comment when its file is in the PR's changed files and its end line falls in a hunk of <code>git diff {merge_base} {sha}</code> on the new side. Every other finding goes in the body.</li>
+  <li><code>COMMENT</code> is required, because GitHub refuses approve and request-changes on a PR by the same account, and all agents post as you.</li>
+  <li>If GitHub answers 422 (a line it will not accept), sm posts again with every finding in the body and no line comments.</li>
+</ul>
+<p>The body:</p>
+<pre><code>&lt;!-- sm-review-request:{request_id} --&gt;
+**sm review** · {Codex|Claude} run ({model}, {effort}) · round {k} · {policy source}{, fallback from {first reviewer}}
+
+**Reviewed commit:** `{sha10}` · **Findings:** {p0} P0 · {p1} P1 · {p2} P2 · {p3} P3{ · {u} unrated} · **Verdict:** {overall_correctness}
+
+{overall_explanation}
+
+{only if some findings had no line comment: ### Findings not on a changed line  +  "#### [P{p}] {title}", "`{path}:{start}-{end}`", body, for each}</code></pre>
+<p>Zero-count priorities are left out of the Findings line, except that it always shows at least <code>0 findings</code>. The marker differs from the doc-review marker <code>sm-review:</code> (<code>http/docs/review.rs:19</code>), so neither path mistakes the other's review. <code>github_actor_is_codex</code> is false for your login, so the GitHub Codex watcher ignores it.</p>
+
+<h3 id="g">G. Wakes, pushes and inbox items</h3>
+<p>Wakes go to <code>notify_session_id</code> with delivery mode <code>sequential</code>, as today.</p>
+<table>
+<thead><tr><th></th><th>When</th><th>Text, exact</th></tr></thead>
+<tbody>
+<tr><td>G1</td><td>Any review lands (GitHub Codex or a run)</td><td><code>[sm review] Review of PR #{n} @ {sha7} is here: {url}</code></td></tr>
+<tr><td>G2</td><td>(reserved)</td><td>—</td></tr>
+<tr><td>G3</td><td>Head moved with no new request</td><td><code>[sm review] Review request {id} for PR #{n} stopped: the PR head moved from {old7} to {new7}. Run `sm request-review {n}` when the new head is ready.</code></td></tr>
+<tr><td>G4</td><td>No reviewer</td><td><code>[sm review] No reviewer could take PR #{n} @ {sha7}. sm has told {owner}. Stand by: sm wakes you when a review lands or {owner} answers.</code></td></tr>
+<tr><td>G5</td><td>Push: GitHub Codex paused</td><td><code>GitHub Codex is out of review quota. Reviews go to local runs until it recovers; sm checks every 2 hours.</code> Tapping it opens Settings › Reviews.</td></tr>
+<tr><td>G6</td><td>Push and inbox item: no reviewer</td><td>Push: <code>No reviewer could take PR #{n} ({author}). Tap to choose.</code> The inbox item is "Needs you", titled <code>PR #{n} has no reviewer</code>. It shows one line per step, <code>{label}: {reason}</code>, and three buttons (D7).</td></tr>
+<tr><td>G7</td><td>You chose to review</td><td><code>[sm review] {owner} will review PR #{n} @ {sha7} personally. Stand by.</code> When it lands: G1.</td></tr>
+</tbody>
+</table>
+<p>Reasons in G6 and <code>steps_log_json</code> are exactly these:</p>
+<ul>
+  <li><code>out of code-review quota</code></li>
+  <li><code>paused (out of quota since {h:mm am})</code></li>
+  <li><code>no response in 5 minutes</code></li>
+  <li><code>reported an error twice</code></li>
+  <li><code>picked up but no review in 60 minutes</code></li>
+  <li><code>{Provider} weekly meter at {p}%</code></li>
+  <li><code>no local checkout of {repo}</code></li>
+  <li><code>failed to start: {error}</code></li>
+  <li><code>failed: exit {code}</code></li>
+  <li><code>failed: no review output</code></li>
+  <li><code>no result in 45 minutes</code></li>
+  <li><code>no author checkout</code></li>
+  <li><code>no review after 90 minutes</code></li>
+  <li><code>stopped unexpectedly</code></li>
+</ul>
+<p>Times are the server's local time.</p>
+
+<h3 id="h">H. Instruction-file text</h3>
+<p>In session-manager <code>CLAUDE.md</code> and <code>AGENTS.md</code> §4, the first paragraph becomes:</p>
+<blockquote>Request a review with <code>sm request-review &lt;pr-number&gt;</code>. Treat the response as registration only, then go idle — do not poll. sm chooses the reviewer, moves to another when one fails, and wakes you with <code>[sm review]</code> when a review is on the PR. If sm refuses the request, or wakes you saying no reviewer could take it, tell me and stand by. Do not post <code>@codex review</code> yourself.</blockquote>
+<p>In fractal-algo-rust, deskbar and office-automate, the <b>Requesting a review</b> paragraph (fractal-algo-rust <code>AGENTS.md:118</code>) becomes:</p>
+<blockquote><b>Requesting a review.</b> Request with <code>sm request-review &lt;pr-number&gt;</code>. This is registration only; sm picks the reviewer and wakes you when the review is on the PR. Go idle and wait — do not poll. If sm refuses, or wakes you saying no reviewer could take it, tell me and stand by. Do not post <code>@codex review</code> yourself.</blockquote>
+<p>In <code>docs/product/lessons.md:59</code>, <code>sm request-codex-review list --all</code> becomes <code>sm request-review list --all</code>.</p>
+
+<h3 id="i">I. Routes, payloads and screens</h3>
+<h4>I1. Routes</h4>
+<table>
+<thead><tr><th>Route</th><th>Who</th><th>Does</th></tr></thead>
+<tbody>
+<tr><td><code>POST /review-requests</code></td><td>session or CLI</td><td>Body <code>{repo, pr_number, notify_session_id?, requester_session_id?, steer?}</code>. It returns the request object: the row's columns from D1, <code>steps</code> (the parsed <code>steps_log_json</code> plus the steps not yet tried), and <code>handoff_ask</code> / <code>claim_warning</code> as today.</td></tr>
+<tr><td><code>GET /review-requests</code>, <code>GET/DELETE /review-requests/{id}</code></td><td>session or CLI</td><td>List, show and cancel. Cancel also cancels a running review job, and sends E7 to a paired reviewer.</td></tr>
+<tr><td><code>POST /review-requests/{id}/submit</code></td><td>the paired reviewer's session</td><td>Body <code>{session_id, review}</code>. Does B4.</td></tr>
+<tr><td><code>GET /review-policies[?repo=&amp;pr=|ticket=|lane=]</code></td><td>any</td><td>All stored policies, or <code>{reviewer, fallback[], source}</code> resolved.</td></tr>
+<tr><td><code>PUT /review-policies</code></td><td>owner guard, or session under B2's rules</td><td>Body <code>{scope, repo, number, reviewer | null, session_id?}</code>. <code>null</code> clears.</td></tr>
+<tr><td><code>GET/PUT /client/settings</code></td><td>owner</td><td>Adds the <code>reviews</code> key and <code>queue_limits.review</code> (C2), with the same merge rules.</td></tr>
+<tr><td><code>GET /client/reviews/status</code></td><td>owner</td><td><code>{github_codex: {state, paused_at, next_check_at, refusal_url}, last_24h: {github_codex, codex_runs, claude_runs, no_reviewer}, running: [...], meters: {codex, claude}}</code></td></tr>
+<tr><td><code>POST /client/reviews/github-codex/check</code></td><td>owner</td><td>Try now.</td></tr>
+<tr><td><code>POST /client/review-requests/{id}/retry</code>, <code>…/owner</code></td><td>owner</td><td>D7's Retry now and Review it myself.</td></tr>
+</tbody>
+</table>
+<h4>I2. Payload additions</h4>
+<ul>
+  <li><b>Board payload</b>, both <code>/board</code> and <code>/client/board</code>:
+    <ul>
+      <li>each lane gets <code>review_policy: {reviewer, fallback[], set_by_name, set_at} | null</code>;</li>
+      <li>each ticket gets the same field, plus <code>review: {state, reviewer_label, since} | null</code> for its PR's active request, shown in amber.</li>
+    </ul></li>
+  <li><b>Sessions</b>: an author with an active request gets <code>waiting_on_review: {pr_number, reviewer_label, since}</code>. A paired reviewer gets <code>paired_reviewer: {repo, ticket, pr_number, round, author_name, request_state}</code>.</li>
+  <li><b>Start options</b> (<code>/client/board/start-options</code>, <code>http/board.rs:850</code>) add <code>review_policy: {resolved, source}</code> for the ticket. <code>POST /client/board/start</code> accepts an optional <code>reviewer</code> (C1). When present, it stores the ticket policy, set by the owner, before creating the author.</li>
+  <li><b>Queue jobs</b>: a review job gets <code>review: {request_id, repo, pr_number, round, reviewer_label, policy_source, why, author_name}</code>. <code>why</code> is <code>default</code>, or <code>{first reviewer}: {reason}, so its fallback</code>.</li>
+</ul>
+<h4>I3. Screens</h4>
+<ul>
+  <li><b>Web Settings</b> (<code>src/web/settings.js</code>): add <code>['reviews','Reviews']</code> after Context handoff. Its groups are as in Figure 3:
+    <ul>
+      <li>the pause banner, shown only while paused, with Try now;</li>
+      <li>the default reviewer: a three-way switch, model and effort pickers fed by <code>/client/session-models</code>, and the fallback, read-only;</li>
+      <li>narrower policies: read-only rows linking to the Board, with repo rows editable here;</li>
+      <li>limits (<code>queue_limits.review</code>, <code>skip_meter_percent</code>), with live meters;</li>
+      <li>a 24-hour bar from <code>/client/reviews/status</code>.</li>
+    </ul></li>
+  <li><b>Web Board</b> (<code>src/web/board.js</code> lane header near line 65, ticket rows):
+    <ul>
+      <li>a review pill in the lane header opens a popover with "Use the default / Set for this lane" and the same one-line editor (Figure 4);</li>
+      <li>ticket rows show a pill only when a ticket policy is set, and the row menu gains "Review policy…";</li>
+      <li>the pill's tooltip names who set it.</li>
+    </ul></li>
+  <li><b>Web Start popover</b> (<code>src/web/board-start.js</code>): a Reviewer row, as in Figure 4b. It offers a switch between Lane default (showing what that resolves to), GitHub, Codex run, Claude run and Paired, then provider, model and effort pickers where they apply, and the fallback as a note.</li>
+  <li><b>Web Agents</b>: a paired reviewer's card shows <code>Reviewing PR #{n} for {author} · round {k}</code>, or <code>Paired reviewer for #{ticket} · idle</code> between rounds.</li>
+  <li><b>Web Queue</b> (<code>src/web/queue.js</code>): review jobs show the fields of I2 on the card and in the side panel (Figure 5). The panel's log is the job's log.</li>
+  <li><b>Web Agents</b> (<code>src/web/agents.js</code>): an author with <code>waiting_on_review</code> shows <code>Waiting on review by {reviewer_label} · {age}</code> in amber.</li>
+  <li><b>Web Inbox</b>: the G6 item with its three buttons.</li>
+  <li><b>Android</b>:
+    <ul>
+      <li>a new <code>ui/settings/ReviewsSection.kt</code> in <code>SettingsScreen.kt</code> (Figure 7A);</li>
+      <li>the Board lane ⋮ and ticket menus open a bottom sheet with the editor (7B), and the Board's Start sheet gains the Reviewer row;</li>
+      <li>the Queue tab shows review jobs' fields;</li>
+      <li>the G6 inbox item and push (7C);</li>
+      <li><code>ApiService.kt</code> gains the routes in I1.</li>
+    </ul></li>
+</ul>
+
+<h3 id="j">J. Tickets</h3>
+<table>
+<thead><tr><th>#</th><th>Ticket</th><th>Delivers</th><th>Done when</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Reviews 1/6: <code>sm request-review</code>, GitHub Codex failures, removals</td><td>B1, B3; D1; D2; D5, D6, D7 for GitHub Codex; G; <code>review_channels</code>; the <code>reviews</code> settings key, with the chain fixed to <code>[github_codex]</code> until ticket 2; I1 request, status, check and retry routes; H as one PR per repo. Starts after nothing.</td><td>Unit tests drive a fake <code>GitHubReviewPoster</code> through each D2 row. On the live server, one request on a test PR while GitHub Codex refuses posts exactly one <code>@codex review</code>, and the author and your phone are told within 20 s. A second request posts nothing until <code>next_check_at</code>. <code>rg "request-codex-review|sm review "</code> finds nothing outside <code>docs/</code>.</td></tr>
+<tr><td>2</td><td>Reviews 2/6: review runs and fallback</td><td>A5 wiring; C2 fallback map; D3, D4, D5 for runs, D8, D9; E1–E4; F; the <code>review</code> queue type and job owner hook. Starts after 1.</td><td>Live: on a small session-manager PR, a Codex run and a Claude run each post a review with line comments, and the author gets G1. Forcing the meter skip moves a request to the other provider. Moving the head cancels a running run and removes its checkout. E4 and F have tests built on recorded outputs.</td></tr>
+<tr><td>3</td><td>Reviews 3/6: repo, lane and ticket policies</td><td>C1, C3; <code>review_policies</code>; B2; the policy routes; board events; I2 board fields. Starts after 2.</td><td>C3's five examples are tests. B2's permission refusals are tests. <code>sm review-policy show --pr</code> agrees with the request's <code>policy_source</code> on a live PR.</td></tr>
+<tr><td>4</td><td>Reviews 4/6: paired reviewers</td><td>C1's <code>paired</code> kind; D3b; B4; E5–E8; the submit route; I2 session and start-options fields; <code>paired_reviewers</code>. Starts after 3.</td><td>Live: a ticket with a paired Codex policy gets <code>{repo_short}-{ticket}-reviewer</code> at its first request. It runs a test through the queue and submits, and sm posts. A second round reuses it. A tracked-file change is refused. Merging the PR retires it.</td></tr>
+<tr><td>5</td><td>Reviews 5/6: web</td><td>I3's web items, including the Start popover's Reviewer row; I2's queue fields. Starts after 4.</td><td>Figures 3, 4, 4b and 5 reproduced against live data in both themes; <code>tests/settings_client.test.cjs</code> extended.</td></tr>
+<tr><td>6</td><td>Reviews 6/6: Android</td><td>I3's Android items, including the Start sheet's Reviewer row. Starts after 4; needs an APK install.</td><td>Figure 7 reproduced on the preview emulator against live data. Whichever of 5 and 6 merges last moves this memo to <code>docs/specs/</code>.</td></tr>
+</tbody>
+</table>
+
+<h3 id="k">K. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Code location</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>One command; the author sees only "requested" and "here"</td><td>B1, G1</td><td><code>sm.rs</code> new variant replacing <code>:91</code>; routes replacing <code>http.rs:1617</code></td><td>CLI output test; wake text test</td></tr>
+<tr><td>Old commands deleted, instruction files updated</td><td>B3, H</td><td><code>sm.rs:90-91</code>, <code>http.rs:1692, 1767, 1787</code>, <code>config.rs:1185</code></td><td>ticket 1 rg check</td></tr>
+<tr><td>Chosen reviewer, then fixed fallback; first review wins</td><td>C2, D2–D6</td><td>watcher <code>http.rs:5841</code>; <code>queue.rs</code> terminal helpers <code>:685-1053</code></td><td>state-machine tests, one per D2 row and D3 outcome</td></tr>
+<tr><td>Quota pauses GitHub Codex everywhere; 2-hour check; Try now</td><td>C2, D2</td><td><code>review_channels</code> in <code>queue.rs</code> schema <code>:3387</code>; detector beside <code>http.rs:1152</code></td><td>quota-reply fixture using the 30 Sep comment text</td></tr>
+<tr><td>5-minute no-pickup, one error re-post, 60-minute picked-up limit</td><td>D2</td><td>constants <code>http.rs:162-168</code> replaced</td><td>timer tests with a fake clock</td></tr>
+<tr><td>Codex run is Codex's own reviewer; Claude run uses its rubric</td><td>A5, E</td><td>new <code>src/review/</code> module; queue job owner hook</td><td>recorded rollout and Claude result fixtures</td></tr>
+<tr><td>sm posts, with line comments; stale head refused</td><td>F, D5</td><td>new poster beside <code>GhCliReviewPoster</code> <code>http.rs:417</code></td><td>diff-hunk placement tests; 422 retry test</td></tr>
+<tr><td>Default, repo, lane, ticket; most specific wins</td><td>C1–C3</td><td><code>review_policies</code>; <code>owner_settings.rs:24</code></td><td>C3 examples</td></tr>
+<tr><td>Who may set policies</td><td>B2</td><td>policy PUT handler</td><td>refusal tests</td></tr>
+<tr><td>4 runs at once; 95% meter skip</td><td>C2, D3</td><td>queue type limits; <code>usage_burn.rs</code> read</td><td>slot and meter tests</td></tr>
+<tr><td>Two pushes only; Needs you with three actions</td><td>D7, G5, G6</td><td><code>owner_push.rs</code>; inbox item</td><td>push text tests; live check in ticket 1</td></tr>
+<tr><td>Paired reviewer: ticket only, starts at first review, author's checkout, runs code, checkout left unchanged</td><td>C1, D3b, B4, E5–E8</td><td>new <code>paired_reviewers</code> table; spawn via <code>CreateCoreSessionRequest</code> <code>sessions.rs:9367</code>; <code>hand_off_rows</code> <code>queue.rs:2511</code></td><td>live check in ticket 4; snapshot-refusal test</td></tr>
+<tr><td>Reviewer chosen in the Start popover</td><td>I2, I3</td><td><code>http/board.rs:850</code>, <code>board-start.js</code>, Android Board start sheet</td><td>tickets 5 and 6</td></tr>
+<tr><td>Screens</td><td>I3</td><td><code>settings.js</code>, <code>board.js</code>, <code>queue.js</code>, <code>agents.js</code>, Android files</td><td>tickets 5 and 6</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not keep re-posting to GitHub Codex, just less often?</b> Its refusals are not random. A quota refusal repeats until the allowance resets or you add credits, and a missing pickup is already abnormal after 95 seconds. Re-posting only delays the review the PR could have had from a run.</p>
+<p><b>Why runs rather than standing reviewer agents?</b> Revision 1 proposed agents. A standing agent carries memory of earlier rounds, and a lane agent carries knowledge of the plan. A run gets both from its prompt: earlier reviews, the author's replies, the tickets and the lane goal. Against that, runs remove five mechanisms: naming, context handoff, nudging, retiring, and one-PR-at-a-time queueing for lane reviewers. They also use Codex's purpose-built reviewer rather than a general agent following a brief. <code>sm review</code>'s old trouble was typing into a live screen on timers. <code>codex exec review</code> has no screen.</p>
+<p><b>How much does a run cost?</b> GitHub Codex costs about 0.04–0.07% of a Codex week per review (fit of 29 September). A Sol run on a PR of typical size is estimated at 0.1–0.2% of a Codex week, and Astra at about three times that. Runs write ordinary Codex and Claude session files, so the usage ledger counts them. Ticket 2 adds the per-review spend to Settings › Reviews.</p>
+<p><b>Did local Codex keep working while GitHub Codex refused?</b> Yes. Between 11:10 pm and 7 am there were 169 Astra and Sol turns, and the Codex weekly meter read 52%. GitHub Codex's refusal names "code reviews" specifically.</p>
+<p><b>What if GitHub Codex's review arrives after a run's?</b> The request is already complete, so sm does not wake the author again. The late review stays on the PR. The author's review loop already requires checking that a review belongs to the current request and head.</p>
+<p><b>Why not let the author choose the reviewer?</b> An author choosing a weaker reviewer is the one conflict of interest in this loop. The author may still steer the review with <code>--steer</code>.</p>
+<p><b>Why does the author not see which reviewer ran?</b> It has nothing to do with that information. The review itself names the reviewer, and <code>sm request-review status</code> shows every step for debugging.</p>
+<p><b>Two reviewers on one PR?</b> Not in this design. A stronger single reviewer, through a ticket policy, covers the cases raised so far.</p>
+<p><b>Why keep the table name <code>codex_review_request_registrations</code>?</b> History (<code>work_history.rs</code>) and analytics read it. Renaming it would change three readers for no behaviour gain.</p>
+<p><b>Does <code>sm doc publish --review</code> change?</b> No. That is your review of a document, with its own marker and wake.</p>
+<p><b>What happens to requests in flight at deploy?</b> Rows with no <code>chain_json</code> run as a one-step <code>[github_codex]</code> chain under the new rules. A request whose posts are already more than 5 minutes old with no pickup advances at the first poll. So it ends as <code>no_reviewer</code> rather than expiring later.</p>
+<p><b>Why can't a run execute the code?</b> A run works in a throwaway checkout with read-only tools, which keeps it cheap and parallel. Building there would mean a cold build for every round. The paired reviewer shares the author's warm build, which is why running code is its job.</p>
+<p><b>Won't a paired reviewer's builds clash with the author's?</b> The author is idle while it waits for the review, and long jobs from both go through sm's queue. sm refuses a review if the reviewer changed tracked files or <code>HEAD</code>. Build outputs such as <code>target/</code> are shared by design.</p>
+<p><b>Why 2 hours between checks?</b> The allowance's reset time is not in the refusal. A check costs one comment on a real PR and a few seconds of that request's time. Checking every 2 hours finds a reset within 2 hours, at a cost of up to 12 extra comments a day.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
