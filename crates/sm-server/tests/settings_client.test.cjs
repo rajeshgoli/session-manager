@@ -89,3 +89,8 @@ test('reverting to the old value while a save is pending still submits the rever
   assert.match(h.text(h.render(props)), /Saved/);
   assert.equal(h.input(h.render(props)).value, 'old');
 });
+
+test('shared handoff controls exclude the desktop app and retain future providers', () => {
+  const providers = harness().evaluate('handoffProviders')({ 'codex-app': true, future: false });
+  assert.deepEqual(Array.from(providers), ['claude', 'codex-fork', 'codex', 'future']);
+});

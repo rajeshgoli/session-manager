@@ -176,11 +176,15 @@ function QueueLimits({ data, write }) {
       save=${value => write('/client/settings', { queue_limits: { [key]: integerLimit(value) } })} />`)}</div>`;
 }
 
+function handoffProviders(providers) {
+  return [...new Set(['claude', 'codex-fork', 'codex', ...Object.keys(providers)])].filter(provider => provider !== 'codex-app');
+}
+
 function Handoff({ write }) {
   const [state, reload] = useResource('/handoff-defaults');
   return html`<h2>Context handoff</h2><p class="sub">Let a fresh agent take over when context fills up. Individual agents can override these defaults.</p>
     <${Resource} state=${state} retry=${reload}>${data => html`
-      ${[...new Set([...Object.keys(data.providers), 'claude', 'codex', 'codex-fork', 'codex-app'])].map(provider => html`<${Field}
+      ${handoffProviders(data.providers).map(provider => html`<${Field}
         label=${`Enable ${provider}`} type="checkbox" initial=${!!data.providers[provider]} save=${value => write('/handoff-defaults', { providers: { [provider]: value } })} />`)}
       ${[['threshold_percent', 'Context threshold (%)'], ['review_floor_percent', 'Review floor (%)'], ['reminder_percent', 'Reminder at (%)']].map(([key, label]) => html`<${Field}
         label=${label} type="number" min=${key === 'review_floor_percent' ? '0' : '0.01'} max="100" step="any" initial=${String(data[key])}
