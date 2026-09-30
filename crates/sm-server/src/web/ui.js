@@ -94,15 +94,18 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
 
 // ---- network state and polling ---------------------------------------------
 
-let failing = false;
+// Polls failing right now; the page is offline while any is.
+const failing = new Set();
+let nextPoll = 0;
 export const network = {
   get offline() {
-    return failing;
+    return failing.size > 0;
   },
-  report(ok) {
-    if (failing === !ok) return;
-    failing = !ok;
-    bus.emit('network', failing);
+  report(poll, ok) {
+    const before = failing.size > 0;
+    if (ok) failing.delete(poll);
+    else failing.add(poll);
+    if (before !== failing.size > 0) bus.emit('network', failing.size > 0);
   },
 };
 
@@ -120,6 +123,7 @@ export function usePoll(load, ms, deps = []) {
     let alive = true;
     let running = false;
     let first = true;
+    const poll = ++nextPoll;
     const run = async () => {
       clearTimeout(timer);
       // The first load runs even in a hidden tab; later polls wait for it to show.
@@ -130,10 +134,11 @@ export function usePoll(load, ms, deps = []) {
         try {
           const value = await saved.current();
           if (alive) setState({ value, error: null });
-          network.report(true);
+          network.report(poll, true);
         } catch (error) {
           if (alive) setState((prev) => ({ value: prev.value, error }));
-          if (!(error instanceof ApiError) || error.status >= 500) network.report(false);
+          // A 4xx answer means the server is reachable.
+          network.report(poll, error instanceof ApiError && error.status < 500);
         } finally {
           running = false;
         }
@@ -149,6 +154,7 @@ export function usePoll(load, ms, deps = []) {
     run();
     return () => {
       alive = false;
+      network.report(poll, true);
       clearTimeout(timer);
       document.removeEventListener('visibilitychange', visible);
     };

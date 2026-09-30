@@ -70,10 +70,15 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
 
   const folder = form && (form.workspace === OTHER ? form.otherWorkspace.trim() : form.workspace);
   useEffect(() => {
-    if (!form) return;
+    if (!form) return undefined;
+    // A slower answer for an earlier provider or folder must not replace this one.
+    let current = true;
     const query = new URLSearchParams({ provider: form.provider });
     if (folder && folder.startsWith('/')) query.set('working_dir', folder);
-    api(`/client/session-models?${query}`).then((value) => setModels(value.models || [])).catch(() => setModels([]));
+    api(`/client/session-models?${query}`)
+      .then((value) => current && setModels(value.models || []))
+      .catch(() => current && setModels([]));
+    return () => { current = false; };
   }, [form && form.provider, folder]);
 
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));

@@ -476,8 +476,11 @@ function SummaryTab({ agent }) {
     const timer = setTimeout(async () => {
       try {
         setRequest(await api(`/btw-requests/${encodeURIComponent(request.request_id)}`));
+        setError(null);
       } catch (e) {
+        // Keep polling: a copy of the request re-arms this effect.
         setError(e.message);
+        setRequest((current) => ({ ...current }));
       }
     }, 2000);
     return () => clearTimeout(timer);
