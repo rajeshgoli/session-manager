@@ -106,8 +106,19 @@ fn fixture(sender: Option<Arc<RecordingSender>>) -> Fixture {
     };
     fs::write(
         &state_file,
-        json!({"sessions": [session("eng00001", "running"), session("asleep01", "stopped")]})
-            .to_string(),
+        json!({"sessions": [
+            session("eng00001", "running"),
+            session("asleep01", "stopped"),
+            // A Codex agent for the approval-wait push (sm#1743).
+            {
+                "id": "cdx00001", "name": "codex-fork-cdx00001", "friendly_name": "sm-1722",
+                "working_dir": "/repo", "tmux_session": "codex-fork-cdx00001",
+                "provider": "codex-fork", "status": "running",
+                "log_file": log_dir.join("cdx00001.log").display().to_string(),
+                "created_at": "2026-09-24T00:00:00Z", "last_activity": "2026-09-24T00:01:00Z",
+            },
+        ]})
+        .to_string(),
     )
     .unwrap();
     let queue_state_dir = dir.join("queue");
@@ -555,4 +566,96 @@ async fn start_now_check_lists_warnings_and_refuses_unauthenticated_local_starts
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// sm#1743: a Codex agent blocked on an "Allow" prompt pushes the owner once
+/// it has waited a minute, and the notification is withdrawn when answered.
+#[tokio::test]
+async fn approval_wait_pushes_the_owner_and_withdraws_when_answered() {
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture(Some(sender.clone()));
+    request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    let log_file = f.dir.join("cdx00001.log");
+    let spec = sm_server::runtime::TmuxSessionSpec {
+        session_id: "cdx00001".to_owned(),
+        session_credential: None,
+        tmux_session: "codex-fork-cdx00001".to_owned(),
+        working_dir: "/repo".to_owned(),
+        log_file: log_file.clone(),
+        provider: "codex-fork".to_owned(),
+        initial_message: None,
+        force_initial_prompt_stdin: false,
+        claude_session_id: None,
+        model: None,
+        reasoning_effort: None,
+    };
+    let event_stream = sm_server::runtime::TmuxRuntime::from_app_config(&AppConfig::default())
+        .codex_fork_runtime_artifacts(&spec)
+        .unwrap()
+        .unwrap()
+        .event_stream_path;
+    fs::create_dir_all(event_stream.parent().unwrap()).unwrap();
+    let waiting = concat!(
+        "{\"ts\":\"2026-09-30T02:47:04Z\",\"event_type\":\"turn_started\",\"payload\":{}}\n",
+        "{\"ts\":\"2026-09-30T02:47:21Z\",\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\",\"activeFlags\":[\"waitingOnApproval\"]}}}\n",
+    );
+    fs::write(&event_stream, waiting).unwrap();
+
+    let pass = |at: time::OffsetDateTime| {
+        let state = f.state.clone();
+        async move {
+            tokio::task::spawn_blocking(move || state.run_follow_pass_at(true, at))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let (_, sessions) = request(&f.app, "GET", "/sessions/cdx00001", None).await;
+    assert_eq!(
+        sessions["activity_state"], "waiting_permission",
+        "{sessions}"
+    );
+
+    let start = time::OffsetDateTime::now_utc();
+    pass(start).await;
+    pass(start + time::Duration::seconds(30)).await;
+    assert!(sender.sent.lock().unwrap().is_empty(), "under a minute");
+    pass(start + time::Duration::seconds(61)).await;
+    pass(start + time::Duration::seconds(76)).await;
+    let sent = sender.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "one push per wait: {sent:?}");
+    let data = &sent[0].1;
+    assert_eq!(data["kind"], "approval_needed");
+    assert_eq!(data["title"], "sm-1722 needs your approval");
+    assert_eq!(data["session_id"], "cdx00001");
+    assert_eq!(data["blocking"], "1");
+    assert_eq!(data["reader_path"], "/?open=agent:cdx00001");
+    let notice_id = data["notice_id"].clone();
+    request(
+        &f.app,
+        "POST",
+        &format!("/client/notices/{notice_id}/ack"),
+        None,
+    )
+    .await;
+
+    fs::write(
+        &event_stream,
+        format!(
+            "{waiting}{}",
+            "{\"ts\":\"2026-09-30T04:41:18Z\",\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\",\"activeFlags\":[]}}}\n"
+        ),
+    )
+    .unwrap();
+    pass(start + time::Duration::seconds(91)).await;
+    let sent = sender.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1].1["kind"], "withdraw");
+    assert_eq!(sent[1].1["notice_id"], notice_id);
 }

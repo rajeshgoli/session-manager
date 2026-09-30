@@ -28,6 +28,8 @@ export function agentBall(agent, ctx, now = Date.now()) {
   const waits = agent.waiting_on || [];
   const ask = ctx.needsYou && ctx.needsYou.get(agent.id);
   if (ask) return { ball: 'you', text: `Waiting on you ${age(ask.newest_at, now)}: ${ask.preview || ask.title}` };
+  // Blocked on an Allow prompt in its terminal (sm#1743).
+  if (agent.state === 'waiting_permission') return { ball: 'you', text: 'Waiting on you: approval prompt in its terminal' };
   const docReview = waits.find((w) => w.kind === 'owner_review');
   if (docReview) {
     return { ball: 'you', text: `Waiting on you ${age(docReview.since, now)}: ${(docReview.label || '').replace(/^Owner review · /, '')}` };

@@ -8,6 +8,12 @@ use super::*;
 
 pub const NOTICE_MESSAGE: &str = "message";
 pub const NOTICE_REVIEW_REQUESTED: &str = "review_requested";
+/// An agent has been blocked on an approval prompt only the owner can answer
+/// (sm#1743). Withdrawn once the agent moves on.
+pub const NOTICE_APPROVAL_NEEDED: &str = "approval_needed";
+/// How long an agent waits on an approval before the owner is pushed, so a
+/// prompt answered at the desk never reaches the phone.
+pub const APPROVAL_NOTICE_DELAY: Duration = Duration::seconds(60);
 /// The push that takes a shown notice's notification off the phone (sm#1643).
 pub const NOTICE_WITHDRAW: &str = "withdraw";
 /// Notices stay listed for the app this long.
@@ -101,6 +107,34 @@ impl NewNotice {
             blocking: false,
         }
     }
+}
+
+impl NewNotice {
+    /// An approval wait: `{agent} needs your approval`. One notice per wait,
+    /// keyed by the session and when the wait was first seen.
+    pub fn approval_needed(
+        user_id: &str,
+        session_id: &str,
+        session_name: &str,
+        waiting_since: OffsetDateTime,
+    ) -> Self {
+        Self {
+            user_id: user_id.to_owned(),
+            kind: NOTICE_APPROVAL_NEEDED.to_owned(),
+            session_id: session_id.to_owned(),
+            session_name: session_name.to_owned(),
+            subject_id: approval_subject_id(session_id, waiting_since),
+            title: format!("{session_name} needs your approval"),
+            body: "Blocked on an Allow prompt. Open its terminal to answer.".to_owned(),
+            reader_path: format!("/?open=agent:{session_id}"),
+            blocking: true,
+        }
+    }
+}
+
+/// `approval:{session}:{unix seconds the wait was first seen}`.
+pub fn approval_subject_id(session_id: &str, waiting_since: OffsetDateTime) -> String {
+    format!("approval:{session_id}:{}", waiting_since.unix_timestamp())
 }
 
 impl Notice {

@@ -10,8 +10,8 @@ use crate::owner_messages::{derive_message_state, OwnerMessage, OwnerMessageStat
 use crate::owner_push::{
     self, follow_message_text, Follow, FollowMailer, FollowTarget, FollowWorld, JobView, MailError,
     NewNotice, Notice, NoticeMailer, NoticeWorld, Notification, OwnerPushStore, PushSender,
-    PushTokenRegistration, ReportView, SessionView, NOTICE_MESSAGE, NOTICE_REVIEW_REQUESTED,
-    TARGET_QUEUE_JOB, TARGET_SESSION,
+    PushTokenRegistration, ReportView, SessionView, APPROVAL_NOTICE_DELAY, NOTICE_APPROVAL_NEEDED,
+    NOTICE_MESSAGE, NOTICE_REVIEW_REQUESTED, TARGET_QUEUE_JOB, TARGET_SESSION,
 };
 
 const MAX_PUSH_TOKEN_CHARS: usize = 4096;
@@ -598,6 +598,13 @@ impl NoticeWorld for AppNoticeWorld<'_> {
             }
             // The lane has ended already: only opening the board clears it.
             crate::board::NOTICE_BOARD_LANE_DONE => Ok(true),
+            // Wanted while the same wait the sweep last saw is still open.
+            NOTICE_APPROVAL_NEEDED => {
+                let waits = self.state.approval_waits.lock().expect("approval waits");
+                Ok(waits.get(&notice.session_id).is_some_and(|since| {
+                    owner_push::approval_subject_id(&notice.session_id, *since) == notice.subject_id
+                }))
+            }
             _ => Ok(false),
         }
     }
@@ -860,9 +867,17 @@ impl AppState {
     /// One pass of the follow worker: fire finished targets (when `sweep`),
     /// then deliver. Returns problems worth logging.
     pub fn run_follow_pass(&self, sweep: bool) -> anyhow::Result<Vec<String>> {
+        self.run_follow_pass_at(sweep, OffsetDateTime::now_utc())
+    }
+
+    /// [`Self::run_follow_pass`] as of `now`, so tests can step the clock.
+    pub fn run_follow_pass_at(
+        &self,
+        sweep: bool,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Vec<String>> {
         let store = push_store(self);
         let world = AppFollowWorld { state: self };
-        let now = OffsetDateTime::now_utc();
         if sweep {
             owner_push::sweep(&store, &world, now)?;
         }
@@ -878,6 +893,7 @@ impl AppState {
         let notice_world = AppNoticeWorld { state: self };
         if sweep {
             owner_push::repair_notices(&store, &notice_world, now)?;
+            self.sweep_approval_waits(&store, now)?;
         }
         problems.extend(owner_push::deliver_notices(
             &store,
@@ -893,6 +909,45 @@ impl AppState {
             now,
         )?);
         Ok(problems)
+    }
+
+    /// Records which live sessions are blocked on an approval prompt, and
+    /// creates the owner's notice once a wait has lasted
+    /// [`APPROVAL_NOTICE_DELAY`] (sm#1743). A wait that ends drops out of the
+    /// map, which withdraws its notice.
+    fn sweep_approval_waits(
+        &self,
+        store: &OwnerPushStore,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<()> {
+        let waiting: Vec<SessionRecord> = self
+            .session_store
+            .list_sessions(false)?
+            .into_iter()
+            .filter(|session| live_activity_state(self, session) == Some("waiting_permission"))
+            .collect();
+        let due: Vec<(SessionRecord, OffsetDateTime)> = {
+            let mut waits = self.approval_waits.lock().expect("approval waits");
+            waits.retain(|id, _| waiting.iter().any(|session| &session.id == id));
+            waiting
+                .into_iter()
+                .filter_map(|session| {
+                    let since = *waits.entry(session.id.clone()).or_insert(now);
+                    (now - since >= APPROVAL_NOTICE_DELAY).then_some((session, since))
+                })
+                .collect()
+        };
+        for (session, since) in due {
+            let session_id = session.id.clone();
+            let notice = NewNotice::approval_needed(
+                &notice_user_id(self, None),
+                &session_id,
+                &session_display_name(session),
+                since,
+            );
+            store.create_notice(&notice, now)?;
+        }
+        Ok(())
     }
 
     pub fn with_push_sender(mut self, sender: Option<Arc<dyn PushSender>>) -> Self {

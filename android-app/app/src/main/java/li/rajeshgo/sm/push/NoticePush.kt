@@ -20,7 +20,9 @@ import li.rajeshgo.sm.R
 object NoticePush {
     const val CHANNEL_ID = "agent_messages"
     /** Board alerts (sm#1665) share the slot of session "board"; a newer one replaces the older. */
-    val KINDS = setOf("message", "review_requested", "board_ready", "board_lane_done")
+    val KINDS = setOf("message", "review_requested", "board_ready", "board_lane_done", KIND_APPROVAL_NEEDED)
+    /** An agent blocked on an Allow prompt (sm#1743): tapping opens the agent, not the Inbox. */
+    const val KIND_APPROVAL_NEEDED = "approval_needed"
     /** sm no longer needs the owner to see a shown notice (sm#1643). */
     const val KIND_WITHDRAW = "withdraw"
     /** The notice a notification shows, so a withdrawal removes only that one. */
@@ -54,9 +56,13 @@ object NoticePush {
             action = FollowPush.ACTION_OPEN_FOLLOW
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(FollowPush.EXTRA_SESSION_ID, message.sessionId)
-            putExtra(FollowPush.EXTRA_READER_PATH, message.readerPath)
-            putExtra(FollowPush.EXTRA_TITLE, message.body)
-            putExtra(FollowPush.EXTRA_INBOX, true)
+            if (message.kind == KIND_APPROVAL_NEEDED) {
+                putExtra(FollowPush.EXTRA_TITLE, message.title)
+            } else {
+                putExtra(FollowPush.EXTRA_READER_PATH, message.readerPath)
+                putExtra(FollowPush.EXTRA_TITLE, message.body)
+                putExtra(FollowPush.EXTRA_INBOX, true)
+            }
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
