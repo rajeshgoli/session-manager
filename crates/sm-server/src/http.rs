@@ -19525,6 +19525,7 @@ mod tests {
         for uri in [
             "/",
             "/?open=agent:abc12345",
+            "/board",
             "/queue",
             "/analytics",
             "/analytics/spend",
@@ -19554,6 +19555,27 @@ mod tests {
         let (status, body) = browser_host_get(&app, "/history?format=json", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["schema_version"], 1);
+        let (status, body) = browser_host_get(&app, "/client/board", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["lanes"].is_array());
+        // Legacy JSON retains its session-cookie guard; the browser app uses
+        // /client/board. Both JSON negotiation forms must still return JSON.
+        for uri in ["/board?format=json", "/board"] {
+            let mut request = browser(uri);
+            request.headers_mut().insert(
+                COOKIE,
+                format!("{SESSION_COOKIE_NAME}={}", owner_session_cookie())
+                    .parse()
+                    .unwrap(),
+            );
+            request.headers_mut().insert(
+                axum::http::header::ACCEPT,
+                "application/json".parse().unwrap(),
+            );
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert!(body["lanes"].is_array(), "{body}");
+        }
         // The shell still needs the owner's login.
         let (status, _) = browser_host_get(&app, "/queue", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -19605,6 +19627,11 @@ mod tests {
         assert!(!html.contains(r#"id="sm-config""#));
         let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(app_host("/board")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("board-add"));
+        assert!(!html.contains(r#"id="sm-config""#));
         let response = app.clone().oneshot(app_host("/queue")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }

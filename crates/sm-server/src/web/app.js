@@ -8,6 +8,7 @@ import {
   html, api, bus, network, usePoll, useShared, setShared, stored, store, panels,
   openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
+import { BoardPage } from './board.js';
 import { AgentsPage } from './agents.js';
 import { TerminalPage } from './terminal.js';
 import { NewAgentPopover } from './start.js';
@@ -16,7 +17,7 @@ import { NewAgentPopover } from './start.js';
 
 const PAGES = [
   { key: 'agents', label: 'Agents', icon: 'agents', path: '/', key_hint: 'a' },
-  { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b', legacy: true },
+  { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
   { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i', legacy: true },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
@@ -143,6 +144,7 @@ function App() {
 
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
+  if (page === 'board') return html`<${BoardPage} />`;
   if (page === 'settings') return html`<${SettingsStub} />`;
   const current = PAGES.find((p) => p.key === page);
   return html`<div class="content"><div class="stub">
