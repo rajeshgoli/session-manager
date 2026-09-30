@@ -192,9 +192,16 @@ const CLAUDE_BTW_WAITING_PREFIX: &str = "claude:waiting:";
 const CLAUDE_BTW_SUBMITTING_PREFIX: &str = "claude:submitting:";
 const CLAUDE_BTW_SUBMITTED_PREFIX: &str = "claude:submitted:";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTicketKind {
+    Phone,
+    Browser,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct MobileTerminalTicket {
+    kind: TerminalTicketKind,
     ticket_id: String,
     secret_hash: String,
     user_id: String,
@@ -322,6 +329,7 @@ mod analytics;
 mod board;
 mod board_clock;
 mod board_page;
+mod browser_terminal;
 mod claims;
 mod docs;
 mod follows;
@@ -1835,6 +1843,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/client/sessions/{session_id}/attach-ticket",
             post(create_mobile_attach_ticket),
+        )
+        .route(
+            "/client/sessions/{session_id}/browser-attach-ticket",
+            post(browser_terminal::create_ticket),
         )
         .route("/client/sessions/{session_id}", get(get_client_session))
         .fallback(not_found);
@@ -7822,6 +7834,7 @@ async fn create_mobile_attach_ticket(
     tickets.insert(
         ticket_id.clone(),
         MobileTerminalTicket {
+            kind: TerminalTicketKind::Phone,
             ticket_id: ticket_id.clone(),
             secret_hash,
             user_id,
@@ -8168,8 +8181,15 @@ async fn mobile_terminal_endpoint(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
+    let browser = request_cloudflare_access_application(&state, &request)
+        == Some(CloudflareAccessApplication::Browser);
+    let (browser_email, access_context) = if browser {
+        (Some(browser_terminal::authorize(&state, &request)?), None)
+    } else {
+        let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+        ensure_public_edge_assertion_for_request(&state, &request)?;
+        (None, context)
+    };
     let (mut parts, _body) = request.into_parts();
     let headers = parts.headers.clone();
     let peer_addr = parts
@@ -8178,7 +8198,14 @@ async fn mobile_terminal_endpoint(
         .map(|value| value.0);
     if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         return Ok(ws
-            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state))
+            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state, browser_email))
+            .into_response());
+    }
+    if browser {
+        return Ok((
+            StatusCode::UPGRADE_REQUIRED,
+            "Terminal requires a WebSocket upgrade",
+        )
             .into_response());
     }
     mobile_terminal_upgrade_required(&state, access_context.as_ref(), &headers, peer_addr)
@@ -8220,7 +8247,11 @@ fn mobile_terminal_upgrade_required(
         .into_response())
 }
 
-async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn mobile_terminal_websocket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    browser_email: Option<String>,
+) {
     if !mobile_terminal_enabled(&state) {
         send_mobile_terminal_error(&mut socket, "mobile terminal attach is disabled").await;
         close_mobile_terminal_socket(&mut socket, 1008, "mobile_terminal_disabled").await;
@@ -8245,7 +8276,7 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
         }
     };
 
-    match consume_mobile_terminal_ticket(&state, &auth_frame) {
+    match consume_terminal_ticket(&state, &auth_frame, browser_email.as_deref()) {
         Ok((ticket, attach_id, stop)) => {
             run_mobile_terminal_bridge(
                 socket,
@@ -8856,6 +8887,9 @@ fn mobile_terminal_key_bytes(key: &str) -> Option<Vec<u8>> {
         "enter" => Some(b"\r".to_vec()),
         "esc" | "escape" => Some(b"\x1b".to_vec()),
         "tab" => Some(b"\t".to_vec()),
+        "shift-tab" => Some(b"\x1b[Z".to_vec()),
+        "up" => Some(b"\x1b[A".to_vec()),
+        "down" => Some(b"\x1b[B".to_vec()),
         "backspace" => Some(b"\x7f".to_vec()),
         "ctrl-c" => Some(b"\x03".to_vec()),
         "ctrl-d" => Some(b"\x04".to_vec()),
@@ -13869,9 +13903,18 @@ fn mobile_terminal_proof_nonce_key(
     [user_id, device_key_id, session_id, nonce].join("\u{1f}")
 }
 
+#[cfg(test)]
 fn consume_mobile_terminal_ticket(
     state: &AppState,
     frame: &MobileTerminalAuthFrame,
+) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
+    consume_terminal_ticket(state, frame, None)
+}
+
+fn consume_terminal_ticket(
+    state: &AppState,
+    frame: &MobileTerminalAuthFrame,
+    browser_email: Option<&str>,
 ) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
     if !mobile_terminal_enabled(state) {
         return Err(ApiError::Status {
@@ -13881,59 +13924,65 @@ fn consume_mobile_terminal_ticket(
     }
     let ticket_id = nonempty_frame_field(&frame.ticket_id);
     let ticket_secret = nonempty_frame_field(&frame.ticket_secret);
-    let device_key_id = nonempty_frame_field(&frame.device_key_id);
-    let nonce = nonempty_frame_field(&frame.nonce);
-    let signature = nonempty_frame_field(&frame.signature);
-    if ticket_id.is_none()
-        || ticket_secret.is_none()
-        || device_key_id.is_none()
-        || nonce.is_none()
-        || signature.is_none()
-    {
-        return Err(ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Invalid terminal auth frame".to_owned(),
-        });
-    }
-    let ticket_id = ticket_id.unwrap();
-    let ticket_secret = ticket_secret.unwrap();
-    let device_key_id = device_key_id.unwrap();
-    let nonce = nonce.unwrap();
-    let signature = signature.unwrap();
+    let (Some(ticket_id), Some(ticket_secret)) = (ticket_id, ticket_secret) else {
+        return Err(browser_terminal::denied("Invalid terminal auth frame"));
+    };
+    let device_key_id = nonempty_frame_field(&frame.device_key_id)
+        .or_else(|| browser_email.map(|_| "browser".to_owned()))
+        .ok_or_else(|| browser_terminal::denied("Invalid terminal auth frame"))?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
-
     let ticket =
         mobile_terminal_ticket_for_consume(state, &ticket_id, &ticket_secret, &device_key_id, now)?;
-    let Some((user_id, user_config)) =
-        mobile_terminal_visible_user(&state.config, &ticket.actor_email)
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is no longer allowed to attach".to_owned(),
-        });
-    };
-    if user_id != ticket.user_id {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is no longer allowed to attach".to_owned(),
-        });
+    match ticket.kind {
+        TerminalTicketKind::Browser => {
+            if browser_email != Some(ticket.actor_email.as_str())
+                || !allowlisted_google_email(&state.config, &ticket.actor_email)
+            {
+                return Err(browser_terminal::denied(
+                    "Browser login required for this ticket",
+                ));
+            }
+        }
+        TerminalTicketKind::Phone => {
+            let nonce = nonempty_frame_field(&frame.nonce)
+                .ok_or_else(|| browser_terminal::denied("Device signature required"))?;
+            let signature = nonempty_frame_field(&frame.signature)
+                .ok_or_else(|| browser_terminal::denied("Device signature required"))?;
+            let Some((user_id, user_config)) =
+                mobile_terminal_visible_user(&state.config, &ticket.actor_email)
+            else {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "User is no longer allowed to attach".to_owned(),
+                });
+            };
+            if user_id != ticket.user_id {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "User is no longer allowed to attach".to_owned(),
+                });
+            }
+            let Some(device_public_key) = mobile_terminal_device_public_key(
+                state,
+                &ticket.user_id,
+                user_config,
+                &device_key_id,
+            )?
+            else {
+                return Err(browser_terminal::denied(
+                    "Device key is no longer registered",
+                ));
+            };
+            let message = mobile_terminal_ws_message(
+                &ticket.ticket_id,
+                &ticket.session_id,
+                &ticket.actor_email,
+                &device_key_id,
+                &nonce,
+            );
+            verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
+        }
     }
-    let Some(device_public_key) =
-        mobile_terminal_device_public_key(state, &ticket.user_id, user_config, &device_key_id)?
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Device key is no longer registered".to_owned(),
-        });
-    };
-    let message = mobile_terminal_ws_message(
-        &ticket.ticket_id,
-        &ticket.session_id,
-        &ticket.actor_email,
-        &device_key_id,
-        &nonce,
-    );
-    verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
 
     let Some(session) = state.session_store.get_session(&ticket.session_id)? else {
         return Err(ApiError::Status {
@@ -14020,6 +14069,12 @@ fn consume_mobile_terminal_ticket(
             stop: stop.clone(),
         },
     );
+    if ticket.kind == TerminalTicketKind::Browser {
+        eprintln!(
+            "browser terminal attach: email={} session={}",
+            ticket.actor_email, ticket.session_id
+        );
+    }
     Ok((ticket, attach_id, stop))
 }
 
@@ -19163,6 +19218,7 @@ mod tests {
 
     fn test_mobile_terminal_ticket() -> MobileTerminalTicket {
         MobileTerminalTicket {
+            kind: TerminalTicketKind::Phone,
             ticket_id: "att_test".to_owned(),
             secret_hash: "secret-hash".to_owned(),
             user_id: "local_bypass".to_owned(),
@@ -23260,4 +23316,5 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert!(html.contains("data-handoff=\"handoff-browser\""));
         assert!(html.contains("hands off at 45%") || html.contains("handoff off"));
     }
+    include!("http/browser_terminal_tests.rs");
 }

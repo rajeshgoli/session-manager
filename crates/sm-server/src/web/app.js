@@ -9,6 +9,7 @@ import {
   openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
 import { AgentsPage } from './agents.js';
+import { TerminalPage } from './terminal.js';
 import { NewAgentPopover } from './start.js';
 
 // ---- pages ------------------------------------------------------------------
@@ -87,7 +88,7 @@ function App() {
           location.href = path;
           return;
         }
-        history.pushState(null, '', urlFor(path, readLocation().open));
+        history.pushState(null, '', urlFor(path, path.startsWith('/terminal/') ? null : readLocation().open));
         setLoc(readLocation());
       }),
       bus.on('open', (ref) => {
@@ -120,7 +121,7 @@ function App() {
   }, [page]);
 
   if (page === 'terminal') {
-    return html`<${TerminalStub} id=${decodeURIComponent(loc.path.slice('/terminal/'.length))} open=${loc.open} />
+    return html`<${TerminalPage} id=${decodeURIComponent(loc.path.slice('/terminal/'.length))} open=${loc.open} />
       <${Toasts} items=${toasts} />`;
   }
 
@@ -463,41 +464,6 @@ function SettingsStub() {
       options=${[{ value: 'system', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]} /></div>
     <p class="sub">Saved in this browser only. The other settings arrive in a later web ticket; until then they live on the phone.</p>
   </div></div>`;
-}
-
-/** `/terminal/{id}` until the browser terminal lands: attach instructions. */
-function TerminalStub({ id, open }) {
-  const [doc] = usePoll(() => api(`/watch/state?session=${encodeURIComponent(id)}`), 10000, [id]);
-  const agent = doc && (doc.sessions || []).find((s) => s.id === id);
-  const back = () => (history.length > 1 ? history.back() : navigate('/'));
-  useEffect(() => {
-    const key = (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === '[') { event.preventDefault(); back(); }
-    };
-    document.addEventListener('keydown', key);
-    return () => document.removeEventListener('keydown', key);
-  }, []);
-  const Renderer = panels.get('agent');
-  return html`<div class="term-page">
-    <div class="term-bar">
-      <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
-      ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
-      <span class="t">${agent ? agent.name : id}</span>
-      <span class="sub">${agent ? agent.state : ''}</span>
-      <span style="flex:1"></span>
-      <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
-    </div>
-    <div class="term-body">
-      <p>The browser terminal is not built yet. Attach from a terminal on the Mac:</p>
-      <p><code>${agent ? agent.attach : `sm attach ${id}`}</code></p>
-    </div>
-    ${open && Renderer
-      ? html`<aside class="panel" style="position:fixed;top:40px;right:0;bottom:0;z-index:31">
-          <${Renderer} id=${open.slice(open.indexOf(':') + 1)} controls=${html`<span class="ctl">
-            <button type="button" class="icon-btn" title="Close" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} />
-        </aside>`
-      : null}
-  </div>`;
 }
 
 render(html`<${App} />`, document.getElementById('app'));
