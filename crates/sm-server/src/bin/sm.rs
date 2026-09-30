@@ -1990,6 +1990,9 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
+    for line in queue_quiet_lines(&payload) {
+        println!("{line}");
+    }
     println!(
         "Max wait: {}s",
         payload["max_wait_seconds"].as_i64().unwrap_or(300)
@@ -2751,7 +2754,7 @@ fn print_queue_jobs(jobs: &[Value]) {
             vec![
                 json_string(job, "label"),
                 json_string(job, "type"),
-                json_string(job, "state"),
+                queue_state_text(job),
                 queue_exit_text(job),
                 job["notify_name"]
                     .as_str()
@@ -2769,6 +2772,44 @@ fn print_queue_jobs(jobs: &[Value]) {
         })
         .collect::<Vec<_>>();
     print_table(&headers, &rows);
+}
+
+fn queue_quiet_age(job: &Value) -> Option<String> {
+    if job["state"].as_str() != Some("running") {
+        return None;
+    }
+    let since = sm_server::queue::parse_queue_timestamp(job["quiet_since"].as_str()?)?;
+    Some(sm_server::queue::quiet::age(
+        ((time::OffsetDateTime::now_utc() - since).whole_milliseconds()) as i64,
+    ))
+}
+
+fn queue_state_text(job: &Value) -> String {
+    let state = json_string(job, "state");
+    queue_quiet_age(job)
+        .map(|age| format!("{state} quiet {age}"))
+        .unwrap_or(state)
+}
+
+fn queue_quiet_lines(job: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(age) = queue_quiet_age(job) {
+        lines.push(format!(
+            "Quiet since {} ({age}): no CPU, GPU or log output. Holding {}.",
+            sm_server::queue::quiet::local_time(job["quiet_since"].as_str().unwrap_or("")),
+            sm_server::queue::quiet::memory(
+                job["footprint_bytes"].as_i64(),
+                job["rss_bytes"].as_i64()
+            )
+        ));
+    }
+    if let Some(at) = job["quiet_alerted_at"].as_str() {
+        lines.push(format!(
+            "Agent told at {}.",
+            sm_server::queue::quiet::local_time(at)
+        ));
+    }
+    lines
 }
 
 fn queue_exit_text(job: &Value) -> String {
@@ -5828,6 +5869,22 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn quiet_cli_status_and_list_clear_after_completion() {
+        let since = (time::OffsetDateTime::now_utc() - time::Duration::minutes(14))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut job = json!({"state":"running", "quiet_since":since, "quiet_alerted_at":since, "footprint_bytes":1073741824});
+        assert_eq!(queue_state_text(&job), "running quiet 14m");
+        let lines = queue_quiet_lines(&job);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("(14m): no CPU, GPU or log output. Holding 1.0 GiB."));
+        assert!(lines[1].starts_with("Agent told at "));
+        job["state"] = json!("cancelled");
+        assert_eq!(queue_state_text(&job), "cancelled");
+        assert_eq!(queue_quiet_lines(&job).len(), 1);
+    }
 
     #[test]
     fn handoff_note_needs_a_link_or_an_existing_file() {
