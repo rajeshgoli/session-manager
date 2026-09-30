@@ -19568,10 +19568,12 @@ mod tests {
                     .parse()
                     .unwrap(),
             );
-            request.headers_mut().insert(
-                axum::http::header::ACCEPT,
-                "application/json".parse().unwrap(),
-            );
+            if uri == "/board" {
+                request.headers_mut().insert(
+                    axum::http::header::ACCEPT,
+                    "application/json".parse().unwrap(),
+                );
+            }
             let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
             assert_eq!(status, StatusCode::OK, "{uri}: {body}");
             assert!(body["lanes"].is_array(), "{body}");
