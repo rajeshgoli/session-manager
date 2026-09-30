@@ -18261,6 +18261,10 @@ mod tests {
         assert_eq!(entries[0]["provider"], "claude");
         assert_eq!(entries[0]["working_dir"], "/repo");
         assert_eq!(entries[0]["text"], text);
+        let rendered = entries[0]["html"].as_str().unwrap();
+        assert!(rendered.contains("<strong>bold</strong>"));
+        assert!(rendered.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!rendered.contains("<script>"));
 
         let response = app
             .clone()
@@ -18275,13 +18279,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(
-            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "{html}"
-        );
-        assert!(!html.contains("<script>alert"), "{html}");
-        assert!(html.contains("<strong>bold</strong>"), "{html}");
-        assert!(html.contains(r#"<a class="tab on" href="/guestbook">Guestbook</a>"#));
+        assert!(html.contains("/assets/app.js"), "{html}");
     }
 
     #[tokio::test]

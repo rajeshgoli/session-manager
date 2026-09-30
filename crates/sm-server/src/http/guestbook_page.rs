@@ -114,9 +114,18 @@ pub(super) async fn get_guestbook(
         limit: params.limit.unwrap_or(DEFAULT_LIMIT),
     })?;
     if params.format.as_deref() == Some("json") || web::wants_json(&request) {
+        let entries: Vec<Value> = page
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut value = json!(entry);
+                value["html"] = json!(render_entry_html(&entry.text));
+                value
+            })
+            .collect();
         let mut body = json!({
             "schema_version": GUESTBOOK_SCHEMA_VERSION,
-            "entries": page.entries,
+            "entries": entries,
             "next_before": page.next_before,
         });
         if let Some(base) = docs::doc_browser_base_url(&state.config) {

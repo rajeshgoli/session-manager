@@ -363,6 +363,7 @@ select.inp { padding: 3px 6px; }
 .work-links { margin-top:8px; }
 .work-links .btn { max-width:100%; white-space:normal; overflow-wrap:anywhere; text-align:left; }
 .guestbook-text { white-space:pre-wrap; }
+.guestbook-markdown pre,.guestbook-markdown table { display:block; max-width:100%; overflow:auto; }
 .list-filter input { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 10px; margin-left:8px; max-width:60%; }
 @media(max-width:600px) {
   .inbox-layout { display:flex; }
