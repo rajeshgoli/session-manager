@@ -76,9 +76,13 @@ pub(super) fn clocks(
             let last_activity = record.and_then(|record| parse_time(&record.last_activity));
             match holder.state {
                 HolderState::Working => {
+                    // A turn start older than the last recorded turn end
+                    // belongs to an earlier turn: its hook was missed.
+                    let last_end = turn_ends.get(&holder.session_id).copied().and_then(from_ms);
                     let turn_start = record
                         .and_then(|record| record.activity_turn_start_hook_at.as_deref())
-                        .and_then(parse_time);
+                        .and_then(parse_time)
+                        .filter(|&start| last_end.is_none_or(|end| start >= end));
                     Some((
                         Activity::Working,
                         turn_start.or(last_activity).unwrap_or(now),
