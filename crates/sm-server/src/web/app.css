@@ -208,9 +208,21 @@ select.inp { padding: 3px 6px; }
 .stub { max-width: 34rem; color: var(--ink-2); display: flex; flex-direction: column; gap: 10px; }
 .stub h2 { margin: 0; font-size: 17px; color: var(--ink); }
 .term-page { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--term); color: var(--term-ink); z-index: 30; }
-.term-bar { height: 40px; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
+.term-bar { height: 40px; flex: 0 0 40px; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
 .term-bar .t { font-weight: 650; }
-.term-body { flex: 1; padding: 24px; font: 13px/1.5 var(--mono); }
+.term-body { flex: 1; min-height: 0; overflow: hidden; padding: 4px; }
+.term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-keys { display: flex; gap: 4px; white-space: nowrap; }
+.term-connection { white-space: nowrap; font-size: 12px; }
+.term-notice { position: absolute; bottom: 16px; left: 12px; right: 12px; padding: 10px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
+.term-panel { position: fixed; top: 40px; right: 0; bottom: 0; z-index: 31; width: 28rem; max-width: 100vw; }
+@media (max-width: 900px) {
+  .term-bar { overflow-x: auto; gap: 6px; padding: 0 6px; }
+  .term-bar > * { flex-shrink: 0; }
+  .term-bar .t { max-width: 100px; }
+  .term-state { display: none; }
+}
+@media (max-width: 600px) { .term-panel { width: 100vw; } }
 
 /* ---- narrow screens (D9: 390 px) -------------------------------------------- */
 @media (max-width: 720px) {
@@ -262,4 +274,49 @@ select.inp { padding: 3px 6px; }
   .settings-nav { flex: none; flex-direction: row; flex-wrap: wrap; position: static; gap: 2px; }
   .settings-nav a { padding: 6px 8px; font-size: 12px; }
   .settings-grid { grid-template-columns: 1fr; }
+}
+
+/* Board: server-owned ticket clocks and lane order (1710 D6.4). */
+.board-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.board-toolbar > .sub { margin-right: auto; }
+.board-lane { flex-shrink: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lane-header { display: flex; gap: 12px; padding: 12px; align-items: center; flex-wrap: wrap; }
+.lane-rank { color: var(--ink-3); font: 600 18px var(--mono); }
+.lane-heading { flex: 1; min-width: 12rem; }
+.ticket-title { border: 0; background: none; padding: 0; text-align: left; cursor: pointer; color: var(--ink); overflow-wrap: anywhere; }
+.ticket-title:hover { color: var(--accent); }
+.lane-heading > .ticket-title { font-weight: 600; }
+.lane-progress { height: 4px; background: var(--panel-2); display: flex; margin: 6px 0 3px; border-radius: 3px; overflow: hidden; max-width: 22rem; }
+.lane-progress .done { background: var(--green); }
+.lane-progress .in-progress { background: var(--accent); }
+.lane-actions { display: flex; gap: 3px; align-items: center; }
+.lane-actions button:disabled { opacity: .4; cursor: default; }
+.critical-path { color: var(--ink-3); font-size: 11.5px; padding: 0 12px 10px; }
+.board-ticket { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 12px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.board-ticket.compact { flex: 1 1 20rem; border-top: 0; padding: 0; }
+.ticket-clock { grid-column: 1 / -1; border: 0; padding: 0; background: none; text-align: left; cursor: pointer; display: grid; grid-template-columns: minmax(8rem, 30%) minmax(0, 1fr); gap: 12px; align-items: center; font-size: 12px; }
+.clock-strip { height: 9px; background: var(--panel-2); position: relative; overflow: hidden; border-radius: 2px; }
+.clock-segment { position: absolute; height: 100%; background: var(--ink-3); }
+.clock-segment.working, .clock-segment.job_running { background: var(--green); }
+.clock-segment.job_running { background: repeating-linear-gradient(120deg, var(--green) 0 3px, color-mix(in srgb, var(--green) 40%, var(--panel)) 3px 5px); }
+.clock-segment.queue, .clock-segment.review { background: var(--amber); }
+.clock-segment.you { background: var(--magenta); }
+.clock-segment.quiet, .clock-segment.stalled, .clock-segment.no_agent, .clock-segment.job_quiet { background: var(--red); }
+.lane-folds { border-top: 1px solid var(--line); }
+.board-fold summary, .other-tickets > summary { padding: 8px 14px; cursor: pointer; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+.lane-confirm { padding: 10px 14px; display: flex; gap: 8px; flex-wrap: wrap; background: var(--panel-2); }
+.board-lane > .err { margin: 8px 14px; }
+.clock-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; padding: 4px; }
+.board-start-overlay { position: fixed; inset: 0; background: #0004; z-index: 39; display: grid; place-items: center; }
+.board-start-overlay .pop.ticket-start { position: relative; left: auto !important; top: auto !important; transform: none !important; max-height: calc(100dvh - 32px); overflow: auto; }
+.ticket-start .sub { margin: 0; }
+.ticket-start .fld .mono { overflow-wrap: anywhere; }
+.brief-preview { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel-2); padding: 8px; margin: 0; max-height: 14rem; overflow: auto; font: 12px/1.5 var(--mono); }
+@media (max-width: 600px) {
+  .ticket-clock { grid-template-columns: 1fr; gap: 5px; }
+  .lane-heading { min-width: 0; flex-basis: calc(100% - 40px); }
+  .lane-actions { margin-left: auto; }
+  .board-toolbar > .sub { width: 100%; }
+  .ticket-start .fld { grid-template-columns: 1fr; gap: 3px; }
+  .ticket-start .seg button { padding: 3px 8px; }
 }
