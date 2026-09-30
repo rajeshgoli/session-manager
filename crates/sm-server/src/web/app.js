@@ -169,7 +169,8 @@ function Page({ page, loc }) {
 
 /** The rail's badges, polled every 30 s (D2), shared with pages that need them. */
 function useRailData() {
-  usePoll(async () => setShared('queue', await api('/client/queue')), 30000);
+  const [, , reloadQueue] = usePoll(async () => setShared('queue', await api('/client/queue')), 30000);
+  useEffect(() => bus.on('queue-changed', reloadQueue), [reloadQueue]);
   usePoll(async () => setShared('inbox', await api('/inbox?format=json')), 30000);
   usePoll(async () => setShared('board_badge', await api('/client/board/badge')), 30000);
 }
