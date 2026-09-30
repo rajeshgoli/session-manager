@@ -6100,7 +6100,26 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
     let second_final = wait_for_queue_job_state(app, &second_background_id, &["displaced"]).await;
     assert_eq!(second_final["state"], "displaced");
     assert_eq!(second_final["termination_reason"], "perf_displacement");
-    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    // Terminal state is persisted before its notification. A stable partial
+    // message list does not mean all three completions have been queued.
+    let expected = [
+        (&first_background_id, "displaced"),
+        (&perf_id, "succeeded"),
+        (&second_background_id, "displaced"),
+    ];
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let notifications = loop {
+        let texts = queued_message_texts(&message_queue_db, "run12345");
+        if expected.iter().all(|(id, state)| {
+            texts
+                .iter()
+                .any(|text| queue_completion_matches(text, id, state))
+        }) || std::time::Instant::now() >= deadline
+        {
+            break texts;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(notifications.iter().any(|text| queue_completion_matches(
         text,
         &first_background_id,
@@ -6193,7 +6212,8 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     // The first test holds until released, so the perf job is always submitted
     // while it runs rather than racing a fixed sleep (sm#1432). The perf job
     // holds the same way, so it is still running while the second test is
-    // checked (sm#1597).
+    // checked (sm#1597). Their timeouts must outlast the 30-second state
+    // observation deadline even when admission is delayed by other tests.
     let release = working_dir.join("release-first-test");
     let release_perf = working_dir.join("release-perf");
     let mut config = AppConfig {
@@ -6229,7 +6249,7 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 5
+            "timeout_seconds": 60
         }),
     )
     .await;
@@ -6250,7 +6270,7 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 30,
+            "timeout_seconds": 60,
             "cpu_percent": 100,
             "gpu_percent": 0,
             "memory_bytes": 4294967296_i64
@@ -6397,6 +6417,17 @@ async fn queue_runtime_admission_respects_configured_perf_cooldown() {
         5,
     )
     .await;
+    let perf_id = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "perf",
+        "configured cooldown perf",
+        "printf configured-perf",
+        5,
+    )
+    .await;
+    // Seed only after fixture setup. Leave a wide observation window under
+    // load; the second pass explicitly shortens the policy to admit the job.
     let now = time::OffsetDateTime::now_utc();
     let started_at = (now - time::Duration::seconds(4))
         .format(&time::format_description::well_known::Rfc3339)
@@ -6412,15 +6443,6 @@ async fn queue_runtime_admission_respects_configured_perf_cooldown() {
         &finished_at,
         0,
     );
-    let perf_id = create_pending_queue_job_of_type(
-        app.clone(),
-        &working_dir,
-        "perf",
-        "configured cooldown perf",
-        "printf configured-perf",
-        5,
-    )
-    .await;
 
     RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
         &queue_state_dir,
@@ -6428,7 +6450,7 @@ async fn queue_runtime_admission_respects_configured_perf_cooldown() {
         0,
         QueueAdmissionPolicy {
             max_running_jobs: 2,
-            perf_cooldown_seconds: 5,
+            perf_cooldown_seconds: 60,
             ..QueueAdmissionPolicy::default()
         },
     )
