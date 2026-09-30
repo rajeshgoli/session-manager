@@ -428,6 +428,9 @@ pub(super) async fn get_board(
     } else {
         ensure_owner_page_read_allowed(&state, &request)?;
     }
+    if let Some(shell) = super::web::shell_page(&state, &request) {
+        return Ok(shell);
+    }
     let filter = lane_filter(&query)?;
     let hours = super::board_clock::clock_hours(query.clock_hours)?;
     let payload = blocking(&state, move |state| {

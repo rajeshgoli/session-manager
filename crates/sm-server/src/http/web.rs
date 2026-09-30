@@ -4,8 +4,8 @@
 //! page at each path, and JSON responses are unchanged everywhere.
 //!
 //! Page paths join the shell as their page modules land: `/` and `/watch`
-//! (Agents), `/queue`, `/analytics…`, `/settings` and `/terminal/{id}` here;
-//! `/board`, `/inbox`, `/history…` and `/guestbook` keep today's page until
+//! (Agents), `/board`, `/queue`, `/analytics…`, `/settings` and `/terminal/{id}` here;
+//! `/inbox`, `/history…` and `/guestbook` keep today's page until
 //! the tickets that build those modules route them through [`shell_page`].
 
 use super::*;
@@ -42,6 +42,8 @@ const ASSETS: &[Asset] = &[
     asset!("vendor/xterm.js", JS),
     asset!("vendor/addon-fit.js", JS),
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
+    asset!("board.js", JS),
+    asset!("board-start.js", JS),
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
