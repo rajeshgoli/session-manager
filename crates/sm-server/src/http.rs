@@ -245,6 +245,9 @@ struct MobileTerminalDisableResponse {
 
 #[derive(Debug, Serialize)]
 struct MobileTerminalDeviceSummary {
+    device_name: String,
+    kind: String,
+    last_seen_at: Option<String>,
     user_id: String,
     device_key_id: String,
     enabled: bool,
@@ -1623,6 +1626,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/client/settings",
             get(settings::get_settings).put(settings::put_settings),
+        )
+        .route("/client/devices", get(list_mobile_terminal_devices))
+        .route("/client/devices/enroll", post(enroll_browser_computer))
+        .route(
+            "/client/devices/{device_key_id}",
+            delete(revoke_mobile_terminal_device),
         )
         .route("/client/board/order", put(board::put_order))
         .route("/client/board/lanes", post(board::client_post_lane))
@@ -8057,11 +8066,81 @@ async fn set_studio_ssh(
     }
 }
 
+#[derive(Deserialize)]
+struct ComputerEnrollmentRequest {
+    name: String,
+    csr_pem: String,
+}
+
+async fn enroll_browser_computer(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(payload): Json<ComputerEnrollmentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = follows::owner_web_or_guard(&state, &headers, peer, "POST", &uri)?;
+    let (user_id, user) = mobile_terminal_visible_user(&state.config, &actor)
+        .filter(|(_, user)| user.owner || user.mobile_terminal_owner)
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Device enrollment requires the owner".into(),
+        })?;
+    if !user
+        .email
+        .as_deref()
+        .is_some_and(|email| allowlisted_google_email(&state.config, email))
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Device enrollment requires the owner".into(),
+        });
+    }
+    if !mobile_devices::valid_computer_name(&payload.name) || payload.csr_pem.len() > 16_384 {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Invalid device name or certificate request".into(),
+        });
+    }
+    let user_id = user_id.to_owned();
+    let name = payload.name;
+    let config = state.config.clone();
+    let chain = tokio::task::spawn_blocking(move || {
+        mobile_devices::enroll_computer(&config, &user_id, &name, &payload.csr_pem)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(json!({ "certificate_chain_pem": chain })))
+}
+
 async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
-    let actor_email = settings_device_actor(&state, &request)?;
+    let browser_actor = owner_web_guard(
+        &state,
+        request.headers(),
+        request_peer_addr(&request),
+        request.method().as_str(),
+    )?;
+    let access_context = if browser_actor.is_none() {
+        let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+        ensure_public_edge_assertion_for_request(&state, &request)?;
+        context
+    } else {
+        None
+    };
+    let actor_email = browser_actor
+        .or_else(|| request_actor_email(&state.config, &request))
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let revoked_keys = state
         .mobile_terminal_revoked_keys
@@ -8093,6 +8172,9 @@ async fn list_mobile_terminal_devices(
                     return None;
                 }
                 Some(MobileTerminalDeviceSummary {
+                    device_name: device_key_id.to_owned(),
+                    kind: "phone".into(),
+                    last_seen_at: None,
                     user_id: user_id.clone(),
                     device_key_id: device_key_id.to_owned(),
                     enabled: key.enabled && !key.public_key.trim().is_empty(),
@@ -8111,6 +8193,9 @@ async fn list_mobile_terminal_devices(
         });
         if !already_present {
             devices.push(MobileTerminalDeviceSummary {
+                device_name: device.device_name,
+                kind: device.kind,
+                last_seen_at: device.last_seen_at,
                 user_id: device.user_id,
                 device_key_id: device.device_id,
                 enabled: !device.public_key_pem.trim().is_empty(),
@@ -8132,7 +8217,19 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
-    let actor_email = settings_device_actor(&state, &request)?;
+    let browser_actor = owner_web_guard(
+        &state,
+        request.headers(),
+        request_peer_addr(&request),
+        request.method().as_str(),
+    )?;
+    let access_context = if browser_actor.is_none() {
+        let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+        ensure_public_edge_assertion_for_request(&state, &request)?;
+        context
+    } else {
+        None
+    };
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
         return Err(ApiError::Status {
@@ -8140,6 +8237,17 @@ async fn revoke_mobile_terminal_device(
             detail: "Mobile terminal device id is required".to_owned(),
         });
     }
+    let actor_email = browser_actor
+        .or_else(|| request_actor_email(&state.config, &request))
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let target_user_id = resolve_mobile_terminal_revoke_target(
         &state,
@@ -8147,11 +8255,6 @@ async fn revoke_mobile_terminal_device(
         owner_view,
         &device_key_id,
         query.user_id.as_deref(),
-    )?;
-    mobile_devices::sync_device_common_name(
-        &state.config.cloudflare_access,
-        &device_key_id,
-        mobile_devices::DevicePolicyAction::Revoke,
     )?;
     let persisted_revoked = mobile_devices::revoke_device(
         &mobile_device_db_path(&state.config),
@@ -8167,6 +8270,17 @@ async fn revoke_mobile_terminal_device(
         stop.store(true, Ordering::SeqCst);
     }
 
+    let config = state.config.cloudflare_access.clone();
+    let common_name = device_key_id.clone();
+    tokio::task::spawn_blocking(move || {
+        mobile_devices::sync_device_common_name(
+            &config,
+            &common_name,
+            mobile_devices::DevicePolicyAction::Revoke,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
     Ok(Json(MobileTerminalRevokeDeviceResponse {
         ok: true,
         revoked: true,
@@ -13292,6 +13406,10 @@ fn ensure_cloudflare_access_context_allowed(
     state: &AppState,
     context: &CloudflareAccessContext,
 ) -> Result<(), ApiError> {
+    if context.application == CloudflareAccessApplication::Browser {
+        browser_owner_email(state, context)?;
+        return Ok(());
+    }
     if context.application != CloudflareAccessApplication::MobileApp {
         return Ok(());
     }
@@ -13452,7 +13570,7 @@ fn mobile_cloudflare_access_device_enrolled_for_user(
     {
         return Ok(true);
     }
-    mobile_devices::active_device_exists(
+    mobile_devices::record_active_device_use(
         &mobile_device_db_path(&state.config),
         user_id,
         device_common_name,
@@ -14689,16 +14807,47 @@ fn ensure_owner_page_read_allowed(state: &AppState, request: &Request) -> Result
                 &assertion,
             )
             .map_err(cloudflare_access_error)?;
-            if context
-                .email
-                .as_deref()
-                .is_some_and(|email| allowlisted_google_email(&state.config, email))
-            {
+            if browser_owner_email(state, &context)?.is_some() {
                 return Ok(());
             }
         }
     }
     ensure_session_read_allowed(state, request)
+}
+
+/// Resolve a verified browser identity. Certificate identities never fall back
+/// to an email or cookie: revocation in the local store takes effect immediately.
+fn browser_owner_email(
+    state: &AppState,
+    context: &CloudflareAccessContext,
+) -> Result<Option<String>, ApiError> {
+    if let Some(name) = context.common_name.as_deref() {
+        for (user_id, user) in &state.config.mobile_terminal.allowed_users {
+            let Some(email) = user.email.as_deref() else {
+                continue;
+            };
+            if !(user.owner || user.mobile_terminal_owner)
+                || !allowlisted_google_email(&state.config, email)
+            {
+                continue;
+            }
+            if mobile_devices::record_active_device_use(
+                &mobile_device_db_path(&state.config),
+                user_id,
+                name,
+            )? {
+                return Ok(Some(email.trim().to_ascii_lowercase()));
+            }
+        }
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Browser device is unknown or revoked".into(),
+        });
+    }
+    Ok(context
+        .email
+        .clone()
+        .filter(|email| allowlisted_google_email(&state.config, email)))
 }
 
 /// Browser access to owner routes (spec 1710 D3). On the browser hostname a
@@ -14730,10 +14879,7 @@ fn owner_web_guard(
         &assertion,
     )
     .map_err(cloudflare_access_error)?;
-    let Some(email) = context
-        .email
-        .filter(|email| allowlisted_google_email(&state.config, email))
-    else {
+    let Some(email) = browser_owner_email(state, &context)? else {
         return Ok(None);
     };
     if method != "GET" {
@@ -18998,6 +19144,167 @@ mod tests {
             &EncodingKey::from_rsa_pem(test_private_key_pem()).expect("private key"),
         )
         .expect("access token")
+    }
+
+    #[tokio::test]
+    async fn browser_certificate_owner_guards_and_immediate_revocation() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.mobile_terminal.allowed_users.insert(
+            "rajesh".into(),
+            MobileTerminalUserConfig {
+                email: Some("rajeshgoli@gmail.com".into()),
+                owner: true,
+                interactive_shell_access: true,
+                ..Default::default()
+            },
+        );
+        config.mobile_terminal.allowed_users.insert(
+            "guest".into(),
+            MobileTerminalUserConfig {
+                email: Some("guest@example.com".into()),
+                interactive_shell_access: true,
+                ..Default::default()
+            },
+        );
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let db = mobile_device_db_path(&state.config);
+        mobile_devices::create_pairing_registration(&db, "rajesh", 15).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (user, name) in [("rajesh", "macbook"), ("guest", "guest-computer")] {
+            conn.execute("INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at, kind) VALUES (?, ?, ?, 'fixture', ?, '2026-01-01', 'computer')",
+                rusqlite::params![user, name, name, name]).unwrap();
+        }
+        let certificate = |name: &str, audience: &str| {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("google-test-key".into());
+            encode(&header, &json!({ "sub": "device", "aud": audience, "iss": "https://team.cloudflareaccess.com", "exp": 4_102_444_800u64,
+                "iat": 1_700_000_000, "common_name": name }), &EncodingKey::from_rsa_pem(test_private_key_pem()).unwrap()).unwrap()
+        };
+        let computer = certificate("macbook", "sm-browser-aud");
+        let email =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let app = router(state);
+        for route in [
+            "/client/settings",
+            "/client/devices",
+            "/history?format=json",
+        ] {
+            for token in [&computer, &email] {
+                let (status, body) = browser_host_get(&app, route, Some(token)).await;
+                assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            }
+            for token in [
+                certificate("unknown", "sm-browser-aud"),
+                certificate("guest-computer", "sm-browser-aud"),
+                certificate("macbook", "sm-mobile-aud"),
+            ] {
+                let (status, body) = browser_host_get(&app, route, Some(&token)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+            }
+        }
+        let (_, devices) = browser_host_get(&app, "/client/devices", Some(&email)).await;
+        let computer_row = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["device_key_id"] == "macbook")
+            .unwrap();
+        assert_eq!(computer_row["kind"], "computer");
+        assert!(computer_row["last_seen_at"].is_string());
+        for (origin, expected) in [
+            ("https://evil.example", StatusCode::FORBIDDEN),
+            ("https://sm.example.com", StatusCode::OK),
+        ] {
+            let mut request = public_request_with_host(
+                Method::DELETE,
+                "/client/devices/macbook?user_id=rajesh",
+                Body::empty(),
+                "sm.example.com",
+            );
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", email.parse().unwrap());
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, expected, "{body}");
+        }
+        for route in [
+            "/client/settings",
+            "/client/devices",
+            "/history?format=json",
+        ] {
+            let (status, body) = browser_host_get(&app, route, Some(&computer)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+            assert_eq!(
+                browser_host_get(&app, route, Some(&email)).await.0,
+                StatusCode::OK
+            );
+        }
+        // A browser-audience assertion is still refused on the phone hostname.
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/client/mobile-terminal/devices",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", email.parse().unwrap());
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_certificate_enrollment_requires_owner_and_origin() {
+        let app = owner_doc_browser_access_app();
+        for (assertion, origin) in [
+            (None, "https://sm.example.com"),
+            (
+                Some(test_browser_access_assertion(
+                    "sm-browser-aud",
+                    "stranger@example.com",
+                    4_102_444_800,
+                )),
+                "https://sm.example.com",
+            ),
+            (
+                Some(test_browser_access_assertion(
+                    "sm-browser-aud",
+                    "rajeshgoli@gmail.com",
+                    4_102_444_800,
+                )),
+                "https://evil.example",
+            ),
+        ] {
+            let mut request = public_request_with_host(
+                Method::POST,
+                "/client/devices/enroll",
+                Body::from(r#"{"name":"macbook","csr_pem":"bad"}"#),
+                "sm.example.com",
+            );
+            request
+                .headers_mut()
+                .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+            if let Some(assertion) = assertion {
+                request
+                    .headers_mut()
+                    .insert("cf-access-jwt-assertion", assertion.parse().unwrap());
+            }
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            assert!(
+                matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{status}"
+            );
+        }
     }
 
     /// Cloudflare Access browser app on `sm.example.com` plus the SM Google

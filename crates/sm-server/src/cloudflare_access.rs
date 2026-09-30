@@ -196,8 +196,9 @@ fn context_from_claims(
     let email = trimmed_string(claims.email);
     let common_name = trimmed_string(claims.common_name);
     let identity = match application {
-        CloudflareAccessApplication::Browser => email
+        CloudflareAccessApplication::Browser => common_name
             .clone()
+            .or_else(|| email.clone())
             .ok_or(CloudflareAccessContextError::MissingIdentity)?,
         CloudflareAccessApplication::MobileApp | CloudflareAccessApplication::NodeFallback => {
             common_name
@@ -684,7 +685,7 @@ sVaOlbQnFfDO9v9eHw+E3vsz
                     "https://team.cloudflareaccess.com",
                     "sm-test-key",
                     None,
-                    Some("sm-phone-1"),
+                    None,
                     None,
                 ),
                 &jwks
