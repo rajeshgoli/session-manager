@@ -118,7 +118,7 @@ pub(crate) fn alert(
         return Ok(());
     }
     let conn = open_queue_jobs_connection(&settings.queue_db_path)?;
-    let _guard = QUEUE_ADMISSION_LOCK
+    let admission_guard = QUEUE_ADMISSION_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let Some(job) = get_queue_job_conn(&conn, &sampled.id)? else {
@@ -148,6 +148,9 @@ pub(crate) fn alert(
             return Ok(());
         }
     }
+    // Admission only protects the job snapshot. Message-store contention
+    // must not delay starting or cancelling unrelated queue jobs.
+    drop(admission_guard);
     let message_id = format!("queue-quiet-{}-{since}", job.id);
     let queue = RetainedQueueStore::new(settings.message_queue_db_path.clone());
     // Recover a crash between enqueue and recording the alert time without
