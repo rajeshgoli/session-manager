@@ -1535,6 +1535,7 @@ pub fn router(state: AppState) -> Router {
             "/client/push-token",
             put(follows::put_push_token).delete(follows::delete_push_token),
         )
+        .route("/client/push/status", get(follows::push_status))
         .route("/client/push/test", post(follows::send_test_push))
         .route("/client/follows", get(follows::list_follows))
         .route("/client/follows/{follow_id}/ack", post(follows::ack_follow))
@@ -7926,13 +7927,15 @@ struct StudioSshToggleRequest {
 /// (local curl tests / internal callers). Non-local requests must satisfy the
 /// exact same gate as `disable_mobile_terminal`: mobile Cloudflare Access +
 /// public-edge assertion + an allowlisted owner who can disable mobile terminal.
-fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(), ApiError> {
-    let peer_addr = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|value| value.0);
-    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
-        return Ok(());
+/// Settings device controls accept the browser owner and retain phone guards.
+fn settings_device_actor(state: &AppState, request: &Request) -> Result<String, ApiError> {
+    if let Some(email) = owner_web_guard(
+        state,
+        request.headers(),
+        request_peer_addr(request),
+        request.method().as_str(),
+    )? {
+        return Ok(email);
     }
     let access_context = ensure_mobile_cloudflare_access_for_request(state, request)?;
     ensure_public_edge_assertion_for_request(state, request)?;
@@ -7946,6 +7949,18 @@ fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(
         access_context.as_ref(),
         &actor_email,
     )?;
+    Ok(actor_email)
+}
+
+fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(), ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    let actor_email = settings_device_actor(state, request)?;
     let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
     else {
         return Err(ApiError::Status {
@@ -8026,18 +8041,7 @@ async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    let actor_email =
-        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required".to_owned(),
-        })?;
-    ensure_mobile_cloudflare_access_context_matches_actor(
-        &state,
-        access_context.as_ref(),
-        &actor_email,
-    )?;
+    let actor_email = settings_device_actor(&state, &request)?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let revoked_keys = state
         .mobile_terminal_revoked_keys
@@ -8108,8 +8112,7 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
+    let actor_email = settings_device_actor(&state, &request)?;
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
         return Err(ApiError::Status {
@@ -8117,16 +8120,6 @@ async fn revoke_mobile_terminal_device(
             detail: "Mobile terminal device id is required".to_owned(),
         });
     }
-    let actor_email =
-        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required".to_owned(),
-        })?;
-    ensure_mobile_cloudflare_access_context_matches_actor(
-        &state,
-        access_context.as_ref(),
-        &actor_email,
-    )?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let target_user_id = resolve_mobile_terminal_revoke_target(
         &state,
@@ -19530,6 +19523,133 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let response = app.clone().oneshot(app_host("/queue")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn settings_push_status_is_owner_scoped_and_never_exposes_tokens() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        let state = AppState::new(config);
+        let store = follows::push_store(&state);
+        for (user, name, token) in [
+            ("rajeshgoli@gmail.com", "Owner phone", "secret-owner-token"),
+            ("someone@example.com", "Other phone", "secret-other-token"),
+        ] {
+            store
+                .upsert_token(
+                    &crate::owner_push::PushTokenRegistration {
+                        user_id: user.into(),
+                        token: token.into(),
+                        device_id: None,
+                        device_name: name.into(),
+                        app_version: "1".into(),
+                    },
+                    OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+        }
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) = browser_host_get(&app, "/client/push/status", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["devices"], json!([{"device_name": "Owner phone"}]));
+        assert!(!body.to_string().contains("secret-"));
+        let (status, _) = browser_host_get(&app, "/client/push/status", None).await;
+        assert!(is_auth_denial_status(status.as_u16()));
+    }
+
+    #[tokio::test]
+    async fn settings_browser_controls_require_owner_origin_and_keep_phone_guard() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        let key = SigningKey::random(&mut OsRng);
+        config.mobile_terminal = mobile_ticket_config(&key).mobile_terminal;
+        let mut user = config
+            .mobile_terminal
+            .allowed_users
+            .remove("local_bypass")
+            .unwrap();
+        user.email = Some("rajeshgoli@gmail.com".into());
+        user.owner = true;
+        config
+            .mobile_terminal
+            .allowed_users
+            .insert("rajesh".into(), user);
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) =
+            browser_host_get(&app, "/client/mobile-terminal/devices", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["devices"][0]["device_key_id"], "test-device");
+        for (method, path, body) in [
+            (Method::POST, "/client/push/test", json!({})),
+            (Method::POST, "/admin/studio-ssh", json!({"enabled": false})),
+            (
+                Method::DELETE,
+                "/client/mobile-terminal/devices/test-device",
+                json!({}),
+            ),
+        ] {
+            for headers in [
+                vec![],
+                vec![("origin", "https://other.example.com")],
+                vec![
+                    ("origin", "https://sm.example.com"),
+                    ("x-sm-session", "agent"),
+                ],
+            ] {
+                let request = owner_web_request(
+                    method.clone(),
+                    path,
+                    "sm.example.com",
+                    Some(&owner),
+                    &headers,
+                    &body,
+                );
+                assert_eq!(
+                    app.clone().oneshot(request).await.unwrap().status(),
+                    StatusCode::FORBIDDEN,
+                    "{path}"
+                );
+            }
+            let request = owner_web_request(
+                method,
+                path,
+                "sm-app.example.com",
+                Some(&owner),
+                &[("origin", "https://sm-app.example.com")],
+                &body,
+            );
+            assert!(
+                is_auth_denial_status(
+                    app.clone()
+                        .oneshot(request)
+                        .await
+                        .unwrap()
+                        .status()
+                        .as_u16()
+                ),
+                "{path}"
+            );
+        }
+        // Auth succeeds, then the unconfigured test sender reports unavailable.
+        let request = owner_web_request(
+            Method::POST,
+            "/client/push/test",
+            "sm.example.com",
+            Some(&owner),
+            &[("origin", "https://sm.example.com")],
+            &json!({}),
+        );
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

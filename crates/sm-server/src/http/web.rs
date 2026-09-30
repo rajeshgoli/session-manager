@@ -38,6 +38,7 @@ const ASSETS: &[Asset] = &[
     asset!("ui.js", JS),
     asset!("start.js", JS),
     asset!("agents.js", JS),
+    asset!("settings.js", JS),
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
@@ -117,6 +118,14 @@ fn shell_response(state: &AppState) -> Response {
     }
     let config = json!({
         "build_id": id,
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "queue_config_limits": {
+            "max_running": state.config.queue_admission_policy().max_running_jobs,
+            "tests": state.config.queue_admission_policy().tests_max_concurrent,
+            "perf": state.config.queue_admission_policy().perf_max_concurrent,
+            "background": state.config.queue_admission_policy().background_max_concurrent,
+            "service": state.config.queue_admission_policy().service_max_concurrent,
+        },
         "refresh_seconds": state.config.web_watch.refresh_seconds(),
         "stall_minutes": state.config.board.stall_minutes,
         "owner_name": state.config.owner_name,

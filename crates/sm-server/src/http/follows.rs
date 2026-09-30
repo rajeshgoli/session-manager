@@ -171,13 +171,30 @@ pub(super) async fn delete_push_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Registration names only: push tokens must never reach the browser.
+pub(super) async fn push_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    let devices = push_store(&state).valid_tokens(&user_id)?;
+    Ok(Json(json!({
+        "configured": state.push_sender.is_some(),
+        "devices": devices.iter().map(|device| json!({
+            "device_name": device.device_name,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
 pub(super) async fn send_test_push(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "POST", &uri)?;
     let Some(sender) = state.push_sender.clone() else {
         return Err(ApiError::Status {
             status: StatusCode::SERVICE_UNAVAILABLE,

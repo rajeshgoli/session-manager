@@ -9,6 +9,7 @@ import {
   openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
 import { AgentsPage } from './agents.js';
+import { SettingsPage } from './settings.js';
 import { NewAgentPopover } from './start.js';
 
 // ---- pages ------------------------------------------------------------------
@@ -142,7 +143,7 @@ function App() {
 
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
-  if (page === 'settings') return html`<${SettingsStub} />`;
+  if (page === 'settings') return html`<${SettingsPage} />`;
   const current = PAGES.find((p) => p.key === page);
   return html`<div class="content"><div class="stub">
     <h2>${current.label}</h2>
@@ -439,31 +440,6 @@ function Toasts({ items }) {
 }
 
 // ---- placeholder pages ----------------------------------------------------------
-
-function SettingsStub() {
-  const [theme, setTheme] = useState(() => {
-    try {
-      return localStorage.getItem('sm-theme') || 'system';
-    } catch (e) {
-      return 'system';
-    }
-  });
-  const choose = (value) => {
-    setTheme(value);
-    try {
-      localStorage.setItem('sm-theme', value);
-    } catch (e) {
-      /* the choice lasts until reload */
-    }
-    document.documentElement.dataset.theme = value;
-  };
-  return html`<div class="content"><div class="stub">
-    <h2>Appearance</h2>
-    <div><${Seg} label="Theme" value=${theme} onChange=${choose}
-      options=${[{ value: 'system', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]} /></div>
-    <p class="sub">Saved in this browser only. The other settings arrive in a later web ticket; until then they live on the phone.</p>
-  </div></div>`;
-}
 
 /** `/terminal/{id}` until the browser terminal lands: attach instructions. */
 function TerminalStub({ id, open }) {
