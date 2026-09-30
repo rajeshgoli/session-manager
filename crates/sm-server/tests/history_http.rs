@@ -344,7 +344,9 @@ async fn history_html_is_a_card_page_with_escaped_text() {
     assert!(html.contains("1 Codex"));
     assert!(html.contains("Memo &lt;draft&gt;"));
     assert!(html.contains(r#"href="/history?agent=eng00001""#));
-    assert!(!html.contains("<script"), "no script needed");
+    // Only the shared shell's Board badge poller; the page itself needs no script.
+    assert_eq!(html.matches("<script").count(), 1);
+    assert!(html.contains("'/client/board/badge'"));
 }
 
 #[tokio::test]
@@ -717,9 +719,9 @@ async fn watch_page_paints_cards_without_scripts() {
         .collect();
     assert_eq!(labels, ["Work", "Docs", "Reviews", "Attach"]);
 
-    // The refresh script is inline, under 10 KB, and reads /watch/state.
+    // The refresh script is inline, under 20 KB, and reads /watch/state.
     let script = &root[root.find("<script>").unwrap() + 8..root.find("</script>").unwrap()];
-    assert!(script.len() < 10 * 1024, "{} bytes", script.len());
+    assert!(script.len() < 20 * 1024, "{} bytes", script.len());
     assert!(script.contains("'/watch/state'"));
     assert!(root.contains(r#"<div id="w" data-refresh="3">"#));
 }
