@@ -49,6 +49,11 @@ const ASSETS: &[Asset] = &[
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("board.js", JS),
     asset!("board-start.js", JS),
+    asset!("inbox.js", JS),
+    asset!("reader.js", JS),
+    asset!("history.js", JS),
+    asset!("guestbook.js", JS),
+    asset!("reader-bar.js", JS),
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
@@ -82,7 +87,7 @@ pub(super) fn build_id() -> &'static str {
     })
 }
 
-fn wants_json(request: &Request) -> bool {
+pub(super) fn wants_json(request: &Request) -> bool {
     request
         .uri()
         .query()
@@ -202,9 +207,26 @@ pub(super) async fn get_asset(
         .into_response())
 }
 
+/// Browser-only navigation for standalone docs, messages and ticket timelines.
+pub(super) fn reader_injection(browser: bool) -> String {
+    if !browser {
+        return String::new();
+    }
+    format!(
+        r#"<script defer src="/assets/reader-bar.js?v={}"></script>"#,
+        build_id()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_navigation_is_injected_only_for_browser_pages() {
+        assert!(reader_injection(false).is_empty());
+        assert!(reader_injection(true).contains("/assets/reader-bar.js?v="));
+    }
 
     #[test]
     fn own_javascript_stays_under_the_size_budget() {

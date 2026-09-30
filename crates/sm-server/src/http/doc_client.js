@@ -7,6 +7,7 @@
   // Mode "review" (docs, the default), "reply" (a message with an agent to
   // answer) or "read" (a message nobody is left to answer) (sm#1580).
   var MODE = CONFIG.mode || 'review';
+  var framed = window.top !== window;
   var MSG = MODE !== 'review';
   var S = window.__smDoc = {
     config: CONFIG,
@@ -194,6 +195,7 @@
     return [S.prState === 'merged' ? 'PR merged — commenting opens a new PR' : 'PR closed — commenting reopens it', 'muted'];
   }
 
+  S.openReview = openReview;
   function renderBar() {
     clear(bar);
     if (MSG) {
@@ -223,8 +225,8 @@
     var st = stateText();
     var n = currentDrafts().length;
     [
-      el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
-      picker,
+      framed ? null : el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
+      framed ? null : picker,
       CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
       el('span', { class: st[1] + ' state', text: st[0] + (S.mergeHold ? ' · ⏸' : ''), title: S.mergeHold ? 'merge hold by ' + S.mergeHold.placed_by : '' }),
       MSG ? null : agentChip(),

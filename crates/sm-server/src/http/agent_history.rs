@@ -157,8 +157,11 @@ pub(super) async fn get_agent_history(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AgentHistoryParams>,
     request: Request,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
+    if let Some(shell) = web::shell_page(&state, &request) {
+        return Ok(shell);
+    }
     let before = match params.before.as_deref().map(str::trim) {
         Some(cursor) if !cursor.is_empty() => {
             Some(decode_cursor(cursor).ok_or_else(|| ApiError::Status {
@@ -195,7 +198,8 @@ pub(super) async fn get_agent_history(
         agents,
         next_before,
         total,
-    })?))
+    })?)
+    .into_response())
 }
 
 #[cfg(test)]

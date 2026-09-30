@@ -292,7 +292,13 @@ pub(super) async fn get_owner_message(
     // (sm#1647). Served here rather than redirected: the app's reader sends
     // paths it does not know to the system browser.
     let at = Some(message.id.clone()).filter(|_| query.bottom.is_none());
-    super::inbox::agent_thread_page(&state, &message.sender_session_id, at)
+    super::inbox::agent_thread_page(
+        &state,
+        &message.sender_session_id,
+        at,
+        false,
+        web::wants_shell(&state, &request),
+    )
 }
 
 /// `2m ago`, `3h ago`, `4d ago`; `just now` under a minute.

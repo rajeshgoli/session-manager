@@ -18298,6 +18298,10 @@ mod tests {
         assert_eq!(entries[0]["provider"], "claude");
         assert_eq!(entries[0]["working_dir"], "/repo");
         assert_eq!(entries[0]["text"], text);
+        let rendered = entries[0]["html"].as_str().unwrap();
+        assert!(rendered.contains("<strong>bold</strong>"));
+        assert!(rendered.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!rendered.contains("<script>"));
 
         let response = app
             .clone()
@@ -18312,13 +18316,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(
-            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "{html}"
-        );
-        assert!(!html.contains("<script>alert"), "{html}");
-        assert!(html.contains("<strong>bold</strong>"), "{html}");
-        assert!(html.contains(r#"<a class="tab on" href="/guestbook">Guestbook</a>"#));
+        assert!(html.contains("/assets/app.js"), "{html}");
     }
 
     #[tokio::test]
@@ -19565,6 +19563,10 @@ mod tests {
             "/",
             "/?open=agent:abc12345",
             "/board",
+            "/inbox",
+            "/history",
+            "/history/agents",
+            "/guestbook",
             "/queue",
             "/analytics",
             "/analytics/spend",
@@ -19666,6 +19668,27 @@ mod tests {
         let html = body_text(response).await;
         assert!(html.contains("Handoff defaults"));
         assert!(!html.contains(r#"id="sm-config""#));
+        for uri in ["/inbox", "/history", "/guestbook"] {
+            let response = app.clone().oneshot(app_host(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert!(
+                !body_text(response).await.contains(r#"id="sm-config""#),
+                "{uri}"
+            );
+        }
+        for uri in ["/inbox", "/history", "/history/agents", "/guestbook"] {
+            let mut request = browser(uri);
+            request
+                .headers_mut()
+                .insert("accept", "application/json".parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+        }
         let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let response = app.clone().oneshot(app_host("/board")).await.unwrap();

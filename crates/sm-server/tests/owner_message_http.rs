@@ -1074,3 +1074,39 @@ async fn a_fired_follow_is_new_until_its_thread_is_read() {
         "new"
     );
 }
+
+#[tokio::test]
+async fn web_thread_json_preserves_quotes_and_recipient() {
+    let f = fixture();
+    let id = created_id(
+        &f,
+        "eng00001",
+        "Question\n\nPlease review this paragraph.",
+        json!({"blocking":true}),
+    )
+    .await;
+    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(thread["session_id"], "eng00001");
+    assert_eq!(thread["can_send"], true);
+    let html = thread["items"][0]["html"].as_str().unwrap();
+    assert!(html.contains(&format!("data-msg=\"{id}\"")), "{html}");
+    assert!(html.contains("data-sm-line"), "{html}");
+    let mut req = Request::builder()
+        .uri("/inbox/agent/eng00001")
+        .header("host", "localhost")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+    let response = f.app.clone().oneshot(req).await.unwrap();
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("/assets/reader-bar.js"));
+    fs::remove_dir_all(f.dir).unwrap();
+}

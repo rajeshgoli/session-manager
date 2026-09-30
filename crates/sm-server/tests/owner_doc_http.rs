@@ -659,3 +659,37 @@ async fn ordinary_review_delivery_is_not_a_document_assignment() {
     let (_, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
     assert!(head["agent"].is_null(), "{head}");
 }
+
+#[tokio::test]
+async fn browser_doc_page_injects_navigation_without_changing_metadata() {
+    let f = fixture();
+    publish(&f, "author01", "a", false, None).await;
+    let mut req = Request::builder()
+        .uri("/docs/widgets/specs/memo.md?from=%2Finbox")
+        .header("host", "localhost")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+    let response = f.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("/assets/reader-bar.js"));
+    assert!(html.contains("sm-doc-client"));
+    let (status, meta) = request(
+        &f.app,
+        "GET",
+        "/docs/widgets/specs/memo.md?format=json",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(meta["selected_commit_sha"], "a".repeat(40));
+    fs::remove_dir_all(f.dir).unwrap();
+}
