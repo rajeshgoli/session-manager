@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1784 — Local models as sm agents</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1784 — Local models as sm agents</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>sm-1784</code> (2aac7357) · Ticket #1784 · 2026-09-30</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Run local agents as ordinary Claude Code sessions that point at a model server on this Mac, and make sm own the one decision no harness can make: when the model is loaded and how many agents may share it, given everything else the machine is doing.</b> The harness (the program that turns a model into an agent: Claude Code, Codex, opencode) is a solved problem; all three on this machine can already talk to a local model. What is unsolved is contention. A resident coding model takes 85–130 GB of the 256 GB, and your queue jobs alone use 173 GB or more in one sample out of ten, and up to 247 GB. Without sm, the first time both want memory at once the machine swaps, and sm's own memory guard stops one of your queue jobs rather than the model, because the model is invisible to it.</p>
+
+<p>Concretely sm gains four things: a <b>local model host</b> it loads and unloads; a <b>seat limit</b> on how many local agents may run against it; a <b>yield rule</b> that unloads the model before any queue job is starved and resumes the parked agents afterwards; and <b>separate accounting</b> so local tokens never count against your Claude or Codex quota. The first step is a pilot of three tickets ending in a <b>bake-off</b> (a head-to-head run of candidate models on past tickets whose right answer we already know). The build-out is gated on its result, because the open question is not plumbing but whether a local model does useful work in your workflow at all.</p>
+
+<dl class="vocab">
+<dt>Model server</dt><dd>The program that holds model weights in memory and answers HTTP requests. Here: LM Studio 0.4.16, already installed and running as a background service. It speaks both the OpenAI and the Anthropic request formats.</dd>
+<dt>Weights</dt><dd>The model itself. Fixed size, loaded once, shared by every agent using that model. Qwen3-Coder-Next at 8-bit is 85 GB; MiniMax M2.5 at 4-bit is 129 GB.</dd>
+<dt>Context cache</dt><dd>Per-agent working memory the model keeps for the conversation so far (known elsewhere as the KV cache). Grows with the conversation length; one per concurrent agent. This, not the weights, is what limits how many agents fit.</dd>
+<dt>Seat</dt><dd>One agent's concurrent slot on the model. LM Studio calls it a parallel prediction; the model is loaded with a fixed number of them.</dd>
+<dt>Prefill / decode</dt><dd>Prefill is the model reading the prompt; decode is it writing the reply. Both are measured in tokens per second. Agents are prefill-heavy: every turn re-sends the whole conversation.</dd>
+<dt>Host</dt><dd>A new per-session field: where the session's model runs. <code>anthropic</code> (today's Claude), <code>openai</code> (today's Codex), or <code>local</code>.</dd>
+<dt>Yield</dt><dd>sm unloading the model because a queue job needs the memory, after first letting local agents finish the turn they are on (<b>drain</b>) and then holding their next message (<b>park</b>).</dd>
+</dl>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:18%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Which harness drives the local model?</td><td><b>Claude Code, launched with a slim profile, pointed at LM Studio.</b> sm spawns it exactly like a Claude agent; the session's host is <code>local</code>. The slim profile drops MCP servers, skills and unused tools so the first prompt shrinks from ~84K tokens to an expected 15–25K. opencode is the fallback if the pilot shows Claude Code cannot be slimmed below 30K or calls tools unreliably on a local model.</td><td>sm already understands Claude Code completely (status, message delivery, usage, resume, compaction); a new harness means ~25 files of new integration.</td></tr>
+<tr><td>2. Which model is resident?</td><td><b>Qwen3-Coder-Next 8-bit by default; MiniMax M2.5 enters only through the bake-off.</b> GLM-5.2 (204 GB) is excluded.</td><td>Qwen's per-agent memory is one-tenth of MiniMax's. With four agents on 100K-token conversations, Qwen needs ~95 GB in total and MiniMax ~230 GB, which leaves nothing for your queue.</td></tr>
+<tr><td>3. Who wins when memory runs short?</td><td><b>Your queue jobs, always.</b> The model is the first thing sm removes, before its memory guard stops any queue job. Local agents drain, park, and resume when memory returns.</td><td>Local agents are optional capacity; your queue jobs are the work.</td></tr>
+<tr><td>4. What happens during a perf run?</td><td><b>A perf run unloads the model for its duration.</b></td><td>Perf asks for a quiet machine; a model decoding at full GPU is the loudest thing on it.</td></tr>
+<tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-codex-review</code> like everyone else's.</td><td>These models are roughly Low-tier quality at best, and the review gate is what makes weaker authors safe.</td></tr>
+<tr><td>6. When may local agents run?</td><td><b>Whenever the model fits, not only overnight.</b> The yield rule handles contention.</td><td>Your queue is light 00:00–05:00 and around 08:00, but also between runs during the day; a fixed window wastes those gaps.</td></tr>
+<tr><td>7. What gets built now?</td><td><b>The pilot only: three tickets, ending in the bake-off.</b> The seat limit, yield rule and app changes are built only if the bake-off passes.</td><td>If local models cannot finish a Low-tier ticket in your workflow, none of the contention machinery is worth building.</td></tr>
+</tbody>
+</table>
+
+<h3>Why this is sm's job</h3>
+<p>LM Studio plus any harness gives you one local agent. It does not know that a queue job is about to take 150 GB, that a perf run wants the GPU quiet, or that three other local agents are already mid-turn. sm knows all three: the queue knows which jobs are running and pending, the utilization recorder samples memory and GPU every five seconds, and the session tracker knows which agents are mid-turn. The figure shows why this matters on this machine specifically.</p>
+
+<figure>
+<svg viewBox="0 0 720 300" role="img" aria-label="Memory used by hour of day" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px">
+<line x1="46" x2="710" y1="266" y2="266" stroke="var(--rule)"/><text x="40" y="270" text-anchor="end" fill="var(--ink-2)">0</text>
+<line x1="46" x2="710" y1="221" y2="221" stroke="var(--rule)"/><text x="40" y="225" text-anchor="end" fill="var(--ink-2)">50</text>
+<line x1="46" x2="710" y1="175" y2="175" stroke="var(--rule)"/><text x="40" y="179" text-anchor="end" fill="var(--ink-2)">100</text>
+<line x1="46" x2="710" y1="130" y2="130" stroke="var(--rule)"/><text x="40" y="134" text-anchor="end" fill="var(--ink-2)">150</text>
+<line x1="46" x2="710" y1="84" y2="84" stroke="var(--rule)"/><text x="40" y="88" text-anchor="end" fill="var(--ink-2)">200</text>
+<line x1="46" x2="710" y1="39" y2="39" stroke="var(--rule)"/><text x="40" y="43" text-anchor="end" fill="var(--ink-2)">250</text>
+<rect x="49" y="238" width="22" height="28" fill="var(--blue)" opacity=".25"/><rect x="49" y="243" width="22" height="23" fill="var(--blue)"/>
+<text x="60" y="281" text-anchor="middle" fill="var(--ink-2)">00</text>
+<rect x="77" y="242" width="22" height="24" fill="var(--blue)" opacity=".25"/><rect x="77" y="244" width="22" height="22" fill="var(--blue)"/>
+<rect x="104" y="243" width="22" height="23" fill="var(--blue)" opacity=".25"/><rect x="104" y="245" width="22" height="21" fill="var(--blue)"/>
+<rect x="132" y="243" width="22" height="23" fill="var(--blue)" opacity=".25"/><rect x="132" y="244" width="22" height="22" fill="var(--blue)"/>
+<text x="143" y="281" text-anchor="middle" fill="var(--ink-2)">03</text>
+<rect x="160" y="204" width="22" height="62" fill="var(--blue)" opacity=".25"/><rect x="160" y="235" width="22" height="31" fill="var(--blue)"/>
+<rect x="187" y="170" width="22" height="96" fill="var(--blue)" opacity=".25"/><rect x="187" y="233" width="22" height="33" fill="var(--blue)"/>
+<rect x="215" y="125" width="22" height="141" fill="var(--blue)" opacity=".25"/><rect x="215" y="198" width="22" height="68" fill="var(--blue)"/>
+<text x="226" y="281" text-anchor="middle" fill="var(--ink-2)">06</text>
+<rect x="243" y="123" width="22" height="143" fill="var(--blue)" opacity=".25"/><rect x="243" y="210" width="22" height="56" fill="var(--blue)"/>
+<rect x="270" y="181" width="22" height="85" fill="var(--blue)" opacity=".25"/><rect x="270" y="233" width="22" height="33" fill="var(--blue)"/>
+<rect x="298" y="135" width="22" height="131" fill="var(--blue)" opacity=".25"/><rect x="298" y="174" width="22" height="92" fill="var(--blue)"/>
+<text x="309" y="281" text-anchor="middle" fill="var(--ink-2)">09</text>
+<rect x="326" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="326" y="133" width="22" height="133" fill="var(--blue)"/>
+<rect x="353" y="82" width="22" height="184" fill="var(--blue)" opacity=".25"/><rect x="353" y="107" width="22" height="159" fill="var(--blue)"/>
+<rect x="381" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="381" y="107" width="22" height="159" fill="var(--blue)"/>
+<text x="392" y="281" text-anchor="middle" fill="var(--ink-2)">12</text>
+<rect x="409" y="82" width="22" height="184" fill="var(--blue)" opacity=".25"/><rect x="409" y="107" width="22" height="159" fill="var(--blue)"/>
+<text x="447" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
+<text x="475" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
+<text x="475" y="281" text-anchor="middle" fill="var(--ink-2)">15</text>
+<text x="502" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
+<rect x="519" y="132" width="22" height="134" fill="var(--blue)" opacity=".25"/><rect x="519" y="172" width="22" height="94" fill="var(--blue)"/>
+<rect x="547" y="43" width="22" height="223" fill="var(--blue)" opacity=".25"/><rect x="547" y="144" width="22" height="122" fill="var(--blue)"/>
+<text x="558" y="281" text-anchor="middle" fill="var(--ink-2)">18</text>
+<rect x="575" y="47" width="22" height="219" fill="var(--blue)" opacity=".25"/><rect x="575" y="139" width="22" height="127" fill="var(--blue)"/>
+<rect x="602" y="44" width="22" height="222" fill="var(--blue)" opacity=".25"/><rect x="602" y="141" width="22" height="125" fill="var(--blue)"/>
+<rect x="630" y="42" width="22" height="224" fill="var(--blue)" opacity=".25"/><rect x="630" y="160" width="22" height="106" fill="var(--blue)"/>
+<text x="641" y="281" text-anchor="middle" fill="var(--ink-2)">21</text>
+<rect x="658" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="658" y="139" width="22" height="127" fill="var(--blue)"/>
+<rect x="685" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="685" y="85" width="22" height="181" fill="var(--blue)"/>
+<line x1="46" x2="710" y1="102" y2="102" stroke="var(--green)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="97" text-anchor="end" fill="var(--green)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">Qwen3-Coder-Next + 4 agents resident → this much left (180 GB)</text>
+<line x1="46" x2="710" y1="225" y2="225" stroke="var(--red)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="220" text-anchor="end" fill="var(--red)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">MiniMax M2.5 + 4 agents resident → this much left (45 GB)</text>
+<text x="46" y="296" fill="var(--ink-2)">hour of day (local) · GB used, dark = average, light = peak · 256 GiB = 275 GB total</text></svg>
+
+<figcaption><b>Figure 1. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples). Dark bars are hourly averages and light bars are hourly peaks. The dashed lines show how much memory is left for everything else once a model and four agents are resident. With Qwen resident, the average hour still fits, and the peak hours (18:00–23:00, driven by queue jobs) force a yield. With MiniMax resident, only the overnight hours fit. The dots mark hours with no samples.</figcaption>
+</figure>
+
+<p>Three facts from the same data drive the design:</p>
+<ul>
+<li><b>Queue jobs are the memory.</b> Queue jobs alone used 49 GB at the median sample, 173 GB at the 90th percentile and 247 GB at the 99th. Background jobs were running 61% of the time.</li>
+<li><b>The GPU is shared, too.</b> From 18:00 to 21:00 the GPU averaged 60–76% busy from queue work. A local model decoding at the same time slows both.</li>
+<li><b>sm's memory guard would hit the wrong target.</b> When available memory falls below 8 GiB, the guard stops the largest <i>queue job</i>. A model server started outside sm is not a queue job, so the guard would stop your job to protect the model. Part of this design is teaching the guard to unload the model first.</li>
+</ul>
+
+<h3>What local agents are worth</h3>
+<p>This is the honest ceiling. Over the last 14 days, your weekly quota went here (sm's fitted quota weights):</p>
+<table>
+<thead><tr><th>Model</th><th>Tier</th><th>Share of its provider's weekly quota</th><th>Could a local model take it?</th></tr></thead>
+<tbody>
+<tr><td>Astra (Codex)</td><td>Top</td><td>68%</td><td>No: design authority and hard review.</td></tr>
+<tr><td>Opus</td><td>Mid</td><td>50%</td><td>A mechanical slice of it, perhaps 10–20%.</td></tr>
+<tr><td>Fable</td><td>Top</td><td>20%</td><td>No.</td></tr>
+<tr><td>Sol (Codex)</td><td>Mid</td><td>2%</td><td>Some.</td></tr>
+<tr><td>Sonnet, Luna</td><td>Low</td><td>under 1%</td><td>Yes, but there is almost nothing there to save.</td></tr>
+</tbody>
+</table>
+<p>So local agents do not pay for themselves by replacing the Low tier; you barely use it. They pay in three other ways, in order of likely value:</p>
+<ol>
+<li><b>Work you skip today because it costs quota.</b> Always-on scouts, log and failure triage, inventory sweeps, and summarising long docs with <code>sm doc cat</code> all become free at the margin.</li>
+<li><b>Moving the mechanical part of Opus work down.</b> Moving 10–20% of Opus-share work saves roughly 5–10% of the weekly Claude quota.</li>
+<li><b>Continuity.</b> When a quota runs out, work today stops until the reset. Local agents keep the Local-tier queue moving.</li>
+</ol>
+<p>The bake-off measures whether (1) and (2) are real. If a local agent cannot finish a Low-tier ticket without a human or a top-tier agent cleaning up after it, the value is negative and we stop.</p>
+
+<h3>The harness choice</h3>
+<table>
+<thead><tr><th style="width:22%"></th><th>A. Claude Code → LM Studio (recommended)</th><th>B. Codex <code>--oss</code> → LM Studio</th><th>C. opencode as a new provider</th></tr></thead>
+<tbody>
+<tr><td>What sm reuses</td><td>Everything Claude has: hooks for status, transcript for usage, verified spawn brief, <code>--resume</code>, <code>/clear</code>, compaction events.</td><td>Only stock-Codex support: status from the pane title, no verified brief. Your Codex fork has its event stream but not <code>--oss</code>.</td><td>Nothing. New status detection, message delivery, usage parser, resume, and UI.</td></tr>
+<tr><td>sm change</td><td>Small: per-session launch environment, a host field, usage split, UI badge.</td><td>Medium: port <code>--oss</code> into the fork, or accept weak stock-Codex integration.</td><td>Large: ~25 files branch on provider today.</td></tr>
+<tr><td>Prompt overhead</td><td>Large by default (34K–96K tokens on this machine; median 84K). The slim profile is required, not optional.</td><td>Moderate.</td><td>Smallest.</td></tr>
+<tr><td>Model fit</td><td>MiniMax M2.5 and Qwen3-Coder are both trained on Claude-Code-style tool use.</td><td>Codex's patch tool format is GPT-specific; open models handle it less well.</td><td>Generic tool calls; works with any model.</td></tr>
+<tr><td>Known risk</td><td>LM Studio 0.4.19 broke tool calling for Qwen on this endpoint<sup><a href="#fn1">1</a></sup>; we pin 0.4.16. Claude Code's auto permission mode may need Anthropic's servers: the pilot checks.</td><td>Integration gap.</td><td>Cost.</td></tr>
+</tbody>
+</table>
+
+<h3>Model choice and how many agents fit</h3>
+<p>Two models on disk are candidates. The number that decides between them is per-agent context-cache memory, which comes from the model's architecture and so is exact rather than estimated: Qwen3-Coder-Next keeps a full cache on only 12 of its 48 layers; MiniMax M2.5 keeps it on all 62.</p>
+<table>
+<thead><tr><th>Model (on disk)</th><th>Size</th><th>Weights</th><th>Cache per agent at 100K tokens</th><th>Weights + 4 agents</th><!--BENCHCOLS--></tr></thead>
+<tbody>
+<tr><td>Qwen3-Coder-Next, 8-bit</td><td>80B total, 3B active per token</td><td>85 GB</td><td>2.5 GB</td><td>~95 GB</td><!--BENCHQWEN--></tr>
+<tr><td>MiniMax M2.5, 4-bit</td><td>230B total, 10B active</td><td>129 GB</td><td>25 GB</td><td>~230 GB</td><!--BENCHMINIMAX--></tr>
+<tr><td>GLM-5.2, 2-bit experts</td><td>large MoE</td><td>204 GB</td><td>n/a</td><td>does not fit beside anything</td><!--BENCHGLM--></tr>
+</tbody>
+</table>
+<!--BENCHPROSE-->
+
+<h3>How it works</h3>
+<figure>
+<svg viewBox="0 0 720 250" role="img" aria-label="Local agent architecture" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink-2)"/></marker></defs>
+<rect x="10" y="20" width="200" height="210" rx="8" fill="var(--surface-2)" stroke="var(--ink-3)"/>
+<text x="110" y="42" text-anchor="middle" font-weight="700" fill="var(--ink)">sm server</text>
+<text x="24" y="70" fill="var(--ink)">session tracker</text><text x="24" y="85" fill="var(--ink-2)" font-size="10.5">host = local, turn state</text>
+<text x="24" y="115" fill="var(--ink)">queue + memory guard</text><text x="24" y="130" fill="var(--ink-2)" font-size="10.5">yield before killing a job</text>
+<text x="24" y="160" fill="var(--violet)" font-weight="700">local model host (new)</text><text x="24" y="175" fill="var(--ink-2)" font-size="10.5">load / unload, seat limit</text>
+<text x="24" y="205" fill="var(--ink)">usage ledger</text><text x="24" y="220" fill="var(--ink-2)" font-size="10.5">local = machine time, 0 quota</text>
+<rect x="270" y="20" width="200" height="90" rx="8" fill="var(--surface-2)" stroke="var(--ink-3)"/>
+<text x="370" y="42" text-anchor="middle" font-weight="700" fill="var(--ink)">tmux: Claude Code</text>
+<text x="370" y="62" text-anchor="middle" fill="var(--ink-2)" font-size="10.5">slim profile, one per agent</text>
+<text x="370" y="80" text-anchor="middle" fill="var(--ink-2)" font-size="10.5">model URL → localhost:1234</text>
+<text x="370" y="96" text-anchor="middle" fill="var(--ink-2)" font-size="10.5">hooks + transcript as today</text>
+<rect x="530" y="20" width="180" height="210" rx="8" fill="var(--surface-2)" stroke="var(--violet)"/>
+<text x="620" y="42" text-anchor="middle" font-weight="700" fill="var(--ink)">LM Studio</text>
+<text x="620" y="62" text-anchor="middle" fill="var(--ink-2)" font-size="10.5">/v1/messages</text>
+<rect x="550" y="80" width="140" height="44" rx="5" fill="none" stroke="var(--violet)"/><text x="620" y="106" text-anchor="middle" fill="var(--ink)">weights (shared)</text>
+<rect x="550" y="134" width="30" height="40" rx="4" fill="none" stroke="var(--blue)"/><rect x="586" y="134" width="30" height="40" rx="4" fill="none" stroke="var(--blue)"/><rect x="622" y="134" width="30" height="40" rx="4" fill="none" stroke="var(--blue)"/><rect x="658" y="134" width="30" height="40" rx="4" fill="none" stroke="var(--blue)"/>
+<text x="620" y="192" text-anchor="middle" fill="var(--blue)" font-size="10.5">one seat + cache per agent</text>
+<text x="620" y="212" text-anchor="middle" fill="var(--ink-2)" font-size="10.5">auto-load on request: off</text>
+<line x1="210" y1="65" x2="268" y2="65" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="239" y="58" text-anchor="middle" fill="var(--ink-2)" font-size="10">spawn</text>
+<line x1="270" y1="95" x2="212" y2="95" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="241" y="110" text-anchor="middle" fill="var(--ink-2)" font-size="10">hooks</text>
+<line x1="470" y1="65" x2="528" y2="65" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="499" y="58" text-anchor="middle" fill="var(--ink-2)" font-size="10">HTTP</text>
+<line x1="210" y1="168" x2="528" y2="168" stroke="var(--violet)" stroke-dasharray="5 3" marker-end="url(#ar)"/><text x="370" y="160" text-anchor="middle" fill="var(--violet)" font-size="10.5">lms load / unload</text>
+</svg>
+<figcaption><b>Figure 2. The moving parts.</b> Only the violet parts are new. The agent is a normal Claude Code session in tmux, so sm tracks it the way it tracks every Claude agent. sm, not LM Studio, decides when the weights are loaded; LM Studio's load-on-first-request feature is switched off so an agent can never pull 85 GB into memory behind sm's back.</figcaption>
+</figure>
+
+<p><b>Spawning.</b> <code>sm spawn claude --host local "brief"</code> starts a local agent. sm refuses with a reason if no seat is free or the model cannot be loaded now; the spawn waits the way a queue job waits. The agent's name, children, <code>sm send</code>, reminders and status all behave as for any Claude agent. The app shows a LOCAL badge.</p>
+
+<p><b>Yielding.</b> The figure below shows a yield from start to finish.</p>
+<figure>
+<svg viewBox="0 0 720 170" role="img" aria-label="Yield timeline" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11.5px">
+<text x="10" y="40" fill="var(--ink)">free memory</text>
+<path d="M120,30 L250,30 L300,70 L330,70 L330,30 L520,30 L560,30 L600,62 L710,62" fill="none" stroke="var(--blue)" stroke-width="2"/>
+<line x1="120" y1="55" x2="710" y2="55" stroke="var(--red)" stroke-dasharray="4 3"/><text x="712" y="52" text-anchor="end" fill="var(--red)" font-size="10">yield line</text>
+<text x="10" y="95" fill="var(--ink)">model</text>
+<rect x="120" y="84" width="220" height="16" fill="var(--violet)" opacity=".7"/><rect x="600" y="84" width="110" height="16" fill="var(--violet)" opacity=".7"/>
+<text x="470" y="96" text-anchor="middle" fill="var(--ink-3)">unloaded</text>
+<text x="10" y="130" fill="var(--ink)">local agents</text>
+<rect x="120" y="119" width="160" height="16" fill="var(--green)" opacity=".7"/><rect x="280" y="119" width="60" height="16" fill="var(--orange)" opacity=".7"/><rect x="340" y="119" width="290" height="16" fill="var(--ink-3)" opacity=".4"/><rect x="630" y="119" width="80" height="16" fill="var(--green)" opacity=".7"/>
+<text x="200" y="131" text-anchor="middle" fill="var(--surface)">working</text><text x="310" y="131" text-anchor="middle" fill="var(--surface)">drain</text><text x="485" y="131" text-anchor="middle" fill="var(--ink)">parked</text><text x="670" y="131" text-anchor="middle" fill="var(--surface)">resumed</text>
+<line x1="280" y1="20" x2="280" y2="150" stroke="var(--ink-3)"/><text x="280" y="163" text-anchor="middle" fill="var(--ink-2)">① job grows</text>
+<line x1="340" y1="20" x2="340" y2="150" stroke="var(--ink-3)"/><text x="360" y="14" text-anchor="middle" fill="var(--ink-2)">② unload</text>
+<line x1="600" y1="20" x2="600" y2="150" stroke="var(--ink-3)"/><text x="600" y="163" text-anchor="middle" fill="var(--ink-2)">③ memory back 10 min → reload</text>
+</svg>
+<figcaption><b>Figure 3. A yield.</b> ① A queue job's memory pushes free memory under the yield line, which sits 24 GB above the guard's 8 GiB floor. sm stops delivering new messages to local agents and lets current turns finish, for at most 10 minutes. ② sm unloads the model. Any turn still running gets a connection error, which Claude Code retries and then gives up on. ③ Once free memory has stayed above the model's reservation plus the yield line for 10 minutes, sm reloads the model and sends each parked agent its held messages, or "continue" if its turn was cut off. A perf run triggers the same sequence when it is admitted and holds the model off until it ends.</figcaption>
+</figure>
+
+<p><b>Accounting.</b> Local turns land in the usage ledger like any Claude turn, tagged with host <code>local</code>. They carry zero quota weight, are excluded from the Claude meter fit, and show in the app's Spend view as a separate "Local" line measured in model-busy hours, so you can see what the local tier did and what it cost the machine.</p>
+
+<h3>The plan</h3>
+<table>
+<thead><tr><th style="width:8%">#</th><th>Ticket</th><th style="width:16%">Tier</th><th style="width:16%">Starts after</th></tr></thead>
+<tbody>
+<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size.</td><td>Opus, high</td><td>—</td></tr>
+<tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>—</td></tr>
+<tr><td>P3</td><td><b>Bake-off.</b> Run 8 closed tickets from the last month (Low- and Mid-tier, with merged PRs) through local agents on each model. Score each: did it finish, did review pass within the normal round limit, wall time, and how much a Mid agent had to fix.</td><td>Opus, high (driver)</td><td>P1, P2</td></tr>
+<tr><td>B1</td><td><b>Seat limit and yield.</b> Build the drain, park and resume behaviour in Figure 3, and wait-for-seat at spawn.</td><td>Opus, high</td><td>P3 passes</td></tr>
+<tr><td>B2</td><td><b>Spend and tier table.</b> Add the Local line in Spend (web and Android) and the Local row in the CLAUDE.md tier table.</td><td>Sonnet, high</td><td>B1</td></tr>
+</tbody>
+</table>
+<p><b>Bake-off pass bar:</b> at least 5 of 8 tickets reach a clean review with no more rescue than a Mid agent spending 15% of that ticket's original tokens, and median wall time within 3× the original. Below that, we stop after the pilot. P1 and P2 are small and stay useful for manual local sessions.</p>
+
+<h3>Risks I cannot close from here</h3>
+<ul>
+<li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent waits ⟨bench⟩ before its first word, and every compaction pays it again. The fallback is opencode, at the cost in the harness table.</li>
+<li><b>Permission mode.</b> Claude Code's auto mode may consult Anthropic's servers to classify actions. If it will not run against a local endpoint, local agents use <code>acceptEdits</code> with a command allowlist, which is stricter.</li>
+<li><b>Instruction following.</b> Weaker models ignore standing rules more often (naming themselves, going idle, not polling). Local agents get a short dedicated brief addendum, and the bake-off scores rule-following explicitly.</li>
+</ul>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<p id="fn1" class="sans"><small>1. LM Studio bug tracker issue 2164, "Regression in 0.4.19 Build 2: Anthropic /v1/messages endpoint breaks tool calling with Qwen models when used with Claude Code".</small></p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<div class="toc">
+<div><a href="#a">A. Conventions</a></div>
+<div><a href="#b">B. Where sm hard-codes provider today</a></div>
+<div><a href="#c">C. P1: host field and launch profile</a></div>
+<div><a href="#d">D. P1: usage accounting</a></div>
+<div><a href="#e">E. P2: sm owns the model</a></div>
+<div><a href="#f">F. B1: seat limit, drain, park, resume</a></div>
+<div><a href="#g">G. B2: Spend line, tier table, UI</a></div>
+<div><a href="#h">H. P3: bake-off protocol</a></div>
+<div><a href="#i">I. Measurements and method</a></div>
+<div><a href="#j">J. Requirement trace</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Conventions</h3>
+<p>Paths are relative to <code>crates/sm-server/src/</code> unless they start with <code>docs/</code>, <code>specs/</code>, <code>web/</code>, <code>android-app/</code>, <code>hooks/</code> or <code>scripts/</code>. Line numbers are at origin/main <code>2a5e74f3</code>; treat them as starting points. "Local agent" means a session whose <code>host</code> is <code>local</code>. "The model server" means LM Studio's local HTTP server on <code>127.0.0.1:1234</code>. <code>lms</code> is LM Studio's CLI at <code>~/.lmstudio/bin/lms</code>. GB means 10<sup>9</sup> bytes throughout. 256 GiB is 275 GB, and sm's memory reserve of 8 GiB is 8.6 GB.</p>
+
+<h3 id="b">B. Where sm hard-codes provider today</h3>
+<p>Provider is a free string on the session record (<code>SessionRecord.provider</code>, sessions.rs:15687, default <code>claude</code>). Its values are <code>claude</code>, <code>codex</code> (stock), <code>codex-fork</code> and the retired <code>codex-app</code>. There is no extension point: about 25 production files branch on the literal strings. This design deliberately keeps <code>provider = "claude"</code> for local agents so that none of those branches change. The new <code>host</code> field is consulted only at the sites listed in C–G. The sites that matter:</p>
+<table>
+<thead><tr><th>Concern</th><th>Site</th><th>Local-agent impact</th></tr></thead>
+<tbody>
+<tr><td>Runtime allow-list</td><td>http.rs:14862 <code>ensure_core_runtime_provider_supported</code>; runtime.rs:1371 <code>launch_command</code></td><td>None: provider stays <code>claude</code>.</td></tr>
+<tr><td>Launch environment</td><td>runtime.rs:2667 <code>managed_session_command</code> (exports <code>CLAUDE_SESSION_MANAGER_ID</code>, <code>ENABLE_TOOL_SEARCH=false</code>)</td><td>Adds host environment (C.3).</td></tr>
+<tr><td>Launch arguments</td><td>runtime.rs:1371–1440; config.rs:1146 <code>ProviderLaunchConfig</code>, defaults config.rs:110–122</td><td>Adds the slim profile (C.4).</td></tr>
+<tr><td>Restore</td><td>runtime.rs:610–636 (<code>--resume &lt;id&gt;</code>)</td><td>Must re-apply host environment (C.6).</td></tr>
+<tr><td>Model catalog</td><td>runtime.rs:405–470; http.rs:2682 <code>/client/session-models</code></td><td>Local host lists the loaded model (C.5).</td></tr>
+<tr><td>Hooks</td><td>scripts/install_notify_server_hook.sh writes <code>~/.claude/settings.json</code>; routes <code>/hooks/claude</code>, <code>/hooks/tool-use</code>, <code>/hooks/context-usage</code> (http.rs:1528–1531)</td><td>Must still fire under the slim profile (C.4).</td></tr>
+<tr><td>Status detection</td><td>sessions.rs:16520 <code>claude_hook_gate</code>; pane scrapes http.rs:12175–12470</td><td>Unchanged.</td></tr>
+<tr><td>Spawn brief acknowledgement</td><td>runtime.rs:1498–1575</td><td>Unchanged (Claude transcript).</td></tr>
+<tr><td>Usage scan</td><td>sessions.rs:416 <code>scan_usage_ledger</code> → <code>record_session_account_key</code> (sessions.rs:428); usage_ledger.rs:1010 <code>scan_artifact</code>; quota_rates.rs:61 <code>family_rate</code></td><td>Local rows get a local account (D).</td></tr>
+<tr><td>Memory guard</td><td>queue.rs:5237–5340 <code>host_memory_guard_pass</code> (stops the largest queue job when available &lt; reserve)</td><td>Unloads the model first (E.4).</td></tr>
+<tr><td>Queue admission</td><td>queue.rs:3726–3895 <code>admit_pending_queue_jobs_conn</code>; perf memory check queue.rs:4549</td><td>Perf admission unloads the model (E.5).</td></tr>
+<tr><td>Utilization recorder</td><td>utilization.rs:353–385 <code>apply_memory</code>; job share utilization.rs:511</td><td>Records model footprint (E.6).</td></tr>
+<tr><td>UI provider label</td><td>web/ui.js:250, web/agents.js:217–227, web/start.js:9–17, web/board-start.js:60; android-app WatchModels, CreateSessionSheet</td><td>LOCAL badge and host picker (G).</td></tr>
+</tbody>
+</table>
+
+<h3 id="c">C. P1: host field and launch profile</h3>
+<h4>C.1 Persisted shape</h4>
+<p>Add <code>host: Option&lt;String&gt;</code> to <code>SessionRecord</code> (sessions.rs:15687 and the two sibling structs at 15727 and 15830 that carry <code>provider</code>). <code>None</code> means the provider's native host. The only other accepted value in this design is <code>"local"</code>. The field is serialised in <code>sessions.json</code> with <code>#[serde(default, skip_serializing_if = "Option::is_none")]</code>, so existing records are unchanged on disk. Any other value is rejected at create with 400 <code>unsupported host &lt;x&gt;</code>. <code>host = "local"</code> with a provider other than <code>claude</code> is rejected with 400 <code>host local requires provider claude</code>.</p>
+<h4>C.2 Entry points</h4>
+<ul>
+<li>CLI: <code>sm spawn claude --host local [--model &lt;id&gt;] …</code> and <code>sm claude --host local</code>. Omitting <code>--model</code> uses the model currently loaded by sm (E). An explicit <code>--model</code> that differs from the loaded model is refused with <code>model &lt;id&gt; is not loaded; loaded: &lt;id&gt;</code>. sm never swaps models to satisfy a spawn.</li>
+<li>HTTP: <code>POST /client/sessions</code> and the spawn route accept <code>"host": "local"</code>. Board start and owner settings (<code>new_agent.provider</code>) do not offer local in P1.</li>
+<li><code>--effort</code> is ignored for host local, and the spawn result says so in one line. Local models have no effort setting that Claude Code can pass.</li>
+</ul>
+<h4>C.3 Launch environment for host local</h4>
+<p>Exported by <code>managed_session_command</code> after the existing exports, only when <code>host = local</code>:</p>
+<pre><code>export ANTHROPIC_BASE_URL=http://127.0.0.1:1234
+export ANTHROPIC_AUTH_TOKEN=lmstudio
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_MODEL=&lt;loaded model identifier&gt;
+export ANTHROPIC_SMALL_FAST_MODEL=&lt;loaded model identifier&gt;
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export SM_HOST=local</code></pre>
+<p>The base URL and token come from a new config block <code>local_host: { base_url, auth_token, lms_path }</code> with those defaults. <code>SM_HOST</code> lets hooks and the brief addendum (C.7) know they are local. Test: a unit test in the style of runtime.rs:3498 asserts that the local command contains each export and that a non-local command contains none of them.</p>
+<h4>C.4 Slim profile</h4>
+<p>Default Claude Code sessions on this machine send a first prompt of 34K–96K tokens (median 84K across the 39 most recent transcripts; see I.3), because every MCP server, skill and plugin contributes tool definitions. For host local, sm appends these arguments to the Claude launch arguments:</p>
+<pre><code>--strict-mcp-config --mcp-config '{"mcpServers":{}}'
+--disable-slash-commands
+--tools Bash,Read,Edit,Write,Glob,Grep,TodoWrite</code></pre>
+<p>User settings still load, so sm's hooks and status line in <code>~/.claude/settings.json</code> still fire. Do not use <code>--bare</code>: it skips settings-defined hooks, and sm's status detection depends on them. CLAUDE.md still loads because it is the standing contract. P1 measures the resulting first-prompt size by reading the first assistant turn's <code>usage</code> in the transcript (input + cache creation + cache read). It records the number in the P1 PR and in I.3. If the size exceeds 30K tokens, P1 stops and reports; the owner then chooses between trimming further and the opencode fallback.</p>
+<h4>C.5 Model catalog</h4>
+<p><code>/client/session-models</code> with <code>host=local</code> returns exactly one entry, the model sm has loaded (E.2), or an empty list with reason <code>no local model loaded</code>.</p>
+<h4>C.6 Restore and clear</h4>
+<p>Restore (<code>--resume</code>) re-runs <code>managed_session_command</code> with the stored host, so the environment is re-applied. This is a correctness requirement, not a nicety. A local session restored without it would resume against Anthropic, bill your quota, and send a local conversation to the cloud. Test: restoring a host-local record produces a command containing <code>ANTHROPIC_BASE_URL</code>. <code>/clear</code> is unchanged.</p>
+<h4>C.7 Brief addendum</h4>
+<p>sm prepends a short fixed block, about 150 words, to the spawn brief of every local agent. The block states: your tier is Local; do not delegate or spawn; use <code>sm status</code> on <code>[sm remind]</code>; open a PR and run <code>sm request-codex-review</code>; stop and report if blocked. The text lives in <code>docs/product/local_agent_addendum.md</code> so it can change without a rebuild; sm reads it at spawn.</p>
+<h4>C.8 Example</h4>
+<pre><code>$ sm model status
+qwen3-coder-next  loaded  seats 1/4 used  reservation 105 GB
+$ sm spawn claude --host local --name sm-1901-inventory "Inventory every call site of …"
+spawned sm-1901-inventory (7c1e…) host=local model=qwen3-coder-next (effort ignored: local host)
+$ sm spawn claude --host local --model minimax-m2.5 "…"
+error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
+
+<h3 id="d">D. P1: usage accounting</h3>
+<ul>
+<li><b>Account.</b> In <code>scan_usage_ledger</code> (sessions.rs:416), a record with <code>host = local</code> records account key <code>local</code> instead of the Claude OAuth identity. The <code>accounts</code> table gets one row <code>account_key = local, provider = local</code>. Every quota consumer (burn windows, meter fit, <code>sm usage</code>, Spend) is keyed by account, so local rows fall out of Claude's numbers with no further change. Test: a ledger fixture with one local seat and one Claude seat shows the Claude weekly percent unchanged by the local rows.</li>
+<li><b>Price.</b> <code>quota_rates::pricing</code> returns rate 0 with <code>needs_note = false</code> for provider <code>local</code>, never the "unknown model priced as opus" fallback.</li>
+<li><b>Model-busy hours.</b> Each local message row already has a timestamp and token counts. B2 computes model-busy hours as the union of [request start, response end] intervals across local rows per hour, from transcript timestamps. P1 only needs the rows stored correctly.</li>
+</ul>
+
+<h3 id="e">E. P2: sm owns the model</h3>
+<h4>E.1 LM Studio settings (one-time, done by P2's setup script)</h4>
+<ul>
+<li>Turn off "just-in-time model loading" in the server settings, so a request for an unloaded model fails instead of loading it.</li>
+<li>Pin LM Studio to 0.4.16 and turn off auto-update. 0.4.19 has a known tool-calling regression on <code>/v1/messages</code> with Qwen. Upgrades become a deliberate step that re-runs the P3 smoke ticket.</li>
+<li>Start the server with <code>lms server start</code> on boot (the app already runs as a service).</li>
+</ul>
+<h4>E.2 Commands</h4>
+<table>
+<thead><tr><th>Command</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>sm model status</code></td><td>Loaded model, seats used / total, reservation, state (E.3), last yield time and reason.</td></tr>
+<tr><td><code>sm model load &lt;key&gt; [--seats N] [--context T]</code></td><td>Defaults: seats 4, context 200000. Computes the reservation (E.4) and refuses if available memory minus reservation is below the yield line. Otherwise runs <code>lms load &lt;key&gt; -c T --parallel N --identifier &lt;short-id&gt; -y</code> and polls <code>GET /v1/models</code> until the identifier appears, with a 10-minute timeout. Only one model may be loaded; loading a second is refused.</td></tr>
+<tr><td><code>sm model unload [--force]</code></td><td>Drains first (F), then runs <code>lms unload &lt;id&gt;</code>. <code>--force</code> skips the drain.</td></tr>
+</tbody>
+</table>
+<p>The short identifier is the last path segment of the key, lower-cased: <code>qwen/qwen3-coder-next</code> → <code>qwen3-coder-next</code>. State persists in a new table <code>local_model</code> in <code>message_queue.db</code> with columns key, identifier, seats, context, reservation_bytes, state, desired (bool: the owner wants it loaded), state_since, and last_yield_reason. <code>desired</code> is what makes resume automatic: sm reloads after a yield only if <code>desired</code> is true. <code>sm model unload</code> by hand sets it false.</p>
+<h4>E.3 States</h4>
+<p><code>unloaded → loading → ready → draining → unloaded</code>, plus <code>yielded</code>: unloaded by sm with <code>desired = true</code>. From <code>yielded</code>, sm returns to <code>loading</code> when the reload condition (F.3) holds.</p>
+<h4>E.4 Reservation and the memory guard</h4>
+<p>Reservation = weights on disk + seats × context × cache bytes per token, where cache bytes per token = 2 (key and value) × full-attention layers × KV heads × head dim × 2 bytes. sm reads the numbers from the model's <code>config.json</code>. For Qwen3-Coder-Next: 12 full-attention layers (48 layers, <code>full_attention_interval</code> 4) × 2 × 2 heads × 256 × 2 = 24,576 bytes per token. For MiniMax M2.5: 62 × 2 × 8 × 128 × 2 = 253,952 bytes per token. Examples:</p>
+<table>
+<thead><tr><th>Model</th><th>Seats × context</th><th>Reservation</th></tr></thead>
+<tbody>
+<tr><td>Qwen3-Coder-Next 8-bit</td><td>4 × 200K</td><td>84.7 + 4 × 4.9 = <b>104.4 GB</b></td></tr>
+<tr><td>Qwen3-Coder-Next 8-bit</td><td>6 × 200K</td><td>84.7 + 6 × 4.9 = 114.2 GB</td></tr>
+<tr><td>MiniMax M2.5 4-bit</td><td>4 × 196K</td><td>128.7 + 4 × 49.8 = 327.9 GB: refused</td></tr>
+<tr><td>MiniMax M2.5 4-bit</td><td>2 × 100K</td><td>128.7 + 2 × 25.4 = 179.5 GB</td></tr>
+</tbody>
+</table>
+<p>If <code>config.json</code> has no recognisable attention layout, sm refuses the load and asks for <code>--reservation &lt;GB&gt;</code>. The <b>yield line</b> is the guard's reserve plus 24 GB (config <code>local_host.yield_margin_bytes</code>), so 32.6 GB of available memory by default. Available memory means the kernel's value that the guard already uses (queue.rs:4519–4542).</p>
+<p>Guard change (queue.rs:5263 <code>host_memory_guard_pass</code>): when available memory falls below the yield line and the model state is <code>ready</code> or <code>draining</code>, the pass starts a yield (F.2) instead of stopping a job. When available memory falls below the reserve itself, which means a yield was too slow, the guard force-unloads the model first. It returns to stopping queue jobs only if memory is still under the reserve after the unload. Test: extend <code>host_memory_guard_stops_the_largest_job_of_any_type_only_under_pressure</code> (queue.rs:8756) with a loaded model and assert the model is unloaded and no job is stopped.</p>
+<h4>E.5 Perf admission</h4>
+<p>When a perf job reaches the front of admission (queue.rs:3726) and the model is <code>ready</code>, sm starts a yield with reason <code>perf &lt;label&gt;</code>. The perf job waits for the model to reach <code>yielded</code>, counting against its existing wait. While any perf job is running or waiting on its cooldown, reload is blocked.</p>
+<h4>E.6 Recorder</h4>
+<p>The utilization recorder adds a nullable <code>local_model_bytes</code> column to <code>host_samples</code>: the summed physical footprint of the LM Studio processes, measured the way job footprint is (utilization.rs:669). This makes the Mac chart able to show the model as its own band.</p>
+
+<h3 id="f">F. B1: seat limit, drain, park, resume</h3>
+<h4>F.1 Seat limit</h4>
+<p>A local agent occupies a seat from spawn until it is retired or killed, not only while mid-turn. Idle agents hold their conversation cache in LM Studio, and admitting more agents than seats makes LM Studio evict caches and re-read whole conversations. A spawn with no free seat waits up to <code>--max-wait</code> (default 5 minutes, same flag and semantics as <code>sm queue run</code>) and then fails with <code>no local seat free (4/4 used by …)</code>.</p>
+<h4>F.2 Drain and park</h4>
+<ol>
+<li>State → <code>draining</code>. sm holds new <code>sm send</code> deliveries, reminders and wakes addressed to local agents in their durable queues. Nothing is lost; delivery is deferred.</li>
+<li>sm waits until every local agent's Claude hook state is <code>TurnStopped</code> (sessions.rs:16520), or until 10 minutes pass (<code>local_host.drain_timeout</code>).</li>
+<li><code>lms unload</code>. State → <code>yielded</code>. Every local agent is marked <code>parked</code>, a new activity-state label shown in the app as "parked: model yielded to &lt;reason&gt;".</li>
+<li>Any agent cut off mid-turn is flagged <code>resume_needed</code>.</li>
+</ol>
+<h4>F.3 Reload and resume</h4>
+<p>Reload condition: <code>desired</code> is true, no perf job is running or in cooldown, and available memory has stayed at or above the reservation plus the yield line for 10 continuous minutes (<code>local_host.reload_hold</code>). On reload, the model is loaded with the same seats and context. Each parked agent's held messages are then delivered in order. An agent flagged <code>resume_needed</code> with nothing held gets <code>[sm] The local model was unloaded while you were working (&lt;reason&gt;). Continue where you left off.</code></p>
+<h4>F.4 Worked example</h4>
+<p>At 18:02 Qwen is loaded (reservation 104 GB) with three local agents. A queue job grows to 140 GB. Available memory drops from 58 GB to 31 GB, below the 32.6 GB yield line. sm drains: two agents are idle and one finishes its turn at 18:05. sm unloads at 18:05 and parks all three. The job ends at 19:40. Available memory has been at or above 137 GB (104 + 32.6) since then, so at 19:50 sm reloads and delivers two held <code>sm send</code> messages to one of the agents.</p>
+
+<h3 id="g">G. B2: Spend line, tier table, UI</h3>
+<ul>
+<li><b>Badge.</b> web/ui.js:250 derives the label from provider; add: host local → "LOCAL" with <code>--violet</code>. The same applies in web/agents.js:217–227 and the Android WatchModels provider label. P1 ships this badge; B2 does the rest.</li>
+<li><b>Spend.</b> analytics_spend.rs:65 and http/analytics.rs:81–87 accept <code>provider=local</code>. The view shows tokens by model and model-busy hours per day, with no quota axis. The web toggle is at web/analytics.js:48; Android: SpendSection.</li>
+<li><b>Start sheets.</b> web/start.js and Android CreateSessionSheet offer "Local (&lt;loaded model&gt;)" only while a model is loaded.</li>
+<li><b>Tier table.</b> B2 adds this row to CLAUDE.md §2: <code>| Local | — | — |</code> with a sentence: "Local: sm spawn claude --host local; mechanical work only (inventory, fixture plumbing, narrow docs, triage). Never spec, design, review or maintainer."</li>
+</ul>
+
+<h3 id="h">H. P3: bake-off protocol</h3>
+<ol>
+<li><b>Pick 8 tickets.</b> Take them from closed tickets merged in the last 30 days whose implementing agent ran at Low or Mid tier. Prefer tickets whose PR diff is under 400 lines and touches fewer than 6 files. Exclude specs and Android-only work. Record each ticket's original token use from usage.db and its wall time from the session record.</li>
+<li><b>Replay each ticket on each model.</b> Use a fresh worktree at the ticket's pre-merge base commit and the original brief, prefixed with C.7. Run Qwen3-Coder-Next 4 seats × 200K. Run MiniMax M2.5 2 seats × 100K in a quiet window.</li>
+<li><b>Review.</b> Each attempt that produces a PR-equivalent diff goes through <code>sm request-codex-review</code> on a draft PR. Close the draft afterwards and never merge it.</li>
+<li><b>Rescue.</b> If an attempt stalls for 30 minutes or fails review twice, a Mid agent (Opus, high) finishes it. Record the Mid agent's tokens as a percentage of the original.</li>
+<li><b>Score each attempt:</b> finished (y/n), review rounds, rescue % of original tokens, wall time ÷ original wall time, and standing-rule violations (named itself, went idle when told, did not poll, used <code>sm status</code>).</li>
+<li><b>Pass bar (from the memo):</b> at least 5 of 8 reach clean review with rescue at or below 15%, and median wall-time ratio at or below 3. Report both models. The owner picks the resident model from the report.</li>
+</ol>
+<p>The report is a memo in <code>docs/working/</code>, published for the owner's review.</p>
+
+<h3 id="i">I. Measurements and method</h3>
+<h4>I.1 Machine and memory history</h4>
+<p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 1 is generated from the same table by a script that groups by local hour.</p>
+<h4>I.2 Quota share</h4>
+<p><code>usage.db</code> <code>message_ledger</code>, last 14 days, weighted with quota_rates.rs:120 and rated with quota_rates.rs:61, then halved to a weekly figure: Astra 68.3%, Opus 50.4%, Fable 20.2%, Sol 2.3%, Sonnet 0.6%, Luna under 0.1%.</p>
+<h4>I.3 First-prompt size</h4>
+<p>From the first assistant message with usage in each of the 39 most recent Claude transcripts across all projects: input + cache creation + cache read. Minimum 34,473, median 84,241, maximum 95,791 tokens.</p>
+<h4>I.4 Model throughput</h4>
+<!--BENCHAPPENDIX-->
+
+<h3 id="j">J. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Where specified</th><th>Code / test</th></tr></thead>
+<tbody>
+<tr><td>Claude Code drives the local model; host field</td><td>C.1–C.3</td><td>sessions.rs SessionRecord; runtime.rs managed_session_command; test after runtime.rs:3498</td></tr>
+<tr><td>Slim profile, first prompt ≤ 30K or stop</td><td>C.4</td><td>Launch args; P1 PR records the measured size</td></tr>
+<tr><td>Restore stays local</td><td>C.6</td><td>Restore command test</td></tr>
+<tr><td>Local tokens never count against quota</td><td>D</td><td>Ledger fixture test</td></tr>
+<tr><td>sm, not LM Studio, loads the model</td><td>E.1, E.2</td><td>JIT off; <code>sm model</code> commands</td></tr>
+<tr><td>Queue jobs win; model unloads before any job stops</td><td>E.4</td><td>Guard test extending queue.rs:8756</td></tr>
+<tr><td>Perf unloads the model</td><td>E.5</td><td>Admission test</td></tr>
+<tr><td>Seat limit; drain, park, resume</td><td>F</td><td>B1 tests: spawn waits; held delivery; resume message</td></tr>
+<tr><td>LOCAL badge; Spend Local line; tier row</td><td>G</td><td>web and Android changes; CLAUDE.md</td></tr>
+<tr><td>Bake-off gates the build-out</td><td>H</td><td>P3 report</td></tr>
+<tr><td>Local work goes through review</td><td>C.7, H.3</td><td>Addendum text</td></tr>
+<tr><td>Model choice by per-agent memory</td><td>E.4, I.4</td><td>Reservation computed from config.json</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not make the model server a queue <code>service</code> job?</b> Service jobs count against the global limit of 2 running queue jobs (config.rs:1689). A resident model would permanently take half of your queue's concurrency. The memory guard also treats a service job as just another job to stop, not as the first thing to unload. The model needs its own small state machine, which is E and F.</p>
+<p><b>Why LM Studio and not vMLX, <code>mlx_lm.server</code> or Ollama?</b> LM Studio is already installed and running as a service and already has both models. It serves the Anthropic request format natively, which Claude Code needs; supports parallel requests on MLX since 0.4.2; and has a scriptable CLI with load, unload and estimate. The <code>opencode.json</code> in the repo root points at a vMLX server on port 8010 from an earlier experiment. vMLX would work behind the same design if it gains an Anthropic endpoint, because only E.2's three commands touch the server.</p>
+<p><b>Why not two models at once, a fast one and a smart one?</b> Qwen plus MiniMax is 214 GB of weights before any conversation cache. That leaves your queue nothing.</p>
+<p><b>Could a local agent be a reviewer?</b> Not as the gate. <code>sm request-codex-review</code> stays the correctness gate. A local first-pass review before a Codex review is a later idea for the bake-off to inform.</p>
+<p><b>What if Claude Code changes its request format and LM Studio lags?</b> Claude Code updates itself. A breaking change shows up as local agents failing their first turn. The P3 smoke ticket, re-run on any Claude Code or LM Studio upgrade, catches it. If it recurs, the opencode fallback removes the dependency.</p>
+<p><b>Does this work on a second machine?</b> Not in this design. The host is <code>127.0.0.1</code>, and the memory logic reads this Mac's memory.</p>
+<p><b>Why keep provider <code>claude</code> instead of adding <code>claude-local</code>?</b> A new provider string would have to be added to every one of the ~25 files that branch on provider (B), for no behavioural difference. The host field touches only the sites that genuinely differ.</p>
+
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
