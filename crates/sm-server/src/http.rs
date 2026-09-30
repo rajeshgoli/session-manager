@@ -8844,7 +8844,11 @@ async fn wait_for_mobile_terminal_initial_resize(
             }
             Some("transport_keepalive") => {
                 // Axum queues the pong; flush it even before the first resize.
-                let _ = socket.flush().await;
+                // A client that stops reading ends the attach (sm#1763).
+                if flush_mobile_terminal_bounded(socket).await.is_err() {
+                    initial.detached = true;
+                    return initial;
+                }
             }
             Some("detach") => {
                 initial.detached = true;
@@ -8887,7 +8891,12 @@ where
         Some("transport_keepalive") => {
             // Ping/Pong are transport frames, not terminal input or disconnects.
             // Flush Axum's automatically queued pong on an otherwise idle PTY.
-            let _ = sender.flush().await;
+            // A client that stops reading ends the attach (sm#1763).
+            if flush_mobile_terminal_bounded(sender).await.is_err() {
+                *close_code = 1001;
+                *close_reason = "client_unresponsive".to_owned();
+                return Ok(true);
+            }
         }
         Some("input") => {
             let data = frame.get("data").and_then(Value::as_str).unwrap_or("");
@@ -9028,6 +9037,22 @@ where
     match tokio::time::timeout(
         Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS),
         sender.send(message),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Flush queued frames, giving up like `send_mobile_terminal_bounded`.
+async fn flush_mobile_terminal_bounded<S>(sender: &mut S) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(
+        Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS),
+        sender.flush(),
     )
     .await
     {
@@ -21180,15 +21205,33 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let (mut client, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
-        if silent.is_some() {
+        if let Some(flood) = silent {
             // Never read, so the client answers no ping. Blocked output adds
-            // up to one send timeout after the socket buffers fill.
+            // up to one send timeout after the socket buffers fill. With a
+            // flood the client keeps pinging, so it is never silent: only the
+            // bounded sends and pong flushes can release the attach.
+            let dropped = done.notified();
+            tokio::pin!(dropped);
             timeout(
                 Duration::from_secs(3 * MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS),
-                done.notified(),
+                async {
+                    let mut ping = tokio::time::interval(Duration::from_secs(2));
+                    loop {
+                        tokio::select! {
+                            _ = &mut dropped => break,
+                            _ = ping.tick(), if flood => {
+                                let _ = timeout(
+                                    Duration::from_secs(1),
+                                    client.send(ClientMessage::Ping(b"still-here".to_vec().into())),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                },
             )
             .await
-            .expect("silent client was not dropped");
+            .expect("unreading client was not dropped");
             assert!(state
                 .mobile_terminal_active_attaches
                 .lock()
