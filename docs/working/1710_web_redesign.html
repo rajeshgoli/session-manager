@@ -523,7 +523,8 @@ You already hold the claim on #1706. Run `sm ticket 1706 --setup-worktree`…</s
 <li>Below: the terminal page, for an agent without a claude.ai session or whenever you choose Terminal. It has its own link, so you can keep it open in a tab. Esc goes to the agent; the back arrow and ⌘[ return to where you came from.</li>
 <li>The Work tab lists the ticket, PRs, docs, reviews and queue jobs (today's expandable card sections). Activity lists the last ten tool calls. Summary is the phone's “Summarize progress”.</li>
 <li>“Message” in the side panel sends the text as an owner message, so it shows in the Inbox thread like a reply sent from the phone.</li>
-<li>The side panel handles docs, queue jobs, inbox threads and tickets the same way. Esc closes it, and every panel has its own link you can share.</li>
+<li>The side panel handles docs, queue jobs, inbox threads and tickets the same way. Every panel has its own link you can share.</li>
+<li><b>Hiding and expanding.</b> The side panel has three sizes: hidden (× or Esc), side (drag its left edge to resize), and wide (⤢ or <kbd>⌘.</kbd>), which covers the page apart from the left menu. The left menu folds to a strip of icons with « or <kbd>⌘\</kbd>. sm remembers both choices per browser, so on the Studio's wide monitors the panel can stay open while the laptop keeps it folded.</li>
 </ul>
 
 <!-- ============ Scenario 7 ============ -->
@@ -651,6 +652,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <p><b>New:</b> the build spec (appendix D) and the ticket plan (appendix E).</p>
 <p><b>Device sign-in (scenario 9, decision 7):</b> the laptop and the Studio sign in with device certificates, as the phone does.</p>
 <p><b>Hung jobs (new scenario 4):</b> a running job with no CPU, no GPU and no new log output for 20 minutes is “quiet” and turns red on the Queue page and the Board. #1848's purchase job shows why the log counts: it barely uses the CPU but is healthy.</p>
+<p><b>Panels:</b> the left menu folds to icons, and the side panel can be hidden, resized or widened. Each browser remembers its own layout (scenario 6).</p>
 <p><b>Full-screen docs:</b> ⤢ opens a doc like today's doc page, with a slim sm bar of back, title, chips and Review (scenario 7).</p>
 <p><b>Memory figures (#1714):</b> memory is Activity Monitor's “Memory Used” (135 of 256 GB now, not “212 GB free”), and each live bar shades the queue's share.</p>
 
@@ -744,6 +746,12 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
   <li><kbd>g</kbd> then <kbd>a</kbd>, <kbd>b</kbd>, <kbd>q</kbd>, <kbd>i</kbd> or <kbd>s</kbd> switches page.</li>
   <li><kbd>Esc</kbd> closes the panel.</li>
   <li>On the terminal page, keys go to the terminal. Leave it with the back arrow or <kbd>⌘[</kbd>.</li>
+  </ul></li>
+<li><b>Folding and sizing.</b>
+  <ul>
+  <li>The left menu is either full (8.2 rem, labels and counts) or folded (3.2 rem, icons, with counts as dots). « in the menu, or <kbd>⌘\</kbd>, toggles it. Below 1100 px wide it starts folded.</li>
+  <li>The side panel is hidden, side or wide. Side width defaults to 28 rem and can be dragged between 20 rem and 60% of the window. Wide covers everything right of the menu. The header's ⤢/⤡ and <kbd>⌘.</kbd> switch between side and wide. × and <kbd>Esc</kbd> hide it; reopening restores the last size.</li>
+  <li><code>localStorage["sm-layout"]</code> stores <code>{rail: "full"|"folded", panel_width_rem, panel_mode: "side"|"wide"}</code>. The <code>?open=</code> link opens the panel at the stored size.</li>
   </ul></li>
 <li><b>Rail badges.</b>
   <ul>
