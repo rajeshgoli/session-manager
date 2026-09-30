@@ -25,7 +25,10 @@ BINARY="$REPO_ROOT/.local/bin/sm-server"
 RUST_LABEL="com.rajeshgoli.session-manager-rust"
 PYTHON_LABELS=("com.rajeshgoli.session-manager" "com.claude.session-manager")
 PLIST_DST="$HOME/Library/LaunchAgents/$RUST_LABEL.plist"
-LOG_DIR="$REPO_ROOT/logs"
+# Outside every checkout: launchd reopens these paths on every respawn and does
+# not create missing parents, so a log dir inside a worktree that is later
+# deleted can keep the service from coming back.
+LOG_DIR="$HOME/.local/share/claude-sessions/launchd-logs"
 DOMAIN="gui/$(id -u)"
 
 _resolve_path() {
@@ -71,7 +74,7 @@ Options:
   --binary PATH        Rust sm-server binary (default: .local/bin/sm-server)
   --label LABEL        Rust launchd label (default: $RUST_LABEL)
   --plist PATH         Rust plist destination (default: ~/Library/LaunchAgents/<label>.plist)
-  --log-dir PATH       Rust launchd stdout/stderr directory (default: logs/)
+  --log-dir PATH       Rust launchd stdout/stderr directory (default: ~/.local/share/claude-sessions/launchd-logs)
 
 First canary shape:
   cargo build -p sm-server --release

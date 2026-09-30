@@ -60,7 +60,8 @@ SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
 SM_LOG_DIR="${SM_LOG_DIR:-}"
 # The cutover's default when --log-dir is not passed. Only used to check that the
 # directory it will create is writable; see the plist check for why that matters.
-CUTOVER_DEFAULT_LOG_DIR="$REPO_ROOT/logs"
+# tests/unit/test_restart_rust_server.py guards this against drift.
+CUTOVER_DEFAULT_LOG_DIR="$HOME/.local/share/claude-sessions/launchd-logs"
 SM_PLIST="${SM_PLIST:-$HOME/Library/LaunchAgents/$SM_LABEL.plist}"
 # The set rust-service-cutover.sh enforces in start_rust. It is hard-coded there
 # with no CLI override, so it is always checked here no matter what
@@ -742,7 +743,8 @@ if [[ -f "$SM_PLIST" ]]; then
     if [[ "$ALLOW_PLIST_CHANGE" -eq 0 ]]; then
       fail "restarting would rewrite $SM_PLIST with different contents (diff above).
        If this is the first run after adopting this script, that diff should be
-       the program path moving to the installed binary - re-run with
+       the program path moving to the installed binary, or the launchd log
+       paths moving to $CUTOVER_DEFAULT_LOG_DIR - re-run with
        --allow-plist-change to accept it. Otherwise pass the missing settings
        (for example SM_LOCAL_ENV) so the rendered plist matches.
        The running service was not touched."

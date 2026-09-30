@@ -380,6 +380,8 @@ def _make_runner(
             "SM_LOCK": str(binary_dir_lock),
             "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
             "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
+            # The default launchd log dir is under $HOME, and the preflight creates it.
+            "HOME": str(installed.parent.parent / "home"),
         }
         script = overrides.pop("_script", SCRIPT)
         for name in overrides.pop("_unset", ()):
@@ -990,6 +992,19 @@ def test_log_dir_is_not_forwarded_by_default(env):
     env["run"]()
 
     assert "--log-dir" not in cutover_line(env, "start-rust")
+
+
+def test_default_log_dir_matches_the_cutover():
+    """Drift guard: the preflight checks the directory the cutover will create, so
+    it must name the same one."""
+    import re
+
+    cutover = (REPO_ROOT / "scripts" / "rust-service-cutover.sh").read_text()
+    theirs = re.search(r'^LOG_DIR="([^"]*)"$', cutover, re.M).group(1)
+    ours = re.search(r'^CUTOVER_DEFAULT_LOG_DIR="([^"]*)"$', SCRIPT.read_text(), re.M).group(1)
+
+    assert ours == theirs
+    assert "REPO_ROOT" not in ours, "the launchd log dir must not live in a checkout"
 
 
 def test_unwritable_log_dir_blocks_before_the_service_is_stopped(env):

@@ -131,6 +131,25 @@ def test_rust_service_cutover_defaults_to_the_installed_binary(tmp_path):
     assert plist["ProgramArguments"][0] == str(REPO_ROOT / ".local" / "bin" / "sm-server")
 
 
+def test_rust_service_cutover_default_log_dir_is_outside_the_checkout(tmp_path):
+    """launchd reopens the log paths on every respawn and does not create missing
+    parents. Defaulting into the invoking checkout made a ticket worktree the live
+    log dir, and deleting that worktree could stop the service from respawning."""
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  port: 18420\n", encoding="utf-8")
+    home = tmp_path / "home"
+
+    result = run_script(
+        "render-plist", "--config", str(config), env={**os.environ, "HOME": str(home)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    plist = plistlib.loads(result.stdout.encode("utf-8"))
+    log_dir = home / ".local" / "share" / "claude-sessions" / "launchd-logs"
+    assert plist["StandardOutPath"] == str(log_dir / "rust-launchd.out.log")
+    assert plist["StandardErrorPath"] == str(log_dir / "rust-launchd.err.log")
+
+
 def test_rust_service_cutover_plan_flags_cargo_output_as_a_blocker(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("server:\n  port: 18420\n", encoding="utf-8")
