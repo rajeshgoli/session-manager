@@ -264,6 +264,41 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
     .await
     .unwrap();
     assert!(attached);
+    // The actual tmux client must see later dimensions, not just the initial size.
+    for (cols, rows) in [(40, 12), (120, 36)] {
+        client
+            .send(ClientMessage::Text(
+                json!({"type":"resize", "cols":cols, "rows":rows})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let expected = format!("{cols}x{rows}");
+        let mut observed = String::new();
+        for _ in 0..40 {
+            let size = Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux.0,
+                    "list-clients",
+                    "-F",
+                    "#{client_width}x#{client_height}",
+                ])
+                .output()
+                .unwrap();
+            observed = String::from_utf8_lossy(&size.stdout).trim().to_owned();
+            if observed == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            observed, expected,
+            "tmux client must receive resize signals"
+        );
+    }
+
     assert!(String::from_utf8_lossy(&output).contains("browser-terminal-echo"));
     assert!(consume_terminal_ticket(
         &state,

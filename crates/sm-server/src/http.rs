@@ -8972,6 +8972,18 @@ fn start_mobile_terminal_attach_client(
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .env("TERM", "xterm-256color");
+    // Give tmux the PTY as its controlling terminal. TIOCSWINSZ then
+    // delivers SIGWINCH to tmux, so later browser/phone resizes redraw it.
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 || nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = command.spawn()?;
     Ok(MobileTerminalPty {
         master: Arc::new(pty.master),
