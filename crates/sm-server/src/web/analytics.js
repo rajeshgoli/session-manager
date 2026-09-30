@@ -36,6 +36,11 @@ function DrillReport({ section }) {
   const value = (n) => spend ? percent(n.percent) : duration(n.active_seconds);
   const labels = Object.fromEntries([...(report?.parts_legend || []), ...(report?.tool_legend || [])].map((l) => [l.key, l.label]));
   const parts = (n) => Object.entries(n.parts || {}).map(([key, v], i) => html`<span style=${`color:var(--${colors[i % colors.length]})`}>${labels[key] || key}: ${spend ? percent(v) : duration(v)}</span>`);
+  const legend = report?.parts_legend || [];
+  const composition = (child) => {
+    const largest = Math.max(1, ...(node.children || []).map((n) => spend ? n.percent : n.active_seconds));
+    return html`<span class="a-composition">${legend.map((part, i) => html`<i title=${`${part.label}: ${spend ? percent(child.parts[part.key]) : duration(child.parts[part.key] || 0)}`} style=${`width:${100 * (child.parts[part.key] || 0) / largest}%;background:var(--${colors[i % colors.length]})`}></i>`)}</span>`;
+  };
   const enter = (child) => setTrail([...crumbs.slice(1).map((n) => n.id), child.id]);
   return html`<div class="q-heading">
     <${Seg} label="Analytics range" value=${range} onChange=${(v) => { setRange(v); setTrail([]); }} options=${ranges.map(([value, label]) => ({ value, label }))} />
@@ -46,7 +51,7 @@ function DrillReport({ section }) {
     ${spend ? html`<div class="q-tiles">${report.meters.map((meter) => html`<section class="q-card"><span class="q-label">${meter.label || meter.account_key}</span><strong>${percent(meter.percent)}</strong><p class="sub">Resets ${clock(meter.resets_at)} · observed ${clock(meter.observed_at)}</p>${meter.pace ? html`<p>${meter.pace.kind === 'runs_out' ? `Runs out ${clock(meter.pace.at)}` : `On pace for ${percent(meter.pace.percent)} at reset`}</p>` : null}<p class="sub">${meter.gap >= 0 ? 'Not in the ledger' : 'Ledger above meter'}: ${percent(Math.abs(meter.gap))}</p></section>`)}</div><p class="sub">${number(report.total.tokens)} tokens · estimated ${percent(report.total.percent)} of weekly allowance</p>${report.notes.map((note) => html`<p class="sub">${note}</p>`)}` : html`<p>${duration(report.total.active_seconds)} active · ${duration(report.total.parked_seconds)} parked · ${report.total.agents} agents</p>`}
     <section class="q-card"><nav class="a-crumbs" aria-label="Analytics drill-down">${crumbs.map((crumb, i) => html`<button class="btn sm" onClick=${() => setTrail(crumbs.slice(1, i + 1).map((n) => n.id))}>${i ? '› ' : ''}${crumb.label}</button>`)}</nav>
       <div class="q-heading"><h2>${node.label}</h2><strong>${value(node)}</strong></div><div class="q-legend">${parts(node)}</div>
-      ${(node.children || []).map((child) => html`<button class="a-row" onClick=${() => enter(child)}><span>${child.label}<small>${child.kind}${child.state ? ` · ${child.state}` : ''}${!spend ? ` · parked ${duration(child.parked_seconds)}` : ` · ${number(child.tokens)} tokens`}</small><span class="a-parts">${parts(child)}</span></span><strong>${value(child)} ›</strong></button>`)}
+      ${(node.children || []).map((child) => html`<button class="a-row" onClick=${() => enter(child)}><span>${child.label}<small>${child.kind}${child.state ? ` · ${child.state}` : ''}${!spend ? ` · parked ${duration(child.parked_seconds)}` : ` · ${number(child.tokens)} tokens`}</small>${composition(child)}<span class="a-parts">${parts(child)}</span></span><strong>${value(child)} ›</strong></button>`)}
       ${!node.children?.length ? html`<p class="sub">${node.session_status || 'No further breakdown.'}${node.turns != null ? ` · ${node.turns} turns` : ''}</p>` : null}
       ${node.session_id ? html`<button class="btn" onClick=${() => openPanel(`agent:${node.session_id}`)}>Open agent</button>` : null}
       ${node.history_path ? html`<a class="btn" href=${node.history_path}>History</a>` : null}

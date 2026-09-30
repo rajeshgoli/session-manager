@@ -7259,7 +7259,7 @@ async fn get_queue_job(
     Path(job_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let queue_state_dir = state.config.queue_runner_state_dir();
     let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
     let Some(job) = RetainedQueueStore::resolve_queue_job_from_path(&queue_db_path, &job_id)
@@ -19717,7 +19717,7 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 17] = [
+    const OWNER_WEB_READS: [&str; 18] = [
         "/client/queue",
         "/client/queue/stats",
         "/client/queue/jobs/job-missing/start-check",
@@ -19725,6 +19725,7 @@ mod tests {
         "/client/utilization/series",
         "/client/host-status",
         "/queue-jobs/job-missing/log",
+        "/queue-jobs/job-missing",
         "/client/analytics/spend",
         "/client/analytics/time",
         "/client/sessions",

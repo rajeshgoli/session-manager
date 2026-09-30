@@ -42,3 +42,7 @@ button.a-row { cursor:pointer; } button.a-row:hover { background:var(--panel-2);
 .analytics-page .q-tiles { grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
 @media(max-width:1100px) { .q-tiles { grid-template-columns:repeat(4,1fr); } .q-mac { grid-column:1/-1; } }
 @media(max-width:600px) { .q-tiles { grid-template-columns:repeat(2,1fr); } .q-job { grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:7px; font-size:12px; } .q-timeline { grid-row:2; grid-column:1/-1; } .q-meter { grid-template-columns:30px minmax(25px,1fr) auto; } .q-legend { gap:8px; } .q-card { padding:10px; } .a-row { gap:6px; } .a-row>span { min-width:0; overflow-wrap:anywhere; } }
+
+.a-composition { display:flex; height:7px; margin:8px 0; min-width:180px; max-width:600px; width:100%; }
+.a-composition i { display:block; height:100%; }
+.a-row>span:first-child { flex:1; }
