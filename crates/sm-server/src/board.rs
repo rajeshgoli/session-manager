@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use crate::owner_push::{format_ts, parse_ts};
 use crate::work_claims::{canonical_repo, HolderState, SessionDirectory};
 
+pub mod clock;
 pub mod model;
 pub mod pushes;
 pub mod sync;
@@ -1754,7 +1755,12 @@ fn done_reason(item: &Item) -> Option<&'static str> {
     })
 }
 
-fn ticket_json(board: &Board, key: &Key, row: Option<&model::Row>) -> Value {
+fn ticket_json(
+    board: &Board,
+    key: &Key,
+    row: Option<&model::Row>,
+    clocks: &BTreeMap<Key, Value>,
+) -> Value {
     let facts = &board.facts[key];
     let waits_on: Vec<Value> = facts
         .waits_on
@@ -1796,6 +1802,9 @@ fn ticket_json(board: &Board, key: &Key, row: Option<&model::Row>) -> Value {
             .map(|(lane_id, rank)| json!({ "lane_id": lane_id, "rank": rank }))
             .collect::<Vec<_>>());
         value["new"] = json!(row.new);
+    }
+    if let Some(clock) = clocks.get(key) {
+        value["clock"] = clock.clone();
     }
     value
 }
@@ -1898,6 +1907,8 @@ pub struct JsonContext<'a> {
     /// `?lane=owner/name#N`: only that lane.
     pub lane_filter: Option<&'a Key>,
     pub now: OffsetDateTime,
+    /// Each in-progress or needs-you ticket's clock (D7), when asked for.
+    pub clocks: &'a BTreeMap<Key, Value>,
 }
 
 pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) -> Value {
@@ -1937,7 +1948,7 @@ pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) 
                     .map(|cycle| cycle.iter().map(key_json).collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
                 "tickets": view.rows.iter()
-                    .map(|row| ticket_json(board, &row.key, Some(row)))
+                    .map(|row| ticket_json(board, &row.key, Some(row), context.clocks))
                     .collect::<Vec<_>>(),
                 "changes": lane_changes(view, context.events),
             })
@@ -1949,7 +1960,7 @@ pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) 
         .map(|(repo, keys)| {
             json!({
                 "repo": repo,
-                "tickets": keys.iter().map(|key| ticket_json(board, key, None)).collect::<Vec<_>>(),
+                "tickets": keys.iter().map(|key| ticket_json(board, key, None, context.clocks)).collect::<Vec<_>>(),
             })
         })
         .collect();

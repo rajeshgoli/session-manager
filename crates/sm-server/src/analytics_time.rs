@@ -226,7 +226,7 @@ struct SeatActivity {
 }
 
 /// Splits `seat`'s time in `[range_start, range_end)` into buckets and
-/// hands each stretch to `emit` with its thread.
+/// hands each stretch `[from, to)` to `emit` with its thread.
 fn classify(
     seat: &str,
     activity: &SeatActivity,
@@ -234,7 +234,7 @@ fn classify(
     attributor: &Attributor,
     folder_repo: &str,
     prompt_from_you: &dyn Fn(&Turn) -> bool,
-    mut emit: impl FnMut(&Attribution, Bucket<'_>, i64),
+    mut emit: impl FnMut(&Attribution, Bucket<'_>, i64, i64),
 ) {
     let lo = activity.first_start.max(range_start);
     let hi = activity.end.min(range_end);
@@ -328,7 +328,7 @@ fn classify(
             attribution = Some((segment, attributor.attribute(seat, at, folder_repo)));
         }
         let (_, attribution) = attribution.as_ref().expect("set above");
-        emit(attribution, bucket, to - from);
+        emit(attribution, bucket, from, to);
     }
 }
 
@@ -389,29 +389,44 @@ impl Leaf {
 
 type LeafKey = (String, Option<i64>, String);
 
-pub fn time_report(
+/// Every agent's recorded activity around a range, ready to classify.
+struct Timelines {
+    attributor: Attributor,
+    deliveries: Deliveries,
+    /// `(seat, activity, folder repo)`, by seat.
+    seats: Vec<(String, SeatActivity, String)>,
+}
+
+impl Timelines {
+    /// Classifies every seat over `range`; `emit` gets the seat too.
+    fn classify(
+        &self,
+        range: (i64, i64),
+        mut emit: impl FnMut(&str, &Attribution, Bucket<'_>, i64, i64),
+    ) {
+        for (seat, activity, folder) in &self.seats {
+            classify(
+                seat,
+                activity,
+                range,
+                &self.attributor,
+                folder,
+                &|turn| self.deliveries.typed_by_you(seat, turn.prompt_at),
+                |attribution, bucket, from, to| emit(seat, attribution, bucket, from, to),
+            );
+        }
+    }
+}
+
+/// Loads what `classify` needs for `[range_start, range_end)`; `None`
+/// without an activity database.
+fn load_timelines(
     sources: &TimeSources<'_>,
-    range: TimeRange,
-    now: OffsetDateTime,
-) -> Result<TimeReport> {
-    let now_ms = i64::try_from(now.unix_timestamp_nanos().div_euclid(NANOS_PER_MS))?;
-    let (range_start, range_end) = (now_ms - range.millis(), now_ms);
-    let report = |root: TimeNode, agents: usize| TimeReport {
-        generated_at: format_nanos(now.unix_timestamp_nanos()),
-        range: range.id(),
-        start: format_nanos(i128::from(range_start) * NANOS_PER_MS),
-        end: format_nanos(i128::from(range_end) * NANOS_PER_MS),
-        total: TimeTotal {
-            active_seconds: root.active_seconds,
-            parked_seconds: root.parked_seconds,
-            agents,
-        },
-        parts_legend: legend(&PARTS),
-        tool_legend: legend(&TOOL_KINDS),
-        root,
-    };
+    (range_start, range_end): (i64, i64),
+    now_ms: i64,
+) -> Result<Option<Timelines>> {
     if !sources.activity_db.exists() {
-        return Ok(report(empty_node("root", "root", "All"), 0));
+        return Ok(None);
     }
     let activity = open_read_only(sources.activity_db)?;
     let bounds = load_seat_bounds(&activity)?;
@@ -443,8 +458,8 @@ pub fn time_report(
     }
     let deliveries = load_deliveries(sources.queue_db, range_start - PROMPT_MATCH_MS)?;
 
-    let mut leaves: BTreeMap<LeafKey, Leaf> = BTreeMap::new();
     let mut repos: HashMap<String, String> = HashMap::new();
+    let mut seats = Vec::new();
     for (seat, &(first_start, last_end)) in &bounds {
         let end = if sources.live_sessions.contains_key(seat) {
             last_end.max(now_ms)
@@ -468,24 +483,62 @@ pub fn time_report(
                 .clone(),
             None => UNKNOWN_REPO.to_owned(),
         };
-        classify(
-            seat,
-            &seat_activity,
-            (range_start, range_end),
-            &attributor,
-            &folder,
-            &|turn| deliveries.typed_by_you(seat, turn.prompt_at),
-            |attribution, bucket, ms| {
-                leaves
-                    .entry((attribution.repo.clone(), attribution.thread, seat.clone()))
-                    .or_default()
-                    .add(bucket, ms);
-            },
-        );
-        for turn in &seat_activity.turns {
+        seats.push((seat.clone(), seat_activity, folder));
+    }
+    Ok(Some(Timelines {
+        attributor,
+        deliveries,
+        seats,
+    }))
+}
+
+pub fn time_report(
+    sources: &TimeSources<'_>,
+    range: TimeRange,
+    now: OffsetDateTime,
+) -> Result<TimeReport> {
+    let now_ms = i64::try_from(now.unix_timestamp_nanos().div_euclid(NANOS_PER_MS))?;
+    let (range_start, range_end) = (now_ms - range.millis(), now_ms);
+    let report = |root: TimeNode, agents: usize| TimeReport {
+        generated_at: format_nanos(now.unix_timestamp_nanos()),
+        range: range.id(),
+        start: format_nanos(i128::from(range_start) * NANOS_PER_MS),
+        end: format_nanos(i128::from(range_end) * NANOS_PER_MS),
+        total: TimeTotal {
+            active_seconds: root.active_seconds,
+            parked_seconds: root.parked_seconds,
+            agents,
+        },
+        parts_legend: legend(&PARTS),
+        tool_legend: legend(&TOOL_KINDS),
+        root,
+    };
+    let Some(timelines) = load_timelines(sources, (range_start, range_end), now_ms)? else {
+        return Ok(report(empty_node("root", "root", "All"), 0));
+    };
+
+    let mut leaves: BTreeMap<LeafKey, Leaf> = BTreeMap::new();
+    timelines.classify(
+        (range_start, range_end),
+        |seat, attribution, bucket, from, to| {
+            leaves
+                .entry((
+                    attribution.repo.clone(),
+                    attribution.thread,
+                    seat.to_owned(),
+                ))
+                .or_default()
+                .add(bucket, to - from);
+        },
+    );
+    for (seat, activity, folder) in &timelines.seats {
+        for turn in &activity.turns {
             if range_start <= turn.started && turn.started < range_end {
-                let attribution =
-                    attributor.attribute(seat, i128::from(turn.started) * NANOS_PER_MS, &folder);
+                let attribution = timelines.attributor.attribute(
+                    seat,
+                    i128::from(turn.started) * NANOS_PER_MS,
+                    folder,
+                );
                 leaves
                     .entry((attribution.repo, attribution.thread, seat.clone()))
                     .or_default()
@@ -494,9 +547,57 @@ pub fn time_report(
         }
     }
 
-    let root = build_tree(leaves, &attributor, sources.live_sessions);
+    let root = build_tree(leaves, &timelines.attributor, sources.live_sessions);
     let agents = count_active_agents(&root);
     Ok(report(root, agents))
+}
+
+/// One agent's stretch of a ticket's time over `[from, to)` in Unix ms.
+/// `part` is a `PARTS` key; tool time is "tools".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadInterval {
+    pub part: &'static str,
+    pub from: i64,
+    pub to: i64,
+}
+
+/// Every ticket's parts over `[from, to)` (the board's ticket clock,
+/// sm#1710 appendix D7), as the Time report attributes them. Parked time
+/// and time on no ticket are left out. Agents on one ticket at once give
+/// overlapping intervals.
+pub fn thread_intervals(
+    sources: &TimeSources<'_>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> Result<BTreeMap<(String, i64), Vec<ThreadInterval>>> {
+    let ms = |at: OffsetDateTime| i64::try_from(at.unix_timestamp_nanos().div_euclid(NANOS_PER_MS));
+    let (from, to) = (ms(from)?, ms(to)?);
+    let mut threads: BTreeMap<(String, i64), Vec<ThreadInterval>> = BTreeMap::new();
+    let Some(timelines) = load_timelines(sources, (from, to), to)? else {
+        return Ok(threads);
+    };
+    timelines.classify((from, to), |_, attribution, bucket, start, end| {
+        let Some(thread) = attribution.thread else {
+            return;
+        };
+        let part = match bucket {
+            Bucket::Part(part) => part,
+            Bucket::Tool(_) => "tools",
+            Bucket::Parked => return,
+        };
+        let intervals = threads
+            .entry((attribution.repo.clone(), thread))
+            .or_default();
+        match intervals.last_mut() {
+            Some(last) if last.part == part && last.to == start => last.to = end,
+            _ => intervals.push(ThreadInterval {
+                part,
+                from: start,
+                to: end,
+            }),
+        }
+    });
+    Ok(threads)
 }
 
 fn legend(entries: &[(&str, &'static str)]) -> Vec<LegendEntry> {
@@ -635,6 +736,26 @@ fn count_active_agents(root: &TimeNode) -> usize {
 }
 
 /// Each seat's first turn start and last turn end over everything recorded.
+/// Each of `seats`' last recorded turn end, Unix ms.
+pub fn last_turn_ends(activity_db: &Path, seats: &[&str]) -> Result<BTreeMap<String, i64>> {
+    let mut ends = BTreeMap::new();
+    if seats.is_empty() || !activity_db.exists() {
+        return Ok(ends);
+    }
+    let activity = open_read_only(activity_db)?;
+    if !table_exists(&activity, "activity_turns")? {
+        return Ok(ends);
+    }
+    let mut statement =
+        activity.prepare("SELECT MAX(ended_at_ms) FROM activity_turns WHERE seat_id = ?1")?;
+    for seat in seats {
+        if let Some(end) = statement.query_row([seat], |row| row.get::<_, Option<i64>>(0))? {
+            ends.insert((*seat).to_owned(), end);
+        }
+    }
+    Ok(ends)
+}
+
 fn load_seat_bounds(activity: &Connection) -> Result<BTreeMap<String, (i64, i64)>> {
     if !table_exists(activity, "activity_turns")? {
         return Ok(BTreeMap::new());

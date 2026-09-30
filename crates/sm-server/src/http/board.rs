@@ -284,11 +284,25 @@ fn unseen(
     Ok(unseen)
 }
 
-/// The board JSON (appendix F).
-pub(super) fn board_payload(state: &AppState, lane_filter: Option<&Key>) -> anyhow::Result<Value> {
+/// The board JSON (appendix F), with each clocked ticket's clock over the
+/// last `clock_hours` when given (sm#1710, D7).
+pub(super) fn board_payload(
+    state: &AppState,
+    lane_filter: Option<&Key>,
+    clock_hours: Option<i64>,
+) -> anyhow::Result<Value> {
     let store = board_store(state);
     let now = time::OffsetDateTime::now_utc();
     let (board, input) = store.board(&outside(state)?, now)?;
+    // A clock that cannot be computed leaves the board as it was.
+    let clocks = clock_hours
+        .map(|hours| super::board_clock::clocks(state, &board, &input, hours, now))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("board clock failed: {error:#}");
+            None
+        })
+        .unwrap_or_default();
     let unseen = unseen(state, &store, &board)?;
     let events = store.events(500)?;
     let repos = store.repo_syncs()?;
@@ -302,6 +316,7 @@ pub(super) fn board_payload(state: &AppState, lane_filter: Option<&Key>) -> anyh
             start_defaults: serde_json::to_value(&state.config.board.start_defaults)?,
             lane_filter,
             now,
+            clocks: &clocks,
         },
     ))
 }
@@ -371,6 +386,8 @@ pub(super) struct BoardQuery {
     format: Option<String>,
     #[serde(default)]
     html: bool,
+    #[serde(default)]
+    clock_hours: Option<i64>,
 }
 
 fn lane_filter(query: &BoardQuery) -> Result<Option<Key>, ApiError> {
@@ -411,8 +428,9 @@ pub(super) async fn get_board(
         ensure_owner_page_read_allowed(&state, &request)?;
     }
     let filter = lane_filter(&query)?;
+    let hours = super::board_clock::clock_hours(query.clock_hours)?;
     let payload = blocking(&state, move |state| {
-        Ok(board_payload(state, filter.as_ref())?)
+        Ok(board_payload(state, filter.as_ref(), Some(hours))?)
     })
     .await?;
     if wants_json {
@@ -522,7 +540,7 @@ fn add_lane(
             Err(refusal) => {
                 let lane = match &refusal {
                     Refusal::Conflict(_, Some(id)) => {
-                        Some(board::lane_json(&board_payload(state, None)?, *id))
+                        Some(board::lane_json(&board_payload(state, None, None)?, *id))
                     }
                     _ => None,
                 };
@@ -538,7 +556,7 @@ fn add_lane(
         send_alerts(state, &recomputed);
         lane_id
     };
-    let lane = board::lane_json(&board_payload(state, None)?, lane_id);
+    let lane = board::lane_json(&board_payload(state, None, None)?, lane_id);
     let title = lane["goal"]["title"].as_str().unwrap_or_default();
     let message = format!(
         "Lane {}: {}#{} {title}. Added at the bottom; {} sets the order.",
@@ -662,7 +680,11 @@ pub(super) async fn client_board(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
-    let mut payload = blocking(&state, |state| Ok(board_payload(state, None)?)).await?;
+    let hours = super::board_clock::clock_hours(query.clock_hours)?;
+    let mut payload = blocking(&state, move |state| {
+        Ok(board_payload(state, None, Some(hours))?)
+    })
+    .await?;
     if query.html {
         payload["html"] = json!(super::board_page::render(&payload));
     }
@@ -697,7 +719,11 @@ pub(super) async fn put_order(
                 )?
                 .map_err(|refusal| refusal_error(refusal, None))?;
         }
-        Ok(board_payload(state, None)?)
+        Ok(board_payload(
+            state,
+            None,
+            Some(crate::board::clock::DEFAULT_CLOCK_HOURS),
+        )?)
     })
     .await?;
     Ok(Json(body))
@@ -754,7 +780,11 @@ pub(super) async fn client_delete_lane(
         if !ended {
             return Err(ApiError::NotFound("Lane not active"));
         }
-        Ok(board_payload(state, None)?)
+        Ok(board_payload(
+            state,
+            None,
+            Some(crate::board::clock::DEFAULT_CLOCK_HOURS),
+        )?)
     })
     .await?;
     Ok(Json(body))

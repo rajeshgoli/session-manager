@@ -262,12 +262,15 @@ fn fixture_options(
         }
         record
     };
+    let mut idle = session("idle0001", None);
+    idle["status"] = json!("idle");
     fs::write(
         &state_file,
         json!({"sessions": [
             session("eng00001", None),
             session("eng00002", None),
             session("gone0001", Some("retired")),
+            idle,
         ]})
         .to_string(),
     )
@@ -829,6 +832,78 @@ async fn queue_job_carries_its_lane() {
     assert_eq!(status, StatusCode::OK, "{job}");
     assert_eq!(job["lane_rank"], Value::Null);
     assert_eq!(job["lane_goal"], Value::Null);
+}
+
+#[tokio::test]
+async fn clocked_tickets_carry_ball_text_and_segments() {
+    let f = fixture();
+    add_goal(&f).await;
+    f.claim(2, "eng00001");
+    f.claim(3, "idle0001");
+    let (status, body) = request(&f.app, "GET", "/client/board?clock_hours=5", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["detail"], "clock_hours must be 3, 6 or 24");
+
+    let (status, board) = request(&f.app, "GET", "/client/board?clock_hours=6", None).await;
+    assert_eq!(status, StatusCode::OK, "{board}");
+    let ticket = |number: i64| {
+        board["lanes"][0]["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ticket| ticket["number"] == number)
+            .cloned()
+            .unwrap()
+    };
+    // A working holder with no turn-start hook: since its last activity.
+    let working = ticket(2)["clock"].clone();
+    assert_eq!(working["ball"], "working", "{working}");
+    assert_eq!(working["since"], "2026-09-24T00:01:00Z");
+    assert!(working["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Agent working "));
+    // Its open turn is not recorded yet, so it fills the six-hour strip.
+    let segments = working["segments"].as_array().unwrap();
+    assert_eq!(segments.len(), 1, "{working}");
+    assert_eq!(segments[0]["kind"], "working");
+    let at = |value: &Value| {
+        time::OffsetDateTime::parse(
+            value.as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        at(&segments[0]["to"]) - at(&segments[0]["from"]),
+        time::Duration::hours(6)
+    );
+    // Idle for days with nothing running: stalled.
+    let idle = ticket(3)["clock"].clone();
+    assert_eq!(idle["ball"], "stalled", "{idle}");
+    assert!(idle["text"]
+        .as_str()
+        .unwrap()
+        .ends_with(": agent idle, nothing running"));
+    // Ready tickets have no clock.
+    assert_eq!(ticket(4)["state"], "ready");
+    assert!(ticket(4).get("clock").is_none());
+
+    // The idle holder's job is the ticket's by its claim.
+    let (status, job) = request(
+        &f.app,
+        "POST",
+        "/queue-jobs",
+        Some(json!({
+            "type": "tests", "argv": ["true"], "cwd": f.dir.display().to_string(),
+            "requester_session_id": "idle0001", "timeout_seconds": 3600,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    let clock = f.ticket(3).await["clock"].clone();
+    assert_eq!(clock["ball"], "queue", "{clock}");
+    assert_eq!(clock["text"], "Job waiting 0m · 1st in line");
 }
 
 struct BoardClaimItems;
