@@ -1,6 +1,7 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg, ConfirmButton } from './ui.js';
+import { html, api, config, Seg } from './ui.js';
+import { DevicesList } from './devices.js';
 
 const SECTIONS = [
   ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'],
@@ -210,24 +211,13 @@ function Notifications({ write }) {
 
 function Devices({ write }) {
   const [ssh, reloadSsh] = useResource('/admin/studio-ssh');
-  const [devices, reloadDevices] = useResource('/client/mobile-terminal/devices');
-  const [status, setStatus] = useState('');
-  const revoke = async device => { setStatus('Revoking…'); try {
-    await write(`/client/mobile-terminal/devices/${encodeURIComponent(device.device_key_id)}?user_id=${encodeURIComponent(device.user_id)}`, undefined, 'DELETE');
-    setStatus('Device revoked'); reloadDevices();
-  } catch (e) { setStatus(e.message); } };
-  return html`<h2>Devices & access</h2><${Resource} state=${ssh} retry=${reloadSsh}>${data => html`
+  return html`<h2>Devices & access</h2><${DevicesList} /><h3>Studio SSH</h3><${Resource} state=${ssh} retry=${reloadSsh}>${data => html`
     <${Field} label="Studio SSH" type="checkbox" initial=${data.enabled} save=${async enabled => {
       const result = await write('/admin/studio-ssh', { enabled }, 'POST');
       if (result.error || result.status === 'error') throw new Error(result.error || 'Studio SSH failed');
       reloadSsh();
     }} /><p class="sub">${data.host} · ${data.status}${data.error ? ` · ${data.error}` : ''}</p>`}</${Resource}>
-    <h3>Enrolled devices</h3><${Resource} state=${devices} retry=${reloadDevices}>${data => html`
-      ${data.devices.length ? data.devices.map(device => html`<div class="settings-device">
-        <div><strong>${device.name || device.device_name || device.device_key_id}</strong><p class="sub">${device.kind || 'Device'} · ${device.user_id}${device.last_used_at ? ` · Last used ${new Date(device.last_used_at).toLocaleString()}` : ''}</p></div>
-        ${device.revoked ? html`<span class="sub">Revoked</span>` : html`<${ConfirmButton} label="Revoke" prompt="Revoke this device's access?" confirmLabel="Revoke" onConfirm=${() => revoke(device)} />`}</div>`)
-        : html`<p class="sub">No enrolled devices.</p>`}
-    `}</${Resource}><p role="status">${status}</p>`;
+    `;
 }
 
 function About() {

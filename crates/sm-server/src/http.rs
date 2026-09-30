@@ -8246,19 +8246,7 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
-    let browser_actor = owner_web_guard(
-        &state,
-        request.headers(),
-        request_peer_addr(&request),
-        request.method().as_str(),
-    )?;
-    let access_context = if browser_actor.is_none() {
-        let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-        ensure_public_edge_assertion_for_request(&state, &request)?;
-        context
-    } else {
-        None
-    };
+    let actor_email = settings_device_actor(&state, &request)?;
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
         return Err(ApiError::Status {
@@ -8266,17 +8254,6 @@ async fn revoke_mobile_terminal_device(
             detail: "Mobile terminal device id is required".to_owned(),
         });
     }
-    let actor_email = browser_actor
-        .or_else(|| request_actor_email(&state.config, &request))
-        .ok_or_else(|| ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required".to_owned(),
-        })?;
-    ensure_mobile_cloudflare_access_context_matches_actor(
-        &state,
-        access_context.as_ref(),
-        &actor_email,
-    )?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let target_user_id = resolve_mobile_terminal_revoke_target(
         &state,
