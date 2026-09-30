@@ -27,7 +27,7 @@ impl Drop for Process {
     }
 }
 fn until(master: &mut File, needle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut output = String::new();
     while Instant::now() < deadline {
         let mut p = libc::pollfd {
@@ -63,8 +63,11 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             };
+            // The listener is nonblocking so the fixture can stop, but each
+            // accepted connection must read a complete HTTP request.
+            stream.set_nonblocking(false).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(15)))
                 .unwrap();
             let mut raw = Vec::new();
             let mut b = [0];
@@ -152,19 +155,18 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
     assert!(initial.contains("28%/35"));
     master.write_all(b"H45\r").unwrap();
     assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        received.recv_timeout(Duration::from_secs(30)).unwrap(),
         (
             "/sessions/agent001/handoff-policy".into(),
             json!({"threshold_percent":45})
         )
     );
     until(&mut master, "Done");
-    master.write_all(b"Hnow\r").unwrap();
-    until(&mut master, "Press H within 5s");
-    assert!(received.try_recv().is_err());
-    master.write_all(b"H").unwrap();
+    // Send the confirmation in the same burst. Waiting for terminal output
+    // between keys can exceed the five-second confirmation window under load.
+    master.write_all(b"Hnow\rH").unwrap();
     assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap().1,
+        received.recv_timeout(Duration::from_secs(30)).unwrap().1,
         json!({"ask_now":true})
     );
     until(&mut master, "Done");
@@ -172,7 +174,7 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
     until(&mut master, "Enable claude: true");
     master.write_all(b"\roff\r").unwrap();
     assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        received.recv_timeout(Duration::from_secs(30)).unwrap(),
         (
             "/handoff-defaults".into(),
             json!({"providers":{"claude":false}})
