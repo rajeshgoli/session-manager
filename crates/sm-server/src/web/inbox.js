@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, usePoll, openPanel, closePanel, registerPanel, Seg, toast } from './ui.js';
+import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast } from './ui.js';
 import { Reader } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -39,7 +39,8 @@ export function InboxPage({ openRef }) {
       if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input,textarea,select,[contenteditable]')) { e.preventDefault(); done(); }
     };
     document.addEventListener('keydown', key);
-    return () => document.removeEventListener('keydown', key);
+    const off = bus.on('inbox-done', done);
+    return () => { document.removeEventListener('keydown', key); off(); };
   }, [selected, busy]);
   const inline = openRef?.startsWith('doc:') || openRef?.startsWith('thread:');
   return html`<div class=${`inbox-layout ${inline ? 'reading' : ''}`}>

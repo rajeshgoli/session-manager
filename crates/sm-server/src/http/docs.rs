@@ -1298,6 +1298,7 @@ async fn view_doc_response(
         .map(|review| json!({"id": review.id, "url": review.github_review_url}));
     let config = json!({
         "docId": doc.id,
+        "authorAgent": doc.author_session_name.as_deref().unwrap_or(&doc.author_session_id),
         "agent": doc_agent(state,doc),
         "mergeHold": doc_hold(state,doc)?,
         "docState": summary.as_ref().map(|summary| summary.state),

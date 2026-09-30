@@ -44,7 +44,7 @@
     select.onchange = () => {const url = new URL(select.value,location.origin); if (from) url.searchParams.set('from',from.pathname+from.search); location.assign(url);};
   }
   if (config.prNumber) add('small',`#${config.prNumber} · ${doc.prState || 'unknown'}`);
-  if (config.agent) add('small',config.agent.name || config.agent.session_name || config.agent.id || '');
+  if (config.authorAgent) add('small',config.authorAgent);
   if (doc?.openReview) { const button = add('button','Review'); button.onclick = () => doc.openReview(); }
   add('a','⤡',{href:returnTo.pathname+returnTo.search,title:'Return to two-pane view'});
   document.body.append(host);
