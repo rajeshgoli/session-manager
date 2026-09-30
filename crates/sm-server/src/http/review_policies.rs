@@ -1,4 +1,4 @@
-//! Review policy reads and writes for the CLI and owner clients.
+//! Review policy reads and writes for owner clients and authenticated sessions.
 use super::*;
 use crate::review::policy;
 

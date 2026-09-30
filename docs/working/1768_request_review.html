@@ -243,7 +243,7 @@
 </style>
 
 <h1>1768 — One review command: sm picks the reviewer and moves on when one can't review</h1>
-<p class="sans"><small>Author: Claude Opus 5.5 <code>8c778c66</code> (sm-1768) · Ticket #1768 · 30 September 2026 · Revision 3 · figures use live sm data from 30 September; screens are illustrative</small></p>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>8c778c66</code> (sm-1768) · Policy update: sm-1778 <code>dee28d61</code> · Ticket #1768 · 30 September 2026 · Revision 4 · figures use live sm data from 30 September; screens are illustrative</small></p>
 
 <h2>Memo</h2>
 <p><b>Agents ask for a review with one command, <code>sm request-review</code>, and never learn how the review gets done.</b> sm reads a <i>review policy</i> that you set in Settings, and optionally per repo, per lane or per ticket. The policy names one reviewer, usually GitHub Codex, which answers in about four minutes and costs almost nothing. When that reviewer refuses or goes quiet, sm moves to a fallback within seconds, instead of re-posting <code>@codex review</code> until the request expires. That next reviewer is a <i>review run</i>: Codex's own built-in reviewer, or Claude given the same rubric, started by sm on this machine in a clean checkout of the PR. sm posts the run's findings on the PR the way GitHub Codex does, with comments on the lines they concern. The author is woken once, when a review is on the PR, with the same <code>[sm review]</code> message it gets today.</p>
@@ -431,7 +431,7 @@ Review requested for PR #1851 at f9d61b2. sm wakes you when it lands.
 </div></div>
 <p class="note" style="font-family:-apple-system,sans-serif">Figure 4b. Left: the Start popover with the new Reviewer row, choosing a paired reviewer. Right: the Agents page once the author first asks for a review.</p>
 <p>A paired reviewer is started only at the ticket's first <code>sm request-review</code>, so a ticket that never reaches a PR costs nothing. It stays for every later round and remembers what it found, so it checks the fixes rather than starting over. It hands off at high context like any agent, and retires when the PR merges. It returns its findings with <code>sm review submit</code>, and sm posts them exactly as it posts a run's. Before posting, sm checks that the reviewer left the author's checkout as it found it.</p>
-<p>A planning agent can set a ticket's policy as well, when it files a ticket it judges risky, for example <code>sm review-policy set ticket 1848 paired/codex/gpt-6-astra/high</code>. The pill shows who set it. An agent can never set the policy for a ticket it holds itself, so an author cannot choose its own reviewer. Only you set the default, repo and lane policies.</p>
+<p>You set a ticket's reviewer in the app. A planning agent can also set a ticket's policy through an authenticated server request when it files a ticket it judges risky. The pill shows who set it. An agent can never set the policy for a ticket it holds itself, so an author cannot choose its own reviewer. Only you set the default, repo and lane policies.</p>
 
 <p class="scen">Scenario 5 · Watching a review run</p>
 <h3>"What is reviewing #1851, and what did it say?"</h3>
@@ -555,7 +555,7 @@ sm: woke far-1848</div>
 <tr><td>4. Where can a policy be set?</td><td><b>Default, repo, lane, ticket; the most specific wins.</b> A PR that closes tickets in two lanes follows the higher-ranked lane. The default is GitHub Codex.</td><td>These are the units you already think in, and each takes one record.</td></tr>
 <tr><td>5. When GitHub Codex refuses for quota?</td><td><b>Pause it for every repo, push you once, and check it again every 2 hours</b>, or when you press Try now. The check uses the next real request, and that request moves on within seconds if the check fails.</td><td>Quota is per account, so one refusal predicts every other request. Checking costs one comment on a PR.</td></tr>
 <tr><td>6. When GitHub Codex goes quiet or errors?</td><td><b>No 👀 in 5 minutes: move on, and do not re-post. "Something went wrong": re-post once after 2 minutes, then move on. 👀 but no review in 60 minutes: move on.</b></td><td>All 697 pickups in two weeks came within 95 seconds, so waiting longer only adds delay.</td></tr>
-<tr><td>7. Who may set policies?</td><td><b>You set all of them</b>, on the web, the phone or the CLI outside a session. <b>Agents set ticket policies only, and never for a ticket they hold.</b> Every policy shows who set it.</td><td>Planners know which tickets are risky; authors must not pick their own reviewers.</td></tr>
+<tr><td>7. Who may set policies?</td><td><b>You set all of them in the web or phone app.</b> <b>Agents may set ticket policies through an authenticated server request only, and never for a ticket they hold.</b> Every policy shows who set it.</td><td>Planners know which tickets are risky; authors must not pick their own reviewers.</td></tr>
 <tr><td>8. Guard rails on runs?</td><td><b>At most 4 review runs at once, and skip a provider whose weekly meter is at 95%.</b> Both are editable in Settings.</td><td>Tokens matter more than wall-clock. Last night's seven PRs never needed more than four runs at once.</td></tr>
 <tr><td>9. Instruction files?</td><td><b>Replace the review paragraphs in each repo's CLAUDE.md and AGENTS.md with the text in appendix H</b>, one PR per repo, in ticket 1. You approve each.</td><td>Those files are yours, and four repos carry the old instructions.</td></tr>
 <tr><td>10. A reviewer that runs the code?</td><td><b>Yes, as a paired reviewer, on tickets only.</b> You choose it in the Start popover or the ticket's menu. It starts at the first review request, works in the author's checkout, may build and test but never edit, and posts through sm like a run. If it can't review, a run of the same model takes over.</td><td>Running the code catches what reading misses. Starting at the first review spends nothing until there is a PR.</td></tr>
@@ -566,7 +566,8 @@ sm: woke far-1848</div>
 <p>The build is six tickets, in order. <b>1</b> adds the new command, deletes the old two, handles GitHub Codex's refusals, and opens the instruction-file PRs. On its own it ends last night's pattern: a refusal reaches the author and you at once instead of after an hour. <b>2</b> adds Codex and Claude review runs and the fallback, which gets the review done. <b>3</b> adds repo, lane and ticket policies. <b>4</b> adds paired reviewers. <b>5</b> (web, including the Start popover's Reviewer row) and <b>6</b> (Android, needs an APK install) follow in parallel and move this document to <code>docs/specs/</code>. Appendix J lists what each ticket must deliver and how it is checked.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>A ticket can have a reviewer that runs the code.</b> The Board's Start popover gains a Reviewer row, and a ticket's policy may be a paired reviewer: an agent in the author's checkout (scenario 4, decision 10). Every other decision stands as you accepted it. The build grows from five tickets to six; paired reviewers are ticket 4.</p>
+<p><b>A ticket can have a reviewer that runs the code.</b> The Board's Start popover gains a Reviewer row, and a ticket's policy may be a paired reviewer: an agent in the author's checkout (scenario 4, decision 10). The build grows from five tickets to six; paired reviewers are ticket 4.</p>
+<p><b>Why is there no review-policy command?</b> You set policies in the app, which signs owner requests. A bare local command cannot prove it is you. The server still exposes the policy routes the apps use and lets authenticated planning agents set ticket policies for work they do not hold.</p>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -574,7 +575,7 @@ sm: woke far-1848</div>
 <h2>Appendices</h2>
 <div class="toc">
   <div><a href="#a">A. What exists today</a></div>
-  <div><a href="#b">B. Commands</a></div>
+  <div><a href="#b">B. Commands and policy routes</a></div>
   <div><a href="#c">C. Policies: shape, storage, resolution</a></div>
   <div><a href="#d">D. How a request runs</a></div>
   <div><a href="#e">E. Review runs: prompts and output</a></div>
@@ -643,7 +644,7 @@ sm: woke far-1848</div>
   <li>Claude Code's headless mode has <code>-p</code>, <code>--model</code>, <code>--effort</code> (low, medium, high, xhigh, max), <code>--output-format json</code>, <code>--json-schema</code>, <code>--allowedTools</code> and <code>--append-system-prompt</code> (<code>claude --help</code>, 30 September).</li>
 </ul>
 
-<h3 id="b">B. Commands</h3>
+<h3 id="b">B. Commands and policy routes</h3>
 <h4>B1. <code>sm request-review [PR] [--repo OWNER/NAME] [--steer TEXT] [--notify TARGET] [--json]</code></h4>
 <ul>
   <li><b>PR</b>: optional. Without it, sm uses the open PR of the current branch (<code>gh pr view --json number</code> in the working directory, as <code>sm pr</code> does). With no open PR, it exits 2 with <code>No open PR for this branch. Pass the PR number.</code></li>
@@ -652,24 +653,18 @@ sm: woke far-1848</div>
   <li>Subcommands <code>list [--all] [--inactive]</code>, <code>status [ID]</code> and <code>cancel [ID]</code> behave as today's. <code>status</code> is where the detail lives: the policy, its source, and one line per reviewer tried, with its outcome.</li>
   <li>Success output, exact, and nothing else except today's <code>handoff_ask</code> and <code>claim_warning</code> lines when they apply: <code>Review requested for PR #{n} at {sha7}. sm wakes you when it lands.</code> <code>--json</code> prints the request object (I1).</li>
 </ul>
-<h4>B2. <code>sm review-policy</code></h4>
-<pre><code>sm review-policy show [--pr N | --ticket N | --lane GOAL] [--repo OWNER/NAME]
-sm review-policy set   SCOPE REVIEWER
-sm review-policy clear SCOPE
-SCOPE    := default | repo [OWNER/NAME] | lane GOAL | ticket N      (repo from --repo or the cwd)
-REVIEWER := github-codex | codex/MODEL/EFFORT | claude/MODEL/EFFORT
-          | paired/codex/MODEL/EFFORT | paired/claude/MODEL/EFFORT      (ticket scope only)</code></pre>
+<h4>B2. Policy routes and permissions</h4>
 <ul>
-  <li><code>show</code> with no flag prints every stored policy. With a flag, it prints the resolved policy, its source and its fallback, as a request would use them.</li>
-  <li><code>set</code> validates with C1 and prints the stored policy with its fallback.</li>
+  <li><code>GET /review-policies</code> returns every stored policy and the default. With <code>repo</code>, optionally narrowed by one of <code>pr</code>, <code>ticket</code> or <code>lane</code>, it returns the policy a request would use, its source and fallback.</li>
+  <li><code>PUT /review-policies</code> sets a policy after C1 validation. The body names <code>scope</code> (<code>default</code>, <code>repo</code>, <code>lane</code> or <code>ticket</code>), <code>repo</code>, <code>number</code> for lane or ticket, and <code>reviewer</code>. A null reviewer clears a stored policy; clearing the default restores GitHub Codex.</li>
   <li>Permissions (decision 7):
     <ul>
-      <li>From a managed session (<code>CLAUDE_SESSION_MANAGER_ID</code> set), only <code>ticket</code> scope may be set or cleared. It is refused when that session, or its handoff successor or predecessor, holds the ticket's claim or the claim of a PR linked to it: <code>You hold #{n}; an author cannot choose its own reviewer.</code></li>
-      <li>Any other scope from a session gives <code>Only {owner} sets default, repo and lane review policies.</code></li>
-      <li>Without a session id, the CLI acts as the owner.</li>
+      <li>An app owner write must carry a signed owner request. A bare local request has no owner authority.</li>
+      <li>An agent write must carry the same session id in the <code>x-sm-session</code> header and <code>session_id</code> body field, plus that session's launch credential in <code>X-SM-Session-Credential</code>. Only <code>ticket</code> scope may be set or cleared. It is refused when that session, or its handoff successor or predecessor, holds the ticket's claim or the claim of a PR linked to it: <code>You hold #{n}; an author cannot choose its own reviewer.</code></li>
+      <li>Any other scope from an agent gives <code>Only {owner} sets default, repo and lane review policies.</code></li>
     </ul></li>
 </ul>
-<p>Examples: <code>sm review-policy set ticket 1848 claude/fable/max</code>; <code>sm review-policy set lane 1843 codex/gpt-6-astra/high</code>; <code>sm review-policy show --pr 1851</code> prints <code>ticket #1848: Claude run fable (max); falls back to Codex run gpt-6-astra (high)</code>.</p>
+<p>Example: the owner chooses Claude fable (max) for ticket #1848 in the app. A resolved read for PR #1851, which closes that ticket, returns source <code>ticket #1848</code>, Claude fable (max), and its Codex fallback. The app displays that source and fallback.</p>
 <h4>B4. <code>sm review submit [--file PATH]</code></h4>
 <p>This is for paired reviewers only. The body is a <code>ReviewOutputEvent</code> JSON document (A5), read from stdin when <code>--file</code> is absent. Checks, in order, each exit 1 with the quoted text:</p>
 <ol>
@@ -1022,7 +1017,7 @@ Submit with `sm review submit` as before.</code></pre>
 <tr><td><code>GET /review-requests</code>, <code>GET/DELETE /review-requests/{id}</code></td><td>session or CLI</td><td>List, show and cancel. Cancel also cancels a running review job, and sends E7 to a paired reviewer.</td></tr>
 <tr><td><code>POST /review-requests/{id}/submit</code></td><td>the paired reviewer's session</td><td>Body <code>{session_id, review}</code>. Does B4.</td></tr>
 <tr><td><code>GET /review-policies[?repo=&amp;pr=|ticket=|lane=]</code></td><td>any</td><td>All stored policies, or <code>{reviewer, fallback[], source}</code> resolved.</td></tr>
-<tr><td><code>PUT /review-policies</code></td><td>owner guard, or session under B2's rules</td><td>Body <code>{scope, repo, number, reviewer | null, session_id?}</code>. <code>null</code> clears.</td></tr>
+<tr><td><code>PUT /review-policies</code></td><td>signed owner app request, or credential-bound session under B2's rules</td><td>Body <code>{scope, repo, number, reviewer | null, session_id?}</code>. <code>null</code> clears.</td></tr>
 <tr><td><code>GET/PUT /client/settings</code></td><td>owner</td><td>Adds the <code>reviews</code> key and <code>queue_limits.review</code> (C2), with the same merge rules.</td></tr>
 <tr><td><code>GET /client/reviews/status</code></td><td>owner</td><td><code>{github_codex: {state, paused_at, next_check_at, refusal_url}, last_24h: {github_codex, codex_runs, claude_runs, no_reviewer}, running: [...], meters: {codex, claude}}</code></td></tr>
 <tr><td><code>POST /client/reviews/github-codex/check</code></td><td>owner</td><td>Try now.</td></tr>
@@ -1077,7 +1072,7 @@ Submit with `sm review submit` as before.</code></pre>
 <tbody>
 <tr><td>1</td><td>Reviews 1/6: <code>sm request-review</code>, GitHub Codex failures, removals</td><td>B1, B3; D1; D2; D5, D6, D7 for GitHub Codex; G; <code>review_channels</code>; the <code>reviews</code> settings key, with the chain fixed to <code>[github_codex]</code> until ticket 2; I1 request, status, check and retry routes; H as one PR per repo. Starts after nothing.</td><td>Unit tests drive a fake <code>GitHubReviewPoster</code> through each D2 row. On the live server, one request on a test PR while GitHub Codex refuses posts exactly one <code>@codex review</code>, and the author and your phone are told within 20 s. A second request posts nothing until <code>next_check_at</code>. <code>rg "request-codex-review|sm review "</code> finds nothing outside <code>docs/</code>.</td></tr>
 <tr><td>2</td><td>Reviews 2/6: review runs and fallback</td><td>A5 wiring; C2 fallback map; D3, D4, D5 for runs, D8, D9; E1–E4; F; the <code>review</code> queue type and job owner hook. Starts after 1.</td><td>Live: on a small session-manager PR, a Codex run and a Claude run each post a review with line comments, and the author gets G1. Forcing the meter skip moves a request to the other provider. Moving the head cancels a running run and removes its checkout. E4 and F have tests built on recorded outputs.</td></tr>
-<tr><td>3</td><td>Reviews 3/6: repo, lane and ticket policies</td><td>C1, C3; <code>review_policies</code>; B2; the policy routes; board events; I2 board fields. Starts after 2.</td><td>C3's five examples are tests. B2's permission refusals are tests. <code>sm review-policy show --pr</code> agrees with the request's <code>policy_source</code> on a live PR.</td></tr>
+<tr><td>3</td><td>Reviews 3/6: repo, lane and ticket policies</td><td>C1, C3; <code>review_policies</code>; B2's policy routes and permissions; board events; I2 board fields. Starts after 2.</td><td>C3's five examples are tests. B2's permission refusals are tests. A resolved <code>GET /review-policies</code> for a live PR agrees with that review request's <code>policy_source</code>.</td></tr>
 <tr><td>4</td><td>Reviews 4/6: paired reviewers</td><td>C1's <code>paired</code> kind; D3b; B4; E5–E8; the submit route; I2 session and start-options fields; <code>paired_reviewers</code>. Starts after 3.</td><td>Live: a ticket with a paired Codex policy gets <code>{repo_short}-{ticket}-reviewer</code> at its first request. It runs a test through the queue and submits, and sm posts. A second round reuses it. A tracked-file change is refused. Merging the PR retires it.</td></tr>
 <tr><td>5</td><td>Reviews 5/6: web</td><td>I3's web items, including the Start popover's Reviewer row; I2's queue fields. Starts after 4.</td><td>Figures 3, 4, 4b and 5 reproduced against live data in both themes; <code>tests/settings_client.test.cjs</code> extended.</td></tr>
 <tr><td>6</td><td>Reviews 6/6: Android</td><td>I3's Android items, including the Start sheet's Reviewer row. Starts after 4; needs an APK install.</td><td>Figure 7 reproduced on the preview emulator against live data. Whichever of 5 and 6 merges last moves this memo to <code>docs/specs/</code>.</td></tr>
