@@ -25,6 +25,53 @@ pub(super) struct TimeParams {
 
 pub(super) type AnalyticsCache = BTreeMap<String, (std::time::Instant, Value)>;
 
+/// The databases Analytics › Time reads.
+pub(super) struct TimePaths {
+    activity_db: PathBuf,
+    usage_db: PathBuf,
+    queue_db: PathBuf,
+    queue_runner_db: PathBuf,
+}
+
+impl TimePaths {
+    pub(super) fn new(config: &AppConfig) -> Self {
+        Self {
+            activity_db: expand_home(&config.activity.db_path),
+            usage_db: expand_home(&config.usage.db_path),
+            queue_db: expand_home(&config.sm_send.db_path),
+            queue_runner_db: expand_home(&config.queue_runner_state_dir().to_string_lossy())
+                .join("queue_runner.db"),
+        }
+    }
+
+    pub(super) fn activity_db(&self) -> &StdPath {
+        &self.activity_db
+    }
+
+    pub(super) fn sources<'a>(
+        &'a self,
+        live_sessions: &'a BTreeMap<String, bool>,
+    ) -> TimeSources<'a> {
+        TimeSources {
+            activity_db: &self.activity_db,
+            usage_db: &self.usage_db,
+            queue_db: &self.queue_db,
+            queue_runner_db: &self.queue_runner_db,
+            live_sessions,
+            repo_of: &crate::work_attribution::folder_repo,
+        }
+    }
+}
+
+/// Live sessions, and whether each is in a turn now.
+pub(super) fn live_sessions(records: &[SessionRecord]) -> BTreeMap<String, bool> {
+    records
+        .iter()
+        .filter(|record| !record.is_stopped())
+        .map(|record| (record.id.clone(), record.lifecycle_status() == "running"))
+        .collect()
+}
+
 pub(super) async fn client_analytics_spend(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SpendParams>,
@@ -111,33 +158,11 @@ pub(super) async fn client_analytics_time(
         return Ok(Json(body));
     }
 
-    let activity_db = expand_home(&state.config.activity.db_path);
-    let usage_db = expand_home(&state.config.usage.db_path);
-    let queue_db = expand_home(&state.config.sm_send.db_path);
-    let queue_runner_db = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
-        .join("queue_runner.db");
-    // Live sessions, and whether each is in a turn now.
-    let live_sessions: BTreeMap<String, bool> = state
-        .session_store
-        .list_sessions(true)?
-        .into_iter()
-        .filter(|record| !record.is_stopped())
-        .map(|record| {
-            let working = record.lifecycle_status() == "running";
-            (record.id, working)
-        })
-        .collect();
+    let paths = TimePaths::new(&state.config);
+    let live_sessions = live_sessions(&state.session_store.list_sessions(true)?);
     let body = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let sources = TimeSources {
-            activity_db: &activity_db,
-            usage_db: &usage_db,
-            queue_db: &queue_db,
-            queue_runner_db: &queue_runner_db,
-            live_sessions: &live_sessions,
-            repo_of: &crate::work_attribution::folder_repo,
-        };
         Ok(serde_json::to_value(analytics_time::time_report(
-            &sources,
+            &paths.sources(&live_sessions),
             range,
             time::OffsetDateTime::now_utc(),
         )?)?)

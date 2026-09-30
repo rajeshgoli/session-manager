@@ -1352,8 +1352,11 @@ fn context<'a>(events: &'a [Event], repos: &'a [RepoSync], unseen: &'a Unseen) -
         start_defaults: json!({"provider": "claude"}),
         lane_filter: None,
         now: now(),
+        clocks: &NO_CLOCKS,
     }
 }
+
+static NO_CLOCKS: BTreeMap<Key, Value> = BTreeMap::new();
 
 #[test]
 fn board_json_shape() {
@@ -1387,6 +1390,28 @@ fn board_json_shape() {
     assert_eq!(rebuild["waits_on"][0]["state"], "done");
     assert_eq!(rebuild["warnings"][0], "working_while_blocked");
     assert_eq!(value["start_defaults"]["provider"], "claude");
+}
+
+#[test]
+fn board_json_attaches_clocks() {
+    let input = iteration7();
+    let board = compute(&input, now());
+    let unseen = Unseen::default();
+    let clocks = BTreeMap::from([(ko(1813), json!({"ball": "you"}))]);
+    let value = board_json(
+        &board,
+        &input,
+        &JsonContext {
+            clocks: &clocks,
+            ..context(&[], &[], &unseen)
+        },
+    );
+    let tickets = value["lanes"][0]["tickets"].as_array().unwrap();
+    assert_eq!(tickets[0]["number"], 1813);
+    assert_eq!(tickets[0]["clock"]["ball"], "you");
+    assert!(tickets[1..]
+        .iter()
+        .all(|ticket| ticket.get("clock").is_none()));
 }
 
 #[test]

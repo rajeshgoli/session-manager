@@ -1849,6 +1849,10 @@ pub struct BoardConfig {
     /// What the Start sheet preselects.
     #[serde(default)]
     pub start_defaults: BoardStartDefaults,
+    /// Minutes a live holder idles, with nothing running or waited on,
+    /// before its ticket's clock turns stalled (sm#1710, D7).
+    #[serde(default = "default_board_stall_minutes")]
+    pub stall_minutes: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -1878,6 +1882,7 @@ impl Default for BoardConfig {
             sync_interval_seconds: default_board_sync_interval_seconds(),
             checkouts: BTreeMap::new(),
             start_defaults: BoardStartDefaults::default(),
+            stall_minutes: default_board_stall_minutes(),
         }
     }
 }
@@ -1894,6 +1899,10 @@ impl BoardConfig {
     pub fn sync_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sync_interval_seconds.max(30))
     }
+
+    pub fn stall(&self) -> time::Duration {
+        time::Duration::minutes(i64::from(self.stall_minutes))
+    }
 }
 
 fn default_board_repos() -> Vec<String> {
@@ -1905,6 +1914,10 @@ fn default_board_repos() -> Vec<String> {
 
 fn default_board_sync_interval_seconds() -> u64 {
     60
+}
+
+fn default_board_stall_minutes() -> u32 {
+    15
 }
 
 fn default_board_start_provider() -> String {

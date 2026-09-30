@@ -322,6 +322,7 @@ pub enum GitHubPullRequestState {
 mod agent_history;
 mod analytics;
 mod board;
+mod board_clock;
 mod board_page;
 mod claims;
 mod docs;
@@ -486,6 +487,8 @@ pub struct AppState {
     /// Serializes board passes, recomputes, and lane and link writes.
     board_lock: Arc<Mutex<()>>,
     board_wake: Arc<board::BoardWake>,
+    /// The ticket clock's thread intervals per `clock_hours`, for 60s.
+    board_clock_cache: Arc<Mutex<board_clock::ClockCache>>,
     codex_review_creation_locks: Arc<Mutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -621,6 +624,7 @@ impl AppState {
             board_source: Arc::new(board::GhCliBoardSource),
             board_lock: Arc::new(Mutex::new(())),
             board_wake: Arc::new(board::BoardWake::default()),
+            board_clock_cache: Arc::new(Mutex::new(BTreeMap::new())),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),

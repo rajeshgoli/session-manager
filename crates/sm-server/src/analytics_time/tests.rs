@@ -67,9 +67,9 @@ fn classify_seat(
         attributor,
         REPO,
         from_you,
-        |attribution, bucket, ms| {
+        |attribution, bucket, from, to| {
             *out.entry((attribution.thread, bucket_key(bucket)))
-                .or_default() += ms;
+                .or_default() += to - from;
         },
     );
     out.into_iter()
@@ -782,4 +782,60 @@ fn report_without_an_activity_db_is_empty() {
     assert_eq!(report.range, "30d");
     assert_eq!(report.total.active_seconds, 0);
     assert!(report.root.children.is_empty());
+}
+
+#[test]
+fn thread_intervals_give_each_ticket_its_parts_in_time_order() {
+    let f = fixture();
+    f.seat("eng", "sm-1719-engineer", None);
+    f.seat("loose", "scout", None);
+    f.queue
+        .execute(
+            &format!(
+                "INSERT INTO work_claims VALUES ('c1', '{REPO}', 1719, 'ticket', 'eng',
+                     '2026-09-29T10:00:00Z', NULL, NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+    f.turn("eng", t("10:00:00"), t("10:10:00"), None);
+    f.span("eng", "s1", t("10:02:00"), t("10:05:00"), "git");
+    f.job("j1", "tests", "eng", t("10:10:00"), Some(t("10:25:00")));
+    f.turn("eng", t("10:30:00"), t("10:40:00"), None);
+    // A seat with no claim is on no ticket.
+    f.turn("loose", t("10:00:00"), t("10:40:00"), None);
+
+    let queue_db = f.dir.join("message_queue.db");
+    let (activity_db, usage_db, runner_db) = (
+        f.dir.join("activity.db"),
+        f.dir.join("usage.db"),
+        f.dir.join("queue_runner.db"),
+    );
+    let sources = TimeSources {
+        activity_db: &activity_db,
+        usage_db: &usage_db,
+        queue_db: &queue_db,
+        queue_runner_db: &runner_db,
+        live_sessions: &f.live,
+        repo_of: &|_| REPO.to_owned(),
+    };
+    let at =
+        |ms: i64| OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * NANOS_PER_MS).unwrap();
+    let threads = thread_intervals(&sources, at(t("10:00:00")), at(t("10:35:00"))).unwrap();
+    assert_eq!(threads.len(), 1);
+    let parts: Vec<(&str, i64, i64)> = threads[&(REPO.to_owned(), 1719)]
+        .iter()
+        .map(|interval| (interval.part, interval.from, interval.to))
+        .collect();
+    assert_eq!(
+        parts,
+        [
+            ("model", t("10:00:00"), t("10:02:00")),
+            ("tools", t("10:02:00"), t("10:05:00")),
+            ("model", t("10:05:00"), t("10:10:00")),
+            ("queue", t("10:10:00"), t("10:25:00")),
+            ("idle", t("10:25:00"), t("10:30:00")),
+            ("model", t("10:30:00"), t("10:35:00")),
+        ]
+    );
 }
