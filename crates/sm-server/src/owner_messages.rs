@@ -39,6 +39,7 @@ pub struct OwnerMessage {
     pub created_at: String,
     pub first_viewed_at: Option<String>,
     pub handled_at: Option<String>,
+    pub handled_via: Option<String>,
 }
 
 /// A passage comment the owner has not sent yet.
@@ -124,6 +125,15 @@ pub fn is_owner_message_id(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+/// A submitted prompt that did not come from sm's own delivery queue.
+pub fn is_owner_typed_prompt(prompt: &str, recently_delivered: bool) -> bool {
+    let prompt = prompt.trim();
+    !prompt.is_empty()
+        && !prompt.starts_with("[Input from:")
+        && !prompt.starts_with("[sm")
+        && !recently_delivered
 }
 
 pub fn message_reader_path(id: &str) -> String {
@@ -343,7 +353,8 @@ pub fn init_owner_messages_schema(conn: &Connection) -> Result<()> {
             blocking INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             first_viewed_at TEXT,
-            handled_at TEXT
+            handled_at TEXT,
+            handled_via TEXT
         );
         CREATE INDEX IF NOT EXISTS owner_messages_sender
             ON owner_messages(sender_session_id, created_at);
@@ -369,6 +380,15 @@ pub fn init_owner_messages_schema(conn: &Connection) -> Result<()> {
             ON owner_message_replies(message_id, created_at);
         "#,
     )?;
+    let has_via = conn
+        .prepare("PRAGMA table_info(owner_messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|column| column == "handled_via");
+    if !has_via {
+        conn.execute_batch("ALTER TABLE owner_messages ADD COLUMN handled_via TEXT")?;
+    }
     Ok(())
 }
 
@@ -409,7 +429,21 @@ pub struct OwnerMessageStore {
 }
 
 const MESSAGE_COLUMNS: &str = "id, human, sender_session_id, sender_session_name, title, \
-     body_markdown, blocking, created_at, first_viewed_at, handled_at";
+     body_markdown, blocking, created_at, first_viewed_at, handled_at, handled_via";
+const LEGACY_MESSAGE_COLUMNS: &str = "id, human, sender_session_id, sender_session_name, title, \
+     body_markdown, blocking, created_at, first_viewed_at, handled_at, NULL AS handled_via";
+
+fn message_columns(conn: &Connection) -> Result<&'static str> {
+    let columns = conn
+        .prepare("PRAGMA table_info(owner_messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(if columns.iter().any(|column| column == "handled_via") {
+        MESSAGE_COLUMNS
+    } else {
+        LEGACY_MESSAGE_COLUMNS
+    })
+}
 const DRAFT_COLUMNS: &str = "id, message_id, line, quote, body, created_at, updated_at";
 const REPLY_COLUMNS: &str =
     "id, message_id, body, comments_json, delivered_text, delivered_to_session_id, created_at";
@@ -553,14 +587,32 @@ impl OwnerMessageStore {
 
     /// Handled: sets `handled_at`, and `first_viewed_at` when unset.
     pub fn mark_handled(&self, id: &str) -> Result<Option<OwnerMessage>> {
+        self.mark_handled_via(id, "manual")
+    }
+
+    pub fn mark_handled_via(&self, id: &str, via: &str) -> Result<Option<OwnerMessage>> {
         let conn = self.open_write()?;
         let now = now_rfc3339();
         conn.execute(
             "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?2), \
-               first_viewed_at = IFNULL(first_viewed_at, ?2) WHERE id = ?1",
-            params![id, now],
+               first_viewed_at = IFNULL(first_viewed_at, ?2), \
+               handled_via = IFNULL(handled_via, ?3) WHERE id = ?1",
+            params![id, now, via],
         )?;
         get_message_conn(&conn, id)
+    }
+
+    /// Answer all open blocking questions from one agent without sending it a message.
+    pub fn answer_session(&self, session_id: &str, via: &str) -> Result<usize> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        Ok(conn.execute(
+            "UPDATE owner_messages SET handled_at = ?2, first_viewed_at = \
+             IFNULL(first_viewed_at, ?2), handled_via = ?3 \
+             WHERE sender_session_id = ?1 AND blocking = 1 AND handled_at IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM owner_message_replies r WHERE r.message_id = owner_messages.id)",
+            params![session_id, now, via],
+        )?)
     }
 
     /// Clear a blocking review notice when its request receives a reviewer.
@@ -569,7 +621,8 @@ impl OwnerMessageStore {
         let now = now_rfc3339();
         conn.execute(
             "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?2), \
-               first_viewed_at = IFNULL(first_viewed_at, ?2) WHERE id = (\
+               first_viewed_at = IFNULL(first_viewed_at, ?2), \
+               handled_via = IFNULL(handled_via, 'inbox') WHERE id = (\
                SELECT message_id FROM owner_message_delivery_keys WHERE key = ?1)",
             params![key, now],
         )?;
@@ -585,9 +638,10 @@ impl OwnerMessageStore {
         };
         let replied = replied_ids(&conn)?;
         let mut statement = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM owner_messages \
+            "SELECT {} FROM owner_messages \
              WHERE created_at >= ?1 OR (blocking = 1 AND handled_at IS NULL) \
-             ORDER BY created_at DESC, rowid DESC"
+             ORDER BY created_at DESC, rowid DESC",
+            message_columns(&conn)?
         ))?;
         let rows = statement
             .query_map(params![since], message_from_row)?
@@ -609,8 +663,9 @@ impl OwnerMessageStore {
             return Ok(Vec::new());
         };
         let mut statement = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM owner_messages WHERE created_at >= ?1 \
-             ORDER BY created_at, rowid"
+            "SELECT {} FROM owner_messages WHERE created_at >= ?1 \
+             ORDER BY created_at, rowid",
+            message_columns(&conn)?
         ))?;
         let rows = statement
             .query_map(params![since], message_from_row)?
@@ -624,7 +679,8 @@ impl OwnerMessageStore {
             return Ok(Vec::new());
         };
         let mut statement = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM owner_messages ORDER BY created_at, rowid"
+            "SELECT {} FROM owner_messages ORDER BY created_at, rowid",
+            message_columns(&conn)?
         ))?;
         let rows = statement
             .query_map([], message_from_row)?
@@ -809,6 +865,7 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerMessage> {
         created_at: row.get(7)?,
         first_viewed_at: row.get(8)?,
         handled_at: row.get(9)?,
+        handled_via: row.get(10)?,
     })
 }
 
@@ -840,7 +897,10 @@ fn reply_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerMessageReply> {
 fn get_message_conn(conn: &Connection, id: &str) -> Result<Option<OwnerMessage>> {
     Ok(conn
         .query_row(
-            &format!("SELECT {MESSAGE_COLUMNS} FROM owner_messages WHERE id = ?1"),
+            &format!(
+                "SELECT {} FROM owner_messages WHERE id = ?1",
+                message_columns(conn)?
+            ),
             params![id],
             message_from_row,
         )

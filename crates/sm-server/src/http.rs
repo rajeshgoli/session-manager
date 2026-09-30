@@ -561,6 +561,8 @@ pub struct AppState {
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
     /// Serializes owner message replies with their draft writes (sm#1580).
     owner_message_lock: Arc<AsyncMutex<()>>,
+    /// Limits repeated Enter frames and prompt hooks to one answer pass per agent in two seconds.
+    owner_answered_at: Arc<Mutex<BTreeMap<String, std::time::Instant>>>,
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
     merge_hold_source: Arc<dyn crate::work_claims::merge_holds::MergeHoldSource>,
@@ -612,7 +614,15 @@ impl AppState {
         }
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
+        if queue_db_path.exists()
+            && (config.rust_core.fixture_writes_enabled || config.rust_core.runtime_enabled)
+        {
+            crate::owner_messages::OwnerMessageStore::new(queue_db_path.clone()).ensure_schema()?;
+        }
+        let board_wake = Arc::new(board::BoardWake::default());
+        let codex_board_wake = board_wake.clone();
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+            .with_owner_answered_wake(Arc::new(move || board::wake_recompute(&codex_board_wake)))
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
@@ -718,11 +728,12 @@ impl AppState {
             analytics_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             owner_message_lock: Arc::new(AsyncMutex::new(())),
+            owner_answered_at: Arc::new(Mutex::new(BTreeMap::new())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
             merge_hold_source: Arc::new(merge_holds::GhMergeHoldSource),
             board_source: Arc::new(board::GhCliBoardSource),
             board_lock: Arc::new(Mutex::new(())),
-            board_wake: Arc::new(board::BoardWake::default()),
+            board_wake,
             board_clock_cache: Arc::new(Mutex::new(BTreeMap::new())),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1903,6 +1914,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/task-complete", post(task_complete))
         .route("/sessions/{session_id}/turn-complete", post(turn_complete))
         .route(
+            "/sessions/{session_id}/needs-you/answered",
+            post(messages::answer_session_needs_you),
+        )
+        .route(
             "/sessions/{session_id}/notify-on-stop",
             post(arm_stop_notify),
         )
@@ -2268,6 +2283,21 @@ async fn claude_hook(
         state
             .session_store
             .apply_claude_user_prompt_submit_hook(&session_id, emitted_at)?;
+        if let Some(prompt) = payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|prompt| crate::owner_messages::is_owner_typed_prompt(prompt, false))
+        {
+            let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+            if queue
+                .recently_delivered_prompt(&session_id, prompt)
+                .is_ok_and(|delivered| {
+                    crate::owner_messages::is_owner_typed_prompt(prompt, delivered)
+                })
+            {
+                let _ = messages::owner_answered(&state, &session_id, "claude_prompt");
+            }
+        }
     }
     if hook_event == "Stop" {
         // Stamped before the transcript retry sleep below, so a turn-start that
@@ -8792,6 +8822,8 @@ async fn run_mobile_terminal_bridge_inner(
                 &mut sender,
                 &master,
                 &frame,
+                state,
+                &ticket.session_id,
                 &mut close_code,
                 &mut close_reason,
             )
@@ -8911,6 +8943,8 @@ async fn run_mobile_terminal_bridge_inner(
                     &mut sender,
                     &master,
                     &frame,
+                    state,
+                    &ticket.session_id,
                     &mut close_code,
                     &mut close_reason,
                 )
@@ -9031,6 +9065,8 @@ async fn process_mobile_terminal_client_frame<S>(
     sender: &mut S,
     master: &Arc<OwnedFd>,
     frame: &Value,
+    state: &AppState,
+    session_id: &str,
     close_code: &mut u16,
     close_reason: &mut String,
 ) -> Result<bool, String>
@@ -9081,6 +9117,9 @@ where
                     *close_reason = "failed_to_deliver_terminal_input".to_owned();
                     return Ok(true);
                 }
+                if terminal_frame_submits_input(frame) {
+                    let _ = messages::owner_answered(state, session_id, "terminal");
+                }
             }
         }
         Some("key") => {
@@ -9107,6 +9146,9 @@ where
                 *close_code = 1011;
                 *close_reason = "failed_to_deliver_terminal_key".to_owned();
                 return Ok(true);
+            }
+            if terminal_frame_submits_input(frame) {
+                let _ = messages::owner_answered(state, session_id, "terminal");
             }
         }
         Some("resize") => {
@@ -9175,6 +9217,44 @@ where
         }
     }
     Ok(false)
+}
+
+fn terminal_frame_submits_input(frame: &Value) -> bool {
+    match mobile_terminal_frame_type(frame).as_deref() {
+        Some("input") => frame
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|data| data.contains(['\r', '\n'])),
+        Some("key") => frame
+            .get("key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.eq_ignore_ascii_case("enter")),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod terminal_answer_tests {
+    use super::*;
+
+    #[test]
+    fn only_submitted_terminal_input_answers() {
+        assert!(terminal_frame_submits_input(
+            &json!({"type": "input", "data": "yes\r"})
+        ));
+        assert!(terminal_frame_submits_input(
+            &json!({"type": "key", "key": "enter"})
+        ));
+        assert!(!terminal_frame_submits_input(
+            &json!({"type": "input", "data": "yes"})
+        ));
+        assert!(!terminal_frame_submits_input(
+            &json!({"type": "key", "key": "tab"})
+        ));
+        assert!(!terminal_frame_submits_input(
+            &json!({"type": "resize", "rows": 40})
+        ));
+    }
 }
 
 /// Send one frame, giving up after `MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS`.

@@ -85,8 +85,12 @@ pub(super) fn request_pass(state: &AppState) {
 /// Asks the loop to recompute without reading GitHub: a message or review
 /// changed, so a Needs-you row may have.
 pub(super) fn request_recompute(state: &AppState) {
-    state.board_wake.recompute.store(true, Ordering::SeqCst);
-    state.board_wake.notify.notify_one();
+    wake_recompute(&state.board_wake);
+}
+
+pub(super) fn wake_recompute(wake: &BoardWake) {
+    wake.recompute.store(true, Ordering::SeqCst);
+    wake.notify.notify_one();
 }
 
 fn config_repos(config: &AppConfig) -> Vec<String> {

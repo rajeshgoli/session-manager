@@ -96,6 +96,7 @@ pub struct SessionStore {
     /// racing a completed driver and mistaking its released lease for failure.
     reparent_apply_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
+    owner_answered_wake: Option<OwnerAnsweredWake>,
     /// Carried on the store rather than read per-request because the codex-fork
     /// event monitor threads evaluate the same thresholds and have no access to
     /// the HTTP layer's `AppConfig`.
@@ -121,6 +122,15 @@ pub struct SessionStore {
     parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
     /// Owner follows fired by `sm task-complete` (sm#1569).
     owner_push_db_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct OwnerAnsweredWake(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for OwnerAnsweredWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnerAnsweredWake")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -229,6 +239,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            owner_answered_wake: None,
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
@@ -312,6 +323,11 @@ impl SessionStore {
         store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
         let _ = store.cancel_unsupported_context_alerts();
         store
+    }
+
+    pub fn with_owner_answered_wake(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.owner_answered_wake = Some(OwnerAnsweredWake(wake));
+        self
     }
 
     pub fn with_owner_push_db_path(mut self, db_path: PathBuf) -> Self {
@@ -1733,6 +1749,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            owner_answered_wake: None,
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
@@ -8230,6 +8247,29 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         drop(_guard);
+        if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
+            if let (Some(prompt), Some(queue)) =
+                (codex_fork_user_prompt(event), self.queue_store.as_ref())
+            {
+                if crate::owner_messages::is_owner_typed_prompt(&prompt, false)
+                    && queue
+                        .recently_delivered_prompt(session_id, &prompt)
+                        .is_ok_and(|delivered| !delivered)
+                {
+                    let store = crate::owner_messages::OwnerMessageStore::new(
+                        queue.db_path().to_path_buf(),
+                    );
+                    if store
+                        .answer_session(session_id, "codex_prompt")
+                        .is_ok_and(|changed| changed > 0)
+                    {
+                        if let Some(wake) = &self.owner_answered_wake {
+                            (wake.0)();
+                        }
+                    }
+                }
+            }
+        }
         if let Some(provider_resume_id) = observed_provider_session_id {
             self.append_seat_session(
                 session_id,
@@ -8834,6 +8874,43 @@ pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
         return false;
     };
     event.as_object().is_some_and(codex_fork_event_starts_turn)
+}
+
+/// Text submitted by the root user turn, once the item has completed.
+fn codex_fork_user_prompt(event: &Map<String, Value>) -> Option<String> {
+    (codex_fork_event_type(event).as_deref() == Some("item/completed")).then_some(())?;
+    let item = codex_fork_payload(event)?.get("item")?.as_object()?;
+    (item.get("type")?.as_str()? == "userMessage").then_some(())?;
+    let text = item
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod owner_prompt_event_tests {
+    use super::*;
+
+    #[test]
+    fn completed_codex_user_message_carries_submitted_text() {
+        let event = json!({"event_type": "item/completed", "payload": {"item": {
+            "type": "userMessage", "content": [{"type": "text", "text": "Checked in Chrome."}]
+        }}});
+        assert_eq!(
+            codex_fork_user_prompt(event.as_object().unwrap()).as_deref(),
+            Some("Checked in Chrome.")
+        );
+        let mut start = event.clone();
+        start["event_type"] = json!("item/started");
+        assert!(codex_fork_user_prompt(start.as_object().unwrap()).is_none());
+        let mut agent = event;
+        agent["payload"]["item"]["type"] = json!("agentMessage");
+        assert!(codex_fork_user_prompt(agent.as_object().unwrap()).is_none());
+    }
 }
 
 pub(crate) fn codex_fork_event_line_matches_root_thread(

@@ -40,6 +40,7 @@ fn message(blocking: bool) -> OwnerMessage {
         created_at: "2026-09-26T10:00:00Z".into(),
         first_viewed_at: None,
         handled_at: None,
+        handled_via: None,
     }
 }
 
@@ -151,6 +152,52 @@ fn derived_states() {
         derive_message_state(&handled, true, false),
         OwnerMessageState::Replied
     );
+}
+
+#[test]
+fn answering_session_clears_only_open_blocking_messages_and_records_source() {
+    let (store, dir) = store();
+    let first = created(store.create(new_message("agent-a", true)).unwrap());
+    let second = created(store.create(new_message("agent-a", true)).unwrap());
+    let other = created(store.create(new_message("agent-b", true)).unwrap());
+    let plain = created(store.create(new_message("agent-a", false)).unwrap());
+    assert_eq!(store.answer_session("agent-a", "terminal").unwrap(), 2);
+    assert_eq!(store.answer_session("agent-a", "manual").unwrap(), 0);
+    for id in [&first.id, &second.id] {
+        let message = store.get(id).unwrap().unwrap();
+        assert!(message.handled_at.is_some());
+        assert_eq!(message.handled_via.as_deref(), Some("terminal"));
+    }
+    assert!(store.get(&other.id).unwrap().unwrap().handled_at.is_none());
+    assert!(store.get(&plain.id).unwrap().unwrap().handled_at.is_none());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn handled_via_column_migrates_existing_message_database() {
+    let (store, dir) = store();
+    let db_path = dir.join("message_queue.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE owner_messages (
+        id TEXT PRIMARY KEY, human TEXT NOT NULL, sender_session_id TEXT NOT NULL,
+        sender_session_name TEXT NOT NULL, title TEXT NOT NULL, body_markdown TEXT NOT NULL,
+        blocking INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+        first_viewed_at TEXT, handled_at TEXT)",
+    )
+    .unwrap();
+    drop(conn);
+    store.ensure_schema().unwrap();
+    let columns: Vec<String> = Connection::open(&db_path)
+        .unwrap()
+        .prepare("PRAGMA table_info(owner_messages)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(columns.contains(&"handled_via".to_owned()));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
