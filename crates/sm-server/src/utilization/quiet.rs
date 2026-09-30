@@ -128,6 +128,7 @@ impl Detector {
             .unwrap_or(i64::MAX)
             .saturating_mul(60_000);
         let mut statuses = HashMap::new();
+        let mut alert_error = None;
         for job in jobs.iter().filter(|j| j.state == "running") {
             let clock = self.clocks.entry(job.id.clone()).or_default();
             if clock.started_at != job.started_at {
@@ -163,26 +164,31 @@ impl Detector {
             }
             let status = clock.status();
             if let Some(entered) = clock.became_quiet {
-                crate::queue::quiet::alert(
+                if let Err(error) = crate::queue::quiet::alert(
                     settings,
                     job,
                     &status,
                     clock.last_active,
                     entered,
                     now,
-                )?;
+                ) {
+                    alert_error.get_or_insert(error);
+                }
             }
             statuses.insert(job.id.clone(), status);
         }
         *STATUS.write().unwrap_or_else(|p| p.into_inner()) =
             Some((settings.queue_db_path.clone(), statuses));
-        Ok(())
+        // Delivery is retried on the next tick. A broken inbox must not hide
+        // quiet jobs, stop evaluation of later jobs, or freeze their clocks.
+        alert_error.map_or(Ok(()), Err)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    static STATUS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample(at: i64) -> Sample {
         Sample {
@@ -288,7 +294,104 @@ mod tests {
     }
 
     #[test]
+    fn quiet_delivery_failure_still_publishes_all_jobs_and_retries() {
+        use crate::queue::{CreateQueueJob, RetainedQueueStore};
+        let _guard = STATUS_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("quiet-delivery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let messages = dir.join("unavailable");
+        std::fs::create_dir_all(&messages).unwrap(); // Opening a directory as SQLite fails.
+        let settings = RecorderSettings {
+            db_path: dir.join("samples.db"),
+            queue_db_path: dir.join("queue_runner.db"),
+            message_queue_db_path: messages.clone(),
+            interval: Duration::from_secs(5),
+            retention_days: 90,
+            quiet_minutes: 10,
+            quiet_alert_repeat_minutes: 120,
+        };
+        let create = |label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &dir,
+                CreateQueueJob {
+                    job_type: "background".into(),
+                    label: label.into(),
+                    requester_session_id: None,
+                    notify_session_id: "agent".into(),
+                    cwd: dir.display().to_string(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: Default::default(),
+                    timeout_seconds: 3600,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                    rank_tickets: None,
+                },
+            )
+            .unwrap()
+        };
+        let first = create("first");
+        let second = create("second");
+        let queue = Connection::open(&settings.queue_db_path).unwrap();
+        queue
+            .execute(
+                "UPDATE queue_jobs SET state='running', started_at='1970-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        let mut conn = open_for_write(&settings.db_path).unwrap();
+        for at in (0..=600_000).step_by(5000) {
+            let rows = [&first, &second].map(|j| JobSample {
+                job_id: j.id.clone(),
+                job_type: "background".into(),
+                state: "running".into(),
+                cpu_seconds_total: Some(0.0),
+                ..JobSample::default()
+            });
+            write_sample(
+                &mut conn,
+                &HostSample {
+                    sampled_at_ms: at,
+                    ..HostSample::default()
+                },
+                &rows,
+            )
+            .unwrap();
+        }
+        let jobs = active_queue_jobs_for_sampling(&settings.queue_db_path).unwrap();
+        let mut detector = Detector::default();
+        assert!(detector.tick(&conn, &settings, &jobs, 600_000).is_err());
+        for id in [&first.id, &second.id] {
+            let record = RetainedQueueStore::get_queue_job_from_path(&settings.queue_db_path, id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                status(&settings.queue_db_path, &record).quiet_since,
+                Some(timestamp(0))
+            );
+            assert!(record.quiet_alerted_at.is_none());
+        }
+        std::fs::remove_dir(&messages).unwrap();
+        detector.tick(&conn, &settings, &jobs, 605_000).unwrap();
+        detector.tick(&conn, &settings, &jobs, 610_000).unwrap();
+        let count: i64 = Connection::open(&messages)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue WHERE id LIKE 'queue-quiet-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(conn);
+        drop(queue);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quiet_replay_and_incremental_updates_agree() {
+        let _guard = STATUS_TEST_LOCK.lock().unwrap();
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let settings = RecorderSettings {
