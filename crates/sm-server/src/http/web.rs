@@ -38,6 +38,10 @@ const ASSETS: &[Asset] = &[
     asset!("ui.js", JS),
     asset!("start.js", JS),
     asset!("agents.js", JS),
+    asset!("terminal.js", JS),
+    asset!("vendor/xterm.js", JS),
+    asset!("vendor/addon-fit.js", JS),
+    asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
@@ -131,6 +135,7 @@ fn shell_response(state: &AppState) -> Response {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sm</title>
 <script>try{{var t=localStorage.getItem("sm-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}}catch(e){{}}</script>
+<link rel="stylesheet" href="/assets/vendor/xterm.css?v={id}">
 <link rel="stylesheet" href="/assets/app.css?v={id}">
 <script type="importmap">{imports}</script>
 <script type="application/json" id="sm-config">{config}</script>
