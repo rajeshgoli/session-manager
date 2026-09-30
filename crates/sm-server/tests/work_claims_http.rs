@@ -491,7 +491,7 @@ async fn implicit_claims_from_doc_publish_and_codex_review_and_the_feed() {
     let (status, body) = request(
         &f.app,
         "POST",
-        "/codex-review-requests",
+        "/review-requests",
         Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "lead0001"})),
     )
     .await;
@@ -554,7 +554,7 @@ async fn review_requests_carry_the_handoff_ask_above_the_floor() {
     let (status, body) = request(
         &f.app,
         "POST",
-        "/codex-review-requests",
+        "/review-requests",
         Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "eng00001"})),
     )
     .await;
@@ -567,7 +567,7 @@ async fn review_requests_carry_the_handoff_ask_above_the_floor() {
     let (status, body) = request(
         &f.app,
         "POST",
-        "/codex-review-requests",
+        "/review-requests",
         Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "eng00001"})),
     )
     .await;
@@ -768,7 +768,7 @@ async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     let (status, body) = request(
         &f.app,
         "POST",
-        "/codex-review-requests",
+        "/review-requests",
         Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "lead0001"})),
     )
     .await;

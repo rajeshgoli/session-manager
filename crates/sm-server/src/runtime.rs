@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{test_isolation_active, AppConfig, CodexReviewConfig, RustCoreConfig};
+use crate::config::{test_isolation_active, AppConfig, RustCoreConfig};
 
 const DEFAULT_SEND_KEYS_SETTLE_MS: f64 = 300.0;
 const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
@@ -712,78 +712,6 @@ impl TmuxRuntime {
         *held = true;
         drop(held);
         Ok(SessionInputGuard { lock })
-    }
-
-    #[allow(clippy::too_many_arguments)] // each argument is a distinct review-request parameter
-    pub fn send_review_sequence(
-        &self,
-        tmux_session: &str,
-        mode: &str,
-        base_branch: Option<&str>,
-        commit_sha: Option<&str>,
-        custom_prompt: Option<&str>,
-        branch_position: Option<usize>,
-        timing: &CodexReviewConfig,
-    ) -> Result<bool> {
-        let _guard = self.lock_session_input(tmux_session)?;
-        if !self.session_exists(tmux_session)? {
-            return Ok(false);
-        }
-        let mode = mode.trim();
-        if mode == "custom" {
-            let prompt = custom_prompt.unwrap_or("").trim();
-            self.send_text_then_enter(tmux_session, &format!("/review {prompt}"))?;
-            return Ok(true);
-        }
-
-        self.send_text_then_enter(tmux_session, "/review")?;
-        thread::sleep(duration_from_seconds(timing.menu_settle_seconds));
-
-        match mode {
-            "branch" => {
-                self.send_key(tmux_session, "Enter")?;
-                thread::sleep(duration_from_seconds(timing.branch_settle_seconds));
-                if base_branch.is_some() {
-                    for _ in 0..branch_position.unwrap_or(0) {
-                        self.send_key(tmux_session, "Down")?;
-                    }
-                }
-                thread::sleep(self.compute_settle_delay(base_branch.unwrap_or("")));
-                self.send_key(tmux_session, "Enter")?;
-            }
-            "uncommitted" => {
-                self.send_key(tmux_session, "Down")?;
-                thread::sleep(self.compute_settle_delay(mode));
-                self.send_key(tmux_session, "Enter")?;
-            }
-            "commit" => {
-                self.send_key(tmux_session, "Down")?;
-                self.send_key(tmux_session, "Down")?;
-                thread::sleep(self.compute_settle_delay(mode));
-                self.send_key(tmux_session, "Enter")?;
-                thread::sleep(duration_from_seconds(timing.branch_settle_seconds));
-                if let Some(commit_sha) =
-                    commit_sha.map(str::trim).filter(|value| !value.is_empty())
-                {
-                    self.send_text(tmux_session, commit_sha)?;
-                    thread::sleep(self.compute_settle_delay(commit_sha));
-                }
-                self.send_key(tmux_session, "Enter")?;
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    pub fn send_steer_text(&self, tmux_session: &str, text: &str) -> Result<bool> {
-        let _guard = self.lock_session_input(tmux_session)?;
-        if !self.session_exists(tmux_session)? {
-            return Ok(false);
-        }
-        self.send_key(tmux_session, "Enter")?;
-        thread::sleep(self.compute_settle_delay(text));
-        self.send_text_then_enter(tmux_session, text)?;
-        Ok(true)
     }
 
     pub fn clear_session(
@@ -1924,10 +1852,6 @@ fn finite_nonnegative_or_default(value: Option<f64>, default: f64) -> f64 {
 
 fn duration_from_millis(millis: f64) -> Duration {
     Duration::from_secs_f64((millis.max(0.0)) / 1000.0)
-}
-
-fn duration_from_seconds(seconds: f64) -> Duration {
-    Duration::from_secs_f64(seconds.max(0.0))
 }
 
 fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {

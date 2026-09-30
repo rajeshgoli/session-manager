@@ -221,6 +221,11 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
 
 /// Columns a handoff leaves alone, with the reason.
 pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "codex_review_request_registrations",
+        "reviewer_session_id",
+        "the reviewer is a separate agent, not the author handing off",
+    ),
     ("work_claims", "parent_session_id", "the parent is the same"),
     ("work_claims", "ended_by_session_id", "history"),
     ("events", "session_id", "history"),

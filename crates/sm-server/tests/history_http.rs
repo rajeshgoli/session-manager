@@ -264,7 +264,7 @@ async fn seeded() -> Fixture {
     claim(&f, "eng00001", "pr", 9, json!({})).await;
     post(
         &f.app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({"pr_number": 9, "repo": REPO, "requester_session_id": "eng00001"}),
     )
     .await;

@@ -21,7 +21,7 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 3] = ["new_agent", "queue_limits", "terminal_limits"];
+const KEYS: [&str; 4] = ["new_agent", "queue_limits", "terminal_limits", "reviews"];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
 const WHOLE_VALUES: [&str; 1] = ["repo_short"];
 const PLACEHOLDERS: [&str; 7] = [
@@ -86,6 +86,10 @@ pub fn defaults() -> Value {
             "per_session": null,
             "global": null,
             "max_attach_seconds": null,
+        },
+        "reviews": {
+            "reviewer": { "kind": "github_codex" },
+            "skip_meter_percent": 95,
         },
     })
 }
@@ -218,6 +222,18 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
         "new_agent" => validate_new_agent(value),
         "queue_limits" => validate_queue_limits(value),
         "terminal_limits" => validate_terminal_limits(value),
+        "reviews" => {
+            if value["reviewer"] != json!({"kind": "github_codex"}) {
+                return Err("reviews.reviewer must be {\"kind\":\"github_codex\"}".to_owned());
+            }
+            if !value["skip_meter_percent"]
+                .as_i64()
+                .is_some_and(|percent| (50..=100).contains(&percent))
+            {
+                return Err("reviews.skip_meter_percent must be 50–100".to_owned());
+            }
+            Ok(())
+        }
         other => Err(format!("unknown field {other}")),
     }
 }
