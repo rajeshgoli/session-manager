@@ -69,12 +69,23 @@ pub(super) struct Issue {
 pub(super) async fn list(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    guard(&state, &headers, peer, "GET", &uri)?;
+    request: Request,
+) -> Result<Response, ApiError> {
+    guard(&state, request.headers(), peer, "GET", request.uri())?;
+    // Browser navigation asks for HTML. Existing API callers, including local
+    // clients with Accept: */*, keep receiving the JSON list.
+    if request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+    {
+        if let Some(shell) = web::shell_page(&state, &request) {
+            return Ok(shell);
+        }
+    }
     let rows = board::blocking(&state, |state| Ok(store(state).list()?)).await?;
-    Ok(Json(json!(rows)))
+    Ok(Json(json!(rows)).into_response())
 }
 pub(super) async fn get(
     State(state): State<Arc<AppState>>,
@@ -221,6 +232,21 @@ pub(super) async fn search(
         detail: "search timed out".into(),
     })??;
     Ok(Json(json!(rows)))
+}
+pub(super) async fn preview(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(input): Json<WriteNote>,
+) -> Result<Json<Value>, ApiError> {
+    guard(&state, &headers, peer, "POST", &uri)?;
+    if input.body.len() > MAX_BODY {
+        return Err(bad("note body exceeds 2 MB"));
+    }
+    Ok(Json(
+        json!({"html": crate::owner_doc_render::render_markdown_sanitized(&input.body)}),
+    ))
 }
 pub(super) async fn import(
     State(state): State<Arc<AppState>>,

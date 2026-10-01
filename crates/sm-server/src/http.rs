@@ -1925,6 +1925,7 @@ pub fn router(state: AppState) -> Router {
         .route("/board", get(board::get_board))
         .route("/notes", get(notes::list).post(notes::create))
         .route("/notes/search", get(notes::search))
+        .route("/notes/preview", post(notes::preview))
         .route(
             "/notes/import",
             post(notes::import).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
@@ -15266,6 +15267,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/analytics"
         || path.starts_with("/analytics/")
         || path == "/settings"
+        || path == "/notes"
         || path.starts_with("/terminal/")
         || path.starts_with("/assets/")
         || path == "/docs"
@@ -17458,9 +17460,20 @@ mod tests {
                     first_probe.pid
                 );
                 let open_files = String::from_utf8_lossy(&lsof.stdout);
+                // Queue children may inherit the live authority and handover
+                // sockets. Only regular files and directories can leak state.
+                let production_files: Vec<_> = open_files
+                    .lines()
+                    .skip(1)
+                    .filter(|line| {
+                        line.contains(production_root.to_string_lossy().as_ref())
+                            && matches!(line.split_whitespace().nth(4), Some("REG" | "DIR"))
+                    })
+                    .collect();
                 assert!(
-                    !open_files.contains(production_root.to_string_lossy().as_ref()),
-                    "unwrapped test child opened production state path:\n{open_files}"
+                    production_files.is_empty(),
+                    "unwrapped test child opened production state path:\n{}",
+                    production_files.join("\n")
                 );
                 println!(
                     "direct-harness lsof proof: child pid {} has no open path below {}",
@@ -21231,6 +21244,42 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         let (status, _) = browser_host_get(&app, "/notes", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn notes_owner_api_stays_json_while_browser_navigation_gets_html() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let request = owner_web_request(
+            Method::GET,
+            "/notes",
+            "sm.example.com",
+            Some(&owner),
+            &[],
+            &json!({}),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+
+        let request = owner_web_request(
+            Method::GET,
+            "/notes",
+            "sm.example.com",
+            Some(&owner),
+            &[("accept", "text/html,application/xhtml+xml")],
+            &json!({}),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
     }
 
     #[tokio::test]

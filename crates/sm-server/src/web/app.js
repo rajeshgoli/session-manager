@@ -17,6 +17,7 @@ import { QueuePage } from './queue.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
+import { NotesView } from './notes.js';
 import { NewAgentPopover } from './start.js';
 import { BugButton } from './bug.js';
 
@@ -27,6 +28,7 @@ const PAGES = [
   { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
   { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
+  { key: 'notes', label: 'Notes', icon: 'history', path: '/notes', key_hint: 'n' },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
   { key: 'history', label: 'History', icon: 'history', path: '/history', minor: true },
   { key: 'guestbook', label: 'Guestbook', icon: 'history', path: '/guestbook', minor: true },
@@ -103,27 +105,45 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const pop = () => { openOrigin = null; setLoc(readLocation()); };
+    let committedIndex = Number.isInteger(history.state?.smHistoryIndex) ? history.state.smHistoryIndex : 0;
+    history.replaceState({ ...history.state, smHistoryIndex: committedIndex }, '', location.href);
+    let reversing = false;
+    const canLeaveNotes = async () => (await Promise.all(bus.request('notes-before-leave'))).every(Boolean);
+    const pop = async () => {
+      if (reversing) { reversing = false; return; }
+      const targetIndex = Number.isInteger(history.state?.smHistoryIndex)
+        ? history.state.smHistoryIndex : committedIndex - 1;
+      const step = Math.sign(targetIndex - committedIndex) || -1;
+      if (document.querySelector('.notes-view') && !(await canLeaveNotes())) {
+        reversing = true;
+        history.go(-step);
+        return;
+      }
+      committedIndex = targetIndex;
+      openOrigin = null; setLoc(readLocation());
+    };
     window.addEventListener('popstate', pop);
     const offs = [
-      bus.on('navigate', (path) => {
+      bus.on('navigate', async (path) => {
+        if (!(await canLeaveNotes())) return;
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
         if ((target && target.legacy) || build.stale) {
           location.href = urlFor(path, null);
           return;
         }
-        history.pushState(null, '', urlFor(path, null));
+        history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, null));
         setLoc(readLocation());
       }),
-      bus.on('open', (ref) => {
+      bus.on('open', async (ref) => {
         const current = readLocation();
         if (current.open === ref) return;
+        if (!(await canLeaveNotes())) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];
         const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')
           ? kind === 'agent' ? '/' : '/queue' : current.path;
-        history.pushState(null, '', urlFor(path, ref));
+        history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, ref));
         setLoc(readLocation());
       }),
       bus.on('toast', (item) => {
@@ -216,6 +236,7 @@ function Page({ page, loc }) {
   if (page === 'settings') return html`<${SettingsPage} />`;
   if (page === 'board') return html`<${BoardPage} />`;
   if (page === 'inbox') return html`<${InboxPage} openRef=${loc.open} />`;
+  if (page === 'notes') return html`<div class="content notes-content"><${NotesView} /></div>`;
   if (page === 'history') return html`<${HistoryPage} path=${loc.path} />`;
   if (page === 'guestbook') return html`<${GuestbookPage} />`;
   const current = PAGES.find((p) => p.key === page);
@@ -426,9 +447,9 @@ function Panel({ openRef, layout, updateLayout }) {
       onClick=${() => updateLayout({ panel_mode: wide ? 'side' : 'wide' })}><${Icon} name=${wide ? 'narrow' : 'wide'} size="14" /></button>
     <button type="button" class="icon-btn" title="Close (Esc)" onClick=${closePanel}><${Icon} name="close" size="14" /></button>
   </span>`;
-  return html`<aside class="panel" aria-label="Details">
+  return html`<aside class="panel" aria-label=${kind === 'notes' ? 'Notes' : 'Details'}>
     <div class="grip" ref=${grip} onMouseDown=${drag}></div>
-    ${Renderer
+    ${kind === 'notes' ? html`<${NotesView} pane onClose=${closePanel} />` : Renderer
       ? html`<${Renderer} key=${openRef} id=${id} controls=${controls} />`
       : html`<div class="phd"><span></span><span class="t">${kind}</span>${controls}
           <span class="s">This item does not open in the panel yet.</span></div>`}
@@ -533,6 +554,12 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
     const down = (event) => {
       const { page: current, loc: where, layout: now, palette: paletteOpen } = state.current;
       const mod = event.metaKey || event.ctrlKey;
+      if (mod && event.key.toLowerCase() === 'j') {
+        event.preventDefault();
+        if (where.open === 'notes:view' && document.querySelector('.notes-dialog')) return;
+        where.open === 'notes:view' ? closePanel() : openPanel('notes:view');
+        return;
+      }
       if (current === 'terminal') return;
       if (mod && event.key.toLowerCase() === 'k') {
         event.preventDefault();
@@ -553,6 +580,9 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       }
       if (paletteOpen || mod || event.altKey) return;
       if (event.key === 'Escape') {
+        // The first Escape in Notes collapses its open editor; the next closes the pane.
+        if (where.open === 'notes:view' && document.querySelector('.notes-dialog')) return;
+        if (where.open === 'notes:view' && document.querySelector('.notes-pane .notes-editor')) return;
         if (where.open) closePanel();
         return;
       }

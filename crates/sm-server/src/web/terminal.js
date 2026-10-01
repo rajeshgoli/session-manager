@@ -1,9 +1,10 @@
 // Terminal page (spec 1710; 1782 G1-G4): switcher, phone keys, route and round-trip time.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store } from './ui.js';
+import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store, toast } from './ui.js';
 import { RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-route.js';
+import { NotesView } from './notes.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 
@@ -173,6 +174,7 @@ export function TerminalPage({ id, open }) {
     };
     control.current = {
       key: (key) => { if (live) send({ type: 'key', key }); terminal.focus(); },
+      paste: (text) => { if (!live) return false; input(`\x1b[200~${text}\x1b[201~`); terminal.focus(); return true; },
       model: () => { input('\x1b[200~/model\x1b[201~\r'); terminal.focus(); },
       focus: () => terminal.focus(),
     };
@@ -284,6 +286,7 @@ export function TerminalPage({ id, open }) {
         return false;
       }
       // The page handles ⌘\ and ⌘⌥↑/↓ (G1).
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') return false;
       if (event.metaKey && (event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
       return true;
     });
@@ -309,6 +312,7 @@ export function TerminalPage({ id, open }) {
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
       <button type="button" class=${`icon-btn${switcher ? ' on' : ''}`} title="Agents (⌘\\)" aria-label="Agents"
         aria-pressed=${switcher} onClick=${toggleSwitcher}><${Icon} name=${switcher ? 'fold' : 'unfold'} /></button>
+      <button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>
       ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
       <span class="t">${agent ? agent.name : id}</span><span class="sub term-state">${agent ? agent.state : ''}</span>
       <span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>
@@ -330,7 +334,9 @@ export function TerminalPage({ id, open }) {
     </div>
     ${connection !== 'Live' ? html`<div class="term-notice" role="status">${error || connection}
       ${connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
-    ${open && Renderer ? html`<aside class="panel term-panel"><${Renderer} id=${id} controls=${html`<span class="ctl">
+    ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
+      onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
+    ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel"><${Renderer} id=${id} controls=${html`<span class="ctl">
       <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
   </div>`;
 }
