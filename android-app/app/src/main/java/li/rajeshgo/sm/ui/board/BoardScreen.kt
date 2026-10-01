@@ -138,6 +138,13 @@ fun boardWarningText(warning: String): String = when (warning) {
 }
 
 /** Start shows on ready rows, except one whose PR merged: it needs closing, not an agent. */
+/** The standing Bugs ticket's line (spec 1859 C5): `Standing lane · 2 open bugs`; null for any other ticket. */
+fun boardStandingText(ticket: BoardTicket): String? {
+    if (ticket.state != "standing") return null
+    val open = ticket.waitsOn.count { it.state != "done" }
+    return "Standing lane · $open open bug" + if (open == 1) "" else "s"
+}
+
 fun boardCanStart(ticket: BoardTicket): Boolean = ticket.state == "ready" && "merged_not_closed" !in ticket.warnings
 
 /**
@@ -690,6 +697,12 @@ private fun LaneHeader(
                     fontFamily = FontFamily.Monospace,
                     color = TextMuted,
                 )
+                if (lane.goal.state == "standing") {
+                    val goal = lane.tickets.firstOrNull { it.repo == lane.goal.repo && it.number == lane.goal.number }
+                    goal?.let(::boardStandingText)?.let {
+                        Text(it, style = MaterialTheme.typography.labelSmall, color = Cyan, modifier = Modifier.padding(top = 2.dp))
+                    }
+                }
                 Text(
                     laneCountsLine(lane),
                     style = MaterialTheme.typography.labelSmall,
@@ -820,6 +833,7 @@ private fun stateChip(state: String): StateChip = when (state) {
     "ready" -> StateChip("READY", Emerald)
     "in_progress" -> StateChip("IN PROG", Cyan)
     "done" -> StateChip("DONE", TextMuted)
+    "standing" -> StateChip("STANDING", Cyan)
     else -> StateChip("BLOCKED", TextMuted)
 }
 
@@ -1000,6 +1014,7 @@ private fun ticketDetails(
     }
     if (ticket.state == "done") ticket.doneReason?.let { details += Detail(it.replace('_', ' '), TextMuted) }
     ticket.warnings.forEach { details += Detail("! " + boardWarningText(it), Rose) }
+    boardStandingText(ticket)?.let { details += Detail(it, Cyan) }
     ticket.alsoIn.forEach { lane ->
         details += Detail("also in lane ${lane.rank}", Cyan) { actions.onShowLane(lane.laneId) }
     }

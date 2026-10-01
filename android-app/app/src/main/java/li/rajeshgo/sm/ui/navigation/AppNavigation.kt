@@ -1,10 +1,26 @@
 package li.rajeshgo.sm.ui.navigation
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.currentBackStackEntryAsState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import androidx.compose.ui.platform.LocalContext
@@ -14,7 +30,16 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.data.model.Reviewer
+import li.rajeshgo.sm.data.model.CreateSessionRequest
+import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
+import li.rajeshgo.sm.ui.bug.BugReportViewModel
+import li.rajeshgo.sm.ui.bug.BugScreen
+import li.rajeshgo.sm.ui.bug.findActivity
+import li.rajeshgo.sm.ui.reviews.StartReviewerRow
+import li.rajeshgo.sm.ui.watch.BugStart
+import li.rajeshgo.sm.ui.watch.CreateSessionSheet
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
 import li.rajeshgo.sm.ui.board.BoardBadgeRefresher
 import li.rajeshgo.sm.ui.board.BoardLinkRequests
@@ -111,6 +136,26 @@ fun AppNavigation() {
     val toWatch = { toTab(Routes.WATCH) }
     val toBoard = { toTab(Routes.BOARD) }
     val toQueue = { toTab(Routes.QUEUE) }
+    // The screen a bug report is about: its route and when it became visible.
+    val backStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = backStackEntry?.destination?.route?.substringBefore('?')
+    val section = backStackEntry?.arguments?.getString("section")
+    LaunchedEffect(currentRoute, section) {
+        currentRoute?.let { BugScreen.shown(it + section?.let { s -> "?section=$s" }.orEmpty()) }
+    }
+    val bugViewModel: BugReportViewModel = viewModel()
+    val snackbars = remember { SnackbarHostState() }
+    val uriHandler = LocalUriHandler.current
+    LaunchedEffect(bugViewModel) {
+        bugViewModel.toastFlow.collect { toast ->
+            val tapped = snackbars.showSnackbar(toast.text, actionLabel = "Open", withDismissAction = true, duration = SnackbarDuration.Long)
+            if (tapped == SnackbarResult.ActionPerformed) {
+                val started = toast.started
+                if (started != null) FollowOpenRequests.pending = FollowOpen(started.sessionId, null, started.name)
+                else runCatching { uriHandler.openUri(toast.issueUrl) }
+            }
+        }
+    }
     // The three-dots menu every screen shares (sm#1659).
     val menu = AppMenuActions(
         onNewSession = {
@@ -121,6 +166,7 @@ fun AppNavigation() {
         onOpenGuestbook = { navController.navigate(Routes.GUESTBOOK) { launchSingleTop = true } },
         onOpenAnalytics = { navController.navigate(Routes.ANALYTICS) { launchSingleTop = true } },
         onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
+        onReportBug = { context.findActivity()?.let(bugViewModel::open) },
     )
 
     // An opened sm link opens in the watch screen's reader when signed in.
@@ -145,73 +191,108 @@ fun AppNavigation() {
         }
     }
 
-    NavHost(navController = navController, startDestination = startDestination) {
-        composable(Routes.SETTINGS) {
-            SettingsScreen(
-                onNavigateToWatch = {
-                    if (!navController.popBackStack()) navController.navigate(Routes.WATCH) {
-                        popUpTo(Routes.SETTINGS) { inclusive = true }
-                    }
-                },
-            )
+    Box(Modifier.fillMaxSize()) {
+        NavHost(navController = navController, startDestination = startDestination) {
+            composable(Routes.SETTINGS) {
+                SettingsScreen(
+                    onNavigateToWatch = {
+                        if (!navController.popBackStack()) navController.navigate(Routes.WATCH) {
+                            popUpTo(Routes.SETTINGS) { inclusive = true }
+                        }
+                    },
+                )
+            }
+            composable(Routes.INBOX) {
+                InboxScreen(
+                    onNavigateToWatch = toWatch,
+                    onNavigateToBoard = toBoard,
+                    onNavigateToQueue = toQueue,
+                    menu = menu,
+                )
+            }
+            composable(Routes.WATCH) {
+                WatchScreen(
+                    onNavigateToInbox = toInbox,
+                    onNavigateToBoard = toBoard,
+                    onNavigateToQueue = toQueue,
+                    menu = menu,
+                )
+            }
+            composable(Routes.BOARD) {
+                BoardScreen(
+                    onNavigateToInbox = toInbox,
+                    onNavigateToWatch = toWatch,
+                    onNavigateToQueue = toQueue,
+                    menu = menu,
+                )
+            }
+            composable(Routes.QUEUE) {
+                QueueScreen(
+                    onNavigateToInbox = toInbox,
+                    onNavigateToWatch = toWatch,
+                    onNavigateToBoard = toBoard,
+                    onOpenUsage = { navController.navigate(Routes.USAGE) },
+                    onOpenStopped = {
+                        navController.navigate("${Routes.ANALYTICS}?section=queue") { launchSingleTop = true }
+                    },
+                    menu = menu,
+                )
+            }
+            composable(Routes.USAGE) {
+                UsageScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Routes.HISTORY) {
+                HistoryScreen(onBack = { navController.popBackStack() }, onOpenWatch = toWatch, menu = menu)
+            }
+            composable(Routes.GUESTBOOK) {
+                GuestbookScreen(onBack = { navController.popBackStack() }, menu = menu)
+            }
+            // `section` (spend, time or queue) is optional; without it the last one shown opens.
+            composable(
+                "${Routes.ANALYTICS}?section={section}",
+                arguments = listOf(navArgument("section") { type = NavType.StringType; nullable = true }),
+            ) { backStackEntry ->
+                AnalyticsScreen(
+                    section = backStackEntry.arguments?.getString("section"),
+                    onBack = { navController.popBackStack() },
+                    onOpenUsage = { navController.navigate(Routes.USAGE) },
+                    onOpenWatch = toWatch,
+                    menu = menu,
+                )
+            }
         }
-        composable(Routes.INBOX) {
-            InboxScreen(
-                onNavigateToWatch = toWatch,
-                onNavigateToBoard = toBoard,
-                onNavigateToQueue = toQueue,
-                menu = menu,
-            )
-        }
-        composable(Routes.WATCH) {
-            WatchScreen(
-                onNavigateToInbox = toInbox,
-                onNavigateToBoard = toBoard,
-                onNavigateToQueue = toQueue,
-                menu = menu,
-            )
-        }
-        composable(Routes.BOARD) {
-            BoardScreen(
-                onNavigateToInbox = toInbox,
-                onNavigateToWatch = toWatch,
-                onNavigateToQueue = toQueue,
-                menu = menu,
-            )
-        }
-        composable(Routes.QUEUE) {
-            QueueScreen(
-                onNavigateToInbox = toInbox,
-                onNavigateToWatch = toWatch,
-                onNavigateToBoard = toBoard,
-                onOpenUsage = { navController.navigate(Routes.USAGE) },
-                onOpenStopped = {
-                    navController.navigate("${Routes.ANALYTICS}?section=queue") { launchSingleTop = true }
-                },
-                menu = menu,
-            )
-        }
-        composable(Routes.USAGE) {
-            UsageScreen(onBack = { navController.popBackStack() })
-        }
-        composable(Routes.HISTORY) {
-            HistoryScreen(onBack = { navController.popBackStack() }, onOpenWatch = toWatch, menu = menu)
-        }
-        composable(Routes.GUESTBOOK) {
-            GuestbookScreen(onBack = { navController.popBackStack() }, menu = menu)
-        }
-        // `section` (spend, time or queue) is optional; without it the last one shown opens.
-        composable(
-            "${Routes.ANALYTICS}?section={section}",
-            arguments = listOf(navArgument("section") { type = NavType.StringType; nullable = true }),
-        ) { backStackEntry ->
-            AnalyticsScreen(
-                section = backStackEntry.arguments?.getString("section"),
-                onBack = { navController.popBackStack() },
-                onOpenUsage = { navController.navigate(Routes.USAGE) },
-                onOpenWatch = toWatch,
-                menu = menu,
-            )
-        }
+        BugReportSheet(bugViewModel)
+        // Above the bottom tabs, so a filed bug's toast does not cover them.
+        SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 72.dp))
     }
+}
+
+/** Report a bug: the Start sheet in its bug mode, with Start's Reviewer row (spec 1859 C4). */
+@Composable
+private fun BugReportSheet(viewModel: BugReportViewModel) {
+    val sheet = viewModel.sheet ?: return
+    val options = sheet.options
+    val defaults = sheet.defaults
+    var reviewer by remember(options?.reviewPolicy) { mutableStateOf<Reviewer?>(null) }
+    CreateSessionSheet(
+        source = null,
+        sessions = emptyList(),
+        loadModels = viewModel::sessionModels,
+        busy = sheet.busy,
+        error = sheet.error,
+        onDismiss = viewModel::close,
+        bug = BugStart(
+            defaults = if (options != null && defaults != null && !options.workingDir.isNullOrBlank()) {
+                CreateSessionRequest(defaults.provider, options.workingDir, defaults.model, defaults.effort)
+            } else null,
+            agentNote = sheet.agentError ?: options?.takeIf { it.workingDir.isNullOrBlank() }?.let { "No checkout of ${it.repo} to start an agent in" },
+            screenshot = sheet.thumbnail,
+            filedIssue = sheet.filedIssue,
+        ),
+        extra = { enabled ->
+            StartReviewerRow(laneDefault = options?.reviewPolicy, value = reviewer, onChange = { reviewer = it }, enabled = enabled)
+        },
+        onFile = { filing -> viewModel.submit(filing.copy(start = filing.start?.copy(reviewer = reviewer))) },
+        onCreate = {},
+    )
 }

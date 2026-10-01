@@ -1065,7 +1065,7 @@ data class BoardGoal(
     val number: Long = 0,
     val title: String = "",
     val url: String = "",
-    /** `close_ready` puts Close in the lane header (spec 1782 H2). */
+    /** `close_ready` puts Close in the lane header (spec 1782 H2); `standing` marks the Bugs lane's goal. */
     val state: String = "",
     @SerialName("sub_issues") val subIssues: BoardSubIssues = BoardSubIssues(),
 )
@@ -1092,7 +1092,7 @@ data class BoardTicket(
     val number: Long = 0,
     val title: String = "",
     val url: String = "",
-    /** `needs_you`, `close_ready`, `ready`, `in_progress`, `blocked` or `done`. */
+    /** `needs_you`, `close_ready`, `ready`, `in_progress`, `blocked`, `standing` or `done`. */
     val state: String = "blocked",
     /** Done only: `completed`, `not_planned`, `duplicate` or `missing`. */
     @SerialName("done_reason") val doneReason: String? = null,
@@ -1250,3 +1250,55 @@ data class BoardCloseRequest(val repo: String, val number: Long)
 
 @Serializable
 data class BoardStarted(@SerialName("session_id") val sessionId: String = "", val name: String = "")
+
+/** `POST /client/bug-reports` (spec 1859 A1). */
+@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+@Serializable
+data class BugReportRequest(
+    val text: String,
+    /** Always `android` from this app; sent although it is the default. */
+    @kotlinx.serialization.EncodeDefault val client: String = "android",
+    @SerialName("client_version") val clientVersion: String,
+    val page: String,
+    val route: String,
+    @SerialName("page_data") val pageData: kotlinx.serialization.json.JsonObject,
+    @SerialName("screenshot_png") val screenshotPng: String? = null,
+    /** Present when "Start an agent" is on. */
+    val start: BugReportStart? = null,
+)
+
+@Serializable
+data class BugReportStart(
+    /** `claude` or `codex-fork`. */
+    val provider: String,
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String? = null,
+    val reviewer: Reviewer? = null,
+)
+
+@Serializable
+data class BugReportIssue(
+    val repo: String = "",
+    val number: Long = 0,
+    val url: String = "",
+    val title: String = "",
+)
+
+@Serializable
+data class BugReportFiled(
+    @SerialName("bug_id") val bugId: String = "",
+    val issue: BugReportIssue = BugReportIssue(),
+    @SerialName("facts_url") val factsUrl: String? = null,
+    @SerialName("on_board") val onBoard: Boolean = true,
+    @SerialName("board_note") val boardNote: String? = null,
+    val started: BoardStarted? = null,
+    @SerialName("start_error") val startError: String? = null,
+)
+
+/** `GET /client/bug-reports/options`: where a bug is filed and where its agent works. */
+@Serializable
+data class BugReportOptions(
+    val repo: String = "",
+    @SerialName("working_dir") val workingDir: String? = null,
+    @SerialName("review_policy") val reviewPolicy: StartReviewPolicy? = null,
+)

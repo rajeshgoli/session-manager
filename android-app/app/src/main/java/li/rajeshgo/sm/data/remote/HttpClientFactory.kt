@@ -62,6 +62,7 @@ class HttpClientFactory(
             .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
             .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor { token })
+            .addInterceptor(PageDataRecorder(PageDataRecorder.pages))
 
         if (includeLogging) {
             builder.addInterceptor(

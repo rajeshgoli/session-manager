@@ -218,4 +218,26 @@ class BoardModelsTest {
         assertEquals("Inbox · 2", li.rajeshgo.sm.ui.links.threadChipText(parsed.thread!!.copy(needsYou = false)))
         assertEquals("/docs/x", parsed.docs.single().readerPath)
     }
+
+    @Test
+    fun standingBugsGoalParsesAndShowsOpenBugs() {
+        val lane = json.decodeFromString(
+            BoardResponse.serializer(),
+            """{"lanes":[{"id":4,"rank":3,
+                 "goal":{"repo":"rajeshgoli/session-manager","number":1869,"title":"Bugs","url":"u","state":"standing"},
+                 "tickets":[{"repo":"rajeshgoli/session-manager","number":1869,"title":"Bugs","url":"u","state":"standing",
+                   "waits_on":[{"repo":"rajeshgoli/session-manager","number":1870,"state":"done"},
+                               {"repo":"rajeshgoli/session-manager","number":1871,"state":"ready"},
+                               {"repo":"rajeshgoli/session-manager","number":1872,"state":"in_progress"}]}]}]}""",
+        ).lanes.single()
+        assertEquals("standing", lane.goal.state)
+        val goal = lane.tickets.single()
+        assertEquals("standing", goal.state)
+        assertEquals("Standing lane · 2 open bugs", boardStandingText(goal))
+        assertEquals("Standing lane · 0 open bugs", boardStandingText(goal.copy(waitsOn = emptyList())))
+        assertEquals("Standing lane · 1 open bug", boardStandingText(goal.copy(waitsOn = goal.waitsOn.take(2))))
+        // Never startable, and any other state has no standing line.
+        assertFalse(boardCanStart(goal))
+        assertNull(boardStandingText(goal.copy(state = "ready")))
+    }
 }

@@ -290,6 +290,13 @@ interface ApiService {
     @POST("client/board/start")
     suspend fun startBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardStartRequest): li.rajeshgo.sm.data.model.BoardStarted
 
+    /** Files a bug from the app (spec 1859 A1); stores the private part on sm, then opens the issue. */
+    @POST("client/bug-reports")
+    suspend fun fileBugReport(@Body request: li.rajeshgo.sm.data.model.BugReportRequest): li.rajeshgo.sm.data.model.BugReportFiled
+
+    @GET("client/bug-reports/options")
+    suspend fun getBugReportOptions(): li.rajeshgo.sm.data.model.BugReportOptions
+
     /** Every stored review policy and the default (sm#1768 appendix B2). */
     @GET("review-policies")
     suspend fun getReviewPolicies(): li.rajeshgo.sm.data.model.ReviewPoliciesResponse
