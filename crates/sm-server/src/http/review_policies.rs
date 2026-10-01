@@ -46,7 +46,10 @@ pub(super) async fn get_policy(
     headers: HeaderMap,
     Query(query): Query<QueryPolicy>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer), "/review-policies")?;
+    // The web app reads with the owner's browser login, as other owner reads do.
+    if owner_web_guard(&state, &headers, Some(peer), "GET")?.is_none() {
+        ensure_session_allowed_from_parts(&state.config, &headers, Some(peer), "/review-policies")?;
+    }
     let db = expand_home(&state.config.sm_send.db_path);
     let selected = [query.pr, query.ticket, query.lane]
         .into_iter()
@@ -127,7 +130,10 @@ pub(super) async fn put_policy(
     headers: HeaderMap,
     Json(body): Json<PutPolicy>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer), "/review-policies")?;
+    // A browser owner write passes here and is checked again by `owner_guard`.
+    if owner_web_guard(&state, &headers, Some(peer), "PUT")?.is_none() {
+        ensure_session_allowed_from_parts(&state.config, &headers, Some(peer), "/review-policies")?;
+    }
     ensure_core_writes_enabled(&state)?;
     let caller = header_text(&headers, handoff::SESSION_HEADER);
     if caller.as_deref() != body.session_id.as_deref() {
