@@ -31,7 +31,11 @@ pub(super) fn owner_answered(
     {
         return Ok(0);
     }
-    if let Ok(mut recent) = state.owner_answered_at.lock() {
+    if via != "manual" {
+        let mut recent = state
+            .owner_answered_at
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Owner answer rate limiter unavailable"))?;
         let now = std::time::Instant::now();
         recent.retain(|_, at| now.duration_since(*at) < Duration::from_secs(2));
         if recent.contains_key(session_id) {

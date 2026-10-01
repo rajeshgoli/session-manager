@@ -680,6 +680,23 @@ async fn blocking_question_counts_and_manual_answer_moves_only_its_agent() {
         .unwrap();
     assert_eq!(eng["facts"]["you"]["kind"], "doc_review");
     post(&f.app, "/sessions/other001/needs-you/answered", json!({})).await;
+
+    // A second question can arrive immediately after an answer. The explicit
+    // manual action still clears it within the terminal/prompt cooldown.
+    store
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: "other001".into(),
+            sender_session_name: "other-agent".into(),
+            title: "Second check".into(),
+            body_markdown: "One more check".into(),
+            blocking: true,
+        })
+        .unwrap();
+    assert_eq!(watch_state(&f.app, "").await["counts"]["needs_you"], 2);
+    let response = post(&f.app, "/sessions/other001/needs-you/answered", json!({})).await;
+    assert_eq!(response["facts"]["you"], Value::Null);
+    assert_eq!(watch_state(&f.app, "").await["counts"]["needs_you"], 1);
 }
 
 #[tokio::test]
