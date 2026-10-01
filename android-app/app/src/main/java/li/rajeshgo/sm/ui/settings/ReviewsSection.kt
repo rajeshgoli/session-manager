@@ -129,7 +129,13 @@ fun ReviewsSection() {
                     preferences.edit().putLong(dismissalKey, dismissedUntil).apply()
                 }
                 kotlinx.coroutines.delay(60_000)
-                status = repository.fetchReviewStatus(url, token)
+                try {
+                    status = repository.fetchReviewStatus(url, token)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    message = error.message ?: "Couldn't refresh review status; retrying."
+                }
             }
         } catch (error: CancellationException) {
             throw error
