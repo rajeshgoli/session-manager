@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -82,6 +83,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun edit(body: String) {
+        if (_state.value.busy) return
         if (body.toByteArray().size > 2 * 1024 * 1024) { _state.update { it.copy(status = "Note is limited to 2 MB") }; return }
         _state.update { it.copy(draft = body, status = "Saving…") }
         saveJob?.cancel()
@@ -151,10 +153,22 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun restore(version: Long) {
         val note = _state.value.note ?: return
         viewModelScope.launch {
-            val (url, token) = credentials()
-            repository.restoreOwnerNote(url, token, note.id, version)
-                .onSuccess { restored -> _state.update { it.copy(note = restored, draft = restored.body, revisions = emptyList(), status = "Restored version $version") }; loadSearch() }
-                .onFailure { error -> _state.update { it.copy(status = "Couldn't restore note: ${error.message}") } }
+            saveJob?.cancelAndJoin()
+            _state.update { it.copy(busy = true) }
+            try {
+                if (!flush()) return@launch
+                val current = _state.value
+                if (current.note?.id != note.id || current.draft != current.note.body) {
+                    _state.update { it.copy(status = "Note changed while restoring. Try again.") }
+                    return@launch
+                }
+                val (url, token) = credentials()
+                repository.restoreOwnerNote(url, token, note.id, version)
+                    .onSuccess { restored -> _state.update { it.copy(note = restored, draft = restored.body, revisions = emptyList(), status = "Restored version $version") }; loadSearch() }
+                    .onFailure { error -> _state.update { it.copy(status = "Couldn't restore note: ${error.message}") } }
+            } finally {
+                _state.update { it.copy(busy = false) }
+            }
         }
     }
 

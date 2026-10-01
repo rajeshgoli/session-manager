@@ -132,16 +132,16 @@ fun NotesScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: NotesViewMo
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     TextButton(onClick = { preview = !preview }) { Text(if (preview) "Edit" else "Preview") }
-                    TextButton(onClick = viewModel::history) { Text("History") }
+                    TextButton(enabled = !state.busy, onClick = viewModel::history) { Text("History") }
                     TextButton(onClick = { deleteConfirm = true }) { Text("Delete") }
                 }
                 if (preview) MarkdownText(state.draft)
                 else OutlinedTextField(value = text, onValueChange = { text = it; viewModel.edit(it.text) },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 280.dp).onFocusChanged { if (!it.isFocused) viewModel.save() },
                     textStyle = androidx.compose.ui.text.TextStyle(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
-                    label = { Text("Note") }, minLines = 12)
+                    label = { Text("Note") }, minLines = 12, enabled = !state.busy)
                 state.revisions.forEach { revision ->
-                    TextButton(onClick = { viewModel.restore(revision.version) }) { Text("Restore version ${revision.version} · ${revision.at}") }
+                    TextButton(enabled = !state.busy, onClick = { viewModel.restore(revision.version) }) { Text("Restore version ${revision.version} · ${revision.at}") }
                 }
             }
         }
@@ -161,7 +161,8 @@ fun NotesScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: NotesViewMo
                 if (kind == "issue") {
                     Choice("Repository", repo, repos) { repo = it }
                 } else {
-                    Choice("Workspace", workspace, workspaces) { workspace = it }
+                    OutlinedTextField(workspace, { workspace = it }, label = { Text("Workspace") }, singleLine = true)
+                    if (workspaces.isNotEmpty()) Choice("Known workspace", workspace, workspaces) { workspace = it }
                     Choice("Provider", provider, listOf("claude", "codex-fork")) { provider = it }
                     OutlinedTextField(model, { model = it }, label = { Text("Model · optional") }, singleLine = true)
                     Choice("Effort", effort, listOf("medium", "high", "xhigh")) { effort = it }
