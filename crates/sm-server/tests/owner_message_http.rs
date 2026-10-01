@@ -799,6 +799,129 @@ async fn old_done_mark_moves_to_the_ticket_without_reappearing() {
 }
 
 #[tokio::test]
+async fn legacy_agent_thread_redirect_preserves_json_and_anchor_query() {
+    let f = fixture();
+    created_id(&f, "eng00001", "Read in web Inbox", json!({})).await;
+    let mut request = Request::builder()
+        .uri("/inbox/agent/eng00001?format=json&at=message-1")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response.headers()["location"],
+        "/inbox/thread/agent%3Aeng00001?format=json&at=message-1"
+    );
+}
+
+#[tokio::test]
+async fn old_done_mark_stays_with_the_first_ticket_when_an_agent_changes_tickets() {
+    let f = fixture();
+    let first = created_id(&f, "eng00001", "First ticket", json!({})).await;
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "agent:eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    seed_claim(&f, "eng00001", "ticket", 1783);
+    let second = created_id(&f, "eng00001", "Second ticket", json!({})).await;
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute(
+        "UPDATE owner_messages SET created_at = '2026-09-29T12:00:00Z' WHERE id = ?1",
+        params![first],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE owner_messages SET created_at = '2026-10-01T12:00:00Z' WHERE id = ?1",
+        params![second],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET ended_at = '2026-09-30T00:00:00Z' WHERE number = 1782",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET claimed_at = '2026-09-30T00:00:01Z' WHERE number = 1783",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        row(&inbox(&f, "done").await, "ticket:acme/widgets#1782")["done"],
+        true
+    );
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1783")["done"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn done_reads_only_finished_work_in_the_selected_ticket() {
+    use sm_server::turn_messages::{stamp, ReplyTiming, TurnMessageStore};
+    let f = fixture();
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    seed_claim(&f, "eng00001", "ticket", 1783);
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let first = time::OffsetDateTime::now_utc() - time::Duration::minutes(3);
+    let second = first + time::Duration::minutes(2);
+    let boundary = first + time::Duration::minutes(1);
+    conn.execute(
+        "UPDATE work_claims SET ended_at = ?1 WHERE number = 1782",
+        params![stamp(boundary)],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET claimed_at = ?1 WHERE number = 1783",
+        params![stamp(boundary + time::Duration::seconds(1))],
+    )
+    .unwrap();
+    let turns = TurnMessageStore::new(f.dir.join("message_queue.db"));
+    turns.record_finished("eng00001", first).unwrap();
+    turns
+        .record_turn(
+            "eng00001",
+            "claude",
+            first,
+            ReplyTiming::AtMessage,
+            "First done",
+        )
+        .unwrap();
+    turns.record_finished("eng00001", second).unwrap();
+    turns
+        .record_turn(
+            "eng00001",
+            "claude",
+            second,
+            ReplyTiming::AtMessage,
+            "Second done",
+        )
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "ticket:acme/widgets#1782"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let finished = turns.finished().unwrap();
+    assert!(finished[0].read_at.is_some());
+    assert!(finished[1].read_at.is_none());
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1783")["group"],
+        "finished"
+    );
+}
+
+#[tokio::test]
 async fn doc_waits_for_archive_and_a_revision_unfolds_it() {
     use sm_server::owner_docs::{OwnerDocStore, PublishOwnerDoc};
     let f = fixture();

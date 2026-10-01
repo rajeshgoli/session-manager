@@ -195,20 +195,6 @@ impl World {
         )
     }
 
-    /// A session's answers to the owner, leaving out any that is also its
-    /// Finished message, which shows once, as Finished.
-    fn agent_replies_of<'a>(
-        &'a self,
-        session_id: &'a str,
-    ) -> impl Iterator<Item = &'a ThreadReply> {
-        self.agent_replies.iter().filter(move |reply| {
-            reply.session_id == session_id
-                && !self.finished.iter().any(|row| {
-                    row.session_id == session_id && row.text_at.as_deref() == Some(&reply.at)
-                })
-        })
-    }
-
     fn marks(&self, key: &str) -> ThreadMarks {
         self.marks.get(key).cloned().unwrap_or_default()
     }
@@ -243,160 +229,6 @@ impl World {
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .unwrap_or_default()
-    }
-
-    /// Agent threads: one per session with a message, a note, or a fired
-    /// follow. Doc publishes alone make no agent thread; the doc has its own.
-    fn agent_rows(&self) -> Vec<InboxRow> {
-        let replied = self.replied();
-        let sender_of: BTreeMap<&str, &str> = self
-            .messages
-            .iter()
-            .map(|message| (message.id.as_str(), message.sender_session_id.as_str()))
-            .collect();
-        let mut sessions = BTreeSet::new();
-        sessions.extend(self.messages.iter().map(|m| m.sender_session_id.as_str()));
-        sessions.extend(self.notes.iter().map(|note| note.session_id.as_str()));
-        sessions.extend(self.follows.iter().map(|follow| follow.session_id.as_str()));
-        sessions.extend(self.finished.iter().map(|row| row.session_id.as_str()));
-        sessions.extend(self.agent_replies.iter().map(|r| r.session_id.as_str()));
-        sessions
-            .into_iter()
-            .map(|session_id| {
-                let messages: Vec<(&OwnerMessage, OwnerMessageState)> = self
-                    .messages
-                    .iter()
-                    .filter(|message| message.sender_session_id == session_id)
-                    .map(|message| (message, self.message_state(message, &replied)))
-                    .collect();
-                // Newest item and its preview.
-                let mut newest: Option<(String, String)> = None;
-                let mut consider = |at: &str, preview: String| {
-                    let at = norm(at);
-                    if newest.as_ref().is_none_or(|(best, _)| at >= *best) {
-                        newest = Some((at, preview));
-                    }
-                };
-                let mut items = messages.len();
-                for (message, _) in &messages {
-                    consider(&message.created_at, message.title.clone());
-                }
-                for reply in self
-                    .replies
-                    .iter()
-                    .filter(|reply| sender_of.get(reply.message_id.as_str()) == Some(&session_id))
-                {
-                    let text = if reply.body.trim().is_empty() {
-                        reply
-                            .comments
-                            .first()
-                            .map(|c| c.quote.as_str())
-                            .unwrap_or("")
-                    } else {
-                        reply.body.as_str()
-                    };
-                    consider(&reply.created_at, format!("You: {}", snippet(text)));
-                    items += 1;
-                }
-                for note in self.notes.iter().filter(|n| n.session_id == session_id) {
-                    consider(&note.created_at, format!("You: {}", snippet(&note.body)));
-                    items += 1;
-                }
-                let marks = self.marks(&agent_thread_key(session_id));
-                let mut follows = 0;
-                for follow in self.follows.iter().filter(|f| f.session_id == session_id) {
-                    let fired_at = follow.fired_at.as_deref().unwrap_or(&follow.created_at);
-                    consider(fired_at, follow_line(follow).0);
-                    items += 1;
-                    follows += 1;
-                }
-                // Each Finished row is one item, so the Done watermark
-                // covers it; one with text is the turn message it shows.
-                let mut unread_finished = None;
-                for row in self.finished.iter().filter(|r| r.session_id == session_id) {
-                    items += 1;
-                    if let (Some(text), Some(at)) = (&row.text, &row.text_at) {
-                        consider(at, first_line(text, 140));
-                        if row.read_at.is_none() {
-                            unread_finished = Some(text);
-                        }
-                    }
-                }
-                // An answer written after the thread was last read is new.
-                let last_read = marks.last_read_at.as_deref().map(norm);
-                let mut unread_reply = false;
-                for reply in self.agent_replies_of(session_id) {
-                    items += 1;
-                    consider(&reply.at, first_line(&reply.text, 140));
-                    unread_reply |= last_read
-                        .as_ref()
-                        .is_none_or(|read| norm(&reply.at) > *read);
-                }
-                // Fired follows are listed oldest first, so any beyond the
-                // count seen at the last read are new.
-                let unread_follow = follows
-                    > marks
-                        .read_follows
-                        .and_then(|seen| usize::try_from(seen).ok())
-                        .unwrap_or(0);
-                let (newest_at, mut preview) = newest.unwrap_or_default();
-                let open_asks = messages
-                    .iter()
-                    .filter(|(_, state)| *state == OwnerMessageState::NeedsYou)
-                    .count();
-                let group = if open_asks > 0 {
-                    if let Some((message, _)) = messages
-                        .iter()
-                        .rev()
-                        .find(|(_, state)| *state == OwnerMessageState::NeedsYou)
-                    {
-                        preview = message.title.clone();
-                    }
-                    "needs_you"
-                } else if let Some(text) = unread_finished {
-                    preview = first_line(text, 140);
-                    "finished"
-                } else if unread_follow
-                    || unread_reply
-                    || messages
-                        .iter()
-                        .any(|(_, state)| *state == OwnerMessageState::New)
-                {
-                    "new"
-                } else {
-                    "earlier"
-                };
-                InboxRow {
-                    thread_key: agent_thread_key(session_id),
-                    kind: "agent",
-                    title: self.agent_name(session_id),
-                    repo: self.agent_repo(session_id),
-                    status: if self.live(session_id) {
-                        "live"
-                    } else {
-                        "ended"
-                    }
-                    .to_owned(),
-                    verdict: None,
-                    pr_number: None,
-                    author: None,
-                    group,
-                    preview,
-                    done: is_done(&marks, items),
-                    newest_at,
-                    message_count: messages.len(),
-                    revision_count: 0,
-                    doc_count: 0,
-                    open_asks,
-                    url: agent_thread_path(session_id),
-                    session_id: Some(session_id.to_owned()),
-                    doc_id: None,
-                    folded_by: None,
-                    agents: vec![self.agent_name(session_id)],
-                    items,
-                }
-            })
-            .collect()
     }
 
     fn doc_rows(&self, state: &AppState) -> Result<Vec<InboxRow>, ApiError> {
@@ -991,14 +823,14 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
 pub(super) async fn get_agent_thread(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-    Query(query): Query<ThreadQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
     let key = work_threads::key_for_agent(&state, &session_id)?;
     let mut path = work_threads::path_for_key(&key);
-    if let Some(at) = query.at.filter(|_| query.bottom.is_none()) {
-        path.push_str(&format!("?at={at}"));
+    if let Some(query) = request.uri().query() {
+        path.push('?');
+        path.push_str(query);
     }
     Ok(axum::response::Redirect::temporary(&path).into_response())
 }

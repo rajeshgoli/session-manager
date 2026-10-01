@@ -310,18 +310,36 @@ impl ThreadCatalog {
         let entries = self.entries();
         let mut keys = BTreeSet::new();
         keys.extend(entries.iter().map(|entry| entry.key.clone()));
-        let legacy: BTreeMap<String, bool> = self
+        let legacy_docs: BTreeMap<String, bool> = self
             .world
-            .agent_rows()
+            .doc_rows(state)?
             .into_iter()
-            .chain(self.world.doc_rows(state)?)
             .map(|row| (row.thread_key, row.done))
             .collect();
         let mut marks_map = self.world.marks.clone();
+        // Old Done marks count items in each agent/doc thread. Walk those items
+        // in their old order so a later ticket cannot erase an earlier ticket's
+        // migrated Done watermark when one agent's history splits by claim.
+        let mut legacy_position: BTreeMap<&str, i64> = BTreeMap::new();
+        let mut migrated_items: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in entries.iter().filter(|entry| entry.counted) {
+            let position = legacy_position
+                .entry(entry.legacy_key.as_str())
+                .or_default();
+            *position += 1;
+            if self
+                .world
+                .marks
+                .get(&entry.legacy_key)
+                .and_then(|marks| marks.done_items)
+                .is_some_and(|done| *position <= done)
+            {
+                *migrated_items.entry(entry.key.as_str()).or_default() += 1;
+            }
+        }
         let mut rows = Vec::new();
         for key in keys {
             let own: Vec<_> = entries.iter().filter(|entry| entry.key == key).collect();
-            let mut sources = BTreeSet::new();
             let mut senders = BTreeSet::new();
             let mut doc_ids = BTreeSet::new();
             let mut items = 0;
@@ -336,7 +354,6 @@ impl ThreadCatalog {
             let marks = marks_map.get(&key).cloned().unwrap_or_default();
             let mut follow_count = 0usize;
             for entry in &own {
-                sources.insert(entry.legacy_key.clone());
                 if let Some(sender) = entry.sender_id {
                     senders.insert(sender.to_owned());
                 }
@@ -470,15 +487,23 @@ impl ThreadCatalog {
                     author = doc.summary.doc.author_session_name.clone();
                 }
             }
-            if marks.done_items.is_none()
-                && !sources.is_empty()
-                && sources
+            let migrated = migrated_items.get(key.as_str()).copied().unwrap_or(0)
+                + self
+                    .docs
                     .iter()
-                    .all(|source| legacy.get(source).copied().unwrap_or(false))
-            {
-                inbox_store(state).migrate_done(&key, items)?;
+                    .filter(|doc| doc.key == key)
+                    .filter(|doc| {
+                        legacy_docs
+                            .get(&doc_thread_key(&doc.summary.doc.id))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .map(|doc| doc.facts.review_count)
+                    .sum::<usize>();
+            if marks.done_items.is_none() && migrated > 0 {
+                inbox_store(state).migrate_done(&key, migrated)?;
                 let entry = marks_map.entry(key.clone()).or_default();
-                entry.done_items = Some(i64::try_from(items).unwrap_or(i64::MAX));
+                entry.done_items = Some(i64::try_from(migrated).unwrap_or(i64::MAX));
             }
             let marks = marks_map.get(&key).cloned().unwrap_or_default();
             let folded_by = if marks
@@ -987,7 +1012,7 @@ pub(super) async fn mark_done(state: &AppState, key: &str) -> Result<usize, ApiE
     }
     let replied = catalog.world.replied();
     let messages = owner_message_store(state);
-    let mut finished_senders = BTreeSet::new();
+    let mut finished_rows = BTreeSet::new();
     let mut docs = BTreeSet::new();
     for entry in &entries {
         match &entry.item {
@@ -1001,7 +1026,7 @@ pub(super) async fn mark_done(state: &AppState, key: &str) -> Result<usize, ApiE
                 }
             }
             Item::Turn(row) => {
-                finished_senders.insert(row.session_id.as_str());
+                finished_rows.insert((row.session_id.as_str(), row.completed_at.as_str()));
             }
             Item::Doc(doc, _) => {
                 docs.insert(doc.id.as_str());
@@ -1009,9 +1034,9 @@ pub(super) async fn mark_done(state: &AppState, key: &str) -> Result<usize, ApiE
             _ => {}
         }
     }
-    for sender in finished_senders {
+    for (sender, completed_at) in finished_rows {
         if let Some(turns) = state.session_store.turn_message_store() {
-            turns.mark_read(sender, OffsetDateTime::now_utc())?;
+            turns.mark_finished_read(sender, completed_at, OffsetDateTime::now_utc())?;
         }
     }
     let store = owner_doc_store(state);
