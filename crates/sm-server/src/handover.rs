@@ -473,6 +473,9 @@ pub fn send_listeners(stream: &UnixStream, fds: &[RawFd], lan_listener: bool) ->
     Ok(())
 }
 
+/// Receive listeners before starting workers that can spawn child processes.
+/// macOS has no atomic close-on-exec receive flag, so startup ordering keeps
+/// children from racing the descriptor receipt and the fcntl below.
 pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
     if !readable_before(stream, std::time::Instant::now() + Duration::from_secs(15))? {
         bail!("timed out waiting for handover listeners");
@@ -480,11 +483,15 @@ pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
     let mut body = [0_u8; 1024];
     let mut iov = [IoSliceMut::new(&mut body)];
     let mut control = cmsg_space!([RawFd; 4]);
+    #[cfg(target_os = "linux")]
+    let receive_flags = MsgFlags::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let receive_flags = MsgFlags::empty();
     let message = recvmsg::<()>(
         stream.as_raw_fd(),
         &mut iov,
         Some(&mut control),
-        MsgFlags::empty(),
+        receive_flags,
     )
     .context("failed to receive handover listeners")?;
     if message.flags.contains(MsgFlags::MSG_CTRUNC) {
@@ -502,6 +509,15 @@ pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
                 fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }
         }
+    }
+    // SCM_RIGHTS transfers the socket, not its descriptor flags. Own every
+    // received descriptor before a fallible operation so errors close them all.
+    for fd in &fds {
+        nix::fcntl::fcntl(
+            fd.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .context("failed to mark handover listener close-on-exec")?;
     }
     let reply: Reply = serde_json::from_slice(&body[..length])?;
     if !reply.handed_over || fds.len() != 3 + usize::from(reply.lan_listener) {
@@ -598,6 +614,14 @@ mod tests {
         let (fds, lan) = receive_listeners(&new).unwrap();
         assert_eq!(fds.len(), 3);
         assert!(!lan);
+        for fd in &fds {
+            let flags = nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+            assert_ne!(
+                flags & nix::libc::FD_CLOEXEC,
+                0,
+                "handed-over listener is inheritable"
+            );
+        }
         assert!(send_listeners(&old, &[tcp.as_raw_fd()], false).is_err());
     }
 
