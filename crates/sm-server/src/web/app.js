@@ -105,7 +105,15 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const pop = () => { openOrigin = null; setLoc(readLocation()); };
+    let committedUrl = location.href;
+    const pop = () => {
+      if (document.querySelector('.notes-dialog')) {
+        history.pushState(null, '', committedUrl);
+        return;
+      }
+      committedUrl = location.href;
+      openOrigin = null; setLoc(readLocation());
+    };
     window.addEventListener('popstate', pop);
     const offs = [
       bus.on('navigate', (path) => {
@@ -117,6 +125,7 @@ function App() {
           return;
         }
         history.pushState(null, '', urlFor(path, null));
+        committedUrl = location.href;
         setLoc(readLocation());
       }),
       bus.on('open', (ref) => {
@@ -128,6 +137,7 @@ function App() {
         const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')
           ? kind === 'agent' ? '/' : '/queue' : current.path;
         history.pushState(null, '', urlFor(path, ref));
+        committedUrl = location.href;
         setLoc(readLocation());
       }),
       bus.on('toast', (item) => {
@@ -565,6 +575,7 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       if (paletteOpen || mod || event.altKey) return;
       if (event.key === 'Escape') {
         // The first Escape in Notes collapses its open editor; the next closes the pane.
+        if (where.open === 'notes:view' && document.querySelector('.notes-dialog')) return;
         if (where.open === 'notes:view' && document.querySelector('.notes-pane .notes-editor')) return;
         if (where.open) closePanel();
         return;

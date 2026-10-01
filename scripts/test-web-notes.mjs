@@ -135,11 +135,20 @@ test('page, terminal pane, actions and a version conflict', async () => {
         await page.keyboard.press('Meta+j');
         await page.locator('.panel .note-card').first().waitFor();
         if (!await page.locator('.panel .notes-editor').count()) await page.locator('.panel .note-card-main').first().click();
+        await page.locator('.panel .notes-editor textarea').fill('Saved before Escape');
         await page.keyboard.press('Escape');
         assert.equal(await page.locator('.panel').count(), 1, 'first Escape keeps the pane');
-        assert.equal(await page.locator('.panel .notes-editor').count(), 0, 'first Escape collapses the note');
+        await page.locator('.panel .notes-editor').waitFor({ state: 'hidden' });
+        assert.equal(handler.notes.find(note => note.id === 'one').body, 'Saved before Escape');
+        await page.locator('.panel .note-card-main').first().click();
+        await page.locator('.panel .notes-editor textarea').fill('Saved before card collapse');
+        await page.locator('.panel .note-card-main').first().click();
+        await page.locator('.panel .notes-editor').waitFor({ state: 'hidden' });
+        assert.equal(handler.notes.find(note => note.id === 'one').body, 'Saved before card collapse');
         await page.keyboard.press('Escape');
         assert.equal(await page.locator('.panel').count(), 0, 'second Escape closes the pane');
+        await page.reload();
+        await page.locator('.note-card-main').first().click();
         await page.locator('.notes-editor-slot textarea').fill('Edited just before import');
         await page.locator('.notes-tools input[type=file]').setInputFiles({ name: 'prompt.md', mimeType: 'text/markdown', buffer: Buffer.from('# Imported prompt\nBody') });
         await page.getByText('Imported prompt', { exact: true }).first().waitFor();
@@ -190,6 +199,16 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await first.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
     await first.keyboard.press('Meta+j');
     assert.equal(await first.locator('.panel').count(), 1, 'pane remains while conflict is unresolved');
+    assert.equal(await first.getByRole('dialog').count(), 1);
+    await first.keyboard.press('Escape');
+    await first.locator('.panel .note-card-main').first().evaluate(button => button.click());
+    assert.equal(await first.locator('.panel .notes-editor textarea').inputValue(), 'Keep the first browser text');
+    assert.equal(await first.getByRole('dialog').count(), 1, 'collapse keeps the conflict dialog');
+    const historySettled = first.evaluate(() => new Promise(resolve =>
+      window.addEventListener('popstate', () => setTimeout(resolve, 0), { once: true })));
+    await first.goBack();
+    await historySettled;
+    assert.equal(new URL(first.url()).searchParams.get('open'), 'notes:view', 'browser history cannot dismiss the conflict');
     assert.equal(await first.getByRole('dialog').count(), 1);
     if (shots) await first.screenshot({ path: `${shots}/notes-conflict-1440-light.png` });
     const forcedSave = first.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');

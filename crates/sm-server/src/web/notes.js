@@ -186,15 +186,6 @@ export function NotesView({ pane = false, onClose, onType }) {
     document.addEventListener('visibilitychange', visible);
     return () => document.removeEventListener('visibilitychange', visible);
   }, []);
-  useEffect(() => {
-    const key = e => {
-      if (e.key === 'Escape' && pane && current.current.open && !e.target.closest('.notes-popover')) {
-        e.stopPropagation(); setOpen(null); setBody('');
-      }
-    };
-    document.addEventListener('keydown', key);
-    return () => document.removeEventListener('keydown', key);
-  }, [pane]);
   const save = (forceVersion = null) => {
     clearTimeout(saveTimer.current);
     if (conflict && forceVersion === null) return Promise.resolve(false);
@@ -216,6 +207,22 @@ export function NotesView({ pane = false, onClose, onType }) {
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
   };
+  const collapse = async () => {
+    if (await save() === false) return;
+    current.current = { open: null, body: '' };
+    store('sm-notes-open', '');
+    setOpen(null); setBody('');
+  };
+  useEffect(() => {
+    const key = e => {
+      if (e.key === 'Escape' && pane && current.current.open && !e.target.closest('.notes-popover')) {
+        e.preventDefault(); e.stopPropagation();
+        collapse();
+      }
+    };
+    document.addEventListener('keydown', key);
+    return () => document.removeEventListener('keydown', key);
+  }, [pane, conflict, open, body]);
   const edit = text => {
     current.current.body = text; setBody(text); setStatus('Unsaved');
     clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => save(), 800);
@@ -265,7 +272,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     ${error ? html`<p class="err">${error}</p>` : null}
     <div class="notes-columns"><div class="notes-list">
       ${hits.map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
-        <button class="note-card-main" type="button" onClick=${() => open?.id === hit.id && pane ? setOpen(null) : choose(hit.id)}>
+        <button class="note-card-main" type="button" onClick=${() => open?.id === hit.id && pane ? collapse() : choose(hit.id)}>
           <span class="note-title">${hit.title || 'Untitled'}</span><small>${age(hit.updated_at)}</small>
           <span class="note-snippet"><${Snippet} hit=${hit} /></span>
         </button>
