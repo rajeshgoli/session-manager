@@ -190,7 +190,8 @@ select.inp { padding: 3px 6px; }
 .you .ok { color: inherit; font-weight: 700; padding: 0 6px; margin-left: auto; }
 .you > .retire-action { margin-left: auto; }
 .retire-action { position: relative; display: inline-flex; flex: none; }
-.retire-confirm { position: absolute; z-index: 3; top: calc(100% + 4px); right: 0; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); box-shadow: 0 4px 12px rgba(0, 0, 0, .18); width: max-content; max-width: min(240px, calc(100vw - 24px)); }
+.retire-confirm { position: absolute; z-index: 3; top: calc(100% + 4px); right: 0; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); box-shadow: 0 4px 12px rgba(0, 0, 0, .18); width: max-content; max-width: min(240px, calc(100vw - 24px)); overflow-wrap: anywhere; }
+.retire-confirm .btn { flex: none; }
 .acts .retire-confirm { left: 0; right: auto; }
 .acard-facts { display: flex; flex-direction: column; gap: 2px; }
 .grp.sec.magenta { color: var(--magenta); } .grp.sec.cyan { color: var(--cyan); } .grp.sec.amber { color: var(--amber); }

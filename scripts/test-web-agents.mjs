@@ -273,3 +273,32 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
     }
   } finally { await browser.close(); }
 });
+
+test('long agent name keeps the Agents confirmation and Cancel in a phone viewport', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    const sessions = fixture().map((agent) => agent.id === 'sm-1776'
+      ? { ...agent, name: 'sm-1776-with-a-very-long-name-that-must-wrap-inside-the-confirmation' }
+      : agent);
+    await page.route('http://localhost/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname.startsWith('/assets/')) {
+        const file = url.pathname.slice('/assets/'.length);
+        return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
+      }
+      if (route.request().isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions, counts: {} } });
+      return route.fulfill({ json: {} });
+    });
+    await page.goto('http://localhost/?open=agent:sm-1776');
+    await page.locator('.details-band .acts .retire-action > button').click();
+    const prompt = page.locator('.details-band .retire-confirm');
+    const cancel = prompt.getByRole('button', { name: 'Cancel' });
+    const box = await prompt.boundingBox();
+    const cancelBox = await cancel.boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= 390, 'confirmation fits inside the phone viewport');
+    assert.ok(cancelBox.x >= 0 && cancelBox.x + cancelBox.width <= 390, 'Cancel stays in view');
+    await cancel.click();
+  } finally { await browser.close(); }
+});
