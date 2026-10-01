@@ -3633,6 +3633,7 @@ async fn deploy_app_artifact(
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut version_code: Option<i64> = None;
     let mut version_name: Option<String> = None;
+    let mut release_notes: Option<String> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -3666,6 +3667,19 @@ async fn deploy_app_artifact(
                     })?);
                 }
             }
+            "release_notes" => {
+                let value = field.text().await.unwrap_or_default();
+                let value = value.trim();
+                if value.chars().count() > 1000 {
+                    return Err(ApiError::Status {
+                        status: StatusCode::BAD_REQUEST,
+                        detail: "release_notes must be at most 1000 characters".to_owned(),
+                    });
+                }
+                if !value.is_empty() {
+                    release_notes = Some(value.to_owned());
+                }
+            }
             "version_name" => {
                 let value = field.text().await.unwrap_or_default();
                 let value = value.trim();
@@ -3697,6 +3711,7 @@ async fn deploy_app_artifact(
         Some(actor_email),
         version_code,
         version_name,
+        release_notes,
     )
     .map_err(|error| ApiError::Status {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -7044,7 +7059,8 @@ async fn client_review_status(
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "github_codex": { "state": channel.state, "paused_at": channel.paused_at,
-            "next_check_at": channel.next_check_at, "refusal_url": channel.refusal_url },
+            "next_check_at": channel.next_check_at, "refusal_url": channel.refusal_url,
+            "quota_resets_at": crate::review::codex_weekly_reset(&expand_home(&state.config.usage.db_path))? },
         "last_24h": { "github_codex": github_codex, "codex_runs": codex_runs, "claude_runs": claude_runs,
             "no_reviewer": no_reviewer },
         "running": running, "needs_you": needs_you, "meters": { "codex": crate::review::meter(&expand_home(&state.config.usage.db_path), "codex")?, "claude": crate::review::meter(&expand_home(&state.config.usage.db_path), "claude")? },
@@ -17571,8 +17587,16 @@ mod tests {
             .unwrap();
         assert!(reports.report_exists(&report.id).unwrap());
 
-        let artifact =
-            store_artifact(artifact_root, "isolation-proof", b"apk", None, None, None).unwrap();
+        let artifact = store_artifact(
+            artifact_root,
+            "isolation-proof",
+            b"apk",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(hashed_path(artifact_root, "isolation-proof", &artifact.artifact_hash).exists());
     }
 

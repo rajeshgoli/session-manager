@@ -94,7 +94,7 @@ fun UpdateReadyBanner(
                 ) {
                     Icon(Icons.Rounded.SystemUpdateAlt, contentDescription = null, tint = Cyan)
                 }
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
                         text = "App update ready",
                         style = MaterialTheme.typography.labelMedium,
@@ -108,6 +108,9 @@ fun UpdateReadyBanner(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    update.releaseNotes?.let { notes ->
+                        Text(notes, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
                 }
             }
             Text(

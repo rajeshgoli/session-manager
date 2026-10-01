@@ -23,6 +23,8 @@ pub struct AppArtifactMetadata {
     pub version_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +73,7 @@ pub fn store_artifact(
     uploaded_by: Option<String>,
     version_code: Option<i64>,
     version_name: Option<String>,
+    release_notes: Option<String>,
 ) -> Result<StoredArtifact> {
     if bytes.is_empty() {
         anyhow::bail!("Uploaded artifact is empty");
@@ -101,6 +104,7 @@ pub fn store_artifact(
         uploaded_by,
         version_code,
         version_name,
+        release_notes,
     };
     write_json_atomically(&meta_path(root, app_name), &metadata)?;
     Ok(StoredArtifact {
@@ -162,6 +166,18 @@ mod tests {
         ] {
             assert!(!valid_app_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn release_notes_round_trip_and_old_metadata_remains_readable() {
+        let old = r#"{"artifact_hash":"deadbeef","size_bytes":3,"uploaded_at":"now","uploaded_by":null,"version_code":1,"version_name":"v1"}"#;
+        let mut meta: super::AppArtifactMetadata = serde_json::from_str(old).unwrap();
+        assert!(meta.release_notes.is_none());
+        meta.release_notes =
+            Some("Drafts survive dismissal. Try closing and reopening a report.".into());
+        let value = serde_json::to_string(&meta).unwrap();
+        let decoded: super::AppArtifactMetadata = serde_json::from_str(&value).unwrap();
+        assert_eq!(decoded.release_notes, meta.release_notes);
     }
 
     #[test]

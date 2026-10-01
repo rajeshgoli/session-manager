@@ -284,6 +284,9 @@ private fun BugReportSheet(viewModel: BugReportViewModel) {
         busy = sheet.busy,
         error = sheet.error,
         onDismiss = viewModel::close,
+        bugDraft = viewModel.draftText,
+        onBugDraftChange = viewModel::saveDraft,
+        onClearBugDraft = viewModel::clearDraft,
         bug = BugStart(
             defaults = if (options != null && defaults != null && !options.workingDir.isNullOrBlank()) {
                 CreateSessionRequest(defaults.provider, options.workingDir, defaults.model, defaults.effort)

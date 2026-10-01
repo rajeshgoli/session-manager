@@ -1510,6 +1510,10 @@ private fun SessionRow(
                             }
                         }
                     }
+                    session.facts?.finished?.text?.takeIf { it.isNotBlank() }?.let { message ->
+                        Text("Last turn", style = MaterialTheme.typography.titleSmall)
+                        MarkdownText(message)
+                    }
                     AgentWorkSections(session, onOpenPage, follow)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {

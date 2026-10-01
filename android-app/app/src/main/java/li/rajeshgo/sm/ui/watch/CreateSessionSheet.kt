@@ -85,6 +85,9 @@ fun CreateSessionSheet(
     extra: (@Composable (Boolean) -> Unit)? = null,
     bug: BugStart? = null,
     onFile: (BugFiling) -> Unit = {},
+    bugDraft: String = "",
+    onBugDraftChange: (String) -> Unit = {},
+    onClearBugDraft: () -> Unit = {},
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     // The agent fields open on the bug defaults once they arrive.
@@ -94,7 +97,7 @@ fun CreateSessionSheet(
     }
     // Board Start and the bug's agent take the same choices.
     val startLike = ticket != null || bug != null
-    var bugText by rememberSaveable { mutableStateOf("") }
+    val bugText = bugDraft
     var bugScreenshot by rememberSaveable { mutableStateOf(bug?.screenshot != null) }
     var bugAgent by rememberSaveable { mutableStateOf(false) }
     val bugLocked = bug?.filedIssue != null
@@ -156,7 +159,13 @@ fun CreateSessionSheet(
                     style = MaterialTheme.typography.bodyMedium,
                 )
             } else {
-                BugFields(bug, bugText, { bugText = it }, bugScreenshot, { bugScreenshot = it }, bugAgent, { bugAgent = it }, !busy && !bugLocked, !busy && !bugLocked && bug.defaults != null && bug.agentNote == null)
+                BugFields(bug, bugText, onBugDraftChange, bugScreenshot, { bugScreenshot = it }, bugAgent, { bugAgent = it }, !busy && !bugLocked, !busy && !bugLocked && bug.defaults != null && bug.agentNote == null)
+            }
+            if (bug != null && !bugLocked) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Draft saved on this device", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onClearBugDraft, enabled = !busy) { Text("Clear draft") }
+                }
             }
             if (ticket?.whenReady == true) {
                 var typeMenu by remember { mutableStateOf(false) }

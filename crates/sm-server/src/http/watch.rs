@@ -152,6 +152,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
         .map(|record| serde_json::to_value(session_response_with_live_activity(state, record)))
         .collect::<Result<_, _>>()?;
 
+    let last_tickets = claims::work_claim_store(state).latest_tickets()?;
     let feed = session_obligations(state)?;
     let obligations: BTreeMap<String, Value> = array(&feed, "sessions")
         .into_iter()
@@ -235,6 +236,9 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             _ => "idle",
         };
         let field = |key: &str| obligation.map_or_else(|| json!([]), |o| o[key].clone());
+        // Closed/released work remains useful context when deciding to retire an agent.
+        // Keep it separate from active claims, which confer ownership.
+        let last_ticket = last_tickets.get(id);
         let waiting_on = field("waiting_on");
         if state != "stopped" {
             live += 1;
@@ -300,6 +304,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "handoff": v["handoff"].clone(),
             "remote_control": remote_control.get(id).cloned().unwrap_or(Value::Null),
             "claims": field("claims"),
+            "last_ticket": last_ticket,
             "docs": field("docs"),
             "waiting_on": waiting_on,
             "waiting_on_review": reviews.get(id).map_or(Value::Null, |r| r["waiting_on_review"].clone()),
@@ -615,14 +620,13 @@ fn agent_facts(
     } else {
         Value::Null
     };
-    // Finished until the next turn clears the completion, and until Done.
+    // Keep completion text until the next turn; Done only clears its unread attention.
     let finished = finished
         .get(s(session, "id"))
-        .filter(|row| row.read_at.is_none())
         .filter(|_| !s(session, "agent_task_completed_at").is_empty())
         .map_or(
             Value::Null,
-            |row| json!({"at": row.completed_at, "text": row.text, "read": false}),
+            |row| json!({"at": row.completed_at, "text": row.text, "read": row.read_at.is_some()}),
         );
     let note = notes.get(s(session, "id"));
     let facts = json!({"agent": {"state": agent_state, "since": activity_since},
@@ -648,7 +652,7 @@ fn agent_facts(
         ("stopped", Value::Null, inverse_time(last))
     } else if !you.is_null() {
         ("you", json!(s(&you, "kind")), s(&you, "since").to_owned())
-    } else if !finished.is_null() {
+    } else if !finished.is_null() && finished["read"] != true {
         ("finished", Value::Null, inverse_time(s(&finished, "at")))
     } else if !quiet.is_empty() || waiting_long || review_long || stalled {
         let reason = if !quiet.is_empty() {
@@ -1392,8 +1396,10 @@ mod facts_tests {
             config: &config,
             now,
         };
-        let (facts, _) = facts_of(&session, &context);
-        assert!(facts["finished"].is_null());
+        let (facts, attention) = facts_of(&session, &context);
+        assert_eq!(facts["finished"]["text"], row.text.clone().unwrap());
+        assert_eq!(facts["finished"]["read"], true);
+        assert_ne!(attention["section"], "finished");
 
         // Text still on its way reads as null ("Finishing…").
         finished.get_mut("far1855").unwrap().read_at = None;

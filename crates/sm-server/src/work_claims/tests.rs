@@ -151,6 +151,26 @@ fn queued(db: &PathBuf, target: &str) -> Vec<String> {
 }
 
 #[test]
+fn latest_ticket_keeps_released_context_without_reopening_ownership() {
+    let (store, _) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    store.end_claims_for_session("eng1").unwrap();
+    assert!(store.active_claims().unwrap().is_empty());
+    let latest = store.latest_tickets().unwrap();
+    assert_eq!(latest["eng1"].claim.number, 1);
+    assert_eq!(latest["eng1"].title, "Agent work claims");
+    store
+        .claim_explicit(
+            &request(WorkKind::Ticket, 2, "eng1", &dir),
+            fetch(&[(2, ticket("open"))]),
+            &dir,
+        )
+        .unwrap();
+    assert_eq!(store.latest_tickets().unwrap()["eng1"].claim.number, 2);
+}
+
+#[test]
 fn claim_then_already_held() {
     let (store, _) = new_store();
     let dir = directory();

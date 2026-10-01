@@ -77,6 +77,14 @@ internal fun reviewLimitsPatch(runs: String?, skip: String?): JsonObject = build
     }
 }
 
+/** A dismissal lasts until the known weekly reset, or until recovery if none is known. */
+fun githubWarningDismissUntil(reset: String?, now: Long): Long =
+    reset?.let { runCatching { OffsetDateTime.parse(it).toInstant().toEpochMilli() }.getOrNull() }
+        ?.takeIf { it > now } ?: Long.MAX_VALUE
+
+fun showGithubWarning(state: String, dismissedUntil: Long, now: Long): Boolean =
+    state == "paused" && dismissedUntil <= now
+
 /** Settings › Reviews (sm#1768 Figure 7A), shared with the web Settings page. */
 @Composable
 fun ReviewsSection() {
@@ -86,6 +94,16 @@ fun ReviewsSection() {
     val url by settings.serverUrl.collectAsState(initial = "")
     val token by settings.accessToken.collectAsState(initial = "")
     val scope = rememberCoroutineScope()
+    val preferences = remember(context) { context.getSharedPreferences("review_warnings", android.content.Context.MODE_PRIVATE) }
+    val dismissalKey = "github:$url"
+    var dismissedUntil by remember(url) { mutableLongStateOf(preferences.getLong(dismissalKey, 0L)) }
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(url) {
+        while (true) {
+            now = System.currentTimeMillis()
+            kotlinx.coroutines.delay(30_000)
+        }
+    }
     var status by remember(url, token) { mutableStateOf<ReviewStatus?>(null) }
     var policies by remember(url, token) { mutableStateOf<ReviewPoliciesResponse?>(null) }
     var owner by remember(url, token) { mutableStateOf<JsonObject?>(null) }
@@ -102,6 +120,17 @@ fun ReviewsSection() {
             status = repository.fetchReviewStatus(url, token)
             policies = repository.fetchReviewPolicies(url, token)
             owner = repository.fetchOwnerSettings(url, token)
+            while (true) {
+                if (status?.githubCodex?.state == "available") {
+                    dismissedUntil = 0L
+                    preferences.edit().remove(dismissalKey).apply()
+                } else if (dismissedUntil == Long.MAX_VALUE) {
+                    dismissedUntil = githubWarningDismissUntil(status?.githubCodex?.quotaResetsAt, System.currentTimeMillis())
+                    preferences.edit().putLong(dismissalKey, dismissedUntil).apply()
+                }
+                kotlinx.coroutines.delay(60_000)
+                status = repository.fetchReviewStatus(url, token)
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
@@ -125,7 +154,7 @@ fun ReviewsSection() {
             return@Column
         }
         val github = current.githubCodex
-        if (github.state == "paused") {
+        if (showGithubWarning(github.state, dismissedUntil, now)) {
             Column(
                 Modifier.fillMaxWidth().background(Amber.copy(alpha = 0.12f), RoundedCornerShape(12.dp)).padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -136,6 +165,16 @@ fun ReviewsSection() {
                         ". Reviews go to local runs.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                github.quotaResetsAt?.let { reset ->
+                    runCatching { OffsetDateTime.parse(reset).atZoneSameInstant(ZoneId.systemDefault())
+                        .format(DateTimeFormatter.ofPattern("EEE, MMM d, h:mm a", Locale.US)) }.getOrNull()?.let {
+                        Text("Codex weekly quota resets $it.", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                }
+                TextButton(onClick = {
+                    dismissedUntil = githubWarningDismissUntil(github.quotaResetsAt, System.currentTimeMillis())
+                    preferences.edit().putLong(dismissalKey, dismissedUntil).apply()
+                }) { Text(if (githubWarningDismissUntil(github.quotaResetsAt, now) == Long.MAX_VALUE) "Dismiss until recovery" else "Dismiss until reset") }
                 reviewClock(github.nextCheckAt)?.let {
                     Text("The next check is after $it.", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
                 }

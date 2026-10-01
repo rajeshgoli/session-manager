@@ -593,11 +593,11 @@ fun attentionGroups(sessions: List<ClientSession>, statusFilter: String, query: 
 
 /** The ticket the agent holds, as "#1771". */
 fun ticketLabel(session: ClientSession): String? =
-    session.obligations?.claims.orEmpty().firstOrNull { it.kind == "ticket" && it.number > 0 }?.let { "#${it.number}" }
+    (session.obligations?.claims.orEmpty().firstOrNull { it.kind == "ticket" && it.number > 0 } ?: session.lastTicket)?.let { "#${it.number}" }
 
 /** The title of the ticket [ticketLabel] names, shown under the agent's name (sm#1900). */
 fun ticketTitle(session: ClientSession): String? =
-    session.obligations?.claims.orEmpty().firstOrNull { it.kind == "ticket" && it.number > 0 }?.title?.trim()?.takeIf { it.isNotEmpty() }
+    (session.obligations?.claims.orEmpty().firstOrNull { it.kind == "ticket" && it.number > 0 } ?: session.lastTicket)?.title?.trim()?.takeIf { it.isNotEmpty() }
 
 /** 1710's age rule: under an hour "{m}m", otherwise "{h}h {m}m". */
 fun factAge(since: String?, now: OffsetDateTime = OffsetDateTime.now()): String? {
