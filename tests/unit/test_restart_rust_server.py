@@ -8,6 +8,7 @@ stubs that record every invocation - including what was sitting at the
 registered path at the time, which is how the install boundary is asserted.
 """
 
+import json
 import os
 import socket
 import subprocess
@@ -234,16 +235,20 @@ phase="$(cat "{state}/phase")"
 echo "curl $url ($phase)" >> "{log}"
 case "$url" in
   */health) exit "$(cat "{state}/${{phase}}_health")" ;;
-  */sessions)
+  */sessions\\?include_stopped=true)
     rc="$(cat "{state}/${{phase}}_health")"
     [[ "$rc" != "0" ]] && exit "$rc"
     rc="$(cat "{state}/${{phase}}_sessions_rc")"
     [[ "$rc" != "0" ]] && exit "$rc"
+    if [[ -f "{state}/${{phase}}_sessions_json" ]]; then
+      cat "{state}/${{phase}}_sessions_json"
+      exit 0
+    fi
     n="$(cat "{state}/${{phase}}_sessions")"
     printf '{{"sessions":['
     for ((i = 0; i < n; i++)); do
       [[ $i -gt 0 ]] && printf ','
-      printf '{{"id":"s%s"}}' "$i"
+      printf '{{"id":"s%s","status":"working"}}' "$i"
     done
     printf ']}}'
     ;;
@@ -1437,7 +1442,50 @@ def test_session_drop_fails(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "session count dropped 12 -> 9" in result.stderr
+    assert "session identities were lost (12 -> 9" in result.stderr
+    assert "unaccounted sessions: s10, s11, s9" in result.stderr
+
+
+def test_completed_session_retiring_during_build_is_accounted_for(env):
+    before = [{"id": "working", "status": "working"},
+              {"id": "retiring", "status": "idle"}]
+    after = [{"id": "working", "status": "working"},
+             {"id": "retiring", "status": "stopped",
+              "agent_task_completed_at": "2026-10-01T07:24:38Z",
+              "completed_at": "2026-10-01T14:54:22Z"}]
+    (env["state"] / "before_sessions_json").write_text(json.dumps({"sessions": before}))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": after}))
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "expected retirements: retiring" in result.stdout
+    assert "session count ok (2 -> 1)" in result.stdout
+
+
+def test_replacement_does_not_mask_a_lost_session(env):
+    before = [{"id": "lost", "status": "working"}]
+    after = [{"id": "replacement", "status": "working"}]
+    (env["state"] / "before_sessions_json").write_text(json.dumps({"sessions": before}))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": after}))
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "unaccounted sessions: lost" in result.stderr
+
+
+def test_stopped_session_without_recorded_completion_is_lost(env):
+    before = [{"id": "lost", "status": "working"}]
+    after = [{"id": "lost", "status": "stopped",
+              "completed_at": "2026-10-01T14:54:22Z"}]
+    (env["state"] / "before_sessions_json").write_text(json.dumps({"sessions": before}))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": after}))
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "unaccounted sessions: lost" in result.stderr
 
 
 def test_allow_drop_tolerates_expected_churn(env):
@@ -1796,6 +1844,14 @@ def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
     copied aside before the source check. A build after that - here, one that
     lands while the service restarts - must not change what gets installed."""
     target = env["tmp"] / "target"
+    (env["state"] / "before_sessions_json").write_text(json.dumps({"sessions": [
+        {"id": "retiring", "status": "idle"},
+    ]}))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": [
+        {"id": "retiring", "status": "stopped",
+         "agent_task_completed_at": "2026-10-01T07:24:38Z",
+         "completed_at": "2026-10-01T14:54:22Z"},
+    ]}))
     built_cli = target / "release" / "sm"
     _write(built_cli, "#!/bin/bash\n# CLI=FROM-SERVER-BUILD\n", executable=True)
     installer = checkout["deployed"] / "scripts" / "install-sm-cli.sh"

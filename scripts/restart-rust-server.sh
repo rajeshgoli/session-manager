@@ -27,7 +27,7 @@
 # Note that `sm-server --help` exiting 0 does NOT prove launchd will accept the
 # binary: a launch constraint is enforced by launchd at spawn, not by exec. The
 # real pre-restart gate is `codesign --verify`, plus the post-restart checks
-# below (health, session count, and a pid that stays put).
+# below (health, session identities, and a pid that stays put).
 
 set -euo pipefail
 
@@ -140,9 +140,9 @@ Options:
                         deploying a branch cut before a merge removes that merged
                         work from production for everyone. Only for a deliberate
                         rollback, or when $SM_DEPLOY_REMOTE cannot be reached.
-  --allow-drop N        Tolerate N fewer sessions after the restart (default: 0).
-                        Sessions can retire on their own between the before and
-                        after samples; raise this only if that is expected.
+  --allow-drop N        Tolerate N unaccounted missing session identities after
+                        restart (default: 0). Completed sessions with recorded
+                        retirement do not count toward this allowance.
   --allow-plist-change  Proceed even though restarting would rewrite the launchd
                         plist with different contents. Read the printed diff
                         first: this is how a deployment setting gets dropped.
@@ -483,10 +483,12 @@ health_ok() {
   curl -sf --connect-timeout 2 --max-time 5 "$SM_BASE_URL/health" >/dev/null 2>&1
 }
 
-# Echoes the session count, or returns nonzero if the server could not be asked.
-session_count() {
+# Echoes a validated session snapshot, including retired records, or returns
+# nonzero if the server could not be asked. We need the identities at both ends
+# to distinguish a normal retirement from a session lost during handover.
+session_snapshot() {
   local body
-  body="$(curl -sf --connect-timeout 2 --max-time 5 "$SM_BASE_URL/sessions" 2>/dev/null)" || return 1
+  body="$(curl -sf --connect-timeout 2 --max-time 5 "$SM_BASE_URL/sessions?include_stopped=true" 2>/dev/null)" || return 1
   printf '%s' "$body" | python3 -c '
 import json, sys
 try:
@@ -494,10 +496,51 @@ try:
 except ValueError:
     sys.exit(1)
 sessions = data.get("sessions")
-if not isinstance(sessions, list):
+if not isinstance(sessions, list) or any(
+    not isinstance(s, dict) or not isinstance(s.get("id"), str)
+    or not s["id"] or not isinstance(s.get("status"), str)
+    for s in sessions
+):
     sys.exit(1)
-print(len(sessions))
+ids = [s["id"] for s in sessions]
+if len(ids) != len(set(ids)):
+    sys.exit(1)
+print(json.dumps(sessions, separators=(",", ":")))
 ' 2>/dev/null || return 1
+}
+
+session_count() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+print(sum(s["status"] != "stopped" for s in json.load(sys.stdin)))
+'
+}
+
+compare_sessions() {
+  printf '%s\0%s' "$1" "$2" | python3 -c '
+import json, sys
+before, after = (json.loads(part) for part in sys.stdin.buffer.read().split(b"\0"))
+previous = {s["id"]: s for s in before if s["status"] != "stopped"}
+current = {s["id"]: s for s in after}
+lost = []
+retired = []
+for sid, old in previous.items():
+    new = current.get(sid)
+    if new is not None and new["status"] != "stopped":
+        continue
+    # A task completion and a terminal timestamp are durable evidence that
+    # this identity retired. A mere stopped status may be a crash or lost seat.
+    if (new is not None and new["status"] == "stopped"
+            and new.get("completed_at")
+            and (old.get("agent_task_completed_at") or new.get("agent_task_completed_at"))):
+        retired.append(sid)
+    else:
+        lost.append(sid)
+print("expected retirements: " + (", ".join(sorted(retired)) or "none"))
+if lost:
+    print("unaccounted sessions: " + ", ".join(sorted(lost)), file=sys.stderr)
+sys.exit(0 if len(lost) <= int(sys.argv[1]) else 1)
+' "$SM_ALLOW_SESSION_DROP"
 }
 
 job_loaded() {
@@ -762,15 +805,17 @@ SOURCE_AT_START="$(source_fingerprint)"
 step "Recording pre-restart state"
 BEFORE_HEALTHY=0
 BEFORE_SESSIONS=""
+BEFORE_SNAPSHOT=""
 if health_ok; then
   BEFORE_HEALTHY=1
-  BEFORE_SESSIONS="$(session_count || true)"
+  BEFORE_SNAPSHOT="$(session_snapshot || true)"
   # Without a baseline the post-restart comparison would be silently skipped,
   # so a restart that dropped the whole registry would still report success.
-  [[ -n "$BEFORE_SESSIONS" ]] \
+  [[ -n "$BEFORE_SNAPSHOT" ]] \
     || fail "server is healthy but its session list could not be read; refusing to
        restart without a baseline to compare against. The running service was
        not touched."
+  BEFORE_SESSIONS="$(session_count "$BEFORE_SNAPSHOT")"
   echo "service is up; sessions before: $BEFORE_SESSIONS"
 else
   echo "service is not answering /health; treating this as a recovery restart"
@@ -1116,16 +1161,14 @@ step "Verifying kernel-bound queue authority"
   || fail "queue authority peer attestation or exact probe validation failed"
 echo "queue authority peer verified"
 
-step "Comparing session count"
-AFTER_SESSIONS="$(session_count || true)"
-[[ -n "$AFTER_SESSIONS" ]] || fail "could not read session count after restart"
+step "Comparing session identities"
+AFTER_SNAPSHOT="$(session_snapshot || true)"
+[[ -n "$AFTER_SNAPSHOT" ]] || fail "could not read session list after restart"
+AFTER_SESSIONS="$(session_count "$AFTER_SNAPSHOT")"
 echo "sessions after: $AFTER_SESSIONS"
-if [[ "$BEFORE_HEALTHY" -eq 1 && -n "$BEFORE_SESSIONS" ]]; then
-  min_expected=$((BEFORE_SESSIONS - SM_ALLOW_SESSION_DROP))
-  (( min_expected < 0 )) && min_expected=0
-  if (( AFTER_SESSIONS < min_expected )); then
-    fail "session count dropped $BEFORE_SESSIONS -> $AFTER_SESSIONS (allowed drop: $SM_ALLOW_SESSION_DROP)"
-  fi
+if [[ "$BEFORE_HEALTHY" -eq 1 ]]; then
+  compare_sessions "$BEFORE_SNAPSHOT" "$AFTER_SNAPSHOT" \
+    || fail "session identities were lost ($BEFORE_SESSIONS -> $AFTER_SESSIONS; allowed unaccounted drop: $SM_ALLOW_SESSION_DROP)"
   echo "session count ok ($BEFORE_SESSIONS -> $AFTER_SESSIONS)"
 else
   echo "no usable before-count; skipping comparison"
