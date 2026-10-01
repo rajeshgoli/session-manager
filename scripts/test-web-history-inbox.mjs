@@ -47,7 +47,9 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
           count++;
         } else if (url.pathname.startsWith('/inbox/agent/')) {
           threadLoads++;
-          data = {title:'Long thread',status:'working',can_send:true,reply_to:'Fixture agent',items:Array.from({length:count}, (_,i) => ({html:`<div class="b"><p data-sm-line="1">Message ${i+1}: enough text to wrap over multiple lines on mobile.</p></div>`}))};
+          data = {title:'Long thread',status:'working',can_send:true,reply_to:'Fixture agent',items:[{type:'turn',finished:true,at:'2026-09-30T12:00:00Z',html:'<p>Finished summary</p>'},
+            {type:'turn',finished:false,at:'2026-09-30T12:05:00Z',html:'<p>Answer to the owner</p>'},
+            ...Array.from({length:count}, (_,i) => ({html:`<div class="b"><p data-sm-line="1">Message ${i+1}: enough text to wrap over multiple lines on mobile.</p></div>`}))]};
         } else if (url.pathname === '/inbox') data = {rows:[]};
         else if (url.pathname.startsWith('/t/')) data = {item:{title:'Fixture ticket',state:'open'},events:[]};
         await route.fulfill({json:data});
@@ -113,6 +115,8 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       await page.getByText('Marked answered').waitFor();
       await page.getByRole('button', {name:'✓ Answered'}).waitFor({state:'detached'});
       assert.equal(answered, 1);
+      // A finished summary is the last turn; an answer to the owner is a reply.
+      assert.deepEqual(await page.locator('.thread-items .turn .lbl').evaluateAll(nodes => nodes.map(node => node.textContent.split(' · ')[0])), ['Last turn', 'Reply']);
       const atBottom = () => {
         const el = document.querySelector('.thread-items');
         return el && el.scrollTop > 0 && Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop) < 2;
