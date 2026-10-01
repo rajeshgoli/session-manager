@@ -231,6 +231,48 @@ fn ticket_jobs(
             .enumerate()
             .map(|(index, id)| (id, index + 1))
             .collect();
+    let held = held_tickets(state, input)?;
+
+    let mut jobs: BTreeMap<Key, Vec<ClockJob>> = BTreeMap::new();
+    for record in &records {
+        if record.job_type == "service" {
+            continue;
+        }
+        let Some(queued_at) = parse_time(&record.queued_at) else {
+            continue;
+        };
+        let phase = match record.state.as_str() {
+            "pending" => JobPhase::Waiting,
+            "running" => JobPhase::Running,
+            _ => JobPhase::Ended,
+        };
+        let tickets = job_tickets(record, &held);
+        let quiet = crate::utilization::quiet::status(&path, record);
+        let job = ClockJob {
+            job_type: record.job_type.clone(),
+            phase,
+            queued_at,
+            started_at: record.started_at.as_deref().and_then(parse_time),
+            finished_at: record.finished_at.as_deref().and_then(parse_time),
+            timeout_seconds: record.timeout_seconds,
+            holding_reason: record.holding_reason.clone(),
+            position: positions.get(&record.id).copied(),
+            quiet_since: quiet.quiet_since.as_deref().and_then(parse_time),
+            cpu_seconds: quiet.cpu_seconds,
+        };
+        for key in tickets {
+            jobs.entry(key).or_default().push(job.clone());
+        }
+    }
+    Ok(jobs)
+}
+
+/// Each session's tickets by its active claims: a ticket claim's own
+/// ticket, and the tickets `work_links` ties a claimed PR to.
+pub(super) fn held_tickets(
+    state: &AppState,
+    input: &ModelInput,
+) -> anyhow::Result<BTreeMap<String, Vec<Key>>> {
     let mut held: BTreeMap<String, Vec<Key>> = BTreeMap::new();
     for view in claims::work_claim_store(state).active_claims()? {
         let claim = view.claim;
@@ -250,48 +292,30 @@ fn ticket_jobs(
             .or_default()
             .extend(numbers.into_iter().map(|number| (repo.clone(), number)));
     }
-
-    let mut jobs: BTreeMap<Key, Vec<ClockJob>> = BTreeMap::new();
-    for record in &records {
-        if record.job_type == "service" {
-            continue;
-        }
-        let Some(queued_at) = parse_time(&record.queued_at) else {
-            continue;
-        };
-        let phase = match record.state.as_str() {
-            "pending" => JobPhase::Waiting,
-            "running" => JobPhase::Running,
-            _ => JobPhase::Ended,
-        };
-        let tickets: Vec<Key> = match record.rank_tickets.as_deref() {
-            Some(tickets) if !tickets.is_empty() => tickets
-                .iter()
-                .map(|(repo, number)| (canonical_repo(repo), *number))
-                .collect(),
-            _ => record
-                .requester_session_id
-                .as_deref()
-                .and_then(|session| held.get(session))
-                .cloned()
-                .unwrap_or_default(),
-        };
-        let quiet = crate::utilization::quiet::status(&path, record);
-        let job = ClockJob {
-            job_type: record.job_type.clone(),
-            phase,
-            queued_at,
-            started_at: record.started_at.as_deref().and_then(parse_time),
-            finished_at: record.finished_at.as_deref().and_then(parse_time),
-            timeout_seconds: record.timeout_seconds,
-            holding_reason: record.holding_reason.clone(),
-            position: positions.get(&record.id).copied(),
-            quiet_since: quiet.quiet_since.as_deref().and_then(parse_time),
-            cpu_seconds: quiet.cpu_seconds,
-        };
-        for key in tickets {
-            jobs.entry(key).or_default().push(job.clone());
-        }
+    // A ticket claim and a claimed PR linked to it name the same ticket.
+    for tickets in held.values_mut() {
+        tickets.sort();
+        tickets.dedup();
     }
-    Ok(jobs)
+    Ok(held)
+}
+
+/// A queue job's tickets: its `rank_tickets`, or else, when that is absent
+/// or empty, its requester's held tickets.
+pub(super) fn job_tickets(
+    record: &crate::queue::QueueJobRecord,
+    held: &BTreeMap<String, Vec<Key>>,
+) -> Vec<Key> {
+    match record.rank_tickets.as_deref() {
+        Some(tickets) if !tickets.is_empty() => tickets
+            .iter()
+            .map(|(repo, number)| (canonical_repo(repo), *number))
+            .collect(),
+        _ => record
+            .requester_session_id
+            .as_deref()
+            .and_then(|session| held.get(session))
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
