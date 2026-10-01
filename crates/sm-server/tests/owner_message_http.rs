@@ -1768,7 +1768,8 @@ async fn check_clears_a_review_request_and_a_finished_summary_from_the_agents_pa
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["kind"], "finished");
-    assert!(body["facts"]["finished"].is_null(), "{body}");
+    // The summary stays on the card as read context (sm#1932).
+    assert_eq!(body["facts"]["finished"]["read"], true, "{body}");
     assert_ne!(
         row(&inbox(&f, "open").await, "agent:eng00001")["group"],
         "finished"
