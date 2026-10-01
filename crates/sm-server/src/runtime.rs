@@ -607,6 +607,16 @@ impl TmuxRuntime {
         Ok(())
     }
 
+    /// This runtime, launching Claude under `name` (`claude --name`). A name
+    /// set at launch spares the session a `/rename` later, which would make
+    /// Claude re-cache the whole conversation.
+    pub fn with_claude_display_name(&self, name: &str) -> Self {
+        let mut runtime = self.clone();
+        runtime.claude_args.push("--name".to_owned());
+        runtime.claude_args.push(name.to_owned());
+        runtime
+    }
+
     pub fn restore_session(
         &self,
         spec: &TmuxSessionSpec,
@@ -3962,6 +3972,32 @@ esac
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn claude_display_name_is_a_launch_flag_ahead_of_the_prompt() {
+        let runtime = TmuxRuntime::from_config(&RustCoreConfig::default())
+            .with_claude_display_name("sm-1931");
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: "/tmp".to_owned(),
+            log_file: PathBuf::from("/tmp/session.log"),
+            provider: "claude".to_owned(),
+            initial_message: Some("do the work".to_owned()),
+            force_initial_prompt_stdin: false,
+            claude_session_id: None,
+            model: None,
+            reasoning_effort: None,
+        };
+
+        let command = runtime.launch_command(&spec, "argv").unwrap();
+
+        assert!(
+            command.ends_with("'--name' 'sm-1931' -- 'do the work'"),
+            "{command}"
+        );
     }
 
     #[test]

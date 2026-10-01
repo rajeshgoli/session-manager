@@ -13877,6 +13877,16 @@ async fn patch_session_metadata_drains_native_rename_when_runtime_enabled() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    // Claude took its name at launch (`--name`), so nothing waits to rename it.
+    let launch_native_renames: i64 = Connection::open(&queue_db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'rename-runtime' AND message_category = 'native_rename'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(launch_native_renames, 0);
 
     let queue = RetainedQueueStore::new(queue_db_path.clone());
     queue

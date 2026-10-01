@@ -4673,7 +4673,22 @@ impl SessionStore {
         // global state mutex while waiting for external provider progress.
         drop(_guard);
 
-        if let Err(error) = runtime.create_session(&spec) {
+        // Claude takes its name at launch. A `/rename` queued instead waits
+        // for the first idle prompt, which can be minutes into a handoff
+        // brief or initial prompt, and re-caches the whole conversation.
+        let launch_name = record
+            .friendly_name
+            .as_deref()
+            .filter(|name| record.provider == "claude" && is_safe_provider_native_rename_name(name))
+            .map(str::to_owned);
+        let named_runtime = launch_name
+            .as_deref()
+            .map(|name| runtime.with_claude_display_name(name));
+        if let Err(error) = named_runtime
+            .as_ref()
+            .unwrap_or(runtime)
+            .create_session(&spec)
+        {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
             let error_message = format!("{error:#}");
@@ -4863,7 +4878,9 @@ impl SessionStore {
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(record.id.clone(), artifacts.event_stream_path)?;
         }
-        self.queue_initial_native_rename(&record);
+        if launch_name.is_none() {
+            self.queue_initial_native_rename(&record);
+        }
         Ok(record)
     }
 
