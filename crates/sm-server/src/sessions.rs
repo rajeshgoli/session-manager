@@ -5108,11 +5108,18 @@ impl SessionStore {
             else {
                 return Ok(());
             };
-            let target = {
+            let (target, text) = {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                reparent_runtime_delivery_target(state, session_id, runtime)?
+                let text = raw_session_object(state, session_id)
+                    .map(|session| text_with_task_reopen_notice(session, &message.text))
+                    .unwrap_or(std::borrow::Cow::Borrowed(message.text.as_str()))
+                    .into_owned();
+                (
+                    reparent_runtime_delivery_target(state, session_id, runtime)?,
+                    text,
+                )
             };
             let Some(target) = target else {
                 return Ok(());
@@ -5126,14 +5133,13 @@ impl SessionStore {
             let delivered = match &target.delivery_route {
                 ReparentRuntimeDeliveryRoute::Tmux => runtime
                     .for_socket_name(target.tmux_socket_name.as_deref())
-                    .send_input(&target.tmux_session, &message.text)?,
+                    .send_input(&target.tmux_session, &text)?,
                 ReparentRuntimeDeliveryRoute::CodexForkControl { control_socket } => {
                     match control_socket
                         .as_ref()
                         .map_err(|error| anyhow::anyhow!(error.clone()))
-                        .and_then(|control_socket| {
-                            codex_fork_submit_message(control_socket, &message.text)
-                        }) {
+                        .and_then(|control_socket| codex_fork_submit_message(control_socket, &text))
+                    {
                         Ok(()) => {
                             control_result = Some(Ok(()));
                             true
@@ -5143,7 +5149,7 @@ impl SessionStore {
                             if runtime.codex_fork_control_tmux_fallback_enabled() {
                                 runtime
                                     .for_socket_name(target.tmux_socket_name.as_deref())
-                                    .send_input(&target.tmux_session, &message.text)?
+                                    .send_input(&target.tmux_session, &text)?
                             } else {
                                 false
                             }
