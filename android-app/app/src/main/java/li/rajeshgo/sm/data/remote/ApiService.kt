@@ -262,6 +262,18 @@ interface ApiService {
     @POST("inbox/done")
     suspend fun markInboxDone(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
 
+    @POST("inbox/archive")
+    suspend fun archiveInbox(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
+
+    @POST("inbox/unarchive")
+    suspend fun unarchiveInbox(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
+
+    @GET("docs/{doc_id}/ask-target")
+    suspend fun getDocAskTarget(@Path("doc_id") docId: String): li.rajeshgo.sm.data.model.DocAskTarget
+
+    @POST("docs/{doc_id}/ask")
+    suspend fun askDoc(@Path("doc_id") docId: String, @Body request: li.rajeshgo.sm.data.model.DocAskRequest): kotlinx.serialization.json.JsonObject
+
     /** Guestbook entries (sm#1660), newest first; `before` is the previous page's `next_before`. */
     @GET("guestbook?format=json")
     suspend fun getGuestbook(

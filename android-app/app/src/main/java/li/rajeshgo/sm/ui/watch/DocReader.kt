@@ -63,6 +63,8 @@ import li.rajeshgo.sm.ui.theme.Cyan
 import li.rajeshgo.sm.ui.theme.Panel
 import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
+import li.rajeshgo.sm.ui.inbox.ThreadScreen
+import li.rajeshgo.sm.ui.inbox.ThreadTarget
 
 /** What the reader needs to load owner pages (`/docs/`, `/history`, `/t/`) as the app: the API base, the SM device bearer token and the Cloudflare device certificate. */
 class DocReaderAuth(
@@ -332,6 +334,7 @@ fun DocReaderOverlay(
     val context = androidx.compose.ui.platform.LocalContext.current
     var loading by remember { mutableStateOf(true) }
     var loadedTitle by remember(page) { mutableStateOf<String?>(null) }
+    var askThread by remember(page) { mutableStateOf<ThreadTarget?>(null) }
     var outage by remember(page) { mutableStateOf<ReaderOutage?>(null) }
     val readerLoad = remember(page) { ReaderLoad() }
     val readyAuth = auth?.getOrNull()
@@ -350,7 +353,7 @@ fun DocReaderOverlay(
         if (readyAuth != null) webView.loadOwnerPage(down.url, readyAuth, readerLoad)
     }
 
-    BackHandler {
+    BackHandler(enabled = askThread == null) {
         val webView = webViewRef
         if (readyAuth != null && webView != null && history.size > 1) {
             history.removeAt(history.lastIndex)
@@ -397,7 +400,23 @@ fun DocReaderOverlay(
                         }
                     }
                     actions?.invoke()
-                    if (readyAuth != null && page.path.startsWith("/docs/")) {
+                    if (readyAuth != null && (currentPath ?: page.path).startsWith("/docs/")) {
+                        OutlinedButton(
+                            onClick = {
+                                webViewRef?.evaluateJavascript("window.__smDoc && window.__smDoc.config && window.__smDoc.config.docId") { idJson ->
+                                    val docId = runCatching { org.json.JSONArray("[$idJson]").getString(0) }.getOrNull()?.takeIf { it.isNotBlank() && it != "null" }
+                                    if (docId == null) {
+                                        android.widget.Toast.makeText(context, "Doc is still loading", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        webViewRef?.evaluateJavascript("window.getSelection().toString()") { quoteJson ->
+                                            val quote = runCatching { org.json.JSONArray("[$quoteJson]").getString(0) }.getOrNull()?.takeIf { it.isNotBlank() }
+                                            askThread = ThreadTarget(null, null, title, docId, quote)
+                                        }
+                                    }
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        ) { Text("Ask") }
                         OutlinedButton(
                             onClick = {
                                 webViewRef?.let { view ->
@@ -457,6 +476,15 @@ fun DocReaderOverlay(
                 }
             }
         }
+    }
+    askThread?.let { target ->
+        ThreadScreen(
+            target = target,
+            onClose = { askThread = null },
+            onOpenTerminal = {},
+            onDone = { askThread = null },
+            onMessage = { message -> android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show() },
+        )
     }
 }
 

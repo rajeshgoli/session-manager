@@ -26,6 +26,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -61,14 +63,19 @@ import java.net.URLDecoder
 import java.time.OffsetDateTime
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.InboxSendRequest
+import li.rajeshgo.sm.data.model.DocAskRequest
+import li.rajeshgo.sm.data.model.DocAskTarget
 import li.rajeshgo.sm.data.model.InboxThread
 import li.rajeshgo.sm.data.model.InboxThreadItem
+import li.rajeshgo.sm.data.model.InboxReplyOption
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -93,7 +100,7 @@ import li.rajeshgo.sm.ui.watch.ReaderPage
 import li.rajeshgo.sm.ui.watch.loadDocReaderAuth
 
 /** What a native thread opens on: a thread key (an Inbox row), else an agent's current thread. */
-data class ThreadTarget(val key: String?, val sessionId: String?, val title: String)
+data class ThreadTarget(val key: String?, val sessionId: String?, val title: String, val docId: String? = null, val quote: String? = null, val foldedBy: String? = null)
 
 /**
  * The thread an sm page path names: `/inbox/thread/{key}` or `/inbox/agent/{id}`
@@ -134,12 +141,35 @@ fun threadTerminalAgent(thread: InboxThread): Pair<String, String>? {
     return thread.items.lastOrNull { it.sender != null }?.sender?.let { it.id to it.name }
 }
 
+/** Ask shows the doc's conversation starting with its first published revision. */
+fun docAskThread(thread: InboxThread, firstPublishedAt: String): InboxThread =
+    if (firstPublishedAt.isBlank()) thread else {
+        val firstSecond = runCatching { OffsetDateTime.parse(firstPublishedAt).toEpochSecond() }.getOrNull() ?: return thread
+        thread.copy(items = thread.items.filter { item ->
+            val itemSecond = runCatching { OffsetDateTime.parse(item.at).toEpochSecond() }.getOrNull()
+            itemSecond == null || itemSecond >= firstSecond
+        })
+    }
+
+/** Match the server's live-first reply choice even when an ended sender forwards to that agent. */
+fun defaultReplyOptionId(thread: InboxThread): String? =
+    thread.replyOptions.firstOrNull { it.status == "live" && it.canSend }?.id
+        ?: thread.replyOptions.firstOrNull { it.canSend }?.id
+
+fun replyOptionLabel(option: InboxReplyOption): String =
+    buildString {
+        append(option.name)
+        option.recipientName?.takeIf { it != option.name }?.let { append(" → "); append(it) }
+        if (option.restores) append(" · restores")
+    }
+
 data class ThreadUiState(
     val thread: InboxThread? = null,
     val loading: Boolean = true,
     val error: String? = null,
     val sending: Boolean = false,
     val busy: Boolean = false,
+    val askTarget: DocAskTarget? = null,
 )
 
 class ThreadViewModel(application: Application) : AndroidViewModel(application) {
@@ -164,6 +194,7 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
     fun open(target: ThreadTarget) {
         if (this.target == target) return
         this.target = target
+        _uiState.value = ThreadUiState()
         load()
     }
 
@@ -172,9 +203,13 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
         val target = target ?: return
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            val key = _uiState.value.thread?.threadKey ?: target.key
-            runCatching { repository.fetchInboxThread(url, token, key, target.sessionId) }
-                .onSuccess { thread -> _uiState.update { it.copy(thread = thread, loading = false, error = null) } }
+            runCatching {
+                val askTarget = target.docId?.let { repository.fetchDocAskTarget(url, token, it) }
+                val key = askTarget?.threadKey ?: _uiState.value.thread?.threadKey ?: target.key
+                val thread = repository.fetchInboxThread(url, token, key, target.sessionId)
+                (askTarget?.let { docAskThread(thread, it.firstPublishedAt) } ?: thread) to askTarget
+            }
+                .onSuccess { (thread, askTarget) -> _uiState.update { it.copy(thread = thread, askTarget = askTarget, loading = false, error = null) } }
                 .onFailure { error ->
                     if (error is CancellationException) throw error
                     if (error is SessionManagerAuthException) settingsRepository.clearAuth()
@@ -184,16 +219,20 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /** Sends [text] to the thread's agent; [onResult] gets the failure's text, or null. */
-    fun send(text: String, submissionId: String, onResult: (String?) -> Unit) {
+    fun send(text: String, submissionId: String, recipient: String?, quote: String?, onResult: (String?) -> Unit) {
         val key = _uiState.value.thread?.threadKey ?: return
         if (_uiState.value.sending || text.isBlank()) return
         _uiState.update { it.copy(sending = true) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch _uiState.update { it.copy(sending = false) }
-            val result = repository.sendInboxThread(url, token, key, InboxSendRequest(submissionId, text.trim()))
+            val result = target?.docId?.let { docId ->
+                repository.askDoc(url, token, docId, DocAskRequest(text.trim(), quote, recipient ?: _uiState.value.askTarget?.default ?: "reader"))
+            } ?: repository.sendInboxThread(url, token, key, InboxSendRequest(submissionId, text.trim(), recipient))
             _uiState.update { it.copy(sending = false) }
             onResult(result.exceptionOrNull()?.let { it.message ?: "Send failed" })
-            if (result.isSuccess) load()
+            if (result.isSuccess) {
+                load()
+            }
         }
     }
 
@@ -201,6 +240,11 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
     fun done(onResult: (String?) -> Unit) {
         val key = _uiState.value.thread?.threadKey ?: return
         write(onResult) { url, token -> repository.markInboxDone(url, token, key) }
+    }
+
+    fun archive(unarchive: Boolean, onResult: (String?) -> Unit) {
+        val thread = _uiState.value.thread ?: return
+        write(onResult) { url, token -> repository.archiveInbox(url, token, thread.threadKey, unarchive) }
     }
 
     /** ✓ Answered (spec 1782 C4): each agent with an open question here stops waiting on you. */
@@ -240,6 +284,9 @@ fun ThreadScreen(
 ) {
     val viewModel: ThreadViewModel = viewModel(key = "thread:${target.key ?: target.sessionId}")
     LaunchedEffect(target) { viewModel.open(target) }
+    LaunchedEffect(target) {
+        while (isActive) { delay(10_000); viewModel.load() }
+    }
     val state by viewModel.uiState.collectAsState()
     val uriHandler = LocalUriHandler.current
     var reader by remember { mutableStateOf<ReaderPage?>(null) }
@@ -248,6 +295,8 @@ fun ThreadScreen(
     var submissionId by rememberSaveable(target) { mutableStateOf(UUID.randomUUID().toString()) }
     // The text last sent under [submissionId]: an edit after it is a new message, with a new id.
     var attempted by rememberSaveable(target) { mutableStateOf<String?>(null) }
+    var recipient by rememberSaveable(target) { mutableStateOf<String?>(null) }
+    var quote by rememberSaveable(target) { mutableStateOf(target.quote) }
     val listState = rememberLazyListState()
     val thread = state.thread
     val now = remember(thread) { OffsetDateTime.now() }
@@ -277,6 +326,9 @@ fun ThreadScreen(
                     modifier = Modifier.weight(1f),
                 )
                 if (thread != null) {
+                    TextButton(onClick = { viewModel.archive(target.foldedBy == "archived") { error -> if (error == null) onDone() else onMessage(error) } }, enabled = !state.busy) {
+                        Text(if (target.foldedBy == "archived") "Unarchive" else "Archive")
+                    }
                     OutlinedButton(
                         onClick = { viewModel.done { error -> if (error == null) onDone() else onMessage(error) } },
                         enabled = !state.busy,
@@ -287,7 +339,7 @@ fun ThreadScreen(
             }
             if (thread != null) {
                 val chips = buildList {
-                    threadTerminalAgent(thread)?.let { (id, name) ->
+                    threadTerminalAgent(thread)?.takeIf { target.docId == null }?.let { (id, name) ->
                         add(LinkChip(name, TextSecondary, onTerminal = { onOpenTerminal(id) }))
                     }
                     threadWorkLink(thread.threadKey)?.let { (text, url) -> add(LinkChip(text, Cyan) { uriHandler.openUri(url) }) }
@@ -331,6 +383,11 @@ fun ThreadScreen(
                     thread = thread,
                     draft = draft,
                     sending = state.sending,
+                    askTarget = state.askTarget,
+                    recipient = recipient,
+                    onRecipient = { recipient = it },
+                    quote = quote,
+                    onRemoveQuote = { quote = null },
                     onDraft = { text ->
                         draft = text
                         if (attempted != null && text != attempted) {
@@ -340,11 +397,12 @@ fun ThreadScreen(
                     },
                     onSend = {
                         attempted = draft
-                        viewModel.send(draft, submissionId) { error ->
+                        viewModel.send(draft, submissionId, recipient, quote) { error ->
                             if (error == null) {
                                 draft = ""
                                 submissionId = UUID.randomUUID().toString()
                                 attempted = null
+                                quote = null
                             } else {
                                 onMessage(error)
                             }
@@ -373,6 +431,17 @@ private fun itemAge(at: String, now: OffsetDateTime): String =
 
 @Composable
 private fun ThreadItem(item: InboxThreadItem, now: OffsetDateTime, onOpenLink: (String) -> Unit) {
+    if (item.type == "doc_revision") {
+        Bubble(color = Panel, border = Border, edge = Fuchsia) {
+            Text(item.text ?: "Document revision", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            Meta(listOfNotNull(item.sender?.name, item.pr?.let { "PR #$it" }, item.sha?.take(7), item.reviewState).joinToString(" · "))
+            item.link?.let { link -> Row {
+                TextButton(onClick = { onOpenLink(link) }) { Text("Open") }
+                TextButton(onClick = { onOpenLink("${link.substringBefore('#')}#sm-review") }) { Text("Review") }
+            } }
+        }
+        return
+    }
     when (item.kind) {
         "owner" -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
             Bubble(color = CyanDeep, border = null, edge = null) {
@@ -400,7 +469,7 @@ private fun ThreadItem(item: InboxThreadItem, now: OffsetDateTime, onOpenLink: (
         )
         "turn", "agent_reply" -> Bubble(color = Panel, border = Border, edge = Cyan) {
             Text(
-                (if (item.kind == "turn") "Last turn" else "Reply") + " · " + itemAge(item.at, now),
+                listOfNotNull(item.sender?.name, if (item.kind == "turn") "Last turn" else "Reply", itemAge(item.at, now)).filter { it.isNotBlank() }.joinToString(" · "),
                 color = Cyan,
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
@@ -458,21 +527,43 @@ private fun ReplyBox(
     thread: InboxThread,
     draft: String,
     sending: Boolean,
+    askTarget: DocAskTarget?,
+    recipient: String?,
+    onRecipient: (String) -> Unit,
+    quote: String?,
+    onRemoveQuote: () -> Unit,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
 ) {
     Surface(color = PanelMuted, shape = RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-            val target = thread.replyTo?.name
-            if (!thread.canSend || target == null) {
+            if (!quote.isNullOrBlank()) Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("“$quote”", modifier = Modifier.weight(1f), maxLines = 3, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = onRemoveQuote) { Text("Remove") }
+            }
+            val choices = if (askTarget != null) buildList {
+                if (askTarget.author?.live == true) add("author" to askTarget.author.name)
+                add("reader" to (askTarget.reader?.name ?: "Reader agent"))
+                if (askTarget.author?.restorable == true) add("restore_author" to "Bring back ${askTarget.author.name} · reloads about ${((askTarget.author.contextTokens ?: 0) + 500) / 1000}k tokens")
+            } else thread.replyOptions.filter { it.canSend }.map { it.id to replyOptionLabel(it) }
+            val chosen = recipient ?: (if (askTarget != null) askTarget.default else defaultReplyOptionId(thread))
+            val target = choices.firstOrNull { it.first == chosen }?.second ?: thread.replyTo?.name
+            if (choices.isEmpty() && (askTarget == null && !thread.canSend)) {
                 Text("No agent is left to reply to.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                 return@Column
             }
+            var menuOpen by remember { mutableStateOf(false) }
+            if (choices.size > 1) Box {
+                TextButton(onClick = { menuOpen = true }) { Text("To: ${target ?: "Select agent"} ▾") }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    choices.forEach { (id, name) -> DropdownMenuItem(text = { Text(name) }, onClick = { onRecipient(id); menuOpen = false }) }
+                }
+            } else Text("To: ${target ?: "Reader agent"}", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
             Row(verticalAlignment = Alignment.Bottom) {
                 OutlinedTextField(
                     value = draft,
                     onValueChange = onDraft,
-                    placeholder = { Text("Write to $target") },
+                    placeholder = { Text(if (askTarget != null) "Ask about this doc…" else "Write to $target") },
                     enabled = !sending,
                     maxLines = 6,
                     modifier = Modifier.weight(1f),
@@ -486,8 +577,9 @@ private fun ReplyBox(
                     else Text("Send", color = if (draft.isNotBlank()) Cyan else TextMuted, fontWeight = FontWeight.Bold)
                 }
             }
-            if (thread.status == "ended") {
-                Text("This agent has ended; a reply goes to $target.", color = Rose, style = MaterialTheme.typography.labelSmall)
+            val restores = if (askTarget == null) thread.replyOptions.firstOrNull { it.id == chosen }?.restores ?: thread.replyTo?.restores ?: false else chosen == "restore_author"
+            if (restores) {
+                Text("Replying brings this agent back.", color = Rose, style = MaterialTheme.typography.labelSmall)
             }
         }
     }

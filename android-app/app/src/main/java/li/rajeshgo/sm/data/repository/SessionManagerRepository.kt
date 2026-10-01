@@ -733,6 +733,21 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).markInboxDone(li.rajeshgo.sm.data.model.InboxDoneRequest(threadKey)) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun archiveInbox(baseUrl: String, token: String, threadKey: String, unarchive: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val request = li.rajeshgo.sm.data.model.InboxDoneRequest(threadKey)
+            if (unarchive) api(baseUrl, token).unarchiveInbox(request) else api(baseUrl, token).archiveInbox(request)
+        }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fetchDocAskTarget(baseUrl: String, token: String, docId: String): li.rajeshgo.sm.data.model.DocAskTarget =
+        withContext(Dispatchers.IO) { executeReadRequest(baseUrl, token) { it.getDocAskTarget(docId) } }
+
+    suspend fun askDoc(baseUrl: String, token: String, docId: String, request: li.rajeshgo.sm.data.model.DocAskRequest): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching { api(baseUrl, token, readTimeoutSeconds = 120).askDoc(docId, request); Unit }.mapFailure(::classifyWriteFailure)
+        }
+
     suspend fun ackNotice(baseUrl: String, token: String, noticeId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).ackNotice(noticeId) }.mapFailure(::classifyWriteFailure)
     }

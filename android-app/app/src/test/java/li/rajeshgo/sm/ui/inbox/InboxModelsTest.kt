@@ -46,6 +46,15 @@ class InboxModelsTest {
         assertTrue(inboxSections(InboxFilter.Done, emptyList()).isEmpty())
     }
 
+    @Test fun workRowsKeepAgentsDocsAndFoldReason() {
+        val response = json.decodeFromString(InboxResponse.serializer(),
+            """{"rows":[{"thread_key":"ticket:o/r#1782","kind":"ticket","title":"#1782 Fit and finish","group":"folded","folded_by":"archived","doc_count":2,"revision_count":5,"agents":["sm-1782","sm-1782-2"]}]}""")
+        val row = response.rows.single()
+        assertEquals("archived", row.foldedBy)
+        assertEquals("sm-1782 · sm-1782-2 · 2 docs, 5 revisions", inboxRowDetail(row))
+        assertEquals("FOLDED · 1", inboxSections(InboxFilter.Open, response.rows).single().first)
+    }
+
     @Test fun agentRowsSayWhatTheyAre() {
         val base = InboxRow(kind = "agent", repo = "trading-core", messageCount = 3, status = "live")
         assertEquals("trading-core · 3 messages · asks you", inboxRowDetail(base.copy(group = "needs_you")))

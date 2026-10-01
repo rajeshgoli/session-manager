@@ -3,6 +3,8 @@ package li.rajeshgo.sm.ui.inbox
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.InboxRow
 import li.rajeshgo.sm.data.model.InboxThread
+import li.rajeshgo.sm.data.model.DocAskTarget
+import li.rajeshgo.sm.data.model.InboxReplyOption
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -38,6 +40,25 @@ class ThreadModelsTest {
         assertEquals("sm-1801", thread.replyTo?.name)
     }
 
+    @Test fun askTargetAndWorkThreadReplyOptionsParse() {
+        val ask = json.decodeFromString(DocAskTarget.serializer(),
+            """{"author":{"id":"s1","name":"sm-1821","state":"ended","live":false,"restorable":true,"context_tokens":380000},"default":"reader","reader":null,"thread_key":"ticket:o/r#1821","first_published_at":"2026-09-30T10:00:00Z"}""")
+        assertEquals("ticket:o/r#1821", ask.threadKey)
+        assertEquals(380000L, ask.author?.contextTokens)
+        assertEquals("2026-09-30T10:00:00Z", ask.firstPublishedAt)
+        val work = json.decodeFromString(InboxThread.serializer(),
+            """{"thread_key":"ticket:o/r#1821","can_send":true,"reply_to":{"id":"s2","name":"sm-1821-2","restores":true,"retired_at":"2026-09-30T10:00:00Z"},"reply_options":[{"id":"s1","name":"sm-1821","status":"ended","can_send":false},{"id":"s2","name":"sm-1821-2","status":"ended","can_send":true,"recipient_id":"s2","recipient_name":"sm-1821-2","restores":true}],"items":[{"kind":"event","type":"doc_revision","doc_id":"abc","pr":1827,"sha":"1234567890abcdef","review_state":"requested","at":"2026-09-30T10:00:00Z","text":"Published: Memo","link":"/docs/session-manager/memo.html?version=1234567890ab"}]}""")
+        assertEquals(true, work.replyTo?.restores)
+        assertEquals("s2", work.replyOptions.last().recipientId)
+        assertEquals("abc", work.items.single().docId)
+        assertEquals("requested", work.items.single().reviewState)
+        val earlier = work.items.single().copy(at = "2026-09-29T10:00:00Z", id = "old")
+        val visible = docAskThread(work.copy(items = listOf(earlier) + work.items), ask.firstPublishedAt)
+        assertEquals(listOf("abc"), visible.items.map { it.docId })
+        val fractional = docAskThread(work, "2026-09-30T10:00:00.789Z")
+        assertEquals(1, fractional.items.size)
+    }
+
     @Test fun answeredClearsTheAgentsThatAsked() {
         assertEquals(listOf("a1b2c3d4"), threadAskers(thread))
         assertEquals(emptyList<String>(), threadAskers(thread.copy(items = thread.items.drop(1))))
@@ -54,6 +75,16 @@ class ThreadModelsTest {
         assertEquals("PR #12 ↗" to "https://github.com/o/r/pull/12", threadWorkLink("pr:o/r#12"))
         assertNull(threadWorkLink("agent:c26eb47e"))
         assertNull(threadWorkLink("docpath:o/r/docs/memo.html"))
+    }
+
+    @Test fun defaultReplyNamesTheLiveSuccessorRatherThanTheEndedForwarder() {
+        val options = listOf(
+            InboxReplyOption(id = "ended", name = "sm-old", status = "ended", canSend = true, recipientId = "live"),
+            InboxReplyOption(id = "live", name = "sm-new", status = "live", canSend = true, recipientId = "live"),
+        )
+        assertEquals("live", defaultReplyOptionId(thread.copy(replyOptions = options)))
+        assertEquals("ended", defaultReplyOptionId(thread.copy(replyOptions = options.take(1))))
+        assertEquals("sm-old → sm-new", replyOptionLabel(options.first().copy(recipientName = "sm-new")))
     }
 
     @Test fun notificationPathsOpenTheirThread() {

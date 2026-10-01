@@ -865,6 +865,9 @@ data class InboxRow(
     @SerialName("doc_id") val docId: String? = null,
     /** The reader page of the thread's doc; a `doc` row opens it (spec 1782 J3). */
     @SerialName("doc_url") val docUrl: String? = null,
+    @SerialName("doc_count") val docCount: Int = 0,
+    @SerialName("folded_by") val foldedBy: String? = null,
+    val agents: List<String> = emptyList(),
 )
 
 /** `GET /inbox/thread/{key}?format=json` (sm#1835): one work thread, oldest item first. */
@@ -876,11 +879,29 @@ data class InboxThread(
     val repo: String = "",
     @SerialName("can_send") val canSend: Boolean = false,
     @SerialName("reply_to") val replyTo: InboxReplyTarget? = null,
+    @SerialName("reply_options") val replyOptions: List<InboxReplyOption> = emptyList(),
     val items: List<InboxThreadItem> = emptyList(),
 )
 
 @Serializable
-data class InboxReplyTarget(val id: String? = null, val name: String? = null)
+data class InboxReplyTarget(
+    val id: String? = null,
+    val name: String? = null,
+    val restores: Boolean = false,
+    @SerialName("retired_at") val retiredAt: String? = null,
+)
+
+@Serializable
+data class InboxReplyOption(
+    val id: String = "",
+    val name: String = "",
+    val status: String = "",
+    @SerialName("can_send") val canSend: Boolean = false,
+    @SerialName("recipient_id") val recipientId: String? = null,
+    @SerialName("recipient_name") val recipientName: String? = null,
+    val restores: Boolean = false,
+    @SerialName("retired_at") val retiredAt: String? = null,
+)
 
 /** One thread item; [kind] says which fields it carries. */
 @Serializable
@@ -902,6 +923,11 @@ data class InboxThreadItem(
     /** An event's page on the sm host: a doc revision or a completion report. */
     val link: String? = null,
     val sender: InboxSender? = null,
+    val type: String? = null,
+    @SerialName("doc_id") val docId: String? = null,
+    val pr: Long? = null,
+    val sha: String? = null,
+    @SerialName("review_state") val reviewState: String? = null,
 )
 
 @Serializable
@@ -915,7 +941,30 @@ data class InboxSender(val id: String = "", val name: String = "", val status: S
 data class InboxSendRequest(
     @SerialName("submission_id") val submissionId: String,
     val body: String,
+    val to: String? = null,
 )
+
+@Serializable
+data class DocAskTarget(
+    val author: DocAskAgent? = null,
+    val default: String = "reader",
+    val reader: DocAskAgent? = null,
+    @SerialName("thread_key") val threadKey: String = "",
+    @SerialName("first_published_at") val firstPublishedAt: String = "",
+)
+
+@Serializable
+data class DocAskAgent(
+    val id: String = "",
+    val name: String = "",
+    val state: String = "",
+    val live: Boolean = false,
+    val restorable: Boolean = false,
+    @SerialName("context_tokens") val contextTokens: Long? = null,
+)
+
+@Serializable
+data class DocAskRequest(val text: String, val quote: String? = null, val target: String)
 
 @Serializable
 data class InboxDoneRequest(
