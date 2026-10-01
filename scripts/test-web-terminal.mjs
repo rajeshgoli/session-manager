@@ -204,6 +204,9 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     await page.keyboard.press('Meta+Backslash');
     await page.waitForFunction(() => !document.querySelector('.term-switch'));
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'false');
+    // After all that switching, sm at the top left goes home in one click.
+    await page.locator('.term-bar').getByRole('link', { name: 'sm', exact: true }).click();
+    await page.waitForFunction(() => location.pathname === '/' && !document.querySelector('.term-bar'));
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
