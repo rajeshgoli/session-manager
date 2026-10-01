@@ -17,7 +17,7 @@ const board = load(`${root}/board.js`);
 await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
-const { startBody, providerDefaults } = modules.get(`${root}/board-start.js`).namespace;
+const { startBody, providerDefaults, canStartAnyway, blockedReasons } = modules.get(`${root}/board-start.js`).namespace;
 const { threadHref } = modules.get(`${root}/ui.js`).namespace;
 test('rows preserve every actionable ticket and sort done by closure time', () => {
   const states = ['needs_you', 'close_ready', 'ready', 'in_progress', 'blocked', 'done'];
@@ -64,6 +64,22 @@ test('Start uses rendered name and brief and omits provider-default model/effort
   const codex = providerDefaults(settings, 'codex-fork');
   assert.deepEqual(codex, { provider: 'codex-fork', model: 'astra', reasoning_effort: 'high' });
   assert.deepEqual(providerDefaults(settings, 'claude'), { provider: 'claude', model: null, reasoning_effort: null });
+});
+
+test('early start follows server warnings and blocked reasons never show an empty waits-on label', () => {
+  const ticket = { repo: 'acme/widgets', number: 42, state: 'blocked', warnings: [], waits_on: [{ number: 41, state: 'ready' }] };
+  const form = { provider: 'claude', name: 'sm-42-engineer', brief: 'Work #42' };
+  assert.equal(canStartAnyway(ticket), true);
+  assert.equal(startBody(ticket, form).start_blocked, true);
+  assert.deepEqual(blockedReasons(ticket), ['#42 waits on #41, which is not done.']);
+  for (const warning of ['stale', 'cycle', 'merged_not_closed']) {
+    const blocked = { ...ticket, warnings: [warning], waits_on: [] };
+    assert.equal(canStartAnyway(blocked), false);
+    assert.equal(startBody(blocked, form).start_blocked, undefined);
+    assert.equal(blockedReasons(blocked).length, 1);
+    assert.doesNotMatch(blockedReasons(blocked)[0], /waits on/);
+  }
+  assert.match(blockedReasons({ ...ticket, warnings: ['stale', 'cycle'], waits_on: [] }).join(' '), /stale.*dependency cycle/);
 });
 
 test('merged-but-open ready tickets cannot offer Start', () => {

@@ -1,7 +1,7 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, age } from './ui.js';
-import { TicketStart } from './board-start.js';
+import { TicketStart, blockedReasons, canStartAnyway } from './board-start.js';
 
 export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
 export const BLOCKED_ROW_LIMIT = 12;
@@ -59,12 +59,12 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
     ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
-    ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>Start anyway</button>` : null}
+    ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
     ${ticket.state === 'close_ready' ? html`<span class="ticket-actions"><button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>
       <span class="anchor"><button class="icon-btn" title="More ticket actions" onClick=${() => setMenu(!menu)}>⋯</button>
         ${menu ? html`<${Popover} onClose=${() => setMenu(false)}><button class="btn sm" onClick=${() => { setMenu(false); onStart(ticket); }}>Start instead</button><//>` : null}</span></span>` : null}
-    ${(ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
-    ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">waits on ${blockedText(ticket)}</span>` : null}
+    ${ticket.state !== 'blocked' && (ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
+    ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">${blockedReasons(ticket).join(' ')}</span>` : null}
     ${ticket.state === 'close_ready' ? html`<span class="sub ticket-state cyan">${parts?.done || 0} of ${parts?.total || 0} parts done · All parts done</span>` : null}
     ${ticket.started_early ? html`<span class="sub ticket-state">started early</span>` : null}
     ${!slim ? html`<${Clock} ticket=${ticket} end=${end} hours=${hours} />` : null}
