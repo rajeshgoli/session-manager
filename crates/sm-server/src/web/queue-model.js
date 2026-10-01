@@ -77,7 +77,8 @@ export function reviewJobText(job) {
   return {
     title: `review · ${review.repo.split('/').pop()} #${review.pr_number}`,
     reviewer: match ? match[1] : review.reviewer_label || 'Review run',
-    detail: [match ? match[2].replace(', ', ' · ') : null, `round ${review.round}`, `for ${review.author_name}`].filter(Boolean).join(' · '),
+    detail: [match ? match[2].replace(', ', ' · ') : null, `round ${review.round}`, `for ${review.author_name}`,
+      review.policy_source && review.policy_source !== 'default' ? `${review.policy_source} policy` : null].filter(Boolean).join(' · '),
     why: review.why === 'default' ? null : review.why,
   };
 }

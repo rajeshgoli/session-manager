@@ -1,6 +1,6 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, navigate, Seg, Toggle, age } from './ui.js';
+import { html, api, config, Seg, Toggle, age } from './ui.js';
 import { tokens, tokensOf } from './handoff.js';
 import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
@@ -258,10 +258,10 @@ function Reviews({ data, write }) {
     <${Resource} state=${listing} retry=${reloadListing}>${() => html`<div class="review-policies">${rows.map(row => html`<div class="review-policy-row">
       <span class="sub">${row.scope === 'repo' ? `Repo · ${row.repo.split('/').pop()}` : row.scope === 'lane' ? `Lane · ${row.repo.split('/').pop()} #${row.number}` : `Ticket ${row.repo.split('/').pop()} #${row.number}`}</span>
       <span>${row.policy ? html`<b>${reviewerText(row.policy.reviewer)}</b> <span class="sub">${setByText(row.policy)} · falls back to ${fallbackText(row.policy.fallback)}</span>` : html`<span class="sub">Uses the default</span>`}</span>
-      ${row.scope === 'repo' ? html`<span class="anchor"><button class="btn sm" onClick=${() => setEditing(row.repo)}>${row.policy ? 'Change' : 'Set'}</button>
-        ${editing === row.repo ? html`<${PolicyPopover} scope="repo" repo=${row.repo} title=${`Reviews for ${row.repo}`} policy=${row.policy} align="right"
-          onClose=${() => setEditing(null)} onSaved=${reloadListing} />` : null}</span>`
-        : html`<button class="btn sm" onClick=${() => navigate('/board')}>Board</button>`}
+      <span class="anchor"><button class="btn sm" onClick=${() => setEditing(`${row.scope}:${row.repo}:${row.number}`)}>${row.policy ? 'Change' : 'Set'}</button>
+        ${editing === `${row.scope}:${row.repo}:${row.number}` ? html`<${PolicyPopover} scope=${row.scope} repo=${row.repo} number=${row.number} align="right"
+          title=${`Reviews for ${row.scope === 'repo' ? row.repo : `${row.scope} ${row.repo.split('/').pop()} #${row.number}`}`} policy=${row.policy}
+          onClose=${() => setEditing(null)} onSaved=${reloadListing} />` : null}</span>
     </div>`)}</div>`}</${Resource}>
     <h3>Limits and today</h3>
     <div class="settings-grid">

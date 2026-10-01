@@ -148,6 +148,7 @@ test('a review job card names the PR, reviewer, round, author and fallback reaso
   assert.deepEqual(reviewJobText(job), { title: 'review · far #1851', reviewer: 'Codex run', detail: 'gpt-6-sol · medium · round 1 · for far-1848',
     why: 'GitHub Codex: paused (out of quota since 11:06 pm), so its fallback' });
   assert.equal(reviewJobText({ review: { ...job.review, why: 'default' } }).why, null);
+  assert.equal(reviewJobText({ review: { ...job.review, policy_source: 'ticket #1848' } }).detail, 'gpt-6-sol · medium · round 1 · for far-1848 · ticket #1848 policy');
   assert.equal(reviewJobText({ label: 'cargo' }), null);
 });
 
@@ -162,4 +163,6 @@ test('authors and paired reviewers read their review state on the Agents page', 
   assert.deepEqual(pairedText({ ...paired, request_state: null }), { active: false, text: 'Paired reviewer for #1848 · idle' });
   assert.equal(pairedText(null), null);
   assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { text: 'No jobs' } } }), { text: 'Reviewing PR #1851 for far-1848 · round 1', tone: 'amber' });
+  assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { running: 1, text: 'Tests running 3m', tone: 'green' } } }),
+    { text: 'Reviewing PR #1851 for far-1848 · round 1 · ▶ Tests running 3m', tone: 'green' });
 });

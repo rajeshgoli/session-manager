@@ -94,8 +94,13 @@ export function agentFact(agent, now = Date.now()) {
 
 /** "▶ 2 running · 2h 56m", "⏸ Waiting 8m · 1st in line", or "No jobs". */
 export function jobsFact(agent) {
+  // A paired reviewer leads with its round and keeps its own jobs' status.
   const paired = pairedText(agent.paired_reviewer);
-  if (paired) return { text: paired.text, tone: paired.active ? 'amber' : 'muted' };
+  const own = agent.facts && agent.facts.jobs;
+  if (paired) {
+    if (!own || !own.tone) return { text: paired.text, tone: paired.active ? 'amber' : 'muted' };
+    return { text: `${paired.text} · ${own.running > 0 ? '▶' : '⏸'} ${own.text}`, tone: own.tone };
+  }
   const jobs = agent.facts && agent.facts.jobs;
   if (!jobs || !jobs.tone) return { text: (jobs && jobs.text) || 'No jobs', tone: 'muted' };
   return { text: `${jobs.running > 0 ? '▶' : '⏸'} ${jobs.text}`, tone: jobs.tone };
