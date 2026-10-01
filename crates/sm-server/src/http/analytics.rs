@@ -140,8 +140,8 @@ pub(super) async fn client_analytics_spend(
     Ok(Json(body))
 }
 
-/// The Claude meters the web usage dash shows (sm#1881). Uncached: the
-/// statusline writes samples every few seconds and this read is a handful of
+/// The Claude and Codex meters the web usage dash shows (sm#1881).
+/// Uncached: samples land every few seconds and this read is a handful of
 /// indexed lookups.
 pub(super) async fn client_usage_meters(
     State(state): State<Arc<AppState>>,
@@ -149,9 +149,17 @@ pub(super) async fn client_usage_meters(
 ) -> Result<Json<Value>, ApiError> {
     ensure_client_read(&state, &request)?;
     let usage_db = expand_home(&state.config.usage.db_path);
+    let account_labels: BTreeMap<String, String> = state
+        .config
+        .usage
+        .accounts
+        .iter()
+        .map(|account| (account.key.clone(), account.label.clone()))
+        .collect();
     let body = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        Ok(serde_json::to_value(crate::usage_meters::claude_meters(
+        Ok(serde_json::to_value(crate::usage_meters::meters(
             &usage_db,
+            &account_labels,
             time::OffsetDateTime::now_utc(),
         )?)?)
     })
