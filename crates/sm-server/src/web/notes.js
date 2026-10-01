@@ -132,26 +132,15 @@ export function NotesView({ pane = false, onClose, onType }) {
   const loadSerial = useRef(0);
   const editSerial = useRef(0);
   const queryRef = useRef(query);
-  const hitsRef = useRef(hits); hitsRef.current = hits;
-  const hitsQuery = useRef(null);
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
   const saveRef = useRef(null);
   const changeQuery = value => { queryRef.current = value; setQuery(value); };
-  const search = async (q = query, afterSave = false) => {
+  const search = async (q = query) => {
     const serial = ++searchSerial.current;
-    const openId = current.current.open?.id;
-    const clearIfMissing = afterSave && q && hitsQuery.current === q
-      && hitsRef.current.some(row => row.id === openId);
     try {
       const rows = await api(`/notes/search?q=${encodeURIComponent(q)}`);
       if (serial !== searchSerial.current || q !== queryRef.current) return;
-      if (clearIfMissing && current.current.open?.id === openId && !rows.some(row => row.id === openId)) {
-        changeQuery('');
-        return;
-      }
-      hitsQuery.current = q;
-      hitsRef.current = rows;
       setHits(rows);
       if (!q) setTotal(rows.length);
       setError('');
@@ -232,7 +221,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       if (current.current.open?.id !== note.id) return true;
       current.current.open = result;
       setOpen(result); setConflict(null); setStatus(`Saved · ${age(result.updated_at)}`);
-      search(queryRef.current, true);
+      search(queryRef.current);
       return true;
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
@@ -304,6 +293,8 @@ export function NotesView({ pane = false, onClose, onType }) {
   const selection = () => selectedText(editor.current, current.current.body);
   const cardText = id => async () => (await api(notePath(id))).body;
   const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) navigate('/notes'); else openPanel('notes:view'); };
+  const pinned = query && (pane || compact) && open && !hits.some(hit => hit.id === open.id)
+    ? { id: open.id, title: open.title, updated_at: open.updated_at, snippet: body, matches: [] } : null;
   return html`<section class=${`notes-view ${pane ? 'notes-pane' : 'notes-page'}`}>
     <header class="notes-head"><h1>Notes</h1><div class="notes-tools">
       <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => changeQuery(e.target.value)} />
@@ -316,16 +307,16 @@ export function NotesView({ pane = false, onClose, onType }) {
     <div class="notes-count">${hits.length} of ${total} notes</div>
     ${error ? html`<p class="err">${error}</p>` : null}
     <div class="notes-columns"><div class="notes-list">
-      ${hits.map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
+      ${[...hits, ...(pinned ? [pinned] : [])].map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
         <button class="note-card-main" type="button" onClick=${() => open?.id === hit.id && pane ? collapse() : choose(hit.id)}>
-          <span class="note-title">${hit.title || 'Untitled'}</span><small>${age(hit.updated_at)}</small>
+          <span class="note-title">${hit.title || 'Untitled'}${pinned?.id === hit.id ? ' · Open note' : ''}</span><small>${age(hit.updated_at)}</small>
           <span class="note-snippet"><${Snippet} hit=${hit} /></span>
         </button>
         <${NoteActions} text=${() => open?.id === hit.id ? selection() : cardText(hit.id)()} summary=${open?.id === hit.id ? selection() : hit.title} canType=${!!onType}
           onType=${onType} repos=${repos} />
         ${(pane || compact) && open?.id === hit.id ? editorView() : null}
       </article>`)}
-      ${!hits.length ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
+      ${!hits.length && !pinned ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
     </div>
     ${!pane && !compact ? html`<div class="notes-editor-slot">${open ? editorView() : html`<p class="notes-empty">Choose a note or create one.</p>`}</div>` : null}</div>
     ${conflict ? html`<div class="notes-dialog-backdrop"><div class="notes-dialog" role="dialog" aria-modal="true" aria-label="Changed on another device">

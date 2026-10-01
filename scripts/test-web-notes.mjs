@@ -49,6 +49,9 @@ function server() {
     const method = request.method();
     const json = (body, status = 200) => route.fulfill({ status, json: body });
     if (url.pathname === '/notes/search') {
+      const hold = handler.holdNextSearch;
+      handler.holdNextSearch = null;
+      if (hold) { handler.searchStarted?.(); await hold; }
       const q = (url.searchParams.get('q') || '').toLowerCase();
       return json(notes.filter(note => note.body.toLowerCase().includes(q) || note.title.toLowerCase().includes(q))
         .map(note => ({ id: note.id, title: note.title, updated_at: note.updated_at, chars: note.body.length,
@@ -121,8 +124,12 @@ test('page, terminal pane, actions and a version conflict', async () => {
       assert.ok((await page.locator('.notes-columns').boundingBox()).width <= width);
       if (shots) await page.screenshot({ path: `${shots}/notes-page-${width}-${colorScheme}.png` });
       await page.getByRole('searchbox', { name: 'Search notes' }).fill('merge');
-      await page.waitForFunction(() => document.querySelectorAll('.note-card').length === 1);
-      assert.equal(await page.locator('.note-card').count(), 1);
+      await page.waitForFunction(isNarrow => {
+        const view = document.querySelector('.notes-page');
+        return view?.querySelector('.notes-count')?.textContent === '1 of 2 notes'
+          && view.querySelectorAll('.note-card').length === (isNarrow ? 2 : 1);
+      }, width < 900);
+      assert.equal(await page.locator('.note-card').count(), width < 900 ? 2 : 1);
       await page.getByRole('searchbox', { name: 'Search notes' }).fill('');
       await page.waitForFunction(() => document.querySelectorAll('.note-card').length === 2);
       await page.locator('.note-card').first().locator('.notes-actions').first().getByText('Start agent').click();
@@ -368,12 +375,46 @@ test('an open editor stays visible when a save removes its search match', async 
       assert.equal((await saved).status(), 200);
       await page.waitForFunction(isPane => {
         const view = document.querySelector(isPane ? '.panel .notes-view' : '.notes-page');
-        return view?.querySelector('input[type=search]')?.value === '' && view.querySelectorAll('.note-card').length === 2;
+        return view?.querySelector('.notes-count')?.textContent === '0 of 2 notes'
+          && view.querySelectorAll('.note-card.selected').length === 1;
       }, pane);
+      assert.equal(await view.getByRole('searchbox', { name: 'Search notes' }).inputValue(), 'Review loop');
+      assert.match(await view.locator('.note-card.selected .note-title').textContent(), /Open note/);
       assert.equal(await editor.inputValue(), 'Text without the original match');
       assert.equal(handler.notes.find(note => note.id === 'one').body, 'Text without the original match');
       await context.close();
     }
+  } finally { await browser.close(); }
+});
+
+test('an open editor stays visible when search and save responses overlap', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 390, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor textarea');
+    let releaseSave;
+    handler.holdNextSave = new Promise(resolve => { releaseSave = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('No longer contains the original heading');
+    await saveStarted;
+    let releaseSearch;
+    handler.holdNextSearch = new Promise(resolve => { releaseSearch = resolve; });
+    const searchStarted = new Promise(resolve => { handler.searchStarted = resolve; });
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Review loop');
+    await searchStarted;
+    releaseSave();
+    await page.waitForFunction(() => document.querySelector('.notes-page .notes-count')?.textContent === '0 of 2 notes');
+    releaseSearch();
+    assert.equal(await search.inputValue(), 'Review loop');
+    assert.equal(await editor.inputValue(), 'No longer contains the original heading');
+    assert.match(await page.locator('.note-card.selected .note-title').textContent(), /Open note/);
+    await context.close();
   } finally { await browser.close(); }
 });
 
