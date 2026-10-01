@@ -1,7 +1,8 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
-import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, age } from './ui.js';
-import { TicketStart, blockedReasons, canStartAnyway } from './board-start.js';
+import { createContext } from 'preact';
+import { useContext, useEffect, useRef, useState } from 'preact/hooks';
+import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age } from './ui.js';
+import { TicketStart, LaneWhenReady, blockedReasons, canStartAnyway, chipText, retryBody, laneCandidates } from './board-start.js';
 import { HandoffPopover } from './handoff.js';
 import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
@@ -54,6 +55,27 @@ function Clock({ ticket, end, hours }) {
 export const canStart = (ticket) => ticket.state === 'ready' && !(ticket.warnings || []).includes('merged_not_closed');
 
 const boardChanged = () => bus.emit('board-changed');
+const AutoStartPaused = createContext(false);
+/** Start when ready is offered on a blocked ticket nobody holds (1821 F4). */
+export const canStartWhenReady = (ticket) => ticket.state === 'blocked' && !ticket.holder
+  && !(ticket.warnings || []).includes('merged_not_closed');
+function WhenReadyChip({ ticket, onStart }) {
+  const paused = useContext(AutoStartPaused);
+  const [retrying, setRetrying] = useState(false);
+  const auto = ticket.auto_start;
+  const failed = auto.state === 'failed';
+  const retry = async () => {
+    setRetrying(true);
+    // An edited type no longer matches: retry as Custom.
+    const put = (body) => api('/client/board/auto-start', { method: 'PUT', body });
+    try { await put(retryBody(ticket)).catch(() => put({ ...retryBody(ticket), agent_type: null })); boardChanged(); }
+    catch (e) { toast(e.message); }
+    finally { setRetrying(false); }
+  };
+  return html`<button class=${`when-ready-chip ${failed ? 'amber' : paused ? 'muted' : ''}`} title=${auto.last_error || ''}
+    onClick=${() => onStart(ticket, 'when_ready')}>${chipText(auto, paused)}</button>
+    ${failed ? html`<button class="btn sm" disabled=${retrying} onClick=${retry}>Retry</button>` : null}`;
+}
 function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false, lanePolicy = null }) {
   const [menu, setMenu] = useState(null);
   const parts = ticket.sub_issues;
@@ -62,12 +84,15 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
     <span class="ticket-actions">
+      ${ticket.auto_start ? html`<${WhenReadyChip} ticket=${ticket} onStart=${onStart} />`
+        : canStartWhenReady(ticket) ? html`<button class="link-btn when-ready-link" onClick=${() => onStart(ticket, 'when_ready')}>Start when ready…</button>` : null}
       ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
       ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
       ${ticket.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
       ${ticket.state !== 'done' ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
         ${menu === 'more' ? html`<${Popover} onClose=${() => setMenu(null)} align="right" className="menu">
           ${ticket.state === 'close_ready' ? html`<button onClick=${() => { setMenu(null); onStart(ticket); }}>Start instead</button>` : null}
+          ${canStartWhenReady(ticket) ? html`<button onClick=${() => { setMenu(null); onStart(ticket, 'when_ready'); }}>Start when ready…</button>` : null}
           <button onClick=${() => setMenu('handoff')}>Hand off…</button>
           <button onClick=${() => setMenu('policy')}>Review policy…</button><//>` : null}
         ${menu === 'policy' ? html`<${PolicyPopover} scope="ticket" repo=${ticket.repo} number=${ticket.number} title=${`Reviews for #${ticket.number}`}
@@ -99,6 +124,7 @@ function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy =
 function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move }) {
   const [ending, setEnding] = useState(false);
   const [reviews, setReviews] = useState(false);
+  const [lining, setLining] = useState(false);
   const policy = lane.review_policy;
   const groups = groupTickets(lane.tickets || []);
   const counts = lane.counts;
@@ -119,11 +145,13 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
         ${reviews ? html`<${PolicyPopover} scope="lane" repo=${lane.goal.repo} number=${lane.goal.number} title=${`Reviews for lane ${lane.rank} · ${lane.goal.title}`}
           policy=${policy} align="right" onClose=${() => setReviews(false)} onSaved=${boardChanged} />` : null}</span>
       <div class="lane-actions">${lane.goal.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(lane.goal)}>Close</button>` : null}
+        ${laneCandidates(lane).length ? html`<button class="btn sm" onClick=${() => setLining(true)}>Start lane when ready…</button>` : null}
         <button class="icon-btn" title="Move lane up" disabled=${busy || index === 0} onClick=${() => move(index, -1)}>↑</button>
         <button class="icon-btn" title="Move lane down" disabled=${busy || index === count - 1} onClick=${() => move(index, 1)}>↓</button>
         <button class="btn sm" disabled=${busy} onClick=${() => setEnding(!ending)}>End</button></div>
       ${short ? html`<${TicketRow} ticket=${groups.active[0]} compact end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
     </header>
+    ${lining ? html`<div class="board-start-overlay"><${LaneWhenReady} lane=${lane} onClose=${() => setLining(false)} onSaved=${boardChanged} /></div>` : null}
     ${ending ? html`<div class="lane-confirm">End this lane? Its tickets stay on GitHub.
       <button class="btn sm" onClick=${() => setEnding(false)}>Cancel</button>
       <button class="btn sm danger" disabled=${busy} onClick=${() => mutate(`/client/board/lanes/${lane.id}`, 'DELETE')}>End lane</button></div>` : null}
@@ -192,7 +220,8 @@ export function BoardPage() {
     return mutate('/client/board/order', 'PUT', { lane_ids: ids });
   };
   const close = (ticket) => mutate('/client/board/close', 'POST', { repo: ticket.repo, number: ticket.number });
-  return html`<div class="content board-content">
+  const startTicket = (ticket, mode = 'start') => setStarting({ ticket, mode });
+  return html`<${AutoStartPaused.Provider} value=${!!(data && data.auto_start_paused)}><div class="content board-content">
     <div class="board-toolbar"><span class="sub">${data ? `${data.lanes.length} lanes · updated ${age(data.generated_at)} ago` : 'Loading board…'}</span>
       <${Seg} label="Clock window" value=${hours} options=${[3, 6, 24].map((n) => ({ value: n, label: `${n} h` }))} onChange=${(n) => { store('sm-board-clock-hours', n); setHours(n); }} />
       <button class="btn" disabled=${busy} onClick=${() => mutate('/client/board/refresh', 'POST')}>Refresh</button>
@@ -202,11 +231,12 @@ export function BoardPage() {
     ${error || actionError ? html`<p class="err" role="alert">${actionError || error.message}</p>` : null}
     ${data ? html`
       ${data.lanes.length ? data.lanes.map((lane, index) => html`<${Lane} key=${lane.id} lane=${lane} index=${index} count=${data.lanes.length}
-        end=${data.generated_at} hours=${hours} onStart=${setStarting} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />`) : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
+        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />`) : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
       ${(data.other || []).map((group) => html`<section class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
-        ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${setStarting} onClose=${close} busy=${busy} />`)}
-        ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${setStarting} onClose=${close} busy=${busy} />` : null}</section>`)}
+        ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />`)}
+        ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />` : null}</section>`)}
       <div class="clock-legend"><span class="ball green">agent working</span><span class="ball green">queue job running (hatched)</span><span class="ball amber">queue or review</span><span class="ball magenta">waiting on you</span><span class="ball red">nothing moving</span></div>` : null}
-    ${starting ? html`<div class="board-start-overlay"><${TicketStart} key=${ticketKey(starting)} ticket=${starting} onClose=${() => setStarting(null)} onStarted=${reload} /></div>` : null}
-  </div>`;
+    ${starting ? html`<div class="board-start-overlay"><${TicketStart} key=${`${ticketKey(starting.ticket)} ${starting.mode}`} ticket=${starting.ticket}
+      mode=${starting.mode} onClose=${() => setStarting(null)} onStarted=${reload} /></div>` : null}
+  </div><//>`;
 }

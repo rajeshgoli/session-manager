@@ -1,6 +1,6 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
 import { useEffect, useState } from 'preact/hooks';
-import { html, api, Popover, Seg, homeRelative, toast, openPanel } from './ui.js';
+import { html, api, Popover, Seg, homeRelative, toast, openPanel, stored, store } from './ui.js';
 import { EFFORTS } from './start.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
@@ -35,7 +35,63 @@ export function providerDefaults(settings, provider) {
   return { provider, model: saved.model || null, reasoning_effort: saved.effort || null };
 }
 
-export function TicketStart({ ticket, onClose, onStarted }) {
+// Start when ready (1821 F4). Efforts match the server's agent-type check.
+export const AUTO_EFFORTS = { claude: ['low', 'medium', 'high', 'xhigh', 'max'], 'codex-fork': ['medium', 'high', 'xhigh'] };
+export const CUSTOM = '__custom__';
+export const LAST_TYPE_KEY = 'sm-auto-start-type';
+
+/** "opus[1m]" → "Opus", "claude-sonnet-4-5" → "Sonnet"; null is the provider default. */
+export function modelShort(model) {
+  if (!model) return 'default';
+  const word = model.replace(/\[.*\]$/, '').replace(/^claude-/, '').split(/[-_\s]/)[0] || model;
+  return word[0].toUpperCase() + word.slice(1);
+}
+
+export const typeText = (type) => `${modelShort(type.model)} ${type.effort || 'default'}`;
+
+/** The agent type whose provider, model and effort equal the choice, else ''. */
+export function matchType(types, choice) {
+  const type = (types || []).find((t) => t.provider === choice.provider && t.model === (choice.model || null)
+    && t.effort === (choice.reasoning_effort || null));
+  return type ? type.name : '';
+}
+
+export function chipText(auto, paused) {
+  const head = auto.state === 'failed' ? '⏵ failed' : paused ? '⏵ paused' : '⏵ when ready';
+  return [head, auto.agent_type, typeText({ model: auto.model, effort: auto.effort })].filter(Boolean).join(' · ');
+}
+
+/** The PUT /client/board/auto-start item. A null brief renders the template at start time. */
+export function autoStartBody(ticket, choice, agentType, brief) {
+  const body = { repo: ticket.repo, number: ticket.number, provider: choice.provider };
+  if (agentType) body.agent_type = agentType;
+  if (choice.model) body.model = choice.model;
+  if (choice.reasoning_effort) body.reasoning_effort = choice.reasoning_effort;
+  if (brief != null) body.brief = brief;
+  return body;
+}
+
+const choiceOf = (auto) => ({ provider: auto.provider, model: auto.model, reasoning_effort: auto.effort });
+export const retryBody = (ticket) => autoStartBody(ticket, choiceOf(ticket.auto_start), ticket.auto_start.agent_type, ticket.auto_start.brief);
+
+/** A stored choice as the type it equals, else Custom; else the Tier line, else the last type used. */
+export function defaultType(ticket, types, last) {
+  const auto = ticket.auto_start;
+  if (auto) return matchType(types, choiceOf(auto)) || CUSTOM;
+  const named = (name) => name && (types.find((t) => t.name.toLowerCase() === name.toLowerCase()) || {}).name;
+  return named(ticket.tier) || named(last) || '';
+}
+
+/** Open lane tickets nobody started or claimed, except the goal. */
+export const laneCandidates = (lane) => (lane.tickets || []).filter((t) => ['blocked', 'ready'].includes(t.state)
+  && !t.holder && !(t.warnings || []).includes('merged_not_closed') && !(t.repo === lane.goal.repo && t.number === lane.goal.number));
+
+const autoStartPath = (ticket) => `/client/board/auto-start?${new URLSearchParams({ repo: ticket.repo, number: ticket.number })}`;
+
+/** Start, or with mode when_ready, Start when ready (1821 F4): an agent type fills provider, model and effort. */
+export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
+  const later = mode === 'when_ready';
+  const auto = later && ticket.auto_start;
   const [form, setForm] = useState(null);
   const [settings, setSettings] = useState(null);
   const [models, setModels] = useState([]);
@@ -43,13 +99,29 @@ export function TicketStart({ ticket, onClose, onStarted }) {
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [typeName, setTypeName] = useState(CUSTOM);
+  const [edited, setEdited] = useState(false);
+  const types = (settings && settings.new_agent.agent_types) || [];
   useEffect(() => {
-    if (ticket.state === 'blocked' && !canStartAnyway(ticket)) return;
+    if (!later && ticket.state === 'blocked' && !canStartAnyway(ticket)) return;
     let alive = true;
     const query = new URLSearchParams({ repo: ticket.repo, number: ticket.number });
-    if (ticket.state === 'blocked') query.set('start_blocked', 'true');
+    if (!later && ticket.state === 'blocked') query.set('start_blocked', 'true');
     Promise.all([api(`/client/board/start-options?${query}`), api('/client/settings')])
-      .then(([options, saved]) => { if (alive) { setForm(options); setSettings(saved); } })
+      .then(([options, saved]) => {
+        if (!alive) return;
+        let next = { ...options, template: options.brief };
+        if (later) {
+          const kinds = saved.new_agent.agent_types || [];
+          const name = defaultType(ticket, kinds, stored(LAST_TYPE_KEY, ''));
+          const type = kinds.find((t) => t.name === name);
+          if (auto) next = { ...next, ...choiceOf(auto), brief: auto.brief ?? options.brief };
+          else if (type) next = { ...next, provider: type.provider, model: type.model, reasoning_effort: type.effort };
+          setTypeName(name || CUSTOM);
+          setEdited(!!auto && auto.brief != null);
+        }
+        setForm(next); setSettings(saved);
+      })
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [ticket.repo, ticket.number]);
@@ -62,46 +134,68 @@ export function TicketStart({ ticket, onClose, onStarted }) {
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [form && form.provider, form && form.working_dir]);
-  const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
-  const start = async () => {
+  const set = (patch) => {
+    const next = { ...form, ...patch };
+    setForm(next);
+    if (later) setTypeName(matchType(types, next) || CUSTOM);
+  };
+  const pick = (name) => {
+    const type = types.find((t) => t.name === name);
+    if (!type) { setTypeName(CUSTOM); setExpanded(true); return; }
+    store(LAST_TYPE_KEY, name);
+    set({ provider: type.provider, model: type.model, reasoning_effort: type.effort });
+  };
+  const run = async (method, path, body, done) => {
     if (busy) return;
     setBusy(true); setError(null);
     try {
-      const result = await api('/client/board/start', { method: 'POST', body: startBody(ticket, form) });
-      onClose(); onStarted();
-      toast(`Started ${result.name}`, () => openPanel(`agent:${result.session_id}`));
+      const result = await api(path, { method, body });
+      onClose(); onStarted(); done(result);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   };
+  const start = () => (later
+    ? run('PUT', '/client/board/auto-start', autoStartBody(ticket, form, typeName === CUSTOM ? null : typeName, edited ? form.brief : null),
+      () => toast(`#${ticket.number} starts when ready`))
+    : run('POST', '/client/board/start', startBody(ticket, form), (result) => toast(`Started ${result.name}`, () => openPanel(`agent:${result.session_id}`))));
   const choices = form && form.model && !models.includes(form.model) ? [form.model, ...models] : models;
   const blocked = ticket.state === 'blocked';
-  const startable = !blocked || canStartAnyway(ticket);
+  const startable = later || !blocked || canStartAnyway(ticket);
   return html`<${Popover} onClose=${onClose} className="ticket-start">
-    <h2>${startable ? 'Start' : 'Blocked'} #${ticket.number}</h2>
+    <h2>${later ? `Start #${ticket.number} when ready` : `${startable ? 'Start' : 'Blocked'} #${ticket.number}`}</h2>
     <p class="sub">${ticket.title}</p>
-    ${blocked ? blockedReasons(ticket).map((reason) => html`<p>${reason}</p>`) : null}
+    ${later ? html`<p>${blocked ? `${blockedReasons(ticket)[0]} It starts at the next refresh after that.` : 'Ready: it starts at the next refresh.'}</p>
+      ${auto && auto.state === 'failed' ? html`<p class="err">Could not start after ${auto.attempts} tries: ${auto.last_error}</p>` : null}
+      ${settings && settings.new_agent.auto_start_paused ? html`<p class="amber">Auto-start is paused (Settings › New agents).</p>` : null}`
+      : blocked ? blockedReasons(ticket).map((reason) => html`<p>${reason}</p>`) : null}
     ${startable && form ? html`
+      ${later ? html`<div class="fld"><span class="l">Agent type</span><${Seg} label="Agent type" value=${typeName} onChange=${pick}
+        options=${[...types.map((t) => ({ value: t.name, label: t.name })), { value: CUSTOM, label: 'Custom' }]} /></div>` : null}
       <${Seg} label="Provider" value=${form.provider}
         options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
         onChange=${(provider) => set(providerDefaults(settings, provider))} />
       <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${homeRelative(form.working_dir)}</span>
         <button class="link-btn" onClick=${() => setExpanded(!expanded)}>${expanded ? 'Less' : 'Change'}</button></div>
-      <div class="line"><span>Named ${form.name}</span><button class="link-btn" onClick=${() => setPreview(!preview)}>Preview</button></div>
+      <div class="line"><span>Named ${form.name}${later ? ` · first message ${edited ? 'edited' : 'default'}` : ''}</span><span>
+        ${later && edited ? html`<button class="link-btn" onClick=${() => { setEdited(false); set({ brief: form.template }); }}>Use default</button> ` : null}
+        <button class="link-btn" onClick=${() => setPreview(!preview)}>Preview</button></span></div>
       ${preview ? html`<pre class="brief-preview">${form.brief}</pre>` : null}
       ${expanded ? html`
         <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
           <option value="">Provider default</option>${choices.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
         <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
-          options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]}
+          options=${[{ value: '', label: 'default' }, ...((later ? AUTO_EFFORTS : EFFORTS)[form.provider] || []).map((e) => ({ value: e, label: e }))]}
           onChange=${(value) => set({ reasoning_effort: value || null })} /></div>
-        <label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>
+        ${later ? null : html`<label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>`}
         <div class="fld"><span class="l">Workspace</span><span class="mono">${homeRelative(form.working_dir)}</span></div>
-        <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief} onInput=${(e) => set({ brief: e.target.value })}></textarea></label>` : null}
-      <${ReviewerRow} form=${form} set=${set} />
+        <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief}
+          onInput=${(e) => { if (later) setEdited(true); set({ brief: e.target.value }); }}></textarea></label>` : null}
+      ${later ? null : html`<${ReviewerRow} form=${form} set=${set} />`}
     ` : startable && !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
-    <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable ? 'Cancel' : 'Close'}</button>
-      ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
+    <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable && !later ? 'Cancel' : 'Close'}</button>
+      ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast('Cancelled'))}>Cancel auto-start</button>` : null}
+      ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
 }
 
@@ -118,4 +212,82 @@ function ReviewerRow({ form, set }) {
       note=${form.reviewer.kind === 'paired' ? `Starts at the first review request, in ${form.name}'s checkout, as ${form.name}-reviewer. It may build and run tests, never edit.` : null} />`
       : html`<p class="sub">${resolved ? `${reviewerText(resolved.resolved)} · from ${resolved.source}` : 'The policy a review request would use.'}</p>`}
   </div></div>`;
+}
+
+/** Start lane when ready (1821 F4): a type and first message per ticket, one request. */
+export function LaneWhenReady({ lane, onClose, onSaved }) {
+  const tickets = laneCandidates(lane);
+  const [types, setTypes] = useState(null);
+  const [rows, setRows] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const key = (t) => `${t.repo}#${t.number}`;
+  useEffect(() => {
+    let alive = true;
+    api('/client/settings').then((saved) => {
+      if (!alive) return;
+      const kinds = saved.new_agent.agent_types || [];
+      const last = stored(LAST_TYPE_KEY, '');
+      setRows(Object.fromEntries(tickets.map((t) => [key(t), { type: defaultType(t, kinds, last),
+        edited: !!t.auto_start && t.auto_start.brief != null, text: t.auto_start ? t.auto_start.brief : null, open: false }])));
+      setTypes(kinds);
+    }).catch((e) => alive && setError(e.message));
+    return () => { alive = false; };
+  }, []);
+  const set = (t, patch) => setRows((prev) => ({ ...prev, [key(t)]: { ...prev[key(t)], ...patch } }));
+  const choose = (t, type) => { set(t, { type }); if (type && type !== CUSTOM) store(LAST_TYPE_KEY, type); };
+  const toggleMessage = async (t) => {
+    const row = rows[key(t)];
+    if (row.open || row.template != null) { set(t, { open: !row.open }); return; }
+    try {
+      const options = await api(`/client/board/start-options?${new URLSearchParams({ repo: t.repo, number: t.number })}`);
+      set(t, { open: true, template: options.brief, text: row.edited ? row.text : options.brief });
+    } catch (e) { setError(e.message); }
+  };
+  const item = (t) => {
+    const row = rows[key(t)];
+    const brief = row.edited ? row.text : null;
+    if (row.type === CUSTOM) return retryBody({ ...t, auto_start: { ...t.auto_start, agent_type: null, brief } });
+    const type = types.find((k) => k.name === row.type);
+    return autoStartBody(t, { ...type, reasoning_effort: type.effort }, type.name, brief);
+  };
+  const save = async () => {
+    if (busy) return;
+    setBusy(true); setError(null);
+    try {
+      // Cancel first: the PUT's recompute could start a dropped ticket.
+      for (const t of tickets.filter((t) => t.auto_start && !rows[key(t)].type)) await api(autoStartPath(t), { method: 'DELETE' });
+      const chosen = tickets.filter((t) => rows[key(t)].type);
+      if (chosen.length) {
+        await api('/client/board/auto-start/lane', { method: 'PUT',
+          body: { goal_repo: lane.goal.repo, goal_number: lane.goal.number, tickets: chosen.map(item) } });
+      }
+      onClose(); onSaved();
+      toast(`Lane ${lane.rank} saved`);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+  return html`<${Popover} onClose=${onClose} className="ticket-start lane-when-ready">
+    <h2>Start lane ${lane.rank} when ready</h2>
+    <p class="sub">${lane.goal.title}</p>
+    ${types ? html`
+      <div class="lwr-table">
+        <div class="lwr-row lwr-head"><span>Ticket</span><span>Agent type</span><span>First message</span></div>
+        ${tickets.map((t) => { const row = rows[key(t)]; const auto = t.auto_start; return html`<div class="lwr-row" key=${key(t)}>
+          <span class="lwr-ticket"><span class="mono">#${t.number}</span> ${t.title}<span class="sub">${t.state === 'ready' ? 'Ready · starts at the next refresh.' : blockedReasons(t)[0]}${auto && auto.state === 'failed' ? ' Last start failed.' : ''}</span></span>
+          <span><select class="inp" aria-label=${`Agent type for #${t.number}`} value=${row.type} onChange=${(e) => choose(t, e.target.value)}>
+            <option value="">Don't start</option>
+            ${types.map((type) => html`<option value=${type.name}>${type.name} · ${typeText(type)}</option>`)}
+            ${auto && defaultType(t, types, '') === CUSTOM ? html`<option value=${CUSTOM}>Custom · ${typeText({ model: auto.model, effort: auto.effort })}</option>` : null}
+          </select></span>
+          <span><button class="link-btn" disabled=${!row.type} onClick=${() => toggleMessage(t)}>${row.edited ? 'edited' : 'default'}</button></span>
+          ${row.open && row.type ? html`<div class="lwr-message"><textarea class="inp" rows="5" value=${row.text} aria-label=${`First message for #${t.number}`}
+            onInput=${(e) => set(t, { text: e.target.value, edited: true })}></textarea>
+            ${row.edited ? html`<button class="link-btn" onClick=${() => set(t, { edited: false, text: row.template })}>Use default</button>` : null}</div>` : null}
+        </div>`; })}
+      </div>` : !error ? html`<p>Loading…</p>` : null}
+    ${error ? html`<p class="err" role="alert">${error}</p>` : null}
+    <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>Cancel</button>
+      <button class="btn pri" disabled=${!types || busy} onClick=${save}>${busy ? 'Saving…' : 'Save'}</button></div>
+  <//>`;
 }

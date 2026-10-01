@@ -192,6 +192,10 @@ function NewAgents({ data, write }) {
       save=${value => save({ repo_short: shortNames(value) })} />
     <${Field} label="Workspaces" type="textarea" initial=${data.workspaces.join('\n')} hint="One absolute path per line."
       save=${value => save({ workspaces: value.split('\n').map(path => path.trim()).filter(Boolean) })} />
+    <${AgentTypes} types=${data.agent_types || []} save=${save} />
+    <${Field} label="Pause auto-start" type="checkbox" initial=${data.auto_start_paused}
+      hint="Holds every Start when ready without losing it; ready tickets start when you turn it off."
+      save=${value => save({ auto_start_paused: value })} />
     <h2>First message when starting a ticket</h2>
     <${Field} label="Template" type="textarea" initial=${data.message_template} onDraft=${value => patch('message_template', value)}
       hint="Placeholders: {ticket} {number} {repo} {repo_name} {repo_short} {title} {url}"
@@ -375,4 +379,60 @@ function About() {
         `built ${new Date(app.data.uploaded_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`)}
     ${row('accent', 'Repository', html`<a href="https://github.com/rajeshgoli/session-manager" target="_blank" rel="noopener">rajeshgoli/session-manager ↗</a>`)}
   </div>`;
+}
+
+// Start when ready picks one of these (1821 F1); the server checks the whole list on save.
+const TYPE_EFFORTS = { claude: ['low', 'medium', 'high', 'xhigh', 'max'], 'codex-fork': ['medium', 'high', 'xhigh'] };
+const MAX_AGENT_TYPES = 8;
+export function typeProblem(rows) {
+  const names = rows.map(row => row.name.trim().toLowerCase());
+  if (names.some(name => !name)) return 'Give every agent type a name.';
+  if (new Set(names).size !== names.length) return 'Agent type names must be different.';
+  if (rows.some(row => !row.model.trim())) return 'Give every agent type a model.';
+  return '';
+}
+function AgentTypes({ types, save }) {
+  const [rows, setRows] = useState(types);
+  const [status, setStatus] = useState('');
+  const [error, setError] = useState(false);
+  const base = useRef(types);
+  useEffect(() => {
+    // Follow a change saved elsewhere (the phone) unless this list has unsaved edits.
+    if (JSON.stringify(rows) === JSON.stringify(base.current)) setRows(types);
+    base.current = types;
+  }, [JSON.stringify(types)]);
+  const dirty = JSON.stringify(rows) !== JSON.stringify(types);
+  const problem = typeProblem(rows);
+  const edit = next => { setStatus(''); setRows(next); };
+  const update = (index, patch) => edit(rows.map((row, i) => i === index ? { ...row, ...patch } : row));
+  const provider = (index, value) => update(index, { provider: value, model: '',
+    effort: TYPE_EFFORTS[value].includes(rows[index].effort) ? rows[index].effort : 'high' });
+  const commit = async () => {
+    setStatus('Saving…'); setError(false);
+    try {
+      await save({ agent_types: rows.map(row => ({ ...row, name: row.name.trim(), model: row.model.trim() })) });
+      setStatus('Saved');
+    } catch (e) { setError(true); setStatus(e.message); }
+  };
+  return html`<h2>Agent types</h2>
+    <p class="sub">Start when ready and Start lane when ready offer these. A ticket whose text has a line such as <code>Tier: Mid</code> starts out as that type.</p>
+    <div class="agent-types">
+      <div class="agent-type head"><span>Name</span><span>Provider</span><span>Model</span><span>Effort</span></div>
+      ${rows.map((row, index) => html`<div class="agent-type">
+        <input class="inp" aria-label="Name" value=${row.name} onInput=${e => update(index, { name: e.target.value })} />
+        <select class="inp" aria-label="Provider" value=${row.provider} onChange=${e => provider(index, e.target.value)}>
+          <option value="claude">Claude</option><option value="codex-fork">Codex</option></select>
+        <input class="inp" aria-label="Model" value=${row.model} list=${row.provider === 'claude' ? 'claude-models' : 'codex-models'}
+          onInput=${e => update(index, { model: e.target.value })} />
+        <select class="inp" aria-label="Effort" value=${row.effort} onChange=${e => update(index, { effort: e.target.value })}>
+          ${TYPE_EFFORTS[row.provider].map(effort => html`<option value=${effort}>${effort}</option>`)}</select>
+        <button class="icon-btn" title=${`Remove ${row.name || 'this type'}`} onClick=${() => edit(rows.filter((_, i) => i !== index))}>×</button>
+      </div>`)}
+    </div>
+    <div class="settings-feedback">
+      <button class="btn sm" disabled=${rows.length >= MAX_AGENT_TYPES}
+        onClick=${() => edit([...rows, { name: '', provider: 'claude', model: '', effort: 'high' }])}>Add type</button>
+      ${dirty ? html`<button class="btn sm" onClick=${() => edit(types)}>Revert</button>
+        <button class="btn sm pri" disabled=${!!problem} onClick=${commit}>Save agent types</button>` : null}
+      <span role=${error || (dirty && problem) ? 'alert' : 'status'} class=${error || (dirty && problem) ? 'settings-error' : 'saved'}>${dirty && problem ? problem : status}</span></div>`;
 }

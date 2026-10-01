@@ -125,3 +125,12 @@ test('policy rows list every board repo, then stored lane and ticket policies', 
   assert.deepEqual(Array.from(rows, r => `${r.scope} ${r.repo} ${r.number} ${r.policy ? 'set' : 'default'}`),
     ['repo o/a 0 default', 'repo o/b 0 set', 'ticket o/a 1848 set', 'lane o/a 1843 set']);
 });
+
+test('agent types need distinct names and a model before Save', () => {
+  const problem = harness().evaluate('typeProblem');
+  const row = (name, model = 'sonnet') => ({ name, provider: 'claude', model, effort: 'high' });
+  assert.equal(problem([row('Top'), row('Low')]), '');
+  assert.equal(problem([row('Top'), row(' ')]), 'Give every agent type a name.');
+  assert.equal(problem([row('Mid'), row('mid ')]), 'Agent type names must be different.');
+  assert.equal(problem([row('Mid', '  ')]), 'Give every agent type a model.');
+});
