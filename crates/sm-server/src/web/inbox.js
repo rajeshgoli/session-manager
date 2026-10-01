@@ -143,8 +143,7 @@ export function Thread({ id, workKey, controls, agent }) {
   const scrollOnLoad = useRef(true);
   const pinned = useRef(false);
   const options = data?.reply_options || [];
-  const defaultTarget = options.find(option => option.can_send && option.recipient_id === data?.reply_to?.id)
-    || options.find(option => option.status === 'live' && option.can_send)
+  const defaultTarget = options.find(option => option.status === 'live' && option.can_send)
     || options.find(option => option.can_send);
   const target = options.find(option => option.id === targetId && option.can_send) || defaultTarget;
   const replyTo = target ? { name: target.recipient_name || target.name, restores: target.restores, retired_at: target.retired_at } : data?.reply_to;

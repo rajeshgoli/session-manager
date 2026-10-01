@@ -49,9 +49,9 @@ test('work threads, reply targets, Archive and the fold at desktop and phone wid
           title:'#1782 Fit and finish', status:'live', can_send:true,
           reply_to:{ id:'successor', name:'sm-1782-2', restores:false, retired_at:null },
           reply_options:[
+            { id:'former', name:'sm-1782-former', status:'ended', can_send:true, recipient_id:'successor', recipient_name:'sm-1782-2', restores:false },
             { id:'successor', name:'sm-1782-2', status:'live', can_send:true, recipient_id:'successor', restores:false },
             { id:'original', name:'sm-1782', status:'ended', can_send:true, recipient_id:'original', restores:true, retired_at:'2026-09-30T12:00:00Z' },
-            { id:'former', name:'sm-1782-former', status:'ended', can_send:true, recipient_id:'successor', recipient_name:'sm-1782-2', restores:false },
           ],
           items:[
             { type:'message', at, sender:{id:'original',name:'sm-1782',status:'ended'}, html:'<div class="b"><h3>First review</h3><div class="md" data-msg="one"><p data-sm-line="1">Please review the first memo.</p></div></div>' },
@@ -72,6 +72,7 @@ test('work threads, reply targets, Archive and the fold at desktop and phone wid
       await page.locator('.thread-doc-card').last().waitFor();
       assert.equal(await page.locator('.thread-doc-card').count(), 2);
       assert.deepEqual(await page.locator('.thread-entry .thread-sender').allTextContents(), ['sm-1782','sm-1782-2']);
+      assert.equal(await page.getByRole('combobox', { name:'Reply to' }).inputValue(), 'successor');
       await page.getByRole('combobox', { name:'Reply to' }).selectOption('former');
       assert.match(await page.getByRole('textbox', { name:'Reply' }).getAttribute('placeholder'), /Write to sm-1782-2/);
       await page.getByRole('combobox', { name:'Reply to' }).selectOption('original');
