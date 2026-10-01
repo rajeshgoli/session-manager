@@ -99,3 +99,7 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - A codex-fork event stream can multiplex the root thread and descendant threads. Project
   seat activity from events matching the stored root provider thread; a descendant idle or
   completion event must never make the root seat writable.
+- A route the web app calls outside `/client/` must accept the owner's browser login
+  (`owner_web_guard`, and add it to `OWNER_WEB_READS` or `owner_web_writes` in `http.rs` tests).
+  Session-auth-only routes pass on localhost and on scratch servers, then return 401 on the
+  public host (#1858). Check a new web screen on `sm.rajeshgo.li` after deploy.
