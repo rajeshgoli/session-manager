@@ -329,12 +329,22 @@ sm all
 ### Mac browser certificate setup
 
 Browser device certificates are opt-in (`cloudflare_access.browser.device_policy`,
-false by default). Before enabling them, turn **HTTP/3 off** for the Cloudflare
-zone under Speed → Settings → Protocol Optimization. This is a zone-wide
-performance setting; HTTPS and HTTP/2 remain enabled. The configured Cloudflare
-API token also needs **Zone Settings Read** permission so enrollment can verify
-that prerequisite before adding the browser hostname to the certificate authority.
-Retain the existing email Access policy as the fallback.
+false by default). Retain the existing email Access policy as the fallback.
+Enrollment does not require a zone-wide HTTP/3 setting or Zone Settings Read
+permission: the working browser connection is what matters, not whether the
+zone offers HTTP/3 to other hostnames.
+
+For Chrome certificate compatibility, start with a hostname-specific Cloudflare
+Response Header Transform Rule: match `(http.host eq "sm.example.com")` (substitute
+the configured browser hostname) and remove the `Alt-Svc` response header, which
+advertises alternative connection protocols. Leave HTTP/3 enabled for the zone.
+This configuration passed certificate sign-in and terminal input on Studio.
+[Cloudflare documents this targeted workaround](https://developers.cloudflare.com/speed/optimization/protocol/troubleshooting/protocol-troubleshooting/#resolution),
+but also notes that DNS HTTPS records can advertise HTTP/3 and browsers can cache
+advertisements for up to 24 hours. The rule does not guarantee every browser will
+use HTTP/2; verify sign-in and terminal input on each computer before keeping
+browser certificate requests enabled. If the scoped rule is insufficient,
+disabling HTTP/3 for the zone is an optional, broader diagnostic fallback.
 
 Run `sm device enroll <name>` on each Mac, then **quit Chrome completely and reopen
 it**. Reloading a tab can retain an older connection and leave terminals unable
@@ -356,7 +366,8 @@ If the rollout fails, disable browser enrollment in the installed config, remove
 only the browser hostname from the Cloudflare client-certificate authority's
 hostname associations, and restart with `scripts/restart-rust-server.sh` if the
 config changed. Keep the phone hostname and existing Access policies. Remove the
-browser association **before** re-enabling HTTP/3. Merely disabling enrollment
+browser association before undoing the transport workaround (disabling the scoped
+header rule, or re-enabling HTTP/3 if it was turned off). Merely disabling enrollment
 in the config does not remove an already-established Cloudflare association.
 
 Message delivery modes:
