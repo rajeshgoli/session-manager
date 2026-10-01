@@ -131,22 +131,31 @@ export function NotesView({ pane = false, onClose, onType }) {
   const searchSerial = useRef(0);
   const loadSerial = useRef(0);
   const editSerial = useRef(0);
+  const queryRef = useRef(query);
+  const hitsRef = useRef(hits); hitsRef.current = hits;
+  const hitsQuery = useRef(null);
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
   const saveRef = useRef(null);
+  const changeQuery = value => { queryRef.current = value; setQuery(value); };
   const search = async (q = query, afterSave = false) => {
     const serial = ++searchSerial.current;
+    const openId = current.current.open?.id;
+    const clearIfMissing = afterSave && q && hitsQuery.current === q
+      && hitsRef.current.some(row => row.id === openId);
     try {
       const rows = await api(`/notes/search?q=${encodeURIComponent(q)}`);
-      if (serial !== searchSerial.current) return;
-      if (afterSave && q && current.current.open && !rows.some(row => row.id === current.current.open.id)) {
-        setQuery('');
+      if (serial !== searchSerial.current || q !== queryRef.current) return;
+      if (clearIfMissing && current.current.open?.id === openId && !rows.some(row => row.id === openId)) {
+        changeQuery('');
         return;
       }
+      hitsQuery.current = q;
+      hitsRef.current = rows;
       setHits(rows);
       if (!q) setTotal(rows.length);
       setError('');
-    } catch (err) { setError(err.message); }
+    } catch (err) { if (serial === searchSerial.current && q === queryRef.current) setError(err.message); }
   };
   useEffect(() => { const timer = setTimeout(() => search(query), 150); return () => clearTimeout(timer); }, [query]);
   useEffect(() => {
@@ -223,7 +232,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       if (current.current.open?.id !== note.id) return true;
       current.current.open = result;
       setOpen(result); setConflict(null); setStatus(`Saved · ${age(result.updated_at)}`);
-      search(query, true);
+      search(queryRef.current, true);
       return true;
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
@@ -265,7 +274,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const choose = async id => { if (await save() === false) return; store('sm-notes-open', id); load(id); };
   const create = async () => {
     if (await save() === false) return;
-    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); setQuery(''); await search(''); load(note.id); }
+    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); changeQuery(''); await search(''); load(note.id); }
     catch (err) { setError(err.message); }
   };
   const importFile = async e => {
@@ -276,7 +285,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', body: form });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      setQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
+      changeQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
     } catch (err) { setError(err.message); }
     e.target.value = '';
   };
@@ -297,7 +306,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) navigate('/notes'); else openPanel('notes:view'); };
   return html`<section class=${`notes-view ${pane ? 'notes-pane' : 'notes-page'}`}>
     <header class="notes-head"><h1>Notes</h1><div class="notes-tools">
-      <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => setQuery(e.target.value)} />
+      <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => changeQuery(e.target.value)} />
       <button type="button" class="btn pri" onClick=${create}>+ New</button>
       <button type="button" class="btn" onClick=${() => file.current?.click()}>Import</button>
       <input ref=${file} hidden type="file" accept=".md,.txt,text/markdown,text/plain" onChange=${importFile} />

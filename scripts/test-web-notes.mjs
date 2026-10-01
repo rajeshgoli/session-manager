@@ -377,6 +377,59 @@ test('an open editor stays visible when a save removes its search match', async 
   } finally { await browser.close(); }
 });
 
+test('saving an open note preserves a search for a different note', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor-slot textarea');
+    await editor.waitFor();
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Merge checklist');
+    await page.waitForFunction(() => document.querySelectorAll('.notes-page .note-card').length === 1);
+    const saved = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await editor.fill('Edited while looking for another note');
+    assert.equal((await saved).status(), 200);
+    assert.equal(await search.inputValue(), 'Merge checklist');
+    assert.equal(await page.locator('.note-card .note-title').first().textContent(), 'Merge checklist');
+    assert.equal(await editor.inputValue(), 'Edited while looking for another note');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('a search entered during a pending save is preserved', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Review loop');
+    await page.waitForFunction(() => document.querySelectorAll('.notes-page .note-card').length === 1);
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor-slot textarea');
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('No longer matches the first search');
+    await saveStarted;
+    await search.fill('Merge checklist');
+    release();
+    await page.waitForFunction(() => document.querySelector('.notes-page .note-title')?.textContent === 'Merge checklist');
+    assert.equal(await search.inputValue(), 'Merge checklist');
+    assert.equal(await editor.inputValue(), 'No longer matches the first search');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
 test('collapse saves edits typed while an earlier save is pending', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
