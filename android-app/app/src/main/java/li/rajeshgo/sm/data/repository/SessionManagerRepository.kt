@@ -608,6 +608,15 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token, readTimeoutSeconds = 120).startBoardTicket(request) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun fetchBugReportOptions(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BugReportOptions = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getBugReportOptions() }
+    }
+
+    suspend fun fileBugReport(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.BugReportRequest): Result<li.rajeshgo.sm.data.model.BugReportFiled> = withContext(Dispatchers.IO) {
+        // Filing waits on GitHub and, with an agent, on the board and the start.
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 120).fileBugReport(request) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchReviewPolicies(baseUrl: String, token: String): li.rajeshgo.sm.data.model.ReviewPoliciesResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getReviewPolicies() }
     }

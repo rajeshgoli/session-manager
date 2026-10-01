@@ -15,6 +15,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.AutoStories
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
@@ -52,11 +53,13 @@ class AppMenuActions(
     val onOpenGuestbook: () -> Unit,
     val onOpenAnalytics: () -> Unit,
     val onOpenSettings: () -> Unit,
+    /** The bug button: captures the screen, then opens Report a bug (spec 1859 C1). */
+    val onReportBug: () -> Unit = {},
 )
 
 /**
- * The top bar every screen shares: title and status line, the three-dots
- * menu, and Settings with its update dot. Pages opened from the menu pass
+ * The top bar every screen shares: title and status line, the bug button,
+ * the three-dots menu, and Settings with its update dot. Pages opened from the menu pass
  * [onBack]; [current] hides the menu entry for the page already showing.
  */
 @Composable
@@ -116,6 +119,9 @@ fun AppTopBar(
                     }
                 }
                 actions?.invoke()
+                IconButton(onClick = menu.onReportBug) {
+                    Icon(Icons.Rounded.BugReport, contentDescription = "Report a bug", tint = TextSecondary)
+                }
                 Box {
                     IconButton(onClick = { menuExpanded = true }) {
                         Icon(Icons.Rounded.MoreVert, contentDescription = "Menu", tint = if (busy) Cyan else TextSecondary)
