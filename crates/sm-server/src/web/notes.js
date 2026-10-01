@@ -307,7 +307,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     <div class="notes-count">${hits.length} of ${total} notes</div>
     ${error ? html`<p class="err">${error}</p>` : null}
     <div class="notes-columns"><div class="notes-list">
-      ${[...hits, ...(pinned ? [pinned] : [])].map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
+      ${(pinned ? [pinned, ...hits] : hits).map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
         <button class="note-card-main" type="button" onClick=${() => open?.id === hit.id && pane ? collapse() : choose(hit.id)}>
           <span class="note-title">${hit.title || 'Untitled'}${pinned?.id === hit.id ? ' · Open note' : ''}</span><small>${age(hit.updated_at)}</small>
           <span class="note-snippet"><${Snippet} hit=${hit} /></span>

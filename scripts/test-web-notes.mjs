@@ -418,6 +418,35 @@ test('an open editor stays visible when search and save responses overlap', asyn
   } finally { await browser.close(); }
 });
 
+test('an open narrow editor stays above a long list of search matches', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const pane of [false, true]) {
+      const context = await browser.newContext({ viewport: { width: pane ? 1440 : 390, height: 900 } });
+      const handler = server();
+      for (let n = 0; n < 30; n++) handler.notes.push({
+        id: `extra-${n}`, title: `Merge checklist ${n}`, body: `Merge checklist ${n}`,
+        version: 1, updated_at: stamp(),
+      });
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      if (pane) await page.keyboard.press('Meta+j');
+      const view = pane ? page.locator('.panel .notes-view') : page.locator('.notes-page');
+      await view.locator('.note-card-main').first().click();
+      await view.locator('.notes-editor textarea').waitFor();
+      await view.getByRole('searchbox', { name: 'Search notes' }).fill('Merge checklist');
+      await page.waitForFunction(isPane => document.querySelector(isPane ? '.panel .notes-count' : '.notes-page .notes-count')?.textContent === '31 of 32 notes', pane);
+      const firstCard = view.locator('.note-card').first();
+      assert.match(await firstCard.getAttribute('class'), /selected/);
+      assert.match(await firstCard.locator('.note-title').textContent(), /Open note/);
+      assert.ok((await view.locator('.notes-editor').boundingBox()).y < 900);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
 test('saving an open note preserves a search for a different note', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
