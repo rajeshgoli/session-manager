@@ -81,7 +81,7 @@ test('three facts for the overlaps Rajesh listed', () => {
   assert.deepEqual(jobsFact(fixtures.review), { text: '⏸ Codex review on PR #1790 · 12m', tone: 'amber' });
   assert.equal(youFact(fixtures.run, now), null);
   // Finished shows only without a question; a doc review cannot be dismissed.
-  assert.deepEqual(youFact(fixtures.far, now), { text: '✔ 1855 done and closed: 68 views built', tone: 'cyan', dismissible: false });
+  assert.deepEqual(youFact(fixtures.far, now), { text: '✔ 1855 done and closed: 68 views built', tone: 'cyan', dismissible: true });
   const finishing = { ...fixtures.far, facts: { ...fixtures.far.facts, finished: { at: '2026-09-30T15:01:00Z', text: null } } };
   assert.equal(youFact(finishing, now).text, '✔ Finishing…');
   assert.equal(youFact(fixtures.docReview, now).dismissible, false);
