@@ -1902,12 +1902,16 @@ pub struct WebWatchConfig {
     /// Seconds between the page's refreshes of `/watch/state`; at least 2.
     #[serde(default = "default_web_watch_refresh_seconds")]
     pub refresh_seconds: u64,
+    /// Minutes before a pending job or review moves into the attention group.
+    #[serde(default = "default_web_watch_waiting_long_minutes")]
+    pub waiting_long_minutes: u32,
 }
 
 impl Default for WebWatchConfig {
     fn default() -> Self {
         Self {
             refresh_seconds: default_web_watch_refresh_seconds(),
+            waiting_long_minutes: default_web_watch_waiting_long_minutes(),
         }
     }
 }
@@ -1920,6 +1924,10 @@ impl WebWatchConfig {
 
 fn default_web_watch_refresh_seconds() -> u64 {
     3
+}
+
+fn default_web_watch_waiting_long_minutes() -> u32 {
+    30
 }
 
 /// `utilization`: the host and queue-job sampler behind the Queue page's

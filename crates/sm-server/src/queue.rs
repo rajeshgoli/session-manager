@@ -555,6 +555,31 @@ impl RetainedQueueStore {
         &self.db_path
     }
 
+    /// Whether a submitted prompt repeats text the server recently injected.
+    pub fn recently_delivered_prompt(&self, session_id: &str, prompt: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let since = (time::OffsetDateTime::now_utc() - time::Duration::seconds(120))
+                .format(&time::format_description::well_known::Rfc3339)?;
+            let mut statement = conn.prepare(
+                "SELECT text, message_category FROM message_queue \
+                 WHERE target_session_id = ?1 AND delivered_at >= ?2",
+            )?;
+            let rows = statement.query_map(params![session_id, since], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (text, category) = row?;
+                if text.trim() == prompt.trim()
+                    || (category.as_deref() == Some("native_rename")
+                        && prompt.trim().starts_with("/rename "))
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     pub fn github_review_channel_from_path(db_path: &Path) -> Result<ReviewChannel> {
         let conn = Connection::open(db_path)?;
         init_codex_review_requests_schema(&conn)?;

@@ -19,6 +19,59 @@ pub(super) fn owner_message_store(state: &AppState) -> OwnerMessageStore {
     OwnerMessageStore::new(expand_home(&state.config.sm_send.db_path))
 }
 
+pub(super) fn owner_answered(
+    state: &AppState,
+    session_id: &str,
+    via: &str,
+) -> Result<usize, ApiError> {
+    if state
+        .session_store
+        .get_session(session_id)?
+        .is_none_or(|session| session_ended(&session))
+    {
+        return Ok(0);
+    }
+    if via != "manual" {
+        let mut recent = state
+            .owner_answered_at
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Owner answer rate limiter unavailable"))?;
+        let now = std::time::Instant::now();
+        recent.retain(|_, at| now.duration_since(*at) < Duration::from_secs(2));
+        if recent.contains_key(session_id) {
+            return Ok(0);
+        }
+        recent.insert(session_id.to_owned(), now);
+    }
+    let changed = owner_message_store(state).answer_session(session_id, via)?;
+    if changed > 0 {
+        super::board::request_recompute(state);
+    }
+    Ok(changed)
+}
+
+/// `POST /sessions/{id}/needs-you/answered`: the owner answered elsewhere.
+pub(super) async fn answer_session_needs_you(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let path = format!("/sessions/{session_id}/needs-you/answered");
+    if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
+        ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), &path)?;
+    }
+    ensure_core_writes_enabled(&state)?;
+    if state.session_store.get_session(&session_id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    let _guard = state.owner_message_lock.lock().await;
+    owner_answered(&state, &session_id, "manual")?;
+    Ok(Json(
+        json!({"facts": super::watch::session_facts(&state, &session_id)?}),
+    ))
+}
+
 /// Retired or killed: the session will never read another message.
 pub(super) fn session_ended(session: &SessionRecord) -> bool {
     matches!(
@@ -617,5 +670,30 @@ mod tests {
         assert_eq!(relative_time("2026-09-26T07:00:00Z", now), "3h ago");
         assert_eq!(relative_time("2026-09-22T10:00:00Z", now), "4d ago");
         assert_eq!(relative_time("garbage", now), "garbage");
+    }
+
+    #[test]
+    fn claude_prompt_distinguishes_owner_typing_from_server_deliveries() {
+        assert!(crate::owner_messages::is_owner_typed_prompt(
+            "Checked in Chrome, merge it.",
+            false
+        ));
+        assert!(!crate::owner_messages::is_owner_typed_prompt("  ", false));
+        assert!(!crate::owner_messages::is_owner_typed_prompt(
+            "[Input from: Rajesh via sm app] Re: \"Check\" (msg_3f9a2c1d)\nYes.",
+            false
+        ));
+        assert!(!crate::owner_messages::is_owner_typed_prompt(
+            "[sm queue] job finished",
+            false
+        ));
+        assert!(!crate::owner_messages::is_owner_typed_prompt(
+            "Started early by Rajesh",
+            true
+        ));
+        assert!(!crate::owner_messages::is_owner_typed_prompt(
+            "/rename sm-1782",
+            true
+        ));
     }
 }

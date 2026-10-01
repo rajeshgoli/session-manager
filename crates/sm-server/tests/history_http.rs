@@ -16,6 +16,7 @@ use sm_server::{
         OwnerDocSource,
     },
     owner_docs::git_blob_sha,
+    owner_messages::{NewOwnerMessage, OwnerMessageStore},
     work_claims::{BatchFetch, GhItem, ItemFetch, WorkClaimStore, WorkItemSource, WorkKind},
 };
 use std::{
@@ -632,7 +633,70 @@ async fn watch_state_matches_what_sm_watch_shows() {
         eng["claims"][0]["url"],
         "https://github.com/acme/widgets/issues/1"
     );
-    assert_eq!(state["counts"], json!({"live": 3, "waiting_on_owner": 1}));
+    assert_eq!(
+        state["counts"],
+        json!({"live": 3, "waiting_on_owner": 1,
+        "needs_you": 1, "finished": 0, "waiting_long": 1,
+        "moving": 0, "waiting": 0, "idle": 1})
+    );
+    assert_eq!(eng["attention"]["section"], "you");
+    assert_eq!(eng["facts"]["you"]["kind"], "doc_review");
+}
+
+#[tokio::test]
+async fn blocking_question_counts_and_manual_answer_moves_only_its_agent() {
+    let f = seeded().await;
+    let store = OwnerMessageStore::new(f.dir.join("message_queue.db"));
+    store
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: "other001".into(),
+            sender_session_name: "other-agent".into(),
+            title: "Check terminal".into(),
+            body_markdown: "Please check the terminal".into(),
+            blocking: true,
+        })
+        .unwrap();
+    let before = watch_state(&f.app, "").await;
+    assert_eq!(before["counts"]["needs_you"], 2);
+    let other = before["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "other001")
+        .unwrap();
+    assert_eq!(other["facts"]["you"]["kind"], "message");
+    assert_eq!(other["attention"]["section"], "you");
+
+    let response = post(&f.app, "/sessions/other001/needs-you/answered", json!({})).await;
+    assert_eq!(response["facts"]["you"], Value::Null);
+    let after = watch_state(&f.app, "").await;
+    assert_eq!(after["counts"]["needs_you"], 1);
+    let eng = after["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "eng00001")
+        .unwrap();
+    assert_eq!(eng["facts"]["you"]["kind"], "doc_review");
+    post(&f.app, "/sessions/other001/needs-you/answered", json!({})).await;
+
+    // A second question can arrive immediately after an answer. The explicit
+    // manual action still clears it within the terminal/prompt cooldown.
+    store
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: "other001".into(),
+            sender_session_name: "other-agent".into(),
+            title: "Second check".into(),
+            body_markdown: "One more check".into(),
+            blocking: true,
+        })
+        .unwrap();
+    assert_eq!(watch_state(&f.app, "").await["counts"]["needs_you"], 2);
+    let response = post(&f.app, "/sessions/other001/needs-you/answered", json!({})).await;
+    assert_eq!(response["facts"]["you"], Value::Null);
+    assert_eq!(watch_state(&f.app, "").await["counts"]["needs_you"], 1);
 }
 
 #[tokio::test]

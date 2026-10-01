@@ -653,6 +653,7 @@ fn render_inbox_page(
 /// One entry on an agent thread's page.
 enum Item<'a> {
     Message(&'a OwnerMessage, OwnerMessageState),
+    Answered(&'a OwnerMessage),
     Reply(&'a OwnerMessageReply),
     Note(&'a OwnerNote),
     Follow(&'a Follow),
@@ -666,6 +667,7 @@ impl Item<'_> {
     fn at(&self) -> String {
         norm(match self {
             Item::Message(message, _) => &message.created_at,
+            Item::Answered(message) => message.handled_at.as_deref().unwrap_or(&message.created_at),
             Item::Reply(reply) => &reply.created_at,
             Item::Note(note) => &note.created_at,
             Item::Follow(follow) => follow.fired_at.as_deref().unwrap_or(&follow.created_at),
@@ -746,6 +748,19 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
         }
     };
     match item {
+        Item::Answered(message) => {
+            let label = match message.handled_via.as_deref() {
+                Some("terminal") => "You answered in the terminal",
+                Some("claude_prompt") => "You answered in Claude",
+                Some("codex_prompt") => "You answered in Codex",
+                Some("inbox") => "Answered in the Inbox",
+                _ => "Marked answered",
+            };
+            format!(
+                "<div class=\"ev\">{label} · {}</div>",
+                when(message.handled_at.as_deref().unwrap_or(&message.created_at))
+            )
+        }
         Item::Message(message, state) => {
             let ask = *state == OwnerMessageState::NeedsYou;
             format!(
@@ -897,6 +912,9 @@ pub(super) fn agent_thread_page(
             message,
             world.message_state(message, &replied),
         ));
+        if message.handled_at.is_some() {
+            items.push(Item::Answered(message));
+        }
     }
     items.extend(
         world
@@ -1068,7 +1086,7 @@ pub(super) async fn post_done(
                 && m.handled_at.is_none()
                 && !replied.contains(m.id.as_str())
         }) {
-            store.mark_handled(&message.id)?;
+            store.mark_handled_via(&message.id, "inbox")?;
         }
         store.mark_sender_viewed(session_id)?;
     } else if let Some(doc_id) = key.strip_prefix("doc:") {

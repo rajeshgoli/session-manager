@@ -161,6 +161,20 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         .join("queue_runner.db");
     let jobs =
         RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?;
+    let positions: BTreeMap<String, usize> = crate::queue::pending_queue_job_consideration_order(
+        &jobs,
+        &crate::queue::queue_ticket_ranks(&expand_home(&state.config.sm_send.db_path)),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, id)| (id, index + 1))
+    .collect();
+    let messages: BTreeMap<String, crate::owner_messages::OwnerMessage> =
+        super::messages::obligation_messages(state)?
+            .into_iter()
+            .filter(|entry| entry.state == crate::owner_messages::OwnerMessageState::NeedsYou)
+            .map(|entry| (entry.message.id.clone(), entry.message))
+            .collect();
     let colliding = colliding_sessions(state, &directory)?;
 
     let repo_filter = nonempty(&params.repo).map(|value| {
@@ -183,7 +197,14 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
 
     let mut out = Vec::new();
     let mut live = 0;
-    let mut waiting_on_owner = 0;
+    let mut counts = BTreeMap::<String, usize>::new();
+    let now = OffsetDateTime::now_utc();
+    let config = &state.config;
+    let fact_context = FactContext {
+        messages: &messages,
+        config,
+        now,
+    };
     for entry in tree_order(&listed) {
         if top_level && entry.depth > 0 {
             continue;
@@ -203,25 +224,40 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         if state != "stopped" {
             live += 1;
         }
-        if waiting_on
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| s(item, "kind") == "owner_review"))
-        {
-            waiting_on_owner += 1;
-        }
         let own_jobs: Vec<Value> = jobs
             .iter()
             .filter(|job| owns(job, id))
             .map(|job| {
                 json!({"id": job.id, "type": job.job_type, "label": job.label,
                        "state": job.state, "started_at": job.started_at,
-                       "queued_at": job.queued_at, "timeout_seconds": job.timeout_seconds})
+                       "queued_at": job.queued_at, "timeout_seconds": job.timeout_seconds,
+                       "quiet_since": job.quiet_alerted_at,
+                       "holding_reason": job.holding_reason,
+                       "position": positions.get(&job.id)})
             })
             .collect();
         let optional = |key: &str| {
             let value = s(v, key);
             (!value.is_empty()).then(|| value.to_owned())
         };
+        let activity_since = launch.get(id).and_then(|l| l.since(state)).or_else(|| {
+            (state != "working")
+                .then(|| optional("last_activity"))
+                .flatten()
+        });
+        let (facts, attention) = agent_facts(
+            v,
+            &waiting_on,
+            &field("claims"),
+            &own_jobs,
+            activity_since.as_deref(),
+            &fact_context,
+        );
+        if state != "stopped" {
+            *counts
+                .entry(s(&attention, "section").to_owned())
+                .or_default() += 1;
+        }
         out.push(json!({
             "id": id,
             "name": name(v),
@@ -243,10 +279,9 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "working_dir": launch.get(id).map(|l| l.working_dir.clone()),
             // A working agent without a turn-start hook (Codex) has no known
             // start; its last activity is always now, so leave it unset.
-            "activity_since": launch
-                .get(id)
-                .and_then(|l| l.since(state))
-                .or_else(|| (state != "working").then(|| optional("last_activity")).flatten()),
+            "activity_since": activity_since,
+            "facts": facts,
+            "attention": attention,
             "handoff": v["handoff"].clone(),
             "remote_control": remote_control.get(id).cloned().unwrap_or(Value::Null),
             "claims": field("claims"),
@@ -260,10 +295,30 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
     }
     Ok(json!({
         "schema_version": WATCH_SCHEMA_VERSION,
-        "generated_at": generated_at(OffsetDateTime::now_utc()),
+        "generated_at": generated_at(now),
         "sessions": out,
-        "counts": {"live": live, "waiting_on_owner": waiting_on_owner},
+        "counts": {"live": live, "waiting_on_owner": counts.get("you").copied().unwrap_or(0),
+                   "needs_you": counts.get("you").copied().unwrap_or(0),
+                   "finished": 0, "waiting_long": counts.get("waiting_long").copied().unwrap_or(0),
+                   "moving": counts.get("moving").copied().unwrap_or(0),
+                   "waiting": counts.get("waiting").copied().unwrap_or(0),
+                   "idle": counts.get("idle").copied().unwrap_or(0)},
     }))
+}
+
+pub(super) fn session_facts(state: &AppState, session_id: &str) -> Result<Value, ApiError> {
+    let doc = watch_state(
+        state,
+        &WatchParams {
+            session: Some(session_id.to_owned()),
+            ..WatchParams::default()
+        },
+    )?;
+    Ok(doc["sessions"]
+        .as_array()
+        .and_then(|items| items.first())
+        .map(|item| item["facts"].clone())
+        .unwrap_or(Value::Null))
 }
 
 struct Launch {
@@ -301,6 +356,304 @@ fn owns(job: &QueueJobRecord, id: &str) -> bool {
         Some(requester) => requester == id,
         None => job.notify_session_id.as_deref() == Some(id),
     }
+}
+
+fn facts_age(since: &str, now: OffsetDateTime) -> String {
+    let minutes = OffsetDateTime::parse(since, &Rfc3339)
+        .map(|at| ((now - at).whole_minutes()).max(0))
+        .unwrap_or(0);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    }
+}
+
+fn old_enough(since: &str, now: OffsetDateTime, minutes: i64) -> bool {
+    OffsetDateTime::parse(since, &Rfc3339)
+        .is_ok_and(|at| now - at >= time::Duration::minutes(minutes))
+}
+
+fn inverse_time(since: &str) -> String {
+    let seconds = OffsetDateTime::parse(since, &Rfc3339)
+        .map(|at| at.unix_timestamp())
+        .unwrap_or(0);
+    format!("{:010}", (9_999_999_999_i64 - seconds).max(0))
+}
+
+fn ordinal(position: u64) -> String {
+    let suffix = if (11..=13).contains(&(position % 100)) {
+        "th"
+    } else {
+        match position % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{position}{suffix}")
+}
+
+struct FactContext<'a> {
+    messages: &'a BTreeMap<String, crate::owner_messages::OwnerMessage>,
+    config: &'a AppConfig,
+    now: OffsetDateTime,
+}
+
+fn agent_facts(
+    session: &Value,
+    waiting_on: &Value,
+    claims: &Value,
+    jobs: &[Value],
+    activity_since: Option<&str>,
+    context: &FactContext<'_>,
+) -> (Value, Value) {
+    let FactContext {
+        messages,
+        config,
+        now,
+    } = context;
+    let now = *now;
+    let stopped = s(session, "status") == "stopped";
+    let working = matches!(s(session, "activity_state"), "working" | "thinking");
+    let agent_state = if stopped {
+        "stopped"
+    } else if working {
+        "working"
+    } else {
+        "idle"
+    };
+    let running: Vec<&Value> = jobs
+        .iter()
+        .filter(|job| s(job, "state") == "running")
+        .collect();
+    let pending: Vec<&Value> = jobs
+        .iter()
+        .filter(|job| s(job, "state") == "pending")
+        .collect();
+    let earliest_start = running
+        .iter()
+        .map(|job| s(job, "started_at"))
+        .filter(|at| !at.is_empty())
+        .min();
+    let oldest_wait = pending
+        .iter()
+        .map(|job| s(job, "queued_at"))
+        .filter(|at| !at.is_empty())
+        .min();
+    let quiet: Vec<&Value> = running
+        .iter()
+        .copied()
+        .filter(|job| !s(job, "quiet_since").is_empty())
+        .collect();
+    let review = waiting_on
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| s(item, "kind") == "review")
+        .min_by_key(|item| s(item, "since"));
+    let review_since = review
+        .map(|item| s(item, "since"))
+        .filter(|since| !since.is_empty());
+    let mut tone = Value::Null;
+    let mut job_text = if running.is_empty() && pending.is_empty() {
+        "No jobs".to_owned()
+    } else if !running.is_empty() && quiet.len() == running.len() && pending.is_empty() {
+        tone = json!("red");
+        let latest = quiet
+            .iter()
+            .max_by_key(|job| s(job, "quiet_since"))
+            .unwrap();
+        format!(
+            "Quiet {}: {}",
+            facts_age(s(latest, "quiet_since"), now),
+            s(latest, "label")
+        )
+    } else if running.len() == 1 && pending.is_empty() {
+        tone = json!("green");
+        let job = running[0];
+        let kind = s(job, "type");
+        let mut chars = kind.chars();
+        let title = chars.next().map_or_else(String::new, |first| {
+            first.to_uppercase().collect::<String>() + chars.as_str()
+        });
+        let mut text = format!("{title} running {}", facts_age(s(job, "started_at"), now));
+        if let Some(limit) = job["timeout_seconds"].as_i64().filter(|limit| *limit > 0) {
+            text.push_str(&format!(
+                " of {}",
+                facts_age(&generated_at(now - time::Duration::seconds(limit)), now)
+            ));
+        }
+        text
+    } else if !running.is_empty() {
+        tone = json!("green");
+        let mut text = format!(
+            "{} running · {}",
+            running.len(),
+            facts_age(earliest_start.unwrap_or(""), now)
+        );
+        if !pending.is_empty() {
+            text.push_str(&format!(
+                " · {} waiting {}",
+                pending.len(),
+                facts_age(oldest_wait.unwrap_or(""), now)
+            ));
+        }
+        text
+    } else if pending.len() == 1 {
+        tone = json!("amber");
+        let job = pending[0];
+        let position = job["position"].as_u64().unwrap_or(1);
+        format!(
+            "Waiting {} · {} in line",
+            facts_age(s(job, "queued_at"), now),
+            ordinal(position)
+        )
+    } else {
+        tone = json!("amber");
+        let mut text = format!(
+            "{} waiting {}",
+            pending.len(),
+            facts_age(oldest_wait.unwrap_or(""), now)
+        );
+        if pending
+            .iter()
+            .all(|job| s(job, "holding_reason") == "concurrency_cap")
+        {
+            text.push_str(" for a slot");
+        }
+        text
+    };
+    if let Some(since) = review_since {
+        if running.is_empty() && pending.is_empty() {
+            job_text = format!(
+                "Codex review on PR #{} · {}",
+                review
+                    .and_then(|item| item["pr_number"].as_i64())
+                    .unwrap_or(0),
+                facts_age(since, now)
+            );
+            tone = json!("amber");
+        } else {
+            job_text.push_str(&format!(" · review {}", facts_age(since, now)));
+        }
+    }
+    let review_fact =
+        review.map(|item| json!({"pr_number": item["pr_number"], "since": item["since"]}));
+    let job_facts = json!({"running": running.len(), "waiting": pending.len(),
+        "quiet": !quiet.is_empty(), "review": review_fact,
+        "earliest_start": earliest_start, "oldest_wait": oldest_wait,
+        "tone": tone, "text": job_text});
+
+    let obligations: Vec<&Value> = waiting_on.as_array().into_iter().flatten().collect();
+    let open_messages: Vec<&crate::owner_messages::OwnerMessage> = obligations
+        .iter()
+        .filter(|item| s(item, "kind") == "owner_message")
+        .filter_map(|item| messages.get(s(item, "id")))
+        .collect();
+    let doc_reviews: Vec<&&Value> = obligations
+        .iter()
+        .filter(|item| s(item, "kind") == "owner_review")
+        .collect();
+    let doc_review = doc_reviews.first().copied();
+    let prompt = s(session, "activity_state") == "waiting_permission";
+    let you = if !open_messages.is_empty() {
+        let oldest = open_messages
+            .iter()
+            .min_by_key(|message| &message.created_at)
+            .unwrap();
+        let newest = open_messages
+            .iter()
+            .max_by_key(|message| &message.created_at)
+            .unwrap();
+        let preview: String = newest.body_markdown.chars().take(120).collect();
+        json!({"kind": "message", "since": oldest.created_at, "text": preview,
+            "more": open_messages.len() - 1 + doc_reviews.len() + usize::from(prompt),
+            "message_ids": open_messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
+            "dismissible": true})
+    } else if let Some(doc) = doc_review {
+        json!({"kind": "doc_review", "since": doc["since"],
+            "text": format!("Review: {}", s(doc, "label").trim_start_matches("Owner review · ")),
+            "more": doc_reviews.len() - 1 + usize::from(prompt), "message_ids": [], "dismissible": false})
+    } else if prompt {
+        json!({"kind": "prompt", "since": activity_since,
+            "text": "Allow prompt in its terminal", "more": 0,
+            "message_ids": [], "dismissible": false})
+    } else {
+        Value::Null
+    };
+    let facts = json!({"agent": {"state": agent_state, "since": activity_since},
+        "jobs": job_facts, "you": you, "finished": null});
+    let last = s(session, "last_activity");
+    let has_claim = claims
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| s(item, "kind") == "ticket"));
+    let threshold = i64::from(config.web_watch.waiting_long_minutes);
+    let waiting_long = oldest_wait.is_some_and(|at| old_enough(at, now, threshold));
+    let review_long = review_since.is_some_and(|at| old_enough(at, now, threshold));
+    let stalled = !working
+        && running.is_empty()
+        && pending.is_empty()
+        && review.is_none()
+        && has_claim
+        && activity_since
+            .is_some_and(|at| old_enough(at, now, i64::from(config.board.stall_minutes)));
+    let (section, reason, key) = if stopped {
+        ("stopped", Value::Null, inverse_time(last))
+    } else if !you.is_null() {
+        ("you", json!(s(&you, "kind")), s(&you, "since").to_owned())
+    } else if !quiet.is_empty() || waiting_long || review_long || stalled {
+        let reason = if !quiet.is_empty() {
+            "quiet"
+        } else if waiting_long {
+            "queue_wait"
+        } else if review_long {
+            "review_wait"
+        } else {
+            "stalled"
+        };
+        let earliest = quiet
+            .iter()
+            .map(|job| s(job, "quiet_since"))
+            .chain(oldest_wait)
+            .chain(review_since)
+            .chain(activity_since.filter(|_| stalled))
+            .filter(|at| !at.is_empty())
+            .min()
+            .unwrap_or("");
+        ("waiting_long", json!(reason), earliest.to_owned())
+    } else if working || !running.is_empty() {
+        let latest = running
+            .iter()
+            .map(|job| s(job, "started_at"))
+            .chain(activity_since)
+            .filter(|at| !at.is_empty())
+            .max()
+            .unwrap_or(last);
+        ("moving", Value::Null, inverse_time(latest))
+    } else if !pending.is_empty() || review.is_some() {
+        (
+            "waiting",
+            Value::Null,
+            oldest_wait
+                .into_iter()
+                .chain(review_since)
+                .min()
+                .unwrap_or("")
+                .to_owned(),
+        )
+    } else {
+        (
+            "idle",
+            Value::Null,
+            format!("{}{}", if has_claim { 0 } else { 1 }, inverse_time(last)),
+        )
+    };
+    (
+        facts,
+        json!({"section": section, "reason": reason, "order_key": key}),
+    )
 }
 
 /// Sessions holding an active claim that a live holder outside their line
@@ -733,5 +1086,143 @@ fn attach_html(v: &Value) -> String {
             r#"<code class="cp mt" data-cp="{0}" title="Click to copy">$ {0} ⧉</code>"#,
             escape_html(command)
         ),
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    #[test]
+    fn attention_examples_keep_agent_jobs_and_owner_question_separate() {
+        let now = OffsetDateTime::parse("2026-09-30T19:47:00Z", &Rfc3339).unwrap();
+        let config = AppConfig::default();
+        let empty = json!([]);
+        let messages = BTreeMap::new();
+        let context = FactContext {
+            messages: &messages,
+            config: &config,
+            now,
+        };
+        let session = |activity: &str| {
+            json!({"status": "active", "activity_state": activity,
+            "last_activity": "2026-09-30T19:42:00Z"})
+        };
+        let running = json!([{"state": "running", "type": "background", "label": "Run",
+            "started_at": "2026-09-30T16:51:00Z", "timeout_seconds": 0}]);
+        let pending = json!([{"state": "pending", "type": "tests", "label": "Test",
+            "queued_at": "2026-09-30T18:45:00Z", "position": 3}]);
+        let recent_pending = json!([{"state": "pending", "type": "tests", "label": "Test",
+            "queued_at": "2026-09-30T19:39:00Z", "position": 1}]);
+        let cases = [
+            (
+                session("idle"),
+                empty.clone(),
+                empty.clone(),
+                running.clone(),
+                "moving",
+                "Background running 2h 56m",
+            ),
+            (
+                session("idle"),
+                empty.clone(),
+                empty.clone(),
+                pending,
+                "waiting_long",
+                "Waiting 1h 2m · 3rd in line",
+            ),
+            (
+                session("working"),
+                empty.clone(),
+                empty.clone(),
+                recent_pending,
+                "moving",
+                "Waiting 8m · 1st in line",
+            ),
+            (
+                session("idle"),
+                json!([{"kind": "review", "pr_number": 1790,
+                "since": "2026-09-30T19:35:00Z"}]),
+                empty.clone(),
+                empty.clone(),
+                "waiting",
+                "Codex review on PR #1790 · 12m",
+            ),
+            (
+                session("idle"),
+                empty.clone(),
+                json!([{"kind": "ticket"}]),
+                empty.clone(),
+                "waiting_long",
+                "No jobs",
+            ),
+        ];
+        for (session, obligations, claims, jobs, section, job_text) in cases {
+            let (facts, attention) = agent_facts(
+                &session,
+                &obligations,
+                &claims,
+                jobs.as_array().unwrap(),
+                Some("2026-09-30T19:13:00Z"),
+                &context,
+            );
+            assert_eq!(attention["section"], section);
+            assert_eq!(facts["jobs"]["text"], job_text);
+        }
+    }
+
+    #[test]
+    fn blocking_message_wins_even_while_agent_works_and_doc_review_remains() {
+        let now = OffsetDateTime::parse("2026-09-30T19:47:00Z", &Rfc3339).unwrap();
+        let mut messages = BTreeMap::new();
+        messages.insert(
+            "msg_3f9a2c1d".to_owned(),
+            crate::owner_messages::OwnerMessage {
+                id: "msg_3f9a2c1d".to_owned(),
+                human: "rajesh".to_owned(),
+                sender_session_id: "agent".to_owned(),
+                sender_session_name: "agent".to_owned(),
+                title: "Check Chrome".to_owned(),
+                body_markdown: "Please check Chrome".to_owned(),
+                blocking: true,
+                created_at: "2026-09-30T19:40:00Z".to_owned(),
+                first_viewed_at: None,
+                handled_at: None,
+                handled_via: None,
+            },
+        );
+        let session = json!({"status": "active", "activity_state": "working"});
+        let config = AppConfig::default();
+        let context = FactContext {
+            messages: &messages,
+            config: &config,
+            now,
+        };
+        let obligations = json!([{"kind": "owner_message", "id": "msg_3f9a2c1d"},
+            {"kind": "owner_review", "since": "2026-09-30T19:41:00Z",
+             "label": "Owner review · Memo"}]);
+        let (facts, attention) = agent_facts(
+            &session,
+            &obligations,
+            &json!([]),
+            &[],
+            Some("2026-09-30T19:42:00Z"),
+            &context,
+        );
+        assert_eq!(facts["agent"]["state"], "working");
+        assert_eq!(facts["you"]["kind"], "message");
+        assert_eq!(facts["you"]["more"], 1);
+        assert_eq!(attention["section"], "you");
+        let (facts, attention) = agent_facts(
+            &session,
+            &json!([obligations[1].clone()]),
+            &json!([]),
+            &[],
+            None,
+            &context,
+        );
+        assert_eq!(facts["you"]["kind"], "doc_review");
+        assert_eq!(facts["you"]["dismissible"], false);
+        assert_eq!(attention["section"], "you");
     }
 }
