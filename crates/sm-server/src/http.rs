@@ -564,36 +564,64 @@ impl GitHubReviewPoster for GhCliReviewPoster {
 
 /// Counts provider side-command workers across rollback generations in one process.
 #[derive(Clone, Default)]
-pub struct BtwWorkers(Arc<(Mutex<usize>, Condvar)>);
+pub struct BtwWorkers(Arc<(Mutex<BtwWorkerState>, Condvar)>);
+
+#[derive(Default)]
+struct BtwWorkerState {
+    active: usize,
+    recovery_blocked: bool,
+}
 
 struct BtwWorkerGuard(BtwWorkers);
 
 impl BtwWorkers {
     fn begin(&self) -> BtwWorkerGuard {
-        let (count, _) = &*self.0;
-        *count.lock().unwrap() += 1;
+        let (state, _) = &*self.0;
+        state.lock().unwrap().active += 1;
         BtwWorkerGuard(self.clone())
     }
 
     pub fn wait_empty(&self, limit: Duration) -> bool {
-        let (count, changed) = &*self.0;
-        let count = count.lock().unwrap();
-        let (count, _) = changed
-            .wait_timeout_while(count, limit, |count| *count != 0)
+        let (state, changed) = &*self.0;
+        let state = state.lock().unwrap();
+        let (state, _) = changed
+            .wait_timeout_while(state, limit, |state| state.active != 0)
             .unwrap();
-        *count == 0
+        state.active == 0
     }
 
     pub fn is_empty(&self) -> bool {
-        let (count, _) = &*self.0;
-        *count.lock().unwrap() == 0
+        let (state, _) = &*self.0;
+        state.lock().unwrap().active == 0
+    }
+
+    pub fn block_recovery(&self) {
+        let (state, _) = &*self.0;
+        state.lock().unwrap().recovery_blocked = true;
+    }
+
+    pub fn allow_recovery(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().recovery_blocked = false;
+        changed.notify_all();
+    }
+
+    fn wait_ready_for_recovery(&self, limit: Duration) -> bool {
+        let (state, changed) = &*self.0;
+        let state = state.lock().unwrap();
+        let (state, _) = changed
+            .wait_timeout_while(state, limit, |state| {
+                state.active != 0 || state.recovery_blocked
+            })
+            .unwrap();
+        state.active == 0 && !state.recovery_blocked
     }
 }
 
 impl Drop for BtwWorkerGuard {
     fn drop(&mut self) {
-        let (count, changed) = &*self.0 .0;
-        *count.lock().unwrap() -= 1;
+        let (state, changed) = &*self.0 .0;
+        state.lock().unwrap().active -= 1;
         changed.notify_all();
     }
 }
@@ -610,6 +638,10 @@ fn btw_worker_blocks_handover_across_rollback_generations() {
     drop(old_worker);
     assert!(workers.is_empty());
     assert!(resumed_generation.wait_empty(Duration::from_millis(1)));
+    workers.block_recovery();
+    assert!(!resumed_generation.wait_ready_for_recovery(Duration::from_millis(1)));
+    workers.allow_recovery();
+    assert!(resumed_generation.wait_ready_for_recovery(Duration::from_millis(1)));
 }
 
 #[derive(Clone)]
@@ -10053,7 +10085,10 @@ async fn get_btw_request(
 
 fn recover_btw_requests(state: Arc<AppState>) {
     thread::spawn(move || {
-        while !state.btw_workers.wait_empty(Duration::from_secs(1)) {
+        while !state
+            .btw_workers
+            .wait_ready_for_recovery(Duration::from_secs(1))
+        {
             if state.shutdown.is_stopped() {
                 return;
             }

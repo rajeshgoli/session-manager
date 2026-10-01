@@ -240,6 +240,25 @@ fn peer_identity(stream: &UnixStream) -> Result<(u32, u32)> {
     Ok((uid, u32::try_from(pid)?))
 }
 
+pub fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    Ok(peer_identity(stream)?.1)
+}
+
+/// Keep rollback recovery parked until every thread in the replacement is gone.
+pub fn wait_peer_exit(pid: u32) -> Result<()> {
+    let pid = i32::try_from(pid)?;
+    loop {
+        if unsafe { nix::libc::kill(pid, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn peer_identity(stream: &UnixStream) -> Result<(u32, u32)> {
     let mut credentials: nix::libc::ucred = unsafe { std::mem::zeroed() };

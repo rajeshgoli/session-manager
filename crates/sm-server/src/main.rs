@@ -578,6 +578,13 @@ async fn main() -> Result<()> {
                 }
                 request = handover_rx.recv() => {
                 let Some(mut stream) = request else { anyhow::bail!("handover acceptor stopped"); };
+                let replacement_pid = match handover::peer_pid(&stream) {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        eprintln!("handover refused: replacement identity unavailable: {error:#}");
+                        continue;
+                    }
+                };
                 if !btw_workers.is_empty() {
                     eprintln!("handover refused: /btw worker is active");
                     drop(stream);
@@ -593,7 +600,7 @@ async fn main() -> Result<()> {
                     Err(error) => {
                         eprintln!("handover LAN pause failed, resuming old slot: {error:#}");
                         lan_control.stop().await;
-                        let _ = authority_thread.join();
+                        drop(authority_thread);
                         let _ = handover_acceptor.join();
                         write_active_slot(handover_dir)?;
                         continue 'generations;
@@ -602,7 +609,9 @@ async fn main() -> Result<()> {
                 if drain_result.is_err() {
                     server_task.abort();
                 }
-                    let _ = authority_thread.join();
+                    // An existing authority request is read-only; do not let a
+                    // stalled client hold the HTTP listener out of service.
+                    drop(authority_thread);
                     let _ = handover_acceptor.join();
                     if !btw_workers.is_empty() {
                         eprintln!("handover refused: /btw worker started during request drain");
@@ -635,8 +644,16 @@ async fn main() -> Result<()> {
                     if let Err(error) = result {
                         eprintln!("handover rolled back: {error:#}");
                     }
+                    btw_workers.block_recovery();
                     let _ = handover::send_decision(&mut stream, handover::Decision::Rollback);
-                    let _ = handover::await_peer_close(&mut stream);
+                    let recovery_workers = btw_workers.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = handover::wait_peer_exit(replacement_pid) {
+                            eprintln!("replacement exit watch failed; /btw recovery remains parked: {error:#}");
+                            return;
+                        }
+                        recovery_workers.allow_recovery();
+                    });
                     write_active_slot(handover_dir)?;
                     inherited_lan = lan_listener;
                     continue 'generations;
