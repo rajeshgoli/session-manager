@@ -138,7 +138,7 @@ fn claim_view_json(config: &AppConfig, view: &ClaimView) -> Value {
     value
 }
 
-fn claim_json(state: &AppState, claim_id: &str) -> Result<Value, ApiError> {
+pub(super) fn claim_json(state: &AppState, claim_id: &str) -> Result<Value, ApiError> {
     let store = work_claim_store(state);
     let claim = store
         .claim(claim_id)?
