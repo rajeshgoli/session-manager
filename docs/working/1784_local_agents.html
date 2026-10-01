@@ -107,13 +107,13 @@
 </style>
 
 <h1>1784 — Local models as sm agents</h1>
-<p class="sans"><small>Author: Claude Opus 5.5 <code>sm-1784</code> (2aac7357) · Ticket #1784 · 2026-09-30</small></p>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>sm-1784</code> (2aac7357) · Ticket #1784 · revision 4, 2026-10-01</small></p>
 
 <h2>Memo</h2>
 
-<p><b>Run local agents as ordinary Claude Code sessions that point at a model server on this Mac, and make sm own the one decision no harness can make: when the model is loaded and how many agents may share it, given everything else the machine is doing.</b> The harness (the program that turns a model into an agent: Claude Code, Codex, opencode) is a solved problem; all three on this machine can already talk to a local model. What is unsolved is contention. A resident coding model takes 85–130 GB of the 256 GB, and your queue jobs alone use 173 GB or more in one sample out of ten, and up to 247 GB. Without sm, the first time both want memory at once the machine swaps, and sm's own memory guard stops one of your queue jobs rather than the model, because the model is invisible to it.</p>
+<p><b>Run local agents as ordinary Claude Code sessions that point at a model server on this Mac, and make sm own the one decision no harness can make: when the model is loaded and how many agents may share it, given everything else the machine is doing.</b> The harness (the program that turns a model into an agent: Claude Code, Codex, opencode) is a solved problem; all three on this machine can already talk to a local model. What is unsolved is contention. A resident coding model takes 40–130 GB of the 256 GB, and your queue jobs alone use 173 GB or more in one sample out of ten, and up to 247 GB. Without sm, the first time both want memory at once the machine swaps, and sm's own memory guard stops one of your queue jobs rather than the model, because the model is invisible to it.</p>
 
-<p>Concretely sm gains four things: a <b>local model host</b> it loads and unloads; a <b>seat limit</b> on how many local agents may run against it; a <b>yield rule</b> that unloads the model before any queue job is starved and resumes the parked agents afterwards; and <b>separate accounting</b> so local tokens never count against your Claude or Codex quota. The first step is a pilot of three tickets ending in a <b>bake-off</b> (a head-to-head run of candidate models on past tickets whose right answer we already know). The build-out is gated on its result, because the open question is not plumbing but whether a local model does useful work in your workflow at all.</p>
+<p>Concretely sm gains four things: a <b>local model host</b> it loads and unloads; a <b>seat limit</b> on how many local agents may run against it; a <b>yield rule</b> that unloads the model before any queue job is starved and resumes the parked agents afterwards; and <b>separate accounting</b> so local tokens never count against your Claude or Codex quota. <b>None of that gets built yet.</b> The first step is a <b>prototype</b> with no sm code: a real ticket from last week (#1913, a queue bug fixed and merged as PR #1918) runs by hand in an isolated worktree. A local model drives Claude Code, and a Codex reviewer grades the result against the fix that actually merged. That one run tests the model and the harness together on your real work. All sm engineering waits on it, because the open question is not plumbing but whether any local model does useful work in your workflow at all.</p>
 
 <dl class="vocab">
 <dt>Model server</dt><dd>The program that holds model weights in memory and answers HTTP requests. Here: LM Studio 0.4.16, already installed and running as a background service. It speaks both the OpenAI and the Anthropic request formats.</dd>
@@ -131,14 +131,15 @@
 <tr><th style="width:18%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. Which harness drives the local model?</td><td><b>Claude Code, launched with a slim profile, pointed at LM Studio.</b> sm spawns it exactly like a Claude agent; the session's host is <code>local</code>. The slim profile drops MCP servers, skills and unused tools so the first prompt shrinks from ~84K tokens to an expected 15–25K. opencode is the fallback if the pilot shows Claude Code cannot be slimmed below 30K or calls tools unreliably on a local model.</td><td>sm already understands Claude Code completely (status, message delivery, usage, resume, compaction); a new harness means ~25 files of new integration.</td></tr>
-<tr><td>2. Which model is resident?</td><td><b>Qwen3-Coder-Next 8-bit by default; MiniMax M2.5 enters only through the bake-off, at one or two agents in quiet windows.</b> GLM-5.2 (204 GB) is excluded.</td><td>Measured: four Qwen agents took 95 GB; two MiniMax agents took 160 GB, and four reached 216 GB, which leaves your queue almost nothing.</td></tr>
+<tr><td>1. Which harness drives the local model?</td><td><b>Claude Code, launched with a slim profile, pointed at LM Studio; opencode runs alongside it in the prototype as the control.</b> The slim profile drops MCP servers, skills and unused tools, so the first prompt shrinks from ~84K tokens to an expected 15–25K. If opencode clearly beats Claude Code on the same task and model, opencode becomes the harness despite the extra sm work.</td><td>sm already understands Claude Code completely (status, message delivery, usage, resume, compaction); a new harness means ~25 files of new integration.</td></tr>
+<tr><td>2. Which model?</td><td><b>Prototype two newer Qwen models: Qwen3.8-27B (58 GB) and Qwen3.6-35B-A3B (38 GB).</b> Add Qwen3.8-Flash-Next (112 GB, the best scores) once LM Studio can run it. Delete Qwen3-Coder-Next, MiniMax M2.5 and GLM-5.2 from disk (413 GB) after the prototype.</td><td>The models on disk are outclassed: the newer ones score higher on Qwen's coding benchmark (61.7 and 49.5 against 44.3) at a fraction of the memory.</td></tr>
 <tr><td>3. Who wins when memory runs short?</td><td><b>Your queue jobs, always.</b> The model is the first thing sm removes, before its memory guard stops any queue job. Local agents drain, park, and resume when memory returns.</td><td>Local agents are optional capacity; your queue jobs are the work.</td></tr>
 <tr><td>4. What happens during a perf run?</td><td><b>A perf run unloads the model for its duration.</b></td><td>Perf asks for a quiet machine; a model decoding at full GPU is the loudest thing on it.</td></tr>
-<tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-review</code> like everyone else's.</td><td>These models are roughly Low-tier quality at best, and the review gate is what makes weaker authors safe.</td></tr>
+<tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-review</code> like everyone else's.</td><td>Vendor scores put the best of these near your Mid tier, but they are vendor-run. Until the prototype shows otherwise, treat them as Low tier, and the review gate keeps a weaker author safe.</td></tr>
 <tr><td>6. When may local agents run?</td><td><b>Whenever the model fits, not only overnight.</b> The yield rule handles contention.</td><td>Your queue is light 00:00–05:00 and around 08:00, but also between runs during the day; a fixed window wastes those gaps.</td></tr>
-<tr><td>7. What gets built now?</td><td><b>The pilot only: three tickets, ending in the bake-off.</b> The seat limit, yield rule and app changes are built only if the bake-off passes.</td><td>If local models cannot finish a Low-tier ticket in your workflow, none of the contention machinery is worth building.</td></tr>
-<tr><td>8. How many agents share the model?</td><td><b>Two, until the pilot shows LM Studio reusing each agent's earlier conversation between turns; then up to four.</b></td><td>Measured on both models: reading speed is shared, so four agents reading at once each wait up to four times longer.</td></tr>
+<tr><td>7. What happens first?</td><td><b>The prototype, by hand, before any sm code.</b> Ticket #1913 runs on each prototype model in Claude Code, and on the better model in opencode, in isolated worktrees during a quiet window you give me. A Codex reviewer grades each result against the merged fix. If one combination passes, two more of last week's tickets run on it to rule out luck. Only then does sm engineering start.</td><td>It measures model and harness together on real work, and costs no engineering if the answer is no.</td></tr>
+<tr><td>8. How many agents share the model?</td><td><b>Two, until the prototype shows LM Studio reusing each agent's earlier conversation between turns; then up to four.</b></td><td>Measured on both models: reading speed is shared, so four agents reading at once each wait up to four times longer.</td></tr>
+<tr><td>9. What may a local agent do without asking?</td><td><b>Run inside Claude Code's sandbox:</b> file writes are confined to its worktree, it has no network beyond the model server, and commands inside the sandbox are approved automatically. <b>Never auto mode.</b></td><td>Auto mode's safety check calls Anthropic directly, not the local model. It would fail, or bill your Claude subscription on every tool call if your login is present.</td></tr>
 </tbody>
 </table>
 
@@ -153,52 +154,52 @@
 <line x1="46" x2="710" y1="130" y2="130" stroke="var(--rule)"/><text x="40" y="134" text-anchor="end" fill="var(--ink-2)">150</text>
 <line x1="46" x2="710" y1="84" y2="84" stroke="var(--rule)"/><text x="40" y="88" text-anchor="end" fill="var(--ink-2)">200</text>
 <line x1="46" x2="710" y1="39" y2="39" stroke="var(--rule)"/><text x="40" y="43" text-anchor="end" fill="var(--ink-2)">250</text>
-<rect x="49" y="238" width="22" height="28" fill="var(--blue)" opacity=".25"/><rect x="49" y="243" width="22" height="23" fill="var(--blue)"/>
+<rect x="49" y="71" width="22" height="195" fill="var(--blue)" opacity=".25"/><rect x="49" y="172" width="22" height="94" fill="var(--blue)"/>
 <text x="60" y="281" text-anchor="middle" fill="var(--ink-2)">00</text>
-<rect x="77" y="242" width="22" height="24" fill="var(--blue)" opacity=".25"/><rect x="77" y="244" width="22" height="22" fill="var(--blue)"/>
-<rect x="104" y="243" width="22" height="23" fill="var(--blue)" opacity=".25"/><rect x="104" y="245" width="22" height="21" fill="var(--blue)"/>
-<rect x="132" y="243" width="22" height="23" fill="var(--blue)" opacity=".25"/><rect x="132" y="244" width="22" height="22" fill="var(--blue)"/>
+<rect x="77" y="75" width="22" height="191" fill="var(--blue)" opacity=".25"/><rect x="77" y="177" width="22" height="89" fill="var(--blue)"/>
+<rect x="104" y="76" width="22" height="190" fill="var(--blue)" opacity=".25"/><rect x="104" y="172" width="22" height="94" fill="var(--blue)"/>
+<rect x="132" y="79" width="22" height="187" fill="var(--blue)" opacity=".25"/><rect x="132" y="173" width="22" height="93" fill="var(--blue)"/>
 <text x="143" y="281" text-anchor="middle" fill="var(--ink-2)">03</text>
-<rect x="160" y="204" width="22" height="62" fill="var(--blue)" opacity=".25"/><rect x="160" y="235" width="22" height="31" fill="var(--blue)"/>
-<rect x="187" y="170" width="22" height="96" fill="var(--blue)" opacity=".25"/><rect x="187" y="233" width="22" height="33" fill="var(--blue)"/>
-<rect x="215" y="125" width="22" height="141" fill="var(--blue)" opacity=".25"/><rect x="215" y="198" width="22" height="68" fill="var(--blue)"/>
+<rect x="160" y="104" width="22" height="162" fill="var(--blue)" opacity=".25"/><rect x="160" y="174" width="22" height="92" fill="var(--blue)"/>
+<rect x="187" y="80" width="22" height="186" fill="var(--blue)" opacity=".25"/><rect x="187" y="192" width="22" height="74" fill="var(--blue)"/>
+<rect x="215" y="125" width="22" height="141" fill="var(--blue)" opacity=".25"/><rect x="215" y="218" width="22" height="48" fill="var(--blue)"/>
 <text x="226" y="281" text-anchor="middle" fill="var(--ink-2)">06</text>
-<rect x="243" y="123" width="22" height="143" fill="var(--blue)" opacity=".25"/><rect x="243" y="210" width="22" height="56" fill="var(--blue)"/>
-<rect x="270" y="181" width="22" height="85" fill="var(--blue)" opacity=".25"/><rect x="270" y="233" width="22" height="33" fill="var(--blue)"/>
-<rect x="298" y="135" width="22" height="131" fill="var(--blue)" opacity=".25"/><rect x="298" y="174" width="22" height="92" fill="var(--blue)"/>
+<rect x="243" y="123" width="22" height="143" fill="var(--blue)" opacity=".25"/><rect x="243" y="224" width="22" height="42" fill="var(--blue)"/>
+<rect x="270" y="181" width="22" height="85" fill="var(--blue)" opacity=".25"/><rect x="270" y="234" width="22" height="32" fill="var(--blue)"/>
+<rect x="298" y="135" width="22" height="131" fill="var(--blue)" opacity=".25"/><rect x="298" y="205" width="22" height="61" fill="var(--blue)"/>
 <text x="309" y="281" text-anchor="middle" fill="var(--ink-2)">09</text>
-<rect x="326" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="326" y="133" width="22" height="133" fill="var(--blue)"/>
-<rect x="353" y="82" width="22" height="184" fill="var(--blue)" opacity=".25"/><rect x="353" y="107" width="22" height="159" fill="var(--blue)"/>
-<rect x="381" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="381" y="107" width="22" height="159" fill="var(--blue)"/>
+<rect x="326" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="326" y="185" width="22" height="81" fill="var(--blue)"/>
+<rect x="353" y="82" width="22" height="184" fill="var(--blue)" opacity=".25"/><rect x="353" y="172" width="22" height="94" fill="var(--blue)"/>
+<rect x="381" y="83" width="22" height="183" fill="var(--blue)" opacity=".25"/><rect x="381" y="171" width="22" height="95" fill="var(--blue)"/>
 <text x="392" y="281" text-anchor="middle" fill="var(--ink-2)">12</text>
-<rect x="409" y="82" width="22" height="184" fill="var(--blue)" opacity=".25"/><rect x="409" y="107" width="22" height="159" fill="var(--blue)"/>
-<text x="447" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
-<text x="475" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
+<rect x="409" y="81" width="22" height="185" fill="var(--blue)" opacity=".25"/><rect x="409" y="168" width="22" height="98" fill="var(--blue)"/>
+<rect x="436" y="24" width="22" height="242" fill="var(--blue)" opacity=".25"/><rect x="436" y="152" width="22" height="114" fill="var(--blue)"/>
+<rect x="464" y="78" width="22" height="188" fill="var(--blue)" opacity=".25"/><rect x="464" y="161" width="22" height="105" fill="var(--blue)"/>
 <text x="475" y="281" text-anchor="middle" fill="var(--ink-2)">15</text>
-<text x="502" y="259" text-anchor="middle" fill="var(--ink-3)">·</text>
-<rect x="519" y="132" width="22" height="134" fill="var(--blue)" opacity=".25"/><rect x="519" y="172" width="22" height="94" fill="var(--blue)"/>
-<rect x="547" y="43" width="22" height="223" fill="var(--blue)" opacity=".25"/><rect x="547" y="144" width="22" height="122" fill="var(--blue)"/>
+<rect x="492" y="81" width="22" height="185" fill="var(--blue)" opacity=".25"/><rect x="492" y="102" width="22" height="164" fill="var(--blue)"/>
+<rect x="519" y="80" width="22" height="186" fill="var(--blue)" opacity=".25"/><rect x="519" y="137" width="22" height="129" fill="var(--blue)"/>
+<rect x="547" y="43" width="22" height="223" fill="var(--blue)" opacity=".25"/><rect x="547" y="189" width="22" height="77" fill="var(--blue)"/>
 <text x="558" y="281" text-anchor="middle" fill="var(--ink-2)">18</text>
-<rect x="575" y="47" width="22" height="219" fill="var(--blue)" opacity=".25"/><rect x="575" y="139" width="22" height="127" fill="var(--blue)"/>
-<rect x="602" y="44" width="22" height="222" fill="var(--blue)" opacity=".25"/><rect x="602" y="141" width="22" height="125" fill="var(--blue)"/>
-<rect x="630" y="42" width="22" height="224" fill="var(--blue)" opacity=".25"/><rect x="630" y="160" width="22" height="106" fill="var(--blue)"/>
+<rect x="575" y="47" width="22" height="219" fill="var(--blue)" opacity=".25"/><rect x="575" y="187" width="22" height="79" fill="var(--blue)"/>
+<rect x="602" y="44" width="22" height="222" fill="var(--blue)" opacity=".25"/><rect x="602" y="181" width="22" height="85" fill="var(--blue)"/>
+<rect x="630" y="42" width="22" height="224" fill="var(--blue)" opacity=".25"/><rect x="630" y="165" width="22" height="101" fill="var(--blue)"/>
 <text x="641" y="281" text-anchor="middle" fill="var(--ink-2)">21</text>
-<rect x="658" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="658" y="139" width="22" height="127" fill="var(--blue)"/>
-<rect x="685" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="685" y="85" width="22" height="181" fill="var(--blue)"/>
-<line x1="46" x2="710" y1="102" y2="102" stroke="var(--green)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="97" text-anchor="end" fill="var(--green)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">Qwen3-Coder-Next + 4 agents resident → this much left (180 GB)</text>
-<line x1="46" x2="710" y1="225" y2="225" stroke="var(--red)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="220" text-anchor="end" fill="var(--red)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">MiniMax M2.5 + 4 agents resident → this much left (45 GB)</text>
+<rect x="658" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="658" y="125" width="22" height="141" fill="var(--blue)"/>
+<rect x="685" y="22" width="22" height="244" fill="var(--blue)" opacity=".25"/><rect x="685" y="92" width="22" height="174" fill="var(--blue)"/>
+<line x1="46" x2="710" y1="102" y2="102" stroke="var(--green)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="97" text-anchor="end" fill="var(--green)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">Qwen3-Coder-Next + 4 agents (measured) → this much left (180 GB)</text>
+<line x1="46" x2="710" y1="212" y2="212" stroke="var(--red)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="207" text-anchor="end" fill="var(--red)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">MiniMax M2.5 + 4 agents (measured) → this much left (59 GB)</text>
 <text x="46" y="296" fill="var(--ink-2)">hour of day (local) · GB used, dark = average, light = peak · 256 GiB = 275 GB total</text></svg>
 
-<figcaption><b>Figure 1. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples). Dark bars are hourly averages and light bars are hourly peaks. The dashed lines show how much memory is left for everything else once a model and four agents are resident. With Qwen resident, the average hour still fits, and the peak hours (18:00–23:00, driven by queue jobs) force a yield. With MiniMax resident, only the overnight hours fit. The dots mark hours with no samples.</figcaption>
+<figcaption><b>Figure 1. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples). Dark bars are hourly averages and light bars are hourly peaks. The dashed lines show how much memory was left for everything else with each benchmarked model and four agents resident. The newer candidates are smaller: 38–58 GB of weights. With Qwen resident, the average hour still fits, and the peak hours (18:00–23:00, driven by queue jobs) force a yield. With MiniMax resident, only the overnight hours fit. The dots mark hours with no samples.</figcaption>
 </figure>
 
-<p>Three facts from the same data drive the design:</p>
+<p>Five facts from that data and from the benchmark runs drive the design:</p>
 <ul>
 <li><b>Queue jobs are the memory.</b> Queue jobs alone used 49 GB at the median sample, 173 GB at the 90th percentile and 247 GB at the 99th. Background jobs were running 61% of the time.</li>
 <li><b>The GPU is shared, too.</b> From 18:00 to 21:00 the GPU averaged 60–76% busy from queue work. A local model decoding at the same time slows both.</li>
 <li><b>sm's memory guard would hit the wrong target.</b> When available memory falls below 8 GiB, the guard stops the largest <i>queue job</i>. A model server started outside sm is not a queue job, so the guard would stop your job to protect the model. Part of this design is teaching the guard to unload the model first.</li>
-<li><b>Stopping the job that loaded a model does not free it.</b> When you asked me to free the machine tonight, I cancelled the benchmark job. Its process ended, but LM Studio kept MiniMax's 129 GB until I unloaded it by hand, because the model lives in LM Studio's process, not the job's. Only something that knows a model is loaded, and calls LM Studio to unload it, gets the memory back.</li>
-<li><b>sm's queue cannot see model work today.</b> During the MiniMax run on 1 Oct, the queue's watchdog reported the benchmark job as quiet and holding 0 GB. Meanwhile the model held 216 GB of wired memory, the GPU was at 100%, and available memory was falling 1 GB every 5 seconds toward the guard's floor. Your <code>1858-train-r2</code> job was running. I unloaded the model by hand with 47 GB left. Without that, the guard would have stopped your training job, the only queue job it could see.</li>
+<li><b>Stopping the job that loaded a model does not free it.</b> When you asked me to free the machine on 30 Sep, I cancelled the benchmark job. Its process ended, but LM Studio kept MiniMax's 129 GB until I unloaded it by hand, because the model lives in LM Studio's process, not the job's. Only something that knows a model is loaded, and calls LM Studio to unload it, gets the memory back.</li>
+<li><b>sm's queue cannot see model work today.</b> During the MiniMax run on 1 Oct, the queue's watchdog reported the benchmark job as quiet and holding 0 GB. Meanwhile the model held 216 GB of wired memory, the GPU was at 100%, and available memory was falling 1 GB every 5 seconds toward the guard's floor. Your <code>1858-train-r2</code> job was running. I unloaded the model by hand with 47 GB left. Without that, the guard would have stopped your training job, the only queue job it could see. The blind spot is narrow: the queue measures only work done on this Mac, and that is correct for <code>1858-train-r2</code>, which streams to a remote GPU pod and really does use almost nothing here. It goes wrong only when a job hands its work to a separate service on this Mac. No such service runs today except a model server.</li>
 </ul>
 
 <h3>What local agents are worth</h3>
@@ -219,7 +220,7 @@
 <li><b>Moving the mechanical part of Opus work down.</b> Moving 10–20% of Opus-share work saves roughly 5–10% of the weekly Claude quota.</li>
 <li><b>Continuity.</b> When a quota runs out, work today stops until the reset. Local agents keep the Local-tier queue moving.</li>
 </ol>
-<p>The bake-off measures whether (1) and (2) are real. If a local agent cannot finish a Low-tier ticket without a human or a top-tier agent cleaning up after it, the value is negative and we stop.</p>
+<p>The prototype measures whether (1) and (2) are real. If a local agent cannot finish a Low-tier ticket without a human or a top-tier agent cleaning up after it, the value is negative and we stop.</p>
 
 <h3>The harness choice</h3>
 <table>
@@ -228,35 +229,40 @@
 <tr><td>What sm reuses</td><td>Everything Claude has: hooks for status, transcript for usage, verified spawn brief, <code>--resume</code>, <code>/clear</code>, compaction events.</td><td>Only stock-Codex support: status from the pane title, no verified brief. Your Codex fork has its event stream but not <code>--oss</code>.</td><td>Nothing. New status detection, message delivery, usage parser, resume, and UI.</td></tr>
 <tr><td>sm change</td><td>Small: per-session launch environment, a host field, usage split, UI badge.</td><td>Medium: port <code>--oss</code> into the fork, or accept weak stock-Codex integration.</td><td>Large: ~25 files branch on provider today.</td></tr>
 <tr><td>Prompt overhead</td><td>Large by default (34K–96K tokens on this machine; median 84K). The slim profile is required, not optional.</td><td>Moderate.</td><td>Smallest.</td></tr>
-<tr><td>Model fit</td><td>MiniMax M2.5 and Qwen3-Coder are both trained on Claude-Code-style tool use.</td><td>Codex's patch tool format is GPT-specific; open models handle it less well.</td><td>Generic tool calls; works with any model.</td></tr>
-<tr><td>Known risk</td><td>LM Studio 0.4.19 broke tool calling for Qwen on this endpoint<sup><a href="#fn1">1</a></sup>; we pin 0.4.16. Claude Code's auto permission mode may need Anthropic's servers: the pilot checks.</td><td>Integration gap.</td><td>Cost.</td></tr>
+<tr><td>Model fit</td><td>Qwen reports its newest models' coding scores using Claude Code itself as the harness, so the vendor has tested this pairing.</td><td>Codex's patch tool format is GPT-specific; open models handle it less well.</td><td>Generic tool calls; works with any model.</td></tr>
+<tr><td>Known risk</td><td>LM Studio 0.4.19 broke tool calling for Qwen on this endpoint<sup><a href="#fn1">1</a></sup>; the prototype pins whichever version passes. Auto mode is unusable (decision 9).</td><td>Integration gap.</td><td>Cost.</td></tr>
 </tbody>
 </table>
 
-<h3>Model choice and how many agents fit</h3>
-<p>Two models on disk are candidates. The number that decides between them is per-agent memory. The architecture sets a floor: Qwen3-Coder-Next keeps a full per-token cache on only 12 of its 48 layers, and MiniMax M2.5 keeps it on all 62. Measured footprints match the floor for Qwen and run well above it for MiniMax (below).</p>
+<h3>Model choice</h3>
+<p>The two models I benchmarked are no longer the best that fit. I surveyed open models released through September 2026 against three constraints: weights of 110 GB or less, so your queue keeps ~140 GB; few active parameters per token, because reading speed is the bottleneck; and a strong score on agentic coding. Qwen's newer general models beat its own coding model. The table uses SWE-bench Pro, a set of real repository tasks scored by whether the fix passes the project's tests.</p>
 <table>
-<thead><tr><th>Model (on disk)</th><th>Size</th><th>Weights</th><th>Cache per agent at 100K tokens</th><th>Weights + 4 agents</th><th>Reads (tokens/s)</th><th>Writes, one agent (tokens/s)</th></tr></thead>
+<thead><tr><th>Model</th><th>Released</th><th>Size that fits</th><th>Work per token</th><th>SWE-bench Pro (vendor)</th><th>Runs in LM Studio today?</th></tr></thead>
 <tbody>
-<tr><td>Qwen3-Coder-Next, 8-bit</td><td>80B total, 3B active per token</td><td>85 GB</td><td>2.5 GB</td><td>~95 GB</td><td>1,300–1,700</td><td>47–58</td></tr>
-<tr><td>MiniMax M2.5, 4-bit</td><td>230B total, 10B active</td><td>129 GB</td><td>25 GB</td><td>~230 GB</td><td>330–710</td><td>21–49</td></tr>
-<tr><td>GLM-5.2, 2-bit experts</td><td>large MoE</td><td>204 GB</td><td>n/a</td><td>does not fit beside anything</td><td>—</td><td>—</td></tr>
+<tr><td><b>Qwen3.8-Flash-Next</b></td><td>Aug 2026</td><td>4-bit, 112 GB</td><td>6B of 125B</td><td>62.5</td><td>Not confirmed: new architecture</td></tr>
+<tr><td><b>Qwen3.8-27B</b></td><td>Aug 2026</td><td>8-bit, 58 GB</td><td>27B (dense: slower)</td><td>61.7</td><td>MLX build published</td></tr>
+<tr><td><b>Qwen3.6-35B-A3B</b></td><td>Apr 2026</td><td>8-bit, 38 GB</td><td>3B of 35B</td><td>49.5</td><td>Yes: LM Studio's own build</td></tr>
+<tr><td>Qwen3-Coder-Next (on disk)</td><td>Feb 2026</td><td>8-bit, 85 GB</td><td>3B of 80B</td><td>44.3</td><td>Yes: measured below</td></tr>
+<tr><td>MiniMax M2.5 (on disk)</td><td>early 2026</td><td>4-bit, 129 GB</td><td>10B of 230B</td><td>not published; successor M2.7 56.2</td><td>Yes: measured below</td></tr>
+<tr><td><i>Reference: Claude Opus 4.6</i></td><td></td><td>cloud</td><td></td><td>53.4 in the same vendor table</td><td></td></tr>
 </tbody>
 </table>
-<p><b>Qwen3-Coder-Next, measured on this machine</b> (30 Sep, 21:18, quiet machine):</p>
-<ul>
-<li><b>Memory is as predicted.</b> 81 GB after loading, 28 seconds to load, and 95 GB with four agents each holding a 26K-token conversation.</li>
-<li><b>One agent is usable.</b> It reads 1,300–1,700 tokens a second and writes 47–58. A 26K-token prompt takes 15 seconds before the first word. For comparison, Claude in the cloud typically answers in a few seconds.</li>
-<li><b>Reading is shared, and four agents do not read faster than one.</b> Four agents sending 26K-token prompts at once waited 22–64 seconds each for their first word. Together they still read only ~1,600 tokens a second, the same as one agent. Writing barely scales either: 64 tokens a second in total across four agents, against 58 for one.</li>
-<li><b>No reuse of an already-read prompt.</b> Re-sending the same 26K-token prompt with one line added cost 15.3 seconds, the same as the first read. If agent turns behave the same way, every turn re-reads the whole conversation. An agent 60K tokens into a ticket would then wait ~40 seconds per turn, and ~2.5 minutes when four agents read at once.</li>
-</ul>
-<p><b>MiniMax M2.5, measured</b> (1 Oct, 13:58, quiet machine; I stopped the last test early to protect a running queue job):</p>
-<ul>
-<li><b>Slower to read, slower to write.</b> It reads 330–710 tokens a second, so a 26K-token prompt takes 54 seconds before the first word and a 51K-token prompt takes 153 seconds. It writes 21–49 tokens a second.</li>
-<li><b>It reuses a prompt it has already read.</b> The same 26K-token prompt with one line added took 0.95 seconds instead of 54. For an agent, where each turn adds a few thousand tokens to a long conversation, this matters more than raw speed.</li>
-<li><b>Its memory grows well past the weights.</b> 121 GB loaded, 160 GB with two agents, 181 GB with four, and 216 GB of wired memory during four 26K-token prompts.</li>
-</ul>
-<p>Hence decision 8: two seats until P1 proves prompt reuse. One fact holds either way: local agents are several times slower per turn than cloud agents. Their value has to come from being free and unmetered, not fast.</p>
+<p>Read the scores as tier placement, not a promise. They are Qwen's own runs, on a task set Qwen corrected, and nobody has rerun them independently. The 27B model works on every one of its parameters for each token, so expect it to read several times slower than the 3B-active models. That is the trade the prototype measures.</p>
+<h4>What the benchmark of the older models shows</h4>
+<p>I measured both models on disk on a quiet machine (appendix I.4). The new candidates use the same two layer designs, so the lessons carry over.</p>
+<table>
+<thead><tr><th></th><th>Qwen3-Coder-Next (Qwen-style layers)</th><th>MiniMax M2.5 (full attention)</th></tr></thead>
+<tbody>
+<tr><td>Memory when loaded</td><td>81 GB</td><td>121 GB</td></tr>
+<tr><td>Memory, four agents working</td><td>95 GB, as the architecture predicts</td><td>181–216 GB, far above it</td></tr>
+<tr><td>Reading, one agent (tokens/s)</td><td>1,300–1,700</td><td>330–710</td></tr>
+<tr><td>Writing, one agent (tokens/s)</td><td>47–58</td><td>21–49</td></tr>
+<tr><td>First word on a 26K-token prompt</td><td>15 s</td><td>54 s</td></tr>
+<tr><td>Same prompt sent again</td><td>15 s: not reused</td><td>under 1 s: reused</td></tr>
+<tr><td>Four agents reading at once</td><td>~1,600 tokens/s in total, no faster than one</td><td>slower still</td></tr>
+</tbody>
+</table>
+<p>Three lessons follow. Qwen-style models keep per-agent memory small; full-attention models do not. Reading speed is shared, so more agents means each waits longer (decision 8). Whether a model reuses the earlier conversation decides how fast a long agent session runs, so the prototype times every turn. Either way, local agents are several times slower per turn than cloud agents: their value is being free and unmetered, not fast.</p>
 
 <h3>How it works</h3>
 <figure>
@@ -315,31 +321,29 @@
 <table>
 <thead><tr><th style="width:8%">#</th><th>Ticket</th><th style="width:16%">Tier</th><th style="width:16%">Starts after</th></tr></thead>
 <tbody>
-<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size, and check that LM Studio reuses an agent's earlier conversation between turns.</td><td>Opus, high</td><td>—</td></tr>
-<tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>—</td></tr>
-<tr><td>P3</td><td><b>Bake-off.</b> Run 8 closed tickets from the last month (Low- and Mid-tier, with merged PRs) through local agents on each model. Score each: did it finish, did review pass within the normal round limit, wall time, and how much a Mid agent had to fix.</td><td>Opus, high (driver)</td><td>P1, P2</td></tr>
-<tr><td>B1</td><td><b>Seat limit and yield.</b> Build the drain, park and resume behaviour in Figure 3, and wait-for-seat at spawn.</td><td>Opus, high</td><td>P3 passes</td></tr>
+<tr><td>P0</td><td><b>Prototype, no sm code.</b> Download the two candidate models (96 GB). Run ticket #1913 three ways in isolated worktrees: each model in Claude Code, and the better one in opencode. Grade each against the merged PR #1918 with a Codex reviewer. If one passes, confirm on two more of last week's tickets. The full protocol is appendix H.</td><td>Opus, high (driver)</td><td>a quiet window from you</td></tr>
+<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size, and check that LM Studio reuses an agent's earlier conversation between turns.</td><td>Opus, high</td><td>P0 passes</td></tr>
+<tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>P0 passes</td></tr>
+<tr><td>B1</td><td><b>Seat limit and yield.</b> Build the drain, park and resume behaviour in Figure 3, and wait-for-seat at spawn.</td><td>Opus, high</td><td>P1, P2</td></tr>
 <tr><td>B2</td><td><b>Spend and tier table.</b> Add the Local line in Spend (web and Android) and the Local row in the CLAUDE.md tier table.</td><td>Sonnet, high</td><td>B1</td></tr>
 </tbody>
 </table>
-<p><b>Bake-off pass bar:</b> at least 5 of 8 tickets reach a clean review with no more rescue than a Mid agent spending 15% of that ticket's original tokens, and median wall time within 3× the original. Below that, we stop after the pilot. P1 and P2 are small and stay useful for manual local sessions.</p>
+<p><b>Prototype pass bar:</b> the grader rates the local fix mergeable as-is or after small changes. Its tests pass. It needs no more than a third of the work the original agent did, measured in rescue effort. It finishes within 3× the original agent's wall time. If no combination passes on #1913, we stop: no sm code is written, and I report what failed.</p>
 
 <h3>Risks I cannot close from here</h3>
 <ul>
 <li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent spends 20 seconds or more reading its prompt before its first word (the default 84K-token prompt would take about a minute), and every compaction pays that again. The fallback is opencode, at the cost in the harness table.</li>
-<li><b>Re-reading every turn.</b> MiniMax reused a prompt it had already read (under 1 second instead of 54). Qwen did not, probably because its fast layers keep a running summary rather than a per-token cache and so can only resume from the exact end of an earlier request. Agent turns do resume from exactly that point, so reuse may well work in practice; P1 checks it with real agent turns. If it does not, a Qwen agent 60K tokens into a ticket waits ~40 seconds per turn, and local agents stay at two seats and short tickets only.</li>
-<li><b>Permission mode.</b> Claude Code's auto mode may consult Anthropic's servers to classify actions. If it will not run against a local endpoint, local agents use <code>acceptEdits</code> with a command allowlist, which is stricter.</li>
-<li><b>Instruction following.</b> Weaker models ignore standing rules more often (naming themselves, going idle, not polling). Local agents get a short dedicated brief addendum, and the bake-off scores rule-following explicitly.</li>
+<li><b>Re-reading every turn.</b> MiniMax reused a prompt it had already read (under 1 second instead of 54). Qwen did not, probably because its fast layers keep a running summary rather than a per-token cache and so can only resume from the exact end of an earlier request. Agent turns do resume from exactly that point. LM Studio's MLX engine (version 1.11 is installed) also saves that state for the newer Qwen models specifically for agent work, so reuse may well work in practice; the prototype logs it on every turn. If it does not, a Qwen agent 60K tokens into a ticket waits ~40 seconds per turn, and local agents stay at two seats and short tickets only.</li>
+<li><b>Instruction following.</b> Weaker models ignore standing rules more often (naming themselves, going idle, not polling). Local agents get a short dedicated brief addendum, and the prototype's grader scores rule-following explicitly.</li>
 </ul>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>You have not reviewed an earlier revision. Since the first version (30 Sep, before any measurements):</p>
+<p>Since revision 3, which you reviewed on 1 Oct:</p>
 <ul>
-<li><b>Both models are measured</b> ("Model choice" and appendix I.4). Qwen's memory matched the prediction; MiniMax's ran far above it, so decision 2 now cites measured numbers and limits MiniMax to one or two agents.</li>
-<li><b>New decision 8:</b> start at two agents per model, because reading speed is shared across agents.</li>
-<li><b>New risk:</b> Qwen did not reuse an already-read prompt in the test; P1 checks real agent turns.</li>
-<li><b>New evidence for sm owning the model:</b> cancelling a job left 129 GB loaded, and the queue saw a 216 GB model run as an idle job.</li>
-<li>The review command is <code>sm request-review</code>, matching the current CLAUDE.md.</li>
+<li><b>The prototype comes first</b> and replaces the bake-off: one real ticket from last week, graded against the merged fix, before any sm code (decision 7, plan P0). You were right that the bake-off was the prototype. It now runs first, by hand.</li>
+<li><b>Newer models.</b> Qwen3-Coder-Next is superseded. Decision 2 now prototypes Qwen3.8-27B and Qwen3.6-35B-A3B, and a new "Model choice" table compares them against the older models.</li>
+<li><b>Auto mode is out (new decision 9).</b> You suspected billing; the docs confirm the classifier calls Anthropic directly, bypassing the local endpoint. Local agents use Claude Code's sandbox instead.</li>
+<li><b>Is queue accounting broken?</b> No. It measures work on this Mac, which is right for jobs like <code>1858-train-r2</code> that run on a remote GPU pod. It is blind only to work a job hands to a local service, and today only a model server does that. See the fifth fact under "Why this is sm's job".</li>
 </ul>
 
 <p id="fn1" class="sans"><small>1. LM Studio bug tracker issue 2164, "Regression in 0.4.19 Build 2: Anthropic /v1/messages endpoint breaks tool calling with Qwen models when used with Claude Code".</small></p>
@@ -354,7 +358,7 @@
 <div><a href="#e">E. P2: sm owns the model</a></div>
 <div><a href="#f">F. B1: seat limit, drain, park, resume</a></div>
 <div><a href="#g">G. B2: Spend line, tier table, UI</a></div>
-<div><a href="#h">H. P3: bake-off protocol</a></div>
+<div><a href="#h">H. P0: prototype protocol</a></div>
 <div><a href="#i">I. Measurements and method</a></div>
 <div><a href="#j">J. Requirement trace</a></div>
 <div><a href="#z">Z. FAQ</a></div>
@@ -401,14 +405,17 @@ unset ANTHROPIC_API_KEY
 export ANTHROPIC_MODEL=&lt;loaded model identifier&gt;
 export ANTHROPIC_SMALL_FAST_MODEL=&lt;loaded model identifier&gt;
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=&lt;context the model is loaded with&gt;
 export SM_HOST=local</code></pre>
+<p><code>CLAUDE_CODE_AUTO_COMPACT_WINDOW</code> is Claude Code's documented setting for a gateway whose context is smaller than Claude's. Claude Code clamps it to at least 100,000 tokens, so models are loaded with at least that much context.</p>
 <p>The base URL and token come from a new config block <code>local_host: { base_url, auth_token, lms_path }</code> with those defaults. <code>SM_HOST</code> lets hooks and the brief addendum (C.7) know they are local. Test: a unit test in the style of runtime.rs:3498 asserts that the local command contains each export and that a non-local command contains none of them.</p>
 <h4>C.4 Slim profile</h4>
 <p>Default Claude Code sessions on this machine send a first prompt of 34K–96K tokens (median 84K across the 39 most recent transcripts; see I.3), because every MCP server, skill and plugin contributes tool definitions. For host local, sm appends these arguments to the Claude launch arguments:</p>
 <pre><code>--strict-mcp-config --mcp-config '{"mcpServers":{}}'
 --disable-slash-commands
 --tools Bash,Read,Edit,Write,Glob,Grep,TodoWrite</code></pre>
-<p>User settings still load, so sm's hooks and status line in <code>~/.claude/settings.json</code> still fire. Do not use <code>--bare</code>: it skips settings-defined hooks, and sm's status detection depends on them. CLAUDE.md still loads because it is the standing contract. P1 measures the resulting first-prompt size by reading the first assistant turn's <code>usage</code> in the transcript (input + cache creation + cache read). It records the number in the P1 PR and in I.3. If the size exceeds 30K tokens, P1 stops and reports; the owner then chooses between trimming further and the opencode fallback.</p>
+<p><b>Permissions.</b> Local agents never use auto mode. Its classifier sends each tool call to <code>api.anthropic.com</code> directly, not through <code>ANTHROPIC_BASE_URL</code>, so it either fails without credentials or spends the logged-in Claude subscription. Local agents launch with <code>--permission-mode acceptEdits</code> plus a <code>--settings</code> JSON that turns on Claude Code's sandbox, with file writes limited to the worktree, no network, and sandboxed commands approved automatically. The prototype confirms the exact setting names against the installed Claude Code, and checks that no request reaches Anthropic during a local run by watching for Claude usage on your account.</p>
+<p>User settings still load, so sm's hooks and status line in <code>~/.claude/settings.json</code> still fire. The documentation does not say whether the slim flags change when hooks run; the prototype checks that every hook fires. Do not use <code>--bare</code>: it skips settings-defined hooks, and sm's status detection depends on them. CLAUDE.md still loads because it is the standing contract. P1 measures the resulting first-prompt size by reading the first assistant turn's <code>usage</code> in the transcript (input + cache creation + cache read). It records the number in the P1 PR and in I.3. If the size exceeds 30K tokens, P1 stops and reports; the owner then chooses between trimming further and the opencode fallback.</p>
 <h4>C.5 Model catalog</h4>
 <p><code>/client/session-models</code> with <code>host=local</code> returns exactly one entry, the model sm has loaded (E.2), or an empty list with reason <code>no local model loaded</code>.</p>
 <h4>C.6 Restore and clear</h4>
@@ -434,7 +441,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <h4>E.1 LM Studio settings (one-time, done by P2's setup script)</h4>
 <ul>
 <li>Turn off "just-in-time model loading" in the server settings, so a request for an unloaded model fails instead of loading it.</li>
-<li>Pin LM Studio to 0.4.16 and turn off auto-update. 0.4.19 has a known tool-calling regression on <code>/v1/messages</code> with Qwen. Upgrades become a deliberate step that re-runs the P3 smoke ticket.</li>
+<li>Pin LM Studio to 0.4.16 and turn off auto-update. 0.4.19 has a known tool-calling regression on <code>/v1/messages</code> with Qwen. Upgrades become a deliberate step that re-runs prototype ticket #1913.</li>
 <li>Start the server with <code>lms server start</code> on boot (the app already runs as a service).</li>
 </ul>
 <h4>E.2 Commands</h4>
@@ -461,7 +468,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 </tbody>
 </table>
 <p>If <code>config.json</code> has no recognisable attention layout, sm refuses the load and asks for <code>--reservation &lt;GB&gt;</code>. The <b>yield line</b> is the guard's reserve plus 24 GB (config <code>local_host.yield_margin_bytes</code>), so 32.6 GB of available memory by default. Available memory means the kernel's value that the guard already uses (queue.rs:4519–4542).</p>
-<p><b>The formula is a floor, not the reservation.</b> LM Studio keeps earlier prompts' caches in memory so that it can reuse them, and MLX holds working buffers on top. Measured, MiniMax grew from 121 GB loaded to 160 GB with two agents on 6.6K-token prompts and 181–216 GB with four. The formula predicts 129 GB plus 3–27 GB. The reservation is therefore the larger of the formula and the highest footprint sm has recorded for that model at that seat count (stored as <code>measured_peak_bytes</code> in <code>local_model</code>, updated from E.6 samples). The guard watches the model's actual footprint, not the reservation. Known peaks to seed it with: Qwen 4 seats 95 GB; MiniMax 2 seats 160 GB, 4 seats 216 GB wired.</p>
+<p><b>The formula is a floor, not the reservation.</b> LM Studio keeps earlier prompts' caches in memory so that it can reuse them, and MLX holds working buffers on top. Measured, MiniMax grew from 121 GB loaded to 160 GB with two agents on 6.6K-token prompts and 181–216 GB with four. The formula predicts 129 GB plus 3–27 GB. The reservation is therefore the larger of the formula and the highest footprint sm has recorded for that model at that seat count (stored as <code>measured_peak_bytes</code> in <code>local_model</code>, updated from E.6 samples). The guard watches the model's actual footprint, not the reservation. Known peaks to seed it with: Qwen3-Coder-Next 4 seats 95 GB; MiniMax M2.5 2 seats 160 GB, 4 seats 216 GB wired. The prototype records peaks for the new candidates.</p>
 <p><b>The model's memory is wired.</b> In the benchmark, wired memory rose from 9 GB to 98–108 GB while Qwen was answering. Wired memory cannot be compressed or paged out, so the kernel cannot relieve pressure from it; only an unload can. This is why the reservation must be counted in full and why the guard's first action is to unload, not to wait.</p>
 <p>Guard change (queue.rs:5263 <code>host_memory_guard_pass</code>): when available memory falls below the yield line and the model state is <code>ready</code> or <code>draining</code>, the pass starts a yield (F.2) instead of stopping a job. When available memory falls below the reserve itself, which means a yield was too slow, the guard force-unloads the model first. It returns to stopping queue jobs only if memory is still under the reserve after the unload. Test: extend <code>host_memory_guard_stops_the_largest_job_of_any_type_only_under_pressure</code> (queue.rs:8756) with a loaded model and assert the model is unloaded and no job is stopped.</p>
 <h4>E.5 Perf admission</h4>
@@ -492,17 +499,61 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <li><b>Tier table.</b> B2 adds this row to CLAUDE.md §2: <code>| Local | — | — |</code> with a sentence: "Local: sm spawn claude --host local; mechanical work only (inventory, fixture plumbing, narrow docs, triage). Never spec, design, review or maintainer."</li>
 </ul>
 
-<h3 id="h">H. P3: bake-off protocol</h3>
+<h3 id="h">H. P0: prototype protocol</h3>
+<p>The prototype is run by hand by one driver agent (Opus, high), in a quiet window the owner names. It writes no sm code. Every step below is either a command the driver runs or a fact it records.</p>
+<h4>H.1 Tasks</h4>
+<table>
+<thead><tr><th>Role</th><th>Ticket</th><th>Merged fix</th><th>Start the worktree at</th></tr></thead>
+<tbody>
+<tr><td>Main task</td><td>#1913 "Queue jobs inherit live server listener file descriptors"</td><td>PR #1918, squash commit <code>14ea14c936</code>: <code>handover.rs</code>, <code>queue.rs</code>, +98/−1</td><td>first parent of <code>14ea14c936</code></td></tr>
+<tr><td>Confirmation 1</td><td>#1855 (retired review-command alias)</td><td>PR #1856: <code>bin/sm.rs</code> plus a new test, +83/−6</td><td>first parent of PR #1856's squash commit</td></tr>
+<tr><td>Confirmation 2</td><td>#1892 (Claude spawn briefs left unsubmitted)</td><td>PR #1922: <code>runtime.rs</code>, <code>tests/read_only_http.rs</code>, +113/−22</td><td>first parent of PR #1922's squash commit</td></tr>
+</tbody>
+</table>
+<p>The confirmation tickets run only on the combination that passed the main task. For each ticket the driver records the original agent's wall time and tokens. It finds the seat whose name carries the ticket number in <code>sessions.json</code> and sums that seat's rows in <code>usage.db</code> <code>message_ledger</code>.</p>
+<h4>H.2 Setup</h4>
 <ol>
-<li><b>Pick 8 tickets.</b> Take them from closed tickets merged in the last 30 days whose implementing agent ran at Low or Mid tier. Prefer tickets whose PR diff is under 400 lines and touches fewer than 6 files. Exclude specs and Android-only work. Record each ticket's original token use from usage.db and its wall time from the session record.</li>
-<li><b>Replay each ticket on each model.</b> Use a fresh worktree at the ticket's pre-merge base commit and the original brief, prefixed with C.7. Run Qwen3-Coder-Next at 2 seats × 200K, and at 4 seats if P1 showed prompt reuse working. Run MiniMax M2.5 2 seats × 100K in a quiet window.</li>
-<li><b>Review.</b> Each attempt that produces a PR-equivalent diff goes through <code>sm request-review</code> on a draft PR. Close the draft afterwards and never merge it.</li>
-<li><b>Rescue.</b> If an attempt stalls for 30 minutes or fails review twice, a Mid agent (Opus, high) finishes it. Record the Mid agent's tokens as a percentage of the original.</li>
-<li><b>Score each attempt:</b> finished (y/n), review rounds, rescue % of original tokens, wall time ÷ original wall time, and standing-rule violations (named itself, went idle when told, did not poll, used <code>sm status</code>).</li>
-<li><b>Pass bar (from the memo):</b> at least 5 of 8 reach clean review with rescue at or below 15%, and median wall-time ratio at or below 3. Report both models. The owner picks the resident model from the report.</li>
+<li><b>Models.</b> <code>lms get</code> the LM Studio MLX 8-bit builds of Qwen3.6-35B-A3B (37.7 GB) and Qwen3.8-27B (58.1 GB). If a model does not load in the installed LM Studio 0.4.16, upgrade LM Studio, avoiding 0.4.19 (tool-calling regression), and record the version used. Qwen3.8-Flash-Next joins only if LM Studio lists its architecture as supported on the day.</li>
+<li><b>Known template fixes, applied before the first run.</b> Qwen3.6 in LM Studio: turn on <code>preserve_thinking</code> if tool calls loop. Qwen3.8: its chat template rejects Claude Code's default effort, so set <code>CLAUDE_CODE_EFFORT_LEVEL=medium</code>. Record any other change made.</li>
+<li><b>Load.</b> <code>lms load &lt;key&gt; -c 131072 --parallel 1 --identifier proto -y</code>. Runs are sequential; one agent at a time.</li>
+<li><b>Worktree.</b> <code>git worktree add ~/worktrees/sm-1784-proto-&lt;model&gt;-&lt;harness&gt;-&lt;ticket&gt; &lt;start commit&gt;</code>. Create no branch on the remote.</li>
 </ol>
-<p>The report is a memo in <code>docs/working/</code>, published for the owner's review.</p>
-
+<h4>H.3 Running</h4>
+<ul>
+<li><b>Brief.</b> The issue body verbatim, then C.7's addendum, then: "Work only in this directory. Do not push, open a PR, or message anyone. Commit your fix locally with a test, run the tests, and stop."</li>
+<li><b>Claude Code.</b> Launch in a plain tmux session (not <code>sm spawn</code>; there is no host field yet) with C.3's environment, C.4's slim flags and C.4's sandbox permissions. Set <code>CARGO_NET_OFFLINE=true</code> so builds use the local crate cache.</li>
+<li><b>opencode.</b> Launch with a provider block pointing at <code>http://127.0.0.1:1234/v1</code>, <code>edit</code> and <code>bash</code> allowed. Wrap it in <code>sandbox-exec</code> with a profile that limits writes to the worktree and <code>$TMPDIR</code> and network to <code>127.0.0.1:1234</code>, so both harnesses run under the same limits.</li>
+<li><b>Cap.</b> Each run gets three times the original agent's wall time, or 3 hours, whichever is longer. Then it is stopped and graded as it stands.</li>
+<li><b>Hands off.</b> The driver answers no questions from the local agent beyond "proceed as you judge best".</li>
+<li><b>Cleanup.</b> Unload the model when done; never rely on process exit (I.4).</li>
+</ul>
+<h4>H.4 What is recorded per run</h4>
+<p>The driver records:</p>
+<ul>
+<li>wall time;</li>
+<li>number of model turns;</li>
+<li>tokens read and written, from the transcript or LM Studio's log;</li>
+<li>first-prompt size;</li>
+<li>time to first token on every turn, which shows whether earlier conversation is reused;</li>
+<li>peak LM Studio footprint;</li>
+<li>whether every sm hook fired;</li>
+<li>whether any Claude usage appeared on the owner's account during the run (it must be none);</li>
+<li>final test result;</li>
+<li>every instruction in the brief the agent ignored.</li>
+</ul>
+<h4>H.5 Grading</h4>
+<p>A Codex reviewer (terra, high) is spawned per run with: the issue, the merged diff, the local diff, and the local test output. It answers:</p>
+<ol>
+<li>Does the local change fix the reported bug? Yes, partly, or no, with the reason.</li>
+<li>Does it add a test that fails before the fix and passes after?</li>
+<li>Does it stay in scope?</li>
+<li>How does its quality compare with the merged fix?</li>
+<li>Verdict: mergeable as-is, small changes, large changes, or wrong.</li>
+<li>Rescue effort: the fraction of the original agent's work still needed to bring it to the merged fix's standard.</li>
+</ol>
+<p>The pass bar is in the memo's plan section.</p>
+<h4>H.6 Report</h4>
+<p>The driver writes a readout memo, <code>docs/working/1784_prototype_readout.html</code>, from <code>docs/memo_template.html</code>. Its first page is a table with one row per run: model, harness, ticket, verdict, wall-time ratio, rescue fraction, and turns. It ends with the recommendation and is published with <code>sm doc publish --pr &lt;N&gt; --review</code>.</p>
 <h3 id="i">I. Measurements and method</h3>
 <h4>I.1 Machine and memory history</h4>
 <p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 1 is generated from the same table by a script that groups by local hour.</p>
@@ -548,6 +599,22 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <p><b>Why the two models differ on reuse.</b> MiniMax keeps a per-token cache on every layer, so LM Studio can cut a saved cache back to the shared start of a new prompt and reuse it. Qwen3-Coder-Next's linear-attention layers (36 of 48) keep one running state per conversation instead. That state can only be reused from exactly where an earlier request ended, not from a point in the middle. The reuse test changes the end of the prompt, so Qwen cannot reuse it. A real agent turn resends the previous request plus the reply plus a new message, which does start exactly where the earlier request ended. That is the case P1 must test.</p>
 <p><b>Lesson from the cancel.</b> Cancelling the queue job ended the script but left the model loaded: <code>lms ps</code> still showed <code>bench-minimax … 128.68 GB … IDLE</code>. <code>lms unload --all</code> freed it. E.2's unload path must therefore call <code>lms unload</code> explicitly, never rely on a process exit.</p>
 
+<h4>I.5 Model survey (1 Oct 2026)</h4>
+<p>Existence and sizes come from the Hugging Face API. Scores come from the official model cards; the rest are vendor or aggregator figures and are marked as such. No Qwen3.6, Qwen3.8 or Flash-Next score has been rerun independently.</p>
+<table>
+<thead><tr><th>Model</th><th>Architecture</th><th>Build that fits</th><th>Scores</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Qwen3.8-Flash-Next</td><td>125B, 6B active, plus 51B n-gram embedding and 4B MTP. Layers: 12 × (3 Gated DeltaNet + 1 Qwen Sparse Attention).</td><td><code>mlx-community/Qwen3.8-Flash-Next-4bit</code>, 111.5 GB</td><td>SWE-bench Pro 62.5; DeepSWE 58.7 (card)</td><td>The new <code>qwen4_exp</code> architecture needs mlx-lm PR 1788; LM Studio support is unconfirmed. The MTPLX server runs it. The card reports DeepSWE as the best of Claude Code and mini-SWE-agent harnesses.</td></tr>
+<tr><td>Qwen3.8-27B</td><td>Dense 27B. Layers: 16 × (3 Gated DeltaNet + 1 gated attention).</td><td><code>mlx-community/Qwen3.8-27B-8bit</code>, 58.1 GB</td><td>SWE-bench Pro 61.7, scored with the Claude Code harness (card)</td><td>The chat template rejects Claude Code's default effort; workaround <code>CLAUDE_CODE_EFFORT_LEVEL=medium</code> (QwenLM/Qwen3.8 issue 217).</td></tr>
+<tr><td>Qwen3.6-35B-A3B</td><td>35B MoE, 3B active. Layers: 10 × (3 Gated DeltaNet + 1 gated attention).</td><td><code>lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit</code>, 37.7 GB</td><td>SWE-bench Verified 73.4, Pro 49.5, Terminal-Bench 2.0 51.5 (card, internal scaffold)</td><td>LM Studio template-parser and tool-loop reports; the <code>preserve_thinking</code> fix is reported (LM Studio issues 1999 and 2045; HF discussions 30 and 51).</td></tr>
+<tr><td>Qwen3-Coder-Next</td><td>80B MoE, 3B active, 12 of 48 layers full attention</td><td>on disk, 85 GB</td><td>SWE-bench Verified 70.6, Pro 44.3 (card)</td><td>Measured in I.4.</td></tr>
+<tr><td>MiniMax M2.7</td><td>229B MoE, 10B active, full attention</td><td>3-bit, 93 GB</td><td>SWE-bench Pro 56.2 (card)</td><td>Same full-attention memory growth as M2.5 (I.4); not a candidate.</td></tr>
+<tr><td>Nemotron 3 Super</td><td>120B, 12B active, Mamba-2 hybrid</td><td>6-bit, 91.5 GB</td><td>SWE-bench Verified 60.5 (OpenHands)</td><td>Below the Qwen candidates.</td></tr>
+</tbody>
+</table>
+<p><b>Too large for this machine beside your queue:</b> MiniMax M3 (4-bit, 225 GB), GLM-5.2 (753B) and GLM-5.3-Flash (306 GB at FP8), DeepSeek V4.1-Flash (503 GB at 4-bit) and Kimi K3. <b>Fits but excluded:</b> DeepSeek V4 Flash fits only at 2-bit (90 GB); it is reported at 9.5 tokens a second on an M3 Ultra and as failing in LM Studio. Devstral 2 is a dense 123B, so its reading is far too slow.</p>
+<p><b>Prompt reuse on these architectures.</b> Gated DeltaNet layers keep a running state that cannot be cut back to an arbitrary earlier point, so plain prefix caching does not work (mlx-lm issue 980). LM Studio's MLX engine 1.8.5 added saved checkpoints at 256-token boundaries for Qwen3.5/3.6-style models aimed at agent workloads; version 1.11.0 is installed here. Whether it covers Qwen3.8 and Flash-Next is what H.4's per-turn timing shows.</p>
+
 <h3 id="j">J. Requirement trace</h3>
 <table>
 <thead><tr><th>Memo requirement</th><th>Where specified</th><th>Code / test</th></tr></thead>
@@ -561,8 +628,9 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <tr><td>Perf unloads the model</td><td>E.5</td><td>Admission test</td></tr>
 <tr><td>Seat limit; drain, park, resume</td><td>F</td><td>B1 tests: spawn waits; held delivery; resume message</td></tr>
 <tr><td>LOCAL badge; Spend Local line; tier row</td><td>G</td><td>web and Android changes; CLAUDE.md</td></tr>
-<tr><td>Bake-off gates the build-out</td><td>H</td><td>P3 report</td></tr>
-<tr><td>Local work goes through review</td><td>C.7, H.3</td><td>Addendum text</td></tr>
+<tr><td>Prototype gates all sm engineering</td><td>H</td><td>P0 report</td></tr>
+<tr><td>No auto mode; sandboxed permissions</td><td>C.4</td><td>Launch-argument test; P0 checks no Anthropic usage</td></tr>
+<tr><td>Local work goes through review</td><td>C.7</td><td>Addendum text</td></tr>
 <tr><td>Model choice by per-agent memory</td><td>E.4, I.4</td><td>Reservation computed from config.json</td></tr>
 <tr><td>Two seats until prompt reuse is proven</td><td>E.2 default; C.4 / P1 check</td><td>P1 PR records whether repeat turns re-read the conversation</td></tr>
 </tbody>
@@ -572,8 +640,8 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <p><b>Why not make the model server a queue <code>service</code> job?</b> Service jobs count against the global limit of 2 running queue jobs (config.rs:1689). A resident model would permanently take half of your queue's concurrency. The memory guard also treats a service job as just another job to stop, not as the first thing to unload. The model needs its own small state machine, which is E and F.</p>
 <p><b>Why LM Studio and not vMLX, <code>mlx_lm.server</code> or Ollama?</b> LM Studio is already installed and running as a service and already has both models. It serves the Anthropic request format natively, which Claude Code needs; supports parallel requests on MLX since 0.4.2; and has a scriptable CLI with load, unload and estimate. The <code>opencode.json</code> in the repo root points at a vMLX server on port 8010 from an earlier experiment. vMLX would work behind the same design if it gains an Anthropic endpoint, because only E.2's three commands touch the server.</p>
 <p><b>Why not two models at once, a fast one and a smart one?</b> Qwen plus MiniMax is 214 GB of weights before any conversation cache. That leaves your queue nothing.</p>
-<p><b>Could a local agent be a reviewer?</b> Not as the gate. <code>sm request-review</code> stays the correctness gate. A local first-pass review before a Codex review is a later idea for the bake-off to inform.</p>
-<p><b>What if Claude Code changes its request format and LM Studio lags?</b> Claude Code updates itself. A breaking change shows up as local agents failing their first turn. The P3 smoke ticket, re-run on any Claude Code or LM Studio upgrade, catches it. If it recurs, the opencode fallback removes the dependency.</p>
+<p><b>Could a local agent be a reviewer?</b> Not as the gate. <code>sm request-review</code> stays the correctness gate. A local first-pass review before a Codex review is a later idea for the prototype to inform.</p>
+<p><b>What if Claude Code changes its request format and LM Studio lags?</b> Claude Code updates itself. A breaking change shows up as local agents failing their first turn. Re-running prototype ticket #1913 on any Claude Code or LM Studio upgrade catches it. If it recurs, the opencode fallback removes the dependency.</p>
 <p><b>Does this work on a second machine?</b> Not in this design. The host is <code>127.0.0.1</code>, and the memory logic reads this Mac's memory.</p>
 <p><b>Why keep provider <code>claude</code> instead of adding <code>claude-local</code>?</b> A new provider string would have to be added to every one of the ~25 files that branch on provider (B), for no behavioural difference. The host field touches only the sites that genuinely differ.</p>
 
