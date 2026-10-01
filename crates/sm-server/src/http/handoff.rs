@@ -310,6 +310,9 @@ pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            if state.shutdown().is_stopped() {
+                return;
+            }
             match state.session_store.stranded_handoff_messages() {
                 Ok(stranded) => {
                     for (predecessor, successor) in stranded {
