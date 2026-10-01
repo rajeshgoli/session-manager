@@ -6,6 +6,14 @@ SERVER_URL="${SERVER_URL:-http://127.0.0.1:8420}"
 APK_PATH="${1:-android-app/app/build/outputs/apk/debug/app-debug.apk}"
 VERSION_CODE="${VERSION_CODE:-}"
 VERSION_NAME="${VERSION_NAME:-}"
+RELEASE_NOTES="${RELEASE_NOTES:-}"
+if [[ -n "${RELEASE_NOTES_FILE:-}" ]]; then
+  RELEASE_NOTES="$(cat -- "$RELEASE_NOTES_FILE")"
+fi
+if [[ -z "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+  echo "Set RELEASE_NOTES (or RELEASE_NOTES_FILE) to a short summary of what changed and what to try." >&2
+  exit 1
+fi
 
 if [[ ! -f "$APK_PATH" ]]; then
   echo "APK not found: $APK_PATH" >&2
@@ -22,6 +30,7 @@ curl_args=(
   -X POST
   "$SERVER_URL/deploy/$APP_NAME"
   -F "file=@${APK_PATH};type=application/vnd.android.package-archive"
+  --form-string "release_notes=$RELEASE_NOTES"
 )
 
 if [[ -n "$VERSION_CODE" ]]; then

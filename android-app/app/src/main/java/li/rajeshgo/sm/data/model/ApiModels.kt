@@ -121,6 +121,7 @@ data class AppArtifactMetadata(
     val versionCode: Int? = null,
     @SerialName("version_name")
     val versionName: String? = null,
+    @SerialName("release_notes") val releaseNotes: String? = null,
 )
 
 @Serializable
@@ -188,6 +189,7 @@ data class ClientSession(
     val model: String? = null,
     @SerialName("reasoning_effort") val reasoningEffort: String? = null,
     val obligations: SessionObligations? = null,
+    @SerialName("last_ticket") val lastTicket: SessionClaim? = null,
     val jobs: List<SessionJob> = emptyList(),
     @SerialName("friendly_name")
     val friendlyName: String? = null,
@@ -256,6 +258,7 @@ data class WatchStateResponse(val sessions: List<WatchStateSession> = emptyList(
 @Serializable
 data class WatchStateSession(
     val id: String,
+    @SerialName("last_ticket") val lastTicket: SessionClaim? = null,
     val facts: AgentFacts? = null,
     val attention: AgentAttention? = null,
 )

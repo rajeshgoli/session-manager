@@ -123,6 +123,31 @@ pub fn meter(db: &Path, provider: &str) -> Result<Option<f64>> {
     }
 }
 
+/// The active Codex account's weekly reset, using the same sample as Analytics.
+/// This is separate from the review channel's two-hour retry timer.
+pub fn codex_weekly_reset(db: &Path) -> Result<Option<String>> {
+    if !db.exists() {
+        return Ok(None);
+    }
+    let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let value = c
+        .query_row(
+            "SELECT resets_at FROM burn_samples WHERE window_kind='codex_10080'
+         AND window_scope IS NULL
+         AND account_key=(SELECT account_key FROM accounts WHERE provider='codex'
+           ORDER BY last_seen DESC,account_key LIMIT 1)
+         ORDER BY observed_at DESC,id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional();
+    match value {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::SqliteFailure(_, Some(e))) if e.contains("no such table") => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn should_skip(percent: Option<f64>, limit: i64) -> bool {
     limit < 100 && percent.is_some_and(|p| p >= limit as f64)
 }
@@ -415,16 +440,18 @@ mod tests {
         (dir, r)
     }
     mod scratch {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         pub struct Scratch(pub std::path::PathBuf);
         impl Scratch {
             pub fn new() -> Self {
                 let p = std::env::temp_dir().join(format!(
-                    "sm-review-{}-{}",
+                    "sm-review-{}-{}-{}",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .as_nanos()
+                        .as_nanos(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
                 std::fs::create_dir_all(&p).unwrap();
                 Self(p)
@@ -506,6 +533,25 @@ mod tests {
             json!({"kind":"claude","model":"sonnet","effort":"high"})
         );
         assert_eq!(c[2]["model"], "gpt-6-luna");
+    }
+
+    #[test]
+    fn weekly_reset_uses_latest_accounts_latest_week_not_the_retry_clock() {
+        let dir = scratch::Scratch::new();
+        let db = dir.0.join("usage.db");
+        assert_eq!(codex_weekly_reset(&db).unwrap(), None);
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE accounts(account_key TEXT,provider TEXT,last_seen TEXT);
+          INSERT INTO accounts VALUES('old','codex','2026-09-29'),('new','codex','2026-09-30');
+          CREATE TABLE burn_samples(id INTEGER PRIMARY KEY,account_key TEXT,window_kind TEXT,window_scope TEXT,resets_at TEXT,observed_at TEXT);
+          INSERT INTO burn_samples VALUES(1,'old','codex_10080',NULL,'2026-10-03T00:00:00Z','2026-09-29'),
+          (2,'new','codex_300',NULL,'2026-10-01T02:00:00Z','2026-09-30');").unwrap();
+        assert_eq!(codex_weekly_reset(&db).unwrap(), None);
+        c.execute_batch("INSERT INTO burn_samples VALUES(3,'new','codex_10080',NULL,'2026-10-07T00:00:00Z','2026-10-01');").unwrap();
+        assert_eq!(
+            codex_weekly_reset(&db).unwrap().as_deref(),
+            Some("2026-10-07T00:00:00Z")
+        );
     }
 
     #[test]

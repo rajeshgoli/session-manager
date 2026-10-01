@@ -140,6 +140,7 @@ fun SettingsScreen(
                 TextButton(onClick = viewModel::refreshUpdate) { Text("Check for updates") }
             } else {
                 Text("${update.versionName} is available", color = Emerald)
+                update.releaseNotes?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
                 Button(onClick = viewModel::installUpdate, enabled = !state.updateInstalling) { Text(if (state.updateInstalling) "Downloading…" else "Install update") }
             }
             state.updateError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }

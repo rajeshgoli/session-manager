@@ -418,7 +418,7 @@ Publish a debug APK to the local artifact server:
 cd android-app
 SM_VERSION_CODE=1072 SM_VERSION_NAME=0.1.2 ./gradlew assembleDebug
 cd ..
-VERSION_CODE=1072 VERSION_NAME=0.1.2 ./scripts/deploy_android_app.sh
+VERSION_CODE=1072 VERSION_NAME=0.1.2 RELEASE_NOTES="Describe what changed and what to try." ./scripts/deploy_android_app.sh
 ```
 
 The app checks:

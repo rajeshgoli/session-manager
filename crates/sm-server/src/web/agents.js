@@ -133,7 +133,7 @@ export function youFact(agent, now = Date.now()) {
       dismissible: !!facts.you.dismissible,
     };
   }
-  if (facts.finished) return { text: `✔ ${facts.finished.text || 'Finishing…'}`, tone: 'cyan', dismissible: true };
+  if (facts.finished && !facts.finished.read) return { text: `✔ ${facts.finished.text || 'Finishing…'}`, tone: 'cyan', dismissible: true };
   return null;
 }
 

@@ -890,6 +890,22 @@ impl WorkClaimStore {
         claim_views(&conn, claims)
     }
 
+    /// Latest confirmed ticket per session, including ended claims for display only.
+    pub fn latest_tickets(&self) -> Result<BTreeMap<String, ClaimView>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        let claims = query_claims(&conn,
+            "WHERE id IN (SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY claimed_at DESC, id DESC) AS rank
+                FROM work_claims WHERE kind='ticket' AND reserved_at IS NULL
+            ) WHERE rank=1)", [])?;
+        Ok(claim_views(&conn, claims)?
+            .into_iter()
+            .map(|view| (view.claim.session_id.clone(), view))
+            .collect())
+    }
+
     /// Every active, confirmed claim: the session feed's source.
     pub fn active_claims(&self) -> Result<Vec<ClaimView>> {
         let Some(conn) = self.open_read()? else {

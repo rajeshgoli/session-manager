@@ -312,6 +312,7 @@ class SessionManagerRepository(
                 obligations = obligationsById[session.id],
                 jobs = allJobs.filter { it.isAwaitedBy(session.id) },
                 facts = watchById[session.id]?.facts,
+                lastTicket = watchById[session.id]?.lastTicket,
                 attention = watchById[session.id]?.attention,
             ) }
         } }) { ScreenCache.watch = it }

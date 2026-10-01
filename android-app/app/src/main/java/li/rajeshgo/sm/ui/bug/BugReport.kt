@@ -151,6 +151,23 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
 
     var sheet by mutableStateOf<BugSheet?>(null)
         private set
+    private val drafts = application.getSharedPreferences("bug_report_draft", Context.MODE_PRIVATE)
+    var draftText by mutableStateOf(drafts.getString("text", "").orEmpty())
+        private set
+    private var retainedSheet: BugSheet? = null
+
+    fun saveDraft(text: String) {
+        draftText = text
+        drafts.edit().putString("text", text).apply()
+    }
+
+    fun clearDraft() {
+        if (sheet?.busy == true) return
+        saveDraft("")
+        retainedSheet = null
+        sheet = null
+    }
+
     private var capturing = false
     private val toasts = Channel<BugToast>(Channel.BUFFERED)
     val toastFlow = toasts.receiveAsFlow()
@@ -158,6 +175,11 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
     /** Captures the window, then opens the sheet; the reads for its agent section follow. */
     fun open(activity: Activity) {
         if (capturing || sheet != null) return
+        retainedSheet?.let {
+            sheet = it
+            retainedSheet = null
+            return
+        }
         capturing = true
         val route = BugScreen.route
         val pageData = PageDataRecorder.pages.snapshot(BugScreen.since)
@@ -183,7 +205,10 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun close() {
-        if (sheet?.busy != true) sheet = null
+        if (sheet?.busy != true) {
+            retainedSheet = sheet
+            sheet = null
+        }
     }
 
     suspend fun sessionModels(provider: String, workingDir: String): List<String> {
@@ -211,6 +236,9 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
             val request = bugReportRequest(filing, current.png, current.page, current.route, current.pageData, bugClientVersion())
             repository.fileBugReport(url, token, request)
                 .onSuccess { result ->
+                    // Already filed, even if starting its agent failed: do not offer
+                    // this text as a new report after an app restart.
+                    drafts.edit().remove("text").apply()
                     if (filing.start != null && result.started == null) {
                         // The bug is filed; the sheet stays open to retry the start only.
                         update { it.copy(busy = false, filed = result, error = result.startError ?: "The agent did not start") }
@@ -222,6 +250,8 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
 
     private suspend fun finish(filed: BugReportFiled, started: BoardStarted?) {
         sheet = null
+        retainedSheet = null
+        saveDraft("")
         toasts.send(BugToast(bugFiledText(filed, started), filed.issue.url, started))
     }
 
@@ -231,7 +261,8 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun update(change: (BugSheet) -> BugSheet) {
-        sheet = sheet?.let(change)
+        if (sheet != null) sheet = sheet?.let(change)
+        else retainedSheet = retainedSheet?.let(change)
     }
 
     private suspend fun credentials(): Pair<String, String>? {
@@ -247,6 +278,7 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
     private suspend fun handleAuth(error: Throwable): Boolean {
         if (error !is SessionManagerAuthException) return false
         settingsRepository.clearAuth()
+        retainedSheet = null
         sheet = null
         return true
     }

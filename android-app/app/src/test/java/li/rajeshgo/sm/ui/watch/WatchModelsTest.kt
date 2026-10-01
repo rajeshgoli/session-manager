@@ -9,6 +9,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WatchModelsTest {
+    @Test fun releasedTicketRemainsVisibleButCurrentClaimWins() {
+        val previous = li.rajeshgo.sm.data.model.SessionClaim(kind = "ticket", number = 1928, title = "App fixes", state = "closed")
+        val finished = session(status = "idle", activityState = "idle").copy(lastTicket = previous)
+        assertEquals("App fixes", ticketTitle(finished))
+        assertEquals("#1928", ticketLabel(finished))
+        val current = previous.copy(number = 1930, title = "Next task", state = "open")
+        val resumed = finished.copy(obligations = li.rajeshgo.sm.data.model.SessionObligations(sessionId = finished.id, claims = listOf(current)))
+        assertEquals("Next task", ticketTitle(resumed))
+        assertEquals("#1930", ticketLabel(resumed))
+    }
+
     @Test
     fun cloningIsAvailableOnlyForProvidersTheServerCanLaunch() {
         for (provider in listOf("claude", "codex", "codex-fork")) assertTrue(supportsSessionCloning(provider))

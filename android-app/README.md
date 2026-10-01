@@ -49,13 +49,17 @@ working JDK through `JAVA_HOME`.
 
 ```
 cd ..
-VERSION_CODE=2 VERSION_NAME=0.1.1 ./scripts/deploy_android_app.sh
+VERSION_CODE=2 VERSION_NAME=0.1.1 RELEASE_NOTES="Describe what changed and what to try." ./scripts/deploy_android_app.sh
 ```
 
 By default the deploy script uploads:
 - app: `session-manager-android`
 - server: `http://127.0.0.1:8420`
 - APK: `android-app/app/build/outputs/apk/debug/app-debug.apk`
+
+Every deployment requires a short owner-facing release note through `RELEASE_NOTES`
+or `RELEASE_NOTES_FILE` (at most 1000 characters). State what changed and what to
+try. The update banner and Settings show it before installation.
 
 You can override those with `APP_NAME`, `SERVER_URL`, `VERSION_CODE`, `VERSION_NAME`, or by passing a different APK path as the first argument.
 

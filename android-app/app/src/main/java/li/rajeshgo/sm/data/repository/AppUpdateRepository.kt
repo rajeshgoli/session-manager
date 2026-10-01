@@ -24,6 +24,7 @@ data class AvailableAppUpdate(
     val artifactHash: String,
     val versionName: String,
     val uploadedAt: String?,
+    val releaseNotes: String? = null,
 )
 
 class AppUpdateRepository(
@@ -54,6 +55,7 @@ class AppUpdateRepository(
             artifactHash = serverArtifactHash,
             versionName = metadata.versionName ?: serverArtifactHash,
             uploadedAt = metadata.uploadedAt,
+            releaseNotes = metadata.releaseNotes?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
 

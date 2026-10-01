@@ -89,6 +89,7 @@ data class GithubCodexChannel(
     val state: String = "available",
     @SerialName("paused_at") val pausedAt: String? = null,
     @SerialName("next_check_at") val nextCheckAt: String? = null,
+    @SerialName("quota_resets_at") val quotaResetsAt: String? = null,
     @SerialName("refusal_url") val refusalUrl: String? = null,
 )
 
