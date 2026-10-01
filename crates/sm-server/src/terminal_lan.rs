@@ -74,8 +74,11 @@ pub async fn run(state: Arc<AppState>) {
                 }
                 Err(error) => {
                     eprintln!("terminal LAN certificate unavailable: {error:#}");
-                    stop(&mut serving).await;
-                    continue;
+                    let dir = expand_home(&lan.cert_dir);
+                    if !certificate_is_valid_for(&dir, &lan.hostname, 0).unwrap_or(false) {
+                        stop(&mut serving).await;
+                        continue;
+                    }
                 }
             }
         }
@@ -125,6 +128,10 @@ async fn start_listener(
 }
 
 fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
+    certificate_is_valid_for(dir, hostname, CERT_RENEW_BEFORE_SECONDS)
+}
+
+fn certificate_is_valid_for(dir: &Path, hostname: &str, min_lifetime_seconds: u64) -> Result<bool> {
     let cert = dir.join("fullchain.pem");
     if !cert.exists() || !dir.join("privkey.pem").exists() {
         return Ok(false);
@@ -132,11 +139,7 @@ fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
     let valid = openssl_command()
         .args(["x509", "-in"])
         .arg(&cert)
-        .args([
-            "-noout",
-            "-checkend",
-            &CERT_RENEW_BEFORE_SECONDS.to_string(),
-        ])
+        .args(["-noout", "-checkend", &min_lifetime_seconds.to_string()])
         .status()
         .context("cannot inspect terminal LAN certificate expiry")?;
     let matching = openssl_command()
@@ -480,6 +483,25 @@ fn default_route_ipv4() -> Result<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    fn write_test_certificate(dir: &Path, days: u32) {
+        let output = openssl_command()
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+            .args([
+                "-days",
+                &days.to_string(),
+                "-subj",
+                "/CN=studio-lan.example.com",
+            ])
+            .args(["-addext", "subjectAltName=DNS:studio-lan.example.com"])
+            .arg("-keyout")
+            .arg(dir.join("privkey.pem"))
+            .arg("-out")
+            .arg(dir.join("fullchain.pem"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
     #[test]
     fn certificate_must_match_hostname_key_and_renewal_window() {
         let dir = std::env::temp_dir().join(format!(
@@ -488,23 +510,15 @@ mod tests {
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir(&dir).unwrap();
-        let cert = dir.join("fullchain.pem");
         let key = dir.join("privkey.pem");
-        let output = openssl_command()
-            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
-            .args(["-days", "90", "-subj", "/CN=studio-lan.example.com"])
-            .args(["-addext", "subjectAltName=DNS:studio-lan.example.com"])
-            .arg("-keyout")
-            .arg(&key)
-            .arg("-out")
-            .arg(&cert)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        write_test_certificate(&dir, 90);
         assert!(certificate_is_fresh(&dir, "studio-lan.example.com").unwrap());
         assert!(!certificate_is_fresh(&dir, "wrong.example.com").unwrap());
-        write_private(&key, b"invalid key").unwrap();
+        write_test_certificate(&dir, 1);
         assert!(!certificate_is_fresh(&dir, "studio-lan.example.com").unwrap());
+        assert!(certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
+        write_private(&key, b"invalid key").unwrap();
+        assert!(!certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 }
