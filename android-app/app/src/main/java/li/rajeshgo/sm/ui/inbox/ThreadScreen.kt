@@ -75,6 +75,7 @@ import li.rajeshgo.sm.data.model.DocAskRequest
 import li.rajeshgo.sm.data.model.DocAskTarget
 import li.rajeshgo.sm.data.model.InboxThread
 import li.rajeshgo.sm.data.model.InboxThreadItem
+import li.rajeshgo.sm.data.model.InboxReplyOption
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -154,6 +155,13 @@ fun docAskThread(thread: InboxThread, firstPublishedAt: String): InboxThread =
 fun defaultReplyOptionId(thread: InboxThread): String? =
     thread.replyOptions.firstOrNull { it.status == "live" && it.canSend }?.id
         ?: thread.replyOptions.firstOrNull { it.canSend }?.id
+
+fun replyOptionLabel(option: InboxReplyOption): String =
+    buildString {
+        append(option.name)
+        option.recipientName?.takeIf { it != option.name }?.let { append(" → "); append(it) }
+        if (option.restores) append(" · restores")
+    }
 
 data class ThreadUiState(
     val thread: InboxThread? = null,
@@ -537,7 +545,7 @@ private fun ReplyBox(
                 if (askTarget.author?.live == true) add("author" to askTarget.author.name)
                 add("reader" to (askTarget.reader?.name ?: "Reader agent"))
                 if (askTarget.author?.restorable == true) add("restore_author" to "Bring back ${askTarget.author.name} · reloads about ${((askTarget.author.contextTokens ?: 0) + 500) / 1000}k tokens")
-            } else thread.replyOptions.filter { it.canSend }.map { it.id to (it.name + if (it.restores) " · restores" else "") }
+            } else thread.replyOptions.filter { it.canSend }.map { it.id to replyOptionLabel(it) }
             val chosen = recipient ?: (if (askTarget != null) askTarget.default else defaultReplyOptionId(thread))
             val target = choices.firstOrNull { it.first == chosen }?.second ?: thread.replyTo?.name
             if (choices.isEmpty() && (askTarget == null && !thread.canSend)) {

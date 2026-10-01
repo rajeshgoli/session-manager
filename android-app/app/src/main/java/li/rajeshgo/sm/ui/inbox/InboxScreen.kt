@@ -247,9 +247,11 @@ fun InboxScreen(
                     if (heading != null) {
                         item(key = "h-$heading") {
                             Text(
-                                if (heading.startsWith("FOLDED")) "${if (foldedOpen) "▾" else "▸"} Folded · ${rows.size} threads (${rows.take(3).joinToString(", ") { it.title }})" else heading,
+                                if (heading.startsWith("FOLDED")) "${if (foldedOpen) "▾" else "▸"} Folded · ${rows.size} threads (${rows.take(3).joinToString(", ") { (it.agents.firstOrNull() ?: it.title).take(18) }})" else heading,
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
                                 color = when {
                                     heading.startsWith("NEEDS") -> Amber
                                     heading.startsWith("NEW") -> Fuchsia
@@ -261,16 +263,12 @@ fun InboxScreen(
                     }
                     items(if (heading?.startsWith("FOLDED") == true && !foldedOpen) emptyList() else rows, key = { it.threadKey }) { row ->
                         val open = { inboxThreadTarget(row)?.let { openThread = it } ?: run { openRow = row } }
-                        Column {
-                            if (row.done || row.group == "folded") InboxRowCard(row, now, onClick = open)
-                            else key(row.threadKey) {
-                                SwipeToDone(onDone = {
-                                    viewModel.markDone(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() }
-                                }) { InboxRowCard(row, now, onClick = open) }
-                            }
-                            TextButton(onClick = { viewModel.archive(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() } }) {
-                                Text(if (row.foldedBy == "archived") "Unarchive" else "Archive")
-                            }
+                        val archive = { viewModel.archive(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() } }
+                        if (row.done || row.group == "folded") InboxRowCard(row, now, onClick = open, onArchive = archive)
+                        else key(row.threadKey) {
+                            SwipeToDone(onDone = {
+                                viewModel.markDone(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() }
+                            }) { InboxRowCard(row, now, onClick = open, onArchive = archive) }
                         }
                     }
                 }
@@ -425,7 +423,7 @@ private fun SwipeToDone(onDone: () -> Unit, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun InboxRowCard(row: InboxRow, now: OffsetDateTime, onClick: () -> Unit) {
+private fun InboxRowCard(row: InboxRow, now: OffsetDateTime, onClick: () -> Unit, onArchive: () -> Unit) {
     val accent = when (row.group) {
         "needs_you" -> Amber
         "new" -> Fuchsia
@@ -480,15 +478,20 @@ private fun InboxRowCard(row: InboxRow, now: OffsetDateTime, onClick: () -> Unit
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 2.dp),
                 )
-                Text(
-                    inboxRowDetail(row),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    color = if (row.kind == "doc" && row.group == "needs_you") Violet else TextMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 3.dp),
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        inboxRowDetail(row),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (row.kind == "doc" && row.group == "needs_you") Violet else TextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(top = 3.dp),
+                    )
+                    TextButton(onClick = onArchive, modifier = Modifier.height(32.dp), contentPadding = PaddingValues(horizontal = 6.dp)) {
+                        Text(if (row.foldedBy == "archived") "Unarchive" else "Archive")
+                    }
+                }
             }
         }
     }

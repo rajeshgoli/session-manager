@@ -84,6 +84,7 @@ class ThreadModelsTest {
         )
         assertEquals("live", defaultReplyOptionId(thread.copy(replyOptions = options)))
         assertEquals("ended", defaultReplyOptionId(thread.copy(replyOptions = options.take(1))))
+        assertEquals("sm-old → sm-new", replyOptionLabel(options.first().copy(recipientName = "sm-new")))
     }
 
     @Test fun notificationPathsOpenTheirThread() {
