@@ -210,6 +210,26 @@ fn the_first_turn_started_after_a_send_answers_it_once() {
 }
 
 #[test]
+fn the_earlier_turn_answers_even_when_its_stop_arrives_later() {
+    let store = store_with_notes(&[now_plus(1)]);
+    store
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(6),
+            Some(now_plus(5)),
+            "Second turn",
+        )
+        .unwrap();
+    store
+        .record_turn("s1", "claude", now_plus(4), Some(now_plus(3)), "First turn")
+        .unwrap();
+    let replies = store.thread_replies().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].text, "First turn");
+}
+
+#[test]
 fn two_sends_before_one_turn_get_one_answer() {
     let store = store_with_notes(&[now_plus(1), now_plus(2)]);
     store

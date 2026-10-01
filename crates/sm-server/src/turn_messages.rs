@@ -99,6 +99,7 @@ pub fn init_turn_messages_schema(conn: &Connection) -> Result<()> {
             input_at TEXT NOT NULL,
             text TEXT NOT NULL,
             at TEXT NOT NULL,
+            turn_started TEXT NOT NULL,
             PRIMARY KEY (session_id, input_at)
         );
         CREATE TABLE IF NOT EXISTS turn_message_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -235,13 +236,17 @@ impl TurnMessageStore {
             .optional()?
             .and_then(|value| parse_time(&value))
             .unwrap_or(turn_at);
-        if let Some(input) =
-            latest_owner_input(&tx, session_id, since, turn_started.unwrap_or(turn_at))?
-        {
+        let started = turn_started.unwrap_or(turn_at);
+        if let Some(input) = latest_owner_input(&tx, session_id, since, started)? {
+            // Hooks can arrive out of order: the turn that started first
+            // after the send is its answer, whichever Stop lands first.
             tx.execute(
-                "INSERT OR IGNORE INTO thread_replies (session_id, input_at, text, at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![session_id, stamp(input), text, at],
+                "INSERT INTO thread_replies (session_id, input_at, text, at, turn_started) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(session_id, input_at) DO UPDATE SET text = excluded.text, \
+                 at = excluded.at, turn_started = excluded.turn_started \
+                 WHERE excluded.turn_started < thread_replies.turn_started",
+                params![session_id, stamp(input), text, at, stamp(started)],
             )?;
         }
         tx.execute(
