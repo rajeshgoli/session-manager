@@ -271,6 +271,16 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     ("owner_notices", "session_id", "history"),
     (
+        "turn_messages",
+        "session_id",
+        "the predecessor's own last words; the successor writes its own",
+    ),
+    (
+        "finished",
+        "session_id",
+        "history of the agent that ran sm task-complete",
+    ),
+    (
         "owner_approval_waits",
         "session_id",
         "live state, recomputed from the session's own prompt every sweep",

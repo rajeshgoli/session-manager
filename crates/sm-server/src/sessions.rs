@@ -349,6 +349,42 @@ impl SessionStore {
         }
     }
 
+    /// Last turn messages and Finished rows share the retained queue DB.
+    pub fn turn_message_store(&self) -> Option<crate::turn_messages::TurnMessageStore> {
+        self.queue_store
+            .as_ref()
+            .map(|queue| crate::turn_messages::TurnMessageStore::new(queue.db_path().to_path_buf()))
+    }
+
+    /// Records the text an agent wrote at the end of a turn, at `at`. Logged
+    /// on failure: the turn itself already happened.
+    fn record_turn_message(
+        &self,
+        session_id: &str,
+        provider: &str,
+        at: OffsetDateTime,
+        text: &str,
+    ) {
+        let Some(store) = self.turn_message_store() else {
+            return;
+        };
+        if let Err(error) = store.record_turn(session_id, provider, at, text) {
+            eprintln!("last turn message for {session_id} not recorded: {error:#}");
+        }
+    }
+
+    /// The Finished row for one `sm task-complete`.
+    fn record_finished(&self, session_id: &str, completed_at: &str) {
+        let Some(store) = self.turn_message_store() else {
+            return;
+        };
+        let completed_at = OffsetDateTime::parse(completed_at, &Rfc3339)
+            .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        if let Err(error) = store.record_finished(session_id, completed_at) {
+            eprintln!("finished row for {session_id} not recorded: {error:#}");
+        }
+    }
+
     pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
         self.seat_session_store = SeatSessionStore::new(db_path);
         self
@@ -2054,6 +2090,13 @@ impl SessionStore {
         }
         self.write_raw_json_value(&state)?;
         drop(_guard);
+        if let Some(last_message) = last_message {
+            // The hook's own emission time orders turns; arrival does not.
+            let at = emitted_at
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .unwrap_or_else(OffsetDateTime::now_utc);
+            self.record_turn_message(session_id, &provider, at, last_message);
+        }
         for (provider_resume_id, artifact_path) in seat_session_appends {
             self.append_seat_session(
                 session_id,
@@ -7475,6 +7518,7 @@ impl SessionStore {
             }
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
+            self.record_finished(session_id, &completed_at);
             self.fire_owner_follows(session_id, &completed_at);
             return Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
                 status: "completed".to_owned(),
@@ -7556,6 +7600,7 @@ impl SessionStore {
         }
 
         self.write_raw_json_value(&state)?;
+        self.record_finished(session_id, &completed_at);
         self.fire_owner_follows(session_id, &completed_at);
         Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
             status: "completed".to_owned(),
@@ -8248,6 +8293,10 @@ impl SessionStore {
         }
         drop(_guard);
         if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
+            if let Some(text) = codex_fork_turn_message(event) {
+                // The stream is applied in order, so arrival orders turns.
+                self.record_turn_message(session_id, &provider, OffsetDateTime::now_utc(), &text);
+            }
             if let (Some(prompt), Some(queue)) =
                 (codex_fork_user_prompt(event), self.queue_store.as_ref())
             {
@@ -8891,9 +8940,44 @@ fn codex_fork_user_prompt(event: &Map<String, Value>) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// The text of a completed codex-fork agent message that is not commentary:
+/// the turn's final answer.
+fn codex_fork_turn_message(event: &Map<String, Value>) -> Option<String> {
+    let event_type = codex_fork_event_type(event)?.replace('/', "_");
+    (normalize_codex_fork_event_type(&event_type) == "item_completed").then_some(())?;
+    let item = codex_fork_payload(event)?.get("item")?.as_object()?;
+    (item.get("type")?.as_str()? == "agentMessage").then_some(())?;
+    (item.get("phase").and_then(Value::as_str) != Some("commentary")).then_some(())?;
+    let text = item.get("text")?.as_str()?;
+    (!text.trim().is_empty()).then(|| text.to_owned())
+}
+
 #[cfg(test)]
 mod owner_prompt_event_tests {
     use super::*;
+
+    #[test]
+    fn only_a_final_codex_agent_message_is_a_turn_message() {
+        let event = json!({"event_type": "item/completed", "payload": {"item": {
+            "type": "agentMessage", "text": "Issue #1778 is done.", "phase": "final_answer"
+        }}});
+        assert_eq!(
+            codex_fork_turn_message(event.as_object().unwrap()).as_deref(),
+            Some("Issue #1778 is done.")
+        );
+        let mut commentary = event.clone();
+        commentary["payload"]["item"]["phase"] = json!("commentary");
+        assert!(codex_fork_turn_message(commentary.as_object().unwrap()).is_none());
+        let mut no_phase = event.clone();
+        no_phase["payload"]["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("phase");
+        assert!(codex_fork_turn_message(no_phase.as_object().unwrap()).is_some());
+        let mut started = event;
+        started["event_type"] = json!("item/started");
+        assert!(codex_fork_turn_message(started.as_object().unwrap()).is_none());
+    }
 
     #[test]
     fn completed_codex_user_message_carries_submitted_text() {

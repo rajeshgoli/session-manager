@@ -1923,6 +1923,10 @@ pub fn router(state: AppState) -> Router {
             post(messages::answer_session_needs_you),
         )
         .route(
+            "/sessions/{session_id}/last-turn",
+            get(messages::get_last_turn),
+        )
+        .route(
             "/sessions/{session_id}/notify-on-stop",
             post(arm_stop_notify),
         )

@@ -29,6 +29,8 @@ const REPARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// third pass (sm#1569).
 const FOLLOW_DELIVERY_INTERVAL: Duration = Duration::from_secs(5);
 const FOLLOW_SWEEP_EVERY_PASSES: u64 = 3;
+/// How often Finished rows are checked for the 10-minute text fallback.
+const FINISHED_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// The open-file soft limit sm-server raises itself to at startup. launchd
 /// starts it at 256, which every queue job, tmux server, and agent it spawns
 /// inherits; a parallel test suite run as a queue job exhausts that ("Too many
@@ -227,6 +229,17 @@ async fn main() -> Result<()> {
                 }
                 pass = pass.wrapping_add(1);
                 thread::sleep(FOLLOW_DELIVERY_INTERVAL);
+            }
+        });
+        // Fills Finished rows whose agent wrote nothing after `sm task-complete`
+        // and drops expired ones (spec 1782 D2).
+        let turns = sm_server::turn_messages::TurnMessageStore::new(expand_home(
+            &state.config().sm_send.db_path,
+        ));
+        thread::spawn(move || loop {
+            thread::sleep(FINISHED_SWEEP_INTERVAL);
+            if let Err(error) = turns.sweep(time::OffsetDateTime::now_utc()) {
+                eprintln!("finished row sweep failed: {error:#}");
             }
         });
         let queue_delivery_state = state.clone();

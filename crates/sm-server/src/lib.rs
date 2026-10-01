@@ -35,6 +35,7 @@ pub mod seat_sessions;
 pub mod sessions;
 pub mod studio_ssh;
 pub mod tool_usage;
+pub mod turn_messages;
 pub mod usage_burn;
 mod usage_db;
 pub mod usage_identity;

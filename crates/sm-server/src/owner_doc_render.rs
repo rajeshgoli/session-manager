@@ -259,6 +259,62 @@ pub fn render_markdown_with_lines(source: &str) -> String {
     apply_line_sentinels(&html, &sentinel_open)
 }
 
+/// Markdown from an agent's turn, rendered for the Inbox: raw HTML shows as
+/// text, and a link or image keeps its target only when it is http(s) or a
+/// path on this site (spec 1782 D3).
+pub fn render_markdown_sanitized(source: &str) -> String {
+    use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
+
+    fn safe(url: &str) -> bool {
+        // Browsers read `\` as `/` and drop tabs and newlines, so `/\host`
+        // and `/\t/host` would leave the site.
+        if url
+            .chars()
+            .any(|ch| ch == '\\' || ch.is_whitespace() || ch.is_control())
+        {
+            return false;
+        }
+        let lower = url.to_ascii_lowercase();
+        lower.starts_with("https://")
+            || lower.starts_with("http://")
+            || lower.starts_with('#')
+            || (lower.starts_with('/') && !lower.starts_with("//"))
+    }
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let events = Parser::new_ext(source, options).map(|event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if !safe(&dest_url) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: CowStr::Borrowed(""),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if !safe(&dest_url) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: CowStr::Borrowed(""),
+            title,
+            id,
+        }),
+        other => other,
+    });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, events);
+    html
+}
+
 fn apply_line_sentinels(html: &str, sentinel_open: &str) -> String {
     let mut output = String::with_capacity(html.len());
     let mut pending: Vec<(Vec<&str>, String)> = Vec::new();
@@ -490,5 +546,31 @@ mod tests {
         assert!(!json.contains('<'), "{json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["title"], "</script><!--");
+    }
+
+    #[test]
+    fn sanitized_markdown_shows_raw_html_as_text_and_drops_unsafe_links() {
+        let html = render_markdown_sanitized(
+            "**Done.** <script>alert(1)</script>\n\n[ok](https://github.com/x) [bad](javascript:alert(1)) ![i](data:x)\n",
+        );
+        assert!(html.contains("<strong>Done.</strong>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains(r#"href="https://github.com/x""#), "{html}");
+        assert!(!html.contains("javascript:"), "{html}");
+        assert!(!html.contains("data:x"), "{html}");
+        for target in ["/\\evil.example", "/\t/evil.example", "//evil.example"] {
+            let html = render_markdown_sanitized(&format!("[x](<{target}>)\n"));
+            let hrefs: Vec<&str> = html
+                .split("href=\"")
+                .skip(1)
+                .filter_map(|rest| rest.split('"').next())
+                .collect();
+            assert!(
+                hrefs.iter().all(|href| !href.contains("evil")),
+                "{target}: {html}"
+            );
+        }
+        assert!(render_markdown_sanitized("[x](/inbox)\n").contains(r#"href="/inbox""#));
     }
 }

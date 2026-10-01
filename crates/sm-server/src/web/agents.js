@@ -458,8 +458,17 @@ function WorkTab({ agent, ball, now }) {
       ? html`<section><h3>Last words</h3><div class="quote">${agent.status_text}</div>
           ${agent.status_at ? html`<div class="sub">${clock(agent.status_at)}</div>` : null}</section>`
       : null}
+    <${LastTurn} id=${agent.id} />
     <section><h3>Workspace</h3><div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div></section>
   `;
+}
+
+// What the agent wrote at the end of its latest turn; none yet is a 404.
+function LastTurn({ id }) {
+  const [turn] = usePoll(() => api(`/sessions/${encodeURIComponent(id)}/last-turn`).catch(() => null), 30000, [id]);
+  if (!turn) return null;
+  return html`<section><h3>Last turn</h3><div class="quote last-turn">${turn.text}</div>
+    <div class="sub">${clock(turn.at)}</div></section>`;
 }
 
 function ActivityTab({ id }) {
