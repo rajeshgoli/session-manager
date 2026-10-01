@@ -87,7 +87,11 @@ enum Command {
     ListDevices(ListDevicesArgs),
     #[command(name = "remove-device")]
     RemoveDevice(RemoveDeviceArgs),
-    #[command(name = "request-review")]
+    // The pre-#1786 name stays accepted: agents launched from a checkout that
+    // predates the rename, or holding the old instructions in context, must
+    // still register their review instead of falling back to an untracked
+    // `@codex review` comment (#1855).
+    #[command(name = "request-review", alias = "request-codex-review")]
     RequestReview(RequestReviewArgs),
     /// Paired reviewers: return your review to sm
     Review(ReviewArgs),
@@ -7350,6 +7354,12 @@ mod tests {
         assert_eq!(create_args.poll_interval_seconds, 45);
         assert_eq!(create_args.retry_interval_seconds, 900);
         assert!(create_args.command.is_none());
+
+        let retired_name_cli = Cli::try_parse_from(["sm", "request-codex-review", "967"]).unwrap();
+        let Command::RequestReview(retired_name_args) = retired_name_cli.command else {
+            panic!("expected the retired name to reach request-review");
+        };
+        assert_eq!(retired_name_args.action_or_pr.as_deref(), Some("967"));
 
         let default_create_cli = Cli::try_parse_from(["sm", "request-review", "967"]).unwrap();
         let Command::RequestReview(default_create_args) = default_create_cli.command else {
