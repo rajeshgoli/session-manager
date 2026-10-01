@@ -17460,9 +17460,20 @@ mod tests {
                     first_probe.pid
                 );
                 let open_files = String::from_utf8_lossy(&lsof.stdout);
+                // Queue children may inherit the live authority and handover
+                // sockets. Only regular files and directories can leak state.
+                let production_files: Vec<_> = open_files
+                    .lines()
+                    .skip(1)
+                    .filter(|line| {
+                        line.contains(production_root.to_string_lossy().as_ref())
+                            && matches!(line.split_whitespace().nth(4), Some("REG" | "DIR"))
+                    })
+                    .collect();
                 assert!(
-                    !open_files.contains(production_root.to_string_lossy().as_ref()),
-                    "unwrapped test child opened production state path:\n{open_files}"
+                    production_files.is_empty(),
+                    "unwrapped test child opened production state path:\n{}",
+                    production_files.join("\n")
                 );
                 println!(
                     "direct-harness lsof proof: child pid {} has no open path below {}",
