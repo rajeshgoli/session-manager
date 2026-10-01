@@ -6,6 +6,11 @@
 //! [`FALLBACK_AFTER`], with the latest one before it. Rows live in the
 //! retained queue DB (`sm_send.db_path`) beside owner messages and Inbox
 //! marks. Spec: `docs/working/1782_fit_and_finish.html`, appendix D.
+//!
+//! An agent's reply to the owner (sm#1844) is the turn message of the first
+//! turn that started after the owner's latest reply or note to it from the
+//! Inbox, the agent band or a message page. It is kept in `thread_replies`,
+//! one row per owner input, so the Inbox thread shows the conversation.
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -47,10 +52,34 @@ pub fn cap_text(text: &str) -> String {
     }
 }
 
+/// When the turn that wrote a message began, for matching it to the owner's
+/// latest send: the first turn started at or after a send answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyTiming {
+    /// The provider reported the turn's start.
+    Started(OffsetDateTime),
+    /// No start is known; the message's own time stands in (codex-fork, or
+    /// a Claude turn whose start hook was missed).
+    AtMessage,
+    /// The message may belong to an older turn (its Stop arrived after a
+    /// newer turn began), so it answers no send.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TurnMessage {
     pub at: String,
     pub text: String,
+}
+
+/// An agent's answer to one owner input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReply {
+    pub session_id: String,
+    /// When the owner's reply or note was sent.
+    pub input_at: String,
+    pub text: String,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,9 +108,66 @@ pub fn init_turn_messages_schema(conn: &Connection) -> Result<()> {
             read_at TEXT,
             PRIMARY KEY (session_id, completed_at)
         );
+        CREATE TABLE IF NOT EXISTS thread_replies (
+            session_id TEXT NOT NULL,
+            input_at TEXT NOT NULL,
+            text TEXT NOT NULL,
+            at TEXT NOT NULL,
+            turn_started TEXT NOT NULL,
+            PRIMARY KEY (session_id, input_at)
+        );
+        CREATE TABLE IF NOT EXISTS turn_message_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         "#,
     )?;
+    // Owner inputs from before replies were recorded have no answer to find.
+    conn.execute(
+        "INSERT OR IGNORE INTO turn_message_meta (key, value) VALUES ('replies_since', ?1)",
+        params![stamp(OffsetDateTime::now_utc())],
+    )?;
     Ok(())
+}
+
+/// The newest owner reply or note delivered to `session_id` at or before
+/// `cutoff` and after `since`, from the owner message tables when present.
+fn latest_owner_input(
+    conn: &Connection,
+    session_id: &str,
+    since: OffsetDateTime,
+    cutoff: OffsetDateTime,
+) -> Result<Option<OffsetDateTime>> {
+    let mut latest = None;
+    for table in ["owner_message_replies", "owner_message_notes"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            continue;
+        }
+        let mut statement = conn.prepare(&format!(
+            "SELECT created_at FROM {table} WHERE delivered_to_session_id = ?1 \
+             ORDER BY created_at DESC LIMIT 20"
+        ))?;
+        let times = statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        latest = times
+            .iter()
+            .filter_map(|value| parse_time(value))
+            // Sends are stored to the second, so compare at that precision.
+            .filter(|at| *at >= since.replace_nanosecond(0).unwrap_or(since) && *at <= cutoff)
+            .chain(latest)
+            .max();
+    }
+    Ok(latest)
+}
+
+fn parse_time(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc3339).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +192,12 @@ impl TurnMessageStore {
         Ok(conn)
     }
 
+    /// Creates the tables, and so fixes the time from which owner sends get
+    /// their answer recorded. The server calls it at startup.
+    pub fn ensure_schema(&self) -> Result<()> {
+        self.open_write().map(drop)
+    }
+
     /// Read connections never create the DB; a missing one reads as empty.
     fn open_read(&self) -> Result<Option<Connection>> {
         if !self.db_path.exists() {
@@ -128,11 +220,16 @@ impl TurnMessageStore {
     /// already stored (hooks can arrive out of order), and fills every
     /// Finished row of that session still without text whose completion is
     /// at or before it. Blank text records nothing.
+    ///
+    /// `timing` says when the turn began; the latest owner input sent at or
+    /// before then is answered by this turn unless a turn that started
+    /// earlier already answered it.
     pub fn record_turn(
         &self,
         session_id: &str,
         provider: &str,
         at: OffsetDateTime,
+        timing: ReplyTiming,
         text: &str,
     ) -> Result<()> {
         let text = text.trim();
@@ -140,9 +237,42 @@ impl TurnMessageStore {
             return Ok(());
         }
         let text = cap_text(text);
+        let turn_at = at;
         let at = stamp(at);
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
+        let since = tx
+            .query_row(
+                "SELECT value FROM turn_message_meta WHERE key = 'replies_since'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| parse_time(&value))
+            .unwrap_or(turn_at);
+        let started = match timing {
+            ReplyTiming::Started(started) => Some(started),
+            ReplyTiming::AtMessage => Some(turn_at),
+            ReplyTiming::Unknown => None,
+        };
+        let input = match started {
+            Some(started) => {
+                latest_owner_input(&tx, session_id, since, started)?.map(|input| (input, started))
+            }
+            None => None,
+        };
+        if let Some((input, started)) = input {
+            // Hooks can arrive out of order: the turn that started first
+            // after the send is its answer, whichever Stop lands first.
+            tx.execute(
+                "INSERT INTO thread_replies (session_id, input_at, text, at, turn_started) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(session_id, input_at) DO UPDATE SET text = excluded.text, \
+                 at = excluded.at, turn_started = excluded.turn_started \
+                 WHERE excluded.turn_started < thread_replies.turn_started",
+                params![session_id, stamp(input), text, at, stamp(started)],
+            )?;
+        }
         tx.execute(
             "INSERT INTO turn_messages (session_id, provider, at, text) VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(session_id) DO UPDATE SET provider = excluded.provider, \
@@ -257,6 +387,38 @@ impl TurnMessageStore {
                     text: row.get(2)?,
                     text_at: row.get(3)?,
                     read_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Every agent reply to an owner input, oldest first.
+    pub fn thread_replies(&self) -> Result<Vec<ThreadReply>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let has_table: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_replies'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_table {
+            return Ok(Vec::new());
+        }
+        let mut statement = conn.prepare(
+            "SELECT session_id, input_at, text, at FROM thread_replies ORDER BY at, session_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ThreadReply {
+                    session_id: row.get(0)?,
+                    input_at: row.get(1)?,
+                    text: row.get(2)?,
+                    at: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

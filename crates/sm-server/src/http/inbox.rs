@@ -25,7 +25,7 @@ use crate::owner_messages::{
     RecordReply, ReplyComment,
 };
 use crate::owner_push::{format_ts, notification_for, parse_ts, Follow, REASON_JOB_FINISHED};
-use crate::turn_messages::FinishedRow;
+use crate::turn_messages::{FinishedRow, ThreadReply};
 
 /// The Open list holds threads with activity this recent, plus every thread
 /// that needs the owner.
@@ -132,6 +132,8 @@ struct World {
     follows: Vec<Follow>,
     /// `sm task-complete` rows, oldest first (spec 1782 D3).
     finished: Vec<FinishedRow>,
+    /// Agents' answers to the owner's sends (sm#1844), oldest first.
+    agent_replies: Vec<ThreadReply>,
     marks: BTreeMap<String, ThreadMarks>,
 }
 
@@ -154,6 +156,12 @@ impl World {
                 .session_store
                 .turn_message_store()
                 .map(|store| store.finished())
+                .transpose()?
+                .unwrap_or_default(),
+            agent_replies: state
+                .session_store
+                .turn_message_store()
+                .map(|store| store.thread_replies())
                 .transpose()?
                 .unwrap_or_default(),
             marks: inbox.marks()?,
@@ -179,6 +187,20 @@ impl World {
             replied.contains(message.id.as_str()),
             !self.live(&message.sender_session_id),
         )
+    }
+
+    /// A session's answers to the owner, leaving out any that is also its
+    /// Finished message, which shows once, as Finished.
+    fn agent_replies_of<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> impl Iterator<Item = &'a ThreadReply> {
+        self.agent_replies.iter().filter(move |reply| {
+            reply.session_id == session_id
+                && !self.finished.iter().any(|row| {
+                    row.session_id == session_id && row.text_at.as_deref() == Some(&reply.at)
+                })
+        })
     }
 
     fn marks(&self, key: &str) -> ThreadMarks {
@@ -231,6 +253,7 @@ impl World {
         sessions.extend(self.notes.iter().map(|note| note.session_id.as_str()));
         sessions.extend(self.follows.iter().map(|follow| follow.session_id.as_str()));
         sessions.extend(self.finished.iter().map(|row| row.session_id.as_str()));
+        sessions.extend(self.agent_replies.iter().map(|r| r.session_id.as_str()));
         sessions
             .into_iter()
             .map(|session_id| {
@@ -293,6 +316,16 @@ impl World {
                         }
                     }
                 }
+                // An answer written after the thread was last read is new.
+                let last_read = marks.last_read_at.as_deref().map(norm);
+                let mut unread_reply = false;
+                for reply in self.agent_replies_of(session_id) {
+                    items += 1;
+                    consider(&reply.at, first_line(&reply.text, 140));
+                    unread_reply |= last_read
+                        .as_ref()
+                        .is_none_or(|read| norm(&reply.at) > *read);
+                }
                 // Fired follows are listed oldest first, so any beyond the
                 // count seen at the last read are new.
                 let unread_follow = follows
@@ -318,6 +351,7 @@ impl World {
                     preview = first_line(text, 140);
                     "finished"
                 } else if unread_follow
+                    || unread_reply
                     || messages
                         .iter()
                         .any(|(_, state)| *state == OwnerMessageState::New)
@@ -697,6 +731,8 @@ enum Item<'a> {
     Follow(&'a Follow),
     /// A Finished row's turn message.
     Turn(&'a FinishedRow),
+    /// The agent's answer to an owner send.
+    AgentReply(&'a ThreadReply),
     Doc(
         &'a crate::owner_docs::OwnerDoc,
         &'a crate::owner_docs::OwnerDocPublish,
@@ -712,6 +748,7 @@ impl Item<'_> {
             Item::Note(note) => &note.created_at,
             Item::Follow(follow) => follow.fired_at.as_deref().unwrap_or(&follow.created_at),
             Item::Turn(row) => row.text_at.as_deref().unwrap_or(&row.completed_at),
+            Item::AgentReply(reply) => &reply.at,
             Item::Doc(_, publish) => &publish.published_at,
         })
     }
@@ -724,6 +761,10 @@ impl Item<'_> {
                 "type": "turn", "at": self.at(), "finished": true,
                 "html": crate::owner_doc_render::render_markdown_sanitized(
                     row.text.as_deref().unwrap_or("")),
+            }),
+            Item::AgentReply(reply) => json!({
+                "type": "turn", "at": self.at(), "finished": false,
+                "html": crate::owner_doc_render::render_markdown_sanitized(&reply.text),
             }),
             _ => json!({"at": self.at(), "html": render_item(self, world, session_id, now)}),
         }
@@ -894,6 +935,11 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 row.text.as_deref().unwrap_or("")
             ),
         ),
+        Item::AgentReply(reply) => format!(
+            r#"<div class="b turn"><div class="lbl">Reply · {when}</div><div class="md">{body}</div></div>"#,
+            when = when(item.at().as_str()),
+            body = crate::owner_doc_render::render_markdown_sanitized(&reply.text),
+        ),
         Item::Doc(doc, publish) => format!(
             r#"<div class="ev">{what} <a href="{url}">{title}</a> · {when}</div>"#,
             what = if publish.review_requested {
@@ -972,7 +1018,11 @@ pub(super) fn agent_thread_page(
         .any(|m| m.sender_session_id == session_id)
         || world.notes.iter().any(|n| n.session_id == session_id)
         || world.follows.iter().any(|f| f.session_id == session_id)
-        || world.finished.iter().any(|f| f.session_id == session_id);
+        || world.finished.iter().any(|f| f.session_id == session_id)
+        || world
+            .agent_replies
+            .iter()
+            .any(|r| r.session_id == session_id);
     if !has_items && !world.sessions.contains_key(&session_id) {
         return Err(ApiError::NotFound("Thread not found"));
     }
@@ -1033,6 +1083,7 @@ pub(super) fn agent_thread_page(
             .filter(|row| row.session_id == session_id && row.text.is_some())
             .map(Item::Turn),
     );
+    items.extend(world.agent_replies_of(&session_id).map(Item::AgentReply));
     let publishes = owner_doc_store(state).publishes_by_session(&session_id, 100)?;
     items.extend(
         publishes

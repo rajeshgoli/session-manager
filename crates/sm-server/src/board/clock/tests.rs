@@ -369,3 +369,30 @@ fn segments_take_the_ball_order_across_agents() {
         ]
     );
 }
+
+#[test]
+fn a_pinned_note_replaces_idle_and_stalled() {
+    let pinned = datetime!(2026-09-29 13:00:00 UTC);
+    let held = idle_since(datetime!(2026-09-28 09:00:00 UTC));
+    check(
+        ClockFacts {
+            holder: held,
+            note: Some((pinned, "Waiting for the midnight window".into())),
+            ..Default::default()
+        },
+        "idle",
+        "📌 Waiting for the midnight window",
+    );
+    // A question still wins over the note.
+    let question = ball(
+        &ClockFacts {
+            needs_you: Some((pinned, "Check Chrome".into())),
+            holder: held,
+            note: Some((pinned, "Waiting".into())),
+            ..Default::default()
+        },
+        NOW,
+        STALL,
+    );
+    assert_eq!(question.kind, "you");
+}

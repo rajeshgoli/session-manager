@@ -1,5 +1,6 @@
 // Agents page and agent panel (spec 1710 D6.1, D6.2; 1782 F). Data: GET /watch/state.
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { safeThreadHtml } from './inbox.js';
 import {
   html, api, usePoll, useNow, config, age, limitText, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
@@ -132,15 +133,18 @@ export function youFact(agent, now = Date.now()) {
       dismissible: !!facts.you.dismissible,
     };
   }
-  if (facts.finished) return { text: `✔ ${facts.finished.text || 'Finishing…'}`, tone: 'cyan', dismissible: false };
+  if (facts.finished) return { text: `✔ ${facts.finished.text || 'Finishing…'}`, tone: 'cyan', dismissible: true };
   return null;
 }
 
-/** Clear "needs you" after answering where sm cannot see (1782 C4). */
+const CLEARED = { message: 'Marked answered', doc_review: 'No review needed', finished: 'Marked read' };
+
+/** ✓: clear what the card shows — a question, a review request or a
+ * Finished summary — as Inbox Done would (1782 C4, sm#1851). */
 export async function markAnswered(agent, after) {
   try {
-    await api(`/sessions/${encodeURIComponent(agent.id)}/needs-you/answered`, { method: 'POST', body: {} });
-    toast('Marked answered');
+    const result = await api(`/sessions/${encodeURIComponent(agent.id)}/needs-you/answered`, { method: 'POST', body: {} });
+    toast(CLEARED[result?.kind] || 'Marked answered');
     if (after) after();
   } catch (error) {
     toast(error.message);
@@ -189,10 +193,41 @@ function Facts({ agent, now, onAnswered }) {
       ? html`<span class=${`you ${you.tone}`}>
           <span class="fa" title=${hoverText(you.text)}>${you.text}</span>
           ${you.dismissible
-            ? html`<button type="button" class="icon-btn ok" title="Mark answered (x)" aria-label="Mark answered"
+            ? html`<button type="button" class="icon-btn ok" title=${you.tone === 'cyan' ? 'Mark read (x)' : 'Mark answered (x)'} aria-label=${you.tone === 'cyan' ? 'Mark read' : 'Mark answered'}
                 onClick=${(event) => { event.stopPropagation(); markAnswered(agent, onAnswered); }}>✓</button>`
             : null}</span>`
+      : null}
+    ${agent.facts?.note
+      ? html`<span class="you note" title=${agent.facts.note.text}><span class="fa">📌 ${agent.facts.note.text}</span></span>`
       : null}`;
+}
+
+/** Pin a note saying why the agent waits; it replaces "stalled" (sm#1851). */
+function NoteEditor({ agent, onSaved }) {
+  const current = agent.facts?.note?.text || '';
+  const [text, setText] = useState(current);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setText(current), [agent.id, current]);
+  const save = async (value) => {
+    setBusy(true);
+    try {
+      await api(`/sessions/${encodeURIComponent(agent.id)}/note`, { method: 'PUT', body: { text: value } });
+      toast(value.trim() ? 'Note pinned' : 'Note removed');
+      if (onSaved) onSaved();
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return html`<section><h3>Note</h3><div class="note-edit">
+    <input type="text" maxlength="200" placeholder="Why it waits, e.g. Waiting for the midnight window"
+      value=${text} disabled=${busy} onInput=${(e) => setText(e.target.value)}
+      onKeyDown=${(e) => { if (e.key === 'Enter' && text.trim() !== current) save(text); }} />
+    <button type="button" class="btn sm" disabled=${busy || !text.trim() || text.trim() === current}
+      onClick=${() => save(text)}>Pin</button>
+    ${current ? html`<button type="button" class="btn sm" disabled=${busy} onClick=${() => save('')}>Remove</button>` : null}
+  </div></section>`;
 }
 
 // ---- page -------------------------------------------------------------------
@@ -566,6 +601,7 @@ function WorkTab({ agent, now, onAnswered }) {
           ${agent.status_at ? html`<div class="sub">${clock(agent.status_at)}</div>` : null}</section>`
       : null}
     <${LastTurn} id=${agent.id} />
+    <${NoteEditor} agent=${agent} onSaved=${onAnswered} />
     <section><h3>Workspace</h3><div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div></section>
   `;
 }
@@ -574,8 +610,12 @@ function WorkTab({ agent, now, onAnswered }) {
 function LastTurn({ id }) {
   const [turn] = usePoll(() => api(`/sessions/${encodeURIComponent(id)}/last-turn`).catch(() => null), 30000, [id]);
   if (!turn) return null;
-  return html`<section><h3>Last turn</h3><div class="quote last-turn">${turn.text}</div>
-    <div class="sub">${clock(turn.at)}</div></section>`;
+  // Reply continues in the agent's Inbox thread, where its answer appears.
+  const reply = () => { navigate('/inbox'); openPanel(`thread:${id}`); };
+  return html`<section><h3>Last turn</h3>
+    <div class="quote last-turn md" dangerouslySetInnerHTML=${{ __html: safeThreadHtml(turn.html || '') }} />
+    <div class="last-turn-foot"><span class="sub">${clock(turn.at)}</span>
+      <button type="button" class="btn sm" onClick=${reply}>Reply</button></div></section>`;
 }
 
 function ActivityTab({ id }) {

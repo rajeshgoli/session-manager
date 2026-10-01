@@ -79,6 +79,17 @@ export class ApiError extends Error {
   }
 }
 
+// The server stamps every response with its build. A tab opened before a
+// deploy keeps running the code it loaded, so once a newer build answers,
+// the page offers a reload and the next page switch loads it.
+export const build = { stale: false };
+function noteBuild(id) {
+  if (id && config.build_id && id !== config.build_id && !build.stale) {
+    build.stale = true;
+    bus.emit('stale-build', true);
+  }
+}
+
 export async function api(path, { method = 'GET', body, headers = {} } = {}) {
   const options = { method, credentials: 'same-origin', cache: 'no-store', headers: { ...headers } };
   if (body !== undefined) {
@@ -86,6 +97,7 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
     options.body = JSON.stringify(body);
   }
   const response = await fetch(path, options);
+  noteBuild(response.headers.get('x-sm-build'));
   const text = await response.text();
   let value = null;
   try {

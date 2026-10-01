@@ -281,6 +281,16 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
         "history of the agent that ran sm task-complete",
     ),
     (
+        "thread_replies",
+        "session_id",
+        "history of the agent that answered",
+    ),
+    (
+        "agent_notes",
+        "session_id",
+        "the owner's note on this agent; a successor gets its own",
+    ),
+    (
         "owner_approval_waits",
         "session_id",
         "live state, recomputed from the session's own prompt every sweep",
