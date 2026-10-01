@@ -21061,6 +21061,11 @@ mod tests {
             let (status, _) = response_json(app.clone().oneshot(request).await.unwrap()).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
         }
+        let request = public_request(Method::GET, "/notes", Body::empty());
+        let (status, _) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = browser_host_get(&app, "/notes", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

@@ -254,16 +254,14 @@ impl NotesStore {
             let title: String = row.get(1)?;
             let body: String = row.get(2)?;
             let updated_at: String = row.get(3)?;
-            let first = if q.is_empty() {
-                Some((0, 0))
-            } else if let Some(pattern) = &pattern {
-                pattern.find(&body).map(|m| (m.start(), m.end()))
-            } else {
-                None
-            };
-            let Some((start, _)) = first else {
+            let body_match = pattern.as_ref().and_then(|pattern| pattern.find(&body));
+            let title_match = pattern
+                .as_ref()
+                .is_some_and(|pattern| pattern.is_match(&title));
+            if !q.is_empty() && body_match.is_none() && !title_match {
                 continue;
-            };
+            }
+            let start = body_match.map_or(0, |matched| matched.start());
             let snippet = if body.len() < 1200 {
                 body.clone()
             } else {
@@ -549,6 +547,7 @@ mod tests {
     fn snippets_import_and_regex() {
         let store = fixture();
         let short = store.create("Hello World", None).unwrap();
+        let titled = store.create("Steps...", Some("Deploy checklist")).unwrap();
         let long = format!(
             "{}\n\n```rust\nlet target = 1;\n```\n\nend",
             "padding".repeat(180)
@@ -558,6 +557,11 @@ mod tests {
         assert_eq!(hits[0].id, short.id);
         assert_eq!(hits[0].snippet, "Hello World");
         assert_eq!((hits[0].matches[0].start, hits[0].matches[0].end), (6, 11));
+        let title_hits = store.search("deploy", false).unwrap();
+        assert_eq!(title_hits.len(), 1);
+        assert_eq!(title_hits[0].id, titled.id);
+        assert_eq!(title_hits[0].snippet, "Steps...");
+        assert!(title_hits[0].matches.is_empty());
         let hits = store.search("target\\s*=", true).unwrap();
         assert_eq!(hits[0].id, fenced.id);
         assert_eq!(hits[0].snippet, "```rust\nlet target = 1;\n```");

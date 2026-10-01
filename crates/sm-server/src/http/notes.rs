@@ -19,6 +19,14 @@ fn guard(
         });
     }
     board::owner_guard(state, headers, peer, method, uri, method != "GET")?;
+    if owner_web_guard(state, headers, Some(peer), method)?.is_none()
+        && authenticated_user(headers, &state.config).is_none()
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Owner login required for Notes".into(),
+        });
+    }
     Ok(())
 }
 fn store(state: &AppState) -> NotesStore {
