@@ -146,9 +146,12 @@ fn certificate_is_valid_for(dir: &Path, hostname: &str, min_lifetime_seconds: u6
         .args(["x509", "-in"])
         .arg(&cert)
         .args(["-noout", "-checkhost", hostname])
-        .status()
+        .output()
         .context("cannot inspect terminal LAN certificate hostname")?;
-    if !valid.success() || !matching.success() {
+    if !valid.success()
+        || !matching.status.success()
+        || !hostname_check_matches(hostname, &matching.stdout)
+    {
         return Ok(false);
     }
     let certificate_key = openssl_command()
@@ -166,6 +169,10 @@ fn certificate_is_valid_for(dir: &Path, hostname: &str, min_lifetime_seconds: u6
     Ok(certificate_key.status.success()
         && private_key.status.success()
         && certificate_key.stdout == private_key.stdout)
+}
+
+fn hostname_check_matches(hostname: &str, output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).trim() == format!("Hostname {hostname} does match certificate")
 }
 
 fn openssl_command() -> Command {
@@ -482,6 +489,18 @@ fn default_route_ipv4() -> Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostname_check_requires_affirmative_output() {
+        assert!(hostname_check_matches(
+            "studio-lan.example.com",
+            b"Hostname studio-lan.example.com does match certificate\n"
+        ));
+        assert!(!hostname_check_matches(
+            "studio-lan.example.com",
+            b"Hostname studio-lan.example.com does NOT match certificate\n"
+        ));
+    }
 
     fn write_test_certificate(dir: &Path, days: u32) {
         let output = openssl_command()
