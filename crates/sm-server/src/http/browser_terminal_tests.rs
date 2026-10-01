@@ -89,13 +89,16 @@ async fn browser_terminal_ticket_is_short_lived_single_use_and_bound_to_login() 
     let state = browser_terminal_state();
     let ticket = mint_browser_terminal_ticket(&state).await;
     assert_eq!(ticket["ws_url"], "/client/terminal");
+    assert_eq!(ticket["server_instance"], state.server_instance);
+    assert_eq!(ticket["direct"][0]["url"], "ws://localhost:8420/client/terminal");
+    assert_eq!(ticket["direct"].as_array().unwrap().len(), 1);
     let id = ticket["ticket_id"].as_str().unwrap();
     {
         let tickets = state.mobile_terminal_tickets.lock().unwrap();
         assert_eq!(tickets[id].kind, TerminalTicketKind::Browser);
         assert_eq!(
             tickets[id].expires_at_unix - tickets[id].created_at_unix,
-            60
+            30
         );
         assert!(!format!("{:?}", tickets[id]).contains(ticket["ticket_secret"].as_str().unwrap()));
     }
@@ -125,6 +128,23 @@ async fn browser_terminal_ticket_is_short_lived_single_use_and_bound_to_login() 
 }
 
 #[tokio::test]
+async fn browser_terminal_ticket_advertises_lan_only_when_enabled() {
+    let mut state = browser_terminal_state();
+    state.config.terminal_direct.lan.enabled = true;
+    state.config.terminal_direct.lan.hostname = "studio-lan.example.com".to_owned();
+    state.config.terminal_direct.lan.port = 9443;
+    let ticket = mint_browser_terminal_ticket(&state).await;
+    assert_eq!(ticket["direct"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        ticket["direct"][1],
+        json!({
+            "url": "wss://studio-lan.example.com:9443/client/terminal",
+            "probe": "https://studio-lan.example.com:9443/client/terminal/probe",
+        })
+    );
+}
+
+#[tokio::test]
 async fn browser_terminal_does_not_remove_phone_signature_requirement() {
     let key = SigningKey::random(&mut OsRng);
     let state = AppState::new(mobile_ticket_config(&key));
@@ -133,6 +153,56 @@ async fn browser_terminal_does_not_remove_phone_signature_requirement() {
     frame.signature = None;
     assert!(consume_terminal_ticket(&state, &frame, None).is_err());
     assert!(consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com")).is_err());
+    assert!(browser_terminal::direct_ticket_email(&state, &frame).is_err());
+}
+
+#[tokio::test]
+async fn browser_terminal_probe_and_direct_upgrade_require_the_expected_peer_and_origin() {
+    let state = browser_terminal_state();
+    let app = router(state.clone());
+    let get = Request::builder()
+        .uri("/client/terminal/probe")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["access-control-allow-origin"], "https://sm.example.com");
+    assert_eq!(response.headers()["vary"], "Origin");
+    assert_eq!(response_json(response).await.1["instance"], state.server_instance);
+    let options = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/client/terminal/probe")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(options).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers()["access-control-allow-private-network"], "true");
+    assert_eq!(response.headers()["access-control-allow-methods"], "GET");
+    for (host, origin, peer, accepted) in [
+        ("localhost:8420", "https://sm.example.com", "127.0.0.1:1234", true),
+        ("localhost:8420", "https://evil.example.com", "127.0.0.1:1234", false),
+        ("localhost:8421", "https://sm.example.com", "127.0.0.1:1234", false),
+        ("localhost:8420", "https://sm.example.com", "192.0.2.1:1234", false),
+    ] {
+        let mut request = Request::builder()
+            .uri("/client/terminal")
+            .header("host", host)
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        assert_eq!(browser_terminal::direct_route(&state, &request).is_some(), accepted);
+    }
+    let mut remote = Request::builder()
+        .uri("/client/terminal")
+        .header("host", "localhost:8420")
+        .header("origin", "https://sm.example.com")
+        .body(Body::empty())
+        .unwrap();
+    remote
+        .extensions_mut()
+        .insert(ConnectInfo("192.0.2.1:1234".parse::<SocketAddr>().unwrap()));
+    assert_eq!(app.oneshot(remote).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -172,7 +242,9 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    let state = browser_terminal_state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = browser_terminal_state().with_listen_port(addr.port());
     let ticket = mint_browser_terminal_ticket(&state).await;
     {
         let mut tickets = state.mobile_terminal_tickets.lock().unwrap();
@@ -182,11 +254,11 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
         stored.tmux_socket_name = Some(tmux.0.clone());
         stored.tmux_session = "terminal".into();
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let app = router(state.clone());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
     });
     let assertion =
         test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
@@ -210,7 +282,21 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
         .headers_mut()
         .insert("origin", "https://evil.example.com".parse().unwrap());
     assert!(connect_async(foreign).await.is_err());
-    let (mut client, _) = connect_async(request()).await.unwrap();
+    let mut direct = format!("ws://{addr}/client/terminal")
+        .into_client_request()
+        .unwrap();
+    direct
+        .headers_mut()
+        .insert("host", format!("localhost:{}", addr.port()).parse().unwrap());
+    direct
+        .headers_mut()
+        .insert("origin", "https://sm.example.com".parse().unwrap());
+    let mut wrong_origin = direct.clone();
+    wrong_origin
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+    assert!(connect_async(wrong_origin).await.is_err());
+    let (mut client, _) = connect_async(direct).await.unwrap();
     client.send(ClientMessage::Text(json!({"type":"auth", "ticket_id":ticket["ticket_id"], "ticket_secret":ticket["ticket_secret"], "output_ack":true}).to_string().into())).await.unwrap();
     client
         .send(ClientMessage::Text(
@@ -221,6 +307,7 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
         .await
         .unwrap();
     let mut attached = false;
+    let mut saw_pong = false;
     let mut output = Vec::new();
     timeout(Duration::from_secs(10), async {
         while let Some(message) = client.next().await {
@@ -237,6 +324,10 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
                 assert_eq!(frame["state"], "attached");
                 attached = true;
                 client
+                    .send(ClientMessage::Text(json!({"type":"ping", "id":7}).to_string().into()))
+                    .await
+                    .unwrap();
+                client
                     .send(ClientMessage::Text(
                         json!({"type":"input", "data":"browser-terminal-echo\r"})
                             .to_string()
@@ -244,6 +335,10 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
                     ))
                     .await
                     .unwrap();
+            }
+            if frame["type"] == "pong" {
+                assert_eq!(frame["id"], 7);
+                saw_pong = true;
             }
             if frame["type"] == "output" {
                 output.extend(STANDARD.decode(frame["data"].as_str().unwrap()).unwrap());
@@ -255,15 +350,16 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
                     ))
                     .await
                     .unwrap();
-                if String::from_utf8_lossy(&output).contains("browser-terminal-echo") {
-                    break;
-                }
+            }
+            if saw_pong && String::from_utf8_lossy(&output).contains("browser-terminal-echo") {
+                break;
             }
         }
     })
     .await
     .unwrap();
     assert!(attached);
+    assert!(saw_pong);
     // The actual tmux client must see later dimensions, not just the initial size.
     for (cols, rows) in [(40, 12), (120, 36)] {
         client

@@ -14,6 +14,113 @@ pub(super) fn authorize(state: &AppState, request: &Request) -> Result<String, A
         .ok_or_else(|| denied("Browser Access login required"))
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DirectRoute {
+    Localhost,
+    Lan,
+}
+
+impl DirectRoute {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Localhost => "localhost",
+            Self::Lan => "lan",
+        }
+    }
+}
+
+pub(super) fn direct_route(state: &AppState, request: &Request) -> Option<DirectRoute> {
+    let browser_host = state.config.cloudflare_access.browser.hostname.as_deref()?;
+    let origin = header_text(request.headers(), "origin")?;
+    if origin != format!("https://{browser_host}") {
+        return None;
+    }
+    let host = header_text(request.headers(), "host")?;
+    let localhost = ["localhost", "127.0.0.1"]
+        .iter()
+        .any(|name| host.eq_ignore_ascii_case(&format!("{name}:{}", state.listen_port)));
+    if localhost && request_peer_addr(request).is_some_and(|peer| peer.ip().is_loopback()) {
+        return Some(DirectRoute::Localhost);
+    }
+    let lan = &state.config.terminal_direct.lan;
+    if lan.enabled
+        && request.extensions().get::<DirectTerminalLan>().is_some()
+        && host.eq_ignore_ascii_case(&format!("{}:{}", lan.hostname, lan.port))
+    {
+        return Some(DirectRoute::Lan);
+    }
+    None
+}
+
+pub(super) fn is_direct_host(state: &AppState, request: &Request) -> bool {
+    if matches!(
+        request_hostname(request.headers()).as_deref(),
+        Some("localhost" | "127.0.0.1")
+    ) {
+        return true;
+    }
+    let lan = &state.config.terminal_direct.lan;
+    lan.enabled
+        && request.extensions().get::<DirectTerminalLan>().is_some()
+        && request_hostname(request.headers()).as_deref() == Some(lan.hostname.as_str())
+}
+
+pub(super) fn direct_ticket_email(
+    state: &AppState,
+    frame: &MobileTerminalAuthFrame,
+) -> Result<String, ApiError> {
+    let tickets = state
+        .mobile_terminal_tickets
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Terminal ticket store unavailable"))?;
+    let ticket = tickets
+        .get(frame.ticket_id.as_deref().unwrap_or(""))
+        .filter(|ticket| ticket.kind == TerminalTicketKind::Browser)
+        .ok_or_else(|| denied("Browser ticket required for direct attach"))?;
+    Ok(ticket.actor_email.clone())
+}
+
+pub(super) async fn probe(State(state): State<Arc<AppState>>) -> Response {
+    let origin = state
+        .config
+        .cloudflare_access
+        .browser
+        .hostname
+        .as_deref()
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_default();
+    (
+        [
+            ("access-control-allow-origin", origin),
+            ("vary", "Origin".to_owned()),
+            ("cache-control", "no-store".to_owned()),
+        ],
+        Json(json!({"instance": state.server_instance})),
+    )
+        .into_response()
+}
+
+pub(super) async fn probe_options(State(state): State<Arc<AppState>>) -> Response {
+    let origin = state
+        .config
+        .cloudflare_access
+        .browser
+        .hostname
+        .as_deref()
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_default();
+    (
+        StatusCode::NO_CONTENT,
+        [
+            ("access-control-allow-origin", origin),
+            ("access-control-allow-private-network", "true".to_owned()),
+            ("access-control-allow-methods", "GET".to_owned()),
+            ("vary", "Origin".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
 pub(super) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -49,7 +156,7 @@ pub(super) async fn create_ticket(
     let tmux_socket_name = attach["tmux_socket_name"].as_str().map(str::to_owned);
     validate_mobile_terminal_tmux_target(&tmux_session, tmux_socket_name.as_deref())?;
     let now = OffsetDateTime::now_utc();
-    let expires_at = now + Duration::from_secs(60);
+    let expires_at = now + Duration::from_secs(30);
     let ticket_id = format!("att_{}", random_urlsafe_token(18));
     let ticket_secret = random_urlsafe_token(40);
     let ticket = MobileTerminalTicket {
@@ -98,9 +205,23 @@ pub(super) async fn create_ticket(
     enforce_mobile_terminal_active_limits(&state, active.values().chain(pending.iter()), &ticket)?;
     ensure_mobile_terminal_ticket_runtime_enabled(&state)?;
     tickets.insert(ticket_id.clone(), ticket);
+    let localhost = format!("localhost:{}", state.listen_port);
+    let mut direct = vec![json!({
+        "url": format!("ws://{localhost}/client/terminal"),
+        "probe": format!("http://{localhost}/client/terminal/probe"),
+    })];
+    let lan = &state.config.terminal_direct.lan;
+    if lan.enabled {
+        let host = format!("{}:{}", lan.hostname, lan.port);
+        direct.push(json!({
+            "url": format!("wss://{host}/client/terminal"),
+            "probe": format!("https://{host}/client/terminal/probe"),
+        }));
+    }
     // Relative to the authenticated browser origin, never the phone hostname.
     Ok(Json(json!({
         "ticket_id": ticket_id, "ticket_secret": ticket_secret,
         "ws_url": "/client/terminal", "expires_at": expires_at.format(&Rfc3339).unwrap(),
+        "server_instance": state.server_instance, "direct": direct,
     })))
 }

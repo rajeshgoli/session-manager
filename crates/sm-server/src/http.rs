@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
@@ -52,6 +52,7 @@ use jsonwebtoken::jwk::JwkSet;
 use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, OFlag},
+    poll::{poll, PollFd, PollFlags},
     pty::{openpty, Winsize},
     unistd::{dup, read as nix_read, write as nix_write},
 };
@@ -198,6 +199,10 @@ enum TerminalTicketKind {
     Phone,
     Browser,
 }
+
+/// Set only by the dedicated TLS listener when it is added to the server.
+#[derive(Clone, Copy)]
+pub struct DirectTerminalLan;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -549,6 +554,8 @@ impl GitHubReviewPoster for GhCliReviewPoster {
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
+    listen_port: u16,
+    server_instance: String,
     session_store: SessionStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     owner_doc_source: Arc<dyn OwnerDocSource>,
@@ -720,6 +727,8 @@ impl AppState {
         ));
         Ok(Self {
             config,
+            listen_port: 8420,
+            server_instance: random_urlsafe_token(24),
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             owner_doc_source: Arc::new(docs::GhCliDocSource),
@@ -753,6 +762,11 @@ impl AppState {
             queue_admission,
             terminal_limits,
         })
+    }
+
+    pub fn with_listen_port(mut self, port: u16) -> Self {
+        self.listen_port = port;
+        self
     }
 
     pub fn drain_background_retry_wakes(&self) -> anyhow::Result<usize> {
@@ -1667,6 +1681,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/client/bug-reports", post(submit_client_bug_report))
         .route("/client/terminal", get(mobile_terminal_endpoint))
+        .route(
+            "/client/terminal/probe",
+            get(browser_terminal::probe).options(browser_terminal::probe_options),
+        )
         .route(
             "/client/mobile-terminal/disable",
             post(disable_mobile_terminal),
@@ -8515,7 +8533,15 @@ async fn mobile_terminal_endpoint(
 ) -> Result<Response, ApiError> {
     let browser = request_cloudflare_access_application(&state, &request)
         == Some(CloudflareAccessApplication::Browser);
-    let (browser_email, access_context) = if browser {
+    let direct_route = browser_terminal::direct_route(&state, &request);
+    if direct_route.is_none() && browser_terminal::is_direct_host(&state, &request) {
+        return Err(browser_terminal::denied(
+            "Direct terminal origin and peer required",
+        ));
+    }
+    let (browser_email, access_context) = if direct_route.is_some() {
+        (None, None)
+    } else if browser {
         (Some(browser_terminal::authorize(&state, &request)?), None)
     } else {
         let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
@@ -8530,10 +8556,12 @@ async fn mobile_terminal_endpoint(
         .map(|value| value.0);
     if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         return Ok(ws
-            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state, browser_email))
+            .on_upgrade(move |socket| {
+                mobile_terminal_websocket(socket, state, browser_email, direct_route)
+            })
             .into_response());
     }
-    if browser {
+    if browser || direct_route.is_some() {
         return Ok((
             StatusCode::UPGRADE_REQUIRED,
             "Terminal requires a WebSocket upgrade",
@@ -8583,6 +8611,7 @@ async fn mobile_terminal_websocket(
     mut socket: WebSocket,
     state: Arc<AppState>,
     browser_email: Option<String>,
+    direct_route: Option<browser_terminal::DirectRoute>,
 ) {
     if !mobile_terminal_enabled(&state) {
         send_mobile_terminal_error(&mut socket, "mobile terminal attach is disabled").await;
@@ -8608,8 +8637,30 @@ async fn mobile_terminal_websocket(
         }
     };
 
-    match consume_terminal_ticket(&state, &auth_frame, browser_email.as_deref()) {
+    let direct_email = if direct_route.is_some() {
+        match browser_terminal::direct_ticket_email(&state, &auth_frame) {
+            Ok(email) => Some(email),
+            Err(error) => {
+                let detail = api_error_detail(&error);
+                send_mobile_terminal_error(&mut socket, &detail).await;
+                close_mobile_terminal_socket(&mut socket, 1008, &detail).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let authorized_email = browser_email.as_deref().or(direct_email.as_deref());
+    match consume_terminal_ticket(&state, &auth_frame, authorized_email) {
         Ok((ticket, attach_id, stop)) => {
+            if let Some(route) = direct_route {
+                eprintln!(
+                    "browser attach direct {} {} {}",
+                    route.label(),
+                    ticket.actor_email,
+                    ticket.session_id
+                );
+            }
             run_mobile_terminal_bridge(
                 socket,
                 state,
@@ -9022,9 +9073,7 @@ async fn wait_for_mobile_terminal_initial_resize(
                 }
             }
             Some("ping") => {
-                let _ =
-                    send_mobile_terminal_json(socket, json!({"type": "status", "state": "pong"}))
-                        .await;
+                let _ = send_mobile_terminal_json(socket, terminal_ping_reply(&frame)).await;
             }
             Some("transport_keepalive") => {
                 // Axum queues the pong; flush it even before the first resize.
@@ -9191,11 +9240,7 @@ where
         Some("ping") => {
             let _ = send_mobile_terminal_bounded(
                 sender,
-                Message::Text(
-                    json!({"type": "status", "state": "pong"})
-                        .to_string()
-                        .into(),
-                ),
+                Message::Text(terminal_ping_reply(frame).to_string().into()),
             )
             .await;
         }
@@ -9217,6 +9262,13 @@ where
         }
     }
     Ok(false)
+}
+
+fn terminal_ping_reply(frame: &Value) -> Value {
+    match frame.get("id").and_then(Value::as_u64) {
+        Some(id) => json!({"type": "pong", "id": id}),
+        None => json!({"type": "status", "state": "pong"}),
+    }
 }
 
 fn terminal_frame_submits_input(frame: &Value) -> bool {
@@ -9441,7 +9493,16 @@ fn mobile_terminal_output_reader(
                     return;
                 }
             }
-            Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(25)),
+            Err(Errno::EAGAIN) => {
+                let mut fds = [PollFd::new(master.as_ref().as_fd(), PollFlags::POLLIN)];
+                match poll(&mut fds, 250u16) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(_) => {
+                        let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
+                        return;
+                    }
+                }
+            }
             Err(Errno::EINTR) => {}
             Err(_) => {
                 let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
@@ -9472,7 +9533,13 @@ fn write_mobile_terminal_pty_blocking(master: &OwnedFd, data: &[u8]) -> Result<(
         match nix_write(master, &data[offset..]) {
             Ok(0) => return Err("failed to deliver terminal input".to_owned()),
             Ok(n) => offset += n,
-            Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(10)),
+            Err(Errno::EAGAIN) => {
+                let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLOUT)];
+                match poll(&mut fds, 250u16) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(_) => return Err("failed to deliver terminal input".to_owned()),
+                }
+            }
             Err(Errno::EINTR) => {}
             Err(_) => return Err("failed to deliver terminal input".to_owned()),
         }

@@ -200,7 +200,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    let state = AppState::try_new(config).context("failed to initialize server state")?;
+    let state = AppState::try_new(config)
+        .context("failed to initialize server state")?
+        .with_listen_port(args.port);
     // Reparent lifecycle and notification delivery can take the cross-process
     // apply lock, access the retained queue, and talk to tmux.  Keep all of
     // that work on one dedicated worker: watch polling is a snapshot read and
