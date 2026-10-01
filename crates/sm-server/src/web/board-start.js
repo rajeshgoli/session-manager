@@ -1,6 +1,6 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
-import { useEffect, useState } from 'preact/hooks';
-import { html, api, Popover, Seg, homeRelative, toast, openPanel, stored, store } from './ui.js';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
 import { EFFORTS } from './start.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
@@ -86,11 +86,42 @@ export function defaultType(ticket, types, last) {
 export const laneCandidates = (lane) => (lane.tickets || []).filter((t) => ['blocked', 'ready'].includes(t.state)
   && !t.holder && !(t.warnings || []).includes('merged_not_closed') && !(t.repo === lane.goal.repo && t.number === lane.goal.number));
 
+/** Report a bug (1859 B4): the POST /client/bug-reports body. `bug` is what the press captured. */
+export function bugBody(bug, { text, screenshot, startAgent }, form) {
+  return {
+    text, client: 'web', client_version: config.build_id || null, page: bug.page, route: bug.route,
+    page_data: trimPageData(bug.page_data || {}),
+    screenshot_png: screenshot && bug.screenshot ? bug.screenshot : null,
+    start: startAgent ? { provider: form.provider, model: form.model || null, reasoning_effort: form.reasoning_effort || null, reviewer: form.reviewer || null } : null,
+  };
+}
+
+/** Board Start on the filed bug, after the server's start failed (decision 9). */
+export function bugStartBody(issue, form) {
+  return startBody({ repo: issue.repo, number: issue.number }, form);
+}
+
+/** The bug dialog's primary button: File bug, File and start, or Start once filed. */
+export function bugPrimary({ startAgent, filed, busy }) {
+  if (filed) return busy ? 'Starting…' : 'Start';
+  if (busy) return startAgent ? 'Filing and starting…' : 'Filing…';
+  return startAgent ? 'File and start' : 'File bug';
+}
+
+export function filedText(result) {
+  return `Filed #${result.issue.number}${result.started ? ` · started ${result.started.name}` : ''}${result.board_note ? ' · not on the board' : ''}`;
+}
+
+/** The new-agent provider and its saved defaults. */
+const defaultProvider = (settings) => (settings.new_agent.provider || '').startsWith('codex') ? 'codex-fork' : 'claude';
+
 const autoStartPath = (ticket) => `/client/board/auto-start?${new URLSearchParams({ repo: ticket.repo, number: ticket.number })}`;
 
 /** Start, or with mode when_ready, Start when ready (1821 F4): an agent type fills provider, model and effort. */
-export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
+export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onStarted = () => {} }) {
+  if (mode === 'bug') ticket = { repo: null, number: null, state: 'ready' };
   const later = mode === 'when_ready';
+  const reporting = mode === 'bug';
   const auto = later && ticket.auto_start;
   const [form, setForm] = useState(null);
   const [settings, setSettings] = useState(null);
@@ -101,8 +132,23 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
   const [error, setError] = useState(null);
   const [typeName, setTypeName] = useState(CUSTOM);
   const [edited, setEdited] = useState(false);
+  const [report, setReport] = useState({ text: '', screenshot: !!(bug && bug.screenshot), startAgent: false });
+  const [filed, setFiled] = useState(null);
   const types = (settings && settings.new_agent.agent_types) || [];
   useEffect(() => {
+    if (!reporting) return;
+    let alive = true;
+    Promise.all([api('/client/bug-reports/options'), api('/client/settings')])
+      .then(([options, saved]) => {
+        if (!alive) return;
+        setForm({ ...providerDefaults(saved, defaultProvider(saved)), working_dir: options.working_dir, review_policy: options.review_policy, reviewer: null });
+        setSettings(saved);
+      })
+      .catch((e) => alive && setError(e.message));
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => {
+    if (reporting) return;
     if (!later && ticket.state === 'blocked' && !canStartAnyway(ticket)) return;
     let alive = true;
     const query = new URLSearchParams({ repo: ticket.repo, number: ticket.number });
@@ -125,15 +171,17 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [ticket.repo, ticket.number]);
+  const wantModels = !!form && (!reporting || report.startAgent);
   useEffect(() => {
-    if (!form) return;
+    if (!wantModels) return;
     let alive = true;
     setModels([]);
-    const query = new URLSearchParams({ provider: form.provider, working_dir: form.working_dir });
+    const query = new URLSearchParams({ provider: form.provider });
+    if (form.working_dir) query.set('working_dir', form.working_dir);
     api(`/client/session-models?${query}`).then((data) => alive && setModels(data.models || []))
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
-  }, [form && form.provider, form && form.working_dir]);
+  }, [wantModels, form && form.provider, form && form.working_dir]);
   const set = (patch) => {
     const next = { ...form, ...patch };
     setForm(next);
@@ -154,6 +202,21 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   };
+  const fileBug = async () => {
+    if (filed) {
+      run('POST', '/client/board/start', bugStartBody(filed.issue, form), (result) => toast(`Started ${result.name}`, () => openPanel(`agent:${result.session_id}`)));
+      return;
+    }
+    if (busy) return;
+    setBusy(true); setError(null);
+    try {
+      const result = await api('/client/bug-reports', { method: 'POST', body: bugBody(bug, report, form) });
+      if (result.start_error) { setFiled(result); setError(result.start_error); return; }
+      onClose();
+      toast(filedText(result), result.started ? () => openPanel(`agent:${result.started.session_id}`) : () => window.open(result.issue.url, '_blank', 'noopener'));
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
   const start = () => (later
     ? run('PUT', '/client/board/auto-start', autoStartBody(ticket, form, typeName === CUSTOM ? null : typeName, edited ? form.brief : null),
       () => toast(`#${ticket.number} starts when ready`))
@@ -161,6 +224,26 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
   const choices = form && form.model && !models.includes(form.model) ? [form.model, ...models] : models;
   const blocked = ticket.state === 'blocked';
   const startable = later || !blocked || canStartAnyway(ticket);
+  if (reporting) {
+    const locked = !!filed;
+    const ready = report.text.trim() && (!report.startAgent || form);
+    return html`<${Popover} onClose=${onClose} className="ticket-start bug-report">
+      <h2>Report a bug</h2>
+      <${BugText} value=${report.text} disabled=${locked} onInput=${(text) => setReport({ ...report, text })} />
+      <p class="sub">Public: goes into a GitHub issue. The first line is the title.</p>
+      <div class="line bug-shot">${bug.screenshot ? html`<img src=${`data:image/png;base64,${bug.screenshot}`} alt="Screenshot" />` : null}
+        <span>Screenshot<br /><span class="sub">${bug.screenshot ? 'Private on sm, with page data and server facts' : 'Screenshot unavailable'}</span></span>
+        <${Toggle} label="Screenshot" checked=${report.screenshot} disabled=${locked || !bug.screenshot} onChange=${(screenshot) => setReport({ ...report, screenshot })} /></div>
+      <div class="line"><span>Start an agent</span>
+        <${Toggle} label="Start an agent" checked=${report.startAgent} disabled=${locked} onChange=${(startAgent) => setReport({ ...report, startAgent })} /></div>
+      ${report.startAgent ? form ? html`<${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} expanded=${expanded} setExpanded=${setExpanded}
+        named=${html`<div class="line"><span>Named from the new ticket, as Start does</span></div>`} />` : !error ? html`<p>Loading…</p>` : null : null}
+      ${filed ? html`<p>Filed <a href=${filed.issue.url} target="_blank" rel="noopener">#${filed.issue.number}</a>; the agent did not start.</p>` : null}
+      ${error ? html`<p class="err" role="alert">${error}</p>` : null}
+      <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${filed ? 'Close' : 'Cancel'}</button>
+        <button class="btn pri" disabled=${!ready || busy} onClick=${fileBug}>${bugPrimary({ startAgent: report.startAgent, filed, busy })}</button></div>
+    <//>`;
+  }
   return html`<${Popover} onClose=${onClose} className="ticket-start">
     <h2>${later ? `Start #${ticket.number} when ready` : `${startable ? 'Start' : 'Blocked'} #${ticket.number}`}</h2>
     <p class="sub">${ticket.title}</p>
@@ -171,32 +254,54 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
     ${startable && form ? html`
       ${later ? html`<div class="fld"><span class="l">Agent type</span><${Seg} label="Agent type" value=${typeName} onChange=${pick}
         options=${[...types.map((t) => ({ value: t.name, label: t.name })), { value: CUSTOM, label: 'Custom' }]} /></div>` : null}
-      <${Seg} label="Provider" value=${form.provider}
-        options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
-        onChange=${(provider) => set(providerDefaults(settings, provider))} />
-      <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${homeRelative(form.working_dir)}</span>
-        <button class="link-btn" onClick=${() => setExpanded(!expanded)}>${expanded ? 'Less' : 'Change'}</button></div>
-      <div class="line"><span>Named ${form.name}${later ? ` · first message ${edited ? 'edited' : 'default'}` : ''}</span><span>
-        ${later && edited ? html`<button class="link-btn" onClick=${() => { setEdited(false); set({ brief: form.template }); }}>Use default</button> ` : null}
-        <button class="link-btn" onClick=${() => setPreview(!preview)}>Preview</button></span></div>
-      ${preview ? html`<pre class="brief-preview">${form.brief}</pre>` : null}
-      ${expanded ? html`
-        <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
-          <option value="">Provider default</option>${choices.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
-        <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
-          options=${[{ value: '', label: 'default' }, ...((later ? AUTO_EFFORTS : EFFORTS)[form.provider] || []).map((e) => ({ value: e, label: e }))]}
-          onChange=${(value) => set({ reasoning_effort: value || null })} /></div>
-        ${later ? null : html`<label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>`}
-        <div class="fld"><span class="l">Workspace</span><span class="mono">${homeRelative(form.working_dir)}</span></div>
-        <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief}
-          onInput=${(e) => { if (later) setEdited(true); set({ brief: e.target.value }); }}></textarea></label>` : null}
-      ${later ? null : html`<${ReviewerRow} form=${form} set=${set} />`}
+      <${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} expanded=${expanded} setExpanded=${setExpanded}
+        efforts=${later ? AUTO_EFFORTS : EFFORTS} reviewer=${!later}
+        named=${html`<div class="line"><span>Named ${form.name}${later ? ` · first message ${edited ? 'edited' : 'default'}` : ''}</span><span>
+          ${later && edited ? html`<button class="link-btn" onClick=${() => { setEdited(false); set({ brief: form.template }); }}>Use default</button> ` : null}
+          <button class="link-btn" onClick=${() => setPreview(!preview)}>Preview</button></span></div>
+          ${preview ? html`<pre class="brief-preview">${form.brief}</pre>` : null}`}
+        extra=${html`
+          ${later ? null : html`<label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>`}
+          <div class="fld"><span class="l">Workspace</span><span class="mono">${homeRelative(form.working_dir)}</span></div>
+          <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief}
+            onInput=${(e) => { if (later) setEdited(true); set({ brief: e.target.value }); }}></textarea></label>`} />
     ` : startable && !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable && !later ? 'Cancel' : 'Close'}</button>
       ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast('Cancelled'))}>Cancel auto-start</button>` : null}
       ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
+}
+
+/** The bug text, focused when the dialog opens. */
+function BugText({ value, disabled, onInput }) {
+  const box = useRef(null);
+  useEffect(() => { if (box.current) box.current.focus(); }, []);
+  return html`<textarea class="inp" rows="5" ref=${box} aria-label="What's wrong" placeholder="What's wrong?" value=${value} disabled=${disabled}
+    onInput=${(e) => onInput(e.target.value)}></textarea>`;
+}
+
+/**
+ * The agent section Start and Report a bug share (1859 B4): provider, the model · effort ·
+ * workspace line with Change, its Model and Effort fields, and the Reviewer row.
+ * `named` follows the line; `extra` follows Effort while expanded.
+ */
+export function AgentFields({ form, set, settings, models, expanded, setExpanded, efforts = EFFORTS, reviewer = true, named = null, extra = null }) {
+  return html`
+    <${Seg} label="Provider" value=${form.provider}
+      options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
+      onChange=${(provider) => set(providerDefaults(settings, provider))} />
+    <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span>
+      <button class="link-btn" onClick=${() => setExpanded(!expanded)}>${expanded ? 'Less' : 'Change'}</button></div>
+    ${named}
+    ${expanded ? html`
+      <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
+        <option value="">Provider default</option>${models.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
+      <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
+        options=${[{ value: '', label: 'default' }, ...(efforts[form.provider] || []).map((e) => ({ value: e, label: e }))]}
+        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>
+      ${extra}` : null}
+    ${reviewer ? html`<${ReviewerRow} form=${form} set=${set} />` : null}`;
 }
 
 /** The reviewer for this ticket (1768 I3): the policy it would use, or a ticket policy stored at Start. */
@@ -209,7 +314,7 @@ function ReviewerRow({ form, set }) {
   return html`<div class="fld top"><span class="l">Reviewer</span><div class="review-editor">
     <${Seg} label="Reviewer for this ticket" value=${kind} options=${kinds} onChange=${choose} />
     ${form.reviewer ? html`<${ReviewerEditor} value=${form.reviewer} kinds=${null} onChange=${(reviewer) => set({ reviewer })}
-      note=${form.reviewer.kind === 'paired' ? `Starts at the first review request, in ${form.name}'s checkout, as ${form.name}-reviewer. It may build and run tests, never edit.` : null} />`
+      note=${form.reviewer.kind === 'paired' ? `Starts at the first review request, in ${form.name ? `${form.name}'s checkout, as ${form.name}-reviewer` : 'the new agent\'s checkout, as its reviewer'}. It may build and run tests, never edit.` : null} />`
       : html`<p class="sub">${resolved ? `${reviewerText(resolved.resolved)} · from ${resolved.source}` : 'The policy a review request would use.'}</p>`}
   </div></div>`;
 }

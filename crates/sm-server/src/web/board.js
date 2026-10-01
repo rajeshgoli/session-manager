@@ -59,6 +59,15 @@ const AutoStartPaused = createContext(false);
 /** Start when ready is offered on a blocked ticket nobody holds (1821 F4). */
 export const canStartWhenReady = (ticket) => ticket.state === 'blocked' && !ticket.holder
   && !(ticket.warnings || []).includes('merged_not_closed');
+/** Which actions a ticket row offers. The standing Bugs goal offers none but ⋯ (1859 B5). */
+export const rowActions = (ticket) => ({
+  start: canStart(ticket), startBlocked: ticket.state === 'blocked', whenReady: canStartWhenReady(ticket),
+  close: ticket.state === 'close_ready', menu: ticket.state !== 'done',
+});
+export function standingText(ticket) {
+  const open = openBlockers(ticket).length;
+  return `Standing lane · ${open} open bug${open === 1 ? '' : 's'}`;
+}
 function WhenReadyChip({ ticket, onStart }) {
   const paused = useContext(AutoStartPaused);
   const [retrying, setRetrying] = useState(false);
@@ -79,17 +88,18 @@ function WhenReadyChip({ ticket, onStart }) {
 function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false, lanePolicy = null }) {
   const [menu, setMenu] = useState(null);
   const parts = ticket.sub_issues;
+  const can = rowActions(ticket);
   const agent = ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name,
     provider: ticket.holder.provider, fact: `${ticket.holder.state === 'working' ? '● Working' : '○ Idle'}${ticket.holder.since ? ` ${age(ticket.holder.since)}` : ''}` } : null;
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
     <span class="ticket-actions">
       ${ticket.auto_start ? html`<${WhenReadyChip} ticket=${ticket} onStart=${onStart} />`
-        : canStartWhenReady(ticket) ? html`<button class="link-btn when-ready-link" onClick=${() => onStart(ticket, 'when_ready')}>Start when ready…</button>` : null}
-      ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
-      ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
-      ${ticket.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
-      ${ticket.state !== 'done' ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
+        : can.whenReady ? html`<button class="link-btn when-ready-link" onClick=${() => onStart(ticket, 'when_ready')}>Start when ready…</button>` : null}
+      ${can.start ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
+      ${can.startBlocked ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
+      ${can.close ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
+      ${can.menu ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
         ${menu === 'more' ? html`<${Popover} onClose=${() => setMenu(null)} align="right" className="menu">
           ${ticket.state === 'close_ready' ? html`<button onClick=${() => { setMenu(null); onStart(ticket); }}>Start instead</button>` : null}
           ${canStartWhenReady(ticket) ? html`<button onClick=${() => { setMenu(null); onStart(ticket, 'when_ready'); }}>Start when ready…</button>` : null}
@@ -107,9 +117,10 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false
     ${ticket.state !== 'blocked' && (ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
     ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">${blockedReasons(ticket).join(' ')}</span>` : null}
     ${ticket.state === 'close_ready' ? html`<span class="sub ticket-state cyan">${parts?.done || 0} of ${parts?.total || 0} parts done · All parts done</span>` : null}
+    ${ticket.state === 'standing' ? html`<span class="sub ticket-state cyan">${standingText(ticket)}</span>` : null}
     ${ticket.started_early ? html`<span class="sub ticket-state">started early</span>` : null}
     ${!slim ? html`<${Clock} ticket=${ticket} end=${end} hours=${hours} />` : null}
-    ${!slim && !ticket.clock && !['ready', 'blocked', 'close_ready'].includes(ticket.state) ? html`<span class="sub ticket-state">${ticket.state.replaceAll('_', ' ')}${ticket.holder ? ` · ${ticket.holder.name}` : ''}</span>` : null}
+    ${!slim && !ticket.clock && !['ready', 'blocked', 'close_ready', 'standing'].includes(ticket.state) ? html`<span class="sub ticket-state">${ticket.state.replaceAll('_', ' ')}${ticket.holder ? ` · ${ticket.holder.name}` : ''}</span>` : null}
     <${Links} ticket=${ticket} prs=${ticket.prs || []} agent=${agent} jobs=${ticket.jobs || []} thread=${ticket.thread} docs=${ticket.docs || []} />
   </div>`;
 }
@@ -130,6 +141,7 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
   const counts = lane.counts;
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
   const short = groups.active.length === 1;
+  const goalRow = (lane.tickets || []).find((t) => t.repo === lane.goal.repo && t.number === lane.goal.number);
   const showBlocked = groups.active.length + groups.blocked.length <= BLOCKED_ROW_LIMIT;
   return html`<section class="board-lane">
     <header class="lane-header">
@@ -138,7 +150,8 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
         <span class="sub">${lane.goal.repo.split('/').pop()}</span> <span class="mono">#${lane.goal.number}</span> · ${lane.goal.title}</button>
         <div class="lane-progress" aria-label=${`${counts.done} done, ${counts.in_progress} in progress, ${total} total`}>
           <i class="done" style=${`width:${counts.done / total * 100}%`}></i><i class="in-progress" style=${`width:${counts.in_progress / total * 100}%`}></i></div>
-        <span class="sub">${Object.entries(counts).filter(([, n]) => n).map(([state, n]) => `${n} ${state.replaceAll('_', ' ')}`).join(' · ')}</span>
+        <span class="sub">${Object.entries(counts).filter(([, n]) => n).map(([state, n]) => `${n} ${state.replaceAll('_', ' ')}`).join(' · ')}
+          ${lane.goal.state === 'standing' ? html`${Object.values(counts).some(Boolean) ? ' · ' : ''}<span class="cyan">${standingText(goalRow || { waits_on: lane.tickets || [] })}</span>` : null}</span>
       </div>
       <span class="anchor"><button class="review-pill" title=${policy ? setByText(policy) : 'This lane uses the default review policy'} onClick=${() => setReviews(!reviews)}>
         Reviews: <b>${policy ? reviewerText(policy.reviewer) : 'default'}</b> ▾</button>

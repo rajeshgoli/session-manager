@@ -5,7 +5,7 @@
 import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  html, api, bus, build, network, usePoll, useShared, setShared, stored, store, panels,
+  html, api, bus, build, network, pageData, usePoll, useShared, setShared, stored, store, panels,
   openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
@@ -18,6 +18,7 @@ import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
 import { NewAgentPopover } from './start.js';
+import { BugButton } from './bug.js';
 
 // ---- pages ------------------------------------------------------------------
 
@@ -141,6 +142,9 @@ function App() {
   }, []);
 
   const page = pageFor(loc.path);
+  // Page data for a bug report is what this page fetched since it opened.
+  const marked = useRef(null);
+  if (marked.current !== page) { marked.current = page; pageData.markPage(); }
   useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating });
   useRailData();
   useDetailsBand(loc.open, page);
@@ -380,6 +384,7 @@ function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
             Queue ${running} running · ${waiting} waiting</a>`
         : null}
     </span>
+    <${BugButton} page=${current ? current.label : ''} />
     <span class="anchor">
       <button type="button" class="btn pri" data-pop-anchor onClick=${() => setCreating(creating ? null : {})}>New agent</button>
       ${creating ? html`<${NewAgentPopover} key=${JSON.stringify(creating)} prefill=${creating} onClose=${() => setCreating(null)} />` : null}

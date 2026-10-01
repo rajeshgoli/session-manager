@@ -1,2 +1,4 @@
 preact 10.29.8 (dist/preact.module.js, hooks/dist/hooks.module.js) and htm 3.1.1
 (dist/htm.module.js) from unpkg.com, with the sourceMappingURL comment removed.
+html-to-image 1.11.13 (es/index.js from the npm package, bundled into one ES
+module with `esbuild --bundle --format=esm`).
