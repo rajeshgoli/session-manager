@@ -27,7 +27,7 @@
   const style = document.createElement('style');
   let theme = 'system'; try {theme = localStorage.getItem('sm-theme') || theme;} catch (_) {}
   const dark = theme === 'dark' || theme === 'system' && matchMedia('(prefers-color-scheme:dark)').matches;
-  style.textContent = `*{box-sizing:border-box}nav{height:36px;display:flex;align-items:center;gap:10px;padding:0 10px;background:${dark?'#121219':'#fff'};color:${dark?'#f5f7fa':'#16171b'};border-bottom:1px solid ${dark?'#2b2b37':'#e0e0d9'};font:12px -apple-system,BlinkMacSystemFont,sans-serif}a{color:${dark?'#5ee7ff':'#0b7a90'};text-decoration:none;white-space:nowrap}strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}button,select{font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:4px;cursor:pointer}select{max-width:85px}small{white-space:nowrap}@media(max-width:600px){small{display:none}nav{gap:6px}strong{font-size:11px}}`;
+  style.textContent = `*{box-sizing:border-box}nav{height:36px;display:flex;align-items:center;gap:10px;padding:0 10px;background:${dark?'#121219':'#fff'};color:${dark?'#f5f7fa':'#16171b'};border-bottom:1px solid ${dark?'#2b2b37':'#e0e0d9'};font:12px -apple-system,BlinkMacSystemFont,sans-serif}a{color:${dark?'#5ee7ff':'#0b7a90'};text-decoration:none;white-space:nowrap}strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}button,select{font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:4px;cursor:pointer}button.print-main{margin-right:-10px;border-top-right-radius:0;border-bottom-right-radius:0}button.print-all{border-top-left-radius:0;border-bottom-left-radius:0;border-left:0}select{max-width:85px}small{white-space:nowrap}@media(max-width:600px){small{display:none}nav{gap:6px}strong{font-size:11px}}`;
   root.append(style);
   const nav = document.createElement('nav'); nav.setAttribute('aria-label','sm reader'); root.append(nav);
   const add = (tag,text,attrs={}) => {
@@ -46,6 +46,21 @@
   if (config.prNumber) add('small',`#${config.prNumber} · ${doc.prState || 'unknown'}`);
   if (config.authorAgent) add('small',config.authorAgent);
   if (doc?.openReview) { const button = add('button','Review'); button.onclick = () => doc.openReview(); }
+  const hasAppendix = !!document.querySelector('.appendix-divider');
+  const printDoc = all => {
+    if (all) {
+      document.documentElement.setAttribute('data-print', 'all');
+      window.addEventListener('afterprint', () => {
+        const toggle = document.getElementById('memo-print-toggle');
+        if (toggle) toggle.click(); // Let the template update its own label and setting.
+        else document.documentElement.removeAttribute('data-print');
+      }, { once: true });
+    }
+    window.print();
+  };
+  const printButton = add('button',hasAppendix ? '⎙ Print memo' : '⎙ Print',hasAppendix ? {class:'print-main'} : {});
+  printButton.onclick = () => printDoc(false);
+  if (hasAppendix) { const allButton = add('button','Print all',{class:'print-all'}); allButton.onclick = () => printDoc(true); }
   add('a','⤡',{href:returnTo.pathname+returnTo.search,title:'Return to two-pane view'});
   document.body.append(host);
   // The original review UI keeps its workflow buttons, below this navigation.
@@ -56,6 +71,7 @@
     review.append(css);
   }
   const spacing = document.createElement('style');
-  spacing.textContent = 'html{scroll-padding-top:80px}body{padding-top:36px!important}';
+  document.body.classList.add('sm-reader-bar-open');
+  spacing.textContent = 'html{scroll-padding-top:80px}body.sm-reader-bar-open{padding-top:36px!important}@media print{#sm-reader-bar{display:none!important}html{scroll-padding-top:0!important}body.sm-reader-bar-open{padding-top:0!important}}';
   document.head.append(spacing);
 })();

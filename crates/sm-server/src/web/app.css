@@ -401,6 +401,9 @@ select.inp { padding: 3px 6px; }
 .inbox-actions span,.reader-title { flex:1; min-width:2.667rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .doc-reader iframe { flex:1; width:100%; border:0; min-height:0; background:var(--panel); }
 .reader-bar select { max-width:6.667rem; background:var(--panel); border:1px solid var(--line); }
+.reader-print { display:inline-flex; }
+.reader-print button + button { border-top-left-radius:0; border-bottom-left-radius:0; border-left:1px solid var(--line); }
+.reader-print button:first-child:not(:last-child) { border-top-right-radius:0; border-bottom-right-radius:0; }
 .ticket-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
 .ticket-reader > .seg { margin:8px 12px; align-self:flex-start; }
 .ticket-reader-content { flex:1; overflow:auto; padding:12px 18px; overflow-wrap:anywhere; }
