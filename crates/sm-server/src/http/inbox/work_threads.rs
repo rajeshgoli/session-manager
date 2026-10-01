@@ -105,7 +105,7 @@ struct DocData {
     key: String,
 }
 
-pub(super) struct ThreadCatalog {
+pub(crate) struct ThreadCatalog {
     world: World,
     work: WorkIndex,
     docs: Vec<DocData>,
@@ -137,7 +137,7 @@ fn add_agent_entry<'a>(
 }
 
 impl ThreadCatalog {
-    pub(super) fn load(state: &AppState) -> Result<Self, ApiError> {
+    pub(crate) fn load(state: &AppState) -> Result<Self, ApiError> {
         let world = World::load(state)?;
         let work = WorkIndex::load(state)?;
         let store = owner_doc_store(state);
@@ -626,6 +626,17 @@ impl ThreadCatalog {
                     .rev()
                     .find(|entry| entry.legacy_key == key)
                     .map(|entry| entry.key.clone())
+            })
+    }
+
+    pub(crate) fn doc_key(&self, doc_id: &str) -> Option<(String, String)> {
+        self.docs
+            .iter()
+            .find(|doc| doc.summary.doc.id == doc_id)
+            .and_then(|doc| {
+                doc.publishes
+                    .first()
+                    .map(|first| (doc.key.clone(), first.published_at.clone()))
             })
     }
 

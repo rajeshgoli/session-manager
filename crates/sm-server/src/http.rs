@@ -345,6 +345,7 @@ pub enum GitHubPullRequestState {
 
 mod agent_history;
 mod analytics;
+mod ask;
 mod auto_retire;
 mod board;
 mod board_clock;

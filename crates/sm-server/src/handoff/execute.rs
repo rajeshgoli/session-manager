@@ -218,6 +218,7 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
     ("parent_wake_registrations", "parent_session_id"),
     ("parent_wake_registrations", "child_session_id"),
     ("owner_docs", "author_session_id"),
+    ("owner_doc_readers", "session_id"),
     ("owner_doc_reviews", "assigned_session_id"),
     ("owner_follows", "session_id"),
 ];

@@ -678,7 +678,7 @@ fn summary_json(
     Ok(value)
 }
 
-fn find_doc(state: &AppState, doc_id: &str) -> Result<OwnerDoc, ApiError> {
+pub(super) fn find_doc(state: &AppState, doc_id: &str) -> Result<OwnerDoc, ApiError> {
     if !is_owner_doc_id(doc_id) {
         return Err(ApiError::NotFound("Doc not found"));
     }
@@ -1230,7 +1230,7 @@ fn token_valid(config: &AppConfig, use_: DocTokenUse, doc_id: &str, token: &str)
 
 /// The doc's JSON endpoints (`/head`, `/drafts`, `/review`) accept its doc
 /// token in place of normal auth; everything else about auth is unchanged.
-fn doc_token_presented(state: &AppState, headers: &HeaderMap, doc_id: &str) -> bool {
+pub(super) fn doc_token_presented(state: &AppState, headers: &HeaderMap, doc_id: &str) -> bool {
     header_text(headers, DOC_TOKEN_HEADER)
         .is_some_and(|token| doc_token_valid(&state.config, doc_id, &token))
 }
@@ -1729,6 +1729,9 @@ pub(super) async fn get_owner_doc_subpath(
     Query(query): Query<DocSubpathQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    if rest == "ask-target" {
+        return super::ask::target(state, first, request).await;
+    }
     // The JSON endpoints also take the page's doc token; pages never do.
     if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts", "reopen-target"])? {
         if !doc_token_presented(&state, request.headers(), &doc.id) {
@@ -1911,6 +1914,9 @@ pub(super) async fn post_owner_doc_subpath(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    if rest == "ask" {
+        return super::ask::send(state, doc_id, peer_addr, headers, body).await;
+    }
     if !matches!(
         rest.as_str(),
         "retract"
