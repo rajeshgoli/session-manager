@@ -2350,11 +2350,14 @@ async fn claude_hook(
         // Stamped before the transcript retry sleep below, so a turn-start that
         // lands during that wait is recognised as the newer signal.
         let received_at = now_rfc3339();
-        let mut last_message = payload
-            .get("sm_last_message")
-            .and_then(Value::as_str)
+        // Claude's own `last_assistant_message` is the turn's final text from
+        // memory. The transcript can still hold the previous turn's message
+        // when a short turn ends before Claude flushes it (sm#1863).
+        let mut last_message = ["last_assistant_message", "sm_last_message"]
+            .into_iter()
+            .filter_map(|key| payload.get(key).and_then(Value::as_str))
             .map(str::trim)
-            .filter(|value| !value.is_empty());
+            .find(|value| !value.is_empty());
         let mut native_title = payload
             .get("sm_native_title")
             .and_then(Value::as_str)
