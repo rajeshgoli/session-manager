@@ -355,6 +355,11 @@ fn prepare_round(
         if at == head {
             text.push_str(&format!("\n\nYou may build and run tests. Run anything longer than a minute with `sm queue run --type tests --cwd {checkout_text}`."));
         }
+        if row.provider == "codex" {
+            // Codex's sandbox blocks the local socket `sm` uses until the
+            // agent asks for escalation, which sm agents are approved for.
+            text.push_str("\n\n`sm` talks to the local Session Manager server. If an `sm` command fails with \"Operation not permitted\", the sandbox blocked it: run the same command again with escalated permissions.");
+        }
         text.push_str(&format!("\n\nWhen done, write your review as JSON matching this schema, and run `sm review submit --file <path>`:\n{}\nThen stay idle. If the author pushes and asks again, sm sends you the next round.", review::SCHEMA.trim_end()));
         text
     } else {
