@@ -452,7 +452,7 @@ sm handoff &lt;file&gt;            # same as --path &lt;file&gt;</code></pre>
 
 <p><b>F.3 Name.</b> Take the predecessor's name. If it ends in <code>-h&lt;k&gt;</code>, where <i>k</i> is an integer ≥ 2, replace that with <code>-h&lt;k+1&gt;</code>. Otherwise append <code>-h2</code>. Examples: <code>sm-1651-engineer</code> → <code>sm-1651-engineer-h2</code> → <code>sm-1651-engineer-h3</code>. And <code>sm-pr-1660-reviewer-2</code> → <code>sm-pr-1660-reviewer-2-h2</code>. Names are not unique in sm today<sup>[11]</sup>, and this rule does not make them so.</p>
 
-<p><b>F.4 Brief.</b> The successor is created with no initial prompt. sm sends the brief as its first message, with delivery mode <code>important</code>, only after Appendix G completes. That way the successor never acts before it holds the work. Lines whose value is empty are omitted.</p>
+<p><b>F.4 Brief.</b> The successor is created with no initial prompt. sm sends the brief as its first message, with delivery mode <code>important</code>, only after Appendix G completes. That way the successor never acts before it holds the work. sm types the brief only into an empty, ready input box: it first waits for the successor's composer as a spawn brief does, and if that wait times out the brief stays queued and the background retry sweep delivers it once the composer is ready. Messages the successor inherits follow the same check, so none overtakes the brief. Lines whose value is empty are omitted.</p>
 
 <pre><code>[sm handoff] You are taking over from &lt;pred name&gt; (&lt;pred id&gt;), which stopped at &lt;pct&gt;% context.
 Handoff note: &lt;link or absolute path&gt;
@@ -567,6 +567,7 @@ Read the handoff note first, then continue the work.</code></pre>
 <tr><td>F.2 fields copied incl. model/effort; root stays root</td><td>unit</td></tr>
 <tr><td>F.3 name rule examples</td><td>unit</td></tr>
 <tr><td>F.4 brief contents; delivered after transfer</td><td>unit</td></tr>
+<tr><td>F.4 brief waits for a ready composer; the retry sweep delivers it</td><td>unit</td></tr>
 <tr><td>F.5 creation failure: state failed, D.6, nothing moved</td><td>unit</td></tr>
 <tr><td>G each row moved; idempotent rerun; recovery from <code>transferring</code> and <code>spawning</code></td><td>unit per row + restart test</td></tr>
 <tr><td>G completeness guard</td><td>unit scanning schemas</td></tr>

@@ -64,8 +64,13 @@ const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 /// Wake categories the background delivery loop retries until an idle target
-/// accepts them: sm queue completion wakes and sm remind reminders.
-const BACKGROUND_RETRY_MESSAGE_CATEGORIES: [&str; 2] = ["queue-completion", "scheduled_reminder"];
+/// accepts them: sm queue completion wakes, sm remind reminders, and a
+/// handoff successor's brief that found its composer not yet ready.
+const BACKGROUND_RETRY_MESSAGE_CATEGORIES: [&str; 3] = [
+    "queue-completion",
+    "scheduled_reminder",
+    crate::handoff::execute::NOTICE_CATEGORY,
+];
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
@@ -20812,6 +20817,51 @@ sleep 30
             1
         );
         assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    /// #1927: a successor still starting up must not have its handoff brief
+    /// typed into a composer that drops it; the retry sweep delivers it once
+    /// the composer is ready.
+    #[test]
+    fn a_handoff_brief_waits_for_a_ready_composer_then_the_retry_sweep_delivers_it() {
+        let starting = queue_completion_test_pane(false);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&starting, "idle");
+        store
+            .queue_handoff_notice(
+                "pred0001",
+                "queue-target",
+                "[sm handoff] brief",
+                "handoff-brief-pred0001",
+                &["queue-target"],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .pending_messages_for_target("queue-target", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(starting.input_lines().is_empty());
+        drop(store);
+
+        let ready = queue_completion_test_pane(true);
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        state["sessions"][0]["tmux_socket_name"] = json!(ready.socket_name);
+        fs::write(&state_file, state.to_string()).unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+            .with_delivery_runtime(Some(ready.runtime.clone()));
+        assert_eq!(store.drain_runtime_background_retry_messages().unwrap(), 1);
+
+        assert!(queue
+            .pending_messages_for_target("queue-target", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(ready.wait_for_input_lines(1), vec!["[sm handoff] brief"]);
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }

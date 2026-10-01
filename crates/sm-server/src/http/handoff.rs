@@ -386,8 +386,23 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
         }
     };
     if state.config.rust_core.runtime_enabled {
-        // Let the new agent's composer settle before its brief is typed.
-        tokio::time::sleep(state.runtime().startup_settle_duration()).await;
+        // Claude takes seconds to show its composer, and a brief typed before
+        // then is lost (#1927). The brief's delivery is ready-fenced as well,
+        // so a timeout here leaves it queued for the retry sweep.
+        let runtime = state
+            .runtime()
+            .for_socket_name(successor.tmux_socket_name.as_deref());
+        let (tmux_session, provider) = (successor.tmux_session.clone(), successor.provider.clone());
+        let ready = tokio::task::spawn_blocking(move || {
+            runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
+        })
+        .await?;
+        if let Err(error) = ready {
+            eprintln!(
+                "handoff successor {} not ready for its brief: {error:#}",
+                successor.id
+            );
+        }
     }
     complete_handoff(&state, predecessor_id, &successor.id).await
 }
@@ -460,6 +475,7 @@ async fn complete_handoff(
         &brief.text,
         &execute::brief_message_id(predecessor_id),
         &[successor_id, predecessor_id],
+        true,
     )?;
     state
         .session_store
@@ -484,6 +500,7 @@ async fn complete_handoff(
             &notice,
             &execute::parent_notice_message_id(predecessor_id),
             &[],
+            false,
         )?;
     }
     // Steps 5 (leftover asks) and 6.
