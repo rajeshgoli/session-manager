@@ -407,9 +407,7 @@ impl SessionStore {
     /// Queue the brief to the successor (G step 3) or the parent notice
     /// (step 5) under the stable queue id `id`, so a resumed transfer never
     /// sends it twice. It sorts ahead of every undelivered message for
-    /// `ahead_of`. Both come from the predecessor. With `ready_fence`, the
-    /// notice is typed only into an empty composer; otherwise it stays queued
-    /// for the background retry sweep.
+    /// `ahead_of`. Both come from the predecessor.
     pub fn queue_handoff_notice(
         &self,
         predecessor_id: &str,
@@ -417,7 +415,6 @@ impl SessionStore {
         text: &str,
         id: &str,
         ahead_of: &[&str],
-        ready_fence: bool,
     ) -> Result<()> {
         let Some(queue) = &self.queue_store else {
             return Ok(());
@@ -440,7 +437,7 @@ impl SessionStore {
             ahead_of,
         )?;
         // A resumed transfer still delivers a notice queued before the crash.
-        self.drain_after_handoff_raw(&mut state, target_session_id, Some(id), ready_fence)?;
+        self.drain_after_handoff_raw(&mut state, target_session_id, Some(id))?;
         if !inserted {
             return self.write_raw_json_value(&state);
         }
@@ -455,8 +452,7 @@ impl SessionStore {
     }
 
     /// Move messages still waiting for the predecessor to the successor and
-    /// deliver what it can, ready-fenced so the brief ahead of them is never
-    /// typed into a successor still starting up. Returns how many moved.
+    /// deliver what it can. Returns how many moved.
     pub fn hand_off_pending_messages(
         &self,
         predecessor_id: &str,
@@ -469,7 +465,7 @@ impl SessionStore {
         if moved > 0 {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
-            self.drain_after_handoff_raw(&mut state, successor_id, None, true)?;
+            self.drain_after_handoff_raw(&mut state, successor_id, None)?;
             self.write_raw_json_value(&state)?;
         }
         Ok(moved)
@@ -512,7 +508,6 @@ impl SessionStore {
         state: &mut Value,
         target_session_id: &str,
         stop_after_message_id: Option<&str>,
-        ready_fence: bool,
     ) -> Result<()> {
         let (Some(queue), Some(runtime)) = (&self.queue_store, self.delivery_runtime.clone())
         else {
@@ -531,7 +526,7 @@ impl SessionStore {
                 None,
                 None,
                 stop_after_message_id,
-                ready_fence,
+                false,
             )?;
         }
         Ok(())
@@ -1115,7 +1110,6 @@ mod tests {
                     "brief",
                     &brief_id,
                     &["succ0001", "pred0001"],
-                    true,
                 )
                 .unwrap();
             store
@@ -1125,7 +1119,6 @@ mod tests {
                     "notice",
                     &execute::parent_notice_message_id("pred0001"),
                     &[],
-                    false,
                 )
                 .unwrap();
         }

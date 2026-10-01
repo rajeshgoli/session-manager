@@ -11736,7 +11736,13 @@ fn drain_pending_runtime_messages_raw(
                     runtime,
                 )?
             } else {
-                if require_ready_fence {
+                // A handoff brief typed into a successor still starting up is
+                // lost (#1927), so handoff notices wait for a ready composer
+                // whichever path drains them; the retry sweep delivers them.
+                if require_ready_fence
+                    || message.message_category.as_deref()
+                        == Some(crate::handoff::execute::NOTICE_CATEGORY)
+                {
                     deliver_runtime_background_text_to_session_raw(
                         state,
                         session_id,
@@ -20822,8 +20828,8 @@ sleep 30
     }
 
     /// #1927: a successor still starting up must not have its handoff brief
-    /// typed into a composer that drops it; the retry sweep delivers it once
-    /// the composer is ready.
+    /// typed into a composer that drops it, by the handoff or by any other
+    /// drain; the retry sweep delivers it once the composer is ready.
     #[test]
     fn a_handoff_brief_waits_for_a_ready_composer_then_the_retry_sweep_delivers_it() {
         let starting = queue_completion_test_pane(false);
@@ -20835,15 +20841,27 @@ sleep 30
                 "[sm handoff] brief",
                 "handoff-brief-pred0001",
                 &["queue-target"],
-                true,
             )
+            .unwrap();
+        // An ordinary send arriving now drains unfenced; it must neither take
+        // the brief nor overtake it.
+        queue
+            .enqueue_message_with_metadata(
+                "queue-target",
+                "[sm send] hello",
+                "sequential",
+                QueueMessageMetadata::default(),
+            )
+            .unwrap();
+        store
+            .drain_runtime_pending_messages_for_session("queue-target", &starting.runtime)
             .unwrap();
         assert_eq!(
             queue
                 .pending_messages_for_target("queue-target", 10)
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert!(starting.input_lines().is_empty());
         drop(store);
@@ -20861,7 +20879,10 @@ sleep 30
             .pending_messages_for_target("queue-target", 10)
             .unwrap()
             .is_empty());
-        assert_eq!(ready.wait_for_input_lines(1), vec!["[sm handoff] brief"]);
+        assert_eq!(
+            ready.wait_for_input_lines(2),
+            vec!["[sm handoff] brief", "[sm send] hello"]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }

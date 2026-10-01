@@ -387,8 +387,8 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     };
     if state.config.rust_core.runtime_enabled {
         // Claude takes seconds to show its composer, and a brief typed before
-        // then is lost (#1927). The brief's delivery is ready-fenced as well,
-        // so a timeout here leaves it queued for the retry sweep.
+        // then is lost (#1927). Handoff notices are delivered ready-fenced as
+        // well, so a timeout here leaves the brief queued for the retry sweep.
         let runtime = state
             .runtime()
             .for_socket_name(successor.tmux_socket_name.as_deref());
@@ -475,7 +475,6 @@ async fn complete_handoff(
         &brief.text,
         &execute::brief_message_id(predecessor_id),
         &[successor_id, predecessor_id],
-        true,
     )?;
     state
         .session_store
@@ -500,7 +499,6 @@ async fn complete_handoff(
             &notice,
             &execute::parent_notice_message_id(predecessor_id),
             &[],
-            false,
         )?;
     }
     // Steps 5 (leftover asks) and 6.
