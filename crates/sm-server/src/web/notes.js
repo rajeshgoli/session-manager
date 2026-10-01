@@ -131,18 +131,20 @@ export function NotesView({ pane = false, onClose, onType }) {
   const searchSerial = useRef(0);
   const loadSerial = useRef(0);
   const editSerial = useRef(0);
+  const queryRef = useRef(query);
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
   const saveRef = useRef(null);
+  const changeQuery = value => { queryRef.current = value; setQuery(value); };
   const search = async (q = query) => {
     const serial = ++searchSerial.current;
     try {
       const rows = await api(`/notes/search?q=${encodeURIComponent(q)}`);
-      if (serial !== searchSerial.current) return;
+      if (serial !== searchSerial.current || q !== queryRef.current) return;
       setHits(rows);
       if (!q) setTotal(rows.length);
       setError('');
-    } catch (err) { setError(err.message); }
+    } catch (err) { if (serial === searchSerial.current && q === queryRef.current) setError(err.message); }
   };
   useEffect(() => { const timer = setTimeout(() => search(query), 150); return () => clearTimeout(timer); }, [query]);
   useEffect(() => {
@@ -219,7 +221,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       if (current.current.open?.id !== note.id) return true;
       current.current.open = result;
       setOpen(result); setConflict(null); setStatus(`Saved · ${age(result.updated_at)}`);
-      search();
+      search(queryRef.current);
       return true;
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
@@ -233,7 +235,11 @@ export function NotesView({ pane = false, onClose, onType }) {
     }
   }), []);
   const collapse = async () => {
-    if (await save() === false) return;
+    for (;;) {
+      if (await save() === false) return;
+      const { open: note, body: text } = current.current;
+      if (!note || text === note.body) break;
+    }
     loadSerial.current++;
     current.current = { open: null, body: '' };
     store('sm-notes-open', '');
@@ -257,7 +263,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const choose = async id => { if (await save() === false) return; store('sm-notes-open', id); load(id); };
   const create = async () => {
     if (await save() === false) return;
-    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); setQuery(''); await search(''); load(note.id); }
+    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); changeQuery(''); await search(''); load(note.id); }
     catch (err) { setError(err.message); }
   };
   const importFile = async e => {
@@ -268,7 +274,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', body: form });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      setQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
+      changeQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
     } catch (err) { setError(err.message); }
     e.target.value = '';
   };
@@ -287,9 +293,11 @@ export function NotesView({ pane = false, onClose, onType }) {
   const selection = () => selectedText(editor.current, current.current.body);
   const cardText = id => async () => (await api(notePath(id))).body;
   const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) navigate('/notes'); else openPanel('notes:view'); };
+  const pinned = query && (pane || compact) && open && !hits.some(hit => hit.id === open.id)
+    ? { id: open.id, title: open.title, updated_at: open.updated_at, snippet: body, matches: [] } : null;
   return html`<section class=${`notes-view ${pane ? 'notes-pane' : 'notes-page'}`}>
     <header class="notes-head"><h1>Notes</h1><div class="notes-tools">
-      <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => setQuery(e.target.value)} />
+      <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => changeQuery(e.target.value)} />
       <button type="button" class="btn pri" onClick=${create}>+ New</button>
       <button type="button" class="btn" onClick=${() => file.current?.click()}>Import</button>
       <input ref=${file} hidden type="file" accept=".md,.txt,text/markdown,text/plain" onChange=${importFile} />
@@ -299,16 +307,16 @@ export function NotesView({ pane = false, onClose, onType }) {
     <div class="notes-count">${hits.length} of ${total} notes</div>
     ${error ? html`<p class="err">${error}</p>` : null}
     <div class="notes-columns"><div class="notes-list">
-      ${hits.map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
+      ${(pinned ? [pinned, ...hits] : hits).map(hit => html`<article key=${hit.id} class=${`note-card ${open?.id === hit.id ? 'selected' : ''}`}>
         <button class="note-card-main" type="button" onClick=${() => open?.id === hit.id && pane ? collapse() : choose(hit.id)}>
-          <span class="note-title">${hit.title || 'Untitled'}</span><small>${age(hit.updated_at)}</small>
+          <span class="note-title">${hit.title || 'Untitled'}${pinned?.id === hit.id ? ' · Open note' : ''}</span><small>${age(hit.updated_at)}</small>
           <span class="note-snippet"><${Snippet} hit=${hit} /></span>
         </button>
         <${NoteActions} text=${() => open?.id === hit.id ? selection() : cardText(hit.id)()} summary=${open?.id === hit.id ? selection() : hit.title} canType=${!!onType}
           onType=${onType} repos=${repos} />
         ${(pane || compact) && open?.id === hit.id ? editorView() : null}
       </article>`)}
-      ${!hits.length ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
+      ${!hits.length && !pinned ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
     </div>
     ${!pane && !compact ? html`<div class="notes-editor-slot">${open ? editorView() : html`<p class="notes-empty">Choose a note or create one.</p>`}</div>` : null}</div>
     ${conflict ? html`<div class="notes-dialog-backdrop"><div class="notes-dialog" role="dialog" aria-modal="true" aria-label="Changed on another device">

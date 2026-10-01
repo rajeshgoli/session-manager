@@ -49,6 +49,9 @@ function server() {
     const method = request.method();
     const json = (body, status = 200) => route.fulfill({ status, json: body });
     if (url.pathname === '/notes/search') {
+      const hold = handler.holdNextSearch;
+      handler.holdNextSearch = null;
+      if (hold) { handler.searchStarted?.(); await hold; }
       const q = (url.searchParams.get('q') || '').toLowerCase();
       return json(notes.filter(note => note.body.toLowerCase().includes(q) || note.title.toLowerCase().includes(q))
         .map(note => ({ id: note.id, title: note.title, updated_at: note.updated_at, chars: note.body.length,
@@ -121,8 +124,12 @@ test('page, terminal pane, actions and a version conflict', async () => {
       assert.ok((await page.locator('.notes-columns').boundingBox()).width <= width);
       if (shots) await page.screenshot({ path: `${shots}/notes-page-${width}-${colorScheme}.png` });
       await page.getByRole('searchbox', { name: 'Search notes' }).fill('merge');
-      await page.waitForFunction(() => document.querySelectorAll('.note-card').length === 1);
-      assert.equal(await page.locator('.note-card').count(), 1);
+      await page.waitForFunction(isNarrow => {
+        const view = document.querySelector('.notes-page');
+        return view?.querySelector('.notes-count')?.textContent === '1 of 2 notes'
+          && view.querySelectorAll('.note-card').length === (isNarrow ? 2 : 1);
+      }, width < 900);
+      assert.equal(await page.locator('.note-card').count(), width < 900 ? 2 : 1);
       await page.getByRole('searchbox', { name: 'Search notes' }).fill('');
       await page.waitForFunction(() => document.querySelectorAll('.note-card').length === 2);
       await page.locator('.note-card').first().locator('.notes-actions').first().getByText('Start agent').click();
@@ -342,6 +349,222 @@ test('navigation saves text typed while an earlier save is pending', async () =>
     await page.waitForURL(`${origin}/board`);
     assert.equal(handler.notes.find(note => note.id === 'one').body, 'Second edit during save');
     await context.close();
+  } finally { await browser.close(); }
+});
+
+test('an open editor stays visible when a save removes its search match', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const pane of [false, true]) {
+      const context = await browser.newContext({ viewport: { width: pane ? 1440 : 390, height: 900 } });
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      if (pane) await page.keyboard.press('Meta+j');
+      const view = pane ? page.locator('.panel .notes-view') : page.locator('.notes-page');
+      await view.locator('.note-card').first().waitFor();
+      await view.getByRole('searchbox', { name: 'Search notes' }).fill('Review loop');
+      await page.waitForFunction(isPane => document.querySelectorAll(isPane ? '.panel .note-card' : '.notes-page .note-card').length === 1, pane);
+      await view.locator('.note-card-main').first().click();
+      const editor = view.locator('.notes-editor textarea');
+      await editor.waitFor();
+      const saved = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+      await editor.fill('Text without the original match');
+      assert.equal((await saved).status(), 200);
+      await page.waitForFunction(isPane => {
+        const view = document.querySelector(isPane ? '.panel .notes-view' : '.notes-page');
+        return view?.querySelector('.notes-count')?.textContent === '0 of 2 notes'
+          && view.querySelectorAll('.note-card.selected').length === 1;
+      }, pane);
+      assert.equal(await view.getByRole('searchbox', { name: 'Search notes' }).inputValue(), 'Review loop');
+      assert.match(await view.locator('.note-card.selected .note-title').textContent(), /Open note/);
+      assert.equal(await editor.inputValue(), 'Text without the original match');
+      assert.equal(handler.notes.find(note => note.id === 'one').body, 'Text without the original match');
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('an open editor stays visible when search and save responses overlap', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 390, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor textarea');
+    let releaseSave;
+    handler.holdNextSave = new Promise(resolve => { releaseSave = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('No longer contains the original heading');
+    await saveStarted;
+    let releaseSearch;
+    handler.holdNextSearch = new Promise(resolve => { releaseSearch = resolve; });
+    const searchStarted = new Promise(resolve => { handler.searchStarted = resolve; });
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Review loop');
+    await searchStarted;
+    releaseSave();
+    await page.waitForFunction(() => document.querySelector('.notes-page .notes-count')?.textContent === '0 of 2 notes');
+    releaseSearch();
+    assert.equal(await search.inputValue(), 'Review loop');
+    assert.equal(await editor.inputValue(), 'No longer contains the original heading');
+    assert.match(await page.locator('.note-card.selected .note-title').textContent(), /Open note/);
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('an open narrow editor stays above a long list of search matches', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const pane of [false, true]) {
+      const context = await browser.newContext({ viewport: { width: pane ? 1440 : 390, height: 900 } });
+      const handler = server();
+      for (let n = 0; n < 30; n++) handler.notes.push({
+        id: `extra-${n}`, title: `Merge checklist ${n}`, body: `Merge checklist ${n}`,
+        version: 1, updated_at: stamp(),
+      });
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      if (pane) await page.keyboard.press('Meta+j');
+      const view = pane ? page.locator('.panel .notes-view') : page.locator('.notes-page');
+      await view.locator('.note-card-main').first().click();
+      await view.locator('.notes-editor textarea').waitFor();
+      await view.getByRole('searchbox', { name: 'Search notes' }).fill('Merge checklist');
+      await page.waitForFunction(isPane => document.querySelector(isPane ? '.panel .notes-count' : '.notes-page .notes-count')?.textContent === '31 of 32 notes', pane);
+      const firstCard = view.locator('.note-card').first();
+      assert.match(await firstCard.getAttribute('class'), /selected/);
+      assert.match(await firstCard.locator('.note-title').textContent(), /Open note/);
+      assert.ok((await view.locator('.notes-editor').boundingBox()).y < 900);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('saving an open note preserves a search for a different note', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor-slot textarea');
+    await editor.waitFor();
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Merge checklist');
+    await page.waitForFunction(() => document.querySelectorAll('.notes-page .note-card').length === 1);
+    const saved = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await editor.fill('Edited while looking for another note');
+    assert.equal((await saved).status(), 200);
+    assert.equal(await search.inputValue(), 'Merge checklist');
+    assert.equal(await page.locator('.note-card .note-title').first().textContent(), 'Merge checklist');
+    assert.equal(await editor.inputValue(), 'Edited while looking for another note');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('a search entered during a pending save is preserved', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    const search = page.getByRole('searchbox', { name: 'Search notes' });
+    await search.fill('Review loop');
+    await page.waitForFunction(() => document.querySelectorAll('.notes-page .note-card').length === 1);
+    await page.locator('.note-card-main').first().click();
+    const editor = page.locator('.notes-editor-slot textarea');
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('No longer matches the first search');
+    await saveStarted;
+    await search.fill('Merge checklist');
+    release();
+    await page.waitForFunction(() => document.querySelector('.notes-page .note-title')?.textContent === 'Merge checklist');
+    assert.equal(await search.inputValue(), 'Merge checklist');
+    assert.equal(await editor.inputValue(), 'No longer matches the first search');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('collapse saves edits typed while an earlier save is pending', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const action of ['card', 'Escape']) {
+      const context = await browser.newContext();
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      await page.keyboard.press('Meta+j');
+      const pane = page.locator('.panel .notes-view');
+      await pane.locator('.note-card-main').first().click();
+      const editor = pane.locator('.notes-editor textarea');
+      await editor.waitFor();
+      let release;
+      handler.holdNextSave = new Promise(resolve => { release = resolve; });
+      const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+      await editor.fill('First edit');
+      await saveStarted;
+      if (action === 'card') await pane.locator('.note-card-main').first().click();
+      else await page.keyboard.press('Escape');
+      await editor.fill('Second edit during collapse');
+      release();
+      await pane.locator('.notes-editor').waitFor({ state: 'hidden' });
+      assert.equal(handler.notes.find(note => note.id === 'one').body, 'Second edit during collapse');
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('a save conflict during collapse keeps the editor and latest text', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const handler = server();
+    const firstContext = await browser.newContext();
+    const secondContext = await browser.newContext();
+    await firstContext.route('**/*', handler);
+    await secondContext.route('**/*', handler);
+    const first = await firstContext.newPage();
+    const second = await secondContext.newPage();
+    await first.goto(`${origin}/notes`);
+    await first.locator('.notes-page .note-card').first().waitFor();
+    await first.keyboard.press('Meta+j');
+    const pane = first.locator('.panel .notes-view');
+    await pane.locator('.note-card-main').first().click();
+    const editor = pane.locator('.notes-editor textarea');
+    await second.goto(`${origin}/notes`);
+    await second.locator('.note-card-main').first().click();
+    const newerSave = second.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await second.locator('.notes-editor textarea').fill('Changed elsewhere');
+    assert.equal((await newerSave).status(), 200);
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('First local edit');
+    await saveStarted;
+    await first.keyboard.press('Escape');
+    await editor.fill('Latest local edit');
+    release();
+    await first.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
+    assert.equal(await editor.inputValue(), 'Latest local edit');
+    assert.equal(await pane.locator('.notes-editor').count(), 1);
+    await firstContext.close();
+    await secondContext.close();
   } finally { await browser.close(); }
 });
 
