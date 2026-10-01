@@ -863,6 +863,58 @@ data class InboxRow(
     val done: Boolean = false,
     @SerialName("session_id") val sessionId: String? = null,
     @SerialName("doc_id") val docId: String? = null,
+    /** The reader page of the thread's doc; a `doc` row opens it (spec 1782 J3). */
+    @SerialName("doc_url") val docUrl: String? = null,
+)
+
+/** `GET /inbox/thread/{key}?format=json` (sm#1835): one work thread, oldest item first. */
+@Serializable
+data class InboxThread(
+    @SerialName("thread_key") val threadKey: String = "",
+    val title: String = "",
+    val status: String = "",
+    val repo: String = "",
+    @SerialName("can_send") val canSend: Boolean = false,
+    @SerialName("reply_to") val replyTo: InboxReplyTarget? = null,
+    val items: List<InboxThreadItem> = emptyList(),
+)
+
+@Serializable
+data class InboxReplyTarget(val id: String? = null, val name: String? = null)
+
+/** One thread item; [kind] says which fields it carries. */
+@Serializable
+data class InboxThreadItem(
+    /** `message`, `owner` (your reply or note), `turn`, `agent_reply` or `event`. */
+    val kind: String = "",
+    val id: String? = null,
+    val at: String = "",
+    val title: String? = null,
+    val markdown: String? = null,
+    /** A message's state: `new`, `read`, `needs you`, `replied` or `handled`. */
+    val state: String? = null,
+    @SerialName("needs_you") val needsYou: Boolean = false,
+    val body: String? = null,
+    val quotes: List<InboxQuote> = emptyList(),
+    /** Who an owner item went to, when not the thread's own agent. */
+    val to: String? = null,
+    val text: String? = null,
+    /** An event's page on the sm host: a doc revision or a completion report. */
+    val link: String? = null,
+    val sender: InboxSender? = null,
+)
+
+@Serializable
+data class InboxQuote(val quote: String = "", val body: String = "")
+
+@Serializable
+data class InboxSender(val id: String = "", val name: String = "", val status: String = "")
+
+/** `POST /inbox/thread/{key}/send`: delivered once per [submissionId]. */
+@Serializable
+data class InboxSendRequest(
+    @SerialName("submission_id") val submissionId: String,
+    val body: String,
 )
 
 @Serializable
@@ -1013,11 +1065,18 @@ data class BoardGoal(
     val number: Long = 0,
     val title: String = "",
     val url: String = "",
+    /** `close_ready` puts Close in the lane header (spec 1782 H2). */
+    val state: String = "",
+    @SerialName("sub_issues") val subIssues: BoardSubIssues = BoardSubIssues(),
 )
+
+@Serializable
+data class BoardSubIssues(val total: Int = 0, val done: Int = 0)
 
 @Serializable
 data class BoardCounts(
     @SerialName("needs_you") val needsYou: Int = 0,
+    @SerialName("close_ready") val closeReady: Int = 0,
     val ready: Int = 0,
     @SerialName("in_progress") val inProgress: Int = 0,
     val blocked: Int = 0,
@@ -1033,7 +1092,7 @@ data class BoardTicket(
     val number: Long = 0,
     val title: String = "",
     val url: String = "",
-    /** `needs_you`, `ready`, `in_progress`, `blocked` or `done`. */
+    /** `needs_you`, `close_ready`, `ready`, `in_progress`, `blocked` or `done`. */
     val state: String = "blocked",
     /** Done only: `completed`, `not_planned`, `duplicate` or `missing`. */
     @SerialName("done_reason") val doneReason: String? = null,
@@ -1054,6 +1113,40 @@ data class BoardTicket(
     @SerialName("review_policy") val reviewPolicy: ReviewPolicy? = null,
     /** The active review request on the ticket's PR. */
     val review: BoardTicketReview? = null,
+    @SerialName("sub_issues") val subIssues: BoardSubIssues = BoardSubIssues(),
+    /** Started with Start anyway while blocked; shown until the ticket closes. */
+    @SerialName("started_early") val startedEarly: Boolean = false,
+    /** The holder's running and waiting queue jobs. */
+    val jobs: List<BoardJob> = emptyList(),
+    /** The holder's Inbox thread, when it has items. */
+    val thread: BoardThread? = null,
+    /** The holder's obligation docs, at most 3. */
+    val docs: List<BoardDoc> = emptyList(),
+)
+
+@Serializable
+data class BoardJob(
+    val id: String = "",
+    val label: String = "",
+    /** `running`, `waiting` or `quiet`. */
+    val state: String = "",
+    val type: String = "",
+    val since: String? = null,
+    @SerialName("quiet_since") val quietSince: String? = null,
+)
+
+@Serializable
+data class BoardThread(
+    val key: String = "",
+    @SerialName("needs_you") val needsYou: Boolean = false,
+    val count: Int = 0,
+)
+
+@Serializable
+data class BoardDoc(
+    val title: String = "",
+    @SerialName("reader_path") val readerPath: String = "",
+    val state: String = "",
 )
 
 @Serializable
@@ -1074,10 +1167,30 @@ data class BoardHolder(
     val name: String = "",
     /** `working`, `idle` or `stopped`. */
     val state: String = "",
+    val provider: String = "",
+    /** When the agent entered [state]. */
+    val since: String? = null,
 )
 
 @Serializable
-data class BoardPr(val repo: String = "", val number: Long = 0, val state: String = "", val url: String = "")
+data class BoardPr(
+    val repo: String = "",
+    val number: Long = 0,
+    val state: String = "",
+    val url: String = "",
+    /** sm's own review record for the PR (spec 1782 H4). */
+    val review: BoardPrReview? = null,
+)
+
+@Serializable
+data class BoardPrReview(
+    /** `you` or `codex`. */
+    val by: String = "",
+    val round: Int = 0,
+    /** `approved`, `changes_requested` or `comments`. */
+    val verdict: String? = null,
+    @SerialName("waiting_since") val waitingSince: String? = null,
+)
 
 @Serializable
 data class BoardAlsoIn(@SerialName("lane_id") val laneId: Long = 0, val rank: Int = 0)
@@ -1128,7 +1241,12 @@ data class BoardStartRequest(
     val brief: String? = null,
     /** Stores the ticket's review policy, set by the owner, before the author starts. */
     val reviewer: Reviewer? = null,
+    /** Start anyway: start a blocked ticket (spec 1782 H3). */
+    @SerialName("start_blocked") val startBlocked: Boolean = false,
 )
+
+@Serializable
+data class BoardCloseRequest(val repo: String, val number: Long)
 
 @Serializable
 data class BoardStarted(@SerialName("session_id") val sessionId: String = "", val name: String = "")

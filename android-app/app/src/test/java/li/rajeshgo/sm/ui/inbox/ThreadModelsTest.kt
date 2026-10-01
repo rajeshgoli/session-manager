@@ -1,0 +1,84 @@
+package li.rajeshgo.sm.ui.inbox
+
+import kotlinx.serialization.json.Json
+import li.rajeshgo.sm.data.model.InboxRow
+import li.rajeshgo.sm.data.model.InboxThread
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+class ThreadModelsTest {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** `GET /inbox/thread/{key}?format=json`, trimmed: a question, your reply, a turn and a doc event. */
+    private val thread = json.decodeFromString(
+        InboxThread.serializer(),
+        """{"thread_key":"ticket:rajeshgoli/session-manager#1801","title":"#1801 Fit and finish 14/14",
+           "status":"live","repo":"rajeshgoli/session-manager","can_send":true,
+           "reply_to":{"id":"c26eb47e","name":"sm-1801","restores":false,"retired_at":null},
+           "reply_options":[],"review_asks":[],
+           "items":[
+             {"kind":"message","id":"msg-1","at":"2026-09-30T10:00:00Z","title":"Keep it?","markdown":"# Keep it?\n\nx",
+              "state":"needs you","needs_you":true,"html":"<div></div>",
+              "sender":{"id":"a1b2c3d4","name":"sm-1800","status":"ended"}},
+             {"kind":"owner","id":"sub-1","at":"2026-09-30T10:05:00Z","body":"Yes.",
+              "quotes":[{"quote":"Keep it?","body":""}],"to":null,"html":"","sender":null},
+             {"type":"turn","kind":"turn","at":"2026-09-30T10:06:00Z","finished":true,"markdown":"Done.","html":"",
+              "sender":{"id":"c26eb47e","name":"sm-1801","status":"live"}},
+             {"kind":"event","at":"2026-09-30T10:07:00Z","text":"Published: Memo","link":"/docs/session-manager/memo.html",
+              "type":"doc_revision","html":"","sender":{"id":"c26eb47e","name":"sm-1801","status":"live"}}
+           ]}""",
+    )
+
+    @Test fun threadJsonParses() {
+        assertEquals(4, thread.items.size)
+        assertEquals("Yes.", thread.items[1].body)
+        assertEquals("Keep it?", thread.items[1].quotes.single().quote)
+        assertEquals("/docs/session-manager/memo.html", thread.items[3].link)
+        assertEquals("sm-1801", thread.replyTo?.name)
+    }
+
+    @Test fun answeredClearsTheAgentsThatAsked() {
+        assertEquals(listOf("a1b2c3d4"), threadAskers(thread))
+        assertEquals(emptyList<String>(), threadAskers(thread.copy(items = thread.items.drop(1))))
+    }
+
+    @Test fun terminalGoesToTheReplyTargetElseTheNewestSender() {
+        assertEquals("c26eb47e" to "sm-1801", threadTerminalAgent(thread))
+        assertEquals("c26eb47e" to "sm-1801", threadTerminalAgent(thread.copy(replyTo = null)))
+        assertNull(threadTerminalAgent(thread.copy(replyTo = null, items = emptyList())))
+    }
+
+    @Test fun threadKeysNameTheirGitHubItem() {
+        assertEquals("#1801 ↗" to "https://github.com/rajeshgoli/session-manager/issues/1801", threadWorkLink(thread.threadKey))
+        assertEquals("PR #12 ↗" to "https://github.com/o/r/pull/12", threadWorkLink("pr:o/r#12"))
+        assertNull(threadWorkLink("agent:c26eb47e"))
+        assertNull(threadWorkLink("docpath:o/r/docs/memo.html"))
+    }
+
+    @Test fun notificationPathsOpenTheirThread() {
+        assertEquals(
+            ThreadTarget("ticket:o/r#1782", null, "t"),
+            threadTargetForPath("/inbox/thread/ticket%3Ao%2Fr%231782?at=msg-1", "t"),
+        )
+        assertEquals(ThreadTarget(null, "eng00001", "t"), threadTargetForPath("/inbox/agent/eng00001?at=msg-1", "t"))
+        assertNull(threadTargetForPath("/messages/msg-1", "t"))
+        assertNull(threadTargetForPath("/docs/session-manager/memo.html", "t"))
+    }
+
+    @Test fun docRowsOpenTheDocAndOthersTheirThread() {
+        val doc = InboxRow(threadKey = "docpath:o/r/docs/m.html", kind = "doc", url = "/inbox/thread/x", docUrl = "/docs/r/docs/m.html")
+        assertNull(inboxThreadTarget(doc))
+        assertEquals("/docs/r/docs/m.html", inboxReaderPage(doc).path)
+        val ticket = InboxRow(threadKey = "ticket:o/r#7", kind = "ticket", title = "#7 X", sessionId = "s1")
+        assertEquals(ThreadTarget("ticket:o/r#7", "s1", "#7 X"), inboxThreadTarget(ticket))
+    }
+
+    /** The client does not follow redirects; an agent's thread is read from the redirect's target. */
+    @Test fun agentThreadRedirectNamesItsKey() {
+        assertEquals("ticket:o/r#1858", li.rajeshgo.sm.data.repository.threadKeyFromLocation("/inbox/thread/ticket%3Ao%2Fr%231858?format=json"))
+        assertEquals("agent:df9fec5a", li.rajeshgo.sm.data.repository.threadKeyFromLocation("/inbox/thread/agent%3Adf9fec5a"))
+        assertNull(li.rajeshgo.sm.data.repository.threadKeyFromLocation("/login"))
+        assertNull(li.rajeshgo.sm.data.repository.threadKeyFromLocation(null))
+    }
+}

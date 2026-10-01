@@ -30,3 +30,8 @@ object NewSessionRequests {
 object ReviewSettingsRequests {
     var pending by mutableStateOf(false)
 }
+
+/** An agent's ⌨ tapped outside Watch (a thread header or a Links chip): Watch opens its terminal. */
+object TerminalOpenRequests {
+    var pending by mutableStateOf<String?>(null)
+}

@@ -228,11 +228,15 @@ enum class DocNavigation {
 
     /** Anything else (GitHub, external links, other sm routes): the system browser. */
     External,
+
+    /** A link to a web page that is one of the app's tabs: stay on the page on screen. */
+    Ignore,
 }
 
 fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): DocNavigation {
     val target = runCatching { URI(targetUrl) }.getOrNull() ?: return DocNavigation.External
     val server = runCatching { URI(serverUrl.trim()) }.getOrNull() ?: return DocNavigation.External
+    if (sameOrigin(server, target) && isAppTabPath(target.rawPath.orEmpty())) return DocNavigation.Ignore
     if (!sameOrigin(server, target) || !isOwnerPagePath(target.rawPath.orEmpty())) {
         return DocNavigation.External
     }
@@ -244,14 +248,17 @@ fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): Do
 }
 
 /**
- * The pages that stay in the reader: docs, owner messages (sm#1580), the Inbox (sm#1647), History, the Guestbook, ticket pages,
- * and the web watch at `/` and `/watch`, so the page shell's Inbox · Watch · History · Guestbook tabs never
- * leave the authenticated web view.
+ * The pages that stay in the reader: docs, owner messages (sm#1580), Inbox pages (sm#1647) and ticket
+ * pages. The web's Watch, History and Guestbook (`/watch`, `/`, `/history`, `/guestbook`) are the app's
+ * own tabs, so the reader never loads them (spec 1782 J4).
  */
 fun isOwnerPagePath(path: String): Boolean =
     path.startsWith("/docs/") || path.startsWith("/messages/") || path.startsWith("/t/") ||
-        path == "/inbox" || path.startsWith("/inbox/") ||
-        path == "/history" || path == "/guestbook" || path == "/watch" || path == "/" || path.isEmpty()
+        path == "/inbox" || path.startsWith("/inbox/")
+
+/** The web pages that are the app's own tabs: a link to one does nothing in the reader. */
+fun isAppTabPath(path: String): Boolean =
+    path == "/watch" || path == "/" || path.isEmpty() || path == "/history" || path.startsWith("/history/") || path == "/guestbook"
 
 private fun sameOrigin(a: URI, b: URI): Boolean =
     a.scheme.equals(b.scheme, ignoreCase = true) &&
@@ -476,6 +483,7 @@ private fun DocReaderWebView(
                         val target = request.url.toString()
                         return when (docNavigation(auth.serverUrl, history.lastOrNull(), target)) {
                             DocNavigation.InPage -> false
+                            DocNavigation.Ignore -> true
                             DocNavigation.Reload -> {
                                 // WebView drops custom headers on page-initiated navigations and
                                 // redirects, so every owner page is loaded again with them.

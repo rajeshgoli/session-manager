@@ -112,6 +112,9 @@ pub(super) struct InboxRow {
     pub done: bool,
     pub session_id: Option<String>,
     pub doc_id: Option<String>,
+    /// The reader page of the thread's doc (the one `status` describes),
+    /// for clients that open a doc row on the doc itself (1782 J3).
+    pub doc_url: Option<String>,
     pub folded_by: Option<&'static str>,
     pub agents: Vec<String>,
     /// Items in the thread, for Done.
@@ -287,6 +290,7 @@ impl World {
                     url: doc_reader_path(summary),
                     session_id: None,
                     doc_id: Some(summary.doc.id.clone()),
+                    doc_url: Some(doc_reader_path(summary)),
                     folded_by: None,
                     agents: author.clone().into_iter().collect(),
                     items,
@@ -614,19 +618,58 @@ impl Item<'_> {
     }
 
     /// The thread JSON's entry: `html` is the item's bubble, except a turn,
-    /// whose `html` is its message alone for the client to label.
+    /// whose `html` is its message alone for the client to label. `kind` and
+    /// its fields are what a native client draws from (1782 J3): `message`
+    /// (`title`, `markdown`, `state`, `needs_you`), `owner` (`body`,
+    /// `quotes`, `to`), `turn` and `agent_reply` (`markdown`), and `event`
+    /// (`text`, `link`).
     fn json(&self, world: &World, session_id: &str, now: OffsetDateTime) -> Value {
+        let to = |delivered: &str| (delivered != session_id).then(|| world.agent_name(delivered));
+        let html = || render_item(self, world, session_id, now);
         match self {
             Item::Turn(row) => json!({
-                "type": "turn", "at": self.at(), "finished": true,
+                "type": "turn", "kind": "turn", "at": self.at(), "finished": true,
+                "markdown": row.text.as_deref().unwrap_or(""),
                 "html": crate::owner_doc_render::render_markdown_sanitized(
                     row.text.as_deref().unwrap_or("")),
             }),
             Item::AgentReply(reply) => json!({
-                "type": "turn", "at": self.at(), "finished": false,
+                "type": "turn", "kind": "agent_reply", "at": self.at(), "finished": false,
+                "markdown": reply.text,
                 "html": crate::owner_doc_render::render_markdown_sanitized(&reply.text),
             }),
-            _ => json!({"at": self.at(), "html": render_item(self, world, session_id, now)}),
+            Item::Message(message, state) => json!({
+                "kind": "message", "id": message.id, "at": self.at(),
+                "title": message.title, "markdown": message.body_markdown,
+                "state": message_state_label(*state),
+                "needs_you": *state == OwnerMessageState::NeedsYou, "html": html(),
+            }),
+            Item::Answered(message) => json!({
+                "kind": "event", "at": self.at(), "text": answered_label(message), "link": null,
+                "html": html(),
+            }),
+            Item::Reply(reply) => json!({
+                "kind": "owner", "id": reply.id, "at": self.at(), "body": reply.body.trim(),
+                "quotes": reply.comments.iter().map(|comment| json!({
+                    "quote": comment.quote.trim(), "body": comment.body.trim(),
+                })).collect::<Vec<_>>(),
+                "to": to(&reply.delivered_to_session_id), "html": html(),
+            }),
+            Item::Note(note) => json!({
+                "kind": "owner", "id": note.id, "at": self.at(), "body": note.body.trim(),
+                "quotes": [], "to": to(&note.delivered_to_session_id), "html": html(),
+            }),
+            Item::Follow(follow) => {
+                let (text, link) = follow_line(follow);
+                json!({"kind": "event", "at": self.at(), "text": text, "link": link, "html": html()})
+            }
+            Item::Doc(doc, publish) => json!({
+                "kind": "event", "at": self.at(),
+                "text": format!("{} {}",
+                    if publish.review_requested { "Asked for review:" } else { "Published:" }, doc.title),
+                "link": doc_readable_path(&doc.repo, &doc.path, &publish.commit_sha),
+                "html": html(),
+            }),
         }
     }
 }
@@ -695,6 +738,16 @@ fn message_state_label(state: OwnerMessageState) -> &'static str {
     }
 }
 
+fn answered_label(message: &OwnerMessage) -> &'static str {
+    match message.handled_via.as_deref() {
+        Some("terminal") => "You answered in the terminal",
+        Some("claude_prompt") => "You answered in Claude",
+        Some("codex_prompt") => "You answered in Codex",
+        Some("inbox") => "Answered in the Inbox",
+        _ => "Marked answered",
+    }
+}
+
 fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDateTime) -> String {
     let when = |at: &str| escape_html(&relative_time(at, now));
     let delivered_to = |to: &str| {
@@ -706,13 +759,7 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
     };
     match item {
         Item::Answered(message) => {
-            let label = match message.handled_via.as_deref() {
-                Some("terminal") => "You answered in the terminal",
-                Some("claude_prompt") => "You answered in Claude",
-                Some("codex_prompt") => "You answered in Codex",
-                Some("inbox") => "Answered in the Inbox",
-                _ => "Marked answered",
-            };
+            let label = answered_label(message);
             format!(
                 "<div class=\"ev\">{label} · {}</div>",
                 when(message.handled_at.as_deref().unwrap_or(&message.created_at))

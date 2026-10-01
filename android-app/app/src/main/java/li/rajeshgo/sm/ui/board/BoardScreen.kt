@@ -71,6 +71,7 @@ import java.time.Duration
 import java.time.OffsetDateTime
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import li.rajeshgo.sm.data.model.BoardDoc
 import li.rajeshgo.sm.data.model.BoardLane
 import li.rajeshgo.sm.data.model.BoardRef
 import li.rajeshgo.sm.data.model.BoardResponse
@@ -79,6 +80,16 @@ import li.rajeshgo.sm.data.model.BoardTicket
 import li.rajeshgo.sm.data.model.QueueOverview
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
+import li.rajeshgo.sm.ui.inbox.ThreadScreen
+import li.rajeshgo.sm.ui.inbox.ThreadTarget
+import li.rajeshgo.sm.ui.links.LinkChip
+import li.rajeshgo.sm.ui.links.LinksRow
+import li.rajeshgo.sm.ui.links.agentChipText
+import li.rajeshgo.sm.ui.links.jobChips
+import li.rajeshgo.sm.ui.links.prChipColor
+import li.rajeshgo.sm.ui.links.prChipText
+import li.rajeshgo.sm.ui.links.threadChipText
+import li.rajeshgo.sm.ui.navigation.TerminalOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.AppMenuActions
 import li.rajeshgo.sm.ui.navigation.AppTopBar
@@ -129,12 +140,80 @@ fun boardWarningText(warning: String): String = when (warning) {
 /** Start shows on ready rows, except one whose PR merged: it needs closing, not an agent. */
 fun boardCanStart(ticket: BoardTicket): Boolean = ticket.state == "ready" && "merged_not_closed" !in ticket.warnings
 
-/** The folded Blocked line: "#a #b #c …", the first three in row order, NEW after new ones. */
-fun blockedPreview(tickets: List<BoardTicket>, base: String): String {
-    val shown = tickets.take(3).joinToString(" ") { ticket ->
-        boardShortRef(ticket.repo, ticket.number, base) + if (ticket.new) " NEW" else ""
-    }
-    return if (tickets.size > 3) "$shown …" else shown
+/**
+ * Start anyway (spec 1782 H3): a blocked ticket the server would start with `start_blocked`.
+ * A ticket an agent already holds is refused whatever the flag says.
+ */
+fun boardCanStartAnyway(ticket: BoardTicket): Boolean =
+    ticket.state == "blocked" && ticket.holder == null &&
+        ticket.warnings.none { it in setOf("stale", "cycle", "merged_not_closed") }
+
+/** The row's own Inbox thread: the ticket's work thread (sm#1835), else the holder's newest thread. */
+fun boardThreadTarget(ticket: BoardTicket): ThreadTarget? {
+    val holder = ticket.holder ?: return null
+    return ThreadTarget("ticket:${ticket.repo.lowercase()}#${ticket.number}", holder.sessionId, "#${ticket.number} ${ticket.title}")
+}
+
+/** Blocked rows show while a lane has at most this many non-done tickets (spec 1782 H1). */
+const val BLOCKED_ROW_LIMIT = 12
+
+/** Most recently closed tickets shown as rows; the rest fold. */
+const val DONE_ROW_LIMIT = 3
+
+/** "Not in any lane" rows per repo before "{n} more ›"; needs-you rows always show. */
+const val OTHER_ROW_LIMIT = 10
+
+/** A lane's tickets as the Board draws them (the same rules as the web Board). */
+data class LaneGroups(
+    /** Needs you, all parts done, ready and in progress: always rows. */
+    val active: List<BoardTicket>,
+    val blocked: List<BoardTicket>,
+    /** Newest closed first. */
+    val done: List<BoardTicket>,
+) {
+    /** Blocked tickets are slim rows, else one fold line. */
+    val showBlocked: Boolean get() = active.size + blocked.size <= BLOCKED_ROW_LIMIT
+
+    /** A lane with one active ticket draws it in its header. */
+    val short: Boolean get() = active.size == 1
+}
+
+fun laneGroups(tickets: List<BoardTicket>): LaneGroups = LaneGroups(
+    active = tickets.filter { it.state !in setOf("blocked", "done") },
+    blocked = tickets.filter { it.state == "blocked" },
+    done = tickets.filter { it.state == "done" }.sortedByDescending { it.closedAt.orEmpty() },
+)
+
+/** One repo's "Not in any lane" rows: every needs-you ticket, then others up to [OTHER_ROW_LIMIT]. */
+fun visibleOther(tickets: List<BoardTicket>): List<BoardTicket> {
+    val urgent = tickets.filter { it.state == "needs_you" }
+    val rest = tickets.filter { it.state != "needs_you" }
+    return urgent + rest.take((OTHER_ROW_LIMIT - urgent.size).coerceAtLeast(0))
+}
+
+/** A ticket's open blockers, as refs: "#1776", "#1777". */
+fun openBlockers(ticket: BoardTicket, base: String): List<String> =
+    ticket.waitsOn.filter { it.state != "done" }.map { boardShortRef(it.repo, it.number, base) }
+
+/** "#a", "#a and #b", "#a, #b and #c". */
+fun refList(refs: List<String>): String = when (refs.size) {
+    0 -> ""
+    1 -> refs[0]
+    else -> refs.dropLast(1).joinToString(", ") + " and " + refs.last()
+}
+
+/** The Start anyway confirmation: "#1777 waits on #1776, which is not done." */
+fun startAnywayText(ticket: BoardTicket, base: String): String {
+    val blockers = openBlockers(ticket, base)
+    if (blockers.isEmpty()) return "#${ticket.number} is blocked. Start it anyway?"
+    val verb = if (blockers.size == 1) "is" else "are"
+    return "#${ticket.number} waits on ${refList(blockers)}, which $verb not done."
+}
+
+/** The folded Blocked line: "14 blocked · waiting on #1776, #1777". */
+fun blockedFoldCaption(tickets: List<BoardTicket>, base: String): String {
+    val blockers = tickets.flatMap { openBlockers(it, base) }.distinct()
+    return "${tickets.size} blocked" + if (blockers.isEmpty()) "" else " · waiting on " + blockers.joinToString(", ")
 }
 
 /** The lane's counts line, as the phone mock shows it. */
@@ -142,47 +221,12 @@ fun laneCountsLine(lane: BoardLane): String {
     val c = lane.counts
     val parts = mutableListOf<String>()
     if (c.needsYou > 0) parts += "${c.needsYou} needs you"
+    if (c.closeReady > 0) parts += "${c.closeReady} all parts done"
     parts += "${c.ready} ready"
     parts += "${c.inProgress} in progress"
     parts += "${c.blocked} blocked"
     if (lane.longestChain.isNotEmpty()) parts += "chain ${lane.longestChain.size}"
     return parts.joinToString(" · ")
-}
-
-/** An agent's queue jobs: what runs and what waits, with the longest times. */
-data class AgentQueue(
-    val running: Int,
-    val longestRunSeconds: Long,
-    val waiting: Int,
-    val oldestWaitSeconds: Long,
-    /** Start-order position of the agent's next waiting job, as the Queue tab numbers it. */
-    val nextPosition: Int?,
-)
-
-/** The jobs [sessionId] waits on, as the Queue tab assigns them; null when it has none. */
-fun agentQueue(overview: QueueOverview?, sessionId: String, now: OffsetDateTime): AgentQueue? {
-    if (overview == null || sessionId.isBlank()) return null
-    val running = overview.running.filter { it.isAwaitedBy(sessionId) }
-    val waiting = overview.queued.filter { it.isAwaitedBy(sessionId) }
-    if (running.isEmpty() && waiting.isEmpty()) return null
-    return AgentQueue(
-        running = running.size,
-        longestRunSeconds = running.mapNotNull { secondsBetween(it.startedAt, now) }.maxOrNull() ?: 0,
-        waiting = waiting.size,
-        oldestWaitSeconds = waiting.mapNotNull { secondsBetween(it.queuedAt, now) }.maxOrNull() ?: 0,
-        nextPosition = waiting.mapNotNull { it.position }.minOrNull(),
-    )
-}
-
-/** "queue: 1 running 1h33m · 1 waiting 1h29m, #6 to start". */
-fun agentQueueText(queue: AgentQueue): String {
-    val parts = mutableListOf<String>()
-    if (queue.running > 0) parts += "${queue.running} running ${shortDuration(queue.longestRunSeconds)}"
-    if (queue.waiting > 0) {
-        parts += "${queue.waiting} waiting ${shortDuration(queue.oldestWaitSeconds)}" +
-            (queue.nextPosition?.let { ", #$it to start" } ?: "")
-    }
-    return "queue: " + parts.joinToString(" · ")
 }
 
 /** The lane's jobs across its agents: "Queue: 4 running · 6 waiting", or null when none. */
@@ -215,13 +259,17 @@ fun BoardScreen(
     val listState = rememberLazyListState()
     var now by remember { mutableStateOf(OffsetDateTime.now()) }
     var reader by remember { mutableStateOf<ReaderPage?>(null) }
+    var thread by remember { mutableStateOf<ThreadTarget?>(null) }
+    var startingAnyway by remember { mutableStateOf<BoardTicket?>(null) }
+    var closing by remember { mutableStateOf<BoardTicket?>(null) }
     var addingLane by remember { mutableStateOf(false) }
     var ending by remember { mutableStateOf<BoardLane?>(null) }
     val toast = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
 
     // Read while shown; each read marks the board seen (appendix K).
-    LaunchedEffect(resumed, reader == null) {
-        if (!resumed || reader != null) return@LaunchedEffect
+    val overlay = reader != null || thread != null
+    LaunchedEffect(resumed, overlay) {
+        if (!resumed || overlay) return@LaunchedEffect
         while (isActive) {
             viewModel.refresh()
             now = OffsetDateTime.now()
@@ -253,7 +301,17 @@ fun BoardScreen(
     }
 
     val actions = BoardRowActions(
-        onStart = viewModel::openStart,
+        onStart = { viewModel.openStart(it) },
+        onStartAnyway = { startingAnyway = it },
+        onClose = { closing = it },
+        onOpenTerminal = { sessionId ->
+            TerminalOpenRequests.pending = sessionId
+            onNavigateToWatch()
+        },
+        onOpenThread = { ticket -> boardThreadTarget(ticket)?.let { thread = it } },
+        onOpenDoc = { ticket, doc ->
+            reader = ReaderPage(title = doc.title, subtitle = "#${ticket.number} ${ticket.title}", path = doc.readerPath)
+        },
         onOpenAgent = { ticket ->
             ticket.holder?.let { holder ->
                 FollowOpenRequests.pending = FollowOpen(holder.sessionId, null, holder.name)
@@ -269,6 +327,7 @@ fun BoardScreen(
         onOpenQueue = onNavigateToQueue,
         onReviewPolicy = { ticket -> viewModel.openReviewPolicy(ReviewPolicyEdit.ticket(ticket)) },
         queue = state.queue,
+        busy = state.busy,
         now = now,
     )
 
@@ -329,12 +388,12 @@ fun BoardScreen(
                         item(key = "lane-${lane.id}") {
                             LaneCard(
                                 lane = lane,
-                                expanded = expanded[lane.id] ?: (lane.rank == 1),
+                                expanded = expanded[lane.id] ?: true,
                                 canMoveUp = index > 0,
                                 canMoveDown = index < lanes.lastIndex,
                                 busy = state.busy,
                                 actions = actions,
-                                onToggle = { viewModel.toggle(lane.id, lane.rank) },
+                                onToggle = { viewModel.toggle(lane.id) },
                                 onMove = { delta -> viewModel.move(lane.id, delta, toast) },
                                 onEnd = { ending = lane },
                                 onReviewPolicy = { viewModel.openReviewPolicy(ReviewPolicyEdit.lane(lane)) },
@@ -355,6 +414,20 @@ fun BoardScreen(
                 onWatch = onNavigateToWatch,
                 onBoard = {},
                 onQueue = onNavigateToQueue,
+            )
+        }
+
+        thread?.let { target ->
+            ThreadScreen(
+                target = target,
+                onClose = { thread = null },
+                onOpenTerminal = { sessionId ->
+                    thread = null
+                    TerminalOpenRequests.pending = sessionId
+                    onNavigateToWatch()
+                },
+                onDone = { thread = null },
+                onMessage = toast,
             )
         }
 
@@ -384,6 +457,34 @@ fun BoardScreen(
                     if (error == null) addingLane = false else toast(error)
                 }
             },
+        )
+    }
+
+    startingAnyway?.let { ticket ->
+        AlertDialog(
+            onDismissRequest = { startingAnyway = null },
+            title = { Text("Start anyway?") },
+            text = { Text(startAnywayText(ticket, ticket.repo) + " The agent is told to build on what is done so far.") },
+            confirmButton = {
+                TextButton(onClick = { startingAnyway = null; viewModel.openStart(ticket, startBlocked = true) }) { Text("Start anyway") }
+            },
+            dismissButton = { TextButton(onClick = { startingAnyway = null }) { Text("Cancel") } },
+        )
+    }
+
+    closing?.let { ticket ->
+        AlertDialog(
+            onDismissRequest = { closing = null },
+            title = { Text("Close #${ticket.number}?") },
+            text = {
+                Text("All ${ticket.subIssues.total} parts are done. sm closes the ticket on GitHub with a comment listing them.")
+            },
+            confirmButton = {
+                TextButton(onClick = { closing = null; viewModel.close(ticket) { error -> toast(error ?: "Closed #${ticket.number}") } }) {
+                    Text("Close")
+                }
+            },
+            dismissButton = { TextButton(onClick = { closing = null }) { Text("Cancel") } },
         )
     }
 
@@ -469,6 +570,7 @@ fun BoardScreen(
                         reasoningEffort = request.reasoningEffort,
                         name = request.name,
                         brief = request.initialMessage,
+                        startBlocked = start.startBlocked,
                         // Unchanged from the ticket's stored policy: leave it as it was set.
                         reviewer = reviewer?.takeUnless { ticketOwn && it == policy?.resolved },
                     ),
@@ -482,15 +584,33 @@ fun BoardScreen(
 /** What a ticket row can open. */
 private class BoardRowActions(
     val onStart: (BoardTicket) -> Unit,
+    /** Start anyway: a confirm, then Start with `start_blocked` (spec 1782 H3). */
+    val onStartAnyway: (BoardTicket) -> Unit,
+    /** Close a ticket whose parts are all done, after a confirm (spec 1782 H2). */
+    val onClose: (BoardTicket) -> Unit,
     val onOpenAgent: (BoardTicket) -> Unit,
+    val onOpenTerminal: (String) -> Unit,
     val onOpenNeedsYou: (BoardTicket) -> Unit,
+    val onOpenThread: (BoardTicket) -> Unit,
+    val onOpenDoc: (BoardTicket, BoardDoc) -> Unit,
     val onShowLane: (Long) -> Unit,
     val onOpenQueue: () -> Unit,
     /** Opens the ticket's review policy sheet (sm#1768 Figure 7B). */
     val onReviewPolicy: (BoardTicket) -> Unit,
-    /** The queue as last read, for each agent's jobs; null until the first read. */
+    /** The queue as last read, for each lane's job line; null until the first read. */
     val queue: QueueOverview?,
+    val busy: Boolean,
     val now: OffsetDateTime,
+)
+
+/** The lane goal as a ticket, for the header's Close. */
+private fun goalTicket(lane: BoardLane): BoardTicket = BoardTicket(
+    repo = lane.goal.repo,
+    number = lane.goal.number,
+    title = lane.goal.title,
+    url = lane.goal.url,
+    state = lane.goal.state,
+    subIssues = lane.goal.subIssues,
 )
 
 @Composable
@@ -506,6 +626,7 @@ private fun LaneCard(
     onEnd: () -> Unit,
     onReviewPolicy: () -> Unit,
 ) {
+    val groups = laneGroups(lane.tickets)
     Surface(
         color = Panel,
         shape = RoundedCornerShape(12.dp),
@@ -516,8 +637,16 @@ private fun LaneCard(
         Row(Modifier.height(IntrinsicSize.Min)) {
             if (lane.unseen) Box(Modifier.width(4.dp).fillMaxHeight().background(Orange))
             Column(Modifier.weight(1f).padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp)) {
-                LaneHeader(lane, laneQueueLine(lane, actions.queue), canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd, actions.onOpenQueue, onReviewPolicy)
-                if (expanded) LaneBody(lane, actions)
+                LaneHeader(lane, laneQueueLine(lane, actions.queue), canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd, actions.onOpenQueue, onReviewPolicy) {
+                    actions.onClose(goalTicket(lane))
+                }
+                // A lane with one active ticket shows it under its header, open or not.
+                if (groups.short) {
+                    Box(Modifier.padding(top = 8.dp, end = 8.dp)) {
+                        TicketRow(groups.active[0], lane.goal.repo, lane.longestChain.firstOrNull(), actions)
+                    }
+                }
+                if (expanded) LaneBody(lane, groups, actions)
             }
         }
     }
@@ -535,6 +664,7 @@ private fun LaneHeader(
     onEnd: () -> Unit,
     onOpenQueue: () -> Unit,
     onReviewPolicy: () -> Unit,
+    onCloseGoal: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.Top) {
@@ -566,6 +696,14 @@ private fun LaneHeader(
                     color = if (lane.counts.needsYou > 0) Amber else TextSecondary,
                     modifier = Modifier.padding(top = 2.dp),
                 )
+                if (lane.goal.state == "close_ready") {
+                    Text(
+                        "${lane.goal.subIssues.done} of ${lane.goal.subIssues.total} parts done · All parts done",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Cyan,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
                 queueLine?.let {
                     Text(
                         it,
@@ -586,6 +724,7 @@ private fun LaneHeader(
                 }
             }
         }
+        if (lane.goal.state == "close_ready") RowButton("Close", primary = true, enabled = !busy, onClick = onCloseGoal)
         Box {
             IconButton(onClick = { menuOpen = true }, enabled = !busy) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = "Lane menu", tint = TextSecondary)
@@ -601,15 +740,13 @@ private fun LaneHeader(
 }
 
 @Composable
-private fun LaneBody(lane: BoardLane, actions: BoardRowActions) {
+private fun LaneBody(lane: BoardLane, groups: LaneGroups, actions: BoardRowActions) {
     val base = lane.goal.repo
     var blockedOpen by rememberSaveable(lane.id) { mutableStateOf(false) }
     var doneOpen by rememberSaveable(lane.id) { mutableStateOf(false) }
     var changesOpen by rememberSaveable(lane.id) { mutableStateOf(false) }
-    val open = lane.tickets.filter { it.state in setOf("needs_you", "ready", "in_progress") }
-    val blocked = lane.tickets.filter { it.state == "blocked" }
-    val done = lane.tickets.filter { it.state == "done" }
     val head = lane.longestChain.firstOrNull()
+    val moreDone = groups.done.drop(DONE_ROW_LIMIT)
     Column(Modifier.padding(top = 10.dp, end = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (lane.longestChain.size > 1) {
             Text(
@@ -627,14 +764,17 @@ private fun LaneBody(lane: BoardLane, actions: BoardRowActions) {
                 color = Rose,
             )
         }
-        open.forEach { TicketRow(it, base, head, actions) }
-        if (blocked.isNotEmpty()) {
-            FoldLine("Blocked (${blocked.size})", blockedPreview(blocked, base), blockedOpen) { blockedOpen = !blockedOpen }
-            if (blockedOpen) blocked.forEach { TicketRow(it, base, head, actions) }
+        if (!groups.short) groups.active.forEach { TicketRow(it, base, head, actions) }
+        if (groups.showBlocked) {
+            groups.blocked.forEach { TicketRow(it, base, head, actions, slim = true) }
+        } else if (groups.blocked.isNotEmpty()) {
+            FoldLine(blockedFoldCaption(groups.blocked, base), null, blockedOpen) { blockedOpen = !blockedOpen }
+            if (blockedOpen) groups.blocked.forEach { TicketRow(it, base, head, actions, slim = true) }
         }
-        if (done.isNotEmpty()) {
-            FoldLine("Done (${done.size})", null, doneOpen) { doneOpen = !doneOpen }
-            if (doneOpen) done.forEach { TicketRow(it, base, null, actions) }
+        groups.done.take(DONE_ROW_LIMIT).forEach { TicketRow(it, base, null, actions, slim = true) }
+        if (moreDone.isNotEmpty()) {
+            FoldLine("${moreDone.size} more done", null, doneOpen) { doneOpen = !doneOpen }
+            if (doneOpen) moreDone.forEach { TicketRow(it, base, null, actions, slim = true) }
         }
         if (lane.changes.isNotEmpty()) {
             FoldLine("Recent changes", null, changesOpen) { changesOpen = !changesOpen }
@@ -676,15 +816,42 @@ private data class StateChip(val label: String, val color: Color)
 
 private fun stateChip(state: String): StateChip = when (state) {
     "needs_you" -> StateChip("NEEDS YOU", Amber)
+    "close_ready" -> StateChip("ALL PARTS DONE", Cyan)
     "ready" -> StateChip("READY", Emerald)
     "in_progress" -> StateChip("IN PROG", Cyan)
     "done" -> StateChip("DONE", TextMuted)
     else -> StateChip("BLOCKED", TextMuted)
 }
 
+@Composable
+private fun RowButton(label: String, primary: Boolean, enabled: Boolean = true, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(999.dp),
+        color = if (primary) CyanDeep else Color.Transparent,
+        border = if (primary) null else BorderStroke(1.dp, Border),
+        modifier = Modifier.padding(start = 8.dp),
+    ) {
+        Text(
+            label,
+            color = if (primary) Cyan else TextSecondary,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+        )
+    }
+}
+
+/**
+ * One ticket. A [slim] row (blocked and done tickets, spec 1782 H1) holds the
+ * ref, title, what it waits on and Start anyway; a full row adds the details
+ * line and the Links line.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, actions: BoardRowActions) {
+private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, actions: BoardRowActions, slim: Boolean = false) {
     val uriHandler = LocalUriHandler.current
     val chip = stateChip(ticket.state)
     val needsYou = ticket.state == "needs_you"
@@ -694,29 +861,32 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
         border = BorderStroke(1.dp, if (needsYou) Amber.copy(alpha = 0.55f) else Border),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = if (slim) 6.dp else 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    chip.label,
-                    color = chip.color,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier
-                        .background(chip.color.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
-                        .padding(horizontal = 5.dp, vertical = 1.dp),
-                )
+                if (!slim) {
+                    Text(
+                        chip.label,
+                        color = chip.color,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .padding(end = 8.dp)
+                            .background(chip.color.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 5.dp, vertical = 1.dp),
+                    )
+                }
                 Text(
                     boardShortRef(ticket.repo, ticket.number, base),
                     style = MaterialTheme.typography.labelMedium,
                     fontFamily = FontFamily.Monospace,
                     color = Cyan,
-                    modifier = Modifier.padding(start = 8.dp).clickable { uriHandler.openUri(ticket.url) },
+                    modifier = Modifier.clickable { uriHandler.openUri(ticket.url) },
                 )
                 Text(
                     ticket.title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (ticket.state == "done") TextSecondary else MaterialTheme.colorScheme.onSurface,
-                    maxLines = 2,
+                    style = if (slim) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium,
+                    color = if (slim) TextSecondary else MaterialTheme.colorScheme.onSurface,
+                    maxLines = if (slim) 1 else 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(start = 6.dp).weight(1f),
                 )
@@ -729,35 +899,51 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                         modifier = Modifier.padding(start = 6.dp),
                     )
                 }
-                if (boardCanStart(ticket)) {
-                    Surface(
-                        onClick = { actions.onStart(ticket) },
-                        shape = RoundedCornerShape(999.dp),
-                        color = CyanDeep,
-                        modifier = Modifier.padding(start = 8.dp),
-                    ) {
-                        Text(
-                            "Start",
-                            color = Cyan,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
-                        )
-                    }
-                }
-                if (ticket.state != "done") {
+                if (boardCanStart(ticket)) RowButton("Start", primary = true) { actions.onStart(ticket) }
+                if (boardCanStartAnyway(ticket)) RowButton("Start anyway", primary = false) { actions.onStartAnyway(ticket) }
+                if (ticket.state == "close_ready") RowButton("Close", primary = true, enabled = !actions.busy) { actions.onClose(ticket) }
+                if (ticket.state != "done" && !slim) {
                     var menuOpen by remember { mutableStateOf(false) }
                     Box {
                         IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(28.dp)) {
                             Icon(Icons.Rounded.MoreVert, contentDescription = "Ticket menu", tint = TextMuted, modifier = Modifier.size(18.dp))
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            if (ticket.state == "close_ready") {
+                                DropdownMenuItem(text = { Text("Start instead") }, onClick = { menuOpen = false; actions.onStart(ticket) })
+                            }
                             DropdownMenuItem(text = { Text("Review policy…") }, onClick = { menuOpen = false; actions.onReviewPolicy(ticket) })
                         }
                     }
                 }
             }
-            val details = ticketDetails(ticket, base, head, actions) { uriHandler.openUri(it) }
+            if (slim) {
+                val line = when (ticket.state) {
+                    "blocked" -> openBlockers(ticket, base).takeIf { it.isNotEmpty() }?.let { "waits on " + it.joinToString(", ") }
+                    "done" -> ticket.doneReason?.replace('_', ' ')
+                    else -> null
+                }
+                val extra = listOfNotNull(line, "started early".takeIf { ticket.startedEarly }) +
+                    ticket.warnings.map { "! " + boardWarningText(it) }
+                if (extra.isNotEmpty()) {
+                    Text(
+                        extra.joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (ticket.warnings.isNotEmpty()) Rose else TextMuted,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                return@Column
+            }
+            if (ticket.state == "close_ready") {
+                Text(
+                    "${ticket.subIssues.done} of ${ticket.subIssues.total} parts done · All parts done",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Cyan,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            val details = ticketDetails(ticket, base, head, actions)
             if (details.isNotEmpty()) {
                 FlowRow(
                     modifier = Modifier.padding(top = 4.dp),
@@ -774,6 +960,7 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                     }
                 }
             }
+            LinksRow(boardLinks(ticket, actions) { uriHandler.openUri(it) }, Modifier.padding(top = 6.dp))
         }
     }
 }
@@ -788,13 +975,12 @@ fun boardReviewText(review: li.rajeshgo.sm.data.model.BoardTicketReview, now: Of
     return if (review.state == "owner") "You are reviewing$age" else "Review: $who$age"
 }
 
-/** A row's detail line (appendix J2), in the order the web board shows it. */
+/** A row's detail line: what needs you, what it waits on, reviews, warnings. Links carry the rest. */
 private fun ticketDetails(
     ticket: BoardTicket,
     base: String,
     head: BoardRef?,
     actions: BoardRowActions,
-    openUrl: (String) -> Unit,
 ): List<Detail> {
     val details = mutableListOf<Detail>()
     ticket.needsYou?.let { needs ->
@@ -803,23 +989,9 @@ private fun ticketDetails(
             details += Detail("heads the longest chain", Amber)
         }
     }
-    ticket.holder?.let { holder ->
-        details += Detail(
-            "${holder.name} (${holder.state})",
-            if (holder.state == "stopped") Rose else TextSecondary,
-        ) { actions.onOpenAgent(ticket) }
-        agentQueue(actions.queue, holder.sessionId, actions.now)?.let { queue ->
-            // Waiting with nothing running is what leaves an agent idle.
-            details += Detail(agentQueueText(queue), if (queue.running == 0) Amber else Cyan, actions.onOpenQueue)
-        }
-    }
-    val waiting = ticket.waitsOn.filter { it.state != "done" }
-    if (waiting.isNotEmpty()) {
-        details += Detail("waits on " + waiting.joinToString(", ") { boardShortRef(it.repo, it.number, base) }, TextMuted)
-    }
-    ticket.prs.forEach { pr ->
-        details += Detail("PR #${pr.number} · ${pr.state.lowercase()}", Violet) { openUrl(pr.url) }
-    }
+    val waiting = openBlockers(ticket, base)
+    if (waiting.isNotEmpty()) details += Detail("waits on " + waiting.joinToString(", "), TextMuted)
+    if (ticket.startedEarly) details += Detail("started early", TextMuted)
     ticket.review?.let { review ->
         details += Detail(boardReviewText(review, actions.now), Amber)
     }
@@ -828,19 +1000,34 @@ private fun ticketDetails(
     }
     if (ticket.state == "done") ticket.doneReason?.let { details += Detail(it.replace('_', ' '), TextMuted) }
     ticket.warnings.forEach { details += Detail("! " + boardWarningText(it), Rose) }
-    if (ticket.subIssuesDone && ticket.state == "ready") {
-        details += Detail("All sub-issues done — close on GitHub", Amber) { openUrl(ticket.url) }
-    }
     ticket.alsoIn.forEach { lane ->
         details += Detail("also in lane ${lane.rank}", Cyan) { actions.onShowLane(lane.laneId) }
     }
     return details
 }
 
+/** The ticket's Links line (spec 1782 H4); GitHub opens outside the app. */
+private fun boardLinks(ticket: BoardTicket, actions: BoardRowActions, openUrl: (String) -> Unit): List<LinkChip> = buildList {
+    add(LinkChip("#${ticket.number} ↗", Cyan) { openUrl(ticket.url) })
+    ticket.prs.forEach { pr -> add(LinkChip(prChipText(pr, actions.now), prChipColor(pr)) { openUrl(pr.url) }) }
+    ticket.holder?.let { holder ->
+        val color = when (holder.state) {
+            "working" -> Emerald
+            "stopped" -> Rose
+            else -> TextSecondary
+        }
+        add(LinkChip(agentChipText(holder, actions.now), color, onTerminal = { actions.onOpenTerminal(holder.sessionId) }) { actions.onOpenAgent(ticket) })
+    }
+    addAll(jobChips(ticket.jobs, actions.now) { actions.onOpenQueue() })
+    ticket.thread?.let { thread ->
+        add(LinkChip(threadChipText(thread), if (thread.needsYou) Fuchsia else TextSecondary) { actions.onOpenThread(ticket) })
+    }
+    ticket.docs.forEach { doc -> add(LinkChip(doc.title, Violet) { actions.onOpenDoc(ticket, doc) }) }
+}
+
+/** Tickets outside every lane: an open section per repo (spec 1782 H1). */
 @Composable
 private fun OtherTickets(groups: List<li.rajeshgo.sm.data.model.BoardOtherGroup>, actions: BoardRowActions) {
-    var open by rememberSaveable { mutableStateOf(false) }
-    val count = groups.sumOf { it.tickets.size }
     Surface(
         color = Panel,
         shape = RoundedCornerShape(12.dp),
@@ -848,21 +1035,22 @@ private fun OtherTickets(groups: List<li.rajeshgo.sm.data.model.BoardOtherGroup>
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            FoldLine(
-                "Not in any lane",
-                groups.filter { it.tickets.isNotEmpty() }.joinToString(" · ") { "${it.repo.substringAfter('/')}: ${it.tickets.size} open" },
-                open,
-            ) { open = !open }
-            if (open && count > 0) {
-                groups.filter { it.tickets.isNotEmpty() }.forEach { group ->
-                    Text(
-                        group.repo,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = TextMuted,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                    group.tickets.forEach { TicketRow(it, group.repo, null, actions) }
+            Text("Not in any lane", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = TextSecondary)
+            groups.filter { it.tickets.isNotEmpty() }.forEach { group ->
+                var moreOpen by rememberSaveable(group.repo) { mutableStateOf(false) }
+                val shown = visibleOther(group.tickets)
+                val more = group.tickets.filterNot { it in shown }
+                Text(
+                    group.repo,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = TextMuted,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                shown.forEach { TicketRow(it, group.repo, null, actions) }
+                if (more.isNotEmpty()) {
+                    FoldLine("${more.size} more", null, moreOpen) { moreOpen = !moreOpen }
+                    if (moreOpen) more.forEach { TicketRow(it, group.repo, null, actions) }
                 }
             }
         }

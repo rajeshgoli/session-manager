@@ -437,6 +437,7 @@ impl ThreadCatalog {
             let mut verdict = None;
             let mut pr_number = None;
             let mut author = None;
+            let mut doc_url = None;
             let mut selected_doc_rank = u8::MAX;
             let mut selected_doc_at = String::new();
             for doc in self.docs.iter().filter(|doc| doc.key == key) {
@@ -485,6 +486,7 @@ impl ThreadCatalog {
                     };
                     pr_number = doc.summary.doc.pr_number;
                     author = doc.summary.doc.author_session_name.clone();
+                    doc_url = Some(doc_reader_path(&doc.summary));
                 }
             }
             let migrated = migrated_items.get(key.as_str()).copied().unwrap_or(0)
@@ -582,6 +584,7 @@ impl ThreadCatalog {
                 done: is_done(&marks, items),
                 session_id: newest_sender,
                 doc_id: doc_ids.into_iter().next(),
+                doc_url,
                 items,
                 folded_by,
                 agents: senders

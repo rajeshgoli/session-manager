@@ -79,13 +79,17 @@ import li.rajeshgo.sm.ui.watch.ReaderPage
 
 private const val INBOX_REFRESH_MS = 30_000L
 
-/** The page an Inbox row opens in the reader. */
+/** The page a doc row opens in the reader: the doc itself, not its thread. */
 fun inboxReaderPage(row: InboxRow): ReaderPage = ReaderPage(
     title = row.title,
     subtitle = if (row.kind == "doc") listOfNotNull(row.repo.ifBlank { null }, row.prNumber?.let { "PR #$it" }).joinToString(" · ")
     else row.repo,
-    path = row.url,
+    path = row.docUrl ?: row.url,
 )
+
+/** Doc rows open the doc; ticket, PR and agent threads open natively (spec 1782 J3). */
+fun inboxThreadTarget(row: InboxRow): ThreadTarget? =
+    if (row.kind == "doc") null else ThreadTarget(row.threadKey.ifBlank { null }, row.sessionId, row.title)
 
 /** The row's third line: repo, then what kind of thread it is. */
 fun inboxRowDetail(row: InboxRow): String {
@@ -119,11 +123,13 @@ fun InboxScreen(
     val resumed = rememberResumed()
     val context = LocalContext.current
     var openRow by remember { mutableStateOf<InboxRow?>(null) }
+    var openThread by remember { mutableStateOf<ThreadTarget?>(null) }
+    val reading = openRow != null || openThread != null
     var now by remember { mutableStateOf(OffsetDateTime.now()) }
 
     // Reload while shown, and when a page opened from here closes.
-    LaunchedEffect(resumed, openRow == null) {
-        if (!resumed || openRow != null) return@LaunchedEffect
+    LaunchedEffect(resumed, reading) {
+        if (!resumed || reading) return@LaunchedEffect
         while (isActive) {
             viewModel.refresh()
             now = OffsetDateTime.now()
@@ -135,6 +141,11 @@ fun InboxScreen(
     LaunchedEffect(pendingOpen) {
         val open = pendingOpen?.takeIf { it.inbox } ?: return@LaunchedEffect
         val path = open.readerPath ?: return@LaunchedEffect
+        threadTargetForPath(path, open.title.ifBlank { "Inbox" })?.let { target ->
+            openThread = target
+            FollowOpenRequests.pending = null
+            return@LaunchedEffect
+        }
         openRow = InboxRow(
             threadKey = open.sessionId?.let { "agent:$it" }.orEmpty(),
             kind = if (path.startsWith("/docs/")) "doc" else "agent",
@@ -239,7 +250,7 @@ fun InboxScreen(
                         }
                     }
                     items(rows, key = { it.threadKey }) { row ->
-                        val open = { openRow = row }
+                        val open = { inboxThreadTarget(row)?.let { openThread = it } ?: run { openRow = row } }
                         if (row.done) {
                             InboxRowCard(row, now, onClick = open)
                         } else {
@@ -263,6 +274,20 @@ fun InboxScreen(
                 onWatch = onNavigateToWatch,
                 onBoard = onNavigateToBoard,
                 onQueue = onNavigateToQueue,
+            )
+        }
+
+        openThread?.let { target ->
+            ThreadScreen(
+                target = target,
+                onClose = { openThread = null },
+                onOpenTerminal = { sessionId ->
+                    openThread = null
+                    li.rajeshgo.sm.ui.navigation.TerminalOpenRequests.pending = sessionId
+                    onNavigateToWatch()
+                },
+                onDone = { openThread = null },
+                onMessage = { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() },
             )
         }
 

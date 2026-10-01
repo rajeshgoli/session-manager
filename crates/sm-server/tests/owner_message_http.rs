@@ -1406,6 +1406,59 @@ async fn web_thread_json_preserves_quotes_and_recipient() {
     fs::remove_dir_all(f.dir).unwrap();
 }
 
+#[tokio::test]
+async fn thread_json_carries_the_fields_a_native_thread_draws() {
+    let f = fixture();
+    let ask = created_id(
+        &f,
+        "eng00001",
+        "# Keep it?\n\nNothing reads **fills**.",
+        json!({"blocking": true}),
+    )
+    .await;
+    let thread_uri = "/inbox/thread/agent%3Aeng00001?format=json";
+    let (_, thread) = request(&f.app, "GET", thread_uri, None).await;
+    let message = &thread["items"][0];
+    assert_eq!(message["kind"], "message", "{message}");
+    assert_eq!(message["id"], ask);
+    assert_eq!(message["title"], "Keep it?");
+    assert_eq!(
+        message["markdown"],
+        "# Keep it?\n\nNothing reads **fills**."
+    );
+    assert_eq!(message["needs_you"], true);
+    assert_eq!(message["sender"]["id"], "eng00001");
+    let body = json!({
+        "submission_id": "sub-native-01",
+        "body": "The month-end recon does.",
+        "quotes": [{"message_id": ask, "quote": "Nothing reads fills."}],
+    });
+    let (status, sent) = request(
+        &f.app,
+        "POST",
+        "/inbox/thread/agent%3Aeng00001/send",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let (_, thread) = request(&f.app, "GET", thread_uri, None).await;
+    let items = thread["items"].as_array().unwrap();
+    assert_eq!(items[0]["needs_you"], false, "a reply answers the question");
+    let reply = items.iter().find(|item| item["kind"] == "owner").unwrap();
+    assert_eq!(reply["body"], "The month-end recon does.");
+    assert_eq!(reply["quotes"][0]["quote"], "Nothing reads fills.");
+    assert!(reply["to"].is_null(), "sent to the thread's own agent");
+    // A row with a doc names the doc's reader page, which the phone opens.
+    publish_doc(&f, "doc00001", "docs/memo.md", false);
+    let listing = inbox(&f, "docs").await;
+    let doc = row(&listing, "pr:acme/widgets#12");
+    assert!(
+        doc["doc_url"].as_str().unwrap().starts_with("/docs/"),
+        "{doc}"
+    );
+    fs::remove_dir_all(f.dir).unwrap();
+}
+
 // ---- Last turn message and Finished (sm#1789) ------------------------------
 
 async fn stop_hook(f: &Fixture, session: &str, text: &str) {
