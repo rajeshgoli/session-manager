@@ -116,12 +116,12 @@ export function TerminalPage({ id, open }) {
     if (next.id !== id) navigate(`/terminal/${encodeURIComponent(next.id)}`);
   };
   const refocus = () => setTimeout(() => control.current?.focus(), 0);
-  // A retired agent's terminal has nothing left to show, so move on to the next agent.
+  // A retired agent's terminal has nothing left to show, so move on to the next agent,
+  // or to the Agents page when none is left (going back could land on one retired earlier).
   const retired = (done) => {
     if (!done) { reload(); return; }
     const next = rowAfterRetire(order, id);
-    if (next) navigate(`/terminal/${encodeURIComponent(next.id)}`);
-    else back();
+    navigate(next ? `/terminal/${encodeURIComponent(next.id)}` : '/');
   };
 
   // ⌘\ toggles the switcher; ⌘⌥↑ and ⌘⌥↓ switch agents. xterm lets these through.
