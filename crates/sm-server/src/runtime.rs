@@ -1603,7 +1603,13 @@ impl TmuxRuntime {
         Some((x.parse().ok()?, y.parse().ok()?))
     }
 
-    fn wait_for_initial_brief_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
+    /// Wait, up to the initial-brief readiness timeout, until the provider's
+    /// composer accepts input. A handoff successor's brief waits on this too.
+    pub fn wait_for_initial_brief_readiness(
+        &self,
+        tmux_session: &str,
+        provider: &str,
+    ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
         loop {
