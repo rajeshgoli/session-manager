@@ -857,11 +857,6 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let removed_command = concat!("request-codex-", "review");
-    if std::env::args().nth(1).as_deref() == Some(removed_command) {
-        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
-        process::exit(2);
-    }
     let cli = Cli::parse();
     let command = cli.command;
     let command = match command {
