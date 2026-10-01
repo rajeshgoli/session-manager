@@ -10980,18 +10980,22 @@ async fn retire_session_after_auth(
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
-            .retire_core_session_with_runtime_authorized(
+            .retire_core_session_with_runtime_authorized_if_finished_idle(
                 &session_id,
                 authority,
                 session_credential.as_deref(),
                 &runtime,
+                payload.if_finished_idle,
             )?
     } else {
-        state.session_store.retire_core_session_authorized(
-            &session_id,
-            authority,
-            session_credential.as_deref(),
-        )?
+        state
+            .session_store
+            .retire_core_session_authorized_if_finished_idle(
+                &session_id,
+                authority,
+                session_credential.as_deref(),
+                payload.if_finished_idle,
+            )?
     };
     match outcome {
         CoreRetireOutcome::Retired(result) => {
@@ -11003,6 +11007,10 @@ async fn retire_session_after_auth(
                 serde_json::to_value(worktrees::cleanup_after_retire(&state, &session_id).await)?;
             Ok(Json(response))
         }
+        CoreRetireOutcome::PreconditionFailed => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Agent is no longer finished and idle; confirm before retiring".to_owned(),
+        }),
         CoreRetireOutcome::NotFound => Ok(Json(json!({
             "error": format!("Session {session_id} not found")
         }))),
@@ -16409,6 +16417,8 @@ fn decoded_last_query_value(query_string: &str, key: &str) -> Result<Option<Stri
 struct RetireSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
+    #[serde(default)]
+    if_finished_idle: bool,
 }
 
 #[derive(Debug, Deserialize)]

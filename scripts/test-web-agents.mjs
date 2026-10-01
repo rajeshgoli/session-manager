@@ -83,7 +83,9 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
           const answered = [];
           const opened = [];
           const retired = [];
+          const retireBodies = [];
           const handoffs = [];
+          let rejectConditionalRetire = false;
           await page.clock.install({ time: new Date(NOW) });
           await page.exposeFunction('recordOpen', (url) => opened.push(url));
           await page.addInitScript(() => { window.open = (url) => { window.recordOpen(url); return null; }; });
@@ -94,7 +96,9 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
               const file = url.pathname.slice('/assets/'.length);
               return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
             }
-            if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+            if (request.isNavigationRequest()) return route.fulfill({
+              body: shell.replace('<html>', `<html data-theme="${colorScheme}">`), contentType: 'text/html',
+            });
             const answer = /^\/sessions\/([^/]+)\/needs-you\/answered$/.exec(url.pathname);
             if (answer && request.method() === 'POST') {
               const id = decodeURIComponent(answer[1]);
@@ -104,6 +108,11 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             }
             const retire = /^\/sessions\/([^/]+)\/retire$/.exec(url.pathname);
             if (retire && request.method() === 'POST') {
+              const body = JSON.parse(request.postData());
+              retireBodies.push(body);
+              if (body.if_finished_idle && rejectConditionalRetire) {
+                return route.fulfill({ status: 409, json: { detail: 'Agent is no longer finished and idle' } });
+              }
               retired.push(decodeURIComponent(retire[1]));
               return route.fulfill({ json: {} });
             }
@@ -126,6 +135,8 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
           });
           await page.goto('http://localhost/');
           await page.waitForFunction(() => document.querySelectorAll('.acard').length > 5);
+          assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()),
+            colorScheme === 'dark' ? '#09090D' : '#F5F5F2');
 
           const headers = await page.locator('.grp.sec').allInnerTexts();
           assert.deepEqual(headers.map((t) => t.trim().toLowerCase()), ['needs you', 'finished', 'waiting long', 'moving', 'waiting', 'idle · 6']);
@@ -156,6 +167,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             if (shots) await page.screenshot({ path: `${shots}/retire-card-${viewport.width}-${colorScheme}.png`, fullPage: true });
             await card('far-1855').getByRole('button', { name: 'Retire' }).click();
             assert.deepEqual(retired, ['far-1855']);
+            assert.deepEqual(retireBodies, [{ if_finished_idle: true }]);
             assert.equal(new URL(page.url()).searchParams.get('open'), null);
             await card('far-1855').click();
             await page.locator('.details-band').waitFor();
@@ -164,6 +176,12 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button').allInnerTexts(),
               ['Open in Claude ↗', '⌨ Terminal', 'Retire', 'Hand off…', '⋯']);
             if (shots) await page.screenshot({ path: `${shots}/retire-band-${viewport.width}-${colorScheme}.png`, fullPage: true });
+            rejectConditionalRetire = true;
+            await actions.getByRole('button', { name: 'Retire' }).click();
+            await actions.locator('.retire-confirm').waitFor();
+            assert.deepEqual(retired, ['far-1855']);
+            await actions.locator('.retire-confirm').getByRole('button', { name: 'Cancel' }).click();
+            rejectConditionalRetire = false;
             await actions.getByRole('button', { name: 'More' }).click();
             const menu = actions.locator('.pop.menu');
             assert.deepEqual(await menu.locator(':scope > button').allInnerTexts(),

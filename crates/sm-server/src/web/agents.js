@@ -186,28 +186,35 @@ export const canRetireImmediately = (agent) => !!agent.facts?.finished && agent.
 function RetireButton({ agent, onRetired, small = false }) {
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
-  const retire = async () => {
+  const retire = async (ifFinishedIdle = false) => {
     if (busy) return;
     setBusy(true);
     try {
-      await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, { method: 'POST', body: {} });
+      await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, {
+        method: 'POST', body: ifFinishedIdle ? { if_finished_idle: true } : {},
+      });
       toast(`Retired ${agent.name}`);
       setAsking(false);
       onRetired?.();
     } catch (error) {
-      toast(error.message);
+      if (ifFinishedIdle && error.status === 409) {
+        setAsking(true);
+        onRetired?.();
+      } else {
+        toast(error.message);
+      }
     } finally {
       setBusy(false);
     }
   };
   const click = (event) => {
     event.stopPropagation();
-    if (canRetireImmediately(agent)) retire();
+    if (canRetireImmediately(agent)) retire(true);
     else setAsking(true);
   };
   return asking
     ? html`<span class="confirm retire-confirm" onClick=${(event) => event.stopPropagation()}>Retire ${agent.name}?
-        <button type="button" class="btn sm danger" disabled=${busy} onClick=${retire}>Retire</button>
+        <button type="button" class="btn sm danger" disabled=${busy} onClick=${() => retire()}>Retire</button>
         <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></span>`
     : html`<button type="button" class=${`btn danger ${small ? 'sm' : ''}`} disabled=${busy}
         onClick=${click}>Retire</button>`;
