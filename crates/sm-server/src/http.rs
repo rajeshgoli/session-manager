@@ -21018,7 +21018,7 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 18] = [
+    const OWNER_WEB_READS: [&str; 19] = [
         "/client/queue",
         "/client/queue/stats",
         "/client/queue/jobs/job-missing/start-check",
@@ -21037,6 +21037,7 @@ mod tests {
         "/sessions/fork1001/context",
         "/btw-requests/btw-missing",
         "/client/follows",
+        "/review-policies",
     ];
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
@@ -21064,6 +21065,11 @@ mod tests {
             (Method::POST, "/sessions/fork1001/follow", json!({})),
             (Method::DELETE, "/sessions/fork1001/follow", json!({})),
             (Method::POST, "/queue-jobs/job-missing/follow", json!({})),
+            (
+                Method::PUT,
+                "/review-policies",
+                json!({"scope": "repo", "repo": "owner/repo", "reviewer": null}),
+            ),
             (Method::DELETE, "/queue-jobs/job-missing/follow", json!({})),
             (
                 Method::POST,
@@ -21145,6 +21151,28 @@ mod tests {
                 assert_eq!(response["detail"], detail, "{method} {uri} {headers:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn browser_owner_sets_and_reads_review_policies() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let reviewer = json!({"kind": "codex", "model": "gpt-6-astra", "effort": "high"});
+        let request = owner_web_request(
+            Method::PUT,
+            "/review-policies",
+            "sm.example.com",
+            Some(&owner),
+            &[("origin", "https://sm.example.com")],
+            &json!({"scope": "repo", "repo": "owner/repo", "reviewer": reviewer}),
+        );
+        let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = browser_host_get(&app, "/review-policies", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["policies"][0]["reviewer"], reviewer);
+        assert_eq!(body["policies"][0]["set_by_session_id"], Value::Null);
     }
 
     #[tokio::test]
