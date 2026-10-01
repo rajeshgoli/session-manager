@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
 
+pub mod paired;
 pub mod policy;
 
 pub const RUBRIC: &str = include_str!("rubric.md");
@@ -62,6 +63,14 @@ pub fn chain(chosen: &Value) -> Vec<Value> {
             Some("sonnet" | "haiku") => run("codex", "gpt-6-luna", "high"),
             _ => run("codex", "gpt-6-sol", "medium"),
         }),
+        Some("paired") => {
+            // A run of the same model takes over, then that run's own fallback.
+            result.extend(chain(&run(
+                chosen["provider"].as_str().unwrap_or("codex"),
+                chosen["model"].as_str().unwrap_or(""),
+                chosen["effort"].as_str().unwrap_or(""),
+            )));
+        }
         _ => {}
     }
     result
@@ -70,6 +79,16 @@ pub fn chain(chosen: &Value) -> Vec<Value> {
 pub fn label(step: &Value) -> String {
     match step["kind"].as_str() {
         Some("github_codex") => "GitHub Codex".into(),
+        Some("paired") => format!(
+            "Paired {} reviewer ({}, {})",
+            if step["provider"] == "claude" {
+                "Claude"
+            } else {
+                "Codex"
+            },
+            step["model"].as_str().unwrap_or("?"),
+            step["effort"].as_str().unwrap_or("?")
+        ),
         kind => format!(
             "{} run ({}, {})",
             if kind == Some("codex") {
@@ -106,6 +125,44 @@ pub fn meter(db: &Path, provider: &str) -> Result<Option<f64>> {
 
 pub fn should_skip(percent: Option<f64>, limit: i64) -> bool {
     limit < 100 && percent.is_some_and(|p| p >= limit as f64)
+}
+
+/// B4's check 2: the first reason a submitted review is not valid.
+pub fn submission_problem(v: &Value) -> Option<&'static str> {
+    if !v.is_object() {
+        Some("the review must be a JSON object")
+    } else if !v["findings"].is_array() {
+        Some("findings must be an array")
+    } else if v["overall_correctness"]
+        .as_str()
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        Some("overall_correctness must be a non-empty string")
+    } else {
+        None
+    }
+}
+
+/// `1 P1 · 2 P2`, or `0 findings`, as on the posted review's Findings line.
+pub fn counts_text(counts: &Value) -> String {
+    let parts: Vec<String> = ["p0", "p1", "p2", "p3", "unrated"]
+        .iter()
+        .filter_map(|key| {
+            let n = counts[*key].as_i64().unwrap_or(0);
+            (n > 0).then(|| {
+                if *key == "unrated" {
+                    format!("{n} unrated")
+                } else {
+                    format!("{n} {}", key.to_uppercase())
+                }
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        "0 findings".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 pub fn valid_output(v: &Value) -> bool {
@@ -226,24 +283,7 @@ pub fn payload(
     diffs: &std::collections::BTreeMap<String, String>,
     inline: bool,
 ) -> Value {
-    let c = counts(output);
-    let summary = ["p0", "p1", "p2", "p3", "unrated"]
-        .iter()
-        .filter_map(|key| {
-            let n = c[*key].as_i64().unwrap_or(0);
-            (n > 0).then(|| {
-                format!(
-                    "{n} {}",
-                    if *key == "unrated" {
-                        "unrated".to_owned()
-                    } else {
-                        key.to_uppercase()
-                    }
-                )
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let summary = counts_text(&counts(output));
     let sha = request.requested_head_sha.as_deref().unwrap_or("");
     let steps: Vec<Value> =
         serde_json::from_str(request.chain_json.as_deref().unwrap_or("[]")).unwrap_or_default();
@@ -255,7 +295,7 @@ pub fn payload(
     } else {
         String::new()
     };
-    let mut body=format!("<!-- sm-review-request:{} -->\n**sm review** · {} · round {} · {}{}\n\n**Reviewed commit:** `{}` · **Findings:** {} · **Verdict:** {}\n\n{}",request.id,request.reviewer_label.as_deref().unwrap_or("Review run"),request.round,request.policy_source.as_deref().unwrap_or("default"),fallback,&sha[..sha.len().min(10)],if summary.is_empty() {"0 findings"} else {&summary},output["overall_correctness"].as_str().unwrap_or(""),output["overall_explanation"].as_str().unwrap_or(""));
+    let mut body=format!("<!-- sm-review-request:{} -->\n**sm review** · {} · round {} · {}{}\n\n**Reviewed commit:** `{}` · **Findings:** {} · **Verdict:** {}\n\n{}",request.id,request.reviewer_label.as_deref().unwrap_or("Review run"),request.round,request.policy_source.as_deref().unwrap_or("default"),fallback,&sha[..sha.len().min(10)],summary,output["overall_correctness"].as_str().unwrap_or(""),output["overall_explanation"].as_str().unwrap_or(""));
     let mut comments = Vec::new();
     let mut unplaced = Vec::new();
     for f in output["findings"].as_array().into_iter().flatten() {
@@ -433,6 +473,41 @@ mod tests {
         assert!(!should_skip(None, 95));
         assert!(should_skip(Some(95.0), 95));
     }
+    #[test]
+    fn submissions_name_their_first_problem_and_counts_read_like_the_review() {
+        assert_eq!(
+            submission_problem(&json!([])),
+            Some("the review must be a JSON object")
+        );
+        assert_eq!(
+            submission_problem(&json!({"overall_correctness":"patch is correct"})),
+            Some("findings must be an array")
+        );
+        assert_eq!(
+            submission_problem(&json!({"findings":[],"overall_correctness":" "})),
+            Some("overall_correctness must be a non-empty string")
+        );
+        assert_eq!(
+            submission_problem(&json!({"findings":[],"overall_correctness":"patch is correct"})),
+            None
+        );
+        let output = json!({"findings":[{"priority":1},{"priority":2},{"priority":2},{"priority":null}],
+            "overall_correctness":"patch is incorrect"});
+        assert_eq!(counts_text(&counts(&output)), "1 P1 · 2 P2 · 1 unrated");
+        assert_eq!(
+            counts_text(&counts(&json!({"findings":[],"overall_correctness":"ok"}))),
+            "0 findings"
+        );
+        let paired = json!({"kind":"paired","provider":"claude","model":"sonnet","effort":"high"});
+        assert_eq!(label(&paired), "Paired Claude reviewer (sonnet, high)");
+        let c = chain(&paired);
+        assert_eq!(
+            c[1],
+            json!({"kind":"claude","model":"sonnet","effort":"high"})
+        );
+        assert_eq!(c[2]["model"], "gpt-6-luna");
+    }
+
     #[test]
     fn newest_account_does_not_inherit_previous_accounts_meter() {
         let dir = scratch::Scratch::new();

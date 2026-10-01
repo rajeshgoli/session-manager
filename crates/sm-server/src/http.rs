@@ -345,6 +345,7 @@ mod history;
 mod inbox;
 mod merge_holds;
 mod messages;
+mod review_paired;
 mod review_policies;
 mod review_runs;
 mod settings;
@@ -1716,6 +1717,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/review-requests/{request_id}",
             get(get_codex_review_request).delete(cancel_codex_review_request),
+        )
+        .route(
+            "/review-requests/{request_id}/submit",
+            post(review_paired::submit),
         )
         .route("/client/reviews/status", get(client_review_status))
         .route(
@@ -4752,11 +4757,26 @@ async fn list_client_sessions(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     let actor_email = ensure_client_read(&state, &request)?;
+    let reviews = review_paired::session_fields(&state).unwrap_or_else(|error| {
+        eprintln!("review fields for sessions failed: {error:#}");
+        BTreeMap::new()
+    });
     let sessions = state
         .session_store
         .list_sessions(false)?
         .into_iter()
-        .map(|session| client_session_value(&state, session, actor_email.as_deref(), None))
+        .map(|session| {
+            let fields = reviews.get(&session.id).cloned();
+            let mut value = client_session_value(&state, session, actor_email.as_deref(), None);
+            value["waiting_on_review"] = json!(null);
+            value["paired_reviewer"] = json!(null);
+            if let Some(Value::Object(fields)) = fields {
+                for (key, field) in fields {
+                    value[key] = field;
+                }
+            }
+            value
+        })
         .collect::<Vec<_>>();
     Ok(Json(json!({ "sessions": sessions })))
 }
@@ -5001,7 +5021,7 @@ async fn create_review_request_core(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             detail: format!("Failed to inspect Codex review requests: {error}"),
         })?;
-        for existing in active {
+        for existing in &active {
             let existing_owner = existing
                 .requester_session_id
                 .as_deref()
@@ -5018,7 +5038,7 @@ async fn create_review_request_core(
             }
             if existing.requested_head_sha.as_deref() == Some(initial_head_sha.as_str()) {
                 let mut response = codex_review_request_response(&state, existing.clone())?;
-                add_codex_review_claim_warning(&state, &existing, &mut response);
+                add_codex_review_claim_warning(&state, existing, &mut response);
                 handoff::add_review_handoff_ask(
                     &state,
                     payload.requester_session_id.as_deref(),
@@ -5027,11 +5047,18 @@ async fn create_review_request_core(
                     },
                     &mut response,
                 );
-                spawn_codex_review_request_watcher(state.clone(), existing.id);
+                spawn_codex_review_request_watcher(state.clone(), existing.id.clone());
                 return Ok(Json(response));
             }
         }
 
+        let superseded: Vec<CodexReviewRequestRegistration> = active
+            .into_iter()
+            .filter(|existing| {
+                existing.requested_head_sha.as_deref() != Some(initial_head_sha.as_str())
+            })
+            .collect();
+        let new_head = initial_head_sha.clone();
         let registration = RetainedQueueStore::create_codex_review_request_in_path(
             &queue_db_path,
             CreateCodexReviewRequest {
@@ -5061,6 +5088,16 @@ async fn create_review_request_core(
                 codex_review_store_error(error)
             }
         })?;
+        for old in &superseded {
+            review_paired::stop(
+                &state,
+                old,
+                &format!(
+                    "the PR head moved to {}",
+                    &new_head[..new_head.len().min(7)]
+                ),
+            );
+        }
         let settings = state.session_store.owner_settings()?;
         let policy = crate::review::policy::resolve(
             &queue_db_path,
@@ -5071,6 +5108,9 @@ async fn create_review_request_core(
             &settings["reviews"]["reviewer"],
         )?;
         let mut chain = vec![policy["reviewer"].clone()];
+        if chain[0]["kind"] == "paired" {
+            chain[0]["ticket"] = policy["ticket"].clone();
+        }
         chain.extend(policy["fallback"].as_array().into_iter().flatten().cloned());
         RetainedQueueStore::initialize_review_chain(
             &queue_db_path,
@@ -5395,6 +5435,7 @@ fn terminate_codex_review_request_for_closed_pr(
 
 fn recover_codex_review_request_watchers(state: Arc<AppState>) {
     review_runs::start_sweeper(state.clone());
+    review_paired::start_sweeper(state.clone());
     if !state.config.rust_core.runtime_enabled {
         return;
     }
@@ -5608,7 +5649,7 @@ fn push_review_notice(state: &AppState, kind: &str, title: &str, body: &str, rea
 
 /// One poll of a durable review chain, including any late GitHub result.
 async fn poll_github_review_step(
-    state: &AppState,
+    state: &Arc<AppState>,
     db_path: &StdPath,
     request: &CodexReviewRequestRegistration,
 ) -> Result<bool, String> {
@@ -5685,6 +5726,9 @@ async fn poll_github_review_step(
         }
     }
     let step = review_runs::current_step(request)?;
+    if step["kind"] == "paired" {
+        return review_paired::poll(state, db_path, request, &step).await;
+    }
     if step["kind"] != "github_codex" {
         return review_runs::poll_run(state, db_path, request, &step).await;
     }
@@ -6311,6 +6355,7 @@ fn complete_codex_review_request(
         return Ok(());
     }
     let text = render_codex_review_landed_message(registration, &review_match);
+    let source = review_match.source.clone();
     let Some(completed) = RetainedQueueStore::complete_codex_review_request_and_enqueue_in_path(
         queue_db_path,
         request_id,
@@ -6339,6 +6384,19 @@ fn complete_codex_review_request(
             );
         }
     }
+    if source != "paired_review" {
+        review_paired::stop(
+            state,
+            registration,
+            &format!(
+                "{} already posted a review",
+                registration
+                    .reviewer_label
+                    .as_deref()
+                    .unwrap_or("Another reviewer")
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -6351,6 +6409,70 @@ fn supersede_codex_review_request_for_head_change(
     current_head_sha: &str,
     last_polled_at: &str,
 ) -> Result<(), String> {
+    if supersede_codex_review_request_inner(
+        state,
+        queue_db_path,
+        request_id,
+        registration,
+        requested_head_sha,
+        current_head_sha,
+        last_polled_at,
+    )? {
+        review_paired::stop(
+            state,
+            registration,
+            &format!(
+                "the PR head moved to {}",
+                &current_head_sha[..current_head_sha.len().min(7)]
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// D5 for a paired reviewer's own submit: the refusal already tells it to
+/// stay idle, so it gets no separate stop message.
+fn supersede_head_change(
+    state: &AppState,
+    queue_db_path: &std::path::Path,
+    registration: &CodexReviewRequestRegistration,
+    requested_head_sha: &str,
+    current_head_sha: &str,
+    notify_reviewer: bool,
+) -> Result<(), String> {
+    if notify_reviewer {
+        return supersede_codex_review_request_for_head_change(
+            state,
+            queue_db_path,
+            &registration.id,
+            registration,
+            requested_head_sha,
+            current_head_sha,
+            &now_rfc3339(),
+        );
+    }
+    supersede_codex_review_request_inner(
+        state,
+        queue_db_path,
+        &registration.id,
+        registration,
+        requested_head_sha,
+        current_head_sha,
+        &now_rfc3339(),
+    )
+    .map(|_| ())
+}
+
+/// True when this call superseded the request.
+fn supersede_codex_review_request_inner(
+    state: &AppState,
+    queue_db_path: &std::path::Path,
+    request_id: &str,
+    registration: &CodexReviewRequestRegistration,
+    requested_head_sha: &str,
+    current_head_sha: &str,
+    last_polled_at: &str,
+) -> Result<bool, String> {
     let reason = format!(
         "PR head changed from {requested_head_sha} to {current_head_sha}; no retry was posted"
     );
@@ -6367,7 +6489,7 @@ fn supersede_codex_review_request_for_head_change(
     )
     .map_err(|error| error.to_string())?
     else {
-        return Ok(());
+        return Ok(false);
     };
     if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -6381,7 +6503,7 @@ fn supersede_codex_review_request_for_head_change(
             );
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
@@ -6732,11 +6854,16 @@ async fn cancel_codex_review_request(
     )?;
     ensure_core_writes_enabled(&state)?;
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let before =
+        RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)?;
     let Some(registration) =
         RetainedQueueStore::cancel_codex_review_request_in_path(&queue_db_path, &request_id)?
     else {
         return Err(ApiError::NotFound("Codex review request not found"));
     };
+    if let Some(before) = before.filter(|before| before.is_active) {
+        review_paired::stop(&state, &before, "the author cancelled the request");
+    }
     Ok(Json(codex_review_request_response(&state, registration)?))
 }
 
@@ -6769,7 +6896,7 @@ async fn client_review_status(
                         request.state == "completed"
                             && !matches!(
                                 request.review_source.as_deref(),
-                                Some("owner" | "codex_run" | "claude_run")
+                                Some("owner" | "codex_run" | "claude_run" | "paired_review")
                             ),
                     ),
                 codex

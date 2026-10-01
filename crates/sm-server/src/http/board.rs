@@ -1004,6 +1004,21 @@ fn start_options_payload(
         },
         checkout(&state.config, &key.0)?,
     );
+    // The Reviewer row starts on what a request for this ticket would use.
+    let default = state.session_store.owner_settings()?["reviews"]["reviewer"].clone();
+    let resolved = crate::review::policy::resolve(
+        &expand_home(&state.config.sm_send.db_path),
+        &key.0,
+        None,
+        Some(key.1),
+        None,
+        &default,
+    )?;
+    options["review_policy"] = json!({
+        "resolved": resolved["reviewer"],
+        "fallback": resolved["fallback"],
+        "source": resolved["source"],
+    });
     if start_blocked {
         let blockers: Vec<i64> = input
             .edges
@@ -1088,6 +1103,9 @@ pub(super) struct StartRequest {
     brief: Option<String>,
     #[serde(default)]
     start_blocked: bool,
+    /// Stored as the ticket's review policy, set by the owner (spec 1768 I2).
+    #[serde(default)]
+    reviewer: Option<Value>,
 }
 
 pub(super) async fn client_start(
@@ -1253,6 +1271,9 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
         return Err(bad_request("provider must be claude or codex-fork"));
     }
     let key = ticket_key(&payload.repo, payload.number)?;
+    if let Some(reviewer) = &payload.reviewer {
+        crate::review::policy::validate("ticket", reviewer).map_err(bad_request)?;
+    }
     let checked_key = key.clone();
     let (options, lanes) = blocking(&state, move |state| {
         let validation = validate_start(state, &checked_key, payload.start_blocked)?;
@@ -1262,6 +1283,20 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
         ))
     })
     .await?;
+    if let Some(reviewer) = &payload.reviewer {
+        crate::review::policy::set(
+            &expand_home(&state.config.sm_send.db_path),
+            crate::review::policy::PolicyChange {
+                scope: "ticket",
+                repo: &key.0,
+                number: key.1,
+                reviewer: Some(reviewer),
+                session_id: None,
+                name: &state.config.owner_name,
+                now: &now_rfc3339(),
+            },
+        )?;
+    }
     let id = state.session_store.allocate_session_id()?;
     let name = trimmed(&payload.name)
         .unwrap_or_else(|| options["name"].as_str().unwrap_or_default().to_owned());

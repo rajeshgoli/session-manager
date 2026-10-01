@@ -110,7 +110,7 @@ fn command(program: &str, args: &[&str], cwd: Option<&FsPath>) -> Result<String>
     );
     Ok(String::from_utf8(out.stdout)?)
 }
-fn gh(args: &[&str]) -> Result<Value> {
+pub(super) fn gh(args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_str(&command("gh", args, None)?)?)
 }
 fn api_list(route: &str) -> Result<Vec<Value>> {
@@ -122,7 +122,7 @@ fn api_list(route: &str) -> Result<Vec<Value>> {
         .flat_map(|v| v.as_array().into_iter().flatten().cloned())
         .collect())
 }
-fn git(cwd: &FsPath, args: &[&str]) -> Result<String> {
+pub(super) fn git(cwd: &FsPath, args: &[&str]) -> Result<String> {
     command("git", args, Some(cwd))
 }
 fn root(state: &AppState) -> PathBuf {
@@ -131,7 +131,7 @@ fn root(state: &AppState) -> PathBuf {
         .expect("queue DB parent")
         .join("reviews")
 }
-fn step_dir(state: &AppState, r: &CodexReviewRequestRegistration) -> PathBuf {
+pub(super) fn step_dir(state: &AppState, r: &CodexReviewRequestRegistration) -> PathBuf {
     root(state)
         .join(&r.id)
         .join(format!("r{}-s{}", r.round, r.step_index))
@@ -195,7 +195,7 @@ fn linked_context(db: &FsPath, repo: &str, pr: i64) -> Result<Vec<(String, i64, 
     Ok(out)
 }
 
-fn prompt(
+pub(super) fn prompt(
     state: &AppState,
     r: &CodexReviewRequestRegistration,
     pr: &Value,
@@ -401,6 +401,25 @@ fn prepare(
     Ok(job)
 }
 
+/// D3 step 1: the reason to skip a provider whose weekly meter is too high.
+pub(super) fn meter_skip(state: &AppState, provider: &str) -> Result<Option<String>> {
+    let percent = review::meter(&expand_home(&state.config.usage.db_path), provider)?;
+    let limit = state.session_store.owner_settings()?["reviews"]["skip_meter_percent"]
+        .as_i64()
+        .unwrap_or(95);
+    Ok(review::should_skip(percent, limit).then(|| {
+        format!(
+            "{} weekly meter at {}%",
+            if provider == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            },
+            percent.unwrap_or(0.0)
+        )
+    }))
+}
+
 pub(super) async fn poll_run(
     state: &AppState,
     db: &FsPath,
@@ -435,23 +454,8 @@ fn poll_run_blocking(
     let job = match RetainedQueueStore::owned_queue_job(&queue_dir(state), &owner(r))? {
         Some(job) => job,
         None => {
-            let percent = review::meter(
-                &expand_home(&state.config.usage.db_path),
-                step["kind"].as_str().context("provider")?,
-            )?;
-            let limit = state.session_store.owner_settings()?["reviews"]["skip_meter_percent"]
-                .as_i64()
-                .unwrap_or(95);
-            if review::should_skip(percent, limit) {
-                return advance(&format!(
-                    "{} weekly meter at {}%",
-                    if step["kind"] == "codex" {
-                        "Codex"
-                    } else {
-                        "Claude"
-                    },
-                    percent.unwrap_or(0.0)
-                ));
+            if let Some(reason) = meter_skip(state, step["kind"].as_str().context("provider")?)? {
+                return advance(&reason);
             }
             match prepare(state, r, step) {
                 Ok(job) => job,
@@ -502,37 +506,63 @@ fn poll_run_blocking(
         Ok(v) => v,
         Err(_) => return advance("failed: no review output"),
     };
-    post(state, db, r, &run, &output)?;
+    post_review(
+        state,
+        db,
+        r,
+        PostTarget {
+            checkout: &run.checkout,
+            merge_base: &run.merge_base,
+            source: &format!("{}_run", run.provider),
+            cache: true,
+        },
+        &output,
+        || cleanup_step(state, r),
+    )?;
     cleanup_step(state, r)?;
     Ok(true)
 }
 
-fn post(
+/// Where a review's findings are placed, and how it completes the request.
+pub(super) struct PostTarget<'a> {
+    pub checkout: &'a FsPath,
+    pub merge_base: &'a str,
+    /// `review_source` on the completed request.
+    pub source: &'a str,
+    /// A run's payloads survive a restart; a paired reviewer resubmits.
+    pub cache: bool,
+}
+
+/// Posts the review (F) and completes the request. `None` when the request
+/// is no longer current, so nothing was posted.
+pub(super) fn post_review(
     state: &AppState,
     db: &FsPath,
     r: &CodexReviewRequestRegistration,
-    run: &Run,
+    target: PostTarget<'_>,
     output: &Value,
-) -> Result<()> {
+    before_post: impl FnOnce() -> Result<()>,
+) -> Result<Option<Value>> {
     let head = r.requested_head_sha.as_deref().context("head")?;
     let dir = step_dir(state, r);
+    fs::create_dir_all(&dir)?;
     let cached = dir.join("payloads.json");
     // Capture both payloads before deleting the terminal job's checkout. A
     // transient GitHub failure can then be retried after restart without
     // retaining a worktree or rerunning the provider.
-    let payloads: Value = if cached.exists() {
+    let payloads: Value = if target.cache && cached.exists() {
         serde_json::from_slice(&fs::read(&cached)?)?
     } else {
         let mut diffs = BTreeMap::new();
         let files = git(
-            &run.checkout,
+            target.checkout,
             &[
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--name-only",
                 "-z",
-                &run.merge_base,
+                target.merge_base,
                 head,
             ],
         )?;
@@ -540,12 +570,12 @@ fn post(
             diffs.insert(
                 path.to_owned(),
                 git(
-                    &run.checkout,
+                    target.checkout,
                     &[
                         "diff",
                         "--no-ext-diff",
                         "--no-textconv",
-                        &run.merge_base,
+                        target.merge_base,
                         head,
                         "--",
                         path,
@@ -553,12 +583,12 @@ fn post(
                 )?,
             );
         }
-        let payloads = json!({"inline":review::payload(r,&run.checkout,output,&diffs,true),"body":review::payload(r,&run.checkout,output,&diffs,false)});
+        let payloads = json!({"inline":review::payload(r,target.checkout,output,&diffs,true),"body":review::payload(r,target.checkout,output,&diffs,false)});
         fs::write(dir.join("payloads.tmp"), payloads.to_string())?;
         fs::rename(dir.join("payloads.tmp"), &cached)?;
         payloads
     };
-    cleanup_step(state, r)?;
+    before_post()?;
     let route = format!("repos/{}/pulls/{}/reviews", r.repo, r.pr_number);
     let marker = format!("<!-- sm-review-request:{} -->", r.id);
     // Recover a POST accepted before a crash or an ambiguous network response.
@@ -585,7 +615,7 @@ fn post(
         })?
     };
     if posted.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     RetainedQueueStore::record_review_findings(db, &r.id, &review::counts(output))?;
     complete_codex_review_request(
@@ -594,7 +624,7 @@ fn post(
         &r.id,
         r,
         GitHubReviewMatch {
-            source: format!("{}_run", run.provider),
+            source: target.source.to_owned(),
             id: posted.get("id").cloned(),
             head_sha: Some(head.to_owned()),
             url: posted["html_url"].as_str().map(str::to_owned),
@@ -606,7 +636,7 @@ fn post(
         &now_rfc3339(),
     )
     .map_err(anyhow::Error::msg)?;
-    Ok(())
+    Ok(Some(posted))
 }
 
 /// Called immediately before *each* POST, including the 422 body-only retry.
