@@ -29,9 +29,10 @@ export function Reader({ id, controls, onBack = closePanel }) {
       const url = new URL(win.location.href);
       if (url.protocol === 'about:') { setError('This link is not a document reader path.'); return; }
       if (url.origin !== location.origin) return;
-      setCurrent(url.pathname + url.search);
+      setCurrent(url.pathname + url.search + (url.hash === '#sm-review' ? url.hash : ''));
       const details = win.__smDoc ? { ...win.__smDoc.config, prState: win.__smDoc.prState } : { title: win.document.title };
       setDoc({ ...details, hasAppendix: !!win.document.querySelector('.appendix-divider') });
+      if (url.hash === '#sm-review' && win.__smDoc?.openReview) win.__smDoc.openReview();
       // Reader links stay inside the shell, including links in authored docs.
       win.document.addEventListener('click', (e) => {
         const link = e.target.closest('a[href]');

@@ -459,6 +459,13 @@ button.sw-sec { cursor: pointer; }
 .inbox-row:hover,.inbox-row.selected { background:var(--sel); }
 .inbox-row span,.inbox-row small { color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%; }
 .inbox-row strong { overflow-wrap:anywhere; }
+.inbox-entry { position:relative; border-bottom:1px solid var(--line); }
+.inbox-entry .inbox-row { border-bottom:0; padding-right:82px; }
+.inbox-entry-action { position:absolute; right:10px; bottom:10px; border:0; background:transparent; color:var(--ink-2); font-size:.8rem; cursor:pointer; }
+.inbox-entry-action:hover { color:var(--ink); text-decoration:underline; }
+.inbox-fold { border-top:1px solid var(--line); margin-top:12px; }
+.inbox-fold-toggle { width:100%; text-align:left; border:0; background:transparent; color:var(--ink-2); padding:12px 14px; cursor:pointer; font-size:.84rem; }
+.inbox-fold-toggle:hover { background:var(--sel); }
 .inbox-reader,.doc-reader,.thread-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
 .inbox-actions,.reader-bar { display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
 .inbox-actions span,.reader-title { flex:1; min-width:2.667rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -481,6 +488,16 @@ button.sw-sec { cursor: pointer; }
 .thread-items .ask { border-color:var(--magenta); }
 .thread-items .turn { border-left:3px solid var(--cyan); }
 .thread-items .turn .lbl { color:var(--cyan); font-size:.9rem; margin-bottom:6px; }
+.thread-entry { margin:10px 0; }
+.thread-entry .b { margin:2px 0; }
+.thread-entry:has(.me) { display:flex; flex-direction:column; align-items:flex-end; }
+.thread-sender { display:block; color:var(--ink-2); font-size:.8rem; margin:0 0 4px 3px; }
+.thread-doc-card { display:flex; flex-direction:column; gap:5px; margin:12px 0; padding:12px; border:1px solid var(--line); border-left:3px solid var(--cyan); border-radius:8px; background:var(--panel); max-width:90%; overflow-wrap:anywhere; }
+.thread-doc-card small { color:var(--ink-2); }
+.thread-doc-actions { display:flex; gap:7px; margin-top:3px; }
+.thread-target { display:flex; gap:8px; align-items:center; margin-bottom:8px; color:var(--ink-2); font-size:.83rem; }
+.thread-target select { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:4px 7px; max-width:70%; }
+.thread-reply-hint { color:var(--ink-2); font-size:.83rem; margin:0 0 8px; }
 .inbox-list h2.cyan { color:var(--cyan); }
 .thread-items .thread-highlight { background:color-mix(in srgb, var(--magenta) 18%, var(--panel)); box-shadow:0 0 0 2px var(--magenta); }
 .thread-items .m,.thread-items .ev { color:var(--ink-3); font-size:.9rem; }
