@@ -1235,6 +1235,10 @@ fn run() -> Result<()> {
                     "Task complete. Remind cancelled. (No EM registered - no notification sent.)"
                 );
             }
+            println!(
+                "Run this last: any message you receive from now on, including a queue job \
+                 result, re-opens your task."
+            );
         }
         Command::TurnComplete(_) => {
             let Some(session_id) = optional_current_session_id() else {

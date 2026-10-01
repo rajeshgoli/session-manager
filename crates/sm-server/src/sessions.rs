@@ -11141,6 +11141,8 @@ fn deliver_runtime_text_to_session_with_ready_fence_raw(
         if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
             return Ok((status, false));
         }
+        let text = text_with_task_reopen_notice(session, text);
+        let text = text.as_ref();
         let tmux_session = json_text(session.get("tmux_session"))
             .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
         let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
@@ -11214,6 +11216,8 @@ fn deliver_urgent_runtime_text_to_session_raw(
         if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
             return Ok((status, false));
         }
+        let text = text_with_task_reopen_notice(session, text);
+        let text = text.as_ref();
         let tmux_session = json_text(session.get("tmux_session"))
             .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
         let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
@@ -12584,6 +12588,21 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     session.insert("retirement_intent".to_owned(), Value::Null);
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
+
+/// Delivering a message clears the agent's `sm task-complete` marker, so tell
+/// the agent; otherwise it believes it is still complete and never re-runs it
+/// (sm#1935).
+fn text_with_task_reopen_notice<'a>(
+    session: &Map<String, Value>,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if json_text(session.get("agent_task_completed_at")).is_none() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(format!("{text}\n\n{TASK_REOPEN_NOTICE}"))
+}
+
+const TASK_REOPEN_NOTICE: &str = "[sm] This message re-opened your task, which you had marked complete. When you finish, run `sm task-complete` again.";
 
 fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
     session.insert("agent_task_completed_at".to_owned(), Value::Null);
@@ -18813,6 +18832,60 @@ sleep 30
             "target_terminal"
         );
         assert_eq!(state["sessions"][0]["status"], "stopped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_to_a_completed_session_tells_the_agent_its_task_reopened() {
+        let root = unique_temp_path("task-reopen-notice");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let tmux_log = root.join("tmux.log");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                tmux_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string());
+        let mut state = json!({
+            "sessions": [{
+                "id": "reopen01",
+                "provider": "claude",
+                "tmux_session": "claude-reopen01",
+                "status": "idle",
+                "agent_task_completed_at": "2026-10-01T21:14:08Z",
+                "created_at": "2026-10-01T20:55:12Z",
+                "last_activity": "2026-10-01T21:14:08Z"
+            }]
+        });
+
+        let (_, delivered) = deliver_runtime_text_to_session_raw(
+            &mut state,
+            "reopen01",
+            "[sm queue] done",
+            &runtime,
+        )
+        .unwrap();
+        assert!(delivered);
+        assert!(state["sessions"][0]["agent_task_completed_at"].is_null());
+        let sent = fs::read_to_string(&tmux_log).unwrap();
+        assert!(sent.contains("re-opened your task"), "{sent}");
+
+        // Once re-opened, later messages carry no notice.
+        fs::write(&tmux_log, "").unwrap();
+        deliver_runtime_text_to_session_raw(&mut state, "reopen01", "[sm queue] again", &runtime)
+            .unwrap();
+        let sent = fs::read_to_string(&tmux_log).unwrap();
+        assert!(sent.contains("again"), "{sent}");
+        assert!(!sent.contains("re-opened your task"), "{sent}");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
