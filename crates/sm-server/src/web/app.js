@@ -109,6 +109,7 @@ function App() {
     window.addEventListener('popstate', pop);
     const offs = [
       bus.on('navigate', (path) => {
+        if (readLocation().open === 'notes:view' && document.querySelector('.notes-dialog')) return;
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
         if ((target && target.legacy) || build.stale) {
@@ -120,6 +121,7 @@ function App() {
       }),
       bus.on('open', (ref) => {
         const current = readLocation();
+        if (current.open === 'notes:view' && document.querySelector('.notes-dialog') && ref !== current.open) return;
         if (current.open === ref) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];
@@ -538,6 +540,7 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       const mod = event.metaKey || event.ctrlKey;
       if (mod && event.key.toLowerCase() === 'j') {
         event.preventDefault();
+        if (where.open === 'notes:view' && document.querySelector('.notes-dialog')) return;
         where.open === 'notes:view' ? closePanel() : openPanel('notes:view');
         return;
       }

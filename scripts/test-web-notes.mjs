@@ -56,6 +56,10 @@ function server() {
             ? [{ start: note.body.toLowerCase().indexOf(q), end: note.body.toLowerCase().indexOf(q) + q.length }] : [] })));
     }
     if (url.pathname === '/notes/preview') return json({ html: `<h1>${request.postDataJSON().body.split('\n')[0].replace(/^# /, '')}</h1>` });
+    if (url.pathname === '/notes/import') {
+      const note = { id: `import-${notes.length}`, title: 'Imported prompt', body: '# Imported prompt\nBody', version: 1, updated_at: stamp() };
+      notes.unshift(note); return json({ ids: [note.id] });
+    }
     if (url.pathname === '/notes' && method === 'POST') {
       const note = { id: `new-${notes.length}`, title: 'Untitled', body: request.postDataJSON().body, version: 1, updated_at: stamp() };
       notes.unshift(note); return json(note);
@@ -83,6 +87,7 @@ function server() {
     return json({});
   };
   handler.calls = calls;
+  handler.notes = notes;
   return handler;
 }
 
@@ -135,6 +140,10 @@ test('page, terminal pane, actions and a version conflict', async () => {
         assert.equal(await page.locator('.panel .notes-editor').count(), 0, 'first Escape collapses the note');
         await page.keyboard.press('Escape');
         assert.equal(await page.locator('.panel').count(), 0, 'second Escape closes the pane');
+        await page.locator('.notes-editor-slot textarea').fill('Edited just before import');
+        await page.locator('.notes-tools input[type=file]').setInputFiles({ name: 'prompt.md', mimeType: 'text/markdown', buffer: Buffer.from('# Imported prompt\nBody') });
+        await page.getByText('Imported prompt', { exact: true }).first().waitFor();
+        assert.equal(handler.notes.find(note => note.id === 'one').body, 'Edited just before import');
       }
       assert.deepEqual(errors, []);
       await context.close();
@@ -164,7 +173,9 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await context.route('**/*', handler);
     const first = await context.newPage();
     await first.goto(`${origin}/notes`);
-    await first.locator('.note-card-main').first().click();
+    await first.locator('.note-card').first().waitFor();
+    await first.keyboard.press('Meta+j');
+    await first.locator('.panel .note-card-main').first().click();
     const secondContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     await secondContext.route('**/*', handler);
     const second = await secondContext.newPage();
@@ -174,9 +185,12 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await second.locator('.notes-editor textarea').fill('Changed on second browser');
     assert.equal((await secondSave).status(), 200);
     const firstSave = first.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
-    await first.locator('.notes-editor textarea').fill('Keep the first browser text');
+    await first.locator('.panel .notes-editor textarea').fill('Keep the first browser text');
     assert.equal((await firstSave).status(), 409);
     await first.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
+    await first.keyboard.press('Meta+j');
+    assert.equal(await first.locator('.panel').count(), 1, 'pane remains while conflict is unresolved');
+    assert.equal(await first.getByRole('dialog').count(), 1);
     if (shots) await first.screenshot({ path: `${shots}/notes-conflict-1440-light.png` });
     const forcedSave = first.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
     await first.getByRole('button', { name: 'Keep mine' }).click();

@@ -72,8 +72,17 @@ pub(super) async fn list(
     request: Request,
 ) -> Result<Response, ApiError> {
     guard(&state, request.headers(), peer, "GET", request.uri())?;
-    if let Some(shell) = web::shell_page(&state, &request) {
-        return Ok(shell);
+    // Browser navigation asks for HTML. Existing API callers, including local
+    // clients with Accept: */*, keep receiving the JSON list.
+    if request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+    {
+        if let Some(shell) = web::shell_page(&state, &request) {
+            return Ok(shell);
+        }
     }
     let rows = board::blocking(&state, |state| Ok(store(state).list()?)).await?;
     Ok(Json(json!(rows)).into_response())

@@ -21236,6 +21236,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notes_owner_api_stays_json_while_browser_navigation_gets_html() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let request = owner_web_request(
+            Method::GET,
+            "/notes",
+            "sm.example.com",
+            Some(&owner),
+            &[],
+            &json!({}),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+
+        let request = owner_web_request(
+            Method::GET,
+            "/notes",
+            "sm.example.com",
+            Some(&owner),
+            &[("accept", "text/html,application/xhtml+xml")],
+            &json!({}),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+    }
+
+    #[tokio::test]
     async fn notes_http_save_conflict_returns_current_note() {
         let app = owner_web_app();
         let owner =

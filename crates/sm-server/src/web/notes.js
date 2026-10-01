@@ -228,6 +228,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   };
   const importFile = async e => {
     const picked = e.target.files?.[0]; if (!picked) return;
+    if (await save() === false) { e.target.value = ''; return; }
     const form = new FormData(); form.append('file', picked);
     try {
       const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', body: form });
