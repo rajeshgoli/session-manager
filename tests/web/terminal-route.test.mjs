@@ -72,6 +72,19 @@ test('the chosen route is remembered for ten minutes and skips the probes', asyn
   assert.deepEqual(relayOnly.calls, []);
 });
 
+test('a remembered direct route to another server instance probes again', async () => {
+  // The server restarted, or another server now owns localhost:8420: never reuse the url blindly.
+  const storage = memory();
+  const now = Date.parse('2026-09-30T20:00:00Z');
+  await chooseRoute(ticket(), { location: page, fetchImpl: fakeFetch({ [LOCAL.probe]: 'inst-1' }).impl, storage, now });
+  const restarted = { ...ticket(), server_instance: 'inst-2' };
+  const fetch = fakeFetch({ [LOCAL.probe]: 'inst-1', [LAN.probe]: 'inst-2' });
+  const route = await chooseRoute(restarted, { location: page, fetchImpl: fetch.impl, storage, now: now + 60000 });
+  assert.equal(route.url, LAN.url);
+  assert.equal(fetch.calls.length, 2);
+  assert.equal(JSON.parse(storage.items.get('sm-term-route')).instance, 'inst-2');
+});
+
 test('no direct list, no instance, or no storage falls back safely', async () => {
   const fetch = fakeFetch({ [LOCAL.probe]: 'inst-1' });
   assert.equal((await chooseRoute({ ws_url: '/client/terminal' }, { location: page, fetchImpl: fetch.impl, storage: memory() })).direct, false);

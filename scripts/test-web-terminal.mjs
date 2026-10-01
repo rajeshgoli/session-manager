@@ -35,6 +35,10 @@ function fixture() {
       jobs: { running: 2, waiting: 0, review: null, text: '2 running · 2h 56m', tone: 'green' },
     }, { remote_control: { url: 'https://claude.ai/code/session_run' } }),
     agent('sm-1776', 'codex-fork', 'moving', '8240469100', { agent: { state: 'working', since: ago(1) } }),
+    // A paired reviewer mid-round with no queue jobs: its row shows the round, not "Idle".
+    agent('sm-reviewer', 'codex', 'waiting', ago(12), {}, {
+      paired_reviewer: { request_state: 'reviewing', pr_number: 1862, author_name: 'sm-1797', round: 1 },
+    }),
     ...['sm-1768', 'sm-1727', 'sm-scout'].map((name, i) => agent(name, 'claude', 'idle', `1824046${9600 + i}`, { agent: { state: 'idle', since: ago(11 + i * 30) } })),
   ];
 }
@@ -133,8 +137,9 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
             await page.getByRole('button', { name: 'Agents' }).click();
           }
           await page.locator('.sw-row').first().waitFor();
-          assert.deepEqual(await page.locator('.sw-sec').allInnerTexts(), ['NEEDS YOU', 'FINISHED', 'MOVING', 'IDLE · 3 ›']);
-          assert.deepEqual(await rows(page), ['sm-1726-engineer', 'far-1855', 'sm-1776', 'iter8-run']);
+          assert.deepEqual(await page.locator('.sw-sec').allInnerTexts(), ['NEEDS YOU', 'FINISHED', 'MOVING', 'WAITING', 'IDLE · 3 ›']);
+          assert.deepEqual(await rows(page), ['sm-1726-engineer', 'far-1855', 'sm-1776', 'iter8-run', 'sm-reviewer']);
+          assert.equal(await page.locator('.sw-row', { hasText: 'sm-reviewer' }).locator('.sw-fact').innerText(), 'Reviewing PR #1862 for sm-1797 · round 1');
           assert.equal(await page.locator('.sw-row.cur .sw-nm').innerText(), 'iter8-run');
           assert.equal(await page.locator('.sw-row.cur .sw-fact').innerText(), '▶ 2 running · 2h 56m');
           assert.match(await page.locator('.sw-row').first().locator('.sw-fact').innerText(), /^◆ 7m: one manual Chrome check/);
@@ -156,18 +161,20 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, errors, state } = await open(browser, { viewport: { width: 1440, height: 900 } });
-    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.goto(`${ORIGIN}/terminal/sm-reviewer`);
     await page.getByText('Live', { exact: true }).waitFor();
-    // iter8-run is the last row: ⌘⌥↓ stays, ⌘⌥↑ goes to the row above and reattaches.
+    // sm-reviewer is the last row: ⌘⌥↓ stays, ⌘⌥↑ goes to the row above and reattaches.
     await page.keyboard.press('Meta+Alt+ArrowDown');
-    assert.equal(new URL(page.url()).pathname, '/terminal/iter8-run');
+    assert.equal(new URL(page.url()).pathname, '/terminal/sm-reviewer');
     await page.keyboard.press('Meta+Alt+ArrowUp');
-    await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
+    await page.waitForFunction(() => location.pathname === '/terminal/iter8-run');
     await page.waitForFunction(() => window.sockets.length === 2 && window.sockets[1].sent.some((f) => f.type === 'auth'));
     assert.ok(await page.evaluate(() => window.sockets[0].sent.some((f) => f.type === 'detach')), 'the old socket detaches');
     assert.equal(await page.evaluate(() => window.sockets[1].sent.find((f) => f.type === 'auth').ticket_id), 't2');
-    assert.equal(await page.locator('.sw-row.cur .sw-nm').innerText(), 'sm-1776');
+    assert.equal(await page.locator('.sw-row.cur .sw-nm').innerText(), 'iter8-run');
     await page.getByText('Live', { exact: true }).waitFor();
+    await page.keyboard.press('Meta+Alt+ArrowUp');
+    await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
     await page.keyboard.press('Meta+Alt+ArrowUp');
     await page.waitForFunction(() => location.pathname === '/terminal/far-1855');
     await page.keyboard.press('Meta+Alt+ArrowDown');

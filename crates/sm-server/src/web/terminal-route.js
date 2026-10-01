@@ -14,19 +14,21 @@ export function relayRoute(ticket, location) {
   return { url: url.href, direct: false, label: loopback(location.hostname) ? 'Direct' : 'Cloudflare' };
 }
 
-function remembered(storage, now) {
+/** The remembered route, if it is under ten minutes old and names this server instance. */
+function remembered(storage, instance, now) {
   try {
     const value = JSON.parse(storage.getItem(ROUTE_KEY));
-    return value && typeof value.url === 'string' && now - value.at < ROUTE_MS ? value.url : null;
+    const fresh = value && typeof value.url === 'string' && now - value.at < ROUTE_MS && value.instance === instance;
+    return fresh ? value.url : null;
   } catch (e) {
     return null;
   }
 }
 
-/** Remember a route ('relay' or a direct url) for ten minutes. */
-export function rememberRoute(storage, url, now) {
+/** Remember a route ('relay' or a direct url) to this server instance for ten minutes. */
+export function rememberRoute(storage, url, instance, now) {
   try {
-    storage.setItem(ROUTE_KEY, JSON.stringify({ url, at: now }));
+    storage.setItem(ROUTE_KEY, JSON.stringify({ url, instance, at: now }));
   } catch (e) {
     /* private window: probe again next time */
   }
@@ -53,19 +55,19 @@ async function probe(fetchImpl, url, instance, ms) {
  * take the first, in list order, whose instance matches the ticket's; a probe
  * that answers with another instance is someone else's server and is skipped.
  * With no match, use the relay. A route remembered within ten minutes skips
- * the probes.
+ * the probes, unless the server instance has changed since.
  */
 export async function chooseRoute(ticket, { location, fetchImpl, storage, now = Date.now(), ms = PROBE_MS }) {
   const relay = relayRoute(ticket, location);
   const direct = Array.isArray(ticket.direct) ? ticket.direct : [];
   if (!ticket.server_instance || !direct.length) return relay;
-  const known = remembered(storage, now);
+  const known = remembered(storage, ticket.server_instance, now);
   if (known === 'relay') return relay;
   if (known && direct.some((entry) => entry.url === known)) return { url: known, direct: true, label: 'Direct' };
   const answers = await Promise.all(direct.map((entry) => probe(fetchImpl, entry.probe, ticket.server_instance, ms)));
   const index = answers.indexOf(true);
   const chosen = index < 0 ? relay : { url: direct[index].url, direct: true, label: 'Direct' };
-  rememberRoute(storage, chosen.direct ? chosen.url : 'relay', now);
+  rememberRoute(storage, chosen.direct ? chosen.url : 'relay', ticket.server_instance, now);
   return chosen;
 }
 

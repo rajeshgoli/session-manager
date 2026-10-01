@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4): switcher, phone keys, route and round-trip time.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store } from './ui.js';
-import { openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, markAnswered } from './agents.js';
+import { openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-route.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -16,12 +16,12 @@ const session = () => { try { return window.sessionStorage; } catch (e) { return
 
 // ---- switcher (1782 G1) ---------------------------------------------------------
 
-/** The row's second line: the you or finished text (with its ✓), else jobs when there are any, else the agent fact. */
+/** The row's second line: the you or finished text (with its ✓), else jobs or a review round, else the agent fact. */
 export function switcherFact(agent, now = Date.now()) {
   const you = youFact(agent, now);
   if (you) return you;
   const jobs = agent.facts && agent.facts.jobs;
-  return jobs && jobs.tone ? jobsFact(agent) : agentFact(agent, now);
+  return (jobs && jobs.tone) || pairedText(agent.paired_reviewer) ? jobsFact(agent) : agentFact(agent, now);
 }
 
 /**
@@ -182,11 +182,11 @@ export function TerminalPage({ id, open }) {
       timer = setTimeout(() => connect(), Math.min(10000, 500 * 2 ** Math.min(retries++, 5)));
     };
     // A direct socket that ends before attaching uses a fresh ticket through the relay (G4).
-    const fallback = (ws) => {
+    const fallback = (ws, instance) => {
       clearTimeout(handshakeTimer);
       if (socket === ws) socket = null;
       ws.close();
-      rememberRoute(session(), 'relay', Date.now());
+      rememberRoute(session(), 'relay', instance, Date.now());
       connect(true);
     };
     const connect = async (relayOnly = false) => {
@@ -207,7 +207,7 @@ export function TerminalPage({ id, open }) {
         // attempt without another automatic signing request after 30 seconds.
         handshakeTimer = setTimeout(() => {
           if (stopped || socket !== ws || live) return;
-          if (chosen.direct) { fallback(ws); return; }
+          if (chosen.direct) { fallback(ws, ticket.server_instance); return; }
           ended = true; socket = null;
           setConnection('Ended');
           setError('Terminal connection timed out. Check any sign-in or Keychain prompt. If device certificates were just enabled, quit and reopen your browser; otherwise choose Reconnect.');
@@ -239,7 +239,7 @@ export function TerminalPage({ id, open }) {
               if (!stopped && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'output_ack', sequence: frame.sequence }));
             });
           } else if (frame.type === 'exit' || frame.type === 'error') {
-            if (chosen.direct && !attached) { fallback(ws); return; }
+            if (chosen.direct && !attached) { fallback(ws, ticket.server_instance); return; }
             clearTimeout(handshakeTimer);
             ended = true; live = false; stopPing(); setConnection('Ended');
             setError(frame.message || frame.reason || '');
@@ -248,7 +248,7 @@ export function TerminalPage({ id, open }) {
         };
         ws.onclose = (event) => {
           if (stopped || socket !== ws) return;
-          if (chosen.direct && !attached) { fallback(ws); return; }
+          if (chosen.direct && !attached) { fallback(ws, ticket.server_instance); return; }
           clearTimeout(handshakeTimer);
           live = false; stopPing();
           if (ended || event.code === 1000 || event.code === 1008) setConnection('Ended');
