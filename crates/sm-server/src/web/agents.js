@@ -28,7 +28,7 @@ const sectionIndex = (agent) => {
   const index = SECTIONS.indexOf(sectionOf(agent));
   return index < 0 ? SECTIONS.indexOf('idle') : index;
 };
-const hasClaim = (agent) => (agent.claims || []).length > 0;
+const hasTicket = (agent) => (agent.claims || []).some((claim) => claim.kind === 'ticket');
 
 /** Section, then the server's order key, then name (1782 B). */
 export function attentionOrder(a, b) {
@@ -54,13 +54,16 @@ export function sectionAgents(sessions) {
     .filter((group) => group.agents.length);
 }
 
-/** Idle agents without a ticket beyond the fourth fold away (1782 F); nothing else folds. */
-export function foldIdle(agents, keep = 4) {
+/**
+ * Idle agents without a ticket beyond the fourth fold away (1782 F); nothing
+ * else folds, and the open agent (`keepId`) stays out of the fold.
+ */
+export function foldIdle(agents, keepId = null, keep = 4) {
   const shown = [];
   const folded = [];
   let loose = 0;
   for (const agent of agents) {
-    if (hasClaim(agent) || loose++ < keep) shown.push(agent);
+    if (hasTicket(agent) || agent.id === keepId || loose++ < keep) shown.push(agent);
     else folded.push(agent);
   }
   return { shown, folded };
@@ -225,11 +228,7 @@ export function AgentsPage({ openRef }) {
     ? sections.map(({ section, agents }) => {
       let shown = agents;
       let folded = [];
-      if (section === 'idle' && !unfold) {
-        ({ shown, folded } = foldIdle(agents));
-        // The open agent never hides.
-        if (folded.some((agent) => agent.id === selected)) ({ shown, folded } = { shown: agents, folded: [] });
-      }
+      if (section === 'idle' && !unfold) ({ shown, folded } = foldIdle(agents, selected));
       return html`<div class=${`grp sec ${SECTION_TONE[section]}`} id=${`sec-${section}`}>
           ${SECTION_LABEL[section]}${['idle', 'stopped'].includes(section) ? ` · ${agents.length}` : ''}</div>
         <div class="cards">
@@ -344,7 +343,7 @@ export function groupAgents(sessions) {
 function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered }) {
   const codex = (agent.provider || '').startsWith('codex');
   const section = sectionOf(agent);
-  const faded = ['idle', 'stopped'].includes(section) && !hasClaim(agent);
+  const faded = ['idle', 'stopped'].includes(section) && !hasTicket(agent);
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
   const tall = !!youFact(agent, now);

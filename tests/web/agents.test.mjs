@@ -106,6 +106,10 @@ test('only idle agents without a ticket beyond the fourth fold', () => {
   assert.deepEqual(folded.map((a) => a.name), ['idle-4', 'idle-5']);
   assert.equal(foldText(folded, now), '+ 2 more idle: idle-4 (11m), idle-5 (11m)');
   assert.equal(foldIdle(loose.slice(0, 4)).folded.length, 0);
+  // A pull request alone is not a ticket; the open agent stays out of the fold, and only it.
+  const prOnly = agent('pr-only', 'idle', '2', {}, { claims: [{ kind: 'pr', number: 9 }] });
+  assert.deepEqual(foldIdle([...loose, prOnly]).folded.map((a) => a.name), ['idle-4', 'idle-5', 'pr-only']);
+  assert.deepEqual(foldIdle(loose, 'idle-5').folded.map((a) => a.name), ['idle-4']);
 });
 
 test('the summary strip drops zero counts except needs you', () => {
