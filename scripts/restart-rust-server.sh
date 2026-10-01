@@ -837,8 +837,9 @@ elif [[ "$SKIP_BUILD" -eq 1 ]]; then
 else
   step "Building sm-server (service still running)"
   # From REPO_ROOT: cargo reads .cargo/config.toml from the cwd, which
-  # --manifest-path does not redirect.
-  (cd "$REPO_ROOT" && cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR") \
+  # --manifest-path does not redirect. SM_BUILD_SHA names the commit in the
+  # server facts of bug reports filed from the app.
+  (cd "$REPO_ROOT" && SM_BUILD_SHA="$(git_repo rev-parse HEAD 2>/dev/null || true)" cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR") \
     || fail "build failed - the running service was not touched"
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"

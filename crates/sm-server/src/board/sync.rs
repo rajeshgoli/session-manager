@@ -129,6 +129,9 @@ pub trait BoardSource: Send + Sync {
     /// Node ids and current links; `None` for an issue that doesn't exist.
     fn resolve(&self, issues: &[Key]) -> Result<Vec<Option<ResolvedIssue>>, String>;
     fn write_link(&self, mutation: &LinkMutation) -> Result<(), WriteError>;
+    /// Files a new issue; its number and URL. `Err` is GitHub's refusal,
+    /// first line first.
+    fn create_issue(&self, repo: &str, title: &str, body: &str) -> Result<(i64, String), String>;
 }
 
 fn graphql_string(value: &str) -> String {

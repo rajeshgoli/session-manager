@@ -131,6 +131,9 @@ pub enum TicketState {
     Ready,
     InProgress,
     Blocked,
+    /// The standing Bugs ticket: a lane goal that is never started or
+    /// closed from the board (spec 1859 A6).
+    Standing,
     Done,
 }
 
@@ -142,6 +145,7 @@ impl TicketState {
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
+            Self::Standing => "standing",
             Self::Done => "done",
         }
     }
@@ -153,6 +157,7 @@ impl TicketState {
             "ready" => Some(Self::Ready),
             "in_progress" => Some(Self::InProgress),
             "blocked" => Some(Self::Blocked),
+            "standing" => Some(Self::Standing),
             "done" => Some(Self::Done),
             _ => None,
         }
@@ -191,6 +196,8 @@ pub struct ModelInput {
     pub members: BTreeMap<i64, BTreeMap<Key, Member>>,
     /// Repos the "not in any lane" list covers.
     pub read_repos: BTreeSet<String>,
+    /// The standing Bugs ticket (`board_settings.bugs_goal`).
+    pub bugs_goal: Option<Key>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -610,6 +617,8 @@ fn ticket_facts(
         .is_some_and(|children| !children.is_empty() && sub_issues_closed == children.len());
     let state = if !item.is_open() {
         TicketState::Done
+    } else if input.bugs_goal.as_ref() == Some(key) {
+        TicketState::Standing
     } else if needs_you.is_some() {
         TicketState::NeedsYou
     } else if holder.is_some() || open_pr {

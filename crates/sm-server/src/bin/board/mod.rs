@@ -283,9 +283,22 @@ fn ticket_line(ticket: &Value, base: &str) -> String {
                 detail.push(reason.replace('_', " "));
             }
         }
+        // The standing Bugs ticket: its open bugs, not each of them.
+        "standing" => {
+            let open = ticket["waits_on"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|bug| bug["state"].as_str() != Some("done"))
+                .count();
+            detail.push(format!(
+                "{open} open bug{}",
+                if open == 1 { "" } else { "s" }
+            ));
+        }
         _ => {}
     }
-    if state != "done" {
+    if state != "done" && state != "standing" {
         let open: Vec<String> = ticket["waits_on"]
             .as_array()
             .into_iter()

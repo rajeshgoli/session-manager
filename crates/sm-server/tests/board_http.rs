@@ -47,6 +47,10 @@ struct FakeBoard {
     issues: Arc<Mutex<BTreeMap<i64, FakeIssue>>>,
     /// PRs GitHub links to each issue.
     prs: Arc<Mutex<BTreeMap<i64, Vec<PrRef>>>>,
+    /// Issues filed: repo, title, body.
+    created: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// GitHub's refusal of the next issue creations.
+    create_fails: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeBoard {
@@ -153,9 +157,34 @@ impl BoardSource for FakeBoard {
                 parent_id,
                 child_id,
             } => issues.get_mut(&child_id.parse().unwrap()).unwrap().2 = parent_id.parse().ok(),
+            LinkMutation::RemoveBlockedBy {
+                issue_id,
+                blocking_id,
+            } => {
+                let blocking: i64 = blocking_id.parse().unwrap();
+                issues
+                    .get_mut(&issue_id.parse().unwrap())
+                    .unwrap()
+                    .1
+                    .retain(|number| *number != blocking);
+            }
             _ => return Err(WriteError::Refused("not in this fake".into())),
         }
         Ok(())
+    }
+
+    fn create_issue(&self, repo: &str, title: &str, body: &str) -> Result<(i64, String), String> {
+        if let Some(error) = self.create_fails.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let mut issues = self.issues.lock().unwrap();
+        let number = issues.keys().max().copied().unwrap_or(0) + 1;
+        issues.insert(number, (true, Vec::new(), None));
+        self.created
+            .lock()
+            .unwrap()
+            .push((repo.to_owned(), title.to_owned(), body.to_owned()));
+        Ok((number, format!("https://github.com/{repo}/issues/{number}")))
     }
 }
 
@@ -300,6 +329,7 @@ fn fixture_options(
     };
     config.board.repos = vec![REPO.to_owned()];
     config.push.db_path = dir.join("owner_push.db").display().to_string();
+    config.bug_reports.db_path = dir.join("bug_reports.db").display().to_string();
     config.rust_core.fixture_writes_enabled = true;
     config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
     let board = FakeBoard::default();
@@ -514,6 +544,20 @@ async fn link_route_outcomes() {
         Some(
             json!({"repo": REPO, "number": 3, "target_repo": REPO, "target_number": 2,
                     "kind": "after", "remove": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["outcome"], "removed");
+    assert!(f.board.issues.lock().unwrap()[&3].1.is_empty());
+    // GitHub's refusal comes back as 422.
+    let (status, response) = request(
+        &f.app,
+        "POST",
+        "/board/links",
+        Some(
+            json!({"repo": REPO, "number": 3, "target_repo": REPO, "target_number": 1,
+                    "kind": "under", "remove": true}),
         ),
     )
     .await;
@@ -1418,3 +1462,477 @@ async fn claimed_pr_takes_its_state_from_the_board_reference() {
     assert_eq!(ticket["prs"][0]["number"], 77);
     assert_eq!(ticket["prs"][0]["state"], "MERGED");
 }
+
+// ---------------------------------------------------------------------------
+// The app's bug button (sm#1859, ticket #1875).
+
+const PNG: [u8; 12] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+
+fn bug_fixture() -> Fixture {
+    fixture_config(|config| {
+        config.google_auth.session_cookie_secret = Some("board-test-secret".into());
+        config.google_auth.allowlist_emails = vec!["owner@example.com".into()];
+        config.board.checkouts.insert(REPO.into(), "/tmp".into());
+        config.bug_reports.repo = REPO.into();
+    })
+}
+
+/// A report as the web app sends it. The page data names a private ticket.
+fn bug(text: &str) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    json!({
+        "text": text,
+        "client": "web",
+        "client_version": "b3f9build",
+        "page": "Board",
+        "route": "/board?lane=3",
+        "page_data": {"/client/board": {"lanes": [{"goal": "fractal-algo-rust#1774 private plan"}]}},
+        "screenshot_png": STANDARD.encode(PNG),
+    })
+}
+
+async fn file(f: &Fixture, body: Value) -> (StatusCode, Value) {
+    owner_request(f, "POST", "/client/bug-reports", Some(body)).await
+}
+
+/// Raw GET: status, content type, body bytes.
+async fn get_raw(f: &Fixture, uri: &str) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+        .body(Body::empty())
+        .unwrap();
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, content_type, bytes.to_vec())
+}
+
+fn report_row(f: &Fixture, bug_id: &str) -> (String, String, Option<i64>) {
+    Connection::open(f.dir.join("bug_reports.db"))
+        .unwrap()
+        .query_row(
+            "SELECT status, report_text, issue_number FROM bug_reports WHERE id = ?1",
+            [bug_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn bugs_titles(f: &Fixture) -> usize {
+    f.board
+        .created
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, title, _)| title == "Bugs")
+        .count()
+}
+
+async fn board(f: &Fixture) -> Value {
+    let (status, board) = request_json_board(f).await;
+    assert_eq!(status, StatusCode::OK, "{board}");
+    board
+}
+
+fn lane_with_goal(board: &Value, goal: i64) -> Option<Value> {
+    board["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["goal"]["number"] == goal)
+        .cloned()
+}
+
+#[tokio::test]
+async fn bug_report_validation() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let f = bug_fixture();
+    let with = |field: &str, value: Value| {
+        let mut body = bug("Board is wrong");
+        body[field] = value;
+        body
+    };
+    let mut oversized = PNG.to_vec();
+    oversized.resize(8 * 1024 * 1024 + 1, 0);
+    let cases = [
+        (with("text", json!("   ")), StatusCode::BAD_REQUEST),
+        (
+            with("text", json!("x".repeat(4001))),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (with("client", json!("ios")), StatusCode::BAD_REQUEST),
+        (with("page", json!("")), StatusCode::BAD_REQUEST),
+        (with("page", json!("p".repeat(41))), StatusCode::BAD_REQUEST),
+        (
+            with("page_data", json!(["not", "an", "object"])),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            with("page_data", json!({"blob": "x".repeat(300_001)})),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            with("screenshot_png", json!("not base64!")),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            with("screenshot_png", json!(STANDARD.encode(b"GIF89a"))),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            with("screenshot_png", json!(STANDARD.encode(&oversized))),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ];
+    for (body, expected) in cases {
+        let (status, payload) = file(&f, body).await;
+        assert_eq!(status, expected, "{payload}");
+    }
+    let (_, payload) = file(&f, with("text", json!("  \n "))).await;
+    assert_eq!(payload["detail"], "text is required");
+    // Nothing was stored or sent.
+    assert!(f.board.created.lock().unwrap().is_empty());
+    assert!(!f.dir.join("bug_reports.db").exists());
+}
+
+#[tokio::test]
+async fn bug_report_issue_body_is_text_and_links_only() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let f = bug_fixture();
+    f.claim(2, "eng00001");
+    let text = "Board shows 'all parts done' when #1858 is still open\n\nSteps: open the board.";
+    let (status, filed) = file(&f, bug(text)).await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    let bug_id = filed["bug_id"].as_str().unwrap().to_owned();
+    assert!(bug_id.starts_with("BR-"));
+    let number = filed["issue"]["number"].as_i64().unwrap();
+    // No browser hostname here: no owner-only link (bugs.rs unit tests cover it).
+    assert!(filed["facts_url"].is_null());
+    assert_eq!(
+        filed["issue"]["title"],
+        "Board shows 'all parts done' when #1858 is still open"
+    );
+    assert_eq!(
+        filed["issue"]["url"],
+        format!("https://github.com/{REPO}/issues/{number}")
+    );
+    assert_eq!(filed["on_board"], true);
+    assert!(filed["board_note"].is_null());
+    assert!(filed["started"].is_null() && filed["start_error"].is_null());
+
+    let created = f.board.created.lock().unwrap().clone();
+    let (repo, title, body) = &created[0];
+    assert_eq!(repo, REPO);
+    assert_eq!(
+        title,
+        "Board shows 'all parts done' when #1858 is still open"
+    );
+    assert_eq!(
+        body,
+        &format!(
+            "{text}\n\n---\nFiled from the sm web app, Board page.\n\
+             Agents: `sm bug show {bug_id}`\n"
+        )
+    );
+    for private in [
+        "/board?lane=3",
+        "fractal",
+        "private plan",
+        "b3f9build",
+        "eng00001",
+    ] {
+        assert!(!body.contains(private), "{private} leaked: {body}");
+    }
+    assert_eq!(
+        report_row(&f, &bug_id),
+        ("filed".into(), text.into(), Some(number))
+    );
+
+    // The owner page and its screenshot.
+    let (status, content_type, page) = get_raw(&f, &format!("/bug-reports/{bug_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/html"));
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.contains("Steps: open the board."));
+    assert!(page.contains("/board?lane=3"));
+    assert!(page.contains(&format!(
+        r#"<img src="/bug-reports/{bug_id}/screenshot.png""#
+    )));
+    assert!(page.contains("fractal-algo-rust#1774 private plan"));
+    let (status, content_type, png) =
+        get_raw(&f, &format!("/bug-reports/{bug_id}/screenshot.png")).await;
+    assert_eq!(
+        (status, content_type.as_str()),
+        (StatusCode::OK, "image/png")
+    );
+    assert_eq!(png, PNG);
+    let (status, _, _) = get_raw(&f, "/bug-reports/BR-missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The agent route carries the private part.
+    let (status, report) = request(&f.app, "GET", &format!("/bugs/{bug_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["text"], text);
+    assert_eq!(report["route"], "/board?lane=3");
+    assert_eq!(report["client_version"], "b3f9build");
+    assert_eq!(report["has_screenshot"], true);
+    assert_eq!(report["issue"]["number"], number);
+    assert_eq!(
+        report["page_data"]["/client/board"]["lanes"][0]["goal"],
+        "fractal-algo-rust#1774 private plan"
+    );
+    let sessions = report["server_facts"]["sessions"].as_array().unwrap();
+    let eng = sessions.iter().find(|s| s["id"] == "eng00001").unwrap();
+    assert_eq!(eng["name"], "eng00001-agent");
+    assert_eq!(eng["ticket"], format!("{REPO}#2"));
+    assert!(!sessions.iter().any(|s| s["id"] == "gone0001"));
+    assert!(report["server_facts"]["board"]["lanes"].is_array());
+    assert_eq!(report["server_facts"]["truncated"], false);
+    let (status, _, encoded) = get_raw(
+        &f,
+        &format!("/bugs/{bug_id}/screenshot.png?encoding=base64"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(STANDARD.decode(encoded).unwrap(), PNG);
+}
+
+#[tokio::test]
+async fn bug_report_title_truncation() {
+    let f = bug_fixture();
+    let line = "é".repeat(100);
+    let (status, filed) = file(&f, bug(&format!("\n  {line}\nsecond line"))).await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    let title = f.board.created.lock().unwrap()[0].1.clone();
+    assert_eq!(title.chars().count(), 80);
+    assert_eq!(title, format!("{}…", "é".repeat(79)));
+    assert_eq!(filed["issue"]["title"], title);
+}
+
+#[tokio::test]
+async fn bug_report_gh_failure_keeps_report() {
+    let f = bug_fixture();
+    *f.board.create_fails.lock().unwrap() = Some(
+        "HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry gh auth login".into(),
+    );
+    let (status, body) = file(&f, bug("Inbox loses my reply")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        body["detail"],
+        "HTTP 401: Bad credentials (https://api.github.com/graphql)"
+    );
+    let bug_id = body["bug_id"].as_str().unwrap();
+    assert_eq!(
+        report_row(&f, bug_id),
+        ("unfiled".into(), "Inbox loses my reply".into(), None)
+    );
+    assert_eq!(bugs_titles(&f), 0);
+}
+
+#[tokio::test]
+async fn bugs_lane_lifecycle() {
+    let f = bug_fixture();
+    // The options route before any Bugs ticket exists.
+    let (status, options) = owner_request(&f, "GET", "/client/bug-reports/options", None).await;
+    assert_eq!(status, StatusCode::OK, "{options}");
+    assert_eq!(options["repo"], REPO);
+    assert_eq!(options["working_dir"], "/tmp");
+    assert_eq!(options["review_policy"]["source"], "default");
+
+    // First bug: creates the Bugs ticket and its lane.
+    let (_, first) = file(&f, bug("First bug")).await;
+    let first = first["issue"]["number"].as_i64().unwrap();
+    assert_eq!(bugs_titles(&f), 1);
+    let goal = first + 1;
+    assert_eq!(f.board.created.lock().unwrap()[1].2, BUGS_BODY);
+    let lane = lane_with_goal(&board(&f).await, goal).expect("Bugs lane");
+    assert_eq!(lane["goal"]["title"], format!("Ticket {goal}"));
+    assert_eq!(lane["goal"]["state"], "standing");
+    assert_eq!(lane["added_by_name"], "Owner");
+    let state_of = |lane: &Value, number: i64| {
+        lane["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ticket| ticket["number"] == number)
+            .map(|ticket| ticket["state"].clone())
+    };
+    assert_eq!(state_of(&lane, first), Some(json!("ready")));
+    assert_eq!(state_of(&lane, goal), Some(json!("standing")));
+    // The goal is in no count.
+    let counts = &lane["counts"];
+    let counted: i64 = [
+        "needs_you",
+        "close_ready",
+        "ready",
+        "in_progress",
+        "blocked",
+        "done",
+    ]
+    .iter()
+    .map(|key| counts[key].as_i64().unwrap())
+    .sum();
+    assert_eq!(counted, 1, "{counts}");
+    // Start and Close refuse it.
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(goal))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let close_body = json!({"repo": REPO, "number": goal});
+    let (status, body) = owner_request(&f, "POST", "/client/board/close", Some(close_body)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Second bug: same ticket and lane.
+    let (_, second) = file(&f, bug("Second bug")).await;
+    let second = second["issue"]["number"].as_i64().unwrap();
+    assert_eq!(bugs_titles(&f), 1);
+    let board_now = board(&f).await;
+    let bugs_lanes = board_now["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|lane| lane["goal"]["number"] == goal)
+        .count();
+    assert_eq!(bugs_lanes, 1);
+    let lane = lane_with_goal(&board_now, goal).unwrap();
+    assert_eq!(state_of(&lane, second), Some(json!("ready")));
+
+    // The options route now resolves the Bugs lane's policy.
+    let (_, options) = owner_request(&f, "GET", "/client/bug-reports/options", None).await;
+    assert_eq!(options["review_policy"]["source"], "default");
+
+    // Ended lane: the next bug adds it back.
+    let lane_id = lane["id"].as_i64().unwrap();
+    let (status, _) = owner_request(
+        &f,
+        "DELETE",
+        &format!("/client/board/lanes/{lane_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(lane_with_goal(&board(&f).await, goal).is_none());
+    let (_, third) = file(&f, bug("Third bug")).await;
+    assert_eq!(third["on_board"], true, "{third}");
+    assert!(lane_with_goal(&board(&f).await, goal).is_some());
+    assert_eq!(bugs_titles(&f), 1);
+
+    // Closed Bugs ticket: the next bug starts a fresh one.
+    close(&f, goal);
+    pass(&f).await;
+    assert!(lane_with_goal(&board(&f).await, goal).is_none());
+    let (_, fourth) = file(&f, bug("Fourth bug")).await;
+    assert_eq!(fourth["on_board"], true, "{fourth}");
+    assert_eq!(bugs_titles(&f), 2);
+    let fresh = fourth["issue"]["number"].as_i64().unwrap() + 1;
+    let lane = lane_with_goal(&board(&f).await, fresh).expect("fresh Bugs lane");
+    assert_eq!(lane["goal"]["state"], "standing");
+    assert_eq!(
+        state_of(&lane, fourth["issue"]["number"].as_i64().unwrap()),
+        Some(json!("ready"))
+    );
+}
+
+#[tokio::test]
+async fn bugs_lane_drops_closed_links() {
+    let f = bug_fixture();
+    let (_, first) = file(&f, bug("First bug")).await;
+    let first = first["issue"]["number"].as_i64().unwrap();
+    let goal = first + 1;
+    let (_, second) = file(&f, bug("Second bug")).await;
+    let second = second["issue"]["number"].as_i64().unwrap();
+    close(&f, first);
+    pass(&f).await;
+    let (_, third) = file(&f, bug("Third bug")).await;
+    let third = third["issue"]["number"].as_i64().unwrap();
+    let blocked_by = f.board.issues.lock().unwrap()[&goal].1.clone();
+    assert_eq!(blocked_by, vec![second, third]);
+    let edges: Vec<i64> = Connection::open(f.dir.join("message_queue.db"))
+        .unwrap()
+        .prepare(
+            "SELECT blocker_number FROM board_edges
+             WHERE waiter_number = ?1 AND kind = 'after' ORDER BY blocker_number",
+        )
+        .unwrap()
+        .query_map([goal], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(edges, vec![second, third]);
+}
+
+#[tokio::test]
+async fn bug_report_starts_agent() {
+    let f = bug_fixture();
+    let mut body = bug("Queue page is blank");
+    body["start"] = json!({"provider": "claude", "model": "opus[1m]", "reasoning_effort": "high"});
+    let (status, filed) = file(&f, body).await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    let number = filed["issue"]["number"].as_i64().unwrap();
+    assert!(filed["start_error"].is_null(), "{filed}");
+    // Named and briefed by the server from the ticket, as board Start does.
+    assert_eq!(filed["started"]["name"], format!("widgets-{number}"));
+    let id = filed["started"]["session_id"].as_str().unwrap();
+    let (_, session) = request(&f.app, "GET", &format!("/sessions/{id}"), None).await;
+    assert_eq!(session["provider"], "claude", "{session}");
+    let holder: String = Connection::open(f.dir.join("message_queue.db"))
+        .unwrap()
+        .query_row(
+            "SELECT session_id FROM work_claims WHERE repo = ?1 AND number = ?2 AND ended_at IS NULL",
+            params![REPO, number],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(holder, id);
+}
+
+#[tokio::test]
+async fn bug_report_start_failure_keeps_issue() {
+    let f = bug_fixture();
+    // Session creation fails after the reservation: the bug stays filed.
+    fs::write(f.dir.join("logs"), "not a directory").unwrap();
+    let mut body = bug("Settings won't save");
+    body["start"] = json!({"provider": "claude"});
+    let (status, filed) = file(&f, body).await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    assert!(filed["started"].is_null());
+    assert!(
+        filed["start_error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{filed}"
+    );
+    let bug_id = filed["bug_id"].as_str().unwrap();
+    assert_eq!(report_row(&f, bug_id).0, "filed");
+    assert_eq!(f.board.created.lock().unwrap().len(), 2);
+    // Board Start on the ticket is the retry.
+    fs::remove_file(f.dir.join("logs")).unwrap();
+    let number = filed["issue"]["number"].as_i64().unwrap();
+    let (status, started) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(number))).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+}
+
+#[tokio::test]
+async fn bug_report_refuses_agent_session() {
+    let f = bug_fixture();
+    // The CLI and agents: no owner sign-in.
+    let (status, _) = request(&f.app, "POST", "/client/bug-reports", Some(bug("x"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/client/bug-reports")
+        .header("content-type", "application/json")
+        .header("x-sm-session", "eng00001")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+        .body(Body::from(bug("x").to_string()))
+        .unwrap();
+    let response = f.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(f.board.created.lock().unwrap().is_empty());
+}
+
+const BUGS_BODY: &str = "Standing lane for bugs filed from the sm app. sm links every open bug to this ticket so the board shows them in the Bugs lane. Leave it open; closing it makes sm start a new one with the next bug.";

@@ -61,6 +61,32 @@ impl BoardSource for GhCliBoardSource {
             None => Ok(()),
         }
     }
+
+    fn create_issue(&self, repo: &str, title: &str, body: &str) -> Result<(i64, String), String> {
+        let args: Vec<String> = [
+            "issue",
+            "create",
+            "-R",
+            repo,
+            "--title",
+            title,
+            "--body-file",
+            "-",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let output = gh_command_output_with_input(&args, body.as_bytes(), Duration::from_secs(30))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("gh issue create failed")
+                .to_owned());
+        }
+        super::bugs::parse_created_issue(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 
 /// Pass requests for the read loop (C1): at most one pass runs and one
@@ -206,7 +232,7 @@ fn recompute_inner(state: &AppState, alerts: bool) -> anyhow::Result<board::Reco
 /// Appendix I: a recompute's alerts become owner notices. Called under the
 /// board lock after every recompute; a failure is logged and the board
 /// still shows the change.
-fn send_alerts(state: &AppState, recomputed: &board::Recomputed) {
+pub(super) fn send_alerts(state: &AppState, recomputed: &board::Recomputed) {
     send_alerts_excluding(state, recomputed, &BTreeSet::new());
 }
 
@@ -636,7 +662,7 @@ fn add_auto_start_fields(
     ticket["auto_start"] = auto_starts.get(&key).cloned().unwrap_or(Value::Null);
 }
 
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     state: &Arc<AppState>,
     work: impl FnOnce(&AppState) -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -646,7 +672,7 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| ApiError::Internal(anyhow::anyhow!("board task failed: {error}")))?
 }
 
-fn refusal_error(refusal: Refusal, lane: Option<Value>) -> ApiError {
+pub(super) fn refusal_error(refusal: Refusal, lane: Option<Value>) -> ApiError {
     let status = match &refusal {
         Refusal::NotFound(_) => StatusCode::NOT_FOUND,
         Refusal::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -660,7 +686,7 @@ fn refusal_error(refusal: Refusal, lane: Option<Value>) -> ApiError {
     ApiError::StatusBody { status, body }
 }
 
-fn bad_request(detail: impl Into<String>) -> ApiError {
+pub(super) fn bad_request(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::BAD_REQUEST,
         detail: detail.into(),
@@ -832,7 +858,7 @@ pub(super) struct PostLaneRequest {
 
 /// D4: checks the goal, adds the lane at the bottom, and reads GitHub so
 /// the lane's first members are its members as planned, not new ones.
-fn add_lane(
+pub(super) fn add_lane(
     state: &AppState,
     goal: Key,
     added_by: String,
@@ -971,7 +997,7 @@ pub(super) fn owner_guard(
     Ok(owner)
 }
 
-fn owner_write_guard(
+pub(super) fn owner_write_guard(
     state: &AppState,
     headers: &HeaderMap,
     peer_addr: SocketAddr,
@@ -1153,7 +1179,7 @@ pub(super) async fn client_board_refresh(
 }
 
 /// Resolve once on the server so both the model catalog and Start use the same checkout.
-fn checkout(config: &AppConfig, repo: &str) -> Result<String, ApiError> {
+pub(super) fn checkout(config: &AppConfig, repo: &str) -> Result<String, ApiError> {
     checkout_in(config, repo, &expand_home("~/projects"))
 }
 
@@ -1318,18 +1344,18 @@ pub(super) async fn start_options(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct StartRequest {
-    repo: String,
-    number: i64,
-    provider: String,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    name: Option<String>,
-    brief: Option<String>,
+    pub(super) repo: String,
+    pub(super) number: i64,
+    pub(super) provider: String,
+    pub(super) model: Option<String>,
+    pub(super) reasoning_effort: Option<String>,
+    pub(super) name: Option<String>,
+    pub(super) brief: Option<String>,
     #[serde(default)]
-    start_blocked: bool,
+    pub(super) start_blocked: bool,
     /// Stored as the ticket's review policy, set by the owner (spec 1768 I2).
     #[serde(default)]
-    reviewer: Option<Value>,
+    pub(super) reviewer: Option<Value>,
 }
 
 pub(super) async fn client_start(
@@ -1667,7 +1693,11 @@ pub(super) fn validate_start(
     })
 }
 
-async fn start(state: Arc<AppState>, payload: StartRequest, auto: bool) -> Result<Value, ApiError> {
+pub(super) async fn start(
+    state: Arc<AppState>,
+    payload: StartRequest,
+    auto: bool,
+) -> Result<Value, ApiError> {
     if !matches!(payload.provider.as_str(), "claude" | "codex-fork") {
         return Err(bad_request("provider must be claude or codex-fork"));
     }

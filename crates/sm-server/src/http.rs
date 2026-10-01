@@ -166,9 +166,6 @@ const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
 // give up once this many `@codex review` comments have been posted.
 const CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS: i64 = 120;
 const CODEX_REVIEW_MAX_ATTEMPTS: i64 = 3;
-const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
-const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
-const BUG_REPORT_MAX_SERVER_STATE_CHARS: usize = 200_000;
 const MOBILE_TERMINAL_DEFAULT_ROWS: u16 = 24;
 const MOBILE_TERMINAL_DEFAULT_COLS: u16 = 80;
 const MOBILE_TERMINAL_MIN_ROWS: u16 = 2;
@@ -340,6 +337,7 @@ mod board;
 mod board_clock;
 mod board_links;
 mod browser_terminal;
+mod bugs;
 mod claims;
 mod docs;
 mod follows;
@@ -947,6 +945,22 @@ fn gh_command_output(args: &[String], timeout_duration: Duration) -> Result<Outp
             let mut command = Command::new("gh");
             command.args(args);
             crate::child_output::output_with_timeout(command, timeout_duration)
+        },
+        || thread::sleep(GH_TRANSPORT_RETRY_DELAY),
+    )
+}
+
+/// `gh_command_output` with `input` on stdin (`--body-file -`).
+fn gh_command_output_with_input(
+    args: &[String],
+    input: &[u8],
+    timeout_duration: Duration,
+) -> Result<Output, String> {
+    retry_github_transport(
+        || {
+            let mut command = Command::new("gh");
+            command.args(args);
+            crate::child_output::output_with_timeout_input(command, input, timeout_duration)
         },
         || thread::sleep(GH_TRANSPORT_RETRY_DELAY),
     )
@@ -1688,7 +1702,18 @@ pub fn router(state: AppState) -> Router {
             "/queue-jobs/{job_id}/follow",
             post(follows::follow_queue_job).delete(follows::unfollow_queue_job),
         )
-        .route("/client/bug-reports", post(submit_client_bug_report))
+        .route("/client/bug-reports", post(bugs::file_bug_report))
+        .route("/client/bug-reports/options", get(bugs::bug_report_options))
+        .route("/bug-reports/{bug_id}", get(bugs::bug_report_page))
+        .route(
+            "/bug-reports/{bug_id}/screenshot.png",
+            get(bugs::bug_report_screenshot),
+        )
+        .route("/bugs/{bug_id}", get(bugs::agent_bug))
+        .route(
+            "/bugs/{bug_id}/screenshot.png",
+            get(bugs::agent_bug_screenshot),
+        )
         .route("/client/terminal", get(mobile_terminal_endpoint))
         .route(
             "/client/terminal/probe",
@@ -3025,116 +3050,6 @@ async fn client_host_status(
     Ok(Json(crate::host_status::snapshot().await))
 }
 
-async fn submit_client_bug_report(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    uri: Uri,
-    headers: HeaderMap,
-    Json(payload): Json<ClientBugReportRequest>,
-) -> Result<Json<ClientBugReportResponse>, ApiError> {
-    let request_target = request_target_from_uri(&uri);
-    let access_context =
-        ensure_mobile_cloudflare_access_from_parts(&state, &headers, Some(peer_addr))?;
-    ensure_public_edge_assertion_from_parts(
-        &state,
-        &headers,
-        Some(peer_addr),
-        "POST",
-        &request_target,
-    )?;
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        "/client/bug-reports",
-    )?;
-    let actor_email = request_actor_email_from_parts(&state.config, &headers, Some(peer_addr));
-    if actor_email.is_none() && state.config.google_auth.requested() {
-        return Err(ApiError::Auth {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required",
-            login_url: None,
-        });
-    }
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        actor_email.as_deref(),
-    )?;
-    let report_text = payload.report_text.trim().to_owned();
-    if report_text.is_empty() {
-        return Err(ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: "report_text is required".to_owned(),
-        });
-    }
-    if report_text.chars().count() > BUG_REPORT_MAX_TEXT_CHARS {
-        return Err(ApiError::Status {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            detail: format!("report_text exceeds {BUG_REPORT_MAX_TEXT_CHARS} characters"),
-        });
-    }
-    let route = payload
-        .client_state
-        .as_ref()
-        .and_then(|value| value.get("route"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let client_state = if payload.include_debug_state {
-        validate_json_payload_size(
-            "client_state",
-            payload.client_state.clone(),
-            BUG_REPORT_MAX_CLIENT_STATE_CHARS,
-        )?
-    } else {
-        None
-    };
-    let server_state = if payload.include_debug_state {
-        validate_json_payload_size(
-            "server_state",
-            Some(bug_report_server_state(
-                &state,
-                payload.selected_session_id.as_deref(),
-            )?),
-            BUG_REPORT_MAX_SERVER_STATE_CHARS,
-        )?
-    } else {
-        None
-    };
-    let bug_report_db_path = expand_home(&state.config.bug_reports.db_path);
-    let store = BugReportStore::new(
-        bug_report_db_path.clone(),
-        state.config.bug_reports.max_reports,
-    );
-    let created = store.create_report(CreateBugReport {
-        report_text: report_text.clone(),
-        reported_by: actor_email,
-        selected_session_id: payload.selected_session_id.clone(),
-        route,
-        app_version: payload.app_version,
-        artifact_hash: payload.artifact_hash,
-        include_debug_state: payload.include_debug_state,
-        client_state,
-        server_state,
-    })?;
-    let (maintainer_notified, delivery_result) = notify_maintainer_of_bug_report(
-        &state,
-        &created.id,
-        &report_text,
-        &payload.selected_session_id,
-        &bug_report_db_path,
-    )
-    .unwrap_or_else(|error| (false, format!("failed:{}", error_name(&error))));
-    store.update_delivery_result(&created.id, &delivery_result)?;
-    Ok(Json(ClientBugReportResponse {
-        status: "submitted",
-        bug_id: created.id,
-        maintainer_notified,
-    }))
-}
-
 async fn list_humans(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -3471,90 +3386,6 @@ async fn inbound_email_webhook(
         "restored": restored,
         "delivery_result": if outcome.delivered { "delivered" } else { "queued" },
     })))
-}
-
-fn notify_maintainer_of_bug_report(
-    state: &AppState,
-    bug_id: &str,
-    report_text: &str,
-    selected_session_id: &Option<String>,
-    db_path: &std::path::Path,
-) -> Result<(bool, String), ApiError> {
-    let Some(maintainer) = state
-        .session_store
-        .lookup_agent_registration("maintainer")?
-    else {
-        return Ok((false, "maintainer_not_found".to_owned()));
-    };
-    let Some(maintainer_session) = state.session_store.get_session(&maintainer.session_id)? else {
-        return Ok((false, "maintainer_not_found".to_owned()));
-    };
-    if state.config.rust_core.runtime_enabled && !is_primary_node(&maintainer_session.node) {
-        return Ok((
-            false,
-            format!("unsupported_remote_node:{}", maintainer_session.node),
-        ));
-    }
-    let selected = selected_session_id.as_deref().unwrap_or("-");
-    let message = format!(
-        "[app bug] {bug_id}\nreport: {}\nsession: {selected}\ndb: {}",
-        bug_report_summary(report_text),
-        db_path.display()
-    );
-    let payload = SendCoreInputRequest {
-        text: message,
-        delivery_mode: "important".to_owned(),
-        sender_session_id: None,
-        from_sm_send: false,
-        timeout_seconds: None,
-        notify_on_delivery: false,
-        notify_after_seconds: None,
-        notify_on_stop: false,
-        remind_soft_threshold: None,
-        remind_hard_threshold: None,
-        remind_cancel_on_reply_session_id: None,
-        parent_session_id: None,
-    };
-    let outcome = if state.config.rust_core.runtime_enabled {
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state.session_store.send_core_input_with_runtime(
-            &maintainer.session_id,
-            payload,
-            &runtime,
-        )?
-    } else {
-        state
-            .session_store
-            .send_core_input(&maintainer.session_id, payload)?
-    };
-    let Some(outcome) = outcome else {
-        return Ok((false, "maintainer_not_found".to_owned()));
-    };
-    if outcome.delivered {
-        return Ok((true, "delivered".to_owned()));
-    }
-    if matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
-        return Ok((false, outcome.status));
-    }
-    Ok((true, "queued".to_owned()))
-}
-
-fn bug_report_summary(report_text: &str) -> String {
-    let mut summary = report_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if summary.chars().count() > 160 {
-        summary = summary.chars().take(157).collect::<String>();
-        summary.push_str("...");
-    }
-    summary
-}
-
-fn error_name(error: &ApiError) -> &'static str {
-    match error {
-        ApiError::Internal(_) => "internal",
-        ApiError::NotFound(_) => "not_found",
-        ApiError::Status { .. } | ApiError::StatusBody { .. } => "status",
-        ApiError::Auth { .. } => "auth",
-    }
 }
 
 fn email_bridge(config: &AppConfig) -> Result<EmailBridge, ApiError> {
@@ -15199,6 +15030,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/board"
         || path == "/client/board/badge"
         || path == "/client/board/start-options"
+        || path == "/client/bug-reports/options"
+        || path.starts_with("/bug-reports/")
         || path.starts_with("/client/github/")
         || path == "/client/settings"
         || path == "/history"
@@ -15838,67 +15671,6 @@ fn request_actor_email(config: &AppConfig, request: &Request) -> Option<String> 
     request_actor_email_from_parts(config, request.headers(), peer_addr)
 }
 
-fn validate_json_payload_size(
-    field_name: &str,
-    payload: Option<Value>,
-    max_chars: usize,
-) -> Result<Option<Value>, ApiError> {
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let raw = serde_json::to_string(&payload).map_err(|_| ApiError::Status {
-        status: StatusCode::BAD_REQUEST,
-        detail: format!("{field_name} must be JSON serializable"),
-    })?;
-    if raw.chars().count() > max_chars {
-        return Err(ApiError::Status {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            detail: format!("{field_name} exceeds {max_chars} serialized characters"),
-        });
-    }
-    Ok(Some(payload))
-}
-
-fn bug_report_server_state(
-    state: &AppState,
-    selected_session_id: Option<&str>,
-) -> Result<Value, ApiError> {
-    let sessions = state
-        .session_store
-        .list_sessions(false)?
-        .into_iter()
-        .map(|session| session_response_with_live_activity(state, session))
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()?;
-    let selected_session = if let Some(session_id) = selected_session_id {
-        match state.session_store.get_session(session_id)? {
-            Some(session) => json!({
-                "found": true,
-                "session": client_session_response_with_live_activity(state, session),
-            }),
-            None => json!({
-                "id": session_id,
-                "found": false,
-            }),
-        }
-    } else {
-        Value::Null
-    };
-    Ok(json!({
-        "captured_at": now_rfc3339(),
-        "bootstrap": client_bootstrap_response(
-            &state.config,
-            mobile_terminal_runtime_disabled(state),
-            state.studio_ssh_enabled.load(Ordering::SeqCst),
-        ),
-        "health": {
-            "status": "healthy",
-        },
-        "sessions": sessions,
-        "selected_session": selected_session,
-    }))
-}
-
 fn device_auth_user(headers: &HeaderMap, config: &AppConfig) -> Option<AuthenticatedUser> {
     let token = request_bearer_token(headers)?;
     let secret = trimmed(&config.google_auth.session_cookie_secret)?;
@@ -16501,30 +16273,8 @@ struct NodeRestoreCandidatesResponse {
     sessions: Vec<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClientBugReportRequest {
-    report_text: String,
-    #[serde(default = "default_true")]
-    include_debug_state: bool,
-    #[serde(default)]
-    selected_session_id: Option<String>,
-    #[serde(default)]
-    client_state: Option<Value>,
-    #[serde(default)]
-    app_version: Option<String>,
-    #[serde(default)]
-    artifact_hash: Option<String>,
-}
-
 fn default_true() -> bool {
     true
-}
-
-#[derive(Debug, Serialize)]
-struct ClientBugReportResponse {
-    status: &'static str,
-    bug_id: String,
-    maintainer_notified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17576,13 +17326,13 @@ mod tests {
             .create_report(CreateBugReport {
                 report_text: "isolated handler store proof".to_owned(),
                 reported_by: None,
-                selected_session_id: None,
+                client: "web".to_owned(),
+                client_version: None,
+                page: "Board".to_owned(),
                 route: None,
-                app_version: None,
-                artifact_hash: None,
-                include_debug_state: false,
-                client_state: None,
-                server_state: None,
+                page_data: json!({}),
+                server_state: json!({}),
+                screenshot_png: None,
             })
             .unwrap();
         assert!(reports.report_exists(&report.id).unwrap());
@@ -20168,7 +19918,11 @@ mod tests {
                 .headers_mut()
                 .insert("cf-access-jwt-assertion", assertion.parse().unwrap());
         }
-        response_json(app.clone().oneshot(request).await.unwrap()).await
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        // Owner pages such as /bug-reports/{id} answer in HTML.
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
     fn seed_cloudflare_access_jwks(state: &AppState) {
@@ -21096,7 +20850,7 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 20] = [
+    const OWNER_WEB_READS: [&str; 22] = [
         "/client/queue",
         "/client/queue/stats",
         "/client/queue/jobs/job-missing/start-check",
@@ -21117,6 +20871,8 @@ mod tests {
         "/btw-requests/btw-missing",
         "/client/follows",
         "/review-policies",
+        "/bug-reports/BR-missing",
+        "/bug-reports/BR-missing/screenshot.png",
     ];
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
@@ -22148,7 +21904,7 @@ mod tests {
             (
                 Method::POST,
                 "/client/bug-reports",
-                r#"{"report_text":"fixture"}"#,
+                r#"{"text":"fixture","client":"android","page":"Board"}"#,
                 true,
             ),
             (Method::GET, "/client/terminal", "", false),
@@ -22852,8 +22608,8 @@ mod tests {
     async fn public_edge_assertion_binds_post_bug_report_query_target() {
         let app = router(AppState::new(public_edge_config()));
         let target = "/client/bug-reports?source=mobile";
-        let mut signed_full_target =
-            public_request(Method::POST, target, Body::from(r#"{"report_text":"   "}"#));
+        let report = r#"{"text":"   ","client":"android","page":"Board"}"#;
+        let mut signed_full_target = public_request(Method::POST, target, Body::from(report));
         signed_full_target
             .headers_mut()
             .insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -22865,13 +22621,16 @@ mod tests {
             "edge-nonce-bug-full-target",
         );
 
+        // Past the edge check, the owner guard wants the owner signed in.
         let response = app.clone().oneshot(signed_full_target).await.unwrap();
         let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["detail"], "report_text is required");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["detail"],
+            "Only the owner, signed in to sm, changes the board or starts agents"
+        );
 
-        let mut signed_bare_path =
-            public_request(Method::POST, target, Body::from(r#"{"report_text":"   "}"#));
+        let mut signed_bare_path = public_request(Method::POST, target, Body::from(report));
         signed_bare_path
             .headers_mut()
             .insert(CONTENT_TYPE, "application/json".parse().unwrap());
