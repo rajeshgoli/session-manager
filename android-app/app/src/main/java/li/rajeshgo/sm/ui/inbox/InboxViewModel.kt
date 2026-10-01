@@ -54,7 +54,7 @@ data class InboxUiState(
 /** Open rows in their groups, in order; other filters are one untitled group. */
 fun inboxSections(filter: InboxFilter, rows: List<InboxRow>): List<Pair<String?, List<InboxRow>>> {
     if (filter != InboxFilter.Open) return if (rows.isEmpty()) emptyList() else listOf(null to rows)
-    return listOf("needs_you" to "NEEDS YOU", "new" to "NEW", "earlier" to "EARLIER")
+    return listOf("needs_you" to "NEEDS YOU", "finished" to "FINISHED", "new" to "NEW", "earlier" to "EARLIER")
         .mapNotNull { (group, label) ->
             rows.filter { it.group == group }.takeIf { it.isNotEmpty() }?.let { "$label · ${it.size}" to it }
         }

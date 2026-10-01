@@ -52,9 +52,9 @@ export function InboxPage({ openRef }) {
         options=${['open','docs','done'].map(value => ({value, label: value[0].toUpperCase()+value.slice(1)}))} /></div>
       ${error ? html`<p role="alert">${error.message}</p>` : null}
       ${!data ? html`<p class="empty">Loading…</p>` : data.rows.length === 0 ? html`<p class="empty">Nothing here.</p>` : null}
-      ${(filter === 'open' ? ['needs_you','new','earlier'] : ['all']).map(group => {
+      ${(filter === 'open' ? ['needs_you','finished','new','earlier'] : ['all']).map(group => {
         const rows = (data?.rows || []).filter(r => group === 'all' || r.group === group);
-        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${group === 'needs_you' ? 'magenta' : ''}>${({needs_you:'Needs you',new:'New',earlier:'Earlier'})[group]}</h2>` : null}
+        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',finished:'cyan'})[group] || ''}>${({needs_you:'Needs you',finished:'Finished',new:'New',earlier:'Earlier'})[group]}</h2>` : null}
           ${rows.map(row => html`<button class=${`inbox-row ${rowRef(row) === openRef ? 'selected' : ''}`} onClick=${() => openPanel(rowRef(row))}>
             <strong>${row.title}</strong><span>${row.preview}</span><small>${row.repo} · ${row.status}${row.pr_number ? ` · #${row.pr_number}` : ''}</small>
           </button>`)}</div>` : null;
@@ -118,7 +118,9 @@ export function Thread({ id, controls }) {
   return html`<section class="thread-reader">
     <div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>
     ${error ? html`<p role="alert">${error.message}</p>` : null}
-    <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
+    <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => item.type === 'turn'
+      ? html`<div key=${i} class="b turn"><div class="lbl">Last turn · ${new Date(item.at).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}</div><div class="md" dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} /></div>`
+      : html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
     <div class="thread-compose">
       ${quotes.map((q,i) => html`<blockquote>${q.quote}<button class="icon-btn" disabled=${busy} title="Remove quote" onClick=${() => setQuotes(quotes.filter((_,n) => n !== i))}>×</button></blockquote>`)}
       ${data?.can_send ? html`<textarea aria-label="Reply" placeholder=${`Write to ${data.reply_to}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />

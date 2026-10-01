@@ -6,12 +6,15 @@
 //! (`HistoryData::agent_work`). Restore itself is `POST /sessions/{id}/restore`.
 
 use super::*;
+use crate::turn_messages::TurnMessage;
 use crate::work_history::{AgentWork, HistoryData};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 pub(super) const AGENT_HISTORY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LIMIT: usize = 30;
 const MAX_LIMIT: usize = 100;
+/// Characters of the last turn message a History row carries.
+const LAST_TURN_CHARS: usize = 300;
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct AgentHistoryParams {
@@ -44,6 +47,8 @@ struct AgentRow {
     ended_at: String,
     /// Its last `sm status` text.
     last_status: Option<String>,
+    /// What it wrote at the end of its latest turn, cut to 300 characters.
+    last_turn: Option<TurnMessage>,
     restorable: bool,
     /// Why this server cannot restore it; null when `restorable`.
     unrestorable_reason: Option<String>,
@@ -126,9 +131,20 @@ fn unrestorable_reason(record: &SessionRecord) -> Option<String> {
     None
 }
 
-fn row(record: SessionRecord, work: &mut BTreeMap<String, AgentWork>) -> AgentRow {
+fn row(
+    record: SessionRecord,
+    work: &mut BTreeMap<String, AgentWork>,
+    turns: &mut BTreeMap<String, TurnMessage>,
+) -> AgentRow {
     let reason = unrestorable_reason(&record);
     AgentRow {
+        last_turn: turns.remove(&record.id).map(|turn| TurnMessage {
+            text: match turn.text.char_indices().nth(LAST_TURN_CHARS) {
+                Some((cut, _)) => format!("{}…", &turn.text[..cut]),
+                None => turn.text,
+            },
+            at: turn.at,
+        }),
         name: display_name(&record),
         state: if record.is_retired() {
             "retired"
@@ -189,9 +205,15 @@ pub(super) async fn get_agent_history(
     records.truncate(limit);
     let data = HistoryData::load(&expand_home(&state.config.sm_send.db_path))?;
     let mut work = data.agent_work(&records.iter().map(|r| r.id.as_str()).collect());
+    let mut turns = state
+        .session_store
+        .turn_message_store()
+        .map(|store| store.last_turns())
+        .transpose()?
+        .unwrap_or_default();
     let agents = records
         .into_iter()
-        .map(|record| row(record, &mut work))
+        .map(|record| row(record, &mut work, &mut turns))
         .collect();
     Ok(Json(serde_json::to_value(AgentHistoryPage {
         schema_version: AGENT_HISTORY_SCHEMA_VERSION,

@@ -72,6 +72,28 @@ pub(super) async fn answer_session_needs_you(
     ))
 }
 
+/// `GET /sessions/{id}/last-turn`: the text the agent wrote at the end of
+/// its latest turn (spec 1782 D4).
+pub(super) async fn get_last_turn(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let path = format!("/sessions/{session_id}/last-turn");
+    if owner_web_guard(&state, &headers, Some(peer_addr), "GET")?.is_none() {
+        ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), &path)?;
+    }
+    let turn = state
+        .session_store
+        .turn_message_store()
+        .map(|store| store.last_turn(&session_id))
+        .transpose()?
+        .flatten()
+        .ok_or(ApiError::NotFound("No last turn message"))?;
+    Ok(Json(json!({"at": turn.at, "text": turn.text})))
+}
+
 /// Retired or killed: the session will never read another message.
 pub(super) fn session_ended(session: &SessionRecord) -> bool {
     matches!(

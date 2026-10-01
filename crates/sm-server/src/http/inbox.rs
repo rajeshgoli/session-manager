@@ -25,6 +25,7 @@ use crate::owner_messages::{
     RecordReply, ReplyComment,
 };
 use crate::owner_push::{format_ts, notification_for, parse_ts, Follow, REASON_JOB_FINISHED};
+use crate::turn_messages::FinishedRow;
 
 /// The Open list holds threads with activity this recent, plus every thread
 /// that needs the owner.
@@ -66,12 +67,17 @@ fn norm(timestamp: &str) -> String {
 
 /// First line of `text`, cut at 120 characters.
 fn snippet(text: &str) -> String {
+    first_line(text, 120)
+}
+
+/// First non-blank line of `text`, cut at `limit` characters.
+fn first_line(text: &str, limit: usize) -> String {
     let line = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("");
-    match line.char_indices().nth(120) {
+    match line.char_indices().nth(limit) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
         None => line.to_owned(),
     }
@@ -92,7 +98,7 @@ pub(super) struct InboxRow {
     pub pr_number: Option<i64>,
     /// A doc's latest revision's publisher.
     pub author: Option<String>,
-    /// `needs_you`, `new` or `earlier`.
+    /// `needs_you`, `finished`, `new` or `earlier`.
     pub group: &'static str,
     pub preview: String,
     pub newest_at: String,
@@ -111,8 +117,9 @@ pub(super) struct InboxRow {
 fn group_rank(group: &str) -> u8 {
     match group {
         "needs_you" => 0,
-        "new" => 1,
-        _ => 2,
+        "finished" => 1,
+        "new" => 2,
+        _ => 3,
     }
 }
 
@@ -123,6 +130,8 @@ struct World {
     replies: Vec<OwnerMessageReply>,
     notes: Vec<OwnerNote>,
     follows: Vec<Follow>,
+    /// `sm task-complete` rows, oldest first (spec 1782 D3).
+    finished: Vec<FinishedRow>,
     marks: BTreeMap<String, ThreadMarks>,
 }
 
@@ -141,6 +150,12 @@ impl World {
             replies: store.all_replies()?,
             notes: inbox.notes()?,
             follows: super::follows::push_store(state).fired()?,
+            finished: state
+                .session_store
+                .turn_message_store()
+                .map(|store| store.finished())
+                .transpose()?
+                .unwrap_or_default(),
             marks: inbox.marks()?,
         })
     }
@@ -215,6 +230,7 @@ impl World {
         sessions.extend(self.messages.iter().map(|m| m.sender_session_id.as_str()));
         sessions.extend(self.notes.iter().map(|note| note.session_id.as_str()));
         sessions.extend(self.follows.iter().map(|follow| follow.session_id.as_str()));
+        sessions.extend(self.finished.iter().map(|row| row.session_id.as_str()));
         sessions
             .into_iter()
             .map(|session_id| {
@@ -265,6 +281,18 @@ impl World {
                     items += 1;
                     follows += 1;
                 }
+                // Each Finished row is one item, so the Done watermark
+                // covers it; one with text is the turn message it shows.
+                let mut unread_finished = None;
+                for row in self.finished.iter().filter(|r| r.session_id == session_id) {
+                    items += 1;
+                    if let (Some(text), Some(at)) = (&row.text, &row.text_at) {
+                        consider(at, first_line(text, 140));
+                        if row.read_at.is_none() {
+                            unread_finished = Some(text);
+                        }
+                    }
+                }
                 // Fired follows are listed oldest first, so any beyond the
                 // count seen at the last read are new.
                 let unread_follow = follows
@@ -286,6 +314,9 @@ impl World {
                         preview = message.title.clone();
                     }
                     "needs_you"
+                } else if let Some(text) = unread_finished {
+                    preview = first_line(text, 140);
+                    "finished"
                 } else if unread_follow
                     || messages
                         .iter()
@@ -528,7 +559,8 @@ const INBOX_STYLE: &str = r#"
 .row-card .m { flex-shrink: 0; }
 .row-card .p { margin: 2px 0; }
 .card.nw { border-left-color: #F0ABFC; }
-.lbl.a { color: var(--ka); } .lbl.nw { color: #F0ABFC; }
+.lbl.a { color: var(--ka); } .lbl.nw { color: #F0ABFC; } .lbl.fin { color: var(--kc); }
+.card.fin { border-left-color: var(--kc); }
 button.done { font: 11px var(--mono); color: var(--kt2); background: var(--k2); border: 1px solid var(--kl);
   border-radius: 999px; padding: 1px 8px; cursor: pointer; }
 .empty { color: var(--kt3); margin: 24px 4px; }
@@ -537,6 +569,7 @@ button.done { font: 11px var(--mono); color: var(--kt2); background: var(--k2); 
 fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
     let edge = match row.group {
         "needs_you" => "a",
+        "finished" => "fin",
         "new" => "nw",
         _ => "",
     };
@@ -567,6 +600,7 @@ fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
         sub.push(
             match (row.group, row.status.as_str()) {
                 ("needs_you", _) => "asks you",
+                ("finished", _) => "finished",
                 (_, "ended") => "agent ended",
                 _ if row.preview.starts_with("You: ") => "you replied",
                 _ => "for your information",
@@ -614,6 +648,7 @@ fn render_inbox_page(
     } else if filter == "open" {
         for (group, label, class) in [
             ("needs_you", "Needs you", "a"),
+            ("finished", "Finished", "fin"),
             ("new", "New", "nw"),
             ("earlier", "Earlier", ""),
         ] {
@@ -657,6 +692,8 @@ enum Item<'a> {
     Reply(&'a OwnerMessageReply),
     Note(&'a OwnerNote),
     Follow(&'a Follow),
+    /// A Finished row's turn message.
+    Turn(&'a FinishedRow),
     Doc(
         &'a crate::owner_docs::OwnerDoc,
         &'a crate::owner_docs::OwnerDocPublish,
@@ -671,8 +708,22 @@ impl Item<'_> {
             Item::Reply(reply) => &reply.created_at,
             Item::Note(note) => &note.created_at,
             Item::Follow(follow) => follow.fired_at.as_deref().unwrap_or(&follow.created_at),
+            Item::Turn(row) => row.text_at.as_deref().unwrap_or(&row.completed_at),
             Item::Doc(_, publish) => &publish.published_at,
         })
+    }
+
+    /// The thread JSON's entry: `html` is the item's bubble, except a turn,
+    /// whose `html` is its message alone for the client to label.
+    fn json(&self, world: &World, session_id: &str, now: OffsetDateTime) -> Value {
+        match self {
+            Item::Turn(row) => json!({
+                "type": "turn", "at": self.at(), "finished": true,
+                "html": crate::owner_doc_render::render_markdown_sanitized(
+                    row.text.as_deref().unwrap_or("")),
+            }),
+            _ => json!({"at": self.at(), "html": render_item(self, world, session_id, now)}),
+        }
     }
 }
 
@@ -697,6 +748,8 @@ const THREAD_STYLE: &str = r#"
 .b .m { margin-top: 4px; }
 .b.me .body { white-space: pre-wrap; }
 .b blockquote, .md blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid #F0ABFC; color: var(--kt2); white-space: pre-wrap; }
+.b.turn { border-left: 3px solid var(--kc); }
+.b.turn .lbl { font: 11.5px var(--mono); color: var(--kc); margin-bottom: 4px; }
 .ev { align-self: center; font: 12px var(--mono); color: var(--kt3); text-align: center; max-width: 92%; }
 .ev a { text-decoration: underline dotted var(--kt3); }
 .md { font-size: 14px; line-height: 1.5; }
@@ -829,6 +882,13 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 ),
             }
         }
+        Item::Turn(row) => format!(
+            r#"<div class="b turn"><div class="lbl">Last turn · {when}</div><div class="md">{body}</div></div>"#,
+            when = when(item.at().as_str()),
+            body = crate::owner_doc_render::render_markdown_sanitized(
+                row.text.as_deref().unwrap_or("")
+            ),
+        ),
         Item::Doc(doc, publish) => format!(
             r#"<div class="ev">{what} <a href="{url}">{title}</a> · {when}</div>"#,
             what = if publish.review_requested {
@@ -883,7 +943,8 @@ pub(super) fn agent_thread_page(
         .iter()
         .any(|m| m.sender_session_id == session_id)
         || world.notes.iter().any(|n| n.session_id == session_id)
-        || world.follows.iter().any(|f| f.session_id == session_id);
+        || world.follows.iter().any(|f| f.session_id == session_id)
+        || world.finished.iter().any(|f| f.session_id == session_id);
     if !has_items && !world.sessions.contains_key(&session_id) {
         return Err(ApiError::NotFound("Thread not found"));
     }
@@ -937,6 +998,13 @@ pub(super) fn agent_thread_page(
             .filter(|follow| follow.session_id == session_id)
             .map(Item::Follow),
     );
+    items.extend(
+        world
+            .finished
+            .iter()
+            .filter(|row| row.session_id == session_id && row.text.is_some())
+            .map(Item::Turn),
+    );
     let publishes = owner_doc_store(state).publishes_by_session(&session_id, 100)?;
     items.extend(
         publishes
@@ -969,9 +1037,8 @@ pub(super) fn agent_thread_page(
             "session_id": session_id, "title": name, "status": status, "repo": repo,
             "can_send": recipient.is_some(),
             "reply_to": recipient.as_ref().map(|s| session_display_name(s.clone())),
-            "items": items.iter().map(|item| json!({
-                "at": item.at(), "html": render_item(item, &world, &session_id, now),
-            })).collect::<Vec<_>>(),
+            "items": items.iter().map(|item| item.json(&world, &session_id, now))
+                .collect::<Vec<_>>(),
         }))
         .into_response());
     }
@@ -1089,6 +1156,9 @@ pub(super) async fn post_done(
             store.mark_handled_via(&message.id, "inbox")?;
         }
         store.mark_sender_viewed(session_id)?;
+        if let Some(turns) = state.session_store.turn_message_store() {
+            turns.mark_read(session_id, OffsetDateTime::now_utc())?;
+        }
     } else if let Some(doc_id) = key.strip_prefix("doc:") {
         let _guard = state.owner_doc_review_lock.lock().await;
         let store = owner_doc_store(&state);

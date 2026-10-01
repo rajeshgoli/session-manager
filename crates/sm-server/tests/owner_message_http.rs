@@ -1110,3 +1110,161 @@ async fn web_thread_json_preserves_quotes_and_recipient() {
     assert!(page.contains("/assets/reader-bar.js"));
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+// ---- Last turn message and Finished (sm#1789) ------------------------------
+
+async fn stop_hook(f: &Fixture, session: &str, text: &str) {
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(
+            json!({"hook_event_name": "Stop", "session_manager_id": session,
+                    "sm_last_message": text}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn watch_entry(f: &Fixture, session: &str) -> Value {
+    let (status, doc) = request(&f.app, "GET", "/watch/state", None).await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    doc["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == session)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn task_complete_puts_the_summary_written_after_it_in_finished() {
+    let f = fixture();
+    stop_hook(&f, "eng00001", "Still working on the run").await;
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/task-complete",
+        Some(json!({"requester_session_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Before the closing summary arrives: Finished, text still on its way.
+    let entry = watch_entry(&f, "eng00001").await;
+    assert_eq!(entry["attention"]["section"], "finished", "{entry}");
+    assert!(entry["facts"]["finished"]["text"].is_null(), "{entry}");
+    assert_eq!(row(&inbox(&f, "open").await, "agent:eng00001"), Value::Null);
+
+    stop_hook(
+        &f,
+        "eng00001",
+        "**1855 done and closed:** 68 views built\nSecond line <script>x</script>",
+    )
+    .await;
+    let entry = watch_entry(&f, "eng00001").await;
+    assert_eq!(
+        entry["facts"]["finished"]["text"],
+        "**1855 done and closed:** 68 views built\nSecond line <script>x</script>"
+    );
+    let (status, doc) = request(&f.app, "GET", "/watch/state", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["counts"]["finished"], 1, "{doc}");
+
+    let (status, turn) = request(&f.app, "GET", "/sessions/eng00001/last-turn", None).await;
+    assert_eq!(status, StatusCode::OK, "{turn}");
+    assert!(turn["text"].as_str().unwrap().starts_with("**1855 done"));
+    let (status, _) = request(&f.app, "GET", "/sessions/child001/last-turn", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The Inbox shows it in Finished, ahead of New, with the first line.
+    created_id(&f, "orphan01", "# For your information\nx", json!({})).await;
+    let listing = inbox(&f, "open").await;
+    assert_eq!(
+        keys(&listing),
+        vec!["agent:eng00001".to_owned(), "agent:orphan01".to_owned()]
+    );
+    let finished = row(&listing, "agent:eng00001");
+    assert_eq!(finished["group"], "finished");
+    assert_eq!(
+        finished["preview"],
+        "**1855 done and closed:** 68 views built"
+    );
+
+    // The thread carries the turn as its own item, sanitized.
+    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    let turns: Vec<&Value> = thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "turn")
+        .collect();
+    assert_eq!(turns.len(), 1, "{thread}");
+    assert_eq!(turns[0]["finished"], true);
+    let html = turns[0]["html"].as_str().unwrap();
+    assert!(
+        html.contains("<strong>1855 done and closed:</strong>"),
+        "{html}"
+    );
+    assert!(!html.contains("<script>"), "{html}");
+
+    // A new turn clears the agent's Finished fact; the Inbox keeps the row.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(json!({"hook_event_name": "UserPromptSubmit",
+                    "session_manager_id": "eng00001", "prompt": "[sm remind] status"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = watch_entry(&f, "eng00001").await;
+    assert!(entry["facts"]["finished"].is_null(), "{entry}");
+    assert_ne!(entry["attention"]["section"], "finished");
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:eng00001")["group"],
+        "finished"
+    );
+
+    // Done reads it: the thread leaves Open and the row is read.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "agent:eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(row(&inbox(&f, "open").await, "agent:eng00001"), Value::Null);
+    let rows = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"))
+        .finished()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].read_at.is_some());
+}
+
+#[tokio::test]
+async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
+    let f = fixture();
+    let store = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"));
+    store
+        .record_turn(
+            "child001",
+            "claude",
+            time::OffsetDateTime::now_utc(),
+            &"x".repeat(400),
+        )
+        .unwrap();
+    let (status, page) = request(&f.app, "GET", "/history/agents?format=json", None).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let agents = page["agents"].as_array().unwrap();
+    let child = agents.iter().find(|a| a["id"] == "child001").unwrap();
+    let text = child["last_turn"]["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 301);
+    assert!(text.ends_with('…'));
+    let orphan = agents.iter().find(|a| a["id"] == "orphan01").unwrap();
+    assert!(orphan["last_turn"].is_null());
+}

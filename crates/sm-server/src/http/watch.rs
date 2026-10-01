@@ -176,6 +176,12 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             .map(|entry| (entry.message.id.clone(), entry.message))
             .collect();
     let colliding = colliding_sessions(state, &directory)?;
+    let finished = state
+        .session_store
+        .turn_message_store()
+        .map(|store| store.newest_finished())
+        .transpose()?
+        .unwrap_or_default();
 
     let repo_filter = nonempty(&params.repo).map(|value| {
         if value.starts_with('~') {
@@ -202,6 +208,7 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
     let config = &state.config;
     let fact_context = FactContext {
         messages: &messages,
+        finished: &finished,
         config,
         now,
     };
@@ -299,7 +306,8 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         "sessions": out,
         "counts": {"live": live, "waiting_on_owner": counts.get("you").copied().unwrap_or(0),
                    "needs_you": counts.get("you").copied().unwrap_or(0),
-                   "finished": 0, "waiting_long": counts.get("waiting_long").copied().unwrap_or(0),
+                   "finished": counts.get("finished").copied().unwrap_or(0),
+                   "waiting_long": counts.get("waiting_long").copied().unwrap_or(0),
                    "moving": counts.get("moving").copied().unwrap_or(0),
                    "waiting": counts.get("waiting").copied().unwrap_or(0),
                    "idle": counts.get("idle").copied().unwrap_or(0)},
@@ -397,6 +405,8 @@ fn ordinal(position: u64) -> String {
 
 struct FactContext<'a> {
     messages: &'a BTreeMap<String, crate::owner_messages::OwnerMessage>,
+    /// Each session's newest Finished row (spec 1782 D2).
+    finished: &'a BTreeMap<String, crate::turn_messages::FinishedRow>,
     config: &'a AppConfig,
     now: OffsetDateTime,
 }
@@ -411,6 +421,7 @@ fn agent_facts(
 ) -> (Value, Value) {
     let FactContext {
         messages,
+        finished,
         config,
         now,
     } = context;
@@ -583,8 +594,17 @@ fn agent_facts(
     } else {
         Value::Null
     };
+    // Finished until the next turn clears the completion, and until Done.
+    let finished = finished
+        .get(s(session, "id"))
+        .filter(|row| row.read_at.is_none())
+        .filter(|_| !s(session, "agent_task_completed_at").is_empty())
+        .map_or(
+            Value::Null,
+            |row| json!({"at": row.completed_at, "text": row.text, "read": false}),
+        );
     let facts = json!({"agent": {"state": agent_state, "since": activity_since},
-        "jobs": job_facts, "you": you, "finished": null});
+        "jobs": job_facts, "you": you, "finished": finished});
     let last = s(session, "last_activity");
     let has_claim = claims
         .as_array()
@@ -603,6 +623,8 @@ fn agent_facts(
         ("stopped", Value::Null, inverse_time(last))
     } else if !you.is_null() {
         ("you", json!(s(&you, "kind")), s(&you, "since").to_owned())
+    } else if !finished.is_null() {
+        ("finished", Value::Null, inverse_time(s(&finished, "at")))
     } else if !quiet.is_empty() || waiting_long || review_long || stalled {
         let reason = if !quiet.is_empty() {
             "quiet"
@@ -1099,8 +1121,10 @@ mod facts_tests {
         let config = AppConfig::default();
         let empty = json!([]);
         let messages = BTreeMap::new();
+        let finished = BTreeMap::new();
         let context = FactContext {
             messages: &messages,
+            finished: &finished,
             config: &config,
             now,
         };
@@ -1193,8 +1217,10 @@ mod facts_tests {
         );
         let session = json!({"status": "active", "activity_state": "working"});
         let config = AppConfig::default();
+        let finished = BTreeMap::new();
         let context = FactContext {
             messages: &messages,
+            finished: &finished,
             config: &config,
             now,
         };
@@ -1224,5 +1250,77 @@ mod facts_tests {
         assert_eq!(facts["you"]["kind"], "doc_review");
         assert_eq!(facts["you"]["dismissible"], false);
         assert_eq!(attention["section"], "you");
+    }
+
+    /// far-1855: idle since 15:01:43, no claim, an unread Finished row at
+    /// 15:01 (spec 1782 appendix B worked examples).
+    #[test]
+    fn finished_shows_until_the_next_turn_or_done() {
+        let now = OffsetDateTime::parse("2026-09-30T19:47:00Z", &Rfc3339).unwrap();
+        let config = AppConfig::default();
+        let messages = BTreeMap::new();
+        let row = crate::turn_messages::FinishedRow {
+            session_id: "far1855".to_owned(),
+            completed_at: "2026-09-30T15:01:00.000000Z".to_owned(),
+            text: Some("1855 done and closed: 68 views built and gated".to_owned()),
+            text_at: Some("2026-09-30T15:01:40.000000Z".to_owned()),
+            read_at: None,
+        };
+        let mut finished = BTreeMap::from([("far1855".to_owned(), row.clone())]);
+        let context = FactContext {
+            messages: &messages,
+            finished: &finished,
+            config: &config,
+            now,
+        };
+        let session = json!({"id": "far1855", "status": "active", "activity_state": "idle",
+            "last_activity": "2026-09-30T15:01:43Z",
+            "agent_task_completed_at": "2026-09-30T15:01:00Z"});
+        let facts_of = |session: &Value, context: &FactContext<'_>| {
+            agent_facts(
+                session,
+                &json!([]),
+                &json!([]),
+                &[],
+                Some("2026-09-30T15:01:43Z"),
+                context,
+            )
+        };
+        let (facts, attention) = facts_of(&session, &context);
+        assert_eq!(attention["section"], "finished");
+        assert_eq!(attention["order_key"], inverse_time("2026-09-30T15:01:00Z"));
+        assert_eq!(facts["finished"]["text"], row.text.clone().unwrap());
+        assert_eq!(facts["finished"]["read"], false);
+
+        // A new turn clears the completion, and with it the fact.
+        let mut next_turn = session.clone();
+        next_turn["agent_task_completed_at"] = Value::Null;
+        let (facts, attention) = facts_of(&next_turn, &context);
+        assert!(facts["finished"].is_null());
+        assert_eq!(attention["section"], "idle");
+
+        // Done on the Inbox thread marks the row read.
+        finished.get_mut("far1855").unwrap().read_at = Some(row.completed_at.clone());
+        let context = FactContext {
+            messages: &messages,
+            finished: &finished,
+            config: &config,
+            now,
+        };
+        let (facts, _) = facts_of(&session, &context);
+        assert!(facts["finished"].is_null());
+
+        // Text still on its way reads as null ("Finishing…").
+        finished.get_mut("far1855").unwrap().read_at = None;
+        finished.get_mut("far1855").unwrap().text = None;
+        let context = FactContext {
+            messages: &messages,
+            finished: &finished,
+            config: &config,
+            now,
+        };
+        let (facts, attention) = facts_of(&session, &context);
+        assert!(facts["finished"]["text"].is_null());
+        assert_eq!(attention["section"], "finished");
     }
 }
