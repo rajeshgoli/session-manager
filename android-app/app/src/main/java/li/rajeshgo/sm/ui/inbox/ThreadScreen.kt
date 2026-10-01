@@ -246,6 +246,8 @@ fun ThreadScreen(
     var draft by rememberSaveable(target) { mutableStateOf("") }
     // One id per draft: a retried Send of the same text is delivered once.
     var submissionId by rememberSaveable(target) { mutableStateOf(UUID.randomUUID().toString()) }
+    // The text last sent under [submissionId]: an edit after it is a new message, with a new id.
+    var attempted by rememberSaveable(target) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val thread = state.thread
     val now = remember(thread) { OffsetDateTime.now() }
@@ -329,12 +331,20 @@ fun ThreadScreen(
                     thread = thread,
                     draft = draft,
                     sending = state.sending,
-                    onDraft = { draft = it },
+                    onDraft = { text ->
+                        draft = text
+                        if (attempted != null && text != attempted) {
+                            submissionId = UUID.randomUUID().toString()
+                            attempted = null
+                        }
+                    },
                     onSend = {
+                        attempted = draft
                         viewModel.send(draft, submissionId) { error ->
                             if (error == null) {
                                 draft = ""
                                 submissionId = UUID.randomUUID().toString()
+                                attempted = null
                             } else {
                                 onMessage(error)
                             }

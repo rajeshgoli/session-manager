@@ -140,9 +140,19 @@ fun boardWarningText(warning: String): String = when (warning) {
 /** Start shows on ready rows, except one whose PR merged: it needs closing, not an agent. */
 fun boardCanStart(ticket: BoardTicket): Boolean = ticket.state == "ready" && "merged_not_closed" !in ticket.warnings
 
-/** Start anyway (spec 1782 H3): a blocked ticket the server would start with `start_blocked`. */
+/**
+ * Start anyway (spec 1782 H3): a blocked ticket the server would start with `start_blocked`.
+ * A ticket an agent already holds is refused whatever the flag says.
+ */
 fun boardCanStartAnyway(ticket: BoardTicket): Boolean =
-    ticket.state == "blocked" && ticket.warnings.none { it in setOf("stale", "cycle", "merged_not_closed") }
+    ticket.state == "blocked" && ticket.holder == null &&
+        ticket.warnings.none { it in setOf("stale", "cycle", "merged_not_closed") }
+
+/** The row's own Inbox thread: the ticket's work thread (sm#1835), else the holder's newest thread. */
+fun boardThreadTarget(ticket: BoardTicket): ThreadTarget? {
+    val holder = ticket.holder ?: return null
+    return ThreadTarget("ticket:${ticket.repo.lowercase()}#${ticket.number}", holder.sessionId, "#${ticket.number} ${ticket.title}")
+}
 
 /** Blocked rows show while a lane has at most this many non-done tickets (spec 1782 H1). */
 const val BLOCKED_ROW_LIMIT = 12
@@ -298,11 +308,7 @@ fun BoardScreen(
             TerminalOpenRequests.pending = sessionId
             onNavigateToWatch()
         },
-        onOpenThread = { ticket ->
-            ticket.holder?.let { holder ->
-                thread = ThreadTarget(null, holder.sessionId, "#${ticket.number} ${ticket.title}")
-            }
-        },
+        onOpenThread = { ticket -> boardThreadTarget(ticket)?.let { thread = it } },
         onOpenDoc = { ticket, doc ->
             reader = ReaderPage(title = doc.title, subtitle = "#${ticket.number} ${ticket.title}", path = doc.readerPath)
         },

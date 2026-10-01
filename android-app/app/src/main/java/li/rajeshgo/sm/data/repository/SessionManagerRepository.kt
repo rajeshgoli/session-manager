@@ -645,11 +645,20 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token, readTimeoutSeconds = 120).restoreSession(sessionId); Unit }.mapFailure(::classifyWriteFailure)
     }
 
-    /** A work thread by its key, or the thread an agent's newest item is in when [key] is null. */
+    /**
+     * A work thread by its key, or the thread an agent's newest item is in when [key] is null
+     * or names no thread (a Board row's ticket the agent never wrote under).
+     */
     suspend fun fetchInboxThread(baseUrl: String, token: String, key: String?, sessionId: String?): li.rajeshgo.sm.data.model.InboxThread =
         withContext(Dispatchers.IO) {
             executeReadRequest(baseUrl, token) { service ->
-                if (key != null) return@executeReadRequest service.getInboxThread(key)
+                if (key != null) {
+                    try {
+                        return@executeReadRequest service.getInboxThread(key)
+                    } catch (error: HttpException) {
+                        if (error.code() != 404 || sessionId == null) throw error
+                    }
+                }
                 val response = service.getAgentThread(requireNotNull(sessionId))
                 response.body()?.takeIf { response.isSuccessful }
                     ?: threadKeyFromLocation(response.headers()["Location"])?.let { service.getInboxThread(it) }

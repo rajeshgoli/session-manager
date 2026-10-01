@@ -170,6 +170,18 @@ class BoardModelsTest {
         assertFalse(boardCanStartAnyway(blocked.copy(warnings = listOf("cycle"))))
         assertFalse(boardCanStartAnyway(blocked.copy(warnings = listOf("stale"))))
         assertFalse(boardCanStartAnyway(ticket(3, "ready")))
+        // The server refuses Start on a held ticket, flag or not.
+        assertFalse(boardCanStartAnyway(blocked.copy(holder = BoardHolder(sessionId = "s1"))))
+    }
+
+    /** The Inbox chip opens the row's ticket thread, falling back to the holder's newest. */
+    @Test fun boardInboxChipOpensTheTicketsThread() {
+        val held = BoardTicket(repo = "RajeshGoli/Session-Manager", number = 1801, title = "Phone", holder = BoardHolder(sessionId = "c26eb47e"))
+        assertEquals(
+            li.rajeshgo.sm.ui.inbox.ThreadTarget("ticket:rajeshgoli/session-manager#1801", "c26eb47e", "#1801 Phone"),
+            boardThreadTarget(held),
+        )
+        assertNull(boardThreadTarget(held.copy(holder = null)))
     }
 
     /** The fields S3 added to the ticket JSON, and the Links line they make (spec 1782 H2-H4). */
