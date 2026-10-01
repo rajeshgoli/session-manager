@@ -127,6 +127,45 @@ pub(crate) struct ThreadCatalog {
     world: World,
     work: WorkIndex,
     docs: Vec<DocData>,
+    ask_answer_keys: BTreeMap<String, String>,
+}
+
+/// The first owner message after a delivered Ask is that question's answer.
+/// A newer Ask replaces the pending question for the same agent.
+fn ask_answer_keys(world: &World) -> BTreeMap<String, String> {
+    enum Event<'a> {
+        Ask(&'a OwnerNote),
+        Answer(&'a OwnerMessage),
+    }
+    let mut events = Vec::new();
+    for note in world
+        .notes
+        .iter()
+        .filter(|note| note.id.starts_with("ask-") && note.thread_key.is_some())
+    {
+        events.push((note.created_at.as_str(), 0, Event::Ask(note)));
+    }
+    for message in &world.messages {
+        events.push((message.created_at.as_str(), 1, Event::Answer(message)));
+    }
+    events.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut pending: BTreeMap<&str, &OwnerNote> = BTreeMap::new();
+    let mut keys = BTreeMap::new();
+    for (_, _, event) in events {
+        match event {
+            Event::Ask(note) => {
+                pending.insert(&note.delivered_to_session_id, note);
+            }
+            Event::Answer(message) => {
+                if let Some(note) = pending.remove(message.sender_session_id.as_str()) {
+                    if let Some(key) = &note.thread_key {
+                        keys.insert(message.id.clone(), key.clone());
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
 struct ThreadEntry<'a> {
@@ -157,6 +196,7 @@ fn add_agent_entry<'a>(
 impl ThreadCatalog {
     pub(crate) fn load(state: &AppState) -> Result<Self, ApiError> {
         let world = World::load(state)?;
+        let ask_answer_keys = ask_answer_keys(&world);
         let work = WorkIndex::load(state)?;
         let store = owner_doc_store(state);
         let facts = store.inbox_facts()?;
@@ -174,7 +214,22 @@ impl ThreadCatalog {
                 key,
             });
         }
-        Ok(Self { world, work, docs })
+        Ok(Self {
+            world,
+            work,
+            docs,
+            ask_answer_keys,
+        })
+    }
+
+    fn message_key(&self, message: &OwnerMessage) -> String {
+        self.ask_answer_keys
+            .get(&message.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                self.work
+                    .agent_key(&message.sender_session_id, &message.created_at)
+            })
     }
 
     fn entries(&self) -> Vec<ThreadEntry<'_>> {
@@ -187,31 +242,28 @@ impl ThreadCatalog {
             .map(|m| (m.id.as_str(), m))
             .collect();
         for message in &self.world.messages {
-            add_agent_entry(
-                &mut entries,
-                &self.work,
-                &message.sender_session_id,
-                &message.created_at,
-                Item::Message(message, self.world.message_state(message, &replied)),
-                true,
-            );
+            let key = self.message_key(message);
+            entries.push(ThreadEntry {
+                key: key.clone(),
+                legacy_key: agent_thread_key(&message.sender_session_id),
+                sender_id: Some(&message.sender_session_id),
+                item: Item::Message(message, self.world.message_state(message, &replied)),
+                counted: true,
+            });
             if message.handled_at.is_some() {
-                add_agent_entry(
-                    &mut entries,
-                    &self.work,
-                    &message.sender_session_id,
-                    &message.created_at,
-                    Item::Answered(message),
-                    false,
-                );
+                entries.push(ThreadEntry {
+                    key,
+                    legacy_key: agent_thread_key(&message.sender_session_id),
+                    sender_id: Some(&message.sender_session_id),
+                    item: Item::Answered(message),
+                    counted: false,
+                });
             }
         }
         for reply in &self.world.replies {
             if let Some(message) = senders.get(reply.message_id.as_str()) {
                 // A reply stays with the message it answered, including after the claim ends.
-                let key = self
-                    .work
-                    .agent_key(&message.sender_session_id, &message.created_at);
+                let key = self.message_key(message);
                 entries.push(ThreadEntry {
                     key,
                     legacy_key: agent_thread_key(&message.sender_session_id),
@@ -282,10 +334,7 @@ impl ThreadCatalog {
                         && norm(&input.created_at) == norm(&reply.input_at)
                 })
                 .and_then(|input| senders.get(input.message_id.as_str()))
-                .map(|message| {
-                    self.work
-                        .agent_key(&message.sender_session_id, &message.created_at)
-                })
+                .map(|message| self.message_key(message))
                 .or_else(|| {
                     self.world
                         .notes
@@ -704,7 +753,7 @@ pub(crate) fn key_for_message(
     state: &AppState,
     message: &OwnerMessage,
 ) -> Result<String, ApiError> {
-    Ok(WorkIndex::load(state)?.agent_key(&message.sender_session_id, &message.created_at))
+    Ok(ThreadCatalog::load(state)?.message_key(message))
 }
 
 pub(crate) fn key_for_agent(state: &AppState, session_id: &str) -> Result<String, ApiError> {

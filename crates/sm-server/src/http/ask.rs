@@ -39,6 +39,50 @@ fn reader_session(state: &AppState, doc_id: &str) -> Result<Option<SessionRecord
     Ok(state.session_store.get_session(&id)?)
 }
 
+fn reader_at_revision(state: &AppState, doc_id: &str, sha: &str) -> Result<bool, ApiError> {
+    let Some((_, path)) = docs::owner_doc_store(state).reader(doc_id)? else {
+        return Ok(false);
+    };
+    let output = Command::new("git")
+        .args(["-C", &path, "rev-parse", "HEAD"])
+        .output()?;
+    Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha)
+}
+
+async fn retire_stale_reader(
+    state: &Arc<AppState>,
+    reader: &SessionRecord,
+) -> Result<(), ApiError> {
+    let work = state.clone();
+    let id = reader.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let authority = RetireAuthority::operator("doc republished");
+        let outcome = if work.config.rust_core.runtime_enabled {
+            work.session_store
+                .retire_core_session_with_runtime_authorized(
+                    &id,
+                    authority,
+                    None,
+                    &TmuxRuntime::from_app_config(&work.config),
+                )?
+        } else {
+            work.session_store
+                .retire_core_session_authorized(&id, authority, None)?
+        };
+        if !matches!(outcome, CoreRetireOutcome::Retired(_)) {
+            return Err(conflict("Cannot replace the reader for the new revision"));
+        }
+        cleanup_reader_worktree(&work, &id).map_err(|error| {
+            conflict(format!(
+                "Cannot remove the previous reader worktree: {error}"
+            ))
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?
+}
+
 fn author_session(state: &AppState, doc: &OwnerDoc) -> Result<Option<SessionRecord>, ApiError> {
     Ok(state.session_store.get_session(&doc.author_session_id)?)
 }
@@ -58,8 +102,10 @@ pub(super) async fn target(
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
     let doc = docs::find_doc(&state, &doc_id)?;
+    let publish = latest_publish(&state, &doc)?;
     let author = author_session(&state, &doc)?;
     let reader = reader_session(&state, &doc_id)?;
+    let reader_current = reader_at_revision(&state, &doc_id, &publish.commit_sha)?;
     let (thread_key, first_published_at) = inbox::work_threads::ThreadCatalog::load(&state)?
         .doc_key(&doc_id)
         .ok_or(ApiError::NotFound("Doc thread not found"))?;
@@ -74,7 +120,7 @@ pub(super) async fn target(
             "context_tokens": session.context_total_input_tokens,
         })),
         "default": choose_default(author.as_ref().is_some_and(|s| !s.is_stopped())),
-        "reader": reader.as_ref().filter(|s| !s.is_stopped())
+        "reader": reader.as_ref().filter(|s| !s.is_stopped() && reader_current)
             .map(|s| json!({"id": s.id, "name": session_display_name(s.clone())})),
         "thread_key": thread_key,
         "first_published_at": first_published_at,
@@ -284,6 +330,7 @@ pub(super) async fn send(
     let _guard = state.owner_message_lock.lock().await;
     let author = author_session(&state, &doc)?;
     let current_reader = reader_session(&state, &doc_id)?;
+    let reader_current = reader_at_revision(&state, &doc_id, &publish.commit_sha)?;
     let (recipient, launched_with_question) = match payload.target.as_str() {
         "author" => author
             .filter(|s| !s.is_stopped())
@@ -305,7 +352,11 @@ pub(super) async fn send(
             }
         }
         "reader" => match current_reader {
-            Some(reader) if !reader.is_stopped() => (reader, false),
+            Some(reader) if !reader.is_stopped() && reader_current => (reader, false),
+            Some(reader) if !reader.is_stopped() => {
+                retire_stale_reader(&state, &reader).await?;
+                (start_reader(&state, &doc, &delivered_text).await?, true)
+            }
             Some(reader) => {
                 let work = state.clone();
                 let id = reader.id.clone();

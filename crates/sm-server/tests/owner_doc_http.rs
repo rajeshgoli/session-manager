@@ -359,6 +359,63 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
             .as_str()
             .unwrap_or("")
             .contains("The memo's reader answer")));
+    fs::write(
+        checkout.join("specs/memo.md"),
+        "# Decision memo\n\nRevised.\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "republish"]);
+    let revised_sha = git(&["rev-parse", "HEAD"]);
+    f.source.files.lock().unwrap().insert(
+        ("specs/memo.md".into(), revised_sha.clone()),
+        b"# Decision memo\n\nRevised.\n".to_vec(),
+    );
+    let (status, republished) = request(
+        &f.app,
+        "POST",
+        "/docs",
+        Some(json!({
+            "repo": REPO, "path": "specs/memo.md", "pr_number": 12,
+            "commit_sha": revised_sha, "session_id": "retired1", "checkout_root": checkout,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{republished}");
+    assert_eq!(republished["id"], doc_id);
+    let (status, target) =
+        request(&f.app, "GET", &format!("/docs/{doc_id}/ask-target"), None).await;
+    assert_eq!(status, StatusCode::OK, "{target}");
+    assert!(target["reader"].is_null());
+    let (status, revised) = request(
+        &f.app,
+        "POST",
+        &endpoint,
+        Some(json!({"text": "What changed?", "target": "reader"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revised}");
+    let revised_reader_id = revised["recipient"]["id"].as_str().unwrap();
+    assert_ne!(revised_reader_id, reader_id);
+    let revised_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&reader_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&revised_head.stdout).trim(),
+        revised_sha
+    );
+    let sessions: Value =
+        serde_json::from_str(&fs::read_to_string(&f.state_file).unwrap()).unwrap();
+    let old_reader = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == reader_id)
+        .unwrap();
+    assert_eq!(old_reader["status"], "stopped");
     let docs = OwnerDocStore::new(f.dir.join("message_queue.db"));
     docs.set_reader(doc_id, "later-reader", "/later/worktree")
         .unwrap();
@@ -407,6 +464,38 @@ async fn ask_a_live_author_uses_the_author_and_the_docs_work_thread() {
         .unwrap();
     assert_eq!(recipient, "author01");
     assert_eq!(thread_key, target["thread_key"].as_str().unwrap());
+    OwnerMessageStore::new(f.dir.join("message_queue.db"))
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: "author01".into(),
+            sender_session_name: "author01-writer".into(),
+            title: "Answer about the memo".into(),
+            body_markdown: "The author answer is here".into(),
+            blocking: false,
+        })
+        .unwrap();
+    let encoded_key = target["thread_key"]
+        .as_str()
+        .unwrap()
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('#', "%23");
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        &format!("/inbox/thread/{encoded_key}?format=json"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The author answer is here")));
     assert!(OwnerDocStore::new(f.dir.join("message_queue.db"))
         .reader(doc_id)
         .unwrap()
