@@ -578,6 +578,11 @@ async fn main() -> Result<()> {
                 }
                 request = handover_rx.recv() => {
                 let Some(mut stream) = request else { anyhow::bail!("handover acceptor stopped"); };
+                if !btw_workers.is_empty() {
+                    eprintln!("handover refused: /btw worker is active");
+                    drop(stream);
+                    continue;
+                }
                 shutdown.stop();
                 let (lan_result, drain_result) = tokio::join!(
                     lan_control.pause(),
@@ -599,12 +604,8 @@ async fn main() -> Result<()> {
                 }
                     let _ = authority_thread.join();
                     let _ = handover_acceptor.join();
-                    let workers = btw_workers.clone();
-                    let workers_clear = tokio::task::spawn_blocking(move || {
-                        workers.wait_empty(Duration::from_secs(10))
-                    }).await?;
-                    if !workers_clear {
-                        eprintln!("handover refused: /btw workers did not stop within ten seconds");
+                    if !btw_workers.is_empty() {
+                        eprintln!("handover refused: /btw worker started during request drain");
                         drop(stream);
                         inherited_lan = lan_listener;
                         continue 'generations;

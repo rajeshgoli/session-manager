@@ -583,6 +583,11 @@ impl BtwWorkers {
             .unwrap();
         *count == 0
     }
+
+    pub fn is_empty(&self) -> bool {
+        let (count, _) = &*self.0;
+        *count.lock().unwrap() == 0
+    }
 }
 
 impl Drop for BtwWorkerGuard {
@@ -599,9 +604,11 @@ fn btw_worker_blocks_handover_across_rollback_generations() {
     let workers = BtwWorkers::default();
     let old_worker = workers.begin();
     let resumed_generation = workers.clone();
+    assert!(!workers.is_empty());
     assert!(!workers.wait_empty(Duration::from_millis(1)));
     assert!(!resumed_generation.wait_empty(Duration::from_millis(1)));
     drop(old_worker);
+    assert!(workers.is_empty());
     assert!(resumed_generation.wait_empty(Duration::from_millis(1)));
 }
 
