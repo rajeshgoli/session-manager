@@ -27,7 +27,18 @@ const SOURCE = { override: 'Set for this agent', ticket: 'From its ticket', defa
  * number}` or null; without it the agent's ticket claim is used. `scope`
  * picks the first view: `agent` or `ticket`.
  */
-export function HandoffPopover({ agent, ticket, scope: initialScope, align, onClose }) {
+export function HandoffPopover({ agent: given, ticket, scope: initialScope, align, onClose }) {
+  // A Board holder carries only its id and name; its provider and model,
+  // which set the window, come from `/watch/state`.
+  const [watched, setWatched] = useState(null);
+  useEffect(() => {
+    if (!given?.id || given.model) return;
+    let live = true;
+    api(`/watch/state?session=${encodeURIComponent(given.id)}`)
+      .then(doc => live && setWatched((doc?.sessions || []).find(session => session.id === given.id) || null)).catch(() => {});
+    return () => { live = false; };
+  }, [given?.id]);
+  const agent = given && watched ? { ...watched, ...given, provider: watched.provider, model: watched.model } : given;
   const claim = (agent?.claims || []).find(item => item.kind === 'ticket');
   const held = ticket || (claim && { repo: claim.repo, number: claim.number });
   const forTicket = held && held.repo?.includes('/') ? held : null;
@@ -41,12 +52,14 @@ export function HandoffPopover({ agent, ticket, scope: initialScope, align, onCl
   const provider = agent?.provider === 'codex-fork' ? 'codex-fork' : 'claude';
   const base = defaults?.provider_thresholds?.[provider]?.threshold_percent;
   // The agent's own window: Claude's is 1M for a `[1m]` model, else 200k.
-  const window = provider === 'claude' && agent?.model ? (agent.model.endsWith('[1m]') ? 1e6 : 2e5) : defaults?.window_tokens?.[provider];
+  // An unheld ticket has no provider yet: show only what the ticket sets.
+  const window = !agent ? null : provider === 'claude' && agent.model ? (agent.model.endsWith('[1m]') ? 1e6 : 2e5) : defaults?.window_tokens?.[provider];
   // A ticket override leaves unset fields to each agent's provider default.
-  const enabled = policy ? policy.enabled ?? !!defaults?.providers?.[provider] : false;
-  const threshold = policy?.threshold_percent ?? base;
+  const enabled = policy ? policy.enabled ?? (agent ? !!defaults?.providers?.[provider] : false) : false;
+  const threshold = policy?.threshold_percent ?? (agent ? base : null);
   const describe = value => scope === 'ticket'
-    ? value.enabled !== null || value.threshold_percent !== null ? `Set for ticket #${forTicket.number}` : 'Using the default'
+    ? value.enabled !== null || value.threshold_percent !== null ? `Set for ticket #${forTicket.number}`
+      : agent ? 'Using the default' : 'Not set: the agent that takes this ticket uses its provider’s default'
     : value.has_gauge === false ? 'This agent has no context gauge, so it cannot hand off automatically.'
     : SOURCE[value.source] || '';
   useEffect(() => { api('/handoff-defaults').then(setDefaults).catch(() => {}); }, []);
@@ -85,7 +98,7 @@ export function HandoffPopover({ agent, ticket, scope: initialScope, align, onCl
         <div class="fld"><span class="l">Hand off at</span>
           <span class="handoff-at"><input class="inp num" type="number" min="1" max="100" step="1" aria-label="Hand off at, percent of context"
             value=${shown} onInput=${event => setDraft(event.target.value)} onChange=${commit} />
-            <span>% · <b>${tokensOf(shown, window)}</b></span></span></div>
+            <span>%${tokensOf(shown, window) ? html` · <b>${tokensOf(shown, window)}</b>` : null}</span></span></div>
         <div class="row" style="justify-content:flex-start">
           <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>`
       : null}
