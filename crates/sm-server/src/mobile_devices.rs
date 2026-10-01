@@ -1060,8 +1060,6 @@ fn ensure_cloudflare_mobile_device_ca(
         let mut browser_request = request.clone();
         browser_request.hostname = trimmed(&config.browser.hostname)
             .context("browser.device_policy requires browser.hostname")?;
-        // Check before either request can associate a browser-only deployment.
-        browser_request.ensure_browser_transport()?;
         request.execute()?;
         browser_request.execute()?;
     } else {
@@ -1249,22 +1247,6 @@ impl DeviceCaTrustRequest {
             None => self.lookup_zone_id(&agent)?,
         };
         self.ensure_hostname_association(&agent, &zone_id, &certificate_id)
-    }
-
-    fn ensure_browser_transport(&self) -> Result<()> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let zone_id = match &self.zone_id {
-            Some(zone_id) => zone_id.clone(),
-            None => self.lookup_zone_id(&agent)?,
-        };
-        let url = format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/settings/http3");
-        let response = cloudflare_get(&agent, &url, &self.api_token).context(
-            "Cannot verify browser certificate transport; the Cloudflare token needs Zone Settings Read permission",
-        )?;
-        validate_browser_certificate_transport(&response)
     }
 
     fn ensure_uploaded_ca(&self, agent: &ureq::Agent) -> Result<String> {
@@ -1543,17 +1525,6 @@ fn cloudflare_result_id(response: &Value) -> Option<String> {
         .and_then(|result| result.get("id"))
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-fn validate_browser_certificate_transport(response: &Value) -> Result<()> {
-    // Chrome's WebSocket handshake cannot open a certificate picker. Require
-    // TCP page navigation to establish the client-certificate choice first.
-    if response.pointer("/result/id").and_then(Value::as_str) != Some("http3")
-        || response.pointer("/result/value").and_then(Value::as_str) != Some("off")
-    {
-        bail!("Browser device certificates require Cloudflare HTTP/3 to be off for this zone; disable it in Speed > Settings > Protocol Optimization before enrollment. HTTPS and HTTP/2 remain enabled.");
-    }
-    Ok(())
 }
 
 fn hostname_associations_from_response(response: &Value) -> Result<Vec<String>> {
@@ -2390,23 +2361,6 @@ mod tests {
             .starts_with("session-manager-mobile-device-ca-"));
         assert!(request.configured_certificate_id.is_none());
         let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn browser_certificates_require_a_verified_http3_off_setting() {
-        assert!(validate_browser_certificate_transport(
-            &json!({"result": {"id": "http3", "value": "off"}})
-        )
-        .is_ok());
-        for response in [
-            json!({"result": {"id": "http3", "value": "on"}}),
-            json!({"result": {"id": "http3", "value": false}}),
-            json!({"result": {"id": "other", "value": "off"}}),
-            json!({"result": {"id": "http3"}}),
-            json!({}),
-        ] {
-            assert!(validate_browser_certificate_transport(&response).is_err());
-        }
     }
 
     #[test]

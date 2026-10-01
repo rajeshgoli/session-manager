@@ -181,9 +181,9 @@ cloudflare_access:
   browser:
     enabled: false
     # Attach the existing device policy during enrollment; email login remains.
-    # Requires HTTP/3 off for this zone (Speed > Settings > Protocol Optimization)
-    # and Zone Settings Read permission on api_token. Enrollment checks before
-    # adding the browser hostname to the device CA.
+    # Verify certificate sign-in and terminal input on each computer. See README
+    # for a hostname-scoped Alt-Svc response-header rule; a zone-wide HTTP/3
+    # change and Zone Settings Read token permission are not required.
     device_policy: false
     app_id: ""
     hostname: "sm.example.com"
