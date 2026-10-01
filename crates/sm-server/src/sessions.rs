@@ -1918,12 +1918,20 @@ impl SessionStore {
         {
             return Ok(Some(session));
         }
-        Ok(sessions.into_iter().find(|session| {
+        let matches_name = |session: &SessionRecord| {
             session.cached_display_name().as_deref() == Some(session_id)
                 || session.friendly_name.as_deref() == Some(session_id)
                 || session.native_title.as_deref() == Some(session_id)
                 || session.name == session_id
-        }))
+        };
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| !session.is_stopped() && matches_name(session))
+            .cloned()
+        {
+            return Ok(Some(session));
+        }
+        Ok(sessions.into_iter().find(matches_name))
     }
 
     pub fn get_context_snapshot(
@@ -17041,6 +17049,7 @@ mod tests {
         let mut live_request = naming_request("codex", Some("vega"));
         live_request.id = Some("live-agent".to_owned());
         store.create_core_session(live_request, None).unwrap();
+        assert_eq!(store.get_session("vega").unwrap().unwrap().id, "live-agent");
 
         let CoreRestoreOutcome::Restored(restored) =
             store.restore_core_session(&old.id).unwrap().unwrap()
@@ -17062,6 +17071,7 @@ mod tests {
             store.get_session("live-agent").unwrap().unwrap().name,
             "vega"
         );
+        assert_eq!(store.get_session("vega").unwrap().unwrap().id, "live-agent");
         let _ = fs::remove_file(path);
     }
 
