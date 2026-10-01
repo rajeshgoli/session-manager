@@ -22,20 +22,38 @@ fn minutes(n: i64) -> OffsetDateTime {
 fn stop_then_task_complete_then_stop_fills_from_the_second_stop() {
     let store = store();
     store
-        .record_turn("s1", "claude", minutes(0), None, "Working on it")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(0),
+            ReplyTiming::AtMessage,
+            "Working on it",
+        )
         .unwrap();
     store.record_finished("s1", minutes(1)).unwrap();
     let row = &store.finished().unwrap()[0];
     assert_eq!(row.text, None);
     store
-        .record_turn("s1", "claude", minutes(2), None, "1855 done and closed")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(2),
+            ReplyTiming::AtMessage,
+            "1855 done and closed",
+        )
         .unwrap();
     let row = &store.finished().unwrap()[0];
     assert_eq!(row.text.as_deref(), Some("1855 done and closed"));
     assert_eq!(row.text_at.as_deref(), Some(stamp(minutes(2)).as_str()));
     // A later turn does not overwrite the filled row.
     store
-        .record_turn("s1", "claude", minutes(3), None, "Anything else?")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(3),
+            ReplyTiming::AtMessage,
+            "Anything else?",
+        )
         .unwrap();
     assert_eq!(
         store.finished().unwrap()[0].text.as_deref(),
@@ -51,18 +69,36 @@ fn stop_then_task_complete_then_stop_fills_from_the_second_stop() {
 fn an_older_stop_arriving_late_neither_replaces_the_last_turn_nor_fills_a_newer_finish() {
     let store = store();
     store
-        .record_turn("s1", "claude", minutes(5), None, "Newer turn")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(5),
+            ReplyTiming::AtMessage,
+            "Newer turn",
+        )
         .unwrap();
     store.record_finished("s1", minutes(6)).unwrap();
     // A Stop emitted at minute 2 arrives now.
     store
-        .record_turn("s1", "claude", minutes(2), None, "Older turn")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(2),
+            ReplyTiming::AtMessage,
+            "Older turn",
+        )
         .unwrap();
     assert_eq!(store.last_turn("s1").unwrap().unwrap().text, "Newer turn");
     assert_eq!(store.finished().unwrap()[0].text, None);
     // A Stop emitted after the completion fills it, even if it arrives late.
     store
-        .record_turn("s1", "claude", minutes(7), None, "Closing summary")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(7),
+            ReplyTiming::AtMessage,
+            "Closing summary",
+        )
         .unwrap();
     assert_eq!(
         store.finished().unwrap()[0].text.as_deref(),
@@ -78,7 +114,7 @@ fn task_complete_without_a_later_stop_falls_back_after_ten_minutes() {
             "s1",
             "claude",
             minutes(0),
-            None,
+            ReplyTiming::AtMessage,
             "Summary before completing",
         )
         .unwrap();
@@ -186,7 +222,7 @@ fn the_first_turn_started_after_a_send_answers_it_once() {
             "s1",
             "claude",
             now_plus(2),
-            Some(now_plus(0)),
+            ReplyTiming::Started(now_plus(0)),
             "Unrelated work",
         )
         .unwrap();
@@ -196,12 +232,18 @@ fn the_first_turn_started_after_a_send_answers_it_once() {
             "s1",
             "claude",
             now_plus(4),
-            Some(now_plus(3)),
+            ReplyTiming::Started(now_plus(3)),
             "Here is my answer",
         )
         .unwrap();
     store
-        .record_turn("s1", "claude", now_plus(6), Some(now_plus(5)), "Later turn")
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(6),
+            ReplyTiming::Started(now_plus(5)),
+            "Later turn",
+        )
         .unwrap();
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
@@ -217,12 +259,18 @@ fn the_earlier_turn_answers_even_when_its_stop_arrives_later() {
             "s1",
             "claude",
             now_plus(6),
-            Some(now_plus(5)),
+            ReplyTiming::Started(now_plus(5)),
             "Second turn",
         )
         .unwrap();
     store
-        .record_turn("s1", "claude", now_plus(4), Some(now_plus(3)), "First turn")
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(4),
+            ReplyTiming::Started(now_plus(3)),
+            "First turn",
+        )
         .unwrap();
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
@@ -233,7 +281,13 @@ fn the_earlier_turn_answers_even_when_its_stop_arrives_later() {
 fn two_sends_before_one_turn_get_one_answer() {
     let store = store_with_notes(&[now_plus(1), now_plus(2)]);
     store
-        .record_turn("s1", "claude", now_plus(4), Some(now_plus(3)), "One answer")
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(4),
+            ReplyTiming::Started(now_plus(3)),
+            "One answer",
+        )
         .unwrap();
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
@@ -244,7 +298,13 @@ fn two_sends_before_one_turn_get_one_answer() {
 fn sends_from_before_replies_were_recorded_get_no_answer() {
     let store = store_with_notes(&[now_plus(-60)]);
     store
-        .record_turn("s1", "claude", now_plus(2), Some(now_plus(1)), "Anything")
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(2),
+            ReplyTiming::Started(now_plus(1)),
+            "Anything",
+        )
         .unwrap();
     assert!(store.thread_replies().unwrap().is_empty());
 }
@@ -253,7 +313,29 @@ fn sends_from_before_replies_were_recorded_get_no_answer() {
 fn without_a_turn_start_the_message_time_decides() {
     let store = store_with_notes(&[now_plus(1)]);
     store
-        .record_turn("s1", "codex-fork", now_plus(2), None, "Codex answer")
+        .record_turn(
+            "s1",
+            "codex-fork",
+            now_plus(2),
+            ReplyTiming::AtMessage,
+            "Codex answer",
+        )
         .unwrap();
     assert_eq!(store.thread_replies().unwrap()[0].text, "Codex answer");
+}
+
+#[test]
+fn a_stop_from_a_superseded_turn_answers_nothing() {
+    let store = store_with_notes(&[now_plus(1)]);
+    store
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(2),
+            ReplyTiming::Unknown,
+            "Older turn",
+        )
+        .unwrap();
+    assert!(store.thread_replies().unwrap().is_empty());
+    assert_eq!(store.last_turn("s1").unwrap().unwrap().text, "Older turn");
 }

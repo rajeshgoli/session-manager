@@ -1255,7 +1255,7 @@ async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
             "child001",
             "claude",
             time::OffsetDateTime::now_utc(),
-            None,
+            sm_server::turn_messages::ReplyTiming::AtMessage,
             &"x".repeat(400),
         )
         .unwrap();
@@ -1281,7 +1281,7 @@ async fn an_unread_finished_thread_stays_open_past_the_open_window() {
             "eng00001",
             "claude",
             long_ago + time::Duration::minutes(1),
-            None,
+            sm_server::turn_messages::ReplyTiming::AtMessage,
             "Done long ago",
         )
         .unwrap();
@@ -1469,4 +1469,40 @@ async fn last_turn_carries_sanitized_html() {
     assert!(html.contains("<strong>Done.</strong>"), "{html}");
     assert!(html.contains("<li>one</li>"), "{html}");
     assert!(!html.contains("<script>"), "{html}");
+}
+
+#[tokio::test]
+async fn a_missed_turn_start_hook_still_lets_the_answer_through() {
+    let f = fixture();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(json!({"hook_event_name": "UserPromptSubmit",
+                    "session_manager_id": "eng00001", "prompt": "[sm remind] status"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    stop_hook(&f, "eng00001", "Earlier turn").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/inbox/agent/eng00001/send",
+        Some(json!({"submission_id": "send-1844-b", "body": "Status?"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // This turn's start hook never arrived; the stored start is the earlier turn's.
+    stop_hook(&f, "eng00001", "All green").await;
+    let (_, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let replies: Vec<&Value> = thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "turn" && item["finished"] == false)
+        .collect();
+    assert_eq!(replies.len(), 1, "{thread}");
+    assert!(replies[0]["html"].as_str().unwrap().contains("All green"));
 }

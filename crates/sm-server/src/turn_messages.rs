@@ -52,6 +52,20 @@ pub fn cap_text(text: &str) -> String {
     }
 }
 
+/// When the turn that wrote a message began, for matching it to the owner's
+/// latest send: the first turn started at or after a send answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyTiming {
+    /// The provider reported the turn's start.
+    Started(OffsetDateTime),
+    /// No start is known; the message's own time stands in (codex-fork, or
+    /// a Claude turn whose start hook was missed).
+    AtMessage,
+    /// The message may belong to an older turn (its Stop arrived after a
+    /// newer turn began), so it answers no send.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TurnMessage {
     pub at: String,
@@ -207,15 +221,15 @@ impl TurnMessageStore {
     /// Finished row of that session still without text whose completion is
     /// at or before it. Blank text records nothing.
     ///
-    /// `turn_started` is when the turn began, when the provider reports it;
-    /// the latest owner input sent at or before it is answered by this turn
-    /// unless an earlier turn already answered it. Without it, `at` is used.
+    /// `timing` says when the turn began; the latest owner input sent at or
+    /// before then is answered by this turn unless a turn that started
+    /// earlier already answered it.
     pub fn record_turn(
         &self,
         session_id: &str,
         provider: &str,
         at: OffsetDateTime,
-        turn_started: Option<OffsetDateTime>,
+        timing: ReplyTiming,
         text: &str,
     ) -> Result<()> {
         let text = text.trim();
@@ -236,8 +250,18 @@ impl TurnMessageStore {
             .optional()?
             .and_then(|value| parse_time(&value))
             .unwrap_or(turn_at);
-        let started = turn_started.unwrap_or(turn_at);
-        if let Some(input) = latest_owner_input(&tx, session_id, since, started)? {
+        let started = match timing {
+            ReplyTiming::Started(started) => Some(started),
+            ReplyTiming::AtMessage => Some(turn_at),
+            ReplyTiming::Unknown => None,
+        };
+        let input = match started {
+            Some(started) => {
+                latest_owner_input(&tx, session_id, since, started)?.map(|input| (input, started))
+            }
+            None => None,
+        };
+        if let Some((input, started)) = input {
             // Hooks can arrive out of order: the turn that started first
             // after the send is its answer, whichever Stop lands first.
             tx.execute(

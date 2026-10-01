@@ -363,13 +363,13 @@ impl SessionStore {
         session_id: &str,
         provider: &str,
         at: OffsetDateTime,
-        turn_started: Option<OffsetDateTime>,
+        timing: crate::turn_messages::ReplyTiming,
         text: &str,
     ) {
         let Some(store) = self.turn_message_store() else {
             return;
         };
-        if let Err(error) = store.record_turn(session_id, provider, at, turn_started, text) {
+        if let Err(error) = store.record_turn(session_id, provider, at, timing, text) {
             eprintln!("last turn message for {session_id} not recorded: {error:#}");
         }
     }
@@ -2025,12 +2025,23 @@ impl SessionStore {
                 .is_some_and(|stored| timestamp_is_after(&stored, received_at))
         });
         let superseded = superseded_by_emission || superseded_by_arrival;
-        // The turn this Stop ends began at its turn-start hook, unless a newer
-        // turn already started.
-        let turn_started = (!superseded)
-            .then(|| json_text(session.get("activity_turn_start_hook_at")))
-            .flatten()
+        // When the turn this Stop ends began, for matching it to an owner send.
+        // A newer turn already started: this Stop may end an older turn, so it
+        // answers nothing. A turn start older than the previous Stop belongs
+        // to an earlier turn (this turn's start hook was missed).
+        let previous_end = json_text(session.get("activity_hook_at"))
             .and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok());
+        let reply_timing = if superseded {
+            crate::turn_messages::ReplyTiming::Unknown
+        } else {
+            json_text(session.get("activity_turn_start_hook_at"))
+                .and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok())
+                .filter(|start| previous_end.is_none_or(|end| *start >= end))
+                .map_or(
+                    crate::turn_messages::ReplyTiming::AtMessage,
+                    crate::turn_messages::ReplyTiming::Started,
+                )
+        };
 
         let now = now_rfc3339();
         if !superseded {
@@ -2102,7 +2113,7 @@ impl SessionStore {
             let at = emitted_at
                 .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
                 .unwrap_or_else(OffsetDateTime::now_utc);
-            self.record_turn_message(session_id, &provider, at, turn_started, last_message);
+            self.record_turn_message(session_id, &provider, at, reply_timing, last_message);
         }
         for (provider_resume_id, artifact_path) in seat_session_appends {
             self.append_seat_session(
@@ -8306,7 +8317,7 @@ impl SessionStore {
                     session_id,
                     &provider,
                     OffsetDateTime::now_utc(),
-                    None,
+                    crate::turn_messages::ReplyTiming::AtMessage,
                     &text,
                 );
             }
