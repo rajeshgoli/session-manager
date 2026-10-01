@@ -1106,6 +1106,20 @@ def test_plist_divergence_blocks_before_any_restart(env):
     assert_service_untouched(env)
 
 
+def test_serving_slot_plist_divergence_blocks_before_handover(env):
+    (env["state"] / "loaded_labels").write_text(f"{LABEL}.blue\n")
+    (env["state"] / "active-slot").write_text("blue\n")
+    old_plist = env["plist"].with_name("service.blue.plist")
+    old_plist.write_text("<plist>has --local-env with secrets</plist>\n")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "would rewrite" in result.stderr
+    assert "cutover start-rust" not in calls(env)
+    assert old_plist.exists()
+
+
 def test_allow_plist_change_proceeds_with_a_warning(env):
     env["plist"].write_text("<plist>different</plist>\n")
 

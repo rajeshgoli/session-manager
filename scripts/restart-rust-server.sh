@@ -863,7 +863,7 @@ mkdir -p "$effective_log_dir" 2>/dev/null || true
 # regenerate is a deployment setting about to be silently dropped - a custom
 # --local-env carrying auth secrets, for instance.
 compare_plist="$SM_PLIST"
-[[ "$old_label" == "$legacy_label" ]] && compare_plist="$legacy_plist"
+[[ -n "$old_plist" ]] && compare_plist="$old_plist"
 if [[ -f "$compare_plist" ]]; then
   RENDERED_PLIST="$(mktemp)"
   "$SM_CUTOVER" render-plist "${cutover_args[@]}" > "$RENDERED_PLIST" \
@@ -880,6 +880,7 @@ def normalized(path):
     args = value.get("ProgramArguments", [])
     if args:
         args[0] = "<slot binary>"
+    value["ProgramArguments"] = [arg for arg in args if arg != "--take-over"]
     return value
 
 try:

@@ -584,6 +584,7 @@ async fn main() -> Result<()> {
                             authority_server.claim_socket();
                         }
                         Some((handover::Decision::Rollback, _connection)) => {
+                            authority_server.keep_socket_for_successor();
                             shutdown.stop();
                             let _ = lan_control.pause().await;
                             let _ = tokio::time::timeout(Duration::from_secs(10), &mut server_task).await;
