@@ -50,6 +50,7 @@ import li.rajeshgo.sm.ui.update.UpdateAvailabilityViewModel
 class AppMenuActions(
     val onNewSession: () -> Unit,
     val onOpenHistory: () -> Unit,
+    val onOpenNotes: () -> Unit,
     val onOpenGuestbook: () -> Unit,
     val onOpenAnalytics: () -> Unit,
     val onOpenSettings: () -> Unit,
@@ -131,6 +132,9 @@ fun AppTopBar(
                         MenuEntry("New session", Icons.Rounded.Add) { menuExpanded = false; menu.onNewSession() }
                         if (current != Routes.HISTORY) {
                             MenuEntry("History", Icons.Rounded.History) { menuExpanded = false; menu.onOpenHistory() }
+                        }
+                        if (current != Routes.NOTES) {
+                            MenuEntry("Notes", Icons.Rounded.AutoStories) { menuExpanded = false; menu.onOpenNotes() }
                         }
                         if (current != Routes.GUESTBOOK) {
                             MenuEntry("Guestbook", Icons.Rounded.AutoStories) { menuExpanded = false; menu.onOpenGuestbook() }

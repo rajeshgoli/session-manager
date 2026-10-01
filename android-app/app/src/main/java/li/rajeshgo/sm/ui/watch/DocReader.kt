@@ -2,6 +2,8 @@ package li.rajeshgo.sm.ui.watch
 
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.Context
+import android.print.PrintManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.webkit.ClientCertRequest
@@ -327,6 +329,7 @@ fun DocReaderOverlay(
     // without the auth headers, so back reloads the previous URL with them.
     val history = remember(page) { mutableStateListOf<String>() }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    val context = androidx.compose.ui.platform.LocalContext.current
     var loading by remember { mutableStateOf(true) }
     var loadedTitle by remember(page) { mutableStateOf<String?>(null) }
     var outage by remember(page) { mutableStateOf<ReaderOutage?>(null) }
@@ -394,6 +397,18 @@ fun DocReaderOverlay(
                         }
                     }
                     actions?.invoke()
+                    if (readyAuth != null && page.path.startsWith("/docs/")) {
+                        OutlinedButton(
+                            onClick = {
+                                webViewRef?.let { view ->
+                                    val manager = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                                    manager.print(title, view.createPrintDocumentAdapter(title), null)
+                                }
+                            },
+                            enabled = webViewRef != null && !loading,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        ) { Text("Print") }
+                    }
                     OutlinedButton(
                         onClick = onClose,
                         modifier = Modifier.height(40.dp),

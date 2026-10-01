@@ -48,6 +48,7 @@ import li.rajeshgo.sm.ui.guestbook.GuestbookScreen
 import li.rajeshgo.sm.ui.history.HistoryScreen
 import li.rajeshgo.sm.ui.inbox.InboxBadgeRefresher
 import li.rajeshgo.sm.ui.inbox.InboxScreen
+import li.rajeshgo.sm.ui.notes.NotesScreen
 import li.rajeshgo.sm.ui.queue.rememberResumed
 import li.rajeshgo.sm.ui.queue.QueueScreen
 import li.rajeshgo.sm.ui.queue.UsageScreen
@@ -65,6 +66,7 @@ object Routes {
     const val QUEUE = "queue"
     const val USAGE = "usage"
     const val HISTORY = "history"
+    const val NOTES = "notes"
     const val GUESTBOOK = "guestbook"
 }
 
@@ -163,6 +165,7 @@ fun AppNavigation() {
             toWatch()
         },
         onOpenHistory = { navController.navigate(Routes.HISTORY) { launchSingleTop = true } },
+        onOpenNotes = { navController.navigate(Routes.NOTES) { launchSingleTop = true } },
         onOpenGuestbook = { navController.navigate(Routes.GUESTBOOK) { launchSingleTop = true } },
         onOpenAnalytics = { navController.navigate(Routes.ANALYTICS) { launchSingleTop = true } },
         onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
@@ -244,6 +247,7 @@ fun AppNavigation() {
             composable(Routes.HISTORY) {
                 HistoryScreen(onBack = { navController.popBackStack() }, onOpenWatch = toWatch, menu = menu)
             }
+            composable(Routes.NOTES) { NotesScreen(onBack = { navController.popBackStack() }, menu = menu) }
             composable(Routes.GUESTBOOK) {
                 GuestbookScreen(onBack = { navController.popBackStack() }, menu = menu)
             }
