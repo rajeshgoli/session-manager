@@ -204,6 +204,18 @@ enum TerminalTicketKind {
 #[derive(Clone, Copy)]
 pub struct DirectTerminalLan;
 
+/// A separate TLS listener exposes only the two browser terminal routes.
+pub fn terminal_lan_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/client/terminal", get(mobile_terminal_endpoint))
+        .route(
+            "/client/terminal/probe",
+            get(browser_terminal::probe).options(browser_terminal::probe_options),
+        )
+        .layer(axum::Extension(DirectTerminalLan))
+        .with_state(state)
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct MobileTerminalTicket {
@@ -23718,6 +23730,58 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             body,
             json!({ "detail": "mobile terminal requires a WebSocket upgrade" })
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_lan_listener_exposes_only_probe_and_direct_terminal() {
+        let mut config = AppConfig::default();
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".into());
+        config.terminal_direct.lan.enabled = true;
+        config.terminal_direct.lan.hostname = "studio-lan.example.com".into();
+        let app = terminal_lan_router(Arc::new(AppState::new(config)));
+        let peer = ConnectInfo(SocketAddr::from(([192, 168, 1, 20], 52000)));
+
+        let probe = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/terminal/probe",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let forbidden_route = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/sessions",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden_route.status(), StatusCode::NOT_FOUND);
+
+        let direct = axum::http::Request::builder()
+            .uri("/client/terminal")
+            .header(HOST, "studio-lan.example.com:8443")
+            .header("origin", "https://sm.example.com")
+            .extension(peer)
+            .body(Body::empty())
+            .unwrap();
+        let direct_response = app.clone().oneshot(direct).await.unwrap();
+        assert_eq!(direct_response.status(), StatusCode::UPGRADE_REQUIRED);
+
+        let wrong_origin = axum::http::Request::builder()
+            .uri("/client/terminal")
+            .header(HOST, "studio-lan.example.com:8443")
+            .header("origin", "https://wrong.example.com")
+            .extension(peer)
+            .body(Body::empty())
+            .unwrap();
+        let denied = app.oneshot(wrong_origin).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
