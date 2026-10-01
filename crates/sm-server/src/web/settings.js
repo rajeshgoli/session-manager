@@ -1,6 +1,7 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg, Toggle, age } from './ui.js';
+import { html, api, config, Seg, Toggle, age, stored, store } from './ui.js';
+import { TITLES_KEY } from './agents.js';
 import { tokens, tokensOf } from './handoff.js';
 import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
@@ -149,7 +150,9 @@ function Appearance() {
     try { const size = Number(localStorage.getItem('sm-text-size')); return Number.isInteger(size) && size >= 13 && size <= 19 ? size : 15; }
     catch { return 15; }
   });
+  const [titles, setTitles] = useState(() => stored(TITLES_KEY, true) !== false);
   const [status, setStatus] = useState('');
+  const chooseTitles = value => { setTitles(value); store(TITLES_KEY, value); setStatus('Saved'); };
   const choose = value => { setTheme(value); document.documentElement.dataset.theme = value;
     try { localStorage.setItem('sm-theme', value); setStatus('Saved'); } catch { setStatus('Applied until reload; browser storage is unavailable.'); } };
   const chooseSize = size => { setTextSize(size); document.documentElement.style.fontSize = `${size}px`;
@@ -161,6 +164,9 @@ function Appearance() {
         onInput=${event => chooseSize(Number(event.target.value))} />
       <output for="sm-text-size">${textSize} px</output>
       <button class="btn sm" type="button" onClick=${() => chooseSize(15)}>Reset</button></div>
+    <div class="settings-field"><label><span>Ticket titles on agent cards</span>
+      <${Toggle} label="Ticket titles on agent cards" checked=${titles} onChange=${chooseTitles} /></label>
+      <p class="sub">Shows each agent's ticket title under its name on the Agents page.</p></div>
     <p class="sub">Saved in this browser only.</p><p role="status" class="saved">${status}</p>`;
 }
 

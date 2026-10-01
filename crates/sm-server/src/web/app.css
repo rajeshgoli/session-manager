@@ -177,6 +177,10 @@ select.inp { padding: 3px 6px; }
 .acard .icons .icon-btn { padding: 1px 4px; }
 .acard .ln { grid-column: 2 / -1; }
 .acard .repo { color: var(--ink-3); }
+/* The ticket title on its own line under the name (sm#1900), full card width at every size. */
+.acard .ttl { grid-column: 2 / -1; font-size: .933rem; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.acard.titled .ring { grid-row: 1 / span 4; }
+.acard.titled.tall .ring { grid-row: 1 / span 5; }
 .card.kb { outline: 2px solid var(--accent); outline-offset: 1px; }
 .acard.sel { border-left-color: var(--edge, var(--line)); }
 .facts { grid-column: 2 / -1; display: grid; grid-template-columns: 7.2rem minmax(0, 1fr); gap: 0 8px; font-size: .867rem; min-width: 0; }

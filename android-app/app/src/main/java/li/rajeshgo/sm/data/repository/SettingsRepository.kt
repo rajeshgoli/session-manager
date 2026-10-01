@@ -49,6 +49,7 @@ class SettingsRepository(
         val TIME_RANGE = stringPreferencesKey("analytics_time_range")
         val ANALYTICS_SECTION = stringPreferencesKey("analytics_section")
         val TEXT_SCALE = floatPreferencesKey("text_scale")
+        val AGENT_TITLES = booleanPreferencesKey("agent_titles")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -206,6 +207,13 @@ class SettingsRepository(
 
     suspend fun saveTextScale(scale: Float) {
         context.dataStore.edit { prefs -> prefs[Keys.TEXT_SCALE] = normalizeTextScale(scale) }
+    }
+
+    /** Settings › Appearance › Ticket titles on agent rows; on unless turned off (sm#1900). */
+    val agentTitles: Flow<Boolean> = context.dataStore.data.map { prefs -> prefs[Keys.AGENT_TITLES] ?: true }
+
+    suspend fun saveAgentTitles(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[Keys.AGENT_TITLES] = enabled }
     }
 
     suspend fun saveFollowPushEnabled(enabled: Boolean) {

@@ -181,6 +181,8 @@ fun WatchScreen(
     val idleSections = remember(sections) { sliceSections(sections, TreeSlice.Idle) }
     val sessionsById = remember(state.sessions) { state.sessions.associateBy { it.id } }
     val context = LocalContext.current
+    val showTitles by remember(context) { li.rajeshgo.sm.data.repository.SettingsRepository(context.applicationContext).agentTitles }
+        .collectAsState(initial = true)
     val lifecycleOwner = LocalLifecycleOwner.current
     var isResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
@@ -427,7 +429,7 @@ fun WatchScreen(
                 onOpenPage = { openPage = it },
                 follow = follow,
             )
-            val rowState = WatchRowState(sessionsById, state.expandedSessionIds, state.detailsBySessionId, state.whatBySessionId)
+            val rowState = WatchRowState(sessionsById, state.expandedSessionIds, state.detailsBySessionId, state.whatBySessionId, showTitles)
             if (if (byRepo) sections.isEmpty() else attention.isEmpty()) {
                 item {
                     EmptyState(query = query, filter = filter)
@@ -1196,6 +1198,7 @@ private class WatchRowState(
     val expandedSessionIds: Set<String>,
     val detailsById: Map<String, SessionDetail>,
     val whatById: Map<String, WhatUiState>,
+    val showTitles: Boolean,
 )
 
 /** What every Watch row can do. */
@@ -1339,6 +1342,15 @@ private fun SessionRow(
                         if (followed) {
                             Icon(Icons.Rounded.NotificationsActive, contentDescription = "Following", tint = Amber, modifier = Modifier.size(16.dp))
                         }
+                    }
+                    if (rowState.showTitles) ticketTitle(session)?.let { title ->
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     val facts = rowFactsLine(session, now)
                     val jobsText = session.facts?.jobs?.text
