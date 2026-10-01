@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age } from './ui.js';
+import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age, stored, store } from './ui.js';
 import { Reader, readerPath } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -35,7 +35,7 @@ const replyTime = value => value ? new Date(value).toLocaleString([], { dateStyl
 
 export function InboxPage({ openRef }) {
   const [filter, setFilter] = useState('open');
-  const [foldOpen, setFoldOpen] = useState(() => localStorage.getItem('sm-inbox-folded-open') === 'true');
+  const [foldOpen, setFoldOpen] = useState(() => stored('sm-inbox-folded-open', false));
   const [data, error, reload] = usePoll(() => api(`/inbox?format=json&filter=${filter}`), 30000, [filter]);
   const rowRef = row => `work:${row.thread_key}`;
   const selected = data?.rows.find(row => rowRef(row) === openRef);
@@ -108,7 +108,7 @@ export function InboxPage({ openRef }) {
           ${rows.map(row)}</div>` : null;
       })}
       ${filter === 'open' && folded.length ? html`<div class="inbox-fold">
-        <button class="inbox-fold-toggle" aria-expanded=${foldOpen} onClick=${() => { localStorage.setItem('sm-inbox-folded-open', String(!foldOpen)); setFoldOpen(!foldOpen); }}>
+        <button class="inbox-fold-toggle" aria-expanded=${foldOpen} onClick=${() => { store('sm-inbox-folded-open', !foldOpen); setFoldOpen(!foldOpen); }}>
           ${foldOpen ? '▾' : '▸'} Folded · ${folded.length} threads (${foldNames}${folded.length > 3 ? ', …' : ''})
         </button>${foldOpen ? folded.map(row) : null}
       </div>` : null}
@@ -147,7 +147,7 @@ export function Thread({ id, workKey, controls, agent }) {
     || options.find(option => option.status === 'live' && option.can_send)
     || options.find(option => option.can_send);
   const target = options.find(option => option.id === targetId && option.can_send) || defaultTarget;
-  const replyTo = target ? { name: target.name, restores: target.restores, retired_at: target.retired_at } : data?.reply_to;
+  const replyTo = target ? { name: target.recipient_name || target.name, restores: target.restores, retired_at: target.retired_at } : data?.reply_to;
   useLayoutEffect(() => {
     if (data && scrollOnLoad.current && items.current) {
       const at = new URLSearchParams(location.search).get('at');
@@ -232,7 +232,7 @@ export function Thread({ id, workKey, controls, agent }) {
       ${data?.can_send ? html`${options.length > 1 ? html`<label class="thread-target">Reply to <select aria-label="Reply to" value=${target?.id} disabled=${busy} onChange=${e => setTargetId(e.target.value)}>
           ${options.map(option => html`<option value=${option.id} disabled=${!option.can_send}>${option.name}${option.restores ? ' · restores' : option.status === 'ended' ? ' · ended' : ''}</option>`)}</select></label>` : null}
         ${replyTo?.restores ? html`<p class="thread-reply-hint">${target?.name || replyTo.name} retired at ${replyTime(replyTo.retired_at)}; replying brings it back.</p>` : null}
-        <textarea aria-label="Reply" placeholder=${`Write to ${target?.name || replyTo?.name || 'agent'}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />
+        <textarea aria-label="Reply" placeholder=${`Write to ${replyTo?.name || 'agent'}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />
         <button class="btn pri" disabled=${busy || (!body.trim() && !quotes.length)} onClick=${send}>${busy ? 'Sending…' : 'Send'}</button>` : html`<p>No agent is left to reply to.</p>`}
       ${failure ? html`<p role="alert">${failure}</p>` : null}
     </div>
