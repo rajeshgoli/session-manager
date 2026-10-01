@@ -1860,6 +1860,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/inbox", get(inbox::get_inbox))
         .route("/inbox/done", post(inbox::post_done))
+        .route("/inbox/archive", post(inbox::work_threads::post_archive))
+        .route(
+            "/inbox/unarchive",
+            post(inbox::work_threads::post_unarchive),
+        )
+        .route("/inbox/thread/{key}", get(inbox::work_threads::get_thread))
+        .route(
+            "/inbox/thread/{key}/send",
+            post(inbox::work_threads::post_thread_send),
+        )
         .route("/inbox/agent/{session_id}", get(inbox::get_agent_thread))
         .route(
             "/inbox/agent/{session_id}/send",

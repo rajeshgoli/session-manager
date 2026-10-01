@@ -12,6 +12,7 @@ use super::messages::{
     valid_submission_id, NO_RECIPIENT,
 };
 use super::*;
+pub(super) mod work_threads;
 use crate::owner_doc_render::{inline_json, render_markdown_with_lines};
 use crate::owner_docs::{
     doc_readable_path, escape_html, page_shell_with_status, OwnerDocState, OwnerDocSummary,
@@ -26,6 +27,7 @@ use crate::owner_messages::{
 };
 use crate::owner_push::{format_ts, notification_for, parse_ts, Follow, REASON_JOB_FINISHED};
 use crate::turn_messages::{FinishedRow, ThreadReply};
+use work_threads::ThreadCatalog;
 
 /// The Open list holds threads with activity this recent, plus every thread
 /// that needs the owner.
@@ -104,11 +106,14 @@ pub(super) struct InboxRow {
     pub newest_at: String,
     pub message_count: usize,
     pub revision_count: usize,
+    pub doc_count: usize,
     pub open_asks: usize,
     pub url: String,
     pub done: bool,
     pub session_id: Option<String>,
     pub doc_id: Option<String>,
+    pub folded_by: Option<&'static str>,
+    pub agents: Vec<String>,
     /// Items in the thread, for Done.
     #[serde(skip)]
     pub items: usize,
@@ -141,6 +146,7 @@ impl World {
     fn load(state: &AppState) -> Result<Self, ApiError> {
         let store = owner_message_store(state);
         let inbox = inbox_store(state);
+        let marks = inbox.marks()?;
         Ok(Self {
             sessions: state
                 .session_store
@@ -164,7 +170,7 @@ impl World {
                 .map(|store| store.thread_replies())
                 .transpose()?
                 .unwrap_or_default(),
-            marks: inbox.marks()?,
+            marks,
         })
     }
 
@@ -380,10 +386,13 @@ impl World {
                     newest_at,
                     message_count: messages.len(),
                     revision_count: 0,
+                    doc_count: 0,
                     open_asks,
                     url: agent_thread_path(session_id),
                     session_id: Some(session_id.to_owned()),
                     doc_id: None,
+                    folded_by: None,
+                    agents: vec![self.agent_name(session_id)],
                     items,
                 }
             })
@@ -434,17 +443,20 @@ impl World {
                     status: summary.state.as_str().to_owned(),
                     verdict: fact.latest_verdict.clone(),
                     pr_number: summary.doc.pr_number,
-                    author,
+                    author: author.clone(),
                     group,
                     preview: doc_preview(summary, fact.latest_verdict.as_deref()),
                     done: is_done(&marks, items),
                     newest_at,
                     message_count: 0,
                     revision_count: summary.publish_count,
+                    doc_count: 1,
                     open_asks: usize::from(group == "needs_you"),
                     url: doc_reader_path(summary),
                     session_id: None,
                     doc_id: Some(summary.doc.id.clone()),
+                    folded_by: None,
+                    agents: author.clone().into_iter().collect(),
                     items,
                 }
             })
@@ -507,13 +519,15 @@ pub(super) struct InboxQuery {
 /// The rows a filter shows, in order, plus the badge values (which always
 /// count the Open list).
 fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize, bool), ApiError> {
-    let world = World::load(state)?;
-    let mut rows = world.agent_rows();
-    rows.extend(world.doc_rows(state)?);
+    let rows = ThreadCatalog::load(state)?.rows(state)?;
     let cutoff = format_ts(OffsetDateTime::now_utc() - OPEN_WINDOW);
     // Needs-you and unread Finished threads stay open until dealt with.
     let open = |row: &InboxRow| {
-        !row.done && (matches!(row.group, "needs_you" | "finished") || row.newest_at >= cutoff)
+        row.group == "folded"
+            || (!row.done
+                && (row.doc_id.is_some()
+                    || matches!(row.group, "needs_you" | "finished")
+                    || row.newest_at >= cutoff))
     };
     let needs_you_count = rows
         .iter()
@@ -522,8 +536,14 @@ fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize
     let has_new = rows.iter().any(|row| open(row) && row.group == "new");
     let newest_first = |a: &InboxRow, b: &InboxRow| b.newest_at.cmp(&a.newest_at);
     let mut rows: Vec<InboxRow> = match filter {
-        "done" => rows.into_iter().filter(|row| row.done).collect(),
-        "docs" => rows.into_iter().filter(|row| row.kind == "doc").collect(),
+        "done" => rows
+            .into_iter()
+            .filter(|row| row.done && row.folded_by.is_none())
+            .collect(),
+        "docs" => rows
+            .into_iter()
+            .filter(|row| row.doc_id.is_some())
+            .collect(),
         _ => rows.into_iter().filter(|row| open(row)).collect(),
     };
     if filter == "open" {
@@ -601,6 +621,8 @@ const INBOX_STYLE: &str = r#"
 button.done { font: 11px var(--mono); color: var(--kt2); background: var(--k2); border: 1px solid var(--kl);
   border-radius: 999px; padding: 1px 8px; cursor: pointer; }
 .empty { color: var(--kt3); margin: 24px 4px; }
+.fold { margin: 18px 0; }
+.fold > summary { cursor: pointer; font: 12px var(--mono); color: var(--kt2); padding: 8px 4px; }
 "#;
 
 fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
@@ -619,31 +641,12 @@ fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
     if !row.repo.is_empty() {
         sub.push(escape_html(&row.repo));
     }
-    if row.kind == "doc" {
-        if let Some(pr) = row.pr_number {
-            sub.push(format!("PR #{pr}"));
-        }
-        if let Some(author) = &row.author {
-            sub.push(escape_html(author));
-        }
-    } else {
-        if row.message_count > 0 {
-            sub.push(format!(
-                "{} message{}",
-                row.message_count,
-                if row.message_count == 1 { "" } else { "s" }
-            ));
-        }
-        sub.push(
-            match (row.group, row.status.as_str()) {
-                ("needs_you", _) => "asks you",
-                ("finished", _) => "finished",
-                (_, "ended") => "agent ended",
-                _ if row.preview.starts_with("You: ") => "you replied",
-                _ => "for your information",
-            }
-            .to_owned(),
-        );
+    sub.extend(row.agents.iter().map(|name| escape_html(name)));
+    if row.doc_count > 0 {
+        sub.push(format!(
+            "{} docs, {} revisions",
+            row.doc_count, row.revision_count
+        ));
     }
     let done_button = if show_done && !row.done {
         format!(
@@ -653,8 +656,19 @@ fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
     } else {
         String::new()
     };
+    let archive_button = if row.folded_by == Some("archived") {
+        format!(
+            r#" <button class="unarchive" data-key="{}">Unarchive</button>"#,
+            escape_html(&row.thread_key)
+        )
+    } else {
+        format!(
+            r#" <button class="archive" data-key="{}">Archive</button>"#,
+            escape_html(&row.thread_key)
+        )
+    };
     format!(
-        r#"<div class="card {edge}"><a class="row-card" href="{url}"><div class="row">{tag}<span class="t">{title}</span><span class="sp"></span><span class="m">{when}</span></div><div class="p">{preview}</div></a><div class="row"><span class="m">{sub}</span><span class="sp"></span>{done_button}</div></div>"#,
+        r#"<div class="card {edge}"><a class="row-card" href="{url}"><div class="row">{tag}<span class="t">{title}</span><span class="sp"></span><span class="m">{when}</span></div><div class="p">{preview}</div></a><div class="row"><span class="m">{sub}</span><span class="sp"></span>{done_button}{archive_button}</div></div>"#,
         url = escape_html(&row.url),
         title = escape_html(&row.title),
         when = escape_html(&relative_time(&row.newest_at, now)),
@@ -700,6 +714,20 @@ fn render_inbox_page(
             for row in group_rows {
                 body.push_str(&render_row(row, now, true));
             }
+        }
+        let folded: Vec<_> = rows.iter().filter(|row| row.group == "folded").collect();
+        if !folded.is_empty() {
+            let names = folded
+                .iter()
+                .take(3)
+                .map(|row| escape_html(&row.title))
+                .collect::<Vec<_>>()
+                .join(", ");
+            body.push_str(&format!(r#"<details class="fold" id="folded"><summary>Folded · {} threads ({names}{more})</summary>"#, folded.len(), more = if folded.len() > 3 { ", …" } else { "" }));
+            for row in folded {
+                body.push_str(&render_row(row, now, false));
+            }
+            body.push_str("</details>");
         }
     } else {
         for row in rows {
@@ -967,14 +995,12 @@ pub(super) async fn get_agent_thread(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
-    let at = query.at.filter(|_| query.bottom.is_none());
-    agent_thread_page(
-        &state,
-        &session_id,
-        at,
-        web::wants_json(&request),
-        web::wants_shell(&state, &request),
-    )
+    let key = work_threads::key_for_agent(&state, &session_id)?;
+    let mut path = work_threads::path_for_key(&key);
+    if let Some(at) = query.at.filter(|_| query.bottom.is_none()) {
+        path.push_str(&format!("?at={at}"));
+    }
+    Ok(axum::response::Redirect::temporary(&path).into_response())
 }
 
 /// Open "PR #n has no reviewer" asks from this agent, for the thread's
@@ -998,185 +1024,6 @@ fn review_asks(state: &AppState, session_id: &str) -> Result<Vec<Value>, ApiErro
         }
     }
     Ok(asks)
-}
-
-/// The thread page for `session_id`, scrolled to message `at`. Also what
-/// `/messages/{id}` serves, so apps that only know that path keep the page
-/// in their reader.
-pub(super) fn agent_thread_page(
-    state: &AppState,
-    session_id: &str,
-    at: Option<String>,
-    json_format: bool,
-    browser: bool,
-) -> Result<Response, ApiError> {
-    let session_id = session_id.to_owned();
-    let world = World::load(state)?;
-    let has_items = world
-        .messages
-        .iter()
-        .any(|m| m.sender_session_id == session_id)
-        || world.notes.iter().any(|n| n.session_id == session_id)
-        || world.follows.iter().any(|f| f.session_id == session_id)
-        || world.finished.iter().any(|f| f.session_id == session_id)
-        || world
-            .agent_replies
-            .iter()
-            .any(|r| r.session_id == session_id);
-    if !has_items && !world.sessions.contains_key(&session_id) {
-        return Err(ApiError::NotFound("Thread not found"));
-    }
-    let follows_seen = world
-        .follows
-        .iter()
-        .filter(|f| f.session_id == session_id)
-        .count();
-    owner_message_store(state).mark_sender_viewed(&session_id)?;
-    inbox_store(state).mark_read(&agent_thread_key(&session_id), follows_seen)?;
-    let world = World::load(state)?;
-    let replied = world.replied();
-    let message_ids: BTreeSet<&str> = world
-        .messages
-        .iter()
-        .filter(|m| m.sender_session_id == session_id)
-        .map(|m| m.id.as_str())
-        .collect();
-    let mut items: Vec<Item<'_>> = Vec::new();
-    for message in world
-        .messages
-        .iter()
-        .filter(|m| m.sender_session_id == session_id)
-    {
-        items.push(Item::Message(
-            message,
-            world.message_state(message, &replied),
-        ));
-        if message.handled_at.is_some() {
-            items.push(Item::Answered(message));
-        }
-    }
-    items.extend(
-        world
-            .replies
-            .iter()
-            .filter(|reply| message_ids.contains(reply.message_id.as_str()))
-            .map(Item::Reply),
-    );
-    items.extend(
-        world
-            .notes
-            .iter()
-            .filter(|note| note.session_id == session_id)
-            .map(Item::Note),
-    );
-    items.extend(
-        world
-            .follows
-            .iter()
-            .filter(|follow| follow.session_id == session_id)
-            .map(Item::Follow),
-    );
-    items.extend(
-        world
-            .finished
-            .iter()
-            .filter(|row| row.session_id == session_id && row.text.is_some())
-            .map(Item::Turn),
-    );
-    items.extend(world.agent_replies_of(&session_id).map(Item::AgentReply));
-    let publishes = owner_doc_store(state).publishes_by_session(&session_id, 100)?;
-    items.extend(
-        publishes
-            .iter()
-            .map(|(doc, publish)| Item::Doc(doc, publish)),
-    );
-    // Stable: equal times keep the order above (messages before replies).
-    items.sort_by_key(Item::at);
-    let now = OffsetDateTime::now_utc();
-    let name = world.agent_name(&session_id);
-    let live = world.live(&session_id);
-    let recipient = live_recipient(state, &session_id);
-    // A thread whose agent handed off continues with its successor (sm#1651).
-    let status = match state.session_store.get_session(&session_id)? {
-        Some(session) if !live && session.successor_session_id.is_some() => {
-            match state.session_store.forwarded_session(&session_id)? {
-                Some(successor) => format!(
-                    "continued by {}",
-                    escape_html(&world.agent_name(&successor.id))
-                ),
-                None => "ended".to_owned(),
-            }
-        }
-        _ if live => "live".to_owned(),
-        _ => "ended".to_owned(),
-    };
-    let repo = world.agent_repo(&session_id);
-    if json_format {
-        return Ok(Json(json!({
-            "session_id": session_id, "title": name, "status": status, "repo": repo,
-            "can_send": recipient.is_some(),
-            "reply_to": recipient.as_ref().map(|s| session_display_name(s.clone())),
-            "items": items.iter().map(|item| item.json(&world, &session_id, now))
-                .collect::<Vec<_>>(),
-            "review_asks": review_asks(state, &session_id)?,
-        }))
-        .into_response());
-    }
-    let mut body = format!(
-        r#"<style>{THREAD_STYLE}</style><div class="th-head"><a class="dim" href="/inbox">‹ Inbox</a><span class="big">{name}</span><span class="m"><span class="dot {dot}"></span>{status}{repo}</span></div><div class="items{quote_class}">"#,
-        name = escape_html(&name),
-        dot = if live { "working" } else { "retired" },
-        repo = if repo.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", escape_html(&repo))
-        },
-        quote_class = if recipient.is_some() {
-            " can-quote"
-        } else {
-            ""
-        },
-    );
-    if items.is_empty() {
-        body.push_str(r#"<div class="ev">Nothing yet. Write below to start.</div>"#);
-    }
-    for item in &items {
-        body.push_str(&render_item(item, &world, &session_id, now));
-    }
-    body.push_str("</div>");
-    let reply_to = recipient.map(session_display_name);
-    body.push_str(r#"<div class="compose">"#);
-    match &reply_to {
-        Some(to) => {
-            let hint = if live {
-                "Tap a paragraph to quote it.".to_owned()
-            } else {
-                format!("This agent has ended; a reply goes to {}.", escape_html(to))
-            };
-            body.push_str(&format!(
-                r#"<div class="qs" id="qs"></div><textarea id="box" rows="2" placeholder="Write to {to}"></textarea><div class="btns"><button id="done">Done</button><span class="msg" id="msg">{hint}</span><button class="send" id="send">Send</button></div>"#,
-                to = escape_html(to),
-            ));
-        }
-        None => body.push_str(
-            r#"<div class="btns"><button id="done">Done</button><span class="msg" id="msg">No agent is left to reply to.</span></div>"#,
-        ),
-    }
-    body.push_str("</div>");
-    let config = json!({
-        "page": "thread",
-        "token": docs::issue_doc_token(&state.config, TOKEN_SUBJECT),
-        "sessionId": session_id,
-        "threadKey": agent_thread_key(&session_id),
-        "canSend": reply_to.is_some(),
-        "at": at,
-    });
-    body.push_str(&format!(
-        "<script>{INBOX_CLIENT_JS}({});</script>",
-        inline_json(&config)
-    ));
-    body.push_str(&web::reader_injection(browser));
-    Ok(html(page_shell_with_status(&name, "inbox", "", &body)))
 }
 
 /// Inbox writes: the page's signed token, or the ordinary session guard
@@ -1213,51 +1060,17 @@ pub(super) async fn post_done(
     ensure_inbox_write_allowed(&state, &headers, peer_addr, "/inbox/done")?;
     let payload: DoneRequest = docs::parse_json_body(&body)?;
     let key = payload.thread_key.trim();
-    let items;
-    if let Some(session_id) = key.strip_prefix("agent:") {
-        let _guard = state.owner_message_lock.lock().await;
-        let world = World::load(&state)?;
-        let row = world
-            .agent_rows()
-            .into_iter()
-            .find(|row| row.thread_key == key);
-        if row.is_none() && !world.sessions.contains_key(session_id) {
-            return Err(ApiError::NotFound("Thread not found"));
-        }
-        items = row.map_or(0, |row| row.items);
-        let replied = world.replied();
-        let store = owner_message_store(&state);
-        for message in world.messages.iter().filter(|m| {
-            m.sender_session_id == session_id
-                && m.blocking
-                && m.handled_at.is_none()
-                && !replied.contains(m.id.as_str())
-        }) {
-            store.mark_handled_via(&message.id, "inbox")?;
-        }
-        store.mark_sender_viewed(session_id)?;
-        if let Some(turns) = state.session_store.turn_message_store() {
-            turns.mark_read(session_id, OffsetDateTime::now_utc())?;
-        }
-    } else if let Some(doc_id) = key.strip_prefix("doc:") {
-        let _guard = state.owner_doc_review_lock.lock().await;
-        let store = owner_doc_store(&state);
-        let summary = store
-            .summary(doc_id)?
-            .ok_or(ApiError::NotFound("Thread not found"))?;
-        if summary.state == OwnerDocState::ReviewRequested {
-            store.dismiss_review(doc_id)?;
-        }
-        items = summary.publish_count
-            + store
-                .inbox_facts()?
-                .get(doc_id)
-                .map_or(0, |fact| fact.review_count);
-    } else {
-        return Err(bad_request("thread_key must be agent:<id> or doc:<id>"));
+    if !["agent:", "doc:", "docpath:", "ticket:", "pr:"]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+    {
+        return Err(bad_request("Invalid thread_key"));
     }
-    inbox_store(&state).mark_done(key, items)?;
-    Ok(Json(json!({ "thread_key": key, "done": true })))
+    let canonical = ThreadCatalog::load(&state)?
+        .canonical_key(key)
+        .ok_or(ApiError::NotFound("Thread not found"))?;
+    work_threads::mark_done(&state, &canonical).await?;
+    Ok(Json(json!({ "thread_key": canonical, "done": true })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1294,6 +1107,15 @@ pub(super) async fn post_agent_send(
         &format!("{}/send", agent_thread_path(&session_id)),
     )?;
     let payload: SendRequest = docs::parse_json_body(&body)?;
+    send_to_agent(&state, &session_id, payload, None).await
+}
+
+async fn send_to_agent(
+    state: &Arc<AppState>,
+    session_id: &str,
+    payload: SendRequest,
+    thread_key: Option<&str>,
+) -> Result<Json<Value>, ApiError> {
     let submission_id = payload.submission_id.trim().to_owned();
     if !valid_submission_id(&submission_id) {
         return Err(bad_request(
@@ -1310,30 +1132,39 @@ pub(super) async fn post_agent_send(
         docs::validated_draft_body(&text)?;
     }
     let _guard = state.owner_message_lock.lock().await;
-    let store = owner_message_store(&state);
-    let inbox = inbox_store(&state);
-    let world = World::load(&state)?;
+    let store = owner_message_store(state);
+    let inbox = inbox_store(state);
+    let world = World::load(state)?;
+    let thread_messages: Option<BTreeSet<String>> = thread_key
+        .map(|key| work_threads::ThreadCatalog::load(state).map(|catalog| catalog.message_ids(key)))
+        .transpose()?;
     let own: Vec<&OwnerMessage> = world
         .messages
         .iter()
-        .filter(|m| m.sender_session_id == session_id)
+        .filter(|m| {
+            thread_messages
+                .as_ref()
+                .map_or(m.sender_session_id == session_id, |ids| ids.contains(&m.id))
+        })
         .collect();
     if let Some(existing) = store.reply(&submission_id)? {
         if !own.iter().any(|m| m.id == existing.message_id) {
             return Err(conflict("submission_id belongs to another thread"));
         }
-        return Ok(Json(sent_json(&state, "reply", Some(&existing), None)));
+        return Ok(Json(sent_json(state, "reply", Some(&existing), None)));
     }
     if let Some(existing) = inbox.note(&submission_id)? {
-        if existing.session_id != session_id {
+        if existing.session_id != session_id
+            || thread_key.is_some_and(|key| existing.thread_key.as_deref() != Some(key))
+        {
             return Err(conflict("submission_id belongs to another thread"));
         }
-        return Ok(Json(sent_json(&state, "note", None, Some(&existing))));
+        return Ok(Json(sent_json(state, "note", None, Some(&existing))));
     }
-    if own.is_empty() && !world.sessions.contains_key(&session_id) {
+    if own.is_empty() && !world.sessions.contains_key(session_id) {
         return Err(ApiError::NotFound("Thread not found"));
     }
-    let Some(recipient) = live_recipient(&state, &session_id) else {
+    let Some(recipient) = live_recipient(state, session_id) else {
         return Err(conflict(NO_RECIPIENT));
     };
     let mut quotes = Vec::new();
@@ -1359,16 +1190,22 @@ pub(super) async fn post_agent_send(
         return Err(bad_request("Nothing to send"));
     }
     let replied = world.replied();
-    let target = own
+    let selected: Vec<_> = own
+        .iter()
+        .copied()
+        .filter(|m| m.sender_session_id == session_id)
+        .collect();
+    let target = selected
         .iter()
         .rev()
         .find(|m| world.message_state(m, &replied) == OwnerMessageState::NeedsYou)
         .or_else(|| {
-            own.iter()
+            selected
+                .iter()
                 .rev()
                 .find(|m| quoted_ids.contains(m.id.as_str()))
         })
-        .or_else(|| own.last())
+        .or_else(|| selected.last())
         .copied();
     let delivered_text = render_thread_text(&state.config.owner_name, target, &text, &quotes);
     let response = match target {
@@ -1390,23 +1227,24 @@ pub(super) async fn post_agent_send(
                 draft_ids: Vec::new(),
             })?;
             if inserted {
-                deliver_now(&state, &recipient.id, &message.id);
+                deliver_now(state, &recipient.id, &message.id);
             }
-            sent_json(&state, "reply", Some(&reply), None)
+            sent_json(state, "reply", Some(&reply), None)
         }
         None => {
             let (note, inserted) = inbox.record_note(&OwnerNote {
                 id: submission_id,
-                session_id: session_id.clone(),
+                session_id: session_id.to_owned(),
                 body: text,
                 delivered_text,
                 delivered_to_session_id: recipient.id.clone(),
                 created_at: String::new(),
+                thread_key: thread_key.map(str::to_owned),
             })?;
             if inserted {
-                deliver_now(&state, &recipient.id, &format!("note to {session_id}"));
+                deliver_now(state, &recipient.id, &format!("note to {session_id}"));
             }
-            sent_json(&state, "note", None, Some(&note))
+            sent_json(state, "note", None, Some(&note))
         }
     };
     Ok(Json(response))
