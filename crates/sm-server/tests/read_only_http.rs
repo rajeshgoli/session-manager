@@ -16948,7 +16948,7 @@ async fn runtime_core_claude_spawn_brief_accepts_transcript_created_by_the_brief
             "name": "claude-lazy",
             "working_dir": working_dir.display().to_string(),
             "provider": "claude",
-            "initial_message": "CLAUDE_LAZY_SENTINEL\n",
+            "initial_message": format!("CLAUDE_LAZY_SENTINEL\n\n  Preserve indentation and 漢字.\n{}\n", "long brief ".repeat(150)),
             "spawn_prompt_source": {"kind": "positional"}
         }),
     )
@@ -21290,20 +21290,15 @@ fn runtime_app_with_structured_claude_provider(
             transcript_root.display()
         )
     };
-    let acknowledgement = if acknowledge {
-        r#"  printf '{"type":"user","sessionId":"%s","message":{"content":"%s"}}\n' "$session_id" "$line" >> "$transcript"
-"#
-    } else {
-        Default::default()
-    };
+    let acknowledgement = if acknowledge { "True" } else { "False" };
     // Claude 2.1.280 creates its transcript only when the first turn arrives.
     let create_transcript = r#"mkdir -p "$(dirname "$transcript")"
 [ -f "$transcript" ] || printf '{"type":"mode","sessionId":"%s"}\n' "$session_id" > "$transcript"
 "#;
-    let (startup_transcript, first_turn_transcript) = if transcript_at_startup {
-        (create_transcript, "")
+    let startup_transcript = if transcript_at_startup {
+        create_transcript
     } else {
-        ("", create_transcript)
+        ""
     };
     fs::write(
         &provider,
@@ -21317,12 +21312,32 @@ for argument in "$@"; do
 done
 project_dir=$(pwd -P | sed 's#/#-#g')
 {transcript_layout}
-{startup_transcript}printf 'renderer layout deliberately irrelevant\n❯'
-while IFS= read -r line; do
-  printf 'received:%s\n' "$line"
-{first_turn_transcript}{acknowledgement}
-  printf 'renderer changed again\n❯'
-done
+{startup_transcript}exec python3 -u - "$transcript" "$session_id" <<'PYTHON'
+import json, os, sys, tty
+path, session_id = sys.argv[1:]
+fd = os.open('/dev/tty', os.O_RDWR)
+tty.setraw(fd)
+# Model the initial composer: only a complete bracketed paste followed by a
+# literal carriage return submits. Preserve newlines and UTF-8 within the paste.
+os.write(fd, b'\x1b[?2004h')
+print('renderer layout deliberately irrelevant\r\n❯', end='', flush=True)
+pending = b''
+while True:
+    pending += os.read(fd, 4096)
+    start, end = b'\x1b[200~', b'\x1b[201~\r'
+    if not pending.startswith(start) or not pending.endswith(end):
+        continue
+    line = pending[len(start):-len(end)].decode('utf-8')
+    pending = b''
+    print('received:' + line, flush=True)
+    if {acknowledgement}:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        content = '\n\n<pasted_content id="c10a">\n' + line + '\n</pasted_content id="c10a">\n'
+        entry = dict(type='user', sessionId=session_id, message=dict(content=content))
+        with open(path, 'a') as transcript:
+            transcript.write(json.dumps(entry) + '\n')
+    print('renderer changed again\r\n❯', end='', flush=True)
+PYTHON
 "#
         ),
     )

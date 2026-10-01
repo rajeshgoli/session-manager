@@ -1483,7 +1483,30 @@ impl TmuxRuntime {
                 if self.session_has_attached_clients(&spec.tmux_session)? {
                     bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
                 }
-                self.send_text_then_enter(&spec.tmux_session, prompt)?;
+                // Frame the entire brief as one paste. Unbracketed input can
+                // be split/dropped by Claude's paste detection, especially for
+                // long or multiline briefs (#1892).
+                self.run_tmux([
+                    "send-keys",
+                    "-t",
+                    &spec.tmux_session,
+                    "-l",
+                    "--",
+                    "\u{1b}[200~",
+                ])?;
+                self.send_text(&spec.tmux_session, prompt)?;
+                self.run_tmux([
+                    "send-keys",
+                    "-t",
+                    &spec.tmux_session,
+                    "-l",
+                    "--",
+                    "\u{1b}[201~",
+                ])?;
+                thread::sleep(self.compute_settle_delay(prompt));
+                // Submit with a literal carriage return so this path does not
+                // depend on tmux's negotiated encoding of the named Enter key.
+                self.run_tmux(["send-keys", "-t", &spec.tmux_session, "-H", "0d"])?;
                 self.wait_for_claude_initial_brief_acceptance(
                     &spec.tmux_session,
                     &transcript,
@@ -2010,8 +2033,9 @@ fn claude_nested_transcript_candidates(project_directories: &[PathBuf]) -> Vec<P
 
 /// A transcript is acknowledgement only if it appends a matching user turn for
 /// this generated provider session after the startup boundary. Claude trims
-/// boundary whitespace on submission; interior text must still match exactly.  Incomplete and
-/// malformed JSONL records fail closed and are reconsidered on the next poll.
+/// boundary whitespace on submission and may add a whole-paste envelope;
+/// interior text must still match exactly. Incomplete and malformed JSONL
+/// records fail closed and are reconsidered on the next poll.
 fn claude_transcript_has_matching_user_turn(
     path: &Path,
     offset: u64,
@@ -2036,10 +2060,31 @@ fn claude_transcript_has_matching_user_turn(
                     .and_then(Value::as_object)
                     .and_then(|message| message.get("content"))
                     .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content == prompt || (!prompt.trim().is_empty() && content == prompt.trim())
-                    })
+                    .is_some_and(|content| claude_brief_text_matches(content, prompt))
         })
+}
+
+/// Claude wraps a long bracketed paste in one provider-generated envelope.
+/// Accept only the entire envelope with matching hexadecimal IDs and exact body;
+/// finding the brief as a substring of a different turn is not acknowledgement.
+fn claude_brief_text_matches(content: &str, prompt: &str) -> bool {
+    let matches =
+        |text: &str| text == prompt || (!prompt.trim().is_empty() && text == prompt.trim());
+    if matches(content) {
+        return true;
+    }
+    let Some(envelope) = content.trim().strip_prefix("<pasted_content id=\"") else {
+        return false;
+    };
+    let Some((id, body_and_end)) = envelope.split_once("\">\n") else {
+        return false;
+    };
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    body_and_end
+        .strip_suffix(format!("\n</pasted_content id=\"{id}\">").as_str())
+        .is_some_and(matches)
 }
 
 /// Claude renders a status/footer block below its live composer. Looking only
@@ -3203,6 +3248,37 @@ esac
             provider_session_id,
             "exact immutable brief"
         ));
+    }
+
+    #[test]
+    fn claude_brief_acceptance_requires_the_complete_paste_envelope() {
+        let prompt = "Read this brief.\n\n  Preserve indentation and 漢字.\n";
+        let wrapped =
+            format!("\n\n<pasted_content id=\"c10a\">\n{prompt}\n</pasted_content id=\"c10a\">\n");
+        assert!(claude_brief_text_matches(&wrapped, prompt));
+        assert!(claude_brief_text_matches(
+            &wrapped.replace(prompt, prompt.trim()),
+            prompt
+        ));
+        for wrong in [
+            wrapped.replace("Preserve", "Change"),
+            wrapped.replace("  Preserve", " Preserve"),
+            wrapped.replace(
+                "</pasted_content id=\"c10a\">",
+                "</pasted_content id=\"c10b\">",
+            ),
+            wrapped.replace("c10a", ""),
+            wrapped.replace("c10a", "not-an-id"),
+            format!("unrelated instructions{wrapped}"),
+            format!("{wrapped}unrelated instructions"),
+            format!("{wrapped}{wrapped}"),
+            wrapped.replace("</pasted_content id=\"c10a\">", ""),
+        ] {
+            assert!(!claude_brief_text_matches(&wrong, prompt), "{wrong:?}");
+        }
+        // A brief that itself contains markup is still matched literally.
+        assert!(claude_brief_text_matches(&wrapped, &wrapped));
+        assert!(!claude_brief_text_matches(&wrapped, "Preserve indentation"));
     }
 
     #[test]
