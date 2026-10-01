@@ -341,22 +341,22 @@
 </style>
 
 <h1>1821 — Fit and finish, round 2: restarts without downtime, notes, inbox threads, asking about a doc, auto-retire</h1>
-<p class="sans"><small>Author: Claude (design) <code>sm-1821</code> · Ticket #1821 · Revision 1, 30 September 2026 · An addendum to the round 1 memo, <code>docs/working/1782_fit_and_finish.html</code>, whose terms and screens it keeps</small></p>
+<p class="sans"><small>Author: Claude (design) <code>sm-1821</code> · Ticket #1821 · Revision 2, 30 September 2026 · An addendum to the round 1 memo, <code>docs/working/1782_fit_and_finish.html</code>, whose terms and screens it keeps</small></p>
 
 <h2>Memo</h2>
 
-<p><b>Your seven notes become one design and ten tickets; two more tickets need no design and are already on the board.</b> sm stops going dark for about 14 seconds at every server restart: the new build starts beside the old one and takes over only once it is ready, so a broken build never takes sm down. A Notes page and a Notes pane give you one big, searchable text store on the server, reachable from every machine and the phone, with Copy, Type into terminal, Start agent and File ticket. The Inbox groups everything about one ticket into one thread, and folds away threads whose agents have all ended. A doc gets an Ask column for quick questions to its author, or to a cheap reader agent when the author is gone. Finished agents that sm started retire themselves after an hour idle, and a reply brings them back. Print (#1825) and the new agent action row (#1826) are filed under the round 1 lane.</p>
+<p><b>Your seven notes become one design and ten tickets; two more tickets need no design and are already on the board.</b> sm stops going dark for about 14 seconds at every server restart: the new build starts beside the old one and takes over only once it is ready, so a broken build never takes sm down. Notes holds many short, individual notes on the server, searched inline as you type, in one view that works as a full page for long writing and as a side pane for quick copying, on every machine and the phone. The Inbox groups everything about one ticket (or one PR) into one thread, folds away threads whose agents have all ended, and keeps docs until you archive them. A doc gets an Ask column for quick questions to its author, or to a cheap reader agent when the author is gone. Finished agents that sm started retire themselves after an hour idle, and a reply brings them back. Print (#1825) and the new agent action row (#1826) are filed under the round 1 lane.</p>
 
-<p><b>Terms used below.</b> A <b>restart</b> is deploying a new <code>sm-server</code> build with <code>scripts/restart-rust-server.sh</code>. <b>launchd</b> is the macOS service manager that keeps <code>sm-server</code> running; a <b>launchd job</b> is one registered service. A <b>hook</b> is the small script Claude runs at events such as the end of a turn, which tells sm what happened. An agent is <b>finished</b> when it ran <code>sm task-complete</code> and has not started a new turn since (round 1 term). <b>Retire</b> ends an agent: its tmux window closes, its ticket claim ends, and sm deletes its worktree when nothing would be lost. <b>Restore</b> brings a retired agent back with its full conversation (History › Restore today). A <b>work thread</b> is the new Inbox thread for one ticket. A <b>reader agent</b> is a small, cheap agent sm starts only to answer questions about one doc.</p>
+<p><b>Terms used below.</b> A <b>restart</b> is deploying a new <code>sm-server</code> build with <code>scripts/restart-rust-server.sh</code>. <b>launchd</b> is the macOS service manager that keeps <code>sm-server</code> running; a <b>launchd job</b> is one registered service. A <b>hook</b> is the small script Claude runs at events such as the end of a turn, which tells sm what happened. An agent is <b>finished</b> when it ran <code>sm task-complete</code> and has not started a new turn since (round 1 term). <b>Retire</b> ends an agent: its tmux window closes, its ticket claim ends, and sm deletes its worktree when nothing would be lost. <b>Restore</b> brings a retired agent back with its full conversation (History › Restore today). A <b>work thread</b> is the new Inbox thread for one ticket, or for one PR when there is no ticket. A <b>reader agent</b> is a small, cheap agent sm starts only to answer questions about one doc.</p>
 
 <h3>Your notes, and what changes</h3>
 <table class="map">
 <thead><tr><th>Your note</th><th>What changes</th></tr></thead>
 <tbody>
 <tr><td>1. Deploy without downtime, cheaply</td><td>The new server starts beside the old and takes the listening socket only when ready; requests wait about a second instead of failing for 14. Scenario 1. Two tickets.</td></tr>
-<tr><td>2. A big text editor for prompts, searchable, on every machine; a side pane for copy and paste</td><td>Notes page plus a Notes pane over any page, stored on the server with history. Search returns paragraphs with Copy, Type into terminal, Start agent and File ticket. Scenario 2. Three tickets including the phone.</td></tr>
-<tr><td>3a. Inbox threads, one per doc even across PRs</td><td>One work thread per ticket: its agents (including successors), every revision of its docs across PRs, and its finished summaries. Scenario 3.</td></tr>
-<tr><td>3b. Hide retired agents' messages under a fold</td><td>Threads whose agents have all ended, with nothing waiting for you, fold into “Ended · n”. Scenario 3.</td></tr>
+<tr><td>2. A big text editor for prompts, searchable, on every machine; a side pane for copy and paste</td><td>Individual notes, stored on the server with history, filtered inline as you type. One view, two sizes: the Notes page for long writing, the Notes pane (⌘J) beside any page for copying. Every note offers Copy, Type into terminal, Start agent and File ticket. Scenario 2. Three tickets including the phone.</td></tr>
+<tr><td>3a. Inbox threads, one per doc even across PRs</td><td>One work thread per ticket: its agents (including successors), every revision of its docs across PRs, and its finished summaries. Work with a PR but no ticket gets one thread per PR. Scenario 3.</td></tr>
+<tr><td>3b. Hide retired agents' messages under a fold</td><td>Threads whose agents have all ended, with nothing waiting for you, fold into “Folded · n”. A thread holding a doc never folds by itself; Archive folds it when you are done. Scenario 3.</td></tr>
 <tr><td>4. Print button for docs</td><td>Print in the reader and on the full-page doc; the browser's own print also drops sm's bar. <b>Filed as #1825</b>, no design needed.</td></tr>
 <tr><td>5. Chat with the agent beside a doc</td><td>An Ask column in the reader. It asks the author when live, else a reader agent; you can choose to bring the author back. Scenario 4.</td></tr>
 <tr><td>6. Retire hidden under ⋯ and two clicks; rarer actions take the space</td><td>Row: Terminal, Retire, Hand off…, ⋯ (Hand off now, Clone, Follow, Copy attach). One click retires a finished idle agent; a Finished card has its own Retire. <b>Filed as #1826</b>.</td></tr>
@@ -396,9 +396,9 @@
 <p><b>What you notice:</b> live pages and terminals reconnect once, as on a network blip. Nothing else. <b>Cost:</b> two Mid tickets, one for the server and one for the restart script.</p>
 
 <div class="scen">Scenario 2 · Writing a long prompt, then using it</div>
-<h3>“Give me one big notepad I can search, on every machine, next to the terminal.”</h3>
-<p>Notes is a new page in the rail, under Inbox. It holds any number of notes, each a long Markdown text in a plain monospace editor that saves as you type. The first note can be your <code>~/Desktop/prompts.md</code>, through Import. Notes live on the server, so the laptop, the Studio and the phone see the same text, and every save keeps a revision you can go back to.</p>
-<p>The <b>Notes pane</b> opens over any page with ⌘J, in the right-hand pane where docs open. Its search box finds earlier text and shows each hit as its whole paragraph, with buttons:</p>
+<h3>“Give me notes I can search inline, on every machine, beside the terminal.”</h3>
+<p><b>Notes holds many individual notes</b>, each a Markdown text of any length: a reusable prompt, a ticket draft, a running log. They live on the server, so the laptop, the Studio and the phone see the same notes, and every save keeps a revision you can go back to. Typing in the search box filters the notes as you type and highlights the match.</p>
+<p><b>One view, two sizes.</b> The <b>Notes page</b> (rail, under Inbox) is for long writing: the note list on the left and the open note in a tall editor filling the rest. The <b>Notes pane</b> (⌘J, on the right of any page, including the terminal) is the same list at pane width: click a note and it opens in place in a smaller editor, and ⤢ moves it to the page. Search, cards and buttons are identical in both.</p>
 <div class="scrwrap"><div class="scr">
  <div class="rail"><div class="brand">sm</div><a class="on">Agents</a><a>Board</a><a>Queue</a><a>Inbox</a><a>Notes</a><span class="grow"></span><a>Settings</a></div>
  <div class="main">
@@ -413,25 +413,24 @@
 
 › ▌</div>
    <div class="npane">
-    <div class="inp">review loop▌</div>
-    <div class="sub">3 paragraphs in 2 notes</div>
-    <div class="hit"><span class="sub">prompts · 12 Sep</span><br>Request a <mark>review</mark> with sm request-review once tests pass. Treat P2s as optional; fix every P1 or answer it on the PR…
-     <div class="acts2"><span class="btn sm">Copy</span><span class="btn sm pri">Type into terminal</span><span class="btn sm">Start agent</span><span class="btn sm">File ticket</span></div></div>
-    <div class="hit"><span class="sub">prompts · 2 Aug</span><br>Close the <mark>review loop</mark> before merging: confirm the review is for your latest push…</div>
+    <div style="display:flex;gap:.3rem"><div class="inp" style="flex:1">review▌</div><span class="btn sm">+ New</span><span class="lk">⤢</span></div>
+    <div class="sub">2 of 41 notes</div>
+    <div class="hit"><b>Review loop brief</b> <span class="sub">· 12 Sep</span><br>Request a <mark>review</mark> with sm request-review once tests pass. Treat P2s as optional; fix every P1 or answer it on the PR…
+     <div class="acts2"><span class="btn sm">Copy</span><span class="btn sm pri">Type into terminal</span><span class="btn sm">Start agent ▾</span><span class="btn sm">File ticket ▾</span></div></div>
+    <div class="hit"><b>Merge checklist</b> <span class="sub">· 2 Aug</span><br>Confirm the <mark>review</mark> is for your latest push, then squash merge…</div>
    </div>
   </div>
  </div>
 </div></div>
 <ul>
-<li><b>Copy</b> puts the paragraph on the clipboard. <b>Type into terminal</b> (terminal page only) types it into the agent's input without pressing Enter, so you can edit before sending.</li>
-<li><b>Start agent</b> opens New agent with the text as its first prompt. <b>File ticket</b> opens a small form (repo, title from the first line, body) and creates the GitHub issue when you press Create.</li>
-<li>Select any text in a note and the same buttons act on the selection instead of the paragraph.</li>
+<li><b>Every note card has the same four buttons</b>, on the page and in the pane, and each acts on the whole note, or on the selected text when you have selected some. <b>Copy</b> copies. <b>Type into terminal</b> (shown when a terminal is open) types the text into that agent's input without pressing Enter, so you can edit before sending. <b>Start agent ▾</b> and <b>File ticket ▾</b> each ask one thing in a small popover under the button (provider and model; repo), prefilled with what you used last, and act on Enter: the agent starts with the text as its first prompt, or the GitHub issue is created with the first line as its title. Neither opens a separate form.</li>
+<li><b>Your <code>~/Desktop/prompts.md</code></b> is 3,208 lines (1,140 paragraphs, only 28 headings), too long to be useful as one note. I recommend leaving it where it is and making a note each time you reuse a prompt from it. Import exists for any <code>.md</code> file and splits it at headings and <code>---</code> lines into separate notes.</li>
 <li>Notes are yours alone: agents cannot read them, and they are not published anywhere.</li>
 </ul>
 
 <div class="scen">Scenario 3 · The Inbox after a day of work</div>
 <h3>“One thread per piece of work, and stop showing me agents that are gone.”</h3>
-<p>Today a thread is one agent, or one doc on one pull request. The same work therefore spreads across several rows: the memo on its first PR, the memo again on a later PR, the agent, and its successor after a handoff. Agents that retired stay as rows. A work thread gathers by ticket instead.</p>
+<p>Today a thread is one agent, or one doc on one pull request. The same work therefore spreads across several rows: the memo on its first PR, the memo again on a later PR, the agent, and its successor after a handoff. Agents that retired stay as rows. A work thread gathers by ticket, or by PR when there is no ticket.</p>
 <div class="pair">
 <div class="phone" style="width:20rem"><div class="ph" style="color:#ADB2C2">Today</div>
  <div class="pc"><div class="n">sm-1782</div><div class="m">Memo revision 3 is published for your review</div></div>
@@ -446,14 +445,15 @@
  <div class="pc"><div class="n">#1782 Fit and finish</div><div class="m">Your review · memo revision 3 (PR #1802)<br>sm-1782 · sm-1782-2 · 2 docs, 5 revisions</div></div>
  <div class="ph" style="color:#ADB2C2">Earlier</div>
  <div class="pc"><div class="n">#1771 Browser certificate requests</div><div class="m">sm-1726-engineer · merged</div></div>
- <div class="fold" style="border-color:#2B2B37;color:#ADB2C2">▸ Ended · 6 threads (sm-1768, sm-reviewer, …)</div>
+ <div class="pc"><div class="n">#1768 One review command</div><div class="m">Doc · memo merged · sm-1768 ended<br><span style="color:#5EE7FF">Archive</span></div></div>
+ <div class="fold" style="border-color:#2B2B37;color:#ADB2C2">▸ Folded · 5 threads (sm-reviewer, …)</div>
 </div>
 </div>
 <p class="cap">The #1782 rows are illustrative; the folded names are agents that retired on 30 September.</p>
 <ul>
-<li><b>Which thread an item joins.</b> An agent's message joins the thread of the ticket the agent held when it sent it. A doc joins the thread of its author's ticket, else the ticket its PR closes. Anything with no ticket keeps today's thread: per doc (now across PRs, by its repo and path), else per agent.</li>
+<li><b>Which thread an item joins.</b> An agent's message joins the thread of the ticket the agent held when it sent it, else of the PR it held. A doc joins the thread of its author's ticket, else the ticket its PR closes, else its PR. Anything with neither keeps today's thread: per doc (now across PRs, by its repo and path), else per agent.</li>
 <li><b>Inside a thread</b> every bubble names its sender, doc revisions appear as cards with Open and Review, and the reply box goes to the newest agent in the thread that is still live, or restores it (scenario 5). A ▾ beside the box picks another agent in the thread.</li>
-<li><b>The Ended fold.</b> A thread folds when every agent in it has ended and nothing in it needs you or holds an unread finished summary. Opening the fold shows the rows as today. A new message unfolds the thread.</li>
+<li><b>The fold.</b> A thread of messages only folds by itself when every agent in it has ended and nothing in it needs you or holds an unread finished summary. <b>A thread with a doc never folds by itself</b>: it stays through its lane and after, until you press <b>Archive</b> on it. Archive works on any thread. Opening the fold shows the rows as today, and a new message or doc revision brings a thread back out.</li>
 </ul>
 
 <div class="scen">Scenario 4 · Reading a memo, with a question</div>
@@ -500,16 +500,18 @@
 <thead><tr><th>Question</th><th>Recommendation</th><th>Why</th></tr></thead>
 <tbody>
 <tr><td>1. Restarts: hand over between two launchd slots?</td><td><b>Yes.</b> Blue and green slots, socket passed from old to new, old parked 30 s for rollback.</td><td>Removes the 14 s gap and the lost hooks, and a bad build never takes sm down. Making every client retry would still lose hooks and still show errors.</td></tr>
-<tr><td>2. Where notes live</td><td><b>The server's database, with every revision kept</b>; Import and Download as <code>.md</code>.</td><td>One copy reachable from every machine and the phone; history protects a long text from a bad paste.</td></tr>
+<tr><td>2. Notes</td><td><b>Individual notes in the server's database, every revision kept; one view used as a page and as a pane.</b> Leave <code>prompts.md</code> as it is; Import splits any file at headings.</td><td>One copy on every machine and the phone; history protects text from a bad paste; one view means one thing to learn.</td></tr>
 <tr><td>3. Notes on the phone</td><td><b>Yes</b>: list, search, Copy, and plain editing.</td><td>Copying a saved prompt into a reply is common on the phone.</td></tr>
-<tr><td>4. Inbox thread key</td><td><b>Ticket, else doc (repo and path), else agent.</b></td><td>The ticket is what “the same work” means across PRs, handoffs and docs.</td></tr>
-<tr><td>5. Ended fold</td><td><b>Fold when every agent ended and nothing needs you or is unread-finished.</b></td><td>Hides the clutter without hiding anything you still have to read.</td></tr>
+<tr><td>4. Inbox thread key</td><td><b>Ticket, else PR, else doc (repo and path), else agent.</b></td><td>The ticket is what “the same work” means across PRs, handoffs and docs; a PR is the next best.</td></tr>
+<tr><td>5. Fold</td><td><b>Message-only threads fold when every agent ended and nothing needs you or is unread-finished. Doc threads stay until you Archive them.</b></td><td>Hides the clutter without hiding anything you still have to read, and keeps docs you return to.</td></tr>
 <tr><td>6. Who answers Ask</td><td><b>The live author; else a Sonnet reader agent; Bring back the author only when you pick it.</b></td><td>A restored author reloads hundreds of thousands of tokens; a reader agent reads one doc.</td></tr>
 <tr><td>7. Which agents auto-retire</td><td><b>Agents sm started</b>, after <b>60 minutes</b> finished and idle, on by default.</td><td>I read “sm context created agents” as these; correct me if you meant only handoff successors. An hour is past the prompt cache, so it costs no extra tokens.</td></tr>
 <tr><td>8. What restores an auto-retired agent</td><td><b>Anything addressed to it.</b> Agents you or a parent retired keep today's routing.</td><td>The message was for that agent; it alone has the context.</td></tr>
 <tr><td>9. Plan</td><td><b>Ten tickets under #1821</b> (appendix G); #1821 becomes its own lane after #1782. Restart and notes-server start at once; the rest wait on named round 1 tickets.</td><td>The Inbox, Agents and reader files are still changing in round 1.</td></tr>
 </tbody></table>
 
+<h3>FAQ — what changed since revision 1</h3>
+<p><b>Notes</b> are many individual notes, filtered inline, in one view at two sizes (page and pane) with the same four buttons; Start agent and File ticket ask their one question in a popover rather than a form. <code>prompts.md</code> is not imported. <b>Inbox</b> threads also gather by PR when there is no ticket, and a thread with a doc never folds by itself: you Archive it.</p>
 <h3>FAQ</h3>
 <p><b>Why not just make hooks and clients retry?</b> It turns errors into waits only for clients we write. The browser, the phone and Cloudflare would still see 14 seconds of nothing, and a broken build would still take sm down until someone fixes it.</p>
 <p><b>Why not keep finished agents alive forever?</b> An idle agent costs no tokens, but it holds memory, a tmux window, a worktree and a ticket claim, and it clutters Agents and the Board. After an hour it has lost its token advantage too.</p>
@@ -574,40 +576,46 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <li><code>GET /notes</code> → <code>[{id,title,updated_at,chars}]</code>. <code>GET /notes/{id}</code> → <code>{id,title,body,version,updated_at}</code>.</li>
 <li><code>POST /notes</code> <code>{title?,body}</code> → the note. <code>PUT /notes/{id}</code> <code>{body,title?,if_version}</code> → the note, or 409 with the current note when <code>if_version</code> is stale. <code>DELETE /notes/{id}</code>.</li>
 <li><code>GET /notes/{id}/revisions</code>, <code>GET /notes/{id}/revisions/{version}</code>, <code>POST /notes/{id}/restore {version}</code> (writes a new version).</li>
-<li><code>GET /notes/search?q=&amp;regex=0|1</code> → up to 50 hits <code>[{note_id,title,updated_at,start,end,text}]</code>. A hit is the <b>paragraph</b> containing the match: the text between blank lines, or a whole fenced code block when the match is inside one. Case-insensitive substring by default; <code>regex=1</code> uses Rust <code>regex</code> with a 100 ms budget. Newest note first, then position.</li>
-<li><code>POST /notes/import</code> (multipart <code>.md</code>/<code>.txt</code>) creates one note. Download is client-side.</li>
+<li><code>GET /notes/search?q=&amp;regex=0|1</code> → up to 50 hits <code>[{note_id,title,updated_at,start,end,text}]</code>. Returns matching <b>notes</b>, newest edited first, up to 100, as <code>[{id,title,updated_at,chars,snippet,matches:[{start,end}]}]</code>. <code>snippet</code> is the whole body when the note is under 1,200 characters, else the paragraph (text between blank lines, or a whole fenced code block) holding the first match. Case-insensitive substring by default; <code>regex=1</code> uses Rust <code>regex</code> with a 100 ms budget. An empty <code>q</code> returns every note in the same shape.</li>
+<li><code>POST /notes/import</code> (multipart <code>.md</code>/<code>.txt</code>) splits the file before every line starting with <code>#</code> and at every line that is exactly <code>---</code>, drops empty parts, and creates one note per part; it returns the ids. Download (one note, or all as a zip) is client-side.</li>
 <li><code>POST /github/issues {repo,title,body}</code> runs <code>gh issue create</code> as the Board's Close runs <code>gh issue close</code> (<code>http/board.rs:1150</code>) and returns <code>{number,url}</code>. Repos offered are those sm knows from claims and lanes.</li>
 </ul>
 <h4>B3. Web</h4>
 <ul>
-<li>Rail entry Notes (<code>web/app.js:26-32</code>), path <code>/notes</code>, key hint <code>n</code>, below Inbox. Page: list of notes left (title, updated age; New, Import); editor right: a full-height monospace <code>&lt;textarea&gt;</code> at the user's text size, Tab inserts two spaces, autosave 800 ms after the last keystroke and on blur, a “Saved · 2s” status, and History (revisions list with Restore). A Preview toggle renders Markdown with the doc renderer.</li>
+<li><b>One component, <code>NotesView</code></b>, renders both the page and the pane; only its width differs. Top: search box (filters as you type, 150 ms debounce, B2 search), <b>+ New</b>, Import, and ⤢ (pane) or ⇥ (page, sends the open note to the pane). Below: note cards, each with title, age, the snippet with matches highlighted, and the four buttons.</li>
+<li><b>Page</b> (rail entry Notes, <code>web/app.js:26-32</code>, path <code>/notes</code>, key hint <code>n</code>, below Inbox): at 900 px and wider, cards in a 22rem column on the left and the open note on the right; narrower, it behaves as the pane. <b>Pane</b>: clicking a card expands it in place into the editor; Esc collapses it.</li>
+<li><b>Editor</b> (same in both): a monospace <code>&lt;textarea&gt;</code> at the user's text size, full height on the page and 16 lines in the pane, Tab inserts two spaces, autosave 800 ms after the last keystroke and on blur, a “Saved · 2s” status, History (revisions with Restore), and a Preview toggle using the doc Markdown renderer.</li>
 <li>Conflict: a 409 shows “Changed on another device” with <b>Load theirs</b> and <b>Keep mine</b> (which saves with the returned version). The page refetches the open note when the tab becomes visible.</li>
-<li><b>Notes pane</b>: ⌘J (Ctrl+J) toggles it on every page, in the reading-pane slot (round 1 appendix E); on the terminal page it takes the Details pane slot. It shows search on top and, with an empty search, the most recent note in a smaller editor. Hit buttons: Copy; Type into terminal (terminal page only: sends the text through the terminal socket as a bracketed paste, no Enter); Start agent (opens New agent with the text as the prompt); File ticket (form: repo select, title prefilled from the first line, body; Create calls B2). With a selection in the editor, the buttons act on the selection.</li>
+<li><b>Notes pane</b>: ⌘J (Ctrl+J) toggles it on every page, in the reading-pane slot (round 1 appendix E); on the terminal page it takes the Details pane slot. It holds a <code>NotesView</code>.</li>
+<li><b>Buttons</b>, on every card and on the open editor, acting on the selection when the editor has one, else the whole note: <b>Copy</b>; <b>Type into terminal</b>, shown while a terminal is open on the page, sending the text through the terminal socket as a bracketed paste with no Enter; <b>Start agent ▾</b>, a popover with provider, model and effort prefilled from <code>localStorage["sm-notes-last-agent"]</code>, which starts the agent with the text as its first prompt on Enter (the New agent request, <code>start.js</code>); <b>File ticket ▾</b>, a popover with the repo prefilled from <code>localStorage["sm-notes-last-repo"]</code>, which on Enter calls <code>POST /github/issues</code> with the first line (without leading <code>#</code>) as title and the rest as body, then toasts the issue link. Each popover shows the title or the first 80 characters it will use.</li>
 </ul>
 <h4>B4. Phone</h4>
-<p>A Notes entry in the overflow of the top bar (bottom navigation stays as is). A list, a search with paragraph hits and Copy, and an editor (<code>TextField</code>, autosave as on the web, the same conflict dialog).</p>
+<p>A Notes entry in the overflow of the top bar (bottom navigation stays as is). The same view as the web pane: search filtering inline, cards with snippets, Copy, Start agent and File ticket (Type into terminal only on the terminal screen), and an editor (<code>TextField</code>, autosave as on the web, the same conflict dialog).</p>
 <h4>B5. Tests</h4>
-<p>Stale <code>if_version</code> gives 409; revision thinning; search paragraph boundaries, fenced blocks, regex timeout; import; deleted notes vanish from search; agent credentials get 403.</p>
+<p>Stale <code>if_version</code> gives 409; revision thinning; snippet is the whole short note or the matching paragraph, fenced blocks, regex timeout; import splits at headings and <code>---</code>; deleted notes vanish from search; agent credentials get 403.</p>
 
-<h3>C. Work threads and the Ended fold</h3>
+<h3>C. Work threads, the fold and Archive</h3>
 <h4>C1. Thread key</h4>
 <ul>
 <li>Today: <code>agent:&lt;session&gt;</code> and <code>doc:&lt;doc_id&gt;</code> (<code>owner_inbox.rs:15-19</code>; <code>http/inbox.rs</code> <code>agent_rows</code>, <code>doc_rows</code>). Docs are unique on repo, path and PR (<code>owner_docs.rs:448</code>).</li>
 <li>New keys, in order of preference:
  <ol><li><code>ticket:&lt;owner/repo&gt;#&lt;n&gt;</code>. For an agent item (message, owner note, fired follow, finished row): the sender's ticket claim open at the item's time, the earliest-claimed when several. For a doc: the ticket claim of the author session open at its first publish, else the ticket that the doc's PR closes (the Board's PR-to-ticket link).</li>
- <li><code>docpath:&lt;owner/repo&gt;/&lt;path&gt;</code> for a doc with no ticket: every PR's doc for that path joins.</li>
- <li><code>agent:&lt;session&gt;</code> for an agent item with no ticket.</li></ol></li>
+ <li><code>pr:&lt;owner/repo&gt;#&lt;n&gt;</code> when there is no ticket. For an agent item: the sender's PR claim open at the item's time. For a doc: its PR.</li>
+ <li><code>docpath:&lt;owner/repo&gt;/&lt;path&gt;</code> for a doc with neither (published without a PR): every doc for that path joins.</li>
+ <li><code>agent:&lt;session&gt;</code> for an agent item with neither.</li></ol></li>
 <li><b>Example.</b> sm-1782 holds #1782 and sends two messages; its successor sm-1782-2 claims #1782 and sends one; the memo is published on PR #1785 and again on PR #1802 by those agents. All five items share <code>ticket:rajeshgoli/session-manager#1782</code>. sm-maintainer, holding no ticket, keeps <code>agent:…</code>.</li>
 <li><code>done_items</code> and Done move to the new keys. Migration maps an old agent or doc key's watermark onto the new key it falls under, taking the item count as of migration, so nothing marked done reappears.</li>
-<li>Row: title is <code>#n {ticket title}</code>, else the doc title, else the agent name. Group is the highest of its items (needs you, finished, new, earlier). Preview is the newest item that set the group. The second line lists the thread's agents and “{d} docs, {r} revisions”.</li>
+<li>Row: title is <code>#n {ticket title}</code>, else <code>PR #n {PR title}</code>, else the doc title, else the agent name. Group is the highest of its items (needs you, finished, new, earlier). Preview is the newest item that set the group. The second line lists the thread's agents and “{d} docs, {r} revisions”.</li>
 <li>Thread JSON (<code>GET /inbox/thread/{key}?format=json</code>, replacing <code>/inbox/agent/{id}</code> and the doc thread page, which redirect) lists items oldest first, each with <code>sender {id,name,status}</code>; doc revisions become <code>{"type":"doc_revision", doc_id, pr, sha, at, review_state}</code> cards.</li>
 <li>Reply target: the newest sender in the thread that is live; else the newest sender whose reply would restore it (appendix E3); else today's <code>live_recipient</code> on the newest sender. The JSON carries <code>reply_to {id,name,restores:bool,retired_at}</code> and <code>reply_options</code> (every sender in the thread), which the ▾ selector uses. <code>POST /inbox/thread/{key}/send {text, to?}</code>.</li>
 </ul>
-<h4>C2. Ended fold</h4>
+<h4>C2. The fold and Archive</h4>
 <ul>
-<li>A thread is <b>ended</b> when every sender in it has ended (<code>session_ended</code>, <code>http/messages.rs:76</code>, or absent from the registry), it is not needs-you, and it has no finished row with <code>read_at</code> null.</li>
-<li>Ended threads leave the groups and sort, newest first, under one fold row “Ended · {n} threads ({first three names}, …)”, collapsed by default (state in <code>localStorage["sm-inbox-ended-open"]</code>). JSON: <code>group:"ended"</code>.</li>
-<li>Any new item in an ended thread un-ends it, because its sender is live or was just restored.</li>
+<li>A thread is <b>ended</b> when it holds no doc, every sender in it has ended (<code>session_ended</code>, <code>http/messages.rs:76</code>, or absent from the registry), it is not needs-you, and it has no finished row with <code>read_at</code> null. A thread holding any doc is never ended.</li>
+<li><b>Archive</b>: <code>POST /inbox/archive {thread_key}</code> stores <code>archived_items = item count</code> beside <code>done_items</code> (<code>owner_inbox.rs</code>). A thread is <b>archived</b> while its item count equals that value. Archive is offered on every thread row and thread header (shortcut <code>y</code>), and does what Done does too. <code>POST /inbox/unarchive</code> clears it.</li>
+<li>Ended and archived threads leave the groups and sort, newest first, under one fold row “Folded · {n} threads ({first three names}, …)”, collapsed by default (state in <code>localStorage["sm-inbox-folded-open"]</code>). JSON: <code>group:"folded"</code>, with <code>folded_by:"ended"|"archived"</code>.</li>
+<li>Any new item (message, finished row, doc revision) brings a thread out: an ended thread because its sender is live or was just restored, an archived one because its item count passed the stored value.</li>
+<li><b>Example.</b> The #1768 thread holds memo 1768 and messages from sm-1768, now retired. It stays under Earlier however long ago it merged. You press Archive and it moves to Folded. A later revision of memo 1768 brings it back.</li>
 </ul>
 
 <h3>D. Ask about a doc</h3>
@@ -632,7 +640,7 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <ul>
 <li>Every 60 s, and only on the serving server (A4 signal), sm retires each eligible session through <code>retire_core_session_with_runtime_authorized</code> with a new authority <code>RetireAuthority::auto_retire()</code>, recording <code>retirement_intent: "auto"</code> and terminal provenance “auto-retire after {n} minutes finished and idle”.</li>
 <li>Settings: <code>owner_settings</code> gains <code>auto_retire {enabled: true, idle_minutes: 60}</code> (range 15 to 1440). <code>GET/PUT /settings/auto-retire</code>, owner and phone guards. Web Settings › New agents and the phone's Settings show a toggle and the minutes (round 1 Toggle).</li>
-<li>History rows show “retired automatically”. The Finished Inbox row stays until Done (round 1 D3), and C2 keeps it out of the Ended fold until then.</li>
+<li>History rows show “retired automatically”. The Finished Inbox row stays until Done (round 1 D3), and C2 keeps it out of the fold until then.</li>
 </ul>
 <h4>E3. Restore on message</h4>
 <ul>
@@ -675,8 +683,8 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <tr><td>No restart gap; bad build never takes sm down</td><td>A</td><td>A5 tests; live <code>curl</code> loop during a restart; a deliberately failing build leaves the old server serving</td></tr>
 <tr><td>Notes page, pane, search, actions, history, every machine</td><td>B1–B3</td><td>B5 tests; screenshots of the page and the pane on the terminal page; a note edited on the laptop shows on the phone</td></tr>
 <tr><td>Notes on the phone</td><td>B4</td><td>Emulator screenshots</td></tr>
-<tr><td>One thread per ticket, docs across PRs</td><td>C1</td><td>Fixture test of the #1782 example; screenshot of today's Inbox</td></tr>
-<tr><td>Ended fold</td><td>C2</td><td>Tests: unread finished stays out of the fold; new item unfolds</td></tr>
+<tr><td>One thread per ticket, else per PR; docs across PRs</td><td>C1</td><td>Fixture test of the #1782 example; screenshot of today's Inbox</td></tr>
+<tr><td>Fold; docs stay until archived</td><td>C2</td><td>Tests: unread finished stays out of the fold; a doc thread never folds by itself; Archive folds it; a new item brings a thread out</td></tr>
 <tr><td>Print</td><td>#1825</td><td>PDFs from #1825</td></tr>
 <tr><td>Ask about a doc</td><td>D</td><td>D tests; screenshot; a live question answered by a reader agent</td></tr>
 <tr><td>Retire up front, one click</td><td>#1826</td><td>#1826 screenshots</td></tr>
