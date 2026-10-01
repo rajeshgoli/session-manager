@@ -330,21 +330,22 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Starts the author. [clearTicketPolicy] first removes the ticket's own
-     * review policy, when the owner switched the Reviewer row back to the lane's.
+     * Starts the author. [clearTicketPolicy] then removes the ticket's own
+     * review policy, when the owner switched the Reviewer row back to the
+     * lane's; a failed Start keeps it.
      */
     fun start(request: BoardStartRequest, clearTicketPolicy: Boolean = false, onStarted: (String) -> Unit) {
         val ticket = _uiState.value.start?.ticket ?: return
         updateStart(ticket) { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            val cleared = if (!clearTicketPolicy) Result.success(Unit) else repository.putReviewPolicy(
-                url, token, li.rajeshgo.sm.data.model.PutReviewPolicyRequest("ticket", request.repo, request.number, null),
-            )
-            cleared.mapCatching { repository.startBoardTicket(url, token, request).getOrThrow() }
+            repository.startBoardTicket(url, token, request)
                 .onSuccess { started ->
                     _uiState.update { it.copy(start = null) }
-                    onStarted(started.name)
+                    val kept = clearTicketPolicy && repository.putReviewPolicy(
+                        url, token, li.rajeshgo.sm.data.model.PutReviewPolicyRequest("ticket", request.repo, request.number, null),
+                    ).isFailure
+                    onStarted(if (kept) "${started.name}; the ticket's own reviewer is still set" else started.name)
                 }
                 .onFailure { error ->
                     if (!handleAuth(error)) {

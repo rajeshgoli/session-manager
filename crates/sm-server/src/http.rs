@@ -6967,14 +6967,22 @@ fn review_requests_needing_owner(
     requests: &[CodexReviewRequestRegistration],
 ) -> Result<Vec<Value>, ApiError> {
     let messages = crate::owner_messages::OwnerMessageStore::new(db_path.to_path_buf());
+    let mut latest = std::collections::HashMap::new();
+    for request in requests {
+        let at = codex_review_request_requested_at(&request.requested_at);
+        let entry = latest
+            .entry((request.repo.as_str(), request.pr_number))
+            .or_insert(at);
+        if at > *entry {
+            *entry = at;
+        }
+    }
     let mut items = Vec::new();
     for request in requests.iter().filter(|r| r.state == "no_reviewer") {
         let at = codex_review_request_requested_at(&request.requested_at);
-        let replaced = requests.iter().any(|later| {
-            later.repo == request.repo
-                && later.pr_number == request.pr_number
-                && codex_review_request_requested_at(&later.requested_at) > at
-        });
+        let replaced = latest
+            .get(&(request.repo.as_str(), request.pr_number))
+            .is_some_and(|newest| *newest > at);
         if replaced
             || !messages.is_open_by_delivery_key(&format!("review-no-reviewer:{}", request.id))?
         {
