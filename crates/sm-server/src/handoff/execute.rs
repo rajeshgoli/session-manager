@@ -254,6 +254,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ("guestbook_entries", "session_id", "history"),
     ("owner_doc_publishes", "session_id", "history"),
     (
+        "owner_doc_reader_sessions",
+        "session_id",
+        "history of which reader wrote each answer",
+    ),
+    (
         "owner_doc_reviews",
         "delivered_to_session_id",
         "delivery record; later reviews are forwarded",

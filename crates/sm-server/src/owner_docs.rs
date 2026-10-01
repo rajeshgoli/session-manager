@@ -471,6 +471,12 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
             session_id TEXT NOT NULL,
             worktree_path TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS owner_doc_reader_sessions (
+            session_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES owner_docs(id)
+        );
+        INSERT OR IGNORE INTO owner_doc_reader_sessions (session_id, doc_id)
+            SELECT session_id, doc_id FROM owner_doc_readers;
         CREATE TABLE IF NOT EXISTS owner_doc_drafts (
             id TEXT PRIMARY KEY,
             doc_id TEXT NOT NULL,
@@ -868,14 +874,35 @@ impl OwnerDocStore {
             .optional()?)
     }
 
+    /// Keep every reader's doc association after a newer reader takes over.
+    pub fn reader_sessions(&self) -> Result<Vec<(String, String)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT session_id, doc_id FROM owner_doc_reader_sessions
+             UNION SELECT session_id, doc_id FROM owner_doc_readers",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sessions)
+    }
+
     pub fn set_reader(&self, doc_id: &str, session_id: &str, worktree_path: &str) -> Result<()> {
-        let conn = self.open_write()?;
-        conn.execute(
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO owner_doc_reader_sessions (session_id, doc_id) VALUES (?1, ?2)",
+            params![session_id, doc_id],
+        )?;
+        tx.execute(
             "INSERT INTO owner_doc_readers (doc_id, session_id, worktree_path)
             VALUES (?1, ?2, ?3) ON CONFLICT(doc_id) DO UPDATE SET
             session_id = excluded.session_id, worktree_path = excluded.worktree_path",
             params![doc_id, session_id, worktree_path],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

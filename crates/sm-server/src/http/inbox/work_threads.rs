@@ -6,6 +6,7 @@ struct WorkIndex {
     claims: Vec<WorkClaim>,
     items: BTreeMap<(String, i64), WorkItem>,
     links: BTreeMap<(String, i64), Vec<i64>>,
+    reader_keys: BTreeMap<String, String>,
 }
 
 impl WorkIndex {
@@ -18,7 +19,7 @@ impl WorkIndex {
                 .or_default()
                 .push(ticket);
         }
-        Ok(Self {
+        let mut index = Self {
             claims: store.all_claims()?,
             items: store
                 .all_items()?
@@ -26,7 +27,21 @@ impl WorkIndex {
                 .map(|item| ((item.repo.to_ascii_lowercase(), item.number), item))
                 .collect(),
             links,
-        })
+            reader_keys: BTreeMap::new(),
+        };
+        let docs = owner_doc_store(state);
+        for (session_id, doc_id) in docs.reader_sessions()? {
+            let (Some(doc), Some(first)) = (
+                docs.get(&doc_id)?,
+                docs.publishes(&doc_id)?.into_iter().next(),
+            ) else {
+                continue;
+            };
+            index
+                .reader_keys
+                .insert(session_id, index.doc_key(&doc, &first));
+        }
+        Ok(index)
     }
 
     fn claim_key(&self, session_id: &str, at: &str, kind: &str) -> Option<String> {
@@ -59,7 +74,10 @@ impl WorkIndex {
     }
 
     fn agent_key(&self, session_id: &str, at: &str) -> String {
-        self.claim_key(session_id, at, "ticket")
+        self.reader_keys
+            .get(session_id)
+            .cloned()
+            .or_else(|| self.claim_key(session_id, at, "ticket"))
             .or_else(|| self.claim_key(session_id, at, "pr"))
             .unwrap_or_else(|| agent_thread_key(session_id))
     }
@@ -911,6 +929,7 @@ mod tests {
             ],
             items: BTreeMap::new(),
             links: BTreeMap::new(),
+            reader_keys: BTreeMap::new(),
         }
     }
 

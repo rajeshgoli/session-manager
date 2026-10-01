@@ -13,6 +13,7 @@ use sm_server::{
     config::{AppConfig, PathsConfig, SmSendConfig},
     http::{router, AppState, DocFetchError, DocPullRequest, OwnerDocSource},
     owner_docs::{git_blob_sha, OwnerDocStore, OwnerDocVerdict, PostedOwnerDocReview},
+    owner_messages::{NewOwnerMessage, OwnerMessageStore},
 };
 use std::{
     collections::BTreeMap,
@@ -313,6 +314,45 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
         )
         .unwrap();
     assert_eq!(count, 1);
+    OwnerMessageStore::new(f.dir.join("message_queue.db"))
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: reader_id.into(),
+            sender_session_name: "ask-widgets".into(),
+            title: "Why buy?".into(),
+            body_markdown: "The memo's reader answer".into(),
+            blocking: false,
+        })
+        .unwrap();
+    let thread_key = before["thread_key"].as_str().unwrap();
+    let encoded_key = thread_key
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('#', "%23");
+    let thread_url = format!("/inbox/thread/{encoded_key}?format=json");
+    let (status, thread) = request(&f.app, "GET", &thread_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The memo's reader answer")));
+    let docs = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    docs.set_reader(doc_id, "later-reader", "/later/worktree")
+        .unwrap();
+    let (status, thread) = request(&f.app, "GET", &thread_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The memo's reader answer")));
     git(&["worktree", "remove", reader_path.to_str().unwrap()]);
     fs::remove_dir_all(f.dir).unwrap();
 }
