@@ -977,6 +977,29 @@ pub(super) async fn get_agent_thread(
     )
 }
 
+/// Open "PR #n has no reviewer" asks from this agent, for the thread's
+/// Retry now, Change policy and Review it myself buttons (1768 G6).
+fn review_asks(state: &AppState, session_id: &str) -> Result<Vec<Value>, ApiError> {
+    let db = expand_home(&state.config.sm_send.db_path);
+    let mut asks = Vec::new();
+    for (request_id, message_id) in
+        owner_message_store(state).open_keyed(session_id, "review-no-reviewer:")?
+    {
+        let Some(request) =
+            RetainedQueueStore::get_codex_review_request_from_path(&db, &request_id)?
+        else {
+            continue;
+        };
+        if request.state == "no_reviewer" {
+            asks.push(json!({
+                "request_id": request.id, "message_id": message_id,
+                "repo": request.repo, "pr_number": request.pr_number,
+            }));
+        }
+    }
+    Ok(asks)
+}
+
 /// The thread page for `session_id`, scrolled to message `at`. Also what
 /// `/messages/{id}` serves, so apps that only know that path keep the page
 /// in their reader.
@@ -1095,6 +1118,7 @@ pub(super) fn agent_thread_page(
             "reply_to": recipient.as_ref().map(|s| session_display_name(s.clone())),
             "items": items.iter().map(|item| item.json(&world, &session_id, now))
                 .collect::<Vec<_>>(),
+            "review_asks": review_asks(state, &session_id)?,
         }))
         .into_response());
     }

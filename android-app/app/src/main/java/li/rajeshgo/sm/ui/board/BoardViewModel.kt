@@ -19,6 +19,7 @@ import li.rajeshgo.sm.data.model.BoardResponse
 import li.rajeshgo.sm.data.model.BoardStartOptions
 import li.rajeshgo.sm.data.model.BoardStartRequest
 import li.rajeshgo.sm.data.model.BoardTicket
+import li.rajeshgo.sm.data.repository.ScreenCache
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -83,6 +84,8 @@ data class BoardUiState(
     val board: BoardResponse? = null,
     val loading: Boolean = true,
     val refreshing: Boolean = false,
+    /** Showing the last board from [ScreenCache] while the first read runs (spec 1782 J5). */
+    val revalidating: Boolean = false,
     val lastUpdated: OffsetDateTime? = null,
     val error: String? = null,
     val signedOut: Boolean = false,
@@ -98,7 +101,11 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = SessionManagerRepository(settingsRepository)
     private var refreshJob: Job? = null
 
-    private val _uiState = MutableStateFlow(BoardUiState())
+    private val _uiState = MutableStateFlow(
+        ScreenCache.board.let { board ->
+            BoardUiState(board = board, loading = board == null, revalidating = board != null, queue = ScreenCache.queue)
+        },
+    )
     val uiState: StateFlow<BoardUiState> = _uiState
 
     /** Lanes the owner opened or closed; the rest follow the default, lane 1 open. */
@@ -109,7 +116,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         val serverUrl = settingsRepository.serverUrl.first()
         val token = settingsRepository.accessToken.first()
         if (serverUrl.isBlank() || token.isBlank()) {
-            _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true, busy = false, start = null) }
+            _uiState.update { it.copy(loading = false, refreshing = false, revalidating = false, signedOut = true, busy = false, start = null) }
             return null
         }
         return serverUrl to token
@@ -119,7 +126,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         if (error !is SessionManagerAuthException) return false
         settingsRepository.clearAuth()
         // Signed out: a Start sheet mid-request would otherwise stay locked.
-        _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true, start = null) }
+        _uiState.update { it.copy(loading = false, refreshing = false, revalidating = false, signedOut = true, start = null) }
         return true
     }
 
@@ -164,7 +171,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 if (error is CancellationException) throw error
                 if (!handleAuth(error)) {
                     _uiState.update {
-                        it.copy(loading = false, refreshing = false, error = error.message ?: "Couldn't load the board")
+                        it.copy(loading = false, refreshing = false, revalidating = false, error = error.message ?: "Couldn't load the board")
                     }
                 }
                 return
@@ -180,6 +187,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                 board = board,
                 loading = false,
                 refreshing = false,
+                revalidating = false,
                 error = null,
                 signedOut = false,
                 lastUpdated = OffsetDateTime.now(),

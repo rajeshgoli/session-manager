@@ -90,9 +90,10 @@ test('reverting to the old value while a save is pending still submits the rever
   assert.equal(h.input(h.render(props)).value, 'old');
 });
 
-test('shared handoff controls exclude the desktop app and retain future providers', () => {
-  const providers = harness().evaluate('handoffProviders')({ 'codex-app': true, future: false });
-  assert.deepEqual(Array.from(providers), ['claude', 'codex-fork', 'codex', 'future']);
+test('handoff settings list only the providers with a context gauge', () => {
+  const providers = harness().evaluate('HANDOFF_PROVIDERS.map(([provider]) => provider).join()');
+  assert.equal(providers, 'claude,codex-fork');
+  assert.equal(harness().evaluate('THRESHOLDS.map(([key]) => key).join()'), 'threshold_percent,reminder_percent,review_floor_percent');
 });
 
 test('terminal limits accept blank as reset and refuse values outside the range', () => {
@@ -103,4 +104,24 @@ test('terminal limits accept blank as reset and refuse values outside the range'
   assert.throws(() => limit('0', 1, 256), /from 1 to 256/);
   assert.throws(() => limit('1.5', 60, 86400), /from 60 to 86400/);
   assert.equal(h.evaluate("TERMINAL_LIMITS.map(([key]) => key).join()"), 'per_user,per_session,global,max_attach_seconds');
+});
+
+test('Reviews sits after Context handoff and its meter limit refuses values outside 50 to 100', () => {
+  const h = harness();
+  assert.equal(h.evaluate("SECTIONS.map(([id]) => id).slice(2, 4).join()"), 'context-handoff,reviews');
+  const percent = h.evaluate('meterPercent');
+  assert.equal(percent('95'), 95); assert.equal(percent('100'), 100);
+  for (const value of ['', '49', '101', '90.5', 'word']) assert.throws(() => percent(value), /from 50 to 100/);
+  assert.equal(h.evaluate('meterText')(63.6), '64%');
+  assert.equal(h.evaluate('meterText')(null), '—');
+});
+
+test('policy rows list every board repo, then stored lane and ticket policies', () => {
+  const rows = harness().evaluate('policyRows')({ policies: [
+    { scope: 'repo', repo: 'o/b', number: 0, reviewer: { kind: 'github_codex' } },
+    { scope: 'ticket', repo: 'o/a', number: 1848, reviewer: { kind: 'claude', model: 'fable', effort: 'max' } },
+    { scope: 'lane', repo: 'o/a', number: 1843, reviewer: { kind: 'codex', model: 'gpt-6-astra', effort: 'high' } },
+  ] }, ['o/a', 'o/b']);
+  assert.deepEqual(Array.from(rows, r => `${r.scope} ${r.repo} ${r.number} ${r.policy ? 'set' : 'default'}`),
+    ['repo o/a 0 default', 'repo o/b 0 set', 'ticket o/a 1848 set', 'lane o/a 1843 set']);
 });

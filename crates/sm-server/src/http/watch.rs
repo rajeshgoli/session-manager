@@ -178,6 +178,11 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
     let colliding = colliding_sessions(state, &directory)?;
     let notes = crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
         .all()?;
+    // 1768 I2: an author waiting on a review, and a paired reviewer's round.
+    let reviews = super::review_paired::session_fields(state).unwrap_or_else(|error| {
+        eprintln!("review fields for watch state failed: {error:#}");
+        BTreeMap::new()
+    });
     let finished = state
         .session_store
         .turn_message_store()
@@ -297,6 +302,8 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "claims": field("claims"),
             "docs": field("docs"),
             "waiting_on": waiting_on,
+            "waiting_on_review": reviews.get(id).map_or(Value::Null, |r| r["waiting_on_review"].clone()),
+            "paired_reviewer": reviews.get(id).map_or(Value::Null, |r| r["paired_reviewer"].clone()),
             "review_history": field("review_history"),
             "jobs": own_jobs,
             "collision": colliding.contains(id),
@@ -544,13 +551,19 @@ fn agent_facts(
     };
     if let Some(since) = review_since {
         if running.is_empty() && pending.is_empty() {
-            job_text = format!(
-                "Codex review on PR #{} · {}",
-                review
-                    .and_then(|item| item["pr_number"].as_i64())
-                    .unwrap_or(0),
-                facts_age(since, now)
-            );
+            // 1768 I3: name the reviewer sm chose once it has one.
+            job_text = match review.map(|item| s(item, "reviewer_label")) {
+                Some(label) if !label.is_empty() => {
+                    format!("Waiting on review by {label} · {}", facts_age(since, now))
+                }
+                _ => format!(
+                    "Codex review on PR #{} · {}",
+                    review
+                        .and_then(|item| item["pr_number"].as_i64())
+                        .unwrap_or(0),
+                    facts_age(since, now)
+                ),
+            };
             tone = json!("amber");
         } else {
             job_text.push_str(&format!(" · review {}", facts_age(since, now)));
@@ -1186,6 +1199,15 @@ mod facts_tests {
                 empty.clone(),
                 "waiting",
                 "Codex review on PR #1790 · 12m",
+            ),
+            (
+                session("idle"),
+                json!([{"kind": "review", "pr_number": 1851, "reviewer_label": "Codex run (gpt-6-sol, medium)",
+                "since": "2026-09-30T19:35:00Z"}]),
+                empty.clone(),
+                empty.clone(),
+                "waiting",
+                "Waiting on review by Codex run (gpt-6-sol, medium) · 12m",
             ),
             (
                 session("idle"),

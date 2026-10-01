@@ -1615,6 +1615,7 @@ pub fn router(state: AppState) -> Router {
         .map(|bridge| bridge.webhook_path())
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
     let state = Arc::new(state);
+    web::server_started_at();
     if let Err(error) = RetainedQueueStore::ensure_codex_review_requests_schema_from_path(
         &expand_home(&state.config.sm_send.db_path),
     ) {
@@ -1802,6 +1803,7 @@ pub fn router(state: AppState) -> Router {
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/history", get(history::get_history))
         .route("/history/agents", get(agent_history::get_agent_history))
+        .route("/history/tickets", get(history::get_history))
         .route("/guestbook", get(guestbook_page::get_guestbook))
         .route("/t/{repo}/{number}", get(history::get_timeline))
         .route("/", get(watch::get_watch_page))
@@ -7222,6 +7224,7 @@ fn project_session_obligations(
                 "label": format!("Review · {} #{}", review.repo, review.pr_number),
                 "repo": review.repo, "pr_number": review.pr_number,
                 "state": review.state, "since": review.requested_at,
+                "reviewer_label": review.reviewer_label,
                 "requester_session_id": review.requester_session_id,
                 "last_polled_at": review.last_polled_at, "last_error": review.last_error,
             }));
@@ -7538,6 +7541,7 @@ async fn client_queue(
                 "perf": {"running": count("perf"), "max": policy.perf_max_concurrent},
                 "background": {"running": count("background"), "max": policy.background_max_concurrent},
                 "service": {"running": count("service"), "max": policy.service_max_concurrent},
+                "review": {"running": count("review"), "max": policy.review_max_concurrent},
             },
         },
         "running": running_json,
@@ -15067,6 +15071,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/settings"
         || path == "/history"
         || path == "/history/agents"
+        || path == "/history/tickets"
         || path == "/guestbook"
         || path.starts_with("/t/")
         || path == "/"
@@ -16818,6 +16823,13 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
+    // 1768 I2: what a review job reviews, for whom, and why this reviewer.
+    response["review"] = review_runs::job_fields(state, &job)
+        .unwrap_or_else(|error| {
+            eprintln!("review fields for queue job {} failed: {error:#}", job.id);
+            None
+        })
+        .unwrap_or(Value::Null);
     response
         .as_object_mut()
         .expect("job response is an object")
@@ -20445,7 +20457,13 @@ mod tests {
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
-        for uri in ["/history", "/history/agents", "/t/widgets/1", "/guestbook"] {
+        for uri in [
+            "/history",
+            "/history/agents",
+            "/history/tickets",
+            "/t/widgets/1",
+            "/guestbook",
+        ] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
             for assertion in [Some(stranger.as_str()), None] {
@@ -20531,6 +20549,7 @@ mod tests {
             "/inbox",
             "/history",
             "/history/agents",
+            "/history/tickets?repo=widgets",
             "/guestbook",
             "/queue",
             "/analytics",
@@ -20545,6 +20564,9 @@ mod tests {
             assert!(html.contains(r#"id="sm-config""#), "{uri}");
             assert!(html.contains(&format!("/assets/app.js?v={build}")), "{uri}");
             assert!(!html.contains("Handoff defaults"), "{uri}");
+            // About shows the server's uptime from the router's start.
+            let started = format!(r#""server_started_at":"{}""#, web::server_started_at());
+            assert!(html.contains(&started), "{uri}");
         }
         // `/watch` moves to `/`, keeping a panel link.
         let response = app

@@ -6,7 +6,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import li.rajeshgo.sm.ui.queue.meterBandColor
 import li.rajeshgo.sm.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -24,10 +26,11 @@ fun HostStatusSheet(state: SettingsUiState, onRefresh: () -> Unit, onClose: () -
             if (host != null && !state.hostLoading) {
                 if (!host.available) Text("Host statistics are unavailable.", color = TextMuted)
                 val memory = if (host.memoryUsedBytes != null && host.memoryTotalBytes != null) "${gib(host.memoryUsedBytes)} / ${gib(host.memoryTotalBytes)} GB" else "Unavailable"
-                HostMetric("Physical memory", memory, "Includes cached memory")
+                val memoryFraction = host.memoryUsedBytes?.let { used -> host.memoryTotalBytes?.takeIf { it > 0 }?.let { used.toDouble() / it } }
+                HostMetric("Physical memory", memory, "Includes cached memory", meterBandColor(memoryFraction))
                 HostMetric("Memory pressure", host.memoryPressure ?: "Unavailable")
-                HostMetric("CPU", percent(host.cpuPercent))
-                HostMetric("GPU", percent(host.gpuPercent))
+                HostMetric("CPU", percent(host.cpuPercent), tint = meterBandColor(host.cpuPercent?.div(100)))
+                HostMetric("GPU", percent(host.gpuPercent), tint = meterBandColor(host.gpuPercent?.div(100), gpu = true))
                 Text("Snapshot · ${li.rajeshgo.sm.ui.watch.summaryAgeLabel(host.sampledAt)}", style = MaterialTheme.typography.bodySmall, color = TextMuted)
             }
             OutlinedButton(onClick = onRefresh, enabled = !state.hostLoading, modifier = Modifier.fillMaxWidth()) { Text("Refresh snapshot") }
@@ -39,10 +42,10 @@ private fun gib(bytes: Long): String = "%.1f".format(bytes.toDouble() / (1024 * 
 private fun percent(value: Double?): String = value?.let { "%.1f%%".format(it) } ?: "Unavailable"
 
 @Composable
-private fun HostMetric(title: String, value: String, note: String? = null) {
+private fun HostMetric(title: String, value: String, note: String? = null, tint: Color? = null) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(title, style = MaterialTheme.typography.labelLarge, color = TextMuted)
-        Text(value, style = MaterialTheme.typography.headlineSmall, color = when (value) { "Normal" -> Emerald; "Elevated" -> Amber; "Critical" -> Rose; else -> TextSecondary })
+        Text(value, style = MaterialTheme.typography.headlineSmall, color = tint ?: when (value) { "Normal" -> Emerald; "Elevated" -> Amber; "Critical" -> Rose; else -> TextSecondary })
         note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
     }
 }

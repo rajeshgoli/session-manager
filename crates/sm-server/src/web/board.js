@@ -1,7 +1,9 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, age } from './ui.js';
+import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, age } from './ui.js';
 import { TicketStart, blockedReasons, canStartAnyway } from './board-start.js';
+import { HandoffPopover } from './handoff.js';
+import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
 export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
 export const BLOCKED_ROW_LIMIT = 12;
@@ -51,18 +53,32 @@ function Clock({ ticket, end, hours }) {
 }
 export const canStart = (ticket) => ticket.state === 'ready' && !(ticket.warnings || []).includes('merged_not_closed');
 
-function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false }) {
-  const [menu, setMenu] = useState(false);
+const boardChanged = () => bus.emit('board-changed');
+function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false, lanePolicy = null }) {
+  const [menu, setMenu] = useState(null);
   const parts = ticket.sub_issues;
   const agent = ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name,
     provider: ticket.holder.provider, fact: `${ticket.holder.state === 'working' ? '● Working' : '○ Idle'}${ticket.holder.since ? ` ${age(ticket.holder.since)}` : ''}` } : null;
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
-    ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
-    ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
-    ${ticket.state === 'close_ready' ? html`<span class="ticket-actions"><button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>
-      <span class="anchor"><button class="icon-btn" title="More ticket actions" onClick=${() => setMenu(!menu)}>⋯</button>
-        ${menu ? html`<${Popover} onClose=${() => setMenu(false)}><button class="btn sm" onClick=${() => { setMenu(false); onStart(ticket); }}>Start instead</button><//>` : null}</span></span>` : null}
+    <span class="ticket-actions">
+      ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
+      ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
+      ${ticket.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
+      ${ticket.state !== 'done' ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
+        ${menu === 'more' ? html`<${Popover} onClose=${() => setMenu(null)} align="right" className="menu">
+          ${ticket.state === 'close_ready' ? html`<button onClick=${() => { setMenu(null); onStart(ticket); }}>Start instead</button>` : null}
+          <button onClick=${() => setMenu('handoff')}>Hand off…</button>
+          <button onClick=${() => setMenu('policy')}>Review policy…</button><//>` : null}
+        ${menu === 'policy' ? html`<${PolicyPopover} scope="ticket" repo=${ticket.repo} number=${ticket.number} title=${`Reviews for #${ticket.number}`}
+          policy=${ticket.review_policy} lanePolicy=${lanePolicy} align="right" onClose=${() => setMenu(null)} onSaved=${boardChanged} />` : null}
+        ${menu === 'handoff' ? html`<${HandoffPopover} scope="ticket" align="right" ticket=${{ repo: ticket.repo, number: ticket.number }}
+          agent=${ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name, provider: ticket.holder.provider, state: ticket.holder.state } : null}
+          onClose=${() => setMenu(null)} />` : null}</span>` : null}
+    </span>
+    ${ticket.review_policy || ticket.review ? html`<span class="sub ticket-state ticket-review">
+      ${ticket.review_policy ? html`<button class="review-pill" title=${setByText(ticket.review_policy)} onClick=${() => setMenu('policy')}>Review: <b>${reviewerText(ticket.review_policy.reviewer)}</b></button>` : null}
+      ${ticket.review ? html`<span class="amber">${ticket.review.reviewer_label || 'Review'}, ${age(ticket.review.since)}</span>` : null}</span>` : null}
     ${ticket.state !== 'blocked' && (ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
     ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">${blockedReasons(ticket).join(' ')}</span>` : null}
     ${ticket.state === 'close_ready' ? html`<span class="sub ticket-state cyan">${parts?.done || 0} of ${parts?.total || 0} parts done · All parts done</span>` : null}
@@ -72,16 +88,18 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false
     <${Links} ticket=${ticket} prs=${ticket.prs || []} agent=${agent} jobs=${ticket.jobs || []} thread=${ticket.thread} docs=${ticket.docs || []} />
   </div>`;
 }
-function Fold({ tickets, label, end, hours, onStart, onClose, busy }) {
+function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy = null }) {
   if (!tickets.length) return null;
   const blockers = [...new Map(tickets.flatMap(openBlockers).map((t) => [ticketKey(t), t])).values()];
   const caption = label === 'Blocked' ? `${tickets.length} blocked` : label === 'More done' ? `${tickets.length} more done` : `${tickets.length} more`;
   return html`<details class="board-fold"><summary>${caption}${label === 'Blocked' && blockers.length ? ` · waiting on ${blockers.map((t) => `#${t.number}`).join(', ')}` : ' ›'}</summary>
-    ${tickets.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} slim />`)}
+    ${tickets.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${lanePolicy} slim />`)}
   </details>`;
 }
 function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move }) {
   const [ending, setEnding] = useState(false);
+  const [reviews, setReviews] = useState(false);
+  const policy = lane.review_policy;
   const groups = groupTickets(lane.tickets || []);
   const counts = lane.counts;
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
@@ -96,11 +114,15 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
           <i class="done" style=${`width:${counts.done / total * 100}%`}></i><i class="in-progress" style=${`width:${counts.in_progress / total * 100}%`}></i></div>
         <span class="sub">${Object.entries(counts).filter(([, n]) => n).map(([state, n]) => `${n} ${state.replaceAll('_', ' ')}`).join(' · ')}</span>
       </div>
+      <span class="anchor"><button class="review-pill" title=${policy ? setByText(policy) : 'This lane uses the default review policy'} onClick=${() => setReviews(!reviews)}>
+        Reviews: <b>${policy ? reviewerText(policy.reviewer) : 'default'}</b> ▾</button>
+        ${reviews ? html`<${PolicyPopover} scope="lane" repo=${lane.goal.repo} number=${lane.goal.number} title=${`Reviews for lane ${lane.rank} · ${lane.goal.title}`}
+          policy=${policy} align="right" onClose=${() => setReviews(false)} onSaved=${boardChanged} />` : null}</span>
       <div class="lane-actions">${lane.goal.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(lane.goal)}>Close</button>` : null}
         <button class="icon-btn" title="Move lane up" disabled=${busy || index === 0} onClick=${() => move(index, -1)}>↑</button>
         <button class="icon-btn" title="Move lane down" disabled=${busy || index === count - 1} onClick=${() => move(index, 1)}>↓</button>
         <button class="btn sm" disabled=${busy} onClick=${() => setEnding(!ending)}>End</button></div>
-      ${short ? html`<${TicketRow} ticket=${groups.active[0]} compact end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} />` : null}
+      ${short ? html`<${TicketRow} ticket=${groups.active[0]} compact end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
     </header>
     ${ending ? html`<div class="lane-confirm">End this lane? Its tickets stay on GitHub.
       <button class="btn sm" onClick=${() => setEnding(false)}>Cancel</button>
@@ -108,11 +130,11 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
     ${lane.stale ? html`<p class="err">GitHub data is stale. Refresh to try again.</p>` : null}
     ${(lane.cycles || []).length ? html`<p class="err">Dependency cycle: ${lane.cycles.map((chain) => chain.map((t) => `#${t.number}`).join(' → ')).join('; ')}</p>` : null}
     ${(lane.longest_chain || []).length ? html`<div class="critical-path">Critical path: ${lane.longest_chain.map((t, i) => html`${i ? ' → ' : ''}<button class="link-btn" onClick=${() => ticketLink(t)}>#${t.number}</button>`)}</div>` : null}
-    ${!short ? groups.active.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} />`) : null}
-    ${showBlocked ? groups.blocked.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} slim />`) : null}
-    <div class="lane-folds">${!showBlocked ? html`<${Fold} tickets=${groups.blocked} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} />` : null}
-      ${groups.done.slice(0, DONE_ROW_LIMIT).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} slim />`)}
-      <${Fold} tickets=${groups.done.slice(DONE_ROW_LIMIT)} label="More done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} /></div>
+    ${!short ? groups.active.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />`) : null}
+    ${showBlocked ? groups.blocked.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`) : null}
+    <div class="lane-folds">${!showBlocked ? html`<${Fold} tickets=${groups.blocked} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
+      ${groups.done.slice(0, DONE_ROW_LIMIT).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
+      <${Fold} tickets=${groups.done.slice(DONE_ROW_LIMIT)} label="More done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
   </section>`;
 }
 function AddLane({ repos, mutate, busy, onClose }) {
@@ -135,6 +157,7 @@ export function BoardPage() {
   const [starting, setStarting] = useState(null);
   const refreshTimer = useRef(null);
   useEffect(() => () => clearTimeout(refreshTimer.current), []);
+  useEffect(() => bus.on('board-changed', reload), [reload]);
   useEffect(() => {
     if (!data) return;
     // Acknowledge each rendered snapshot, never an unseen poll result.

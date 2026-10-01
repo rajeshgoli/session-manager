@@ -6,6 +6,7 @@ import {
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
   openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
+import { HandoffPopover } from './handoff.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -94,9 +95,31 @@ export function agentFact(agent, now = Date.now()) {
 
 /** "▶ 2 running · 2h 56m", "⏸ Waiting 8m · 1st in line", or "No jobs". */
 export function jobsFact(agent) {
+  // A paired reviewer leads with its round and keeps its own jobs' status.
+  const paired = pairedText(agent.paired_reviewer);
+  const own = agent.facts && agent.facts.jobs;
+  if (paired) {
+    if (!own || !own.tone) return { text: paired.text, tone: paired.active ? 'amber' : 'muted' };
+    return { text: `${paired.text} · ${own.running > 0 ? '▶' : '⏸'} ${own.text}`, tone: own.tone };
+  }
   const jobs = agent.facts && agent.facts.jobs;
   if (!jobs || !jobs.tone) return { text: (jobs && jobs.text) || 'No jobs', tone: 'muted' };
   return { text: `${jobs.running > 0 ? '▶' : '⏸'} ${jobs.text}`, tone: jobs.tone };
+}
+
+/** A paired reviewer's line: reviewing a round, or idle between rounds (1768 I3). */
+export function pairedText(paired) {
+  if (!paired) return null;
+  if (['waiting_reviewer', 'reviewing', 'nudged'].includes(paired.request_state)) {
+    return { active: true, text: `Reviewing PR #${paired.pr_number} for ${paired.author_name || 'its author'} · round ${paired.round}` };
+  }
+  return { active: false, text: `Paired reviewer for #${paired.ticket} · idle` };
+}
+
+/** An author's line while sm finds and runs its review (1768 I3). */
+export function reviewWaitText(waiting, review, now = Date.now()) {
+  if (!waiting) return `Waiting on review of PR #${review.pr_number} · ${age(review.since, now)}`;
+  return `Waiting on review by ${waiting.reviewer_label || 'sm'} · ${age(waiting.since, now)}`;
 }
 
 /** The You line: an open question, else the finished summary, else nothing. */
@@ -469,8 +492,8 @@ function AgentActions({ agent }) {
     <${FollowButton} id=${agent.id} />
     ${live
       ? html`<span class="anchor"><button type="button" class="btn" data-pop-anchor
-          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off</button>
-          ${menu === 'handoff' ? html`<${HandoffPopover} id=${agent.id} onClose=${close} />` : null}</span>`
+          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
+          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} onClose=${close} />` : null}</span>`
       : null}
     <button type="button" class="btn" onClick=${() => newAgent({
       provider: agent.provider, model: agent.model, effort: agent.reasoning_effort, workspace: agent.working_dir,
@@ -500,52 +523,6 @@ function FollowButton({ id }) {
   };
   return html`<button type="button" class=${following ? 'btn on' : 'btn'} aria-pressed=${following}
     disabled=${busy || !follows} onClick=${toggle}>${following ? 'Following' : 'Follow'}</button>`;
-}
-
-/** The phone's handoff controls (GET/PUT /sessions/{id}/handoff-policy). */
-function HandoffPopover({ id, onClose }) {
-  const path = `/sessions/${encodeURIComponent(id)}/handoff-policy`;
-  const [policy, setPolicy] = useState(null);
-  const [note, setNote] = useState('Loading…');
-  const [asking, setAsking] = useState(false);
-  useEffect(() => {
-    api(path).then((value) => { setPolicy(value); setNote(`Using ${value.source} policy`); })
-      .catch((error) => setNote(error.message));
-  }, [path]);
-  const write = async (body) => {
-    setNote('Saving…');
-    try {
-      const value = await api(path, { method: 'PUT', body });
-      setPolicy(value);
-      setNote(body.ask_now ? 'Asked the agent to hand off' : 'Saved');
-    } catch (error) {
-      setNote(error.message);
-    }
-  };
-  const threshold = (event) => {
-    const number = Number(event.target.value);
-    if (!Number.isInteger(number) || number < 1 || number > 100) setNote('Enter an integer from 1 to 100');
-    else write({ threshold_percent: number });
-  };
-  return html`<${Popover} onClose=${onClose}>
-    <h2>Context handoff</h2>
-    ${policy
-      ? html`<label class="check"><${Toggle} label="Hand off automatically" checked=${policy.enabled}
-            onChange=${enabled => write({ enabled })} /> Hand off automatically</label>
-          <div class="fld"><span class="l">Threshold (%)</span>
-            <input class="inp num" type="number" min="1" max="100" step="1" style="width:6rem"
-              value=${policy.threshold_percent} onChange=${threshold} /></div>
-          <div class="row" style="justify-content:flex-start">
-            <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button>
-            ${asking
-              ? html`<span class="confirm">Ask this agent to hand off?
-                  <button type="button" class="btn sm danger" onClick=${() => { setAsking(false); write({ ask_now: true }); }}>Confirm handoff</button>
-                  <button type="button" class="btn sm" onClick=${() => setAsking(false)}>Cancel</button></span>`
-              : html`<button type="button" class="btn sm" onClick=${() => setAsking(true)}>Hand off now</button>`}
-          </div>`
-      : null}
-    <span class="sub" role="status">${note}</span>
-  <//>`;
 }
 
 function MoreMenu({ agent, onClose }) {
@@ -605,7 +582,7 @@ function WorkTab({ agent, now, onAnswered }) {
       : null}
     ${reviews.length
       ? html`<section><h3>Reviews</h3><ul>${reviews.map((review) => html`<li>
-          <span class="ball amber">Codex review on PR #${review.pr_number}</span> <span class="sub">requested ${age(review.since, now)} ago</span></li>`)}</ul></section>`
+          <span class="ball amber">${reviewWaitText(agent.waiting_on_review, review, now)}</span> <span class="sub">PR #${review.pr_number} · requested ${age(review.since, now)} ago</span></li>`)}</ul></section>`
       : null}
     ${docs.length
       ? html`<section><h3>Docs</h3><ul>${docs.slice(0, 6).map((doc) => html`<li>

@@ -629,6 +629,43 @@ impl OwnerMessageStore {
         Ok(())
     }
 
+    /// Unhandled messages from `sender_session_id` created under a delivery
+    /// key starting with `prefix`, as (key suffix, message id), oldest first.
+    pub fn open_keyed(
+        &self,
+        sender_session_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let has_keys = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'owner_message_delivery_keys'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_keys {
+            return Ok(Vec::new());
+        }
+        let mut statement = conn.prepare(
+            "SELECT k.key, m.id FROM owner_message_delivery_keys k \
+             JOIN owner_messages m ON m.id = k.message_id \
+             WHERE m.sender_session_id = ?1 AND m.handled_at IS NULL \
+             AND substr(k.key, 1, length(?2)) = ?2 ORDER BY m.created_at, m.id",
+        )?;
+        let rows = statement
+            .query_map(params![sender_session_id, prefix], |row| {
+                let key: String = row.get(0)?;
+                Ok((key[prefix.len()..].to_owned(), row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Messages the obligations projection needs: every message created at
     /// or after `since`, plus older blocking messages nobody has answered.
     /// Each comes with whether it has a reply. Newest first.

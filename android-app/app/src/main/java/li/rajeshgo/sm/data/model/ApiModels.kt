@@ -244,7 +244,69 @@ data class ClientSession(
     val primaryAction: PrimaryAction? = null,
     @SerialName("remote_control")
     val remoteControl: RemoteControlLink? = null,
+    /** From `/watch/state`, joined by id: the server's three facts and attention section (spec 1782 B). */
+    val facts: AgentFacts? = null,
+    val attention: AgentAttention? = null,
 )
+
+/** `GET /watch/state`: only the fields the phone draws. */
+@Serializable
+data class WatchStateResponse(val sessions: List<WatchStateSession> = emptyList())
+
+@Serializable
+data class WatchStateSession(
+    val id: String,
+    val facts: AgentFacts? = null,
+    val attention: AgentAttention? = null,
+)
+
+@Serializable
+data class AgentFacts(
+    val agent: AgentStateFact? = null,
+    val jobs: JobsFact? = null,
+    val you: YouFact? = null,
+    val finished: FinishedFact? = null,
+)
+
+/** `working`, `idle` or `stopped`, since [since]. */
+@Serializable
+data class AgentStateFact(val state: String = "idle", val since: String? = null)
+
+/** The agent's queue jobs and Codex review, as one line; [tone] is green, amber, red or null. */
+@Serializable
+data class JobsFact(
+    val running: Int = 0,
+    val waiting: Int = 0,
+    val quiet: Boolean = false,
+    val tone: String? = null,
+    val text: String = "No jobs",
+)
+
+/** What the agent needs from the owner: a message, a doc review or an Allow prompt. */
+@Serializable
+data class YouFact(
+    val kind: String = "message",
+    val since: String? = null,
+    val text: String = "",
+    val more: Int = 0,
+    @SerialName("message_ids") val messageIds: List<String> = emptyList(),
+    val dismissible: Boolean = false,
+)
+
+/** The agent ran `sm task-complete`; [text] is its last turn message, null while it is still writing. */
+@Serializable
+data class FinishedFact(val at: String? = null, val text: String? = null, val read: Boolean = false)
+
+@Serializable
+data class AgentAttention(
+    val section: String = "idle",
+    val reason: String? = null,
+    @SerialName("order_key") val orderKey: String = "",
+)
+
+/** `POST /sessions/{id}/needs-you/answered`: the session's facts after clearing. */
+@Serializable
+data class NeedsYouAnsweredResponse(val facts: AgentFacts? = null)
 
 @Serializable
 data class AdoptionProposal(

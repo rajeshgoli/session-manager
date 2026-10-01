@@ -23,6 +23,7 @@ import li.rajeshgo.sm.data.model.QueueStartCheck
 import li.rajeshgo.sm.data.model.QueueStats
 import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.data.model.UtilizationSeries
+import li.rajeshgo.sm.data.repository.ScreenCache
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -55,6 +56,8 @@ data class QueueUiState(
     val loading: Boolean = true,
     /** A pull-to-refresh in Analytics › Queue is in flight. */
     val refreshing: Boolean = false,
+    /** Showing the last overview from [ScreenCache] while the first read runs (spec 1782 J5). */
+    val revalidating: Boolean = false,
     val lastUpdated: OffsetDateTime? = null,
     val refreshError: String? = null,
     val signedOut: Boolean = false,
@@ -78,7 +81,11 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
     private var statsJob: Job? = null
     private var usageJob: Job? = null
 
-    private val _uiState = MutableStateFlow(QueueUiState(usageHours = rememberedUsageHours))
+    private val _uiState = MutableStateFlow(
+        ScreenCache.queue.let { overview ->
+            QueueUiState(usageHours = rememberedUsageHours, overview = overview, loading = overview == null, revalidating = overview != null)
+        },
+    )
     val uiState: StateFlow<QueueUiState> = _uiState
 
     init {
@@ -92,7 +99,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
         val serverUrl = settingsRepository.serverUrl.first()
         val token = settingsRepository.accessToken.first()
         if (serverUrl.isBlank() || token.isBlank()) {
-            _uiState.value = _uiState.value.copy(loading = false, signedOut = true)
+            _uiState.value = _uiState.value.copy(loading = false, revalidating = false, signedOut = true)
             return null
         }
         return serverUrl to token
@@ -101,7 +108,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun handleAuth(error: Throwable): Boolean {
         if (error !is SessionManagerAuthException) return false
         settingsRepository.clearAuth()
-        _uiState.value = _uiState.value.copy(loading = false, signedOut = true)
+        _uiState.value = _uiState.value.copy(loading = false, revalidating = false, signedOut = true)
         return true
     }
 
@@ -117,13 +124,14 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
                         overview = it,
                         loading = false,
                         refreshing = false,
+                        revalidating = false,
                         lastUpdated = OffsetDateTime.now(),
                         refreshError = null,
                     )
                 }
                 .onFailure { error ->
                     if (!handleAuth(error)) {
-                        _uiState.value = _uiState.value.copy(loading = false, refreshError = "Couldn't refresh — retrying")
+                        _uiState.value = _uiState.value.copy(loading = false, revalidating = false, refreshError = "Couldn't refresh — retrying")
                     }
                     _uiState.update { it.copy(refreshing = false) }
                 }

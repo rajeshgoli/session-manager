@@ -96,6 +96,12 @@ interface ApiService {
     @GET("client/sessions/{session_id}")
     suspend fun getClientSession(@Path("session_id") sessionId: String): ClientSession
 
+    @GET("watch/state")
+    suspend fun getWatchState(): li.rajeshgo.sm.data.model.WatchStateResponse
+
+    @POST("sessions/{session_id}/needs-you/answered")
+    suspend fun answerNeedsYou(@Path("session_id") sessionId: String): li.rajeshgo.sm.data.model.NeedsYouAnsweredResponse
+
     @GET("sessions/{session_id}/handoff-policy")
     suspend fun getHandoffPolicy(@Path("session_id") sessionId: String): li.rajeshgo.sm.data.model.HandoffPolicy
 
@@ -224,7 +230,7 @@ interface ApiService {
     ): li.rajeshgo.sm.data.model.GuestbookResponse
 
     /** Agents no longer live (sm#1661), newest first; `before` is the previous page's `next_before`. */
-    @GET("history/agents")
+    @GET("history/agents?format=json")
     suspend fun getAgentHistory(
         @Query("q") query: String?,
         @Query("before") before: String?,

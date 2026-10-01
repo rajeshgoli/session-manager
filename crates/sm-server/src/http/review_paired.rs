@@ -692,12 +692,21 @@ fn retire_reason(
         )
         .optional()?
         .unwrap_or_else(|| row.repo.clone());
-    let author_holds: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_claims WHERE ended_at IS NULL AND \
-         ((kind='ticket' AND repo=?1 AND number=?2) OR (kind='pr' AND repo=?3 AND number=?4)))",
-        rusqlite::params![row.repo, row.ticket, pr_repo, row.pr_number],
-        |r| r.get(0),
+    // The author is whoever holds a claim in the reviewer's checkout; a
+    // handoff successor keeps the worktree, another agent's takeover does not.
+    let mut stmt = conn.prepare(
+        "SELECT worktree_path FROM work_claims WHERE ended_at IS NULL AND worktree_path IS NOT NULL \
+         AND ((kind='ticket' AND repo=?1 AND number=?2) OR (kind='pr' AND repo=?3 AND number=?4))",
     )?;
+    let checkout = PathBuf::from(&row.checkout);
+    let author_holds = stmt
+        .query_map(
+            rusqlite::params![row.repo, row.ticket, pr_repo, row.pr_number],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|path| expand_home(path) == checkout);
     if !author_holds {
         return Ok(Some("the author's claim ended"));
     }
@@ -743,13 +752,15 @@ pub(super) fn start_sweeper(state: Arc<AppState>) {
     if !state.config.rust_core.runtime_enabled {
         return;
     }
+    // The first sweep waits a full interval: retiring sessions during a
+    // restart trips the restart script's session-count check.
     tokio::spawn(async move {
         loop {
+            tokio::time::sleep(Duration::from_secs(RETIRE_SWEEP_SECONDS)).await;
             let task_state = state.clone();
             if let Ok(Err(error)) = tokio::task::spawn_blocking(move || sweep(&task_state)).await {
                 eprintln!("paired reviewer sweep: {error:#}");
             }
-            tokio::time::sleep(Duration::from_secs(RETIRE_SWEEP_SECONDS)).await;
         }
     });
 }
@@ -833,6 +844,67 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{:?}", out);
+    }
+
+    #[test]
+    fn a_takeover_with_another_checkout_retires_the_reviewer() {
+        let dir = std::env::temp_dir().join(format!(
+            "sm-paired-retire-{}-{}",
+            std::process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("queue.db");
+        crate::review::policy::ensure_schema(&db).unwrap();
+        RetainedQueueStore::ensure_codex_review_requests_schema_from_path(&db).unwrap();
+        let reviewer =
+            json!({"kind":"paired","provider":"codex","model":"gpt-6-luna","effort":"medium"});
+        crate::review::policy::set(
+            &db,
+            crate::review::policy::PolicyChange {
+                scope: "ticket",
+                repo: "far/repo",
+                number: 1848,
+                reviewer: Some(&reviewer),
+                session_id: None,
+                name: "Rajesh",
+                now: "now",
+            },
+        )
+        .unwrap();
+        let row = paired::PairedReviewer {
+            session_id: "reviewer".into(),
+            repo: "far/repo".into(),
+            ticket: 1848,
+            pr_number: 7,
+            provider: "codex".into(),
+            model: "gpt-6-luna".into(),
+            effort: "medium".into(),
+            checkout: expand_home("~/worktrees/far-1848")
+                .to_string_lossy()
+                .into_owned(),
+            created_at: "now".into(),
+            retired_at: None,
+            rounds: 1,
+            last_review_url: None,
+        };
+        let mut config = AppConfig::default();
+        config.sm_send.db_path = db.display().to_string();
+        let state = AppState::new(config)
+            .with_github_review_poster(Arc::new(FakeGitHub(StdMutex::new(HEAD.into()))));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // The author's claim records its worktree with `~`.
+        conn.execute_batch("INSERT INTO work_claims(id,repo,number,kind,session_id,source,claimed_at,worktree_path) VALUES
+            ('c1','far/repo',1848,'ticket','author','test','now','~/worktrees/far-1848');").unwrap();
+        assert_eq!(retire_reason(&state, &db, &row).unwrap(), None);
+        conn.execute_batch("UPDATE work_claims SET ended_at='later' WHERE id='c1';
+            INSERT INTO work_claims(id,repo,number,kind,session_id,source,claimed_at,worktree_path) VALUES
+            ('c2','far/repo',1848,'ticket','other','test','later','~/worktrees/far-1848-other');").unwrap();
+        assert_eq!(
+            retire_reason(&state, &db, &row).unwrap(),
+            Some("the author's claim ended")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

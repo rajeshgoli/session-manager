@@ -19,6 +19,7 @@ import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.SessionJob
+import li.rajeshgo.sm.data.repository.ScreenCache
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
@@ -79,6 +80,8 @@ data class WatchUiState(
     val whatBySessionId: Map<String, WhatUiState> = emptyMap(),
     val loading: Boolean = true,
     val refreshing: Boolean = false,
+    /** Showing the last agents from [ScreenCache] while the first read runs (spec 1782 J5). */
+    val revalidating: Boolean = false,
     val studioSshEnabled: Boolean = false,
     val studioSshStatus: String = "off",
     val studioSshHost: String = "",
@@ -114,7 +117,11 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     private var terminalAttachToken: String? = null
     private var pendingTerminalResize: Pair<Int, Int>? = null
 
-    private val _uiState = MutableStateFlow(WatchUiState())
+    private val _uiState = MutableStateFlow(
+        ScreenCache.watch.let { cached ->
+            WatchUiState(sessions = cached.orEmpty(), loading = cached == null, revalidating = cached != null)
+        },
+    )
     val uiState: StateFlow<WatchUiState> = _uiState
 
     /** Server URL, bearer token and device certificate for the doc reader; null when signed out. */
@@ -252,7 +259,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                     )
                     return@launch
                 }
-                _uiState.value = _uiState.value.copy(loading = initial, refreshing = !initial, error = null)
+                _uiState.value = _uiState.value.copy(loading = initial && _uiState.value.sessions.isEmpty(), refreshing = !initial, error = null)
                 val expandedSessionIds = _uiState.value.expandedSessionIds
                 runCatching { sessionRepository.fetchSessions(serverUrl, accessToken) }
                     .onSuccess { liveSessions ->
@@ -323,7 +330,27 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                     }
             } finally {
                 refreshJob = null
+                _uiState.value = _uiState.value.copy(revalidating = false)
             }
+        }
+    }
+
+    /**
+     * ✓ Answered (spec 1782 C4): the owner answered this agent elsewhere. The row
+     * takes the returned facts at once; the next read moves it to its new section.
+     */
+    fun answerNeedsYou(session: ClientSession, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            val (serverUrl, accessToken) = signedInOrNull()
+                ?: return@launch onComplete(Result.failure(IllegalStateException("Sign in to answer agents")))
+            val result = sessionRepository.answerNeedsYou(serverUrl, accessToken, session.id)
+            result.onSuccess { facts ->
+                _uiState.value = _uiState.value.copy(
+                    sessions = _uiState.value.sessions.map { if (it.id == session.id) it.copy(facts = facts ?: it.facts?.copy(you = null)) else it },
+                )
+                refresh()
+            }
+            onComplete(result.map { "Marked answered" })
         }
     }
 

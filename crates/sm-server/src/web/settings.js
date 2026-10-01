@@ -1,10 +1,12 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg, Toggle } from './ui.js';
+import { html, api, config, Seg, Toggle, age } from './ui.js';
+import { tokens, tokensOf } from './handoff.js';
+import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
 
 const SECTIONS = [
-  ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'],
+  ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'], ['reviews', 'Reviews'],
   ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['about', 'About'],
 ];
 const SAMPLE = { repo: 'rajeshgoli/session-manager', number: 1706, title: 'Board Start preselects Fable', url: 'https://github.com/rajeshgoli/session-manager/issues/1706' };
@@ -132,7 +134,8 @@ export function SettingsPage() {
     <div class="settings-body" key=${selected}>
       ${selected === 'appearance' ? html`<${Appearance} />` : selected === 'context-handoff' ? html`<${Handoff} write=${write} />`
         : selected === 'notifications' ? html`<${Notifications} write=${write} />` : selected === 'devices-access' ? html`<${Devices} write=${write} />`
-        : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'queue-limits'
+        : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'reviews'
+          ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
           : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
           : html`<${NewAgents} data=${data.new_agent} write=${write} />`}</${Resource}>`}
@@ -198,9 +201,82 @@ function NewAgents({ data, write }) {
 
 function QueueLimits({ data, write }) {
   return html`<h2>Queue limits</h2><p class="sub">Changes apply without a restart. Lower limits hold new starts; running jobs continue. Reset restores the configured value shown in the field.</p>
-    <div class="settings-grid">${[['max_running', 'Total'], ['tests', 'Tests'], ['perf', 'Performance'], ['background', 'Background'], ['service', 'Service']].map(([key, label]) => html`<${Field}
+    <div class="settings-grid">${[['max_running', 'Total'], ['tests', 'Tests'], ['perf', 'Performance'], ['background', 'Background'], ['service', 'Service'], ['review', 'Review runs']].map(([key, label]) => html`<${Field}
       label=${label} type="number" min="0" max="16" initial=${data[key]} placeholder=${String(config.queue_config_limits?.[key] ?? '')} reset=${true}
       save=${value => write('/client/settings', { queue_limits: { [key]: integerLimit(value) } })} />`)}</div>`;
+}
+
+export function meterPercent(value) {
+  const n = Number(value);
+  if (value === '' || !Number.isInteger(n) || n < 50 || n > 100) throw new Error('Enter a whole number from 50 to 100.');
+  return n;
+}
+
+/** Policy rows for Settings › Reviews: every repo, then stored lane and ticket policies. */
+export function policyRows(listing, repos) {
+  const policies = listing?.policies || [];
+  const repoNames = [...new Set([...(repos || []), ...policies.filter(p => p.scope === 'repo').map(p => p.repo)])].sort();
+  return [
+    ...repoNames.map(repo => ({ scope: 'repo', repo, number: 0, policy: policies.find(p => p.scope === 'repo' && p.repo === repo) || null })),
+    ...policies.filter(p => p.scope !== 'repo').map(policy => ({ scope: policy.scope, repo: policy.repo, number: policy.number, policy })),
+  ];
+}
+
+const meterText = value => typeof value === 'number' ? `${Math.round(value)}%` : '—';
+const timeText = iso => iso ? new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+
+function Reviews({ data, write }) {
+  const [status, reloadStatus] = useResource('/client/reviews/status');
+  const [listing, reloadListing] = useResource('/review-policies');
+  const [board] = useResource('/client/board');
+  const [reviewer, setReviewer] = useState(data.reviews.reviewer);
+  const [saved, setSaved] = useState(''), [checking, setChecking] = useState(false), [editing, setEditing] = useState(null);
+  const choose = async next => {
+    setReviewer(next); setSaved('Saving…');
+    try { await write('/client/settings', { reviews: { reviewer: next } }); setSaved('Saved'); }
+    catch (e) { setSaved(e.message); }
+  };
+  const tryNow = async () => {
+    setChecking(true);
+    try { await write('/client/reviews/github-codex/check', undefined, 'POST'); setSaved('The next review request checks GitHub Codex.'); reloadStatus(); }
+    catch (e) { setSaved(e.message); } finally { setChecking(false); }
+  };
+  const github = status.data?.github_codex;
+  const day = status.data?.last_24h;
+  const rows = policyRows(listing.data, (board.data?.repos || []).map(r => r.repo));
+  const reviewed = day ? day.github_codex + day.codex_runs + day.claude_runs : 0;
+  const total = day ? reviewed + day.no_reviewer : 0;
+  return html`<h2>Reviews</h2><p class="sub">Shared with the phone. Agents run sm request-review; sm picks the reviewer below and moves to its fallback when it can't review.</p>
+    ${github?.state === 'paused' ? html`<div class="review-banner" role="status"><span class="chip amber">Paused</span>
+      <span><b>GitHub Codex is out of code-review quota</b> since ${timeText(github.paused_at)}. Reviews go to local runs.
+        ${github.next_check_at ? ` The next check is after ${timeText(github.next_check_at)}.` : ''}</span>
+      <button class="btn sm" disabled=${checking} onClick=${tryNow}>Try now</button></div>` : null}
+    <h3>Default reviewer <span class="sub">every repo, lane and ticket without its own</span></h3>
+    <${ReviewerEditor} value=${reviewer} onChange=${choose} />
+    <p role="status" class="saved">${saved}</p>
+    <h3>Narrower policies</h3>
+    <${Resource} state=${listing} retry=${reloadListing}>${() => html`<div class="review-policies">${rows.map(row => html`<div class="review-policy-row">
+      <span class="sub">${row.scope === 'repo' ? `Repo · ${row.repo.split('/').pop()}` : row.scope === 'lane' ? `Lane · ${row.repo.split('/').pop()} #${row.number}` : `Ticket ${row.repo.split('/').pop()} #${row.number}`}</span>
+      <span>${row.policy ? html`<b>${reviewerText(row.policy.reviewer)}</b> <span class="sub">${setByText(row.policy)} · falls back to ${fallbackText(row.policy.fallback)}</span>` : html`<span class="sub">Uses the default</span>`}</span>
+      <span class="anchor"><button class="btn sm" onClick=${() => setEditing(`${row.scope}:${row.repo}:${row.number}`)}>${row.policy ? 'Change' : 'Set'}</button>
+        ${editing === `${row.scope}:${row.repo}:${row.number}` ? html`<${PolicyPopover} scope=${row.scope} repo=${row.repo} number=${row.number} align="right"
+          title=${`Reviews for ${row.scope === 'repo' ? row.repo : `${row.scope} ${row.repo.split('/').pop()} #${row.number}`}`} policy=${row.policy}
+          onClose=${() => setEditing(null)} onSaved=${reloadListing} />` : null}</span>
+    </div>`)}</div>`}</${Resource}>
+    <h3>Limits and today</h3>
+    <div class="settings-grid">
+      <${Field} label="Review runs at once" type="number" min="0" max="16" initial=${data.queue_limits.review} placeholder="4" reset=${true}
+        hint='Queue type "review"; another run waits for a slot.' save=${value => write('/client/settings', { queue_limits: { review: integerLimit(value) } })} />
+      <${Field} label="Skip a provider at (% of its weekly meter)" type="number" min="50" max="100" initial=${data.reviews.skip_meter_percent}
+        hint=${status.data ? `Codex ${meterText(status.data.meters.codex)} · Claude ${meterText(status.data.meters.claude)} now. 100 never skips.` : '100 never skips.'}
+        save=${value => write('/client/settings', { reviews: { skip_meter_percent: meterPercent(value) } })} />
+    </div>
+    <${Resource} state=${status} retry=${reloadStatus}>${() => html`<div class="review-day">
+      <p><b>Last 24 hours: ${total}</b> <span class="sub">· GitHub Codex ${day.github_codex} · Codex runs ${day.codex_runs} · Claude runs ${day.claude_runs} · ${day.no_reviewer ? html`<span class="magenta">${day.no_reviewer} left unreviewed</span>` : 'none left unreviewed'}</span></p>
+      <div class="review-bar" aria-hidden="true">${[['github_codex', 'cyan'], ['codex_runs', 'green'], ['claude_runs', 'amber'], ['no_reviewer', 'magenta']].map(([key, color]) => day[key]
+        ? html`<i style=${`flex:${day[key]};background:var(--${color})`} title=${`${key.replace('_', ' ')}: ${day[key]}`}></i>` : null)}</div>
+      ${status.data.running.length ? html`<p class="sub">Now: ${status.data.running.map(r => `${r.repo.split('/').pop()} #${r.pr_number} · ${r.reviewer_label || 'starting'}`).join('; ')}</p>` : null}
+    </div>`}</${Resource}>`;
 }
 
 function TerminalLimits({ data, config, write }) {
@@ -211,21 +287,45 @@ function TerminalLimits({ data, config, write }) {
       save=${value => write('/client/settings', { terminal_limits: { [key]: terminalLimit(value, min, max) } })} />`)}</div>`;
 }
 
-function handoffProviders(providers) {
-  return [...new Set(['claude', 'codex-fork', 'codex', ...Object.keys(providers)])].filter(provider => provider !== 'codex-app');
+// Only providers with a context gauge can hand off: plain Codex and
+// codex-app are not listed.
+const HANDOFF_PROVIDERS = [
+  ['claude', 'Claude agents', () => 'Off. Claude agents keep working until their context fills.'],
+  ['codex-fork', 'Codex agents', window => `Off. Codex compacts its own context near the end of its ${window ? `${tokens(window)} ` : ''}window.`],
+];
+const THRESHOLDS = [
+  ['threshold_percent', 'Hand off at', '0.01', ''],
+  ['reminder_percent', 'Remind at', '0.01', ''],
+  ['review_floor_percent', 'Review floor', '0', ' (below this, a review request does not ask for a handoff)'],
+];
+
+function Threshold({ label, initial, min, window, note, save }) {
+  const [draft, setDraft] = useState(initial);
+  return html`<${Field} label=${`${label} (%)`} type="number" min=${min} max="100" step="any" initial=${initial}
+    onDraft=${setDraft} hint=${`${tokensOf(draft, window) ? `· ${tokensOf(draft, window)}` : ''}${note}`}
+    save=${value => { if (!value.trim() || !Number.isFinite(Number(value))) throw new Error('Enter a percentage.'); return save(Number(value)); }} />`;
 }
 
 function Handoff({ write }) {
-  const [state, reload] = useResource('/handoff-defaults');
-  return html`<h2>Context handoff</h2><p class="sub">Let a fresh agent take over when context fills up. Individual agents can override these defaults.</p>
+  const [state, reload, setData] = useResource('/handoff-defaults');
+  const save = body => write('/handoff-defaults', body).then(data => { setData(data); return data; });
+  return html`<h2>Context handoff</h2><p class="sub">Let a fresh agent take over when context fills up. Shared with the phone.</p>
     <${Resource} state=${state} retry=${reload}>${data => html`
-      ${handoffProviders(data.providers).map(provider => html`<${Field}
-        label=${`Enable ${provider}`} type="checkbox" initial=${!!data.providers[provider]} save=${value => write('/handoff-defaults', { providers: { [provider]: value } })} />`)}
-      ${[['threshold_percent', 'Context threshold (%)'], ['review_floor_percent', 'Review floor (%)'], ['reminder_percent', 'Reminder at (%)']].map(([key, label]) => html`<${Field}
-        label=${label} type="number" min=${key === 'review_floor_percent' ? '0' : '0.01'} max="100" step="any" initial=${String(data[key])}
-        save=${value => { if (!value.trim() || !Number.isFinite(Number(value))) throw new Error('Enter a percentage.'); return write('/handoff-defaults', { [key]: Number(value) }); }} />`)}
-      ${[['ask_on_codex_review', 'Ask on Codex review request'], ['ask_on_doc_review', 'Ask on document review request']].map(([key, label]) => html`<${Field}
-        label=${label} type="checkbox" initial=${data[key]} save=${value => write('/handoff-defaults', { [key]: value })} />`)}
+      ${HANDOFF_PROVIDERS.map(([provider, name, off]) => {
+        const on = !!data.providers[provider];
+        const thresholds = data.provider_thresholds?.[provider] || {};
+        return html`<section class="handoff-provider" key=${provider}><h3>${name}</h3>
+          <${Field} label="Hand off automatically" type="checkbox" initial=${on} save=${value => save({ providers: { [provider]: value } })} />
+          ${on ? THRESHOLDS.map(([key, label, min, note]) => html`<${Threshold} key=${key} label=${label} min=${min} note=${note}
+              initial=${String(thresholds[key] ?? '')} window=${data.window_tokens?.[provider]}
+              save=${value => save({ provider_thresholds: { [provider]: { [key]: value } } })} />`)
+            : html`<p class="sub">${off(data.window_tokens?.[provider])}</p>`}
+        </section>`;
+      })}
+      ${HANDOFF_PROVIDERS.some(([provider]) => data.providers[provider]) ? html`<h3>When a review is requested</h3>
+        ${[['ask_on_codex_review', 'Codex review of a PR: ask the agent to hand off first'], ['ask_on_doc_review', 'Your review of a doc: ask the agent to hand off first']].map(([key, label]) => html`<${Field}
+          label=${label} type="checkbox" initial=${data[key]} save=${value => save({ [key]: value })} />`)}` : null}
+      <p class="sub">To try handoff on one agent or one ticket, leave these off and use Hand off… in that agent's details or in a ticket's ⋯ on the Board. The agents that take over inherit the setting.</p>
     `}</${Resource}>`;
 }
 
@@ -255,9 +355,24 @@ function Devices({ write }) {
 }
 
 function About() {
-  const [app, reload] = useResource('/apps/session-manager-android/meta.json');
-  return html`<h2>About</h2><dl class="settings-about"><dt>Server version</dt><dd>${config.server_version || 'Unavailable'}</dd>
-    <dt>Web build</dt><dd>${config.build_id}</dd></dl>
-    <h3>Latest Android app</h3><${Resource} state=${app} retry=${reload}>${data => html`<p>${data.version_name || data.artifact_hash}
-      ${data.version_code ? ` · build ${data.version_code}` : ''}</p><p class="sub">Published ${new Date(data.uploaded_at).toLocaleString()}</p>`}</${Resource}>`;
+  const [app, reloadApp] = useResource('/apps/session-manager-android/meta.json');
+  const [health, setHealth] = useState(null);
+  useEffect(() => {
+    let live = true;
+    fetch('/health').then(response => response.ok ? response.json() : null).then(body => live && setHealth(body?.status === 'healthy'))
+      .catch(() => live && setHealth(false));
+    return () => { live = false; };
+  }, []);
+  const row = (dot, label, value, sub) => html`<div class="about-row"><span class=${`about-dot ${dot}`} aria-hidden="true"></span>
+    <span class="about-label">${label}</span><span class="about-value">${value}${sub ? html`<span class="sub"> · ${sub}</span>` : null}</span></div>`;
+  return html`<h2 class="about-title"><span class="about-mark">sm</span> About</h2><div class="about-rows">
+    ${row(health === null ? 'slate' : health ? 'green' : 'red', 'Server', config.server_version || 'Unavailable',
+      [config.server_started_at && `up ${age(config.server_started_at)}`, health === null ? 'checking' : health ? 'healthy' : 'not answering'].filter(Boolean).join(' · '))}
+    ${row('green', 'Web build', html`<code>${config.build_id}</code>`)}
+    ${app.error ? row('red', 'Phone app', 'Unavailable', html`${app.error} <button class="btn sm" onClick=${reloadApp}>Retry</button>`)
+      : !app.data ? row('slate', 'Phone app', 'Loading…')
+      : row('green', 'Phone app', `${app.data.version_name || app.data.artifact_hash}${app.data.version_code ? ` · build ${app.data.version_code}` : ''}`,
+        `built ${new Date(app.data.uploaded_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`)}
+    ${row('accent', 'Repository', html`<a href="https://github.com/rajeshgoli/session-manager" target="_blank" rel="noopener">rajeshgoli/session-manager ↗</a>`)}
+  </div>`;
 }

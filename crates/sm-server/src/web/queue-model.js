@@ -65,3 +65,20 @@ export async function askJobQuestion(api, owner, job, question) {
     throw error;
   }
 }
+
+/**
+ * A review job's card text (spec 1768 I2): the PR it reviews, the reviewer,
+ * its model, round and author, and why this reviewer when it is a fallback.
+ */
+export function reviewJobText(job) {
+  const review = job.review;
+  if (!review) return null;
+  const match = /^(.*?) \((.*)\)$/.exec(review.reviewer_label || '');
+  return {
+    title: `review · ${review.repo.split('/').pop()} #${review.pr_number}`,
+    reviewer: match ? match[1] : review.reviewer_label || 'Review run',
+    detail: [match ? match[2].replace(', ', ' · ') : null, `round ${review.round}`, `for ${review.author_name}`,
+      review.policy_source && review.policy_source !== 'default' ? `${review.policy_source} policy` : null].filter(Boolean).join(' · '),
+    why: review.why === 'default' ? null : review.why,
+  };
+}

@@ -55,6 +55,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -132,7 +134,7 @@ fun HistoryScreen(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 item(key = "top") {
                     AppTopBar(
@@ -270,27 +272,31 @@ private fun AgentCard(
     onOpenPage: (ReaderPage) -> Unit,
 ) {
     val summary = workSummary(agent.work)
+    // The Board and Inbox style (spec 1782 J1): a left edge in the row's colour.
+    val edge = if (restore == RestoreState.Restored) Emerald else if (agent.state == "retired") Border else Amber
     Surface(
-        shape = RoundedCornerShape(22.dp),
+        shape = RoundedCornerShape(12.dp),
         color = Panel,
         border = BorderStroke(1.dp, if (restore == RestoreState.Restored) Emerald.copy(alpha = 0.5f) else Border),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column {
+        Column(
+            Modifier
+                .drawBehind { drawRect(edge, size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height)) }
+                .padding(start = 3.dp),
+        ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(enabled = summary != null, onClick = onToggle)
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    val dot = if (restore == RestoreState.Restored) Emerald else if (agent.state == "retired") TextMuted else Amber
-                    Box(Modifier.size(9.dp).background(dot, CircleShape))
-                    Spacer(Modifier.width(10.dp))
                     Text(
                         agent.name.ifBlank { agent.id },
-                        style = MaterialTheme.typography.titleMedium,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
@@ -345,15 +351,21 @@ private fun AgentCard(
 @Composable
 private fun StateChip(state: String) {
     val tint = if (state == "retired") TextMuted else Amber
-    Surface(shape = RoundedCornerShape(999.dp), color = tint.copy(alpha = 0.16f)) {
-        Text(state.uppercase(), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall, color = tint)
-    }
+    Text(
+        state.uppercase(),
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.Bold,
+        color = tint,
+        modifier = Modifier
+            .background(tint.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 1.dp),
+    )
 }
 
 /** Restore, its progress and outcome, or why this agent cannot be restored. */
 @Composable
 private fun RestoreBar(agent: AgentHistoryRow, restore: RestoreState?, onRestore: () -> Unit, onOpenWatch: () -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         when {
             !agent.restorable -> Text(
                 agent.unrestorableReason ?: "Cannot be restored",

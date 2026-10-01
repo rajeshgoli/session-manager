@@ -163,6 +163,7 @@ fun InboxScreen(
                         title = "Inbox",
                         menu = menu,
                         busy = state.refreshing,
+                        refreshBar = state.revalidating,
                         current = Routes.INBOX,
                         onRefresh = { viewModel.refresh(pull = true) },
                     )

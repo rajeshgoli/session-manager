@@ -22,6 +22,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -70,71 +71,80 @@ fun AppTopBar(
     onRefresh: (() -> Unit)? = null,
     /** Screen buttons before the menu, such as the Board's add lane. */
     actions: (@Composable () -> Unit)? = null,
+    /** Screen entries at the top of the three-dots menu; call the argument to close the menu. */
+    menuEntries: (@Composable (close: () -> Unit) -> Unit)? = null,
+    /** A thin bar under the top bar while a screen refreshes data it already shows (spec 1782 J5). */
+    refreshBar: Boolean = false,
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
     val update by updateViewModel.uiState.collectAsState()
     var menuExpanded by remember { mutableStateOf(false) }
 
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(18.dp),
-        color = Panel,
-        border = BorderStroke(1.dp, Border),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(start = if (onBack != null) 4.dp else 14.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically,
+    Column(modifier) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = Panel,
+            border = BorderStroke(1.dp, Border),
         ) {
-            if (onBack != null) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = TextSecondary)
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = if (onBack != null) 4.dp else 14.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (onBack != null) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = TextSecondary)
+                    }
                 }
-            }
-            Column(Modifier.weight(1f)) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (!subtitle.isNullOrBlank()) {
-                    Spacer(Modifier.height(2.dp))
+                Column(Modifier.weight(1f)) {
                     Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (busy) Cyan else TextMuted,
+                        title,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (!subtitle.isNullOrBlank()) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (busy) Cyan else TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
-            }
-            actions?.invoke()
-            Box {
-                IconButton(onClick = { menuExpanded = true }) {
-                    Icon(Icons.Rounded.MoreVert, contentDescription = "Menu", tint = if (busy) Cyan else TextSecondary)
-                }
-                DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                    MenuEntry("New session", Icons.Rounded.Add) { menuExpanded = false; menu.onNewSession() }
-                    if (current != Routes.HISTORY) {
-                        MenuEntry("History", Icons.Rounded.History) { menuExpanded = false; menu.onOpenHistory() }
+                actions?.invoke()
+                Box {
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "Menu", tint = if (busy) Cyan else TextSecondary)
                     }
-                    if (current != Routes.GUESTBOOK) {
-                        MenuEntry("Guestbook", Icons.Rounded.AutoStories) { menuExpanded = false; menu.onOpenGuestbook() }
-                    }
-                    if (current != Routes.ANALYTICS) {
-                        MenuEntry("Analytics", Icons.Rounded.Analytics) { menuExpanded = false; menu.onOpenAnalytics() }
-                    }
-                    if (onRefresh != null) {
-                        MenuEntry(if (busy) "Refresh (running...)" else "Refresh", Icons.Rounded.Refresh, enabled = !busy) {
-                            menuExpanded = false
-                            onRefresh()
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        menuEntries?.invoke { menuExpanded = false }
+                        MenuEntry("New session", Icons.Rounded.Add) { menuExpanded = false; menu.onNewSession() }
+                        if (current != Routes.HISTORY) {
+                            MenuEntry("History", Icons.Rounded.History) { menuExpanded = false; menu.onOpenHistory() }
+                        }
+                        if (current != Routes.GUESTBOOK) {
+                            MenuEntry("Guestbook", Icons.Rounded.AutoStories) { menuExpanded = false; menu.onOpenGuestbook() }
+                        }
+                        if (current != Routes.ANALYTICS) {
+                            MenuEntry("Analytics", Icons.Rounded.Analytics) { menuExpanded = false; menu.onOpenAnalytics() }
+                        }
+                        if (onRefresh != null) {
+                            MenuEntry(if (busy) "Refresh (running...)" else "Refresh", Icons.Rounded.Refresh, enabled = !busy) {
+                                menuExpanded = false
+                                onRefresh()
+                            }
                         }
                     }
                 }
+                SettingsIconButtonWithUpdate(hasUpdate = update.availableUpdate != null, onClick = menu.onOpenSettings)
             }
-            SettingsIconButtonWithUpdate(hasUpdate = update.availableUpdate != null, onClick = menu.onOpenSettings)
+        }
+        Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp).height(2.dp)) {
+            if (refreshBar) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp), color = Cyan, trackColor = Border)
         }
     }
 }

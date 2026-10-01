@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, registerPanel, closePanel, openPanel, bus, typingIn } from './ui.js';
 
 export function shellName(path = location.pathname) {
-  return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
+  return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/history/tickets': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
 }
 export function fullScreen(path) {
   const url = new URL(path, location.origin);
@@ -30,7 +30,8 @@ export function Reader({ id, controls, onBack = closePanel }) {
       if (url.protocol === 'about:') { setError('This link is not a document reader path.'); return; }
       if (url.origin !== location.origin) return;
       setCurrent(url.pathname + url.search);
-      setDoc(win.__smDoc ? { ...win.__smDoc.config, prState: win.__smDoc.prState } : { title: win.document.title });
+      const details = win.__smDoc ? { ...win.__smDoc.config, prState: win.__smDoc.prState } : { title: win.document.title };
+      setDoc({ ...details, hasAppendix: !!win.document.querySelector('.appendix-divider') });
       // Reader links stay inside the shell, including links in authored docs.
       win.document.addEventListener('click', (e) => {
         const link = e.target.closest('a[href]');
@@ -48,12 +49,31 @@ export function Reader({ id, controls, onBack = closePanel }) {
     } catch (e) { setError('Unable to open this reader.'); }
   };
   const shortcut = (e) => {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'p') {
+      e.preventDefault(); printDoc(false); return;
+    }
     if (e.key === 'e' && e.target.ownerDocument !== document && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
       e.preventDefault(); bus.emit('inbox-done');
     }
     if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
       e.preventDefault(); fullScreen(frame.current?.contentWindow.location.href || current);
     }
+  };
+  const printDoc = (all) => {
+    const win = frame.current?.contentWindow;
+    if (!win) return;
+    try {
+      if (win.location.origin !== location.origin) return;
+      if (all) {
+        win.document.documentElement.setAttribute('data-print', 'all');
+        win.addEventListener('afterprint', () => {
+          const toggle = win.document.getElementById('memo-print-toggle');
+          if (toggle) toggle.click(); // Let the template update its own label and setting.
+          else win.document.documentElement.removeAttribute('data-print');
+        }, { once: true });
+      }
+      win.print();
+    } catch (_) { /* The frame may have navigated away from the document. */ }
   };
   useEffect(() => {
     document.addEventListener('keydown', shortcut);
@@ -72,6 +92,7 @@ export function Reader({ id, controls, onBack = closePanel }) {
         if (match) openPanel(`ticket:${match[1]}#${match[2]}`);
       }}>#${doc.prNumber} · ${doc.prState || 'unknown'}</button>` : null}
       ${doc?.docId ? html`<button class="btn sm" onClick=${() => frame.current.contentWindow.__smDoc.openReview()}>Review</button>` : null}
+      ${doc ? html`<span class="reader-print"><button class="btn sm" onClick=${() => printDoc(false)}>⎙ ${doc.hasAppendix ? 'Print memo' : 'Print'}</button>${doc.hasAppendix ? html`<button class="btn sm" onClick=${() => printDoc(true)}>Print all</button>` : null}</span>` : null}
       <button class="icon-btn" title="Full screen (f)" onClick=${() => fullScreen(current)}>⤢</button>
       <a href=${current} target="_blank" rel="noopener" title="Open in new tab">↗</a>${controls}
     </div>

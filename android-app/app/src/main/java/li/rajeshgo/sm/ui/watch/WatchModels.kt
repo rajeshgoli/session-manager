@@ -298,37 +298,39 @@ fun buildSections(sessions: List<ClientSession>): List<WatchSection> {
         .sortedWith(compareBy<WatchSection>({ sectionPriority(it) }, { it.repoLabel.lowercase() }, { it.repoKey }))
 }
 
-fun filterSections(sections: List<WatchSection>, statusFilter: String, query: String): List<WatchSection> {
+/** The status filter and search box: [query] matches name, id, repo, role, provider, status or alias. */
+fun sessionMatches(session: ClientSession, statusFilter: String, query: String): Boolean {
     val normalizedQuery = query.trim().lowercase()
-
-    fun matches(session: ClientSession): Boolean {
-        if (statusFilter != "all" && !matchesStatusFilter(session, statusFilter)) {
-            return false
-        }
-        if (normalizedQuery.isBlank()) {
-            return true
-        }
-        val haystack = buildString {
-            append(session.id)
-            append(' ')
-            append(session.name)
-            append(' ')
-            append(sessionDisplayName(session))
-            append(' ')
-            append(session.tmuxSession)
-            append(' ')
-            append(session.workingDir)
-            append(' ')
-            append(session.role ?: "")
-            append(' ')
-            append(session.provider ?: "")
-            append(' ')
-            append(session.agentStatusText ?: "")
-            append(' ')
-            append(session.aliases.joinToString(" "))
-        }.lowercase()
-        return haystack.contains(normalizedQuery)
+    if (statusFilter != "all" && !matchesStatusFilter(session, statusFilter)) {
+        return false
     }
+    if (normalizedQuery.isBlank()) {
+        return true
+    }
+    val haystack = buildString {
+        append(session.id)
+        append(' ')
+        append(session.name)
+        append(' ')
+        append(sessionDisplayName(session))
+        append(' ')
+        append(session.tmuxSession)
+        append(' ')
+        append(session.workingDir)
+        append(' ')
+        append(session.role ?: "")
+        append(' ')
+        append(session.provider ?: "")
+        append(' ')
+        append(session.agentStatusText ?: "")
+        append(' ')
+        append(session.aliases.joinToString(" "))
+    }.lowercase()
+    return haystack.contains(normalizedQuery)
+}
+
+fun filterSections(sections: List<WatchSection>, statusFilter: String, query: String): List<WatchSection> {
+    fun matches(session: ClientSession): Boolean = sessionMatches(session, statusFilter, query)
 
     fun filterNode(node: WatchSessionNode): WatchSessionNode? {
         val sameRepoChildren = node.sameRepoChildren.mapNotNull(::filterNode)
@@ -559,3 +561,89 @@ fun defaultFollowMessage(ownerName: String): String {
 const val NOTIFICATIONS_OFF_MESSAGE = "Notifications off — you'll be emailed instead"
 
 fun isStoppedSession(session: ClientSession): Boolean = session.status == "stopped"
+
+/** Attention sections in the server's order (spec 1782 B), with their headings. */
+val ATTENTION_SECTIONS = listOf(
+    "you" to "NEEDS YOU",
+    "finished" to "FINISHED",
+    "waiting_long" to "WAITING LONG",
+    "moving" to "MOVING",
+    "waiting" to "WAITING",
+    "idle" to "IDLE",
+    "stopped" to "STOPPED",
+)
+
+data class AttentionGroup(val section: String, val label: String, val sessions: List<ClientSession>)
+
+/** The server's section; a stopped agent, or one `/watch/state` did not list, falls back without guessing more. */
+fun attentionSection(session: ClientSession): String = when {
+    session.status == "stopped" -> "stopped"
+    else -> session.attention?.section?.takeIf { section -> ATTENTION_SECTIONS.any { it.first == section } } ?: "idle"
+}
+
+/** Watch by attention: sections in order, each sorted by the server's order key, then name. */
+fun attentionGroups(sessions: List<ClientSession>, statusFilter: String, query: String): List<AttentionGroup> {
+    val bySection = sessions.filter { sessionMatches(it, statusFilter, query) }.groupBy(::attentionSection)
+    return ATTENTION_SECTIONS.mapNotNull { (section, label) ->
+        bySection[section]?.sortedWith(
+            compareBy<ClientSession>({ it.attention?.orderKey.orEmpty() }, { sessionDisplayName(it).lowercase() }, { it.id }),
+        )?.let { AttentionGroup(section, "$label · ${it.size}", it) }
+    }
+}
+
+/** The ticket the agent holds, as "#1771". */
+fun ticketLabel(session: ClientSession): String? =
+    session.obligations?.claims.orEmpty().firstOrNull { it.kind == "ticket" && it.number > 0 }?.let { "#${it.number}" }
+
+/** 1710's age rule: under an hour "{m}m", otherwise "{h}h {m}m". */
+fun factAge(since: String?, now: OffsetDateTime = OffsetDateTime.now()): String? {
+    val parsed = parseIso(since) ?: return null
+    val minutes = Duration.between(parsed, now).toMinutes().coerceAtLeast(0)
+    return if (minutes < 60) "${minutes}m" else "${minutes / 60}h ${minutes % 60}m"
+}
+
+/** The agent fact: "● Working 1m", "○ Idle 7m" or "■ Stopped". */
+fun agentFactText(session: ClientSession, now: OffsetDateTime = OffsetDateTime.now()): String {
+    val agent = session.facts?.agent
+    val state = if (session.status == "stopped") "stopped" else agent?.state ?: "idle"
+    val age = factAge(agent?.since, now)?.let { " $it" }.orEmpty()
+    return when (state) {
+        "working" -> "● Working$age"
+        "stopped" -> "■ Stopped"
+        else -> "○ Idle$age"
+    }
+}
+
+/**
+ * Line 2 of a Watch row (spec 1782 J2): "#1771 · ○ Idle 7m · No jobs". A
+ * finished agent reads "#1855 · finished 4h 46m", plus its jobs when it has any.
+ */
+fun rowFactsLine(session: ClientSession, now: OffsetDateTime = OffsetDateTime.now()): String {
+    val jobs = session.facts?.jobs
+    val finished = session.facts?.finished
+    val parts = if (attentionSection(session) == "finished" && finished != null) {
+        listOfNotNull(
+            ticketLabel(session),
+            "finished${factAge(finished.at, now)?.let { " $it" }.orEmpty()}",
+            jobs?.text?.takeIf { it.isNotBlank() && it != "No jobs" },
+        )
+    } else {
+        listOfNotNull(ticketLabel(session), agentFactText(session, now), jobs?.text?.takeIf { it.isNotBlank() } ?: "No jobs")
+    }
+    return parts.joinToString(" · ")
+}
+
+/** Line 3 when the agent needs the owner: "◆ 7m: 1771 is waiting for… (+1 more)". */
+fun youLine(session: ClientSession, now: OffsetDateTime = OffsetDateTime.now()): String? {
+    val you = session.facts?.you ?: return null
+    val age = factAge(you.since, now)?.let { "$it: " }.orEmpty()
+    val more = if (you.more > 0) " (+${you.more} more)" else ""
+    return "◆ $age${you.text.trim()}$more"
+}
+
+/** Line 3 for a finished agent the owner has not read: the first line of its last turn message. */
+fun finishedLine(session: ClientSession): String? {
+    val finished = session.facts?.finished?.takeIf { !it.read } ?: return null
+    val text = finished.text?.lineSequence()?.map { it.trim() }?.firstOrNull { it.isNotEmpty() }
+    return "✔ ${text ?: "Finishing…"}"
+}

@@ -42,14 +42,19 @@ function pageFor(path) {
 function readLocation() {
   const params = new URLSearchParams(location.search);
   const open = params.get('open');
+  // `/history` opens on agents now; an older link that filters tickets
+  // (`repo`, `agent` or a ticket `open`) keeps landing on the tickets tab.
+  if (location.pathname === '/history' && (params.has('repo') || params.has('agent') || (open && !open.includes(':')))) {
+    history.replaceState(history.state, '', `/history/tickets${location.search}${location.hash}`);
+  }
   return { path: location.pathname, open: params.get('panel') || (open?.includes(':') ? open : null) };
 }
 
 function urlFor(path, open) {
   const params = new URLSearchParams(path === location.pathname ? location.search : '');
-  // History reserves `open` for its ticket filter. Keep panel state separate
-  // there, while still accepting old `?open=ticket:…` links on arrival.
-  const key = path === '/history' ? 'panel' : 'open';
+  // History's tickets tab reserves `open` for its ticket filter. Keep panel
+  // state separate there, while still accepting `?open=ticket:…` on arrival.
+  const key = path === '/history/tickets' ? 'panel' : 'open';
   params.delete('panel');
   if (key === 'open' || params.get('open')?.includes(':')) params.delete('open');
   if (!open?.startsWith('thread:')) params.delete('at');

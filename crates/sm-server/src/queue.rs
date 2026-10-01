@@ -1587,6 +1587,18 @@ impl RetainedQueueStore {
             .map(Option::flatten)
     }
 
+    /// The owner tag a job was created with (`create_owned_queue_job`).
+    pub fn queue_job_owner_from_path(db_path: &Path, job_id: &str) -> Result<Option<String>> {
+        let conn = open_queue_jobs_connection(db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        Ok(conn
+            .query_row("SELECT owner FROM queue_jobs WHERE id=?1", [job_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     pub fn create_queue_job_in_state_dir(
         state_dir: &Path,
         request: CreateQueueJob,

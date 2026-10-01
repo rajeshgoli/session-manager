@@ -2,6 +2,10 @@
 import { useEffect, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, toast, openPanel } from './ui.js';
 import { EFFORTS } from './start.js';
+import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
+
+export const REVIEWER_KINDS = [{ value: '', label: 'Lane default' }, { value: 'github_codex', label: 'GitHub' },
+  { value: 'codex', label: 'Codex run' }, { value: 'claude', label: 'Claude run' }, { value: 'paired', label: 'Paired' }];
 
 export const canStartAnyway = (ticket) => ticket.state === 'blocked'
   && !(ticket.warnings || []).some((warning) => ['stale', 'cycle', 'merged_not_closed'].includes(warning));
@@ -22,6 +26,7 @@ export function startBody(ticket, form) {
   if (canStartAnyway(ticket)) body.start_blocked = true;
   if (form.model) body.model = form.model;
   if (form.reasoning_effort) body.reasoning_effort = form.reasoning_effort;
+  if (form.reviewer) body.reviewer = form.reviewer;
   return body;
 }
 
@@ -92,9 +97,25 @@ export function TicketStart({ ticket, onClose, onStarted }) {
         <label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>
         <div class="fld"><span class="l">Workspace</span><span class="mono">${homeRelative(form.working_dir)}</span></div>
         <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief} onInput=${(e) => set({ brief: e.target.value })}></textarea></label>` : null}
+      <${ReviewerRow} form=${form} set=${set} />
     ` : startable && !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable ? 'Cancel' : 'Close'}</button>
       ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
+}
+
+/** The reviewer for this ticket (1768 I3): the policy it would use, or a ticket policy stored at Start. */
+function ReviewerRow({ form, set }) {
+  const resolved = form.review_policy;
+  const own = resolved && resolved.source && resolved.source.startsWith('ticket');
+  const kinds = REVIEWER_KINDS.map((k) => (k.value === '' && own ? { ...k, label: 'Ticket\'s own' } : k));
+  const kind = form.reviewer ? form.reviewer.kind : '';
+  const choose = (value) => set({ reviewer: value ? switchKind(form.reviewer || resolved?.resolved, value) : null });
+  return html`<div class="fld top"><span class="l">Reviewer</span><div class="review-editor">
+    <${Seg} label="Reviewer for this ticket" value=${kind} options=${kinds} onChange=${choose} />
+    ${form.reviewer ? html`<${ReviewerEditor} value=${form.reviewer} kinds=${null} onChange=${(reviewer) => set({ reviewer })}
+      note=${form.reviewer.kind === 'paired' ? `Starts at the first review request, in ${form.name}'s checkout, as ${form.name}-reviewer. It may build and run tests, never edit.` : null} />`
+      : html`<p class="sub">${resolved ? `${reviewerText(resolved.resolved)} · from ${resolved.source}` : 'The policy a review request would use.'}</p>`}
+  </div></div>`;
 }

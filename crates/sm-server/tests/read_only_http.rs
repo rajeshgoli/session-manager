@@ -9984,6 +9984,43 @@ async fn context_usage_hook_is_served_and_records_tokens() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_takes_a_1m_model_over_the_reported_window() {
+    // Claude Code reports `context_window_size` 200000 for Opus 1M agents
+    // (seen live on 1 October 2026: 345,884 tokens at 35%).
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    for (model_id, reported, expected) in [
+        (Some("claude-opus-5-5[1m]"), Some(200_000), 1_000_000),
+        (Some("claude-sonnet-5-5"), Some(200_000), 200_000),
+        (None, Some(400_000), 400_000),
+        (None, None, 200_000),
+    ] {
+        let (status, _) = post_json(
+            app.clone(),
+            "/hooks/context-usage",
+            json!({"session_id": "run12345", "used_percentage": 35.0,
+                   "total_input_tokens": 70_000, "context_window_tokens": reported,
+                   "model_id": model_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let session = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "run12345")
+            .unwrap();
+        assert_eq!(
+            session["context_window_tokens"],
+            json!(expected),
+            "{model_id:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_database() {
     let state_file = write_session_fixture();
     let usage_db_path = unique_temp_path().with_extension("usage.db");
