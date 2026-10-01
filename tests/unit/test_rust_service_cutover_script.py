@@ -106,6 +106,25 @@ def test_rust_service_cutover_render_plist_uses_rust_binary_and_config(tmp_path)
         str(config),
     ]
     assert plist["WorkingDirectory"] == str(REPO_ROOT)
+    assert plist["KeepAlive"] == {"SuccessfulExit": False}
+
+
+def test_takeover_plist_passes_flag_to_server(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  port: 18420\n", encoding="utf-8")
+    binary = tmp_path / "sm-server-green"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    result = run_script(
+        "render-plist", "--config", str(config), "--binary", str(binary),
+        "--label", "com.rajeshgoli.session-manager-rust.green", "--take-over",
+    )
+
+    assert result.returncode == 0, result.stderr
+    plist = plistlib.loads(result.stdout.encode("utf-8"))
+    assert plist["Label"] == "com.rajeshgoli.session-manager-rust.green"
+    assert plist["ProgramArguments"][-1] == "--take-over"
 
 
 def test_rust_service_cutover_runs_from_the_checkout_that_holds_the_binary(tmp_path):
