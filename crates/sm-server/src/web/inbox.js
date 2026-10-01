@@ -172,7 +172,7 @@ export function Thread({ id, controls, agent }) {
       jobs=${agent.jobs || []} /></div>` : null}
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => item.type === 'turn'
-      ? html`<div key=${i} class="b turn"><div class="lbl">Last turn · ${new Date(item.at).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}</div><div class="md" dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} /></div>`
+      ? html`<div key=${i} class="b turn"><div class="lbl">${item.finished === false ? 'Reply' : 'Last turn'} · ${new Date(item.at).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}</div><div class="md" dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} /></div>`
       : html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
     <div class="thread-compose">
       ${quotes.map((q,i) => html`<blockquote>${q.quote}<button class="icon-btn" disabled=${busy} title="Remove quote" onClick=${() => setQuotes(quotes.filter((_,n) => n !== i))}>×</button></blockquote>`)}
