@@ -290,6 +290,7 @@ fun BoardScreen(
                         menu = menu,
                         subtitle = board?.let(::lastRead)?.let { "Read from GitHub ${shortDuration(Duration.between(it, now).seconds)} ago" },
                         busy = state.refreshing,
+                        refreshBar = state.revalidating,
                         current = Routes.BOARD,
                         onRefresh = { viewModel.refresh(pull = true) },
                         actions = {

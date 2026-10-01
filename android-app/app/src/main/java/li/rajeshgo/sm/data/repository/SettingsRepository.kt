@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
@@ -47,6 +48,7 @@ class SettingsRepository(
         val SPEND_RANGE = stringPreferencesKey("analytics_spend_range")
         val TIME_RANGE = stringPreferencesKey("analytics_time_range")
         val ANALYTICS_SECTION = stringPreferencesKey("analytics_section")
+        val TEXT_SCALE = floatPreferencesKey("text_scale")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -199,6 +201,13 @@ class SettingsRepository(
         prefs[Keys.FOLLOW_PUSH_ENABLED] ?: true
     }
 
+    /** Settings › Appearance › Text size, a factor on every type style (spec 1782 A1). */
+    val textScale: Flow<Float> = context.dataStore.data.map { prefs -> normalizeTextScale(prefs[Keys.TEXT_SCALE]) }
+
+    suspend fun saveTextScale(scale: Float) {
+        context.dataStore.edit { prefs -> prefs[Keys.TEXT_SCALE] = normalizeTextScale(scale) }
+    }
+
     suspend fun saveFollowPushEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.FOLLOW_PUSH_ENABLED] = enabled }
     }
@@ -229,6 +238,7 @@ class SettingsRepository(
     }
 
     suspend fun clearAuth() {
+        ScreenCache.clear()
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.ACCESS_TOKEN)
             prefs.remove(Keys.USER_EMAIL)
@@ -284,4 +294,14 @@ class SettingsRepository(
     private companion object {
         private const val MAX_PERSISTED_WHAT_SUMMARIES = 20
     }
+}
+
+const val TEXT_SCALE_DEFAULT = 1.0f
+const val TEXT_SCALE_MIN = 0.85f
+const val TEXT_SCALE_MAX = 1.30f
+
+/** 85% to 130% in 5% steps; anything missing or out of range is 100%. */
+fun normalizeTextScale(value: Float?): Float {
+    if (value == null || value.isNaN() || value < TEXT_SCALE_MIN - 0.001f || value > TEXT_SCALE_MAX + 0.001f) return TEXT_SCALE_DEFAULT
+    return Math.round(value * 20f) / 20f
 }

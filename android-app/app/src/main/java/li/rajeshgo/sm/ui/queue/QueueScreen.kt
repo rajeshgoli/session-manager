@@ -140,6 +140,7 @@ fun QueueScreen(
                         subtitle = state.lastUpdated?.let { "Updated ${shortDuration(Duration.between(it, now).seconds)} ago" },
                         current = Routes.QUEUE,
                         onRefresh = { viewModel.refresh(); viewModel.refreshStats() },
+                        refreshBar = state.revalidating,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
                     state.refreshError?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall) }
@@ -268,10 +269,13 @@ internal fun SectionHeader(text: String) {
     }
 }
 
-internal fun meterColor(row: MeterRow): Color = when {
-    row.fraction == null -> TextMuted
-    row.label == "GPU" && meterBand(row.fraction) == Meter.LOW -> Cyan
-    else -> when (meterBand(row.fraction)) {
+internal fun meterColor(row: MeterRow): Color = meterBandColor(row.fraction, gpu = row.label == "GPU")
+
+/** Usage colour (spec 1782 A2): green, amber above 60%, red above 85%; GPU's low band is cyan. */
+internal fun meterBandColor(fraction: Double?, gpu: Boolean = false): Color = when {
+    fraction == null -> TextMuted
+    gpu && meterBand(fraction) == Meter.LOW -> Cyan
+    else -> when (meterBand(fraction)) {
         Meter.LOW -> Emerald
         Meter.MID -> Amber
         Meter.HIGH -> Rose

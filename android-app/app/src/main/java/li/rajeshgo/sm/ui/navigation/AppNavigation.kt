@@ -91,31 +91,18 @@ fun AppNavigation() {
             delay(INBOX_BADGE_REFRESH_MS)
         }
     }
-    val toInbox = {
-        navController.navigate(Routes.INBOX) {
-            popUpTo(Routes.WATCH) { inclusive = false }
+    // Bottom tabs keep their state and view models while another tab shows (spec 1782 J5).
+    val toTab = { route: String ->
+        navController.navigate(route) {
+            popUpTo(Routes.WATCH) { saveState = true }
             launchSingleTop = true
+            restoreState = true
         }
     }
-
-    val toWatch = {
-        navController.navigate(Routes.WATCH) {
-            popUpTo(Routes.WATCH) { inclusive = false }
-            launchSingleTop = true
-        }
-    }
-    val toBoard = {
-        navController.navigate(Routes.BOARD) {
-            popUpTo(Routes.WATCH) { inclusive = false }
-            launchSingleTop = true
-        }
-    }
-    val toQueue = {
-        navController.navigate(Routes.QUEUE) {
-            popUpTo(Routes.WATCH) { inclusive = false }
-            launchSingleTop = true
-        }
-    }
+    val toInbox = { toTab(Routes.INBOX) }
+    val toWatch = { toTab(Routes.WATCH) }
+    val toBoard = { toTab(Routes.BOARD) }
+    val toQueue = { toTab(Routes.QUEUE) }
     // The three-dots menu every screen shares (sm#1659).
     val menu = AppMenuActions(
         onNewSession = {

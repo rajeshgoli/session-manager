@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.InboxResponse
 import li.rajeshgo.sm.data.model.InboxRow
+import li.rajeshgo.sm.data.repository.ScreenCache
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -47,9 +48,17 @@ data class InboxUiState(
     val rows: List<InboxRow> = emptyList(),
     val loading: Boolean = true,
     val refreshing: Boolean = false,
+    /** Showing this filter's last rows from [ScreenCache] while the first read runs (spec 1782 J5). */
+    val revalidating: Boolean = false,
     val error: String? = null,
     val signedOut: Boolean = false,
 )
+
+/** The Inbox as last seen for [filter], or a loading state when it has never been read. */
+fun cachedInboxState(filter: InboxFilter): InboxUiState {
+    val cached = ScreenCache.inbox[filter.query]
+    return InboxUiState(filter = filter, rows = cached?.rows.orEmpty(), loading = cached == null, revalidating = cached != null)
+}
 
 /** Open rows in their groups, in order; other filters are one untitled group. */
 fun inboxSections(filter: InboxFilter, rows: List<InboxRow>): List<Pair<String?, List<InboxRow>>> {
@@ -65,14 +74,14 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = SessionManagerRepository(settingsRepository)
     private var loadJob: Job? = null
 
-    private val _uiState = MutableStateFlow(InboxUiState())
+    private val _uiState = MutableStateFlow(cachedInboxState(InboxFilter.Open))
     val uiState: StateFlow<InboxUiState> = _uiState
 
     private suspend fun credentials(): Pair<String, String>? {
         val serverUrl = settingsRepository.serverUrl.first()
         val token = settingsRepository.accessToken.first()
         if (serverUrl.isBlank() || token.isBlank()) {
-            _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true) }
+            _uiState.update { it.copy(loading = false, refreshing = false, revalidating = false, signedOut = true) }
             return null
         }
         return serverUrl to token
@@ -82,7 +91,7 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setFilter(filter: InboxFilter) {
         if (filter == _uiState.value.filter) return
-        _uiState.update { it.copy(filter = filter, rows = emptyList(), loading = true, error = null) }
+        _uiState.value = cachedInboxState(filter)
         loadJob?.cancel()
         loadJob = null
         refresh()
@@ -100,7 +109,7 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
                     InboxBadge.update(response)
                     _uiState.update {
                         if (it.filter != filter) it
-                        else it.copy(rows = response.rows, loading = false, refreshing = false, error = null, signedOut = false)
+                        else it.copy(rows = response.rows, loading = false, refreshing = false, revalidating = false, error = null, signedOut = false)
                     }
                 }
                 .onFailure { error ->
@@ -109,10 +118,10 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
                     if (_uiState.value.filter != filter) return@onFailure
                     if (error is SessionManagerAuthException) {
                         settingsRepository.clearAuth()
-                        _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true) }
+                        _uiState.update { it.copy(loading = false, refreshing = false, revalidating = false, signedOut = true) }
                     } else {
                         _uiState.update {
-                            it.copy(loading = false, refreshing = false, error = error.message ?: "Couldn't load the Inbox")
+                            it.copy(loading = false, refreshing = false, revalidating = false, error = error.message ?: "Couldn't load the Inbox")
                         }
                     }
                 }

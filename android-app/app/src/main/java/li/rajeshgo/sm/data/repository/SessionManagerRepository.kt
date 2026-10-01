@@ -91,6 +91,40 @@ fun stripTerminalControls(text: String): String {
     return output.toString()
 }
 
+/**
+ * The last payload each tab drew, kept in memory for the life of the process
+ * (spec 1782 J5). A screen whose view model is recreated starts from it and
+ * refreshes in the background instead of showing a spinner. Sign-out clears it.
+ */
+object ScreenCache {
+    @Volatile var watch: List<ClientSession>? = null
+    @Volatile var board: li.rajeshgo.sm.data.model.BoardResponse? = null
+    @Volatile var queue: li.rajeshgo.sm.data.model.QueueOverview? = null
+    /** Inbox rows per filter query. */
+    val inbox = java.util.concurrent.ConcurrentHashMap<String, li.rajeshgo.sm.data.model.InboxResponse>()
+
+    /** Bumped by every sign-out, so a read that started before it cannot refill the cache. */
+    @Volatile var generation = 0L
+        private set
+
+    @Synchronized
+    fun clear() {
+        generation++
+        watch = null
+        board = null
+        queue = null
+        inbox.clear()
+    }
+
+    /** Runs [read] and stores its result with [store], unless a sign-out happened meanwhile. */
+    suspend fun <T> remember(read: suspend () -> T, store: (T) -> Unit): T {
+        val started = generation
+        val value = read()
+        synchronized(this) { if (generation == started) store(value) }
+        return value
+    }
+}
+
 class SessionManagerRepository(
     private val settingsRepository: SettingsRepository? = null,
 ) {
@@ -260,17 +294,26 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
-        coroutineScope {
+        ScreenCache.remember({ coroutineScope {
             val sessions = async { executeReadRequest(baseUrl, token) { it.getClientSessions().sessions } }
             val obligations = async { executeReadRequest(baseUrl, token) { it.getSessionObligations().sessions }.associateBy { it.sessionId } }
             val jobs = async { executeReadRequest(baseUrl, token) { it.getSessionJobs().jobs } }
+            val watch = async { executeReadRequest(baseUrl, token) { it.getWatchState().sessions }.associateBy { it.id } }
             val obligationsById = obligations.await()
             val allJobs = jobs.await()
+            val watchById = watch.await()
             sessions.await().map { session -> session.copy(
                 obligations = obligationsById[session.id],
                 jobs = allJobs.filter { it.isAwaitedBy(session.id) },
+                facts = watchById[session.id]?.facts,
+                attention = watchById[session.id]?.attention,
             ) }
-        }
+        } }) { ScreenCache.watch = it }
+    }
+
+    /** ✓ Answered (spec 1782 C4): clears the agent's open questions without telling it. */
+    suspend fun answerNeedsYou(baseUrl: String, token: String, sessionId: String): Result<li.rajeshgo.sm.data.model.AgentFacts?> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).answerNeedsYou(sessionId).facts }.mapFailure(::classifyWriteFailure)
     }
 
     suspend fun createSession(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.CreateSessionRequest): Result<li.rajeshgo.sm.data.model.CreatedSession> = withContext(Dispatchers.IO) {
@@ -384,7 +427,7 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchQueue(baseUrl: String, token: String): li.rajeshgo.sm.data.model.QueueOverview = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getQueue() }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getQueue() } }) { ScreenCache.queue = it }
     }
 
     suspend fun fetchQueueStats(baseUrl: String, token: String, hours: Int): li.rajeshgo.sm.data.model.QueueStats = withContext(Dispatchers.IO) {
@@ -508,11 +551,11 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchInbox(baseUrl: String, token: String, filter: String): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getInbox(filter) }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter) } }) { ScreenCache.inbox[filter] = it }
     }
 
     suspend fun fetchBoard(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardResponse = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getBoard() }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getBoard() } }) { ScreenCache.board = it }
     }
 
     suspend fun fetchBoardBadge(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardBadge = withContext(Dispatchers.IO) {
