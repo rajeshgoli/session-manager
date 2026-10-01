@@ -153,11 +153,6 @@ pub(super) async fn put_policy(
     };
     if let Some(value) = &body.reviewer {
         policy::validate(&body.scope, value).map_err(bad)?;
-        if value["kind"] == "paired" {
-            return Err(bad(
-                "Paired reviewers are available after the paired-reviewer feature ships.",
-            ));
-        }
     }
     if let Some(id) = caller.as_deref() {
         let credential = reparent_session_credential(&headers)?;

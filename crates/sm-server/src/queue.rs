@@ -724,6 +724,48 @@ impl RetainedQueueStore {
         Ok(())
     }
 
+    /// A paired step has its reviewer; the round waits until it is idle.
+    pub fn attach_paired_reviewer(
+        db_path: &Path,
+        id: &str,
+        index: i64,
+        session_id: &str,
+        label: &str,
+    ) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET reviewer_session_id=?3, reviewer_label=?4, step_state='waiting_reviewer' WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,session_id,label])?;
+        Ok(())
+    }
+
+    /// The round goes to the reviewer with its snapshot, in one transaction:
+    /// its timers start now. False when the step moved on meanwhile.
+    pub fn send_paired_round_in_path(
+        db_path: &Path,
+        id: &str,
+        index: i64,
+        snapshot: &str,
+        now: &str,
+        reviewer: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        with_immediate_transaction(&conn, |conn| {
+            let changed = conn.execute("UPDATE codex_review_request_registrations SET checkout_snapshot=?3, step_state='reviewing', step_started_at=?4 WHERE id=?1 AND step_index=?2 AND is_active=1 AND step_state='waiting_reviewer' AND reviewer_session_id=?5",params![id,index,snapshot,now,reviewer])?;
+            if changed == 1 {
+                enqueue_message_with_metadata_conn(
+                    conn,
+                    reviewer,
+                    text,
+                    "sequential",
+                    QueueMessageMetadata::default(),
+                )?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
     pub fn record_review_findings(db_path: &Path, id: &str, findings: &JsonValue) -> Result<()> {
         let conn = Connection::open(db_path)?;
         conn.execute(
@@ -2899,6 +2941,10 @@ impl RetainedQueueStore {
                       WHERE notify_session_id = ?1 AND is_active = 1",
                     "UPDATE codex_review_request_registrations SET requester_session_id = ?2
                       WHERE requester_session_id = ?1 AND is_active = 1",
+                    "UPDATE codex_review_request_registrations SET reviewer_session_id = ?2
+                      WHERE reviewer_session_id = ?1 AND is_active = 1",
+                    "UPDATE OR IGNORE paired_reviewers SET session_id = ?2
+                      WHERE session_id = ?1",
                     "UPDATE scheduled_reminders SET target_session_id = ?2
                       WHERE target_session_id = ?1 AND is_active = 1",
                     "UPDATE OR IGNORE remind_registrations SET target_session_id = ?2
@@ -3833,6 +3879,7 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
         "superseded_at",
         "TIMESTAMP",
     )?;
+    conn.execute_batch(crate::review::paired::SCHEMA)?;
     for (name, kind) in [
         ("chain_json", "TEXT"),
         ("policy_source", "TEXT"),

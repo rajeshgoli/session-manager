@@ -204,9 +204,9 @@ pub fn resolve(
     tickets = ranked.into_iter().map(|(_, ticket)| ticket).collect();
     for (r, n) in &tickets {
         if let Some(p) = get(&conn, "ticket", r, *n)? {
-            return Ok(
-                json!({"reviewer":p["reviewer"],"fallback":p["fallback"],"source":source(&p)}),
-            );
+            // A paired reviewer needs to know whose ticket it serves.
+            return Ok(json!({"reviewer":p["reviewer"],"fallback":p["fallback"],
+                "source":source(&p),"ticket":{"repo":r,"number":n}}));
         }
     }
     let mut lanes: Vec<(i64, String, i64)> = Vec::new();

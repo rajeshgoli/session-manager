@@ -89,6 +89,8 @@ enum Command {
     RemoveDevice(RemoveDeviceArgs),
     #[command(name = "request-review")]
     RequestReview(RequestReviewArgs),
+    /// Paired reviewers: return your review to sm
+    Review(ReviewArgs),
     #[command(name = "subagent-start")]
     SubagentStart(EmptyArgs),
     #[command(name = "subagent-stop")]
@@ -777,6 +779,21 @@ struct RequestReviewArgs {
     command: Option<RequestReviewCommand>,
 }
 
+#[derive(Args)]
+struct ReviewArgs {
+    #[command(subcommand)]
+    command: ReviewCommand,
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    /// Submit your review as JSON (from --file, or stdin); sm posts it
+    Submit {
+        #[arg(long)]
+        file: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum RequestReviewCommand {
     List,
@@ -1298,6 +1315,7 @@ fn run() -> Result<()> {
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
         Command::RequestReview(args) => run_request_codex_review(&client, args)?,
+        Command::Review(args) => run_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
         Command::MergeHold(args) => merge_holds::run(&client, args)?,
@@ -2169,6 +2187,49 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
     if let Some(ask) = handoff_ask(&response) {
         println!("{ask}");
     }
+    Ok(())
+}
+
+fn run_review(client: &ApiClient, args: ReviewArgs) -> Result<()> {
+    let ReviewCommand::Submit { file } = args.command;
+    let not_reviewing = || anyhow!("You are not reviewing an active request.");
+    let session_id = optional_current_session_id().ok_or_else(not_reviewing)?;
+    let text = match file {
+        Some(path) => fs::read_to_string(&path).with_context(|| format!("read {path}"))?,
+        None => {
+            let mut text = String::new();
+            io::stdin().read_to_string(&mut text)?;
+            text
+        }
+    };
+    let review: Value = serde_json::from_str(&text).map_err(|error| {
+        anyhow!("The review is not valid: {error}. The schema is in the brief.")
+    })?;
+    let requests = client.get_json("/review-requests")?["requests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let request = requests
+        .iter()
+        .find(|r| r["is_active"] == true && r["reviewer_session_id"] == session_id.as_str())
+        .ok_or_else(not_reviewing)?;
+    let id = request["id"].as_str().ok_or_else(not_reviewing)?;
+    let credential = current_session_credential(&session_id)?;
+    let response = client.request_with_headers(
+        "POST",
+        &format!("/review-requests/{}/submit", encode_path_segment(id)),
+        Some(json!({"session_id": session_id, "review": review})),
+        &[("X-SM-Session-Credential", credential.as_str())],
+    )?;
+    if !(200..300).contains(&response.status) {
+        let detail = serde_json::from_str::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["detail"].as_str().map(str::to_owned))
+            .unwrap_or(response.body);
+        bail!("{detail}");
+    }
+    let body: Value = serde_json::from_str(&response.body)?;
+    println!("{}", body["text"].as_str().unwrap_or_default());
     Ok(())
 }
 
