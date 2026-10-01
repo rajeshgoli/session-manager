@@ -20,6 +20,7 @@ pub mod guestbook;
 pub mod handoff;
 pub mod http;
 pub mod mobile_devices;
+pub mod notes;
 pub mod owner_doc_render;
 pub mod owner_docs;
 pub mod owner_inbox;

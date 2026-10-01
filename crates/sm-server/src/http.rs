@@ -361,6 +361,7 @@ mod history;
 mod inbox;
 mod merge_holds;
 mod messages;
+mod notes;
 mod review_paired;
 mod review_policies;
 mod review_runs;
@@ -1817,6 +1818,20 @@ pub fn router(state: AppState) -> Router {
         .route("/merge-holds/release", post(merge_holds::release))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/board", get(board::get_board))
+        .route("/notes", get(notes::list).post(notes::create))
+        .route("/notes/search", get(notes::search))
+        .route(
+            "/notes/import",
+            post(notes::import).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/notes/{id}",
+            get(notes::get).put(notes::save).delete(notes::delete),
+        )
+        .route("/notes/{id}/revisions", get(notes::revisions))
+        .route("/notes/{id}/revisions/{version}", get(notes::revision))
+        .route("/notes/{id}/restore", post(notes::restore))
+        .route("/github/issues", post(notes::create_issue))
         .route("/board/links", post(board::post_link))
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
@@ -17187,6 +17202,7 @@ mod tests {
             let isolation_root = test_isolation_root_from_environment().unwrap().unwrap();
             let paths = [
                 config.paths.state_file.clone(),
+                config.paths.notes_db.clone(),
                 config.sm_send.db_path.clone(),
                 config.mobile_analytics.message_queue_db.clone(),
                 config.tool_logging.db_path.clone(),
@@ -21026,6 +21042,72 @@ mod tests {
                 assert_eq!(response["detail"], detail, "{method} {uri} {headers:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn notes_refuse_agent_credentials() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for header in ["x-sm-session", "x-sm-session-id"] {
+            let request = owner_web_request(
+                Method::GET,
+                "/notes",
+                "sm.example.com",
+                Some(&owner),
+                &[(header, "abc12345")],
+                &json!({}),
+            );
+            let (status, _) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let request = public_request(Method::GET, "/notes", Body::empty());
+        let (status, _) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = browser_host_get(&app, "/notes", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn notes_http_save_conflict_returns_current_note() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let headers = [("origin", "https://sm.example.com")];
+        let request = owner_web_request(
+            Method::POST,
+            "/notes",
+            "sm.example.com",
+            Some(&owner),
+            &headers,
+            &json!({"body":"# Draft\nfirst"}),
+        );
+        let (status, created) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let uri = format!("/notes/{}", created["id"].as_str().unwrap());
+        let request = owner_web_request(
+            Method::PUT,
+            &uri,
+            "sm.example.com",
+            Some(&owner),
+            &headers,
+            &json!({"body":"# Draft\nsecond","if_version":1}),
+        );
+        let (status, saved) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["version"], 2);
+        let request = owner_web_request(
+            Method::PUT,
+            &uri,
+            "sm.example.com",
+            Some(&owner),
+            &headers,
+            &json!({"body":"old copy","if_version":1}),
+        );
+        let (status, conflict) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(conflict["body"], "# Draft\nsecond");
+        assert_eq!(conflict["version"], 2);
     }
 
     #[tokio::test]

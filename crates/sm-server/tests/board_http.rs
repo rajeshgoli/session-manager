@@ -313,6 +313,7 @@ fn fixture_options(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: dir.join("message_queue.db").display().to_string(),
