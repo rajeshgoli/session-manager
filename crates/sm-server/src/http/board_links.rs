@@ -165,15 +165,21 @@ impl BoardLinks {
             .map(|reply| reply.message_id.clone())
             .collect();
         let mut threads = BTreeMap::<String, Value>::new();
-        let mut newest_message = BTreeMap::<String, String>::new();
+        let mut newest_item = BTreeMap::<String, (String, String)>::new();
         let mut newest_open = BTreeMap::<String, String>::new();
+        let mut consider_item = |session: &str, at: &str, id: &str| {
+            let entry = newest_item.entry(session.to_owned()).or_default();
+            if at >= entry.0.as_str() {
+                *entry = (at.to_owned(), id.to_owned());
+            }
+        };
         let all_messages = messages.all()?;
         let sender_of: BTreeMap<String, String> = all_messages
             .iter()
             .map(|message| (message.id.clone(), message.sender_session_id.clone()))
             .collect();
         for message in all_messages {
-            newest_message.insert(message.sender_session_id.clone(), message.id.clone());
+            consider_item(&message.sender_session_id, &message.created_at, &message.id);
             let thread = threads.entry(message.sender_session_id.clone()).or_insert_with(|| json!({
                 "key": format!("agent:{}", message.sender_session_id), "needs_you": false, "count": 0,
             }));
@@ -193,12 +199,14 @@ impl BoardLinks {
         }
         for reply in replies {
             if let Some(session) = sender_of.get(&reply.message_id) {
+                consider_item(session, &reply.created_at, &reply.id);
                 if let Some(thread) = threads.get_mut(session) {
                     thread["count"] = json!(thread["count"].as_u64().unwrap_or(0) + 1);
                 }
             }
         }
         for note in super::inbox::inbox_store(state).notes()? {
+            consider_item(&note.session_id, &note.created_at, &note.id);
             let thread = threads.entry(note.session_id.clone()).or_insert_with(|| {
                 json!({
                     "key": format!("agent:{}", note.session_id), "needs_you": false, "count": 0,
@@ -209,7 +217,7 @@ impl BoardLinks {
         for (session, thread) in &mut threads {
             if let Some(at) = newest_open
                 .get(session)
-                .or_else(|| newest_message.get(session))
+                .or_else(|| newest_item.get(session).map(|(_, id)| id))
             {
                 thread["at"] = json!(at);
             }

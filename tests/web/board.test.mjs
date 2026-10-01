@@ -18,6 +18,7 @@ await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/prea
 await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults } = modules.get(`${root}/board-start.js`).namespace;
+const { threadHref } = modules.get(`${root}/ui.js`).namespace;
 test('rows preserve every actionable ticket and sort done by closure time', () => {
   const states = ['needs_you', 'close_ready', 'ready', 'in_progress', 'blocked', 'done'];
   const rows = states.map((state, number) => ({ state, number }));
@@ -34,6 +35,7 @@ test('other tickets always expose needs-you rows and blockers omit closed depend
   const blocked = {waits_on:[{number:2,state:'done'},{number:3,state:'in_progress'}]};
   assert.deepEqual(openBlockers(blocked).map(t => t.number), [3]);
   assert.equal(blockedText(blocked), '#3');
+  assert.equal(threadHref({key:'agent:session-1',at:'message one'}), '/inbox?open=thread:session-1&at=message%20one');
 });
 test('clock clips at the chosen window and preserves gaps and quiet segments', () => {
   const end = '2026-09-30T03:00:00Z';
