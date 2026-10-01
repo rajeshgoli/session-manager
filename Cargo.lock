@@ -2014,6 +2014,7 @@ dependencies = [
  "qrcode",
  "rand_core 0.6.4",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

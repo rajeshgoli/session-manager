@@ -58,6 +58,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The LAN listener and ACME client both use rustls. Their dependency graph
+    // enables more than one crypto backend, so choose one before either runs.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
     let config = AppConfig::load_from_path_with_local_env(&args.config, args.local_env.as_deref())?;
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
