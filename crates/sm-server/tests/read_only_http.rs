@@ -599,6 +599,7 @@ fn queue_runtime_test_app(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -1209,6 +1210,7 @@ async fn client_bug_report_enforces_auth_and_payload_bounds() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         bug_reports: BugReportsConfig {
             db_path: bug_db.display().to_string(),
@@ -1273,6 +1275,7 @@ async fn bug_agent_route_guard() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         bug_reports: BugReportsConfig {
             db_path: unique_temp_path().display().to_string(),
@@ -1712,6 +1715,7 @@ async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         app_artifacts: AppArtifactsConfig {
             root_dir: artifact_root.display().to_string(),
@@ -1822,6 +1826,7 @@ async fn app_artifact_upload_rejects_encoded_whitespace_app_name() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         app_artifacts: AppArtifactsConfig {
             root_dir: artifact_root.display().to_string(),
@@ -1872,6 +1877,7 @@ async fn app_artifact_upload_rejects_public_unauthenticated_access_when_auth_ena
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         app_artifacts: AppArtifactsConfig {
             root_dir: artifact_root.display().to_string(),
@@ -1924,6 +1930,7 @@ async fn codex_review_requests_missing_db_returns_empty_requests() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: state_file
@@ -2004,6 +2011,7 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2089,6 +2097,7 @@ async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_r
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2180,6 +2189,7 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2288,6 +2298,7 @@ async fn github_quota_pauses_channel_and_skips_the_next_request() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2351,6 +2362,7 @@ async fn ending_a_reserved_quota_probe_allows_the_next_request_to_check() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2405,6 +2417,7 @@ async fn github_error_reposts_once_then_stops() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2471,6 +2484,7 @@ async fn failed_codex_error_repost_ends_without_repeating_comments() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2537,6 +2551,7 @@ async fn github_silence_stops_without_reposting() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2581,6 +2596,7 @@ async fn codex_review_request_create_survives_client_disconnect() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2666,6 +2682,7 @@ async fn codex_review_request_create_reconciles_head_after_post() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2741,6 +2758,7 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2817,6 +2835,7 @@ async fn codex_review_request_create_rejects_stopped_notify_session() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2852,6 +2871,7 @@ async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -2928,6 +2948,7 @@ async fn codex_review_request_watcher_clears_retry_after_pickup() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3012,6 +3033,7 @@ async fn codex_review_request_watcher_terminates_when_pr_closes() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3070,6 +3092,7 @@ async fn codex_review_request_watcher_waits_on_stopped_and_terminates_on_retired
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3144,6 +3167,7 @@ async fn codex_review_request_watcher_survives_unreadable_session_state() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3238,6 +3262,7 @@ async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_sessio
         AppState::new(AppConfig {
             paths: PathsConfig {
                 state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
             },
             sm_send: SmSendConfig {
                 db_path: queue_db.display().to_string(),
@@ -3373,6 +3398,7 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3461,6 +3487,7 @@ async fn codex_review_request_recovery_backfills_missing_head_before_matching_re
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3515,6 +3542,7 @@ async fn codex_review_request_recovery_terminates_missing_notify_session() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3565,6 +3593,7 @@ async fn codex_review_request_recovery_terminates_retired_notify_session() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3606,6 +3635,7 @@ async fn codex_review_request_recovery_keeps_stopped_notify_session_active() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3657,6 +3687,7 @@ async fn codex_review_request_recovery_applies_new_silence_rule_to_old_requests(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3742,6 +3773,7 @@ async fn legacy_review_request_uses_silence_deadline_despite_oversized_poll_inte
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3802,6 +3834,7 @@ async fn codex_review_request_create_returns_actionable_conflict_for_other_owner
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3848,6 +3881,7 @@ async fn codex_review_request_supersedes_same_owner_stale_head_and_ignores_late_
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -3977,6 +4011,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     let disabled_app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4000,6 +4035,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4121,6 +4157,7 @@ async fn codex_review_request_create_surfaces_transport_failure_as_bad_gateway()
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4161,6 +4198,7 @@ async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4180,6 +4218,7 @@ async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
     let mut write_config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4202,6 +4241,7 @@ async fn codex_review_requests_unknown_notify_target_returns_404() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -4267,6 +4307,7 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4285,6 +4326,7 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4359,6 +4401,7 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4471,6 +4514,7 @@ async fn queue_job_log_reads_a_bounded_derived_tail() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4565,6 +4609,7 @@ async fn queue_jobs_derives_state_dir_for_direct_custom_state_config() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -4587,6 +4632,7 @@ async fn queue_jobs_unknown_notify_target_returns_404() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4639,6 +4685,7 @@ async fn queue_job_create_is_disabled_by_default() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4676,6 +4723,7 @@ async fn queue_job_create_persists_pending_job_and_files() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4780,6 +4828,7 @@ async fn queue_job_create_validates_request_shape() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4885,6 +4934,7 @@ async fn queue_job_create_runs_when_runtime_enabled() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -4957,6 +5007,7 @@ async fn queue_job_runtime_respects_configured_max_running_jobs() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5029,6 +5080,7 @@ async fn queue_job_runtime_applies_configured_type_cap_and_default_timeout() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5101,6 +5153,7 @@ async fn queue_job_background_accepts_explicit_no_timeout() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5202,6 +5255,7 @@ async fn queue_job_runtime_persists_failure_and_timeout() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5292,6 +5346,7 @@ async fn queue_timeout_waits_for_process_group_cleanup_after_wrapper_exits() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5353,6 +5408,7 @@ fn process_guard_test_app(label: &str, job_max: i64) -> (axum::Router, PathBuf, 
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5605,6 +5661,7 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5737,6 +5794,7 @@ async fn queue_runtime_memory_guard_records_cause_and_sample_before_termination(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -5811,6 +5869,7 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -6829,6 +6888,7 @@ async fn queue_runtime_recovery_at_service_capacity_preserves_non_service_reserv
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -7084,6 +7144,7 @@ async fn queue_job_cancel_persists_pending_cancel() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -7147,6 +7208,7 @@ async fn queue_job_cancel_does_not_admit_pending_jobs_without_runtime_ownership(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -7211,6 +7273,7 @@ async fn queue_job_cancel_terminates_running_job() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -7371,6 +7434,7 @@ async fn queue_job_cancel_force_stops_unmonitored_running_process_group() {
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -7970,6 +8034,7 @@ async fn shadow_http_reports_codex_review_request_detail_200_as_status_only() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -8012,6 +8077,7 @@ async fn shadow_http_reports_codex_review_request_detail_404() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: state_file
@@ -8059,6 +8125,7 @@ async fn shadow_http_reports_codex_review_request_cancel_as_status_only_without_
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -8111,6 +8178,7 @@ async fn shadow_http_reports_codex_review_request_create_as_status_only_without_
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -8573,6 +8641,7 @@ async fn shadow_http_reports_queue_job_detail_404() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: state_file
@@ -8622,6 +8691,7 @@ async fn shadow_http_reports_queue_job_detail_200_as_status_only() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         queue_runner: QueueRunnerConfig {
             state_dir: queue_state_dir.display().to_string(),
@@ -11550,6 +11620,7 @@ async fn session_tool_calls_reads_activity_spans_for_all_providers() {
         let app = router(AppState::new(AppConfig {
             paths: PathsConfig {
                 state_file: state_file.display().to_string(),
+                ..PathsConfig::default()
             },
             usage: sm_server::config::UsageConfig {
                 enabled: true,
@@ -11594,6 +11665,7 @@ async fn session_tool_calls_handles_empty_activity_database() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         usage: sm_server::config::UsageConfig {
             enabled: true,
@@ -11618,6 +11690,7 @@ async fn session_activity_actions_projects_codex_observability_rows() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_observability: CodexObservabilityConfig {
             db_path: observability_db.display().to_string(),
@@ -11702,6 +11775,7 @@ async fn session_activity_actions_handles_empty_and_gating_errors() {
     let disabled_app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_rollout: CodexRolloutConfig {
             enable_observability_projection: false,
@@ -11729,6 +11803,7 @@ async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_events: CodexEventsConfig {
             db_path: events_db.display().to_string(),
@@ -11785,6 +11860,7 @@ async fn session_codex_events_since_seq_reports_retention_gap() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_events: CodexEventsConfig {
             db_path: events_db.display().to_string(),
@@ -11807,6 +11883,7 @@ async fn session_codex_events_since_seq_reports_retention_gap() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_events: CodexEventsConfig {
             db_path: events_db.display().to_string(),
@@ -11829,6 +11906,7 @@ async fn session_codex_events_handles_missing_db_session_and_provider_errors() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_events: CodexEventsConfig {
             db_path: state_file
@@ -11870,6 +11948,7 @@ async fn session_codex_events_handles_missing_db_session_and_provider_errors() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_rollout: CodexRolloutConfig {
             enable_durable_events: false,
@@ -11926,6 +12005,7 @@ async fn session_codex_events_decodes_query_and_uses_last_duplicate_value() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_events: CodexEventsConfig {
             db_path: events_db.display().to_string(),
@@ -11963,6 +12043,7 @@ async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_requests: CodexRequestsConfig {
             db_path: requests_db.display().to_string(),
@@ -12050,6 +12131,7 @@ async fn session_codex_pending_requests_handles_empty_and_gating_errors() {
     let disabled_app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_rollout: CodexRolloutConfig {
             enable_structured_requests: false,
@@ -12091,6 +12173,7 @@ async fn session_tool_calls_handles_missing_db_and_invalid_limit() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         usage: sm_server::config::UsageConfig {
             enabled: true,
@@ -12260,6 +12343,7 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -12611,6 +12695,7 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -12698,6 +12783,7 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -13443,6 +13529,7 @@ async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -13596,6 +13683,7 @@ async fn patch_session_metadata_updates_friendly_name_and_em_state() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
@@ -13755,6 +13843,7 @@ async fn patch_session_metadata_drains_native_rename_when_runtime_enabled() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path.display().to_string(),
@@ -13836,6 +13925,7 @@ async fn patch_session_metadata_rejects_invalid_and_reserved_friendly_names() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -13931,6 +14021,7 @@ async fn patch_session_metadata_is_em_does_not_load_human_config() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         email: EmailConfig {
             bridge_config: bridge_config.display().to_string(),
@@ -13970,6 +14061,7 @@ async fn shadow_http_predicts_patch_session_metadata_without_writing() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14196,6 +14288,7 @@ async fn fixture_registry_clear_removes_recovered_maintainer_history() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14339,6 +14432,7 @@ async fn fixture_core_spawn_endpoint_inherits_parent_fields() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14468,6 +14562,7 @@ async fn fixture_core_writes_preserve_concurrent_session_updates() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14521,6 +14616,7 @@ async fn fixture_core_logs_do_not_collide_for_sanitized_session_ids() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14593,6 +14689,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     let config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(&state_file)
@@ -17758,6 +17855,7 @@ while true; do sleep 1; done
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path.display().to_string(),
@@ -18184,6 +18282,7 @@ while true; do sleep 1; done
     let config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path.display().to_string(),
@@ -18297,6 +18396,7 @@ while true; do sleep 1; done
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_fork: CodexForkLaunchConfig {
             command: codex_binary.display().to_string(),
@@ -18498,6 +18598,7 @@ async fn runtime_core_fails_create_when_stdin_prompt_cannot_be_delivered() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(&state_file)
@@ -20192,6 +20293,7 @@ fn config_with_state_file(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         ..AppConfig::default()
     }
@@ -20225,6 +20327,7 @@ fn config_with_state_file_and_email(
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         email: EmailConfig {
             bridge_config: bridge_config.display().to_string(),
@@ -20241,6 +20344,7 @@ fn config_with_state_file_and_queue(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(state_file)
@@ -20664,6 +20768,7 @@ fn config_with_state_file_and_auth(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         google_auth: GoogleAuthConfig {
             enabled: true,
@@ -21232,6 +21337,7 @@ done
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(state_file)
@@ -21307,6 +21413,7 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(state_file)
@@ -21360,6 +21467,7 @@ fn runtime_app_with_command(
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: queue_db_path_for_state_file(state_file)
@@ -22165,6 +22273,7 @@ fn owner_docs_state_with(
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: dir.join("message_queue.db").display().to_string(),
@@ -24127,6 +24236,7 @@ async fn session_tool_calls_usage_disabled_reads_pre_tool_use_rows() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         tool_logging: ToolLoggingConfig {
             db_path: tool_db.display().to_string(),
@@ -24192,6 +24302,7 @@ async fn session_tool_calls_usage_disabled_projects_codex_fork_observability_row
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_observability: CodexObservabilityConfig {
             db_path: observability_db.display().to_string(),
@@ -24252,6 +24363,7 @@ async fn session_tool_calls_codex_fork_missing_observability_db_returns_empty_ro
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
         },
         codex_observability: CodexObservabilityConfig {
             db_path: state_file

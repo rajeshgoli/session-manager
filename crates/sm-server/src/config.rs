@@ -378,6 +378,13 @@ impl AppConfig {
             Path::new("bug_reports.db"),
             &expand_home_for_path_match(&default_bug_reports_db_path()),
         )?;
+        self.paths.notes_db = isolate_path_from_protected_root(
+            &self.paths.notes_db,
+            &default_notes_db_path(),
+            &instance,
+            Path::new("notes.db"),
+            &expand_home_for_path_match(&default_notes_db_path()),
+        )?;
         self.app_artifacts.root_dir = isolate_path_from_protected_root(
             &self.app_artifacts.root_dir,
             &default_app_artifacts_dir(),
@@ -613,18 +620,25 @@ fn canonicalize_path_for_containment(path: &Path) -> Result<PathBuf> {
 pub struct PathsConfig {
     #[serde(default = "default_state_file")]
     pub state_file: String,
+    #[serde(default = "default_notes_db_path")]
+    pub notes_db: String,
 }
 
 impl Default for PathsConfig {
     fn default() -> Self {
         Self {
             state_file: default_state_file(),
+            notes_db: default_notes_db_path(),
         }
     }
 }
 
 fn default_state_file() -> String {
     "~/.local/share/claude-sessions/sessions.json".to_owned()
+}
+
+fn default_notes_db_path() -> String {
+    "~/.local/share/claude-sessions/notes.db".to_owned()
 }
 
 fn default_app_artifacts_dir() -> String {
@@ -2273,6 +2287,7 @@ impl From<RawConfig> for AppConfig {
         Self {
             paths: PathsConfig {
                 state_file: paths.state_file,
+                notes_db: paths.notes_db,
             },
             human_recipient_reserved_names: human_reserved_names_from_yaml(&raw.humans),
             email: raw.email,
@@ -2326,6 +2341,8 @@ impl From<RawConfig> for AppConfig {
 struct RawPathsConfig {
     #[serde(default = "default_state_file")]
     state_file: String,
+    #[serde(default = "default_notes_db_path")]
+    notes_db: String,
     #[serde(default = "default_message_queue_db_path")]
     message_queue_db: String,
     #[serde(default = "default_server_log_file")]
@@ -2340,6 +2357,7 @@ impl Default for RawPathsConfig {
     fn default() -> Self {
         Self {
             state_file: default_state_file(),
+            notes_db: default_notes_db_path(),
             message_queue_db: default_message_queue_db_path(),
             server_log_file: default_server_log_file(),
             app_artifacts_dir: default_app_artifacts_dir(),
