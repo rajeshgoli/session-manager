@@ -182,7 +182,6 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun show(board: BoardResponse) {
         BoardBadge.count = board.unseen.count
-        ScreenCache.board = board
         _uiState.update {
             it.copy(
                 board = board,

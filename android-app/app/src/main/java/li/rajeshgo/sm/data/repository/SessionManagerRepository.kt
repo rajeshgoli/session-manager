@@ -103,11 +103,25 @@ object ScreenCache {
     /** Inbox rows per filter query. */
     val inbox = java.util.concurrent.ConcurrentHashMap<String, li.rajeshgo.sm.data.model.InboxResponse>()
 
+    /** Bumped by every sign-out, so a read that started before it cannot refill the cache. */
+    @Volatile var generation = 0L
+        private set
+
+    @Synchronized
     fun clear() {
+        generation++
         watch = null
         board = null
         queue = null
         inbox.clear()
+    }
+
+    /** Runs [read] and stores its result with [store], unless a sign-out happened meanwhile. */
+    suspend fun <T> remember(read: suspend () -> T, store: (T) -> Unit): T {
+        val started = generation
+        val value = read()
+        synchronized(this) { if (generation == started) store(value) }
+        return value
     }
 }
 
@@ -280,7 +294,7 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
-        coroutineScope {
+        ScreenCache.remember({ coroutineScope {
             val sessions = async { executeReadRequest(baseUrl, token) { it.getClientSessions().sessions } }
             val obligations = async { executeReadRequest(baseUrl, token) { it.getSessionObligations().sessions }.associateBy { it.sessionId } }
             val jobs = async { executeReadRequest(baseUrl, token) { it.getSessionJobs().jobs } }
@@ -293,8 +307,8 @@ class SessionManagerRepository(
                 jobs = allJobs.filter { it.isAwaitedBy(session.id) },
                 facts = watchById[session.id]?.facts,
                 attention = watchById[session.id]?.attention,
-            ) }.also { ScreenCache.watch = it }
-        }
+            ) }
+        } }) { ScreenCache.watch = it }
     }
 
     /** ✓ Answered (spec 1782 C4): clears the agent's open questions without telling it. */
@@ -413,7 +427,7 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchQueue(baseUrl: String, token: String): li.rajeshgo.sm.data.model.QueueOverview = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getQueue() }.also { ScreenCache.queue = it }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getQueue() } }) { ScreenCache.queue = it }
     }
 
     suspend fun fetchQueueStats(baseUrl: String, token: String, hours: Int): li.rajeshgo.sm.data.model.QueueStats = withContext(Dispatchers.IO) {
@@ -537,11 +551,11 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchInbox(baseUrl: String, token: String, filter: String): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getInbox(filter) }.also { ScreenCache.inbox[filter] = it }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter) } }) { ScreenCache.inbox[filter] = it }
     }
 
     suspend fun fetchBoard(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardResponse = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getBoard() }.also { ScreenCache.board = it }
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getBoard() } }) { ScreenCache.board = it }
     }
 
     suspend fun fetchBoardBadge(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardBadge = withContext(Dispatchers.IO) {

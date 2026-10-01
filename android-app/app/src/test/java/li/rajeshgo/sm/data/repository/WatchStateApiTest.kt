@@ -45,6 +45,16 @@ class WatchStateApiTest {
     }
 
     @Test
+    fun aReadThatStartedBeforeSignOutDoesNotRefillTheCache() = kotlinx.coroutines.runBlocking {
+        val board = li.rajeshgo.sm.data.model.BoardResponse(generatedAt = "old account")
+        val returned = ScreenCache.remember({ ScreenCache.clear(); board }) { ScreenCache.board = it }
+        assertEquals(board, returned)
+        assertNull(ScreenCache.board)
+        ScreenCache.remember({ board }) { ScreenCache.board = it }
+        assertEquals(board, ScreenCache.board)
+    }
+
+    @Test
     fun signOutClearsEveryCachedTab() {
         ScreenCache.board = li.rajeshgo.sm.data.model.BoardResponse()
         ScreenCache.inbox["open"] = li.rajeshgo.sm.data.model.InboxResponse()
