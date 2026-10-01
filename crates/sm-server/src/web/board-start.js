@@ -5,6 +5,7 @@ import { EFFORTS } from './start.js';
 
 export function startBody(ticket, form) {
   const body = { repo: ticket.repo, number: ticket.number, provider: form.provider, name: form.name, brief: form.brief };
+  if (ticket.state === 'blocked') body.start_blocked = true;
   if (form.model) body.model = form.model;
   if (form.reasoning_effort) body.reasoning_effort = form.reasoning_effort;
   return body;
@@ -26,6 +27,7 @@ export function TicketStart({ ticket, onClose, onStarted }) {
   useEffect(() => {
     let alive = true;
     const query = new URLSearchParams({ repo: ticket.repo, number: ticket.number });
+    if (ticket.state === 'blocked') query.set('start_blocked', 'true');
     Promise.all([api(`/client/board/start-options?${query}`), api('/client/settings')])
       .then(([options, saved]) => { if (alive) { setForm(options); setSettings(saved); } })
       .catch((e) => alive && setError(e.message));
@@ -52,9 +54,11 @@ export function TicketStart({ ticket, onClose, onStarted }) {
     finally { setBusy(false); }
   };
   const choices = form && form.model && !models.includes(form.model) ? [form.model, ...models] : models;
+  const blockers = (ticket.waits_on || []).filter((item) => item.state !== 'done').map((item) => `#${item.number}`);
   return html`<${Popover} onClose=${onClose} className="ticket-start">
     <h2>Start #${ticket.number}</h2>
     <p class="sub">${ticket.title}</p>
+    ${ticket.state === 'blocked' ? html`<p>#${ticket.number} waits on ${blockers.join(', ')}, which ${blockers.length === 1 ? 'is' : 'are'} not done.</p>` : null}
     ${form ? html`
       <${Seg} label="Provider" value=${form.provider}
         options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
@@ -75,6 +79,6 @@ export function TicketStart({ ticket, onClose, onStarted }) {
     ` : !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>Cancel</button>
-      <button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button></div>
+      <button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : ticket.state === 'blocked' ? 'Start anyway' : 'Start'}</button></div>
   <//>`;
 }
