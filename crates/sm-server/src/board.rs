@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use crate::owner_push::{format_ts, parse_ts};
 use crate::work_claims::{canonical_repo, HolderState, SessionDirectory};
 
+pub mod auto_start;
 pub mod clock;
 pub mod model;
 pub mod pushes;
@@ -39,6 +40,7 @@ pub const CHANGES_SHOWN: usize = 10;
 /// Notice kinds the board creates (appendix I).
 pub const NOTICE_BOARD_READY: &str = "board_ready";
 pub const NOTICE_BOARD_LANE_DONE: &str = "board_lane_done";
+pub const NOTICE_BOARD_AUTO_START: &str = "board_auto_start";
 
 pub fn init_board_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -139,8 +141,22 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             started_early_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
         );
+        CREATE TABLE IF NOT EXISTS auto_starts (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, agent_type TEXT,
+            provider TEXT NOT NULL, model TEXT, effort TEXT, brief TEXT,
+            state TEXT NOT NULL CHECK (state IN ('waiting','started','failed','cancelled')),
+            attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, session_id TEXT,
+            authorized_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number)
+        );
         "#,
     )?;
+    if conn
+        .prepare("SELECT tier FROM board_items LIMIT 0")
+        .is_err()
+    {
+        conn.execute("ALTER TABLE board_items ADD COLUMN tier TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -614,6 +630,17 @@ impl BoardStore {
                     params![repo, issue.number, updated_at],
                 )?;
             }
+            tx.execute(
+                "UPDATE board_items SET tier = ?3 WHERE repo = ?1 AND number = ?2",
+                params![
+                    repo,
+                    issue.number,
+                    issue
+                        .body
+                        .as_deref()
+                        .and_then(crate::owner_settings::ticket_tier)
+                ],
+            )?;
             let outgoing: Vec<(Key, EdgeKind)> = issue
                 .blocked_by
                 .iter()

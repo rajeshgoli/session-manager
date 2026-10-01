@@ -26,6 +26,7 @@ fn now() -> OffsetDateTime {
 #[derive(Debug, Clone, Default)]
 struct FakeIssue {
     title: String,
+    body: Option<String>,
     open: bool,
     state_reason: Option<String>,
     blocked_by: Vec<Key>,
@@ -148,6 +149,7 @@ impl BoardSource for FakeGitHub {
                 IssueNode {
                     number: key.1,
                     title: issue.title.clone(),
+                    body: issue.body.clone(),
                     url: format!("https://github.com/{}/issues/{}", key.0, key.1),
                     updated_at: None,
                     state_reason: issue.state_reason.clone(),
@@ -263,6 +265,144 @@ fn outside() -> Outside {
         owner_name: "Owner".into(),
         config_repos: vec![REPO.to_owned()],
     }
+}
+
+#[test]
+fn auto_start_authorization_retries_three_times_and_resets() {
+    let (store, dir) = temp_store();
+    let choice = auto_start::Choice {
+        repo: REPO.into(),
+        number: 11,
+        agent_type: Some("Mid".into()),
+        provider: "claude".into(),
+        model: Some("opus[1m]".into()),
+        reasoning_effort: Some("high".into()),
+        brief: None,
+    };
+    store
+        .authorize_auto_starts(std::slice::from_ref(&choice), now())
+        .unwrap();
+    assert_eq!(store.auto_starts().unwrap()[0].state, "waiting");
+    for attempt in 1..=3 {
+        assert_eq!(
+            store
+                .auto_start_result(&k(11), Err("launch failed"), now())
+                .unwrap(),
+            attempt
+        );
+    }
+    let record = store.auto_starts().unwrap().remove(0);
+    assert_eq!(record.state, "failed");
+    assert_eq!(record.attempts, 3);
+    assert_eq!(record.last_error.as_deref(), Some("launch failed"));
+    store.authorize_auto_starts(&[choice], now()).unwrap();
+    let record = store.auto_starts().unwrap().remove(0);
+    assert_eq!(record.state, "waiting");
+    assert_eq!(record.attempts, 0);
+    store
+        .auto_start_result(&k(11), Ok("session-11"), now())
+        .unwrap();
+    assert_eq!(
+        store.auto_starts().unwrap()[0].session_id.as_deref(),
+        Some("session-11")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auto_start_lane_write_rolls_back_and_tier_is_synced() {
+    let (store, dir) = temp_store();
+    let choice = |number| auto_start::Choice {
+        repo: REPO.into(),
+        number,
+        agent_type: None,
+        provider: "claude".into(),
+        model: None,
+        reasoning_effort: None,
+        brief: None,
+    };
+    let conn = store.open_write().unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_second BEFORE INSERT ON auto_starts
+        WHEN NEW.number = 2 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    assert!(store
+        .authorize_auto_starts(&[choice(1), choice(2)], now())
+        .is_err());
+    assert!(store.auto_starts().unwrap().is_empty());
+    drop(conn);
+    let github = FakeGitHub::new();
+    github.open(k(3));
+    github.with(&k(3), |issue| {
+        issue.body = Some("Context\nTier: mId (Opus 1M)".into())
+    });
+    run_pass(&store, &github, &outside(), now()).unwrap();
+    assert_eq!(
+        store.ticket_tiers().unwrap().get(&k(3)).map(String::as_str),
+        Some("mId")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auto_start_plan_respects_ready_claim_container_closed_pause_and_prior_start() {
+    let (store, dir) = temp_store();
+    let github = FakeGitHub::new();
+    for number in 1..=7 {
+        github.open(k(number));
+    }
+    for number in [2, 3, 4, 6, 7] {
+        github.under(&k(number), &k(1));
+    }
+    github.under(&k(5), &k(4));
+    github.after(&k(3), &k(2));
+    add_lane(&store, &github, &k(1));
+    github.close(&k(5), "COMPLETED");
+    github.close(&k(7), "COMPLETED");
+    claim_ticket(&store, 6, "eng1", "agent 6");
+    let recomputed = run_pass(&store, &github, &outside(), now()).unwrap();
+    assert_eq!(state(&recomputed.board, &k(2)), TicketState::Ready);
+    assert_eq!(state(&recomputed.board, &k(3)), TicketState::Blocked);
+    assert_eq!(state(&recomputed.board, &k(4)), TicketState::CloseReady);
+    let choice = |number| auto_start::Choice {
+        repo: REPO.into(),
+        number,
+        agent_type: None,
+        provider: "claude".into(),
+        model: None,
+        reasoning_effort: None,
+        brief: None,
+    };
+    store
+        .authorize_auto_starts(&[2, 3, 4, 6, 7].map(choice), now())
+        .unwrap();
+    let (starts, cancellations) =
+        auto_start::plan(&recomputed, store.auto_starts().unwrap(), false);
+    assert_eq!(
+        starts
+            .iter()
+            .map(|record| record.number)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(
+        cancellations
+            .iter()
+            .map(|(key, _)| key.1)
+            .collect::<Vec<_>>(),
+        vec![6, 7]
+    );
+    let (paused, still_cancelled) =
+        auto_start::plan(&recomputed, store.auto_starts().unwrap(), true);
+    assert!(paused.is_empty());
+    assert_eq!(still_cancelled.len(), 2);
+    store
+        .auto_start_result(&k(2), Ok("started-2"), now())
+        .unwrap();
+    let (again, _) = auto_start::plan(&recomputed, store.auto_starts().unwrap(), false);
+    assert!(again.is_empty());
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// The context-handoff lane: 1654, 1656, 1657 after 1653; all four under

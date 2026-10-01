@@ -578,6 +578,8 @@ pub struct AppState {
     board_source: Arc<dyn crate::board::sync::BoardSource>,
     /// Serializes board passes, recomputes, and lane and link writes.
     board_lock: Arc<Mutex<()>>,
+    /// Serializes each automatic launch with owner cancellation and Pause.
+    board_auto_start_gate: Arc<AsyncMutex<()>>,
     board_wake: Arc<board::BoardWake>,
     /// The ticket clock's thread intervals per `clock_hours`, for 60s.
     board_clock_cache: Arc<Mutex<board_clock::ClockCache>>,
@@ -746,6 +748,7 @@ impl AppState {
             merge_hold_source: Arc::new(merge_holds::GhMergeHoldSource),
             board_source: Arc::new(board::GhCliBoardSource),
             board_lock: Arc::new(Mutex::new(())),
+            board_auto_start_gate: Arc::new(AsyncMutex::new(())),
             board_wake,
             board_clock_cache: Arc::new(Mutex::new(BTreeMap::new())),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1773,6 +1776,14 @@ pub fn router(state: AppState) -> Router {
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
         .route("/client/board/start", post(board::client_start))
+        .route(
+            "/client/board/auto-start",
+            put(board::put_auto_start).delete(board::delete_auto_start),
+        )
+        .route(
+            "/client/board/auto-start/lane",
+            put(board::put_auto_start_lane),
+        )
         .route("/client/board/close", post(board::client_close))
         .route(
             "/client/github/{owner}/{repo}/{number}",

@@ -23,7 +23,7 @@ pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
 const KEYS: [&str; 4] = ["new_agent", "queue_limits", "terminal_limits", "reviews"];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
-const WHOLE_VALUES: [&str; 2] = ["repo_short", "reviewer"];
+const WHOLE_VALUES: [&str; 3] = ["repo_short", "reviewer", "agent_types"];
 const PLACEHOLDERS: [&str; 7] = [
     "ticket",
     "number",
@@ -80,6 +80,12 @@ pub fn defaults() -> Value {
                 "rajeshgoli/session-manager": "sm",
             },
             "message_template": DEFAULT_MESSAGE_TEMPLATE,
+            "agent_types": [
+                {"name": "Top", "provider": "claude", "model": "fable", "effort": "xhigh"},
+                {"name": "Mid", "provider": "claude", "model": "opus[1m]", "effort": "high"},
+                {"name": "Low", "provider": "claude", "model": "sonnet", "effort": "high"}
+            ],
+            "auto_start_paused": false,
         },
         "queue_limits": {
             "max_running": null,
@@ -245,6 +251,58 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
 }
 
 fn validate_new_agent(value: &Value) -> Result<(), String> {
+    if !value["auto_start_paused"].is_boolean() {
+        return Err("new_agent.auto_start_paused must be a boolean".to_owned());
+    }
+    let types = value["agent_types"]
+        .as_array()
+        .ok_or_else(|| "new_agent.agent_types must be a list".to_owned())?;
+    if types.len() > 8 {
+        return Err("new_agent.agent_types allows at most 8 types".to_owned());
+    }
+    let mut names = BTreeSet::new();
+    for agent in types {
+        let object = agent
+            .as_object()
+            .ok_or_else(|| "each agent type must be an object".to_owned())?;
+        if object.len() != 4
+            || !["name", "provider", "model", "effort"]
+                .iter()
+                .all(|key| object.contains_key(*key))
+        {
+            return Err("each agent type needs name, provider, model, and effort".to_owned());
+        }
+        let name = agent["name"]
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| "agent type name must be non-empty".to_owned())?;
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!("agent type {name} is duplicated"));
+        }
+        let provider = agent["provider"].as_str().unwrap_or_default();
+        if provider_settings_key(provider).is_none() {
+            return Err(format!(
+                "agent type {name} provider must be claude or codex-fork"
+            ));
+        }
+        if agent["model"]
+            .as_str()
+            .is_none_or(|model| model.trim().is_empty())
+        {
+            return Err(format!("agent type {name} model must be non-empty"));
+        }
+        let efforts = if provider == "claude" {
+            &CLAUDE_EFFORTS[..]
+        } else {
+            &CODEX_EFFORTS[..]
+        };
+        if !agent["effort"]
+            .as_str()
+            .is_some_and(|effort| efforts.contains(&effort))
+        {
+            return Err(format!("agent type {name} effort is invalid"));
+        }
+    }
     let provider = value["provider"].as_str();
     if provider_settings_key(provider.unwrap_or_default()).is_none() {
         return Err("new_agent.provider must be claude or codex-fork".to_owned());
@@ -397,6 +455,30 @@ pub struct NewAgentSettings {
     pub name_pattern: String,
     pub repo_short: BTreeMap<String, String>,
     pub message_template: String,
+    pub agent_types: Vec<AgentType>,
+    pub auto_start_paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AgentType {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+}
+
+/// The first ticket body line beginning `Tier:` names an agent type.
+pub fn ticket_tier(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let line = line.trim_start();
+        let rest = line
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("tier:"))?;
+        let word = line[rest.len()..].split_whitespace().next()?;
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        (!word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .then(|| word.to_owned())
+    })
 }
 
 /// `None` leaves the choice to the provider.
@@ -613,6 +695,41 @@ pub fn terminal_limits(config: &AppConfig, settings: &Value) -> TerminalLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_types_and_ticket_tier() {
+        let settings = settings(None);
+        assert_eq!(
+            settings
+                .new_agent
+                .agent_types
+                .iter()
+                .map(|kind| kind.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Top", "Mid", "Low"]
+        );
+        assert!(!settings.new_agent.auto_start_paused);
+        assert_eq!(
+            ticket_tier("## Context\n tier: Mid (Opus 1M)\nTier: Low"),
+            Some("Mid".into())
+        );
+        assert_eq!(
+            ticket_tier("Details tier: Top\nTier: Low"),
+            Some("Low".into())
+        );
+        assert_eq!(ticket_tier("Tier: many words"), Some("many".into()));
+        assert_eq!(ticket_tier("No tier here"), None);
+        assert!(apply_patch(None, &json!({"new_agent":{"auto_start_paused":true}})).is_ok());
+        assert!(apply_patch(
+            None,
+            &json!({"new_agent":{"agent_types":[
+                {"name":"A","provider":"claude","model":"fable","effort":"high"},
+                {"name":"a","provider":"claude","model":"sonnet","effort":"high"}
+            ]}})
+        )
+        .is_err());
+        assert!(apply_patch(None, &json!({"new_agent":{"agent_types":vec![json!({"name":"A","provider":"claude","model":"fable","effort":"high"});9]}})).is_err());
+    }
 
     fn settings(stored: Option<&Value>) -> OwnerSettings {
         OwnerSettings::from_effective(&effective(stored)).unwrap()
