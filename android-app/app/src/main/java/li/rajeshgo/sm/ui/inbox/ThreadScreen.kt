@@ -140,6 +140,10 @@ fun threadTerminalAgent(thread: InboxThread): Pair<String, String>? {
     return thread.items.lastOrNull { it.sender != null }?.sender?.let { it.id to it.name }
 }
 
+/** Ask shows the doc's conversation starting with its first published revision. */
+fun docAskThread(thread: InboxThread, firstPublishedAt: String): InboxThread =
+    if (firstPublishedAt.isBlank()) thread else thread.copy(items = thread.items.filter { it.at >= firstPublishedAt })
+
 data class ThreadUiState(
     val thread: InboxThread? = null,
     val loading: Boolean = true,
@@ -183,7 +187,8 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
             runCatching {
                 val askTarget = target.docId?.let { repository.fetchDocAskTarget(url, token, it) }
                 val key = askTarget?.threadKey ?: _uiState.value.thread?.threadKey ?: target.key
-                repository.fetchInboxThread(url, token, key, target.sessionId) to askTarget
+                val thread = repository.fetchInboxThread(url, token, key, target.sessionId)
+                (askTarget?.let { docAskThread(thread, it.firstPublishedAt) } ?: thread) to askTarget
             }
                 .onSuccess { (thread, askTarget) -> _uiState.update { it.copy(thread = thread, askTarget = askTarget, loading = false, error = null) } }
                 .onFailure { error ->

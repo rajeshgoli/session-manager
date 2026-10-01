@@ -950,6 +950,7 @@ data class DocAskTarget(
     val default: String = "reader",
     val reader: DocAskAgent? = null,
     @SerialName("thread_key") val threadKey: String = "",
+    @SerialName("first_published_at") val firstPublishedAt: String = "",
 )
 
 @Serializable
