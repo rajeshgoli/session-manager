@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1859 — A bug button in the sm app</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1859 — A bug button in the sm app</h1>
+<p class="sans"><small>Author: sm-1859 <code>baa3e909</code> · Ticket #1859 · Revision 2</small></p>
+
+<h2>Memo</h2>
+
+<p><b>One button files a bug without leaking private work.</b> The top bar of the web app and the phone app gets a bug button. Pressing it captures the screen, then opens the existing Start dialog in a <b>Report a bug</b> mode: you type what is wrong, see the screenshot, and can switch on "Start an agent", which shows the same agent choices Start shows on the board. sm files a GitHub issue in <code>rajeshgoli/session-manager</code> that holds <i>only the words you typed</i> plus a private link. The screenshot and the server facts stay on the sm server, where only you (signed in) and your local agents can read them. The new ticket appears on the board in a standing <b>Bugs</b> lane. If "Start an agent" was on, sm starts the agent you chose on it in the same step, exactly as the board's Start does.</p>
+
+<p>This split matters because <code>session-manager</code> is a public repository and <code>fractal-algo-rust</code> is private. A board screenshot or an agent list names private FAR tickets; neither ever reaches GitHub.</p>
+
+<div class="vocab">
+<dl>
+<dt>Bug report</dt><dd>What one press of the button produces: your text, an optional screenshot, the page data and the server facts, stored on the sm server under an id like <code>BR-20261001-041502-3fa9c1</code>.</dd>
+<dt>Page data</dt><dd>The data the page you were looking at had loaded from the server — for the board, the board as the server last sent it. It is what the screenshot shows, as data an agent can search.</dd>
+<dt>Server facts</dt><dd>What the server adds at filing time: the server build, every live agent (name, provider, state, ticket), board read status, and running queue jobs.</dd>
+<dt>Owner-only page</dt><dd>A page on <code>sm.rajeshgo.li</code> that opens only for you signed in, like the doc reader. Each bug report gets one.</dd>
+<dt>Bugs ticket and Bugs lane</dt><dd>One open issue titled "Bugs" in <code>session-manager</code> that sm creates on first use and keeps as a board lane goal. Every open bug filed from the app is linked to it as "Bugs starts after this bug" — the same link <code>sm board after</code> makes — which is what puts the bug in the lane.</dd>
+</dl>
+</div>
+
+<h3>How a report flows</h3>
+<figure>
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="12">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#52514e"/></marker></defs>
+  <rect x="10" y="20" width="150" height="70" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="85" y="45" text-anchor="middle" font-weight="700">You press 🐞</text>
+  <text x="85" y="63" text-anchor="middle">screen captured,</text>
+  <text x="85" y="78" text-anchor="middle">Start dialog opens</text>
+  <rect x="215" y="20" width="170" height="70" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="300" y="45" text-anchor="middle" font-weight="700">sm server</text>
+  <text x="300" y="63" text-anchor="middle">stores screenshot, page</text>
+  <text x="300" y="78" text-anchor="middle">data, server facts</text>
+  <rect x="440" y="10" width="300" height="60" rx="8" fill="#fff" stroke="#e34948"/>
+  <text x="590" y="32" text-anchor="middle" font-weight="700" fill="#e34948">Public: GitHub issue in session-manager</text>
+  <text x="590" y="50" text-anchor="middle">your text + "owner only" link + sm bug show id</text>
+  <rect x="440" y="90" width="300" height="60" rx="8" fill="#fff" stroke="#008300"/>
+  <text x="590" y="112" text-anchor="middle" font-weight="700" fill="#008300">Private: owner-only page on sm.rajeshgo.li</text>
+  <text x="590" y="130" text-anchor="middle">screenshot, page data, server facts</text>
+  <rect x="215" y="170" width="170" height="60" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="300" y="195" text-anchor="middle" font-weight="700">Board: Bugs lane</text>
+  <text x="300" y="212" text-anchor="middle">the new ticket is a row</text>
+  <rect x="440" y="170" width="300" height="60" rx="8" fill="#fff" stroke="#2a78d6"/>
+  <text x="590" y="192" text-anchor="middle" font-weight="700" fill="#2a78d6">"Start an agent" on?</text>
+  <text x="590" y="210" text-anchor="middle">sm starts the agent you chose on it</text>
+  <line x1="160" y1="55" x2="213" y2="55" stroke="#52514e" marker-end="url(#ar)"/>
+  <line x1="385" y1="45" x2="438" y2="40" stroke="#52514e" marker-end="url(#ar)"/>
+  <line x1="385" y1="70" x2="438" y2="115" stroke="#52514e" marker-end="url(#ar)"/>
+  <line x1="300" y1="90" x2="300" y2="168" stroke="#52514e" marker-end="url(#ar)"/>
+  <line x1="385" y1="200" x2="438" y2="200" stroke="#52514e" marker-end="url(#ar)"/>
+</svg>
+<figcaption>Red is public, green is private. Agents on this machine read the private part with <code>sm bug show &lt;id&gt;</code>; the issue body tells them the id.</figcaption>
+</figure>
+
+<h3>What you see</h3>
+<figure>
+<div style="display:flex;gap:1.2rem;flex-wrap:wrap;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;line-height:1.4">
+<div style="width:21rem;background:#121219;color:#F5F7FA;border:1px solid #2B2B37;border-radius:12px;padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.5)">
+ <div style="font-size:16px;font-weight:700;margin-bottom:8px">Report a bug</div>
+ <div style="border:1px solid #2B2B37;background:#1A1A23;border-radius:8px;padding:8px;min-height:48px;color:#F5F7FA">Board shows 'all parts done' when #1858 is still open…</div>
+ <div style="color:#777C8B;font-size:12px;margin:4px 0 10px">Public: goes into a GitHub issue. The first line is the title.</div>
+ <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+  <div style="width:64px;height:40px;border:1px solid #2B2B37;border-radius:6px;background:linear-gradient(#1A1A23 30%,#2B2B37 30% 34%,#1A1A23 34% 60%,#2B2B37 60% 64%,#1A1A23 64%)"></div>
+  <div style="flex:1"><div>Screenshot</div><div style="color:#ADB2C2;font-size:12px">Private on sm, with page data and server facts</div></div>
+  <span style="width:34px;height:20px;border-radius:999px;background:#5EE7FF;display:flex;align-items:center;padding:2px;box-sizing:border-box"><span style="width:16px;height:16px;border-radius:50%;background:#121219;margin-left:14px"></span></span>
+ </div>
+ <div style="display:flex;align-items:center;gap:10px;border-top:1px solid #2B2B37;padding-top:10px">
+  <div style="flex:1">Start an agent</div>
+  <span style="width:34px;height:20px;border-radius:999px;background:#5EE7FF;display:flex;align-items:center;padding:2px;box-sizing:border-box"><span style="width:16px;height:16px;border-radius:50%;background:#121219;margin-left:14px"></span></span>
+ </div>
+ <div style="margin-top:10px;padding:8px 10px;border-left:2px solid #5EE7FF;background:#1A1A23;border-radius:4px">
+  <div style="display:flex;border:1px solid #2B2B37;border-radius:6px;width:max-content;margin-bottom:6px"><span style="padding:2px 10px;background:#143744;color:#5EE7FF;border-radius:5px">Claude</span><span style="padding:2px 10px;color:#ADB2C2">Codex</span></div>
+  <div style="color:#ADB2C2">claude-opus-5-5 · high · ~/projects/session-manager <span style="color:#5EE7FF">Change</span></div>
+  <div style="color:#ADB2C2">Named from the new ticket, as Start does</div>
+  <div style="color:#ADB2C2">Reviewer: Lane default · Codex run</div>
+ </div>
+ <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px"><span style="border:1px solid #2B2B37;border-radius:8px;padding:4px 12px">Cancel</span><span style="background:#5EE7FF;color:#09090D;border-radius:8px;padding:4px 12px;font-weight:600">File and start</span></div>
+</div>
+<div style="flex:1;min-width:14rem;font-family:Georgia,serif;font-size:.95rem">
+<p style="margin-top:0">The highlighted block is the existing Start dialog's agent section, unchanged: the Claude/Codex switch, the model · effort · workspace line with Change (which opens Model and Effort), and the Reviewer row. It appears only while "Start an agent" is on; with it off the button reads <b>File bug</b>.</p>
+<p>The defaults are the ones Start uses: your saved new-agent defaults for the provider, the session-manager checkout, and the Bugs lane's review policy. The agent's name and first message are written by the server from the new ticket, as Start does, so they cannot be previewed before filing.</p>
+<p>On the phone it is the same bottom sheet Start uses, with Material switches in place of the toggles.</p>
+</div>
+</div>
+<figcaption>Dark theme, drawn with the app's own colours and controls. After filing, the dialog closes with a toast "Filed #1870" (tap to open the issue), or "Filed #1870 · started sm-1870-engineer" (tap to open the agent).</figcaption>
+</figure>
+
+<h3>What goes where</h3>
+<table>
+<thead><tr><th>Item</th><th>Public GitHub issue</th><th>Private, on sm</th></tr></thead>
+<tbody>
+<tr><td>Your text</td><td>Yes. First line is the title, the full text is the body.</td><td>Yes</td></tr>
+<tr><td>Which app and page ("web, Board")</td><td>Yes, as a footer line</td><td>Yes, with the exact address of the page</td></tr>
+<tr><td>Screenshot</td><td>No</td><td>Yes, unless you switch it off</td></tr>
+<tr><td>Page data, server facts</td><td>No</td><td>Yes</td></tr>
+<tr><td>Link to the owner-only page, and the <code>sm bug show</code> id</td><td>Yes</td><td>—</td></tr>
+</tbody>
+</table>
+<p>The one public risk left is your own words: if you type a private ticket's title, it is published. The dialog says so under the text box.</p>
+
+<h3>The Bugs lane, by example</h3>
+<p>You file three bugs: #1870, #1871, #1872. The first filing creates the Bugs ticket (say #1869), adds it as a lane at the bottom of the board, and links #1870. The lane now shows the Bugs ticket as its goal and the open bugs as rows, each with the usual Start button. An agent fixes #1870 and its PR closes it. When you file #1873, sm first drops the link to closed #1870 and then adds #1873, so the Bugs ticket always links only open bugs. GitHub allows at most 50 such links per issue<sup>1</sup>, so dropping closed ones keeps the lane working indefinitely.</p>
+<p>The Bugs ticket itself never offers Start or Close, even when every bug is fixed. It shows <b>"Standing lane · 2 open bugs"</b> instead. Without this, it would show "All parts done" and Close whenever the lane is empty, and one click would end the lane.</p>
+<p>A bug can later move into a plan: <code>sm board under 1871 &lt;plan goal&gt;</code> works, because the Bugs link is the "starts after" kind and an issue can have many of those but only one parent.</p>
+
+<h3>Decision surface</h3>
+<p>Rows 1–4 are the calls you made on 2026-09-30; rows 5–9 are new and carry my recommendation.</p>
+<table>
+<thead><tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. What reaches the public issue?</td><td><b>Your text and links only.</b> Screenshot, page data and server facts stay on sm.</td><td>Decided: session-manager is public, FAR is private.</td></tr>
+<tr><td>2. Web screenshot</td><td><b>Bundle html-to-image</b> (MIT, about 20 KB), which draws the page into a picture without a permission prompt.</td><td>Decided: the browser's screen-share route asks you to pick a window every time.</td></tr>
+<tr><td>3. Where filed bugs go</td><td><b>A standing Bugs lane</b>, created by sm on first use.</td><td>Decided: the board only shows tickets that are in a lane.</td></tr>
+<tr><td>4. How the work is cut</td><td><b>Three tickets</b>: server first, then web and phone in parallel.</td><td>Decided: same shape as the Reviews feature.</td></tr>
+<tr><td>5. If you end the Bugs lane on the board</td><td><b>The next bug you file adds it back.</b> To stop that, close the Bugs ticket; the next bug then creates a fresh one.</td><td>A filed bug that lands nowhere on the board is the failure this feature exists to prevent.</td></tr>
+<tr><td>6. The old bug-report route</td><td><b>Replace it.</b> Same address, new form; its message to the retired maintainer seat goes away.</td><td>No app calls it today, and the maintainer seat it messages no longer exists.</td></tr>
+<tr><td>7. How agents read the private part</td><td><b><code>sm bug show &lt;id&gt;</code></b> prints text, page data and server facts and saves the screenshot to a file the agent can open.</td><td>The issue is all an agent gets from GitHub; the id in its footer is the key.</td></tr>
+<tr><td>8. If GitHub refuses the filing</td><td><b>The dialog stays open with your text</b> and shows GitHub's error; File retries. The report is already stored, so nothing typed is lost.</td><td>A phone on a bad connection should not eat a bug report.</td></tr>
+<tr><td>9. If the bug is filed but the agent fails to start</td><td><b>The bug stays filed;</b> the dialog shows the start error with a <b>Start</b> button that retries only the start.</td><td>Filing twice would create a duplicate issue.</td></tr>
+</tbody>
+</table>
+
+<h3>Tickets</h3>
+<table>
+<thead><tr><th>Ticket</th><th>Scope</th><th>Starts after</th><th>Tier</th></tr></thead>
+<tbody>
+<tr><td>Server</td><td>Filing route, private storage, owner-only page, Bugs ticket and lane, the "standing" board state, <code>sm bug show</code>, removal of the old route's maintainer message (appendix A)</td><td>—</td><td>Mid</td></tr>
+<tr><td>Web</td><td>Top-bar button, capture, Report-a-bug mode of the Start dialog, standing-lane display (appendix B)</td><td>Server</td><td>Mid</td></tr>
+<tr><td>Android</td><td>Same on the phone (appendix C)</td><td>Server</td><td>Mid</td></tr>
+</tbody>
+</table>
+<p>Web and Android touch disjoint files and can run at the same time once the server ticket merges.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<ul>
+<li><b>No new form.</b> The bug button opens the existing Start dialog in a Report-a-bug mode, built from its own controls: toggles, the Claude/Codex switch, the model and effort line, the Reviewer row. The mock above is drawn in the app's colours.</li>
+<li><b>Starting is part of filing.</b> With "Start an agent" on, one press of <b>File and start</b> files the bug and starts the chosen agent on it; no second sheet opens. Decision 9 is new: a failed start leaves the bug filed and offers a retry of the start only.</li>
+</ul>
+
+<p class="sans"><small><sup>1</sup> GitHub docs, "Creating issue dependencies": up to 50 issues per relationship type. Sub-issues allow 100 per parent, but a bug could then have no other parent.</small></p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. Server ticket</h3>
+
+<h4>A1. Filing route: <code>POST /client/bug-reports</code></h4>
+<p>Replaces the handler <code>submit_client_bug_report</code> (<code>http.rs:3017</code>) at the same path.</p>
+<ul>
+<li><b>Guards.</b> <code>owner_guard</code> (<code>http/board.rs:907</code>) — the browser owner login with same-origin check, or the mobile owner guard — then <code>ensure_core_writes_enabled</code>. The old mobile-only guard chain goes. Agent sessions are refused (owner_guard already refuses the agent session header).</li>
+<li><b>Request</b> (JSON):
+<pre><code>{
+  "text": "Board shows 'all parts done'…\nMore detail…",   // required; trimmed; 1–4000 chars
+  "client": "web" | "android",                              // required
+  "client_version": "b3f9…" ,                               // web: build id; android: versionName (versionCode)
+  "page": "Board",                                          // required; human page name, ≤ 40 chars
+  "route": "/board?lane=3",                                 // private; ≤ 500 chars
+  "page_data": { "/client/board": { … } },                  // object; serialized ≤ 300 000 chars
+  "screenshot_png": "iVBORw0KGgo…" | null,                  // base64 PNG; decoded ≤ 8 MiB
+  "start": null | {                                         // present when "Start an agent" is on
+    "provider": "claude" | "codex-fork",
+    "model": "claude-opus-5-5" | null,
+    "reasoning_effort": "high" | null,
+    "reviewer": { … } | null                                // same shape as StartRequest.reviewer
+  }
+}</code></pre></li>
+<li><b>Validation</b>, before anything is stored or sent: empty text → 400 <code>text is required</code>; text over 4000 chars → 413; <code>client</code> not one of the two values → 400; <code>page</code> empty or over 40 chars → 400; <code>page_data</code> not an object or over its cap → 413; screenshot not valid base64, not starting with the PNG signature <code>89 50 4E 47 0D 0A 1A 0A</code>, or over 8 MiB decoded → 400 / 413.</li>
+<li><b>Order of work</b>, all inside <code>blocking(…)</code>:
+<ol>
+<li>Build server facts (A3) and store the report (A2). From here the report survives any later failure.</li>
+<li>Create the issue (A4). On failure return 502 with body <code>{"detail": "&lt;first stderr line&gt;", "bug_id": "BR-…"}</code>; the stored row keeps <code>status = 'unfiled'</code>.</li>
+<li>Record the issue on the row, <code>status = 'filed'</code>.</li>
+<li>Take <code>board_lock</code>, ensure the Bugs ticket and lane, drop links to closed bugs, link the new one (A5). A failure here does not fail the request; it sets <code>on_board: false</code> and <code>board_note</code>.</li>
+<li>If <code>start</code> is null, <code>request_pass(state)</code> and return. Otherwise <code>request_pass(state)</code>, then wait (at most 15 s, polling the board facts every 250 ms without holding <code>board_lock</code>) until the new ticket has board facts, then run the same start path as <code>POST /client/board/start</code> (<code>client_start</code>, <code>http/board.rs:1335</code>) with a <code>StartRequest</code> of <code>{repo, number, provider, model, reasoning_effort, reviewer}</code> and no <code>name</code>/<code>brief</code>, so the server renders both from the ticket exactly as start-options does. Extract the body of <code>client_start</code> into a function both handlers call; do not call the route over HTTP. A timeout or a start refusal does not fail the request: <code>started</code> is null and <code>start_error</code> carries the reason (decision 9). <code>on_board: false</code> skips the start with <code>start_error: "not on the board: &lt;board_note&gt;"</code>.</li>
+</ol></li>
+<li><b>Response 200:</b>
+<pre><code>{
+  "bug_id": "BR-20261001-041502-3fa9c1",
+  "issue": { "repo": "rajeshgoli/session-manager", "number": 1870,
+             "url": "https://github.com/rajeshgoli/session-manager/issues/1870",
+             "title": "Board shows 'all parts done'…" },
+  "facts_url": "https://sm.rajeshgo.li/bug-reports/BR-20261001-041502-3fa9c1",   // null when the browser app is off
+  "on_board": true,
+  "board_note": null,     // e.g. "Bugs lane link refused: …" when on_board is false
+  "started": null | { "session_id": "…", "name": "sm-1870-engineer" },
+  "start_error": null     // set when start was asked for and did not happen
+}</code></pre></li>
+<li><b>Start options before filing:</b> <code>GET /client/bug-reports/options</code>, owner guard, returns <code>{repo, working_dir, review_policy}</code>: the filing repo, the working directory that board Start would use for a ticket in that repo (the same resolution start-options uses), and the review policy resolved for the Bugs lane (or the repo default when no Bugs ticket exists yet). The clients take provider, model and effort defaults from <code>/client/settings</code> exactly as <code>providerDefaults</code> does (<code>web/board-start.js:35</code>), and the model list from <code>/client/session-models</code>.</li>
+<li>The maintainer notification (<code>notify_maintainer_of_bug_report</code>, <code>http.rs:3465</code>, and <code>bug_report_summary</code>) and the <code>maintainer_delivery_result</code> update are deleted. The column stays in the table (existing rows), written as NULL.</li>
+<li>The filing repo is <code>bug_reports.repo</code> in config, default <code>rajeshgoli/session-manager</code>.</li>
+</ul>
+
+<h4>A2. Storage</h4>
+<p>Reuse <code>bug_reports.db</code> (<code>bug_reports.rs</code>). Add columns by migration (<code>ALTER TABLE … ADD COLUMN</code>, guarded by a column check): <code>client TEXT</code>, <code>client_version TEXT</code>, <code>page TEXT</code>, <code>page_data_json TEXT</code>, <code>issue_repo TEXT</code>, <code>issue_number INTEGER</code>, <code>issue_url TEXT</code>. The existing <code>route</code>, <code>report_text</code>, <code>server_state_json</code>, <code>status</code>, <code>reported_by</code> (owner email when known) columns carry the rest; <code>app_version</code> and <code>artifact_hash</code> are left NULL. The screenshot goes into the existing, unused <code>bug_report_attachments</code> table: <code>kind = 'screenshot'</code>, <code>mime_type = 'image/png'</code>, payload the decoded bytes. The <code>max_reports</code> pruning already deletes attachments with their report (<code>bug_reports.rs:182</code>). Ids keep the existing <code>BR-…</code> format (<code>bug_id</code>, <code>bug_reports.rs:195</code>).</p>
+
+<h4>A3. Server facts</h4>
+<p>Replace <code>bug_report_server_state</code> (<code>http.rs:15850</code>) with a smaller, fixed shape. Serialized cap 200 000 chars; if over, drop <code>sessions[].activity</code> first, then truncate the <code>sessions</code> list and set <code>"truncated": true</code>.</p>
+<pre><code>{
+  "captured_at": "2026-10-01T04:15:02Z",
+  "server": { "build": "&lt;git sha the binary was built from, if known&gt;", "started_at": "…" },
+  "sessions": [ { "id": "baa3e909", "name": "sm-1859", "provider": "claude",
+                  "state": "working", "ticket": "rajeshgoli/session-manager#1859",
+                  "parent": "…", "activity": "…" } ],     // every non-retired session
+  "board": { "last_pass_at": "…", "stale_repos": ["…"], "lanes": [ { "id": 3, "goal": "owner/repo#N" } ] },
+  "queue": [ { "id": "job_…", "label": "…", "type": "tests", "state": "running", "since": "…" } ],
+  "truncated": false
+}</code></pre>
+<p>Each field is sourced from what the existing routes already return (sessions list, board badge/status, queue list); no new collection.</p>
+
+<h4>A4. The GitHub issue</h4>
+<ul>
+<li><b>Title:</b> the first non-blank line of the text, trimmed. If longer than 80 characters, cut at 79 characters (character, not byte, boundary) and append <code>…</code>.</li>
+<li><b>Body</b>, exactly:
+<pre><code>&lt;the full text, as typed&gt;
+
+---
+Filed from the sm &lt;web|Android&gt; app, &lt;page&gt; page.
+Screenshot and server facts (owner only): &lt;facts_url&gt;
+Agents: `sm bug show &lt;bug_id&gt;`</code></pre>
+The "owner only" line is omitted when <code>facts_url</code> is null. Nothing else is added: not the route, not the version, not any session or ticket name.</li>
+<li>Command: <code>gh issue create -R &lt;repo&gt; --title &lt;title&gt; --body-file -</code> with the body on stdin (no shell; avoids argument-length and quoting issues), via the same timeout and transport-retry wrapper as <code>gh_command_output</code> (<code>http.rs:944</code>) — add a stdin-taking variant beside it. Timeout 30 s. Parse the issue URL from the last non-empty stdout line; the number is its final path segment. Non-zero exit or unparseable output → 502 as A1.</li>
+</ul>
+
+<h4>A5. Bugs ticket, lane, links</h4>
+<ul>
+<li><b>Where it is remembered.</b> Board store (the <code>sm_send</code> SQLite db used by <code>board_store</code>, <code>http/board.rs:75</code>): a key–value row <code>bugs_goal = "&lt;repo&gt;#&lt;number&gt;"</code>, in a new <code>board_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)</code> table.</li>
+<li><b>Ensure the ticket.</b> If no <code>bugs_goal</code> is stored, or the stored issue is closed or missing on GitHub, create it: title <code>Bugs</code>, body <code>Standing lane for bugs filed from the sm app. sm links every open bug to this ticket so the board shows them in the Bugs lane. Leave it open; closing it makes sm start a new one with the next bug.</code> Store its key.</li>
+<li><b>Ensure the lane.</b> If no current lane has this goal, add one via the same path as <code>POST /client/board/lanes</code> (<code>add_lane</code>, <code>http/board.rs:835</code>), recorded as added by the owner. This is also what re-adds a lane you ended (decision 5).</li>
+<li><b>Drop closed links.</b> For each "after" edge in the store whose waiter is the Bugs ticket and whose blocker is closed, call <code>board::write_link</code> (<code>board.rs:1643</code>) with <code>remove: true</code>. Errors are logged and skipped.</li>
+<li><b>Link the new bug.</b> <code>board::write_link</code> with <code>ticket = Bugs ticket</code>, <code>target = new issue</code>, <code>kind = After</code>. A refusal (for example GitHub's 50-link limit with 50 bugs open) sets <code>on_board: false</code> and <code>board_note</code> to the refusal text.</li>
+</ul>
+
+<h4>A6. The "standing" board state</h4>
+<ul>
+<li><code>TicketState</code> (<code>board/model.rs:130</code>) gains <code>Standing</code>, serialized <code>"standing"</code>. In <code>ticket_facts</code> (<code>model.rs:~610</code>) it is decided right after <code>Done</code>: an open ticket whose key equals the stored <code>bugs_goal</code> is <code>Standing</code>. <code>ModelInput</code> carries the bugs goal key so the model stays pure.</li>
+<li><code>Standing</code> is in no count (<code>board.rs:1964</code> counts), raises no ready or lane notices (<code>board/pushes.rs:88</code>), is refused by Start and Close validation (both already accept only other states — keep it that way), and is not a lane-ending condition. The ticket JSON gains nothing new: clients compute "N open bugs" from <code>waits_on</code> entries that are open.</li>
+<li>CLI <code>sm board</code> text shows <code>standing</code> and <code>N open bugs</code> (<code>bin/board/mod.rs:237</code>).</li>
+</ul>
+
+<h4>A7. Owner-only page</h4>
+<ul>
+<li><code>GET /bug-reports/{id}</code>: a server-rendered, self-contained HTML page (no app shell) guarded by <code>ensure_owner_page_read_allowed</code> (<code>http.rs:15483</code>). Content: the text; a table of client, version, page, route, filed time, issue link; the screenshot (<code>&lt;img src="/bug-reports/{id}/screenshot.png"&gt;</code>, width 100%) if any; page data and server facts as pretty-printed JSON inside <code>&lt;details&gt;</code>. Unknown id → 404 page.</li>
+<li><code>GET /bug-reports/{id}/screenshot.png</code>: same guard; <code>image/png</code>; 404 if none.</li>
+<li>Add <code>/bug-reports/</code> to <code>is_protected_read_surface</code> (<code>http.rs:15161-15225</code>) and a row to the owner web reads test table (<code>OWNER_WEB_READS</code>, <code>http.rs:21087</code>). The installed Android app sends unknown paths to the browser, which is correct here: the page opens in the phone's browser behind the same login.</li>
+</ul>
+
+<h4>A8. Agent read: route and <code>sm bug show</code></h4>
+<ul>
+<li><code>GET /bugs/{id}</code> guarded by <code>ensure_session_allowed_from_parts</code> (the agent guard used by <code>POST /board/links</code>, <code>http/board.rs:774</code>): JSON <code>{bug_id, created_at, client, client_version, page, route, text, issue, has_screenshot, page_data, server_facts}</code>. <code>GET /bugs/{id}/screenshot.png</code>, same guard.</li>
+<li><code>sm bug show &lt;id&gt;</code> (new module <code>bin/bug/</code>, wired in <code>bin/sm.rs</code>): prints the text, a metadata block, then page data and server facts as indented JSON; if there is a screenshot, writes it to <code>$TMPDIR/sm-bug-&lt;id&gt;.png</code> and prints <code>Screenshot: &lt;path&gt;</code>. <code>--json</code> prints the route's JSON unchanged. Accepts the id with or without the <code>BR-</code> prefix.</li>
+</ul>
+
+<h4>A9. Removals and the old route's dependents</h4>
+<p>Update, in the same PR: the route's row in <code>is_retained_write_surface</code> (<code>http.rs:15083</code>, still a retained write); <code>cloudflare_access_gates_native_client_routes</code> (<code>http.rs:22112</code>) and <code>public_edge_assertion_binds_post_bug_report_query_target</code> (<code>http.rs:22838</code>) — rewrite for the owner guard or delete if the guard they test is gone; the three bug-report tests in <code>tests/read_only_http.rs</code> (<code>:1206</code>, <code>:1283</code>, <code>:1374</code>) and the shadow classification at <code>:8899</code>. <code>handoff/execute.rs:252</code> stays (the column is unchanged). Python migration scaffolding under <code>tests/unit</code> and <code>scripts/rust_migration</code> refers only to the path, which is unchanged; leave it. <code>specs/538_app_bug_reporting_with_sqlite_spool.md</code> gets a one-line pointer to this spec's shipped copy.</p>
+
+<h4>A10. Server tests</h4>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Validation rejects each bad field with its status</td><td><code>bug_report_validation</code></td></tr>
+<tr><td>Issue body contains the text, the footer, and none of route, page data, facts, session names (assert on the stdin given to a fake <code>gh</code>)</td><td><code>bug_report_issue_body_is_text_and_links_only</code></td></tr>
+<tr><td>Title cut at 80 characters on a multi-byte line</td><td><code>bug_report_title_truncation</code></td></tr>
+<tr><td>gh failure → 502 with bug_id; row stored as <code>unfiled</code></td><td><code>bug_report_gh_failure_keeps_report</code></td></tr>
+<tr><td>First report creates Bugs ticket and lane; second reuses them; ended lane is re-added; closed Bugs ticket is replaced</td><td><code>bugs_lane_lifecycle</code></td></tr>
+<tr><td>Links to closed bugs are removed before the new link</td><td><code>bugs_lane_drops_closed_links</code></td></tr>
+<tr><td>Bugs goal is <code>standing</code> with zero, some, and all bugs closed; not counted; no notices; Start and Close refuse it</td><td><code>standing_goal_state</code> (in <code>board/tests.rs</code>)</td></tr>
+<tr><td>Owner page and screenshot need the owner login; agent route needs a session</td><td>rows in <code>OWNER_WEB_READS</code>; <code>bug_agent_route_guard</code></td></tr>
+<tr><td>With <code>start</code>, the agent starts with the server-rendered name and brief; a refused start returns 200 with <code>start_error</code> and the issue filed</td><td><code>bug_report_starts_agent</code>, <code>bug_report_start_failure_keeps_issue</code></td></tr>
+<tr><td>Agents and the CLI cannot file (owner guard)</td><td><code>bug_report_refuses_agent_session</code></td></tr>
+<tr><td><code>sm bug show</code> prints and writes the screenshot</td><td>CLI test in <code>bin/bug/tests.rs</code></td></tr>
+</tbody>
+</table>
+
+<h3>B. Web ticket</h3>
+<h4>B1. Button</h4>
+<p>In <code>TopBar</code> (<code>web/app.js:285-320</code>), an icon button (🐞, title "Report a bug") immediately left of the New agent button, on every page.</p>
+<h4>B2. Capture</h4>
+<ul>
+<li>Vendor html-to-image (latest release; MIT): <code>web/vendor/html-to-image.js</code> (ES module build), <code>html-to-image-LICENSE</code>, a line in <code>vendor/VERSIONS</code> in the existing prose form, an <code>asset!</code> entry in <code>http/web.rs</code> <code>ASSETS</code>, and a <code>VENDOR_IMPORTS</code> entry.</li>
+<li>On press, before the dialog renders: <code>toPng(document.body, {pixelRatio: Math.min(devicePixelRatio, 2), filter: (n) =&gt; !n.dataset?.bugExclude})</code>. Capture failure, or a result over 8 MiB decoded at ratio 2, retries once at ratio 1; a second failure opens the dialog with "Screenshot unavailable" and the Screenshot toggle off and disabled.</li>
+</ul>
+<h4>B3. Page data</h4>
+<p>The shared <code>api()</code> helper keeps, in memory, the latest parsed JSON response for each GET path (path without query as key, at most 12 keys, oldest evicted). The dialog sends the entries whose path the current page fetched since it was opened; if their serialized size exceeds 300 000 characters it drops largest entries first.</p>
+<h4>B4. Report-a-bug mode of the Start dialog</h4>
+<ul>
+<li>Extend <code>TicketStart</code> (<code>web/board-start.js:40</code>) rather than adding a component beside it. Extract its agent section — the Provider <code>Seg</code>, the model · effort · workspace line with Change and its expanded Model/Effort fields, and <code>ReviewerRow</code> — into <code>AgentFields({form, set, settings, models})</code>, used by both modes. In bug mode the Name, Workspace and First message fields and the Preview link are not shown; the line "Named from the new ticket, as Start does" replaces them.</li>
+<li>Bug mode, top to bottom, as in the memo mock: title "Report a bug"; a <code>textarea.inp</code> (autofocus, 5 rows) with the public note under it in <code>.sub</code>; the screenshot thumbnail beside a <code>Toggle</code> (<code>web/ui.js:269</code>) labelled "Screenshot" with the private note, on by default, off and disabled when capture failed; a <code>Toggle</code> "Start an agent", off by default; when on, <code>AgentFields</code> inside the dialog's existing section styling; Cancel and a primary button that reads <b>File bug</b> or <b>File and start</b>, disabled until the text is non-blank. All with existing classes (<code>.fld</code>, <code>.line</code>, <code>.inp</code>, <code>.btn</code>, <code>.sub</code>, <code>.err</code>); no new colours. The dialog root carries <code>data-bug-exclude</code>.</li>
+<li>Opening fetches <code>/client/bug-reports/options</code> and <code>/client/settings</code> in parallel (models load once a provider is chosen, as today). The text field is usable before they arrive; only the agent section waits.</li>
+<li><code>page</code> is the nav label of the current page; <code>route</code> is <code>location.pathname + location.search</code>; <code>client_version</code> the build id.</li>
+<li>On 200: close and toast "Filed #N" (opens <code>issue.url</code>), or "Filed #N · started &lt;name&gt;" (opens the agent panel, as Start's toast does). If <code>board_note</code> is set, the toast adds "not on the board". If <code>start</code> was sent and <code>start_error</code> is set, the dialog stays open: the text and screenshot rows lock, the issue link and <code>start_error</code> show, and the primary button becomes <b>Start</b>, which calls <code>POST /client/board/start</code> for the new ticket with the chosen agent fields (decision 9).</li>
+<li>On an error response: keep everything, show the server's <code>detail</code> in <code>.err</code>.</li>
+</ul>
+<h4>B5. Standing lane display</h4>
+<p>In <code>TicketRow</code> (<code>web/board.js</code>) and the lane header: state <code>standing</code> shows the cyan sub-line "Standing lane · N open bugs" (N = open entries of <code>waits_on</code>), no Start, no Close; the ⋯ menu stays.</p>
+<h4>B6. Web tests</h4>
+<p>Following the existing web test pattern: page-data ring eviction; capture fallback to ratio 1 then "unavailable"; bug mode hides Name/Workspace/First message and swaps the button label with the Start toggle; a start_error response turns the button into Start; standing row renders without Start or Close.</p>
+
+<h3>C. Android ticket</h3>
+<h4>C1. Button</h4>
+<p><code>AppTopBar</code> (<code>ui/navigation/AppTopBar.kt:63</code>) gains a bug icon button before the menu, wired through <code>AppMenuActions</code> (<code>AppNavigation.kt:115</code>) so every screen that places the bar gets it.</p>
+<h4>C2. Capture</h4>
+<p>On press, before the sheet shows: <code>PixelCopy.request</code> on the activity window into an ARGB_8888 bitmap of the window size, compressed to PNG. If the PNG exceeds 8 MiB, scale the bitmap to half size and retry once. Failure → sheet opens with screenshot unavailable, as B2.</p>
+<h4>C3. Page data</h4>
+<p>An OkHttp interceptor keeps the latest response body of each GET path (same 12-key, 300 000-character rules as B3). The sheet sends the entries fetched by the current screen since it became visible. <code>page</code> is the screen's nav label, <code>route</code> the current navigation route, <code>client_version</code> "versionName (versionCode)".</p>
+<h4>C4. Report-a-bug mode of the Start sheet</h4>
+<p>Extend <code>CreateSessionSheet</code> (<code>ui/watch/CreateSessionSheet.kt:43</code>), the sheet board Start already uses, rather than adding a sheet. Add a <code>bug: BugStart?</code> parameter beside <code>ticket: TicketStart?</code>. In bug mode the sheet shows, above its existing fields: an <code>OutlinedTextField</code> "What's wrong" with the public note, the screenshot thumbnail with a Material <code>Switch</code> "Screenshot", and a <code>Switch</code> "Start an agent". The existing provider, model and effort controls show only while that switch is on; the workspace picker, name and first-message fields are hidden (the workspace is fixed to <code>working_dir</code> from the options route, shown as the label row ticket mode shows). The Reviewer row comes through the existing <code>extra</code> slot, as board Start passes it. The button reads "File bug" or "File and start". Results, toasts (snackbars) and the start-only retry follow B4.</p><h4>C5. Standing lane display</h4>
+<p><code>BoardScreen.kt</code> renders state <code>standing</code> as B5. The dead branch at <code>BoardScreen.kt:831</code> (<code>subIssuesDone &amp;&amp; state == "ready"</code>, unreachable since close-ready precedes ready) is removed.</p>
+<h4>C6. Android tests</h4>
+<p>Unit tests for the interceptor ring, request building from screen state, and the standing row; a parsing test for <code>"state":"standing"</code> in <code>BoardModelsTest.kt</code>.</p>
+
+<h3>D. Memo requirement to appendix</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Where</th></tr></thead>
+<tbody>
+<tr><td>Button on web and phone top bar</td><td>B1, C1</td></tr>
+<tr><td>Screen captured on press</td><td>B2, C2</td></tr>
+<tr><td>Only text and links public</td><td>A4; test <code>bug_report_issue_body_is_text_and_links_only</code></td></tr>
+<tr><td>Screenshot, page data, server facts private</td><td>A2, A3, A7, A8</td></tr>
+<tr><td>Standing Bugs lane; never Start/Close; closed links dropped</td><td>A5, A6, B5, C5</td></tr>
+<tr><td>Decision 5 (ended lane re-added)</td><td>A5 "Ensure the lane"; test <code>bugs_lane_lifecycle</code></td></tr>
+<tr><td>Decision 6 (old route replaced)</td><td>A1, A9</td></tr>
+<tr><td>Decision 7 (<code>sm bug show</code>)</td><td>A8</td></tr>
+<tr><td>Decision 8 (form survives failure)</td><td>A1 order of work, B4, C4</td></tr>
+<tr><td>Start an agent, in the existing Start dialog</td><td>A1 step 5 and options route, B4, C4</td></tr>
+<tr><td>Decision 9 (failed start keeps the bug)</td><td>A1 step 5, B4; test <code>bug_report_start_failure_keeps_issue</code></td></tr>
+</tbody>
+</table>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not attach the screenshot to the issue privately?</b> GitHub has no private attachment on a public issue, and its image upload is not available through the API.</p>
+<p><b>Why "starts after" links rather than sub-issues?</b> An issue has at most one parent. A bug that later belongs to a plan would have to be unhooked from Bugs first, and an agent doing <code>sm board under</code> would be refused. "Starts after" links have no such limit.</p>
+<p><b>Why a new board state rather than hiding the Bugs ticket?</b> The ticket is the lane goal and the lane header shows it; it must render, just never as startable or closable.</p>
+<p><b>Why does the server start the agent rather than the client after filing?</b> Board Start needs the ticket to have board facts, which arrive a moment after the issue is linked. The server can wait for that under its own clock; one request also means one press and no window in which the bug is filed but the dialog has moved on.</p><p><b>Does the public issue reveal the page I was on?</b> Only its name ("Board", "Inbox"), not its address, which can contain a private ticket number.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
