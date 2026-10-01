@@ -24,6 +24,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,6 +36,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -586,6 +588,7 @@ private fun MobileTerminalOverlay(
     var copyRequest by remember { mutableStateOf(0L) }
     val controls = remember(terminal.connectionGeneration) { TerminalControls() }
     var actionsOpen by remember { mutableStateOf(false) }
+    var notesOpen by remember { mutableStateOf(false) }
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val focus = androidx.compose.ui.platform.LocalFocusManager.current
     BackHandler(onBack = onDetach)
@@ -697,9 +700,15 @@ private fun MobileTerminalOverlay(
                         }
                         HorizontalDivider()
                         DropdownMenuItem(text = { Text("Copy terminal") }, onClick = { actionsOpen = false; copyRequest += 1 })
+                        DropdownMenuItem(text = { Text("Type note into terminal") }, enabled = connected, onClick = { actionsOpen = false; notesOpen = true })
                     }
                 }
             }
+
+            if (notesOpen) TerminalNotesDialog(onDismiss = { notesOpen = false }, onType = { note ->
+                onTerminalInput("\u001b[200~$note\u001b[201~")
+                notesOpen = false
+            })
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -730,6 +739,28 @@ private fun MobileTerminalOverlay(
             }
         }
     }
+}
+
+@Composable
+private fun TerminalNotesDialog(onDismiss: () -> Unit, onType: (String) -> Unit) {
+    val notes: li.rajeshgo.sm.ui.notes.NotesViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val state by notes.state.collectAsState()
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Type note into terminal") },
+        text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = state.query, onValueChange = notes::search, label = { Text("Search notes") }, singleLine = true)
+                state.hits.forEach { hit ->
+                    TextButton(onClick = { notes.withNoteText(hit.id, onType) }) {
+                        Text(hit.title.ifBlank { "Untitled" } + " · " + hit.snippet.take(60), maxLines = 2)
+                    }
+                }
+                state.status.takeIf(String::isNotBlank)?.let { Text(it) }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -1287,11 +1318,25 @@ private fun SessionRow(
     val onUpdateWhat = { actions.onUpdateWhat(session) }
     val onRegenerateWhat = { actions.onRegenerateWhat(session) }
     val onKill = { actions.onKill(session) }
+    var confirmRetire by remember(session.id) { mutableStateOf(false) }
+    val retire: () -> Unit = {
+        if (session.facts?.finished != null && session.facts.agent?.state == "idle") onKill()
+        else confirmRetire = true
+    }
+    if (confirmRetire) androidx.compose.material3.AlertDialog(
+        onDismissRequest = { confirmRetire = false },
+        title = { Text("Retire ${session.name}?") },
+        text = { Text("Its current turn will end.") },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false; onKill() }) { Text("Retire") } },
+        dismissButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false }) { Text("Cancel") } },
+    )
     val onOpenPage = actions.onOpenPage
     val follow = actions.follow
     val followed = session.id in follow.followedSessionIds
     var showHandoff by remember(session.id) { mutableStateOf(false) }
-    if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session) { showHandoff = false }
+    var showHandoffNow by remember(session.id) { mutableStateOf(false) }
+    if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, onDismiss = { showHandoff = false })
+    if (showHandoffNow) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, { showHandoffNow = false }, showNow = true)
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val context = LocalContext.current
     val remoteControlUrl = remoteControlUrl(session)
@@ -1389,7 +1434,8 @@ private fun SessionRow(
                             }
                         }
                     } else if (finished != null) {
-                        Text(finished, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(finished, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        if (!isStoppedSession(session)) androidx.compose.material3.TextButton(onClick = retire) { Text("Retire") }
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1439,18 +1485,20 @@ private fun SessionRow(
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
                     }
                     var actionsExpanded by remember { mutableStateOf(false) }
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // Two pills at most, so the actions menu stays on screen at phone width.
+                    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         if (remoteControlUrl != null) {
                             ActionPill(label = "Open in Claude", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = openAgent, tint = Emerald)
-                        } else if (attachSupported) {
+                        }
+                        if (attachSupported) {
                             ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
                         }
-                        if (supportsSessionCloning(session.provider)) ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
+                        if (!isStoppedSession(session)) androidx.compose.material3.TextButton(onClick = retire) { Text("Retire", color = Rose) }
+                        if (!isStoppedSession(session)) androidx.compose.material3.TextButton(onClick = { showHandoff = true }) { Text("Hand off…") }
                         Box {
                             IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
                             DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
-                                DropdownMenuItem(text = { Text("Context handoff") }, onClick = { actionsExpanded = false; showHandoff = true })
+                                if (!isStoppedSession(session)) DropdownMenuItem(text = { Text("Hand off now") }, onClick = { actionsExpanded = false; showHandoffNow = true })
+                                if (supportsSessionCloning(session.provider)) DropdownMenuItem(text = { Text("Clone") }, onClick = { actionsExpanded = false; onClone() })
                                 if (remoteControlUrl != null && attachSupported) DropdownMenuItem(text = { Text("Open terminal") }, onClick = { actionsExpanded = false; onOpenAttach() })
                                 if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
                                 if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
@@ -1459,7 +1507,6 @@ private fun SessionRow(
                                 } else {
                                     DropdownMenuItem(text = { Text("Follow") }, enabled = !isStoppedSession(session), onClick = { actionsExpanded = false; follow.onFollow(session) })
                                 }
-                                DropdownMenuItem(text = { Text("Retire session", color = Rose) }, onClick = { actionsExpanded = false; onKill() })
                             }
                         }
                     }

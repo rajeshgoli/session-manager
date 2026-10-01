@@ -30,6 +30,32 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @GET("notes/search")
+    suspend fun searchOwnerNotes(@Query("q") query: String): List<li.rajeshgo.sm.data.model.OwnerNoteHit>
+
+    @GET("notes/{id}")
+    suspend fun getOwnerNote(@Path("id") id: String): li.rajeshgo.sm.data.model.OwnerNote
+
+    @POST("notes")
+    suspend fun createOwnerNote(@Body note: li.rajeshgo.sm.data.model.OwnerNoteWrite): li.rajeshgo.sm.data.model.OwnerNote
+
+    @PUT("notes/{id}")
+    suspend fun saveOwnerNote(@Path("id") id: String, @Body note: li.rajeshgo.sm.data.model.OwnerNoteWrite): retrofit2.Response<li.rajeshgo.sm.data.model.OwnerNote>
+
+    @DELETE("notes/{id}")
+    suspend fun deleteOwnerNote(@Path("id") id: String): retrofit2.Response<Unit>
+
+    @GET("notes/{id}/revisions")
+    suspend fun ownerNoteRevisions(@Path("id") id: String): List<li.rajeshgo.sm.data.model.OwnerNoteRevision>
+
+    @GET("notes/{id}/revisions/{version}")
+    suspend fun ownerNoteRevision(@Path("id") id: String, @Path("version") version: Long): li.rajeshgo.sm.data.model.OwnerNoteRevision
+
+    @POST("notes/{id}/restore")
+    suspend fun restoreOwnerNote(@Path("id") id: String, @Body revision: li.rajeshgo.sm.data.model.OwnerNoteRestore): li.rajeshgo.sm.data.model.OwnerNote
+
+    @POST("github/issues")
+    suspend fun fileOwnerIssue(@Body issue: li.rajeshgo.sm.data.model.OwnerIssueRequest): li.rajeshgo.sm.data.model.OwnerIssueCreated
     @GET("client/host-status")
     suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
 
@@ -289,6 +315,12 @@ interface ApiService {
 
     @POST("client/board/start")
     suspend fun startBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardStartRequest): li.rajeshgo.sm.data.model.BoardStarted
+
+    @PUT("client/board/auto-start")
+    suspend fun setBoardAutoStart(@Body choice: li.rajeshgo.sm.data.model.BoardAutoStartChoice): kotlinx.serialization.json.JsonObject
+
+    @DELETE("client/board/auto-start")
+    suspend fun cancelBoardAutoStart(@Query("repo") repo: String, @Query("number") number: Long): kotlinx.serialization.json.JsonObject
 
     /** Files a bug from the app (spec 1859 A1); stores the private part on sm, then opens the issue. */
     @POST("client/bug-reports")

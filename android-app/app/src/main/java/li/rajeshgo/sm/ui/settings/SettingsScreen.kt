@@ -147,6 +147,7 @@ fun SettingsScreen(
         if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
             li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
         }
+        if (state.isLoggedIn) SettingsGroup("New agents") { AutoRetireSection() }
         if (state.isLoggedIn) Box(Modifier.bringIntoViewRequester(reviews)) {
             SettingsGroup("Reviews") { ReviewsSection() }
         }

@@ -1023,6 +1023,7 @@ data class BoardResponse(
     val lanes: List<BoardLane> = emptyList(),
     val other: List<BoardOtherGroup> = emptyList(),
     @SerialName("start_defaults") val startDefaults: BoardStartDefaults = BoardStartDefaults(),
+    @SerialName("auto_start_paused") val autoStartPaused: Boolean = false,
 )
 
 @Serializable
@@ -1122,7 +1123,58 @@ data class BoardTicket(
     val thread: BoardThread? = null,
     /** The holder's obligation docs, at most 3. */
     val docs: List<BoardDoc> = emptyList(),
+    val tier: String? = null,
+    @SerialName("auto_start") val autoStart: BoardAutoStart? = null,
 )
+
+@Serializable
+data class BoardAutoStart(
+    @SerialName("agent_type") val agentType: String? = null,
+    val provider: String = "claude",
+    val model: String? = null,
+    val effort: String? = null,
+    val brief: String? = null,
+    val state: String = "waiting",
+    @SerialName("last_error") val lastError: String? = null,
+)
+
+@Serializable
+data class BoardAutoStartChoice(
+    val repo: String,
+    val number: Long,
+    @SerialName("agent_type") val agentType: String? = null,
+    val provider: String,
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String? = null,
+    val brief: String? = null,
+)
+
+@Serializable
+data class OwnerNote(
+    val id: String = "", val title: String = "", val body: String = "",
+    val version: Long = 0, @SerialName("updated_at") val updatedAt: String = "",
+)
+
+@Serializable
+data class OwnerNoteHit(
+    val id: String = "", val title: String = "", val snippet: String = "",
+    val chars: Int = 0, @SerialName("updated_at") val updatedAt: String = "",
+)
+
+@Serializable
+data class OwnerNoteWrite(val body: String, val title: String? = null, @SerialName("if_version") val ifVersion: Long? = null)
+
+@Serializable
+data class OwnerNoteRevision(val version: Long, val at: String = "", val body: String? = null)
+
+@Serializable
+data class OwnerNoteRestore(val version: Long)
+
+@Serializable
+data class OwnerIssueRequest(val repo: String, val title: String, val body: String)
+
+@Serializable
+data class OwnerIssueCreated(val number: Long, val url: String)
 
 @Serializable
 data class BoardJob(

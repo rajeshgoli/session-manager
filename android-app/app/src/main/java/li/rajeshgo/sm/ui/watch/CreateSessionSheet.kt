@@ -38,7 +38,12 @@ data class TicketStart(
     val provider: String,
     val model: String?,
     val effort: String,
+    val whenReady: Boolean = false,
+    val agentTypes: List<AgentTypeChoice> = emptyList(),
+    val selectedType: String? = null,
 )
+
+data class AgentTypeChoice(val name: String, val provider: String, val model: String, val effort: String)
 
 /**
  * Report a bug (spec 1859 C4): the sheet takes the bug's text and
@@ -96,6 +101,7 @@ fun CreateSessionSheet(
     var provider by rememberSaveable(sheetKey) { mutableStateOf(template.provider) }
     var model by rememberSaveable(sheetKey) { mutableStateOf(template.model.orEmpty()) }
     var effort by rememberSaveable(sheetKey) { mutableStateOf(template.reasoningEffort.orEmpty()) }
+    var selectedType by rememberSaveable(sheetKey) { mutableStateOf(ticket?.selectedType) }
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name.orEmpty()) }
@@ -133,6 +139,7 @@ fun CreateSessionSheet(
             Text(
                 when {
                     bug != null -> "Report a bug"
+                    ticket?.whenReady == true -> "Start when ready"
                     ticket != null -> "Start"
                     source == null -> "New session"
                     else -> "Clone ${sessionDisplayName(source)}"
@@ -150,6 +157,20 @@ fun CreateSessionSheet(
                 )
             } else {
                 BugFields(bug, bugText, { bugText = it }, bugScreenshot, { bugScreenshot = it }, bugAgent, { bugAgent = it }, !busy && !bugLocked, !busy && !bugLocked && bug.defaults != null && bug.agentNote == null)
+            }
+            if (ticket?.whenReady == true) {
+                var typeMenu by remember { mutableStateOf(false) }
+                Box {
+                    OutlinedButton(onClick = { typeMenu = true }, enabled = !busy) { Text("Agent type: ${selectedType ?: "Custom"}") }
+                    DropdownMenu(expanded = typeMenu, onDismissRequest = { typeMenu = false }) {
+                        ticket.agentTypes.forEach { choice ->
+                            DropdownMenuItem(text = { Text(choice.name) }, onClick = {
+                                selectedType = choice.name; provider = choice.provider; model = choice.model; effort = choice.effort; typeMenu = false
+                            })
+                        }
+                        DropdownMenuItem(text = { Text("Custom") }, onClick = { selectedType = null; typeMenu = false })
+                    }
+                }
             }
             if (bug == null || bugAgent) {
                 val providers = if (startLike) listOf("claude", "codex-fork") else listOf("claude", "codex")
@@ -208,7 +229,7 @@ fun CreateSessionSheet(
                 modifier = Modifier.fillMaxWidth().height(52.dp),
             ) {
                 val label = when {
-                    bug == null -> if (ticket != null) "Start" else "Create session"
+                    bug == null -> if (ticket?.whenReady == true) "Start when ready" else if (ticket != null) "Start" else "Create session"
                     bugLocked -> "Start"
                     bugAgent -> "File and start"
                     else -> "File bug"
