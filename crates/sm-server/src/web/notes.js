@@ -134,11 +134,15 @@ export function NotesView({ pane = false, onClose, onType }) {
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
   const saveRef = useRef(null);
-  const search = async (q = query) => {
+  const search = async (q = query, afterSave = false) => {
     const serial = ++searchSerial.current;
     try {
       const rows = await api(`/notes/search?q=${encodeURIComponent(q)}`);
       if (serial !== searchSerial.current) return;
+      if (afterSave && q && current.current.open && !rows.some(row => row.id === current.current.open.id)) {
+        setQuery('');
+        return;
+      }
       setHits(rows);
       if (!q) setTotal(rows.length);
       setError('');
@@ -219,7 +223,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       if (current.current.open?.id !== note.id) return true;
       current.current.open = result;
       setOpen(result); setConflict(null); setStatus(`Saved · ${age(result.updated_at)}`);
-      search();
+      search(query, true);
       return true;
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
@@ -233,7 +237,11 @@ export function NotesView({ pane = false, onClose, onType }) {
     }
   }), []);
   const collapse = async () => {
-    if (await save() === false) return;
+    for (;;) {
+      if (await save() === false) return;
+      const { open: note, body: text } = current.current;
+      if (!note || text === note.body) break;
+    }
     loadSerial.current++;
     current.current = { open: null, body: '' };
     store('sm-notes-open', '');

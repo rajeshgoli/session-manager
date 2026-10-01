@@ -345,6 +345,106 @@ test('navigation saves text typed while an earlier save is pending', async () =>
   } finally { await browser.close(); }
 });
 
+test('an open editor stays visible when a save removes its search match', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const pane of [false, true]) {
+      const context = await browser.newContext({ viewport: { width: pane ? 1440 : 390, height: 900 } });
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      if (pane) await page.keyboard.press('Meta+j');
+      const view = pane ? page.locator('.panel .notes-view') : page.locator('.notes-page');
+      await view.locator('.note-card').first().waitFor();
+      await view.getByRole('searchbox', { name: 'Search notes' }).fill('Review loop');
+      await page.waitForFunction(isPane => document.querySelectorAll(isPane ? '.panel .note-card' : '.notes-page .note-card').length === 1, pane);
+      await view.locator('.note-card-main').first().click();
+      const editor = view.locator('.notes-editor textarea');
+      await editor.waitFor();
+      const saved = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+      await editor.fill('Text without the original match');
+      assert.equal((await saved).status(), 200);
+      await page.waitForFunction(isPane => {
+        const view = document.querySelector(isPane ? '.panel .notes-view' : '.notes-page');
+        return view?.querySelector('input[type=search]')?.value === '' && view.querySelectorAll('.note-card').length === 2;
+      }, pane);
+      assert.equal(await editor.inputValue(), 'Text without the original match');
+      assert.equal(handler.notes.find(note => note.id === 'one').body, 'Text without the original match');
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('collapse saves edits typed while an earlier save is pending', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const action of ['card', 'Escape']) {
+      const context = await browser.newContext();
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-page .note-card').first().waitFor();
+      await page.keyboard.press('Meta+j');
+      const pane = page.locator('.panel .notes-view');
+      await pane.locator('.note-card-main').first().click();
+      const editor = pane.locator('.notes-editor textarea');
+      await editor.waitFor();
+      let release;
+      handler.holdNextSave = new Promise(resolve => { release = resolve; });
+      const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+      await editor.fill('First edit');
+      await saveStarted;
+      if (action === 'card') await pane.locator('.note-card-main').first().click();
+      else await page.keyboard.press('Escape');
+      await editor.fill('Second edit during collapse');
+      release();
+      await pane.locator('.notes-editor').waitFor({ state: 'hidden' });
+      assert.equal(handler.notes.find(note => note.id === 'one').body, 'Second edit during collapse');
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('a save conflict during collapse keeps the editor and latest text', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const handler = server();
+    const firstContext = await browser.newContext();
+    const secondContext = await browser.newContext();
+    await firstContext.route('**/*', handler);
+    await secondContext.route('**/*', handler);
+    const first = await firstContext.newPage();
+    const second = await secondContext.newPage();
+    await first.goto(`${origin}/notes`);
+    await first.locator('.notes-page .note-card').first().waitFor();
+    await first.keyboard.press('Meta+j');
+    const pane = first.locator('.panel .notes-view');
+    await pane.locator('.note-card-main').first().click();
+    const editor = pane.locator('.notes-editor textarea');
+    await second.goto(`${origin}/notes`);
+    await second.locator('.note-card-main').first().click();
+    const newerSave = second.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await second.locator('.notes-editor textarea').fill('Changed elsewhere');
+    assert.equal((await newerSave).status(), 200);
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await editor.fill('First local edit');
+    await saveStarted;
+    await first.keyboard.press('Escape');
+    await editor.fill('Latest local edit');
+    release();
+    await first.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
+    assert.equal(await editor.inputValue(), 'Latest local edit');
+    assert.equal(await pane.locator('.notes-editor').count(), 1);
+    await firstContext.close();
+    await secondContext.close();
+  } finally { await browser.close(); }
+});
+
 test('Back and Forward keep their entries, and New clears an active search', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
