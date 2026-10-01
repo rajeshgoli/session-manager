@@ -685,6 +685,19 @@ fn finished_container_is_close_ready_only_without_active_work() {
         TicketState::InProgress
     );
     input.holders.clear();
+    // A finished container that also starts after an open ticket waits for it.
+    input.items.insert(k(3), item(&k(3), true));
+    input.edges.push(edge(&k(1), &k(3), EdgeKind::After));
+    assert_eq!(
+        compute(&input, now()).facts[&k(1)].state,
+        TicketState::Blocked
+    );
+    input.items.insert(k(3), item(&k(3), false));
+    assert_eq!(
+        compute(&input, now()).facts[&k(1)].state,
+        TicketState::CloseReady
+    );
+    input.edges.truncate(1);
     input.edges[0].kind = EdgeKind::After;
     assert_eq!(
         compute(&input, now()).facts[&k(1)].state,

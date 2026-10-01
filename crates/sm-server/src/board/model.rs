@@ -614,7 +614,7 @@ fn ticket_facts(
         TicketState::NeedsYou
     } else if holder.is_some() || open_pr {
         TicketState::InProgress
-    } else if sub_issues_done && !any_stale && !in_cycle {
+    } else if sub_issues_done && !open_blocker && !any_stale && !in_cycle {
         TicketState::CloseReady
     } else if !open_blocker && !any_stale && !in_cycle {
         TicketState::Ready
