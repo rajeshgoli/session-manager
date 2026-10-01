@@ -41,6 +41,7 @@ pub mod usage_burn;
 mod usage_db;
 pub mod usage_identity;
 pub mod usage_ledger;
+pub mod usage_meters;
 pub mod usage_report;
 pub mod utilization;
 pub mod watch_view;

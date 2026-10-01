@@ -31,13 +31,11 @@ const write = (path, body) => api(path, { method: 'POST', headers: { 'X-SM-Doc-T
 export function InboxPage({ openRef }) {
   const [filter, setFilter] = useState('open');
   const [data, error, reload] = usePoll(() => api(`/inbox?format=json&filter=${filter}`), 30000, [filter]);
-  const rowRef = row => row.kind === 'doc' ? `doc:${row.url}` : `thread:${row.session_id}`;
-  const selected = data?.rows.find(row => rowRef(row) === openRef || (
-    row.kind === 'doc' && openRef?.startsWith('doc:') &&
-    new URL(row.url, location.origin).pathname === new URL(openRef.slice(4), location.origin).pathname
-  ));
+  const rowRef = row => `work:${row.thread_key}`;
+  const selected = data?.rows.find(row => rowRef(row) === openRef);
   const [busy, setBusy] = useState(false);
-  const threadId = openRef?.startsWith('thread:') ? openRef.slice(7) : null;
+  const workKey = openRef?.startsWith('work:') ? openRef.slice(5) : null;
+  const threadId = openRef?.startsWith('thread:') ? openRef.slice(7) : selected?.session_id;
   const [agent, reloadAgent] = useWatchedAgent(threadId);
   const [retiring, setRetiring] = useState(false);
   useEffect(() => setRetiring(false), [threadId]);
@@ -70,16 +68,16 @@ export function InboxPage({ openRef }) {
     const off = bus.on('inbox-done', done);
     return () => { document.removeEventListener('keydown', key); off(); };
   }, [selected, busy]);
-  const inline = openRef?.startsWith('doc:') || openRef?.startsWith('thread:');
+  const inline = openRef?.startsWith('doc:') || openRef?.startsWith('thread:') || !!workKey;
   return html`<div class=${`inbox-layout ${inline ? 'reading' : ''}`}>
     <section class="inbox-list" aria-label="Inbox threads">
       <div class="inbox-filters"><${Seg} label="Inbox filter" value=${filter} onChange=${setFilter}
         options=${['open','docs','done'].map(value => ({value, label: value[0].toUpperCase()+value.slice(1)}))} /></div>
       ${error ? html`<p role="alert">${error.message}</p>` : null}
       ${!data ? html`<p class="empty">Loading…</p>` : data.rows.length === 0 ? html`<p class="empty">Nothing here.</p>` : null}
-      ${(filter === 'open' ? ['needs_you','finished','new','earlier'] : ['all']).map(group => {
+      ${(filter === 'open' ? ['needs_you','finished','new','earlier','folded'] : ['all']).map(group => {
         const rows = (data?.rows || []).filter(r => group === 'all' || r.group === group);
-        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',finished:'cyan'})[group] || ''}>${({needs_you:'Needs you',finished:'Finished',new:'New',earlier:'Earlier'})[group]}</h2>` : null}
+        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',finished:'cyan'})[group] || ''}>${({needs_you:'Needs you',finished:'Finished',new:'New',earlier:'Earlier',folded:'Folded'})[group]}</h2>` : null}
           ${rows.map(row => html`<button class=${`inbox-row ${rowRef(row) === openRef ? 'selected' : ''}`} onClick=${() => openPanel(rowRef(row))}>
             <strong>${row.title}</strong><span>${row.preview}</span><small>${row.repo} · ${row.status}${row.pr_number ? ` · #${row.pr_number}` : ''}</small>
           </button>`)}</div>` : null;
@@ -95,14 +93,15 @@ export function InboxPage({ openRef }) {
               <button class="btn sm" onClick=${() => setRetiring(false)}>Cancel</button></span>`
           : html`<button class="btn sm" onClick=${() => setRetiring(true)}>Retire…</button>` : null}</div>` : null}
       ${openRef?.startsWith('doc:') ? html`<${Reader} key=${openRef} id=${openRef.slice(4)} />`
-        : threadId ? html`<${Thread} key=${openRef} id=${threadId} agent=${agent} />`
+        : workKey || threadId ? html`<${Thread} key=${openRef} id=${threadId} workKey=${workKey} agent=${agent} />`
         : html`<div class="empty">Choose a thread or document to read.</div>`}
     </section>
   </div>`;
 }
 
-export function Thread({ id, controls, agent }) {
-  const [data, error, reload] = usePoll(() => api(`/inbox/agent/${encodeURIComponent(id)}?format=json`), 30000, [id]);
+export function Thread({ id, workKey, controls, agent }) {
+  const endpoint = workKey ? `/inbox/thread/${encodeURIComponent(workKey)}` : `/inbox/agent/${encodeURIComponent(id)}`;
+  const [data, error, reload] = usePoll(() => api(`${endpoint}?format=json`), 30000, [endpoint]);
   const [body, setBody] = useState('');
   const [quotes, setQuotes] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -158,7 +157,7 @@ export function Thread({ id, controls, agent }) {
     if (attempt.current?.signature !== signature) attempt.current = {signature, id: crypto.randomUUID()};
     setBusy(true); setFailure('');
     try {
-      await write(`/inbox/agent/${encodeURIComponent(id)}/send`, {...payload, submission_id: attempt.current.id});
+      await write(`${endpoint}/send`, {...payload, submission_id: attempt.current.id});
       scrollOnLoad.current = true;
       attempt.current = null; setBody(''); setQuotes([]); reload();
     } catch (e) { setFailure(e.message); }
@@ -177,7 +176,7 @@ export function Thread({ id, controls, agent }) {
     ${(data?.review_asks || []).map(ask => html`<${ReviewAsk} key=${ask.request_id} ask=${ask} onDone=${reload} />`)}
     <div class="thread-compose">
       ${quotes.map((q,i) => html`<blockquote>${q.quote}<button class="icon-btn" disabled=${busy} title="Remove quote" onClick=${() => setQuotes(quotes.filter((_,n) => n !== i))}>×</button></blockquote>`)}
-      ${data?.can_send ? html`<textarea aria-label="Reply" placeholder=${`Write to ${data.reply_to}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />
+      ${data?.can_send ? html`<textarea aria-label="Reply" placeholder=${`Write to ${data.reply_to?.name || data.reply_to}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />
         <button class="btn pri" disabled=${busy || (!body.trim() && !quotes.length)} onClick=${send}>${busy ? 'Sending…' : 'Send'}</button>` : html`<p>No agent is left to reply to.</p>`}
       ${failure ? html`<p role="alert">${failure}</p>` : null}
     </div>

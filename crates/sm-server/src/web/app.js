@@ -155,7 +155,7 @@ function App() {
       <${Toasts} items=${toasts} />`;
   }
 
-  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread):/.test(loc.open));
+  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread|work):/.test(loc.open));
   const cls = ['app', layout.rail === 'folded' && 'folded', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
@@ -269,26 +269,86 @@ function Rail({ page, layout, updateLayout }) {
         <${Icon} name=${folded ? 'unfold' : 'fold'} size="14" /></button></div>
     ${PAGES.filter((p) => !p.bottom).map(item)}
     <span class="grow"></span>
+    <${Dash} />
     ${PAGES.filter((p) => p.bottom).map(item)}
   </nav>`;
 }
 
-// ---- top bar ----------------------------------------------------------------
+// ---- usage dash (sm#1881) ------------------------------------------------------
 
-function Meter({ label, total, queue, text, className = '' }) {
-  const width = (value) => `width:${Math.max(0, Math.min(100, value || 0))}%`;
-  const color = meterBand((total || 0) / 100, label.toLowerCase());
-  return html`<span class=${`meter ${className}`} style=${`--meter-color:var(--${color})`} title=${label}>${label}
-    <i><s style=${`${width(total)};opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(Math.min(total || 0, queue))}></s>` : null}</i>${text}</span>`;
+const CLAUDE_METERS = [
+  { kind: 'session_5h', label: '5-hour', short: '5h', idle: 'Starts on next use' },
+  { kind: 'weekly_all', label: 'This week', short: 'Wk', idle: 'No reading' },
+];
+
+/** Today: the time; within a week: weekday and time; else the date. */
+function when(iso) {
+  const at = Date.parse(iso || '');
+  if (!Number.isFinite(at)) return '';
+  const date = new Date(at);
+  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }).toLowerCase();
+  if (new Date().toDateString() === date.toDateString()) return time;
+  if (at - Date.now() < 6 * 86400000) return `${date.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  return `${date.toLocaleDateString([], { day: 'numeric', month: 'short' })} ${time}`;
 }
 
-function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
+function DashMeter({ label, short, total, queue, text, brief = text, lines = [], kind = '', title = '' }) {
+  const width = (value) => `width:${Math.max(0, Math.min(100, value || 0))}%`;
+  const color = meterBand((total || 0) / 100, kind);
+  return html`<div class="dm" style=${`--meter-color:var(--${color})`} title=${title || `${label} ${text}`}>
+    <span class="dl"><span class="lb">${label}</span><span class="sh">${short}</span><b class="full">${text}</b><b class="brief">${brief}</b></span>
+    <i><s style=${`${width(total)};opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(Math.min(total || 0, queue))}></s>` : null}</i>
+    ${lines.map(([line, tone]) => html`<small class=${tone || ''}>${line}</small>`)}
+  </div>`;
+}
+
+function claudeMeter(spec, meter) {
+  if (!meter) return { ...spec, total: 0, text: '–', lines: [[spec.idle]] };
+  const pct = Math.round(meter.percent);
+  const lines = [[`Resets ${when(meter.resets_at)}`]];
+  if (meter.pace?.kind === 'runs_out') lines.push([`Out ${when(meter.pace.at)}`, pct >= 85 ? 'red' : 'amber']);
+  const pace = meter.pace?.kind === 'runs_out' ? ` · runs out ${when(meter.pace.at)}`
+    : meter.pace?.kind === 'on_pace' ? ` · on pace for ${Math.round(meter.pace.percent)}% at reset` : '';
+  return {
+    ...spec, total: meter.percent, text: `${pct}%`, lines,
+    title: `${spec.label}: ${pct}% used · resets ${when(meter.resets_at)}${pace} · read ${when(meter.observed_at)}`,
+  };
+}
+
+function Dash() {
   const [host] = usePoll(() => api('/client/host-status'), 10000);
-  const queue = useShared('queue');
-  const current = PAGES.find((p) => p.key === page);
+  const [usage] = usePoll(() => api('/client/usage/meters'), 30000);
   const mac = host && host.available !== false ? host : null;
   const memTotal = mac && mac.memory_total_bytes;
   const memPct = (bytes) => (memTotal ? (100 * bytes) / memTotal : 0);
+  const meters = usage?.meters || [];
+  const claude = usage ? [
+    ...CLAUDE_METERS.map((spec) => claudeMeter(spec, meters.find((m) => m.kind === spec.kind))),
+    // A model-scoped week (Fable) shows only while Claude reports one.
+    ...meters.filter((m) => m.kind === 'weekly_scoped').map((m) =>
+      claudeMeter({ kind: m.kind, label: `${m.scope || 'Model'} week`, short: (m.scope || 'Md').slice(0, 2) }, m)),
+  ] : [];
+  return html`<div class="dash" aria-label="Usage">
+    ${claude.length ? html`<a class="dh" href="/analytics/spend" title="Claude usage · open Analytics"
+        onClick=${(e) => { e.preventDefault(); navigate('/analytics/spend'); }}>Claude</a>
+      ${claude.map((m) => html`<${DashMeter} key=${m.label} ...${m} />`)}` : null}
+    ${mac ? html`<span class="dh">Mac</span>
+      <${DashMeter} label="Memory" short="Mem" kind="memory" total=${memPct(mac.memory_used_bytes)}
+        queue=${typeof mac.queue_memory_bytes === 'number' ? memPct(mac.queue_memory_bytes) : undefined}
+        text=${`${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G`} brief=${`${Math.round(memPct(mac.memory_used_bytes))}%`}
+        title=${`Memory ${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G${typeof mac.queue_memory_bytes === 'number' ? ` · queue ${gigabytes(mac.queue_memory_bytes)}G` : ''}`} />
+      <${DashMeter} label="CPU" short="CPU" kind="cpu" total=${mac.cpu_percent} queue=${mac.queue_cpu_percent}
+        text=${`${Math.round(mac.cpu_percent || 0)}%`} />
+      <${DashMeter} label="GPU" short="GPU" kind="gpu" total=${mac.gpu_percent} queue=${mac.queue_gpu_percent}
+        text=${typeof mac.gpu_percent === 'number' ? `${Math.round(mac.gpu_percent)}%` : '–'} />` : null}
+  </div>`;
+}
+
+// ---- top bar ----------------------------------------------------------------
+
+function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
+  const queue = useShared('queue');
+  const current = PAGES.find((p) => p.key === page);
   const running = queue ? (queue.running || []).length : null;
   const waiting = queue ? (queue.queued || []).length : null;
   const waitingLong = queue?.queued?.some(job => Date.now() - Date.parse(job.queued_at) >= 30 * 60 * 1000);
@@ -299,15 +359,6 @@ function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
     ${offline ? html`<span class="offline" role="status">Offline, retrying</span>` : null}
     ${stale ? html`<button type="button" class="stale-build" onClick=${() => location.reload()}>sm was updated · Reload</button>` : null}
     <span class="meters">
-      ${mac
-        ? html`<${Meter} label="Memory" total=${memPct(mac.memory_used_bytes)}
-            queue=${typeof mac.queue_memory_bytes === 'number' ? memPct(mac.queue_memory_bytes) : undefined}
-            text=${`${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G${typeof mac.queue_memory_bytes === 'number' ? ` · queue ${gigabytes(mac.queue_memory_bytes)}G` : ''}`} className="memory" />
-          <${Meter} label="CPU" total=${mac.cpu_percent} queue=${mac.queue_cpu_percent}
-            text=${`${Math.round(mac.cpu_percent || 0)}%`} className="cpu" />
-          <${Meter} label="GPU" total=${mac.gpu_percent} queue=${mac.queue_gpu_percent}
-            text=${typeof mac.gpu_percent === 'number' ? `${Math.round(mac.gpu_percent)}%` : '–'} className="gpu" />`
-        : null}
       ${queue
         ? html`<a class=${`meter link ${waitingLong ? 'amber' : ''}`} href="/queue" onClick=${(e) => { e.preventDefault(); navigate('/queue'); }}>
             Queue ${running} running · ${waiting} waiting</a>`

@@ -183,7 +183,8 @@ const hoverText = (text) => (text.length > 1000 ? `${text.slice(0, 1000)}…` : 
 /** A finished agent is safe to retire immediately only after its current turn is idle. */
 export const canRetireImmediately = (agent) => !!agent.facts?.finished && agent.facts?.agent?.state === 'idle';
 
-function RetireButton({ agent, onRetired, small = false }) {
+/** `onRetired(true)` after a retire; `onRetired(false)` when a busy agent needs the confirmation instead. */
+export function RetireButton({ agent, onRetired, small = false }) {
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
   const retire = async (ifFinishedIdle = false) => {
@@ -195,11 +196,11 @@ function RetireButton({ agent, onRetired, small = false }) {
       });
       toast(`Retired ${agent.name}`);
       setAsking(false);
-      onRetired?.();
+      onRetired?.(true);
     } catch (error) {
       if (ifFinishedIdle && error.status === 409) {
         setAsking(true);
-        onRetired?.();
+        onRetired?.(false);
       } else {
         toast(error.message);
       }

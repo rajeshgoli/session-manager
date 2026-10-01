@@ -290,7 +290,7 @@ async fn unread_cap_refuses_sixth_and_resets_on_view() {
     let (status, _) = create(&f, "eng00001", "sixth", json!({})).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     // Opening the sender's thread is.
-    let (status, _) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    let (status, _) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = create(&f, "eng00001", "sixth", json!({})).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -340,26 +340,32 @@ async fn page_marks_viewed_json_does_not() {
 async fn thread_reply_box_follows_recipient() {
     let f = fixture();
     created_id(&f, "eng00001", "x", json!({"blocking": true})).await;
-    let (_, page) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    let (_, page) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert!(page.contains(r#""canSend":true"#), "{page}");
     assert!(page.contains("Write to eng00001-agent"), "{page}");
     assert!(page.contains("NEEDS YOU"), "{page}");
     // A retired sender with a live parent: the parent answers, and an ended
     // sender needs nobody.
     created_id(&f, "child001", "x", json!({"blocking": true})).await;
-    let (_, page) = send(&f.app, "GET", "/inbox/agent/child001", None).await;
+    let (_, page) = send(&f.app, "GET", "/inbox/thread/agent%3Achild001", None).await;
     assert!(page.contains(r#""canSend":true"#));
     assert!(page.contains("a reply goes to eng00001-agent"), "{page}");
     assert!(!page.contains("NEEDS YOU"), "an ended sender needs nobody");
     // Nobody left: no reply box, Done still offered.
     for sender in ["orphan01", "killed01"] {
         created_id(&f, sender, "x", json!({})).await;
-        let (_, page) = send(&f.app, "GET", &format!("/inbox/agent/{sender}"), None).await;
+        let (_, page) = send(
+            &f.app,
+            "GET",
+            &format!("/inbox/thread/agent%3A{sender}"),
+            None,
+        )
+        .await;
         assert!(page.contains(r#""canSend":false"#), "{sender}");
         assert!(page.contains("No agent is left to reply to"), "{sender}");
         assert!(page.contains(r#"id="done""#), "{sender}");
     }
-    let (status, _) = send(&f.app, "GET", "/inbox/agent/nobody01", None).await;
+    let (status, _) = send(&f.app, "GET", "/inbox/thread/agent%3Anobody01", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -644,7 +650,7 @@ async fn opening_a_message_withdraws_its_phone_notification() {
         sender.sent.lock().unwrap()[0]["reader_path"],
         format!("/messages/{id}")
     );
-    let (status, _) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    let (status, _) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert_eq!(status, StatusCode::OK);
     pass(&f).await;
     pass(&f).await;
@@ -714,12 +720,304 @@ fn publish_doc(f: &Fixture, session: &str, path: &str, review: bool) -> String {
         .id
 }
 
+fn seed_claim(f: &Fixture, session: &str, kind: &str, number: i64) {
+    sm_server::work_claims::WorkClaimStore::new(f.dir.join("message_queue.db"))
+        .ensure_schema()
+        .unwrap();
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute("INSERT OR IGNORE INTO work_items (repo, number, kind, title, state, url) VALUES ('acme/widgets', ?1, ?2, ?3, 'open', '')",
+        params![number, kind, format!("Work {number}")]).unwrap();
+    conn.execute("INSERT INTO work_claims (id, repo, number, kind, session_id, source, claimed_at) VALUES (?1, 'acme/widgets', ?2, ?3, ?4, 'explicit', '2026-01-01T00:00:00Z')",
+        params![format!("{session}-{kind}-{number}"), number, kind, session]).unwrap();
+}
+
+#[tokio::test]
+async fn a_ticket_collects_two_agents_and_a_doc_while_an_unlinked_pr_stays_separate() {
+    let f = fixture();
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    seed_claim(&f, "child001", "ticket", 1782);
+    seed_claim(&f, "orphan01", "pr", 1790);
+    created_id(&f, "eng00001", "First agent", json!({})).await;
+    created_id(&f, "child001", "Successor", json!({})).await;
+    publish_doc(&f, "eng00001", "docs/memo.md", false);
+    created_id(&f, "orphan01", "PR update", json!({})).await;
+    let listing = inbox(&f, "open").await;
+    assert_eq!(keys(&listing).len(), 2, "{listing}");
+    let ticket = row(&listing, "ticket:acme/widgets#1782");
+    assert_eq!(ticket["message_count"], 2);
+    assert_eq!(ticket["doc_count"], 1);
+    assert_eq!(ticket["revision_count"], 1);
+    assert_eq!(ticket["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(row(&listing, "pr:acme/widgets#1790")["message_count"], 1);
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/ticket%3Aacme%2Fwidgets%231782?format=json",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert_eq!(thread["items"].as_array().unwrap().len(), 3);
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["sender"]["id"].is_string()));
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["type"] == "doc_revision"));
+}
+
+#[tokio::test]
+async fn old_done_mark_moves_to_the_ticket_without_reappearing() {
+    let f = fixture();
+    created_id(&f, "eng00001", "Already done", json!({})).await;
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "agent:eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1782"),
+        Value::Null
+    );
+    assert_eq!(
+        row(&inbox(&f, "done").await, "ticket:acme/widgets#1782")["done"],
+        true
+    );
+    created_id(&f, "eng00001", "New work", json!({})).await;
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1782")["group"],
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn legacy_agent_thread_redirect_preserves_json_and_anchor_query() {
+    let f = fixture();
+    created_id(&f, "eng00001", "Read in web Inbox", json!({})).await;
+    let mut request = Request::builder()
+        .uri("/inbox/agent/eng00001?format=json&at=message-1")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response.headers()["location"],
+        "/inbox/thread/agent%3Aeng00001?format=json&at=message-1"
+    );
+}
+
+#[tokio::test]
+async fn old_done_mark_stays_with_the_first_ticket_when_an_agent_changes_tickets() {
+    let f = fixture();
+    let first = created_id(&f, "eng00001", "First ticket", json!({})).await;
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "agent:eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    seed_claim(&f, "eng00001", "ticket", 1783);
+    let second = created_id(&f, "eng00001", "Second ticket", json!({})).await;
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute(
+        "UPDATE owner_messages SET created_at = '2026-09-29T12:00:00Z' WHERE id = ?1",
+        params![first],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE owner_messages SET created_at = '2026-10-01T12:00:00Z' WHERE id = ?1",
+        params![second],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET ended_at = '2026-09-30T00:00:00Z' WHERE number = 1782",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET claimed_at = '2026-09-30T00:00:01Z' WHERE number = 1783",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        row(&inbox(&f, "done").await, "ticket:acme/widgets#1782")["done"],
+        true
+    );
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1783")["done"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn done_reads_only_finished_work_in_the_selected_ticket() {
+    use sm_server::turn_messages::{stamp, ReplyTiming, TurnMessageStore};
+    let f = fixture();
+    seed_claim(&f, "eng00001", "ticket", 1782);
+    seed_claim(&f, "eng00001", "ticket", 1783);
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let first = time::OffsetDateTime::now_utc() - time::Duration::minutes(3);
+    let second = first + time::Duration::minutes(2);
+    let boundary = first + time::Duration::minutes(1);
+    conn.execute(
+        "UPDATE work_claims SET ended_at = ?1 WHERE number = 1782",
+        params![stamp(boundary)],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET claimed_at = ?1 WHERE number = 1783",
+        params![stamp(boundary + time::Duration::seconds(1))],
+    )
+    .unwrap();
+    let turns = TurnMessageStore::new(f.dir.join("message_queue.db"));
+    turns.record_finished("eng00001", first).unwrap();
+    turns
+        .record_turn(
+            "eng00001",
+            "claude",
+            first,
+            ReplyTiming::AtMessage,
+            "First done",
+        )
+        .unwrap();
+    turns.record_finished("eng00001", second).unwrap();
+    turns
+        .record_turn(
+            "eng00001",
+            "claude",
+            second,
+            ReplyTiming::AtMessage,
+            "Second done",
+        )
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "ticket:acme/widgets#1782"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let finished = turns.finished().unwrap();
+    assert!(finished[0].read_at.is_some());
+    assert!(finished[1].read_at.is_none());
+    assert_eq!(
+        row(&inbox(&f, "open").await, "ticket:acme/widgets#1783")["group"],
+        "finished"
+    );
+}
+
+#[tokio::test]
+async fn doc_waits_for_archive_and_a_revision_unfolds_it() {
+    use sm_server::owner_docs::{OwnerDocStore, PublishOwnerDoc};
+    let f = fixture();
+    let doc = publish_doc(&f, "orphan01", "docs/memo.md", false);
+    let store = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    store.record_view(&doc, &"b".repeat(40)).unwrap();
+    let key = "pr:acme/widgets#12";
+    assert_eq!(row(&inbox(&f, "open").await, key)["folded_by"], Value::Null);
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/inbox/archive",
+        Some(json!({"thread_key": key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(row(&inbox(&f, "open").await, key)["folded_by"], "archived");
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/unarchive",
+        Some(json!({"thread_key": key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row(&inbox(&f, "open").await, key)["folded_by"], Value::Null);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/archive",
+        Some(json!({"thread_key": key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    store
+        .publish(
+            PublishOwnerDoc {
+                repo: "acme/widgets".into(),
+                path: "docs/memo.md".into(),
+                pr_number: Some(12),
+                session_id: "orphan01".into(),
+                session_name: Some("orphan01-agent".into()),
+                title: "Queue memo".into(),
+                note: None,
+                commit_sha: "c".repeat(40),
+                blob_sha: "d".repeat(40),
+                review_requested: false,
+                checkout_root: None,
+            },
+            |_| false,
+        )
+        .unwrap();
+    let row = row(&inbox(&f, "open").await, key);
+    assert_eq!(row["folded_by"], Value::Null);
+    assert_eq!(row["revision_count"], 2);
+}
+
+#[tokio::test]
+async fn an_unread_finished_retired_agent_stays_out_of_the_fold() {
+    let f = fixture();
+    let turns = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"));
+    let at = time::OffsetDateTime::now_utc();
+    turns.record_finished("child001", at).unwrap();
+    turns
+        .record_turn(
+            "child001",
+            "claude",
+            at,
+            sm_server::turn_messages::ReplyTiming::AtMessage,
+            "Finished work",
+        )
+        .unwrap();
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:child001")["group"],
+        "finished"
+    );
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/inbox/done",
+        Some(json!({"thread_key": "agent:child001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:child001")["folded_by"],
+        "ended"
+    );
+}
+
 #[tokio::test]
 async fn inbox_groups_threads_by_what_they_need() {
     let f = fixture();
     // Read, so earlier.
     created_id(&f, "orphan01", "# Old news\nx", json!({})).await;
-    send(&f.app, "GET", "/inbox/agent/orphan01", None).await;
+    send(&f.app, "GET", "/inbox/thread/agent%3Aorphan01", None).await;
     // Unread note from an ended agent: new.
     created_id(&f, "child001", "# Inventory done\nx", json!({})).await;
     // A blocking question: needs you, with the question as the preview.
@@ -727,19 +1025,18 @@ async fn inbox_groups_threads_by_what_they_need() {
     created_id(&f, "eng00001", "# Keep it?\nx", json!({"blocking": true})).await;
     created_id(&f, "eng00001", "# Progress\nx", json!({})).await;
     // A review request from a live agent needs you; a plain publish is new.
-    let review = publish_doc(&f, "eng00001", "docs/memo.md", true);
-    let plain = publish_doc(&f, "eng00001", "docs/readout.md", false);
+    publish_doc(&f, "eng00001", "docs/memo.md", true);
+    publish_doc(&f, "eng00001", "docs/readout.md", false);
 
     let listing = inbox(&f, "open").await;
     assert_eq!(listing["needs_you_count"], 2);
     assert_eq!(listing["has_new"], true);
     let order = keys(&listing);
-    assert_eq!(order.len(), 5, "{listing}");
+    assert_eq!(order.len(), 4, "{listing}");
     assert!(order[..2].contains(&"agent:eng00001".to_owned()));
-    assert!(order[..2].contains(&format!("doc:{review}")));
-    assert!(order[2..4].contains(&"agent:child001".to_owned()));
-    assert!(order[2..4].contains(&format!("doc:{plain}")));
-    assert_eq!(order[4], "agent:orphan01");
+    assert!(order[..2].contains(&"pr:acme/widgets#12".to_owned()));
+    assert_eq!(order[2], "agent:child001");
+    assert_eq!(order[3], "agent:orphan01");
 
     let eng = row(&listing, "agent:eng00001");
     assert_eq!(eng["group"], "needs_you");
@@ -747,31 +1044,26 @@ async fn inbox_groups_threads_by_what_they_need() {
     assert_eq!(eng["message_count"], 3);
     assert_eq!(eng["open_asks"], 1);
     assert_eq!(eng["status"], "live");
-    assert_eq!(eng["url"], "/inbox/agent/eng00001");
-    let doc = row(&listing, &format!("doc:{review}"));
-    assert_eq!(doc["kind"], "doc");
+    assert_eq!(eng["url"], "/inbox/thread/agent%3Aeng00001");
+    let doc = row(&listing, "pr:acme/widgets#12");
+    assert_eq!(doc["kind"], "pr");
     assert_eq!(doc["group"], "needs_you");
     assert_eq!(doc["status"], "review_requested");
     assert_eq!(doc["preview"], "Review requested · revision 1");
     assert_eq!(doc["pr_number"], 12);
     assert_eq!(doc["author"], "eng00001-agent");
-    assert!(doc["url"]
-        .as_str()
-        .unwrap()
-        .starts_with("/docs/widgets/docs/memo.md"));
-    assert_eq!(
-        row(&listing, &format!("doc:{plain}"))["preview"],
-        "Published · for your information"
-    );
+    assert_eq!(doc["doc_count"], 2);
+    assert_eq!(doc["revision_count"], 2);
+    assert_eq!(doc["url"], "/inbox/thread/pr%3Aacme%2Fwidgets%2312");
     assert_eq!(row(&listing, "agent:child001")["status"], "ended");
 
     // The Docs filter lists every doc; the page shows the groups.
-    assert_eq!(keys(&inbox(&f, "docs").await).len(), 2);
+    assert_eq!(keys(&inbox(&f, "docs").await).len(), 1);
     let (status, page) = send(&f.app, "GET", "/inbox", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Needs you · 2"), "{page}");
-    assert!(page.contains("New · 2"), "{page}");
-    assert!(page.contains("Earlier · 1"), "{page}");
+    assert!(page.contains("New · 1"), "{page}");
+    assert!(page.contains("Folded · 1 threads"), "{page}");
     assert!(page.contains(r#"class="tab on" href="/inbox""#), "{page}");
     let (status, _) = send(&f.app, "GET", "/inbox?filter=bogus", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -809,8 +1101,8 @@ async fn a_verdict_shows_only_while_the_latest_revision_has_it() {
             },
         )
         .unwrap();
-    let key = format!("doc:{doc}");
-    let reviewed = row(&inbox(&f, "docs").await, &key);
+    let key = "pr:acme/widgets#12";
+    let reviewed = row(&inbox(&f, "docs").await, key);
     assert_eq!(reviewed["status"], "reviewed");
     assert_eq!(reviewed["verdict"], "approve");
     assert_eq!(reviewed["preview"], "You reviewed · Approved");
@@ -834,7 +1126,7 @@ async fn a_verdict_shows_only_while_the_latest_revision_has_it() {
         )
         .unwrap();
     store.record_view(&doc, &git_blob_sha(b"v2")).unwrap();
-    let read = row(&inbox(&f, "docs").await, &key);
+    let read = row(&inbox(&f, "docs").await, key);
     assert_eq!(read["status"], "read");
     assert_eq!(read["verdict"], Value::Null);
     assert_eq!(read["preview"], "Read");
@@ -843,10 +1135,10 @@ async fn a_verdict_shows_only_while_the_latest_revision_has_it() {
 #[tokio::test]
 async fn a_review_request_from_an_ended_agent_is_new_not_needs_you() {
     let f = fixture();
-    let doc = publish_doc(&f, "orphan01", "docs/memo.md", true);
+    publish_doc(&f, "orphan01", "docs/memo.md", true);
     let listing = inbox(&f, "open").await;
     assert_eq!(listing["needs_you_count"], 0);
-    assert_eq!(row(&listing, &format!("doc:{doc}"))["group"], "new");
+    assert_eq!(row(&listing, "pr:acme/widgets#12")["group"], "new");
 }
 
 #[tokio::test]
@@ -892,11 +1184,8 @@ async fn thread_send_answers_the_open_question_once() {
     assert_eq!(message["state"], "replied");
     let listing = inbox(&f, "open").await;
     assert_eq!(listing["needs_you_count"], 0);
-    assert_eq!(
-        row(&listing, "agent:eng00001")["preview"],
-        "You: The month-end recon does."
-    );
-    let (_, page) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    assert_eq!(row(&listing, "agent:eng00001")["preview"], "Copying");
+    let (_, page) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert!(
         page.contains("<blockquote>Nothing reads fills.</blockquote>"),
         "{page}"
@@ -955,7 +1244,7 @@ async fn writing_first_sends_a_note_without_a_re_line() {
     let thread = row(&listing, "agent:eng00001");
     assert_eq!(thread["preview"], "You: Pause the copy.");
     assert_eq!(thread["group"], "earlier");
-    let (_, page) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    let (_, page) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert!(page.contains("Pause the copy."), "{page}");
 }
 
@@ -981,8 +1270,8 @@ async fn done_clears_the_ask_and_anything_new_reopens_the_thread() {
     let (_, message) = request(&f.app, "GET", &format!("/messages/{ask}?format=json"), None).await;
     assert_eq!(message["state"], "handled");
     let docs = inbox(&f, "docs").await;
-    assert_eq!(row(&docs, &format!("doc:{doc}"))["status"], "new");
-    assert_eq!(row(&docs, &format!("doc:{doc}"))["done"], true);
+    assert_eq!(row(&docs, "pr:acme/widgets#12")["status"], "new");
+    assert_eq!(row(&docs, "pr:acme/widgets#12")["done"], true);
     let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
     let queue_exists: bool = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE name = 'message_queue'")
@@ -1043,7 +1332,7 @@ async fn a_fired_follow_is_new_until_its_thread_is_read() {
         thread["preview"],
         "eng00001-agent finished · No completion report published"
     );
-    let (_, page) = send(&f.app, "GET", "/inbox/agent/eng00001", None).await;
+    let (_, page) = send(&f.app, "GET", "/inbox/thread/agent%3Aeng00001", None).await;
     assert!(
         page.contains(r#"<div class="ev">eng00001-agent finished"#),
         "{page}"
@@ -1085,15 +1374,21 @@ async fn web_thread_json_preserves_quotes_and_recipient() {
         json!({"blocking":true}),
     )
     .await;
-    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Aeng00001?format=json",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(thread["session_id"], "eng00001");
+    assert_eq!(thread["thread_key"], "agent:eng00001");
     assert_eq!(thread["can_send"], true);
     let html = thread["items"][0]["html"].as_str().unwrap();
     assert!(html.contains(&format!("data-msg=\"{id}\"")), "{html}");
     assert!(html.contains("data-sm-line"), "{html}");
     let mut req = Request::builder()
-        .uri("/inbox/agent/eng00001")
+        .uri("/inbox/thread/agent%3Aeng00001")
         .header("host", "localhost")
         .body(Body::empty())
         .unwrap();
@@ -1194,7 +1489,13 @@ async fn task_complete_puts_the_summary_written_after_it_in_finished() {
     );
 
     // The thread carries the turn as its own item, sanitized.
-    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Aeng00001?format=json",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{thread}");
     let turns: Vec<&Value> = thread["items"]
         .as_array()
@@ -1324,7 +1625,13 @@ async fn the_agents_answer_to_an_inbox_send_appears_in_its_thread() {
         "**Healthy.** 99 of 123 chunks uploaded."
     );
 
-    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Aeng00001?format=json",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{thread}");
     let turns: Vec<&Value> = thread["items"]
         .as_array()
@@ -1345,7 +1652,13 @@ async fn the_agents_answer_to_an_inbox_send_appears_in_its_thread() {
         "earlier"
     );
     stop_hook(&f, "eng00001", "Unprompted progress note").await;
-    let (_, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let (_, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Aeng00001?format=json",
+        None,
+    )
+    .await;
     let turns = thread["items"]
         .as_array()
         .unwrap()
@@ -1496,7 +1809,13 @@ async fn a_missed_turn_start_hook_still_lets_the_answer_through() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     // This turn's start hook never arrived; the stored start is the earlier turn's.
     stop_hook(&f, "eng00001", "All green").await;
-    let (_, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let (_, thread) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Aeng00001?format=json",
+        None,
+    )
+    .await;
     let replies: Vec<&Value> = thread["items"]
         .as_array()
         .unwrap()

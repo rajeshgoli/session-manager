@@ -450,9 +450,10 @@ pub(super) async fn get_owner_message(
     // (sm#1647). Served here rather than redirected: the app's reader sends
     // paths it does not know to the system browser.
     let at = Some(message.id.clone()).filter(|_| query.bottom.is_none());
-    super::inbox::agent_thread_page(
+    let key = super::inbox::work_threads::key_for_message(&state, &message)?;
+    super::inbox::work_threads::thread_page(
         &state,
-        &message.sender_session_id,
+        &key,
         at,
         false,
         web::wants_shell(&state, &request),
