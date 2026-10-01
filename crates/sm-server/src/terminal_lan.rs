@@ -39,6 +39,7 @@ pub struct LanControl {
 #[derive(Default)]
 struct LanServing {
     listener: Option<std::net::TcpListener>,
+    tls: Option<RustlsConfig>,
     handle: Option<Handle<SocketAddr>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -72,14 +73,30 @@ impl LanControl {
                 let _ = task.await;
             }
         }
-        self.inner.lock().unwrap().listener = None;
+        let mut inner = self.inner.lock().unwrap();
+        inner.listener = None;
+        inner.tls = None;
         Ok(listener)
+    }
+
+    async fn reload_certificate(&self, lan: &TerminalDirectLanConfig) -> Result<()> {
+        let tls = self.inner.lock().unwrap().tls.clone();
+        if let Some(tls) = tls {
+            let dir = expand_home(&lan.cert_dir);
+            tls.reload_from_pem(
+                fs::read(dir.join("fullchain.pem"))?,
+                fs::read(dir.join("privkey.pem"))?,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn stop(&self) {
         let (handle, task) = {
             let mut inner = self.inner.lock().unwrap();
             inner.listener = None;
+            inner.tls = None;
             (inner.handle.take(), inner.task.take())
         };
         if let Some(handle) = handle {
@@ -162,7 +179,10 @@ pub async fn run(
                 Ok(renewed) => {
                     last_cert_check = Some(tokio::time::Instant::now());
                     if renewed {
-                        control.stop().await;
+                        if let Err(error) = control.reload_certificate(&lan).await {
+                            eprintln!("terminal LAN certificate reload failed: {error:#}");
+                            last_cert_check = None;
+                        }
                     }
                 }
                 Err(error) => {
@@ -216,7 +236,7 @@ async fn start_listener(
         lan.hostname, lan.port
     );
     let handle = Handle::new();
-    let server = axum_server::from_tcp_rustls(listener, tls)?.handle(handle.clone());
+    let server = axum_server::from_tcp_rustls(listener, tls.clone())?.handle(handle.clone());
     let task = tokio::spawn(async move {
         let server = server
             .serve(terminal_lan_router(state).into_make_service_with_connect_info::<SocketAddr>());
@@ -235,6 +255,7 @@ async fn start_listener(
     }
     let mut inner = control.inner.lock().unwrap();
     inner.listener = Some(retained);
+    inner.tls = Some(tls);
     inner.handle = Some(handle);
     inner.task = Some(task);
     Ok(())
@@ -651,6 +672,56 @@ mod tests {
         assert!(certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
         write_private(&key, b"invalid key").unwrap();
         assert!(!certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn certificate_reload_keeps_inherited_listener_bound() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!(
+            "sm-terminal-lan-reload-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        write_test_certificate(&dir, 1);
+        let first_cert = fs::read(dir.join("fullchain.pem")).unwrap();
+        let tls = RustlsConfig::from_pem(
+            first_cert.clone(),
+            fs::read(dir.join("privkey.pem")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let old_slot_listener = listener.try_clone().unwrap();
+        let control = LanControl::default();
+        {
+            let mut serving = control.inner.lock().unwrap();
+            serving.listener = Some(listener);
+            serving.tls = Some(tls);
+        }
+        write_test_certificate(&dir, 90);
+        assert_ne!(first_cert, fs::read(dir.join("fullchain.pem")).unwrap());
+        let lan = TerminalDirectLanConfig {
+            cert_dir: dir.to_string_lossy().into_owned(),
+            ..TerminalDirectLanConfig::default()
+        };
+        control.reload_certificate(&lan).await.unwrap();
+        assert_eq!(
+            control
+                .inner
+                .lock()
+                .unwrap()
+                .listener
+                .as_ref()
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+            address
+        );
+        assert_eq!(old_slot_listener.local_addr().unwrap(), address);
+        assert!(std::net::TcpListener::bind(address).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }
