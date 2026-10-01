@@ -266,7 +266,15 @@ pub fn render_markdown_sanitized(source: &str) -> String {
     use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
 
     fn safe(url: &str) -> bool {
-        let lower = url.trim().to_ascii_lowercase();
+        // Browsers read `\` as `/` and drop tabs and newlines, so `/\host`
+        // and `/\t/host` would leave the site.
+        if url
+            .chars()
+            .any(|ch| ch == '\\' || ch.is_whitespace() || ch.is_control())
+        {
+            return false;
+        }
+        let lower = url.to_ascii_lowercase();
         lower.starts_with("https://")
             || lower.starts_with("http://")
             || lower.starts_with('#')
@@ -551,5 +559,18 @@ mod tests {
         assert!(html.contains(r#"href="https://github.com/x""#), "{html}");
         assert!(!html.contains("javascript:"), "{html}");
         assert!(!html.contains("data:x"), "{html}");
+        for target in ["/\\evil.example", "/\t/evil.example", "//evil.example"] {
+            let html = render_markdown_sanitized(&format!("[x](<{target}>)\n"));
+            let hrefs: Vec<&str> = html
+                .split("href=\"")
+                .skip(1)
+                .filter_map(|rest| rest.split('"').next())
+                .collect();
+            assert!(
+                hrefs.iter().all(|href| !href.contains("evil")),
+                "{target}: {html}"
+            );
+        }
+        assert!(render_markdown_sanitized("[x](/inbox)\n").contains(r#"href="/inbox""#));
     }
 }
