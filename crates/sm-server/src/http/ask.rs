@@ -128,6 +128,19 @@ pub(super) async fn target(
     .into_response())
 }
 
+pub(super) async fn items(
+    state: Arc<AppState>,
+    doc_id: String,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_owner_page_read_allowed(&state, &request)?;
+    docs::find_doc(&state, &doc_id)?;
+    let items = inbox::work_threads::ThreadCatalog::load(&state)?
+        .doc_items(&doc_id)
+        .ok_or(ApiError::NotFound("Doc thread not found"))?;
+    Ok(Json(json!({"items": items})).into_response())
+}
+
 fn reader_worktree(
     state: &AppState,
     doc: &OwnerDoc,

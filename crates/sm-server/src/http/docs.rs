@@ -1732,6 +1732,9 @@ pub(super) async fn get_owner_doc_subpath(
     if rest == "ask-target" {
         return super::ask::target(state, first, request).await;
     }
+    if rest == "ask-items" {
+        return super::ask::items(state, first, request).await;
+    }
     // The JSON endpoints also take the page's doc token; pages never do.
     if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts", "reopen-target"])? {
         if !doc_token_presented(&state, request.headers(), &doc.id) {
