@@ -1837,7 +1837,8 @@ pub fn page_shell(title: &str, active_tab: &str, body: &str) -> String {
     page_shell_with_status(title, active_tab, "", body)
 }
 
-/// [`page_shell`] with `status` (HTML) at the right end of the top bar.
+/// [`page_shell`] with `status` (HTML) at the right end of the top bar. A
+/// request from the phone app gets no top bar ([`IN_APP`]).
 pub fn page_shell_with_status(title: &str, active_tab: &str, status: &str, body: &str) -> String {
     let tab = |name: &str, href: &str, label: &str| {
         let class = if name == active_tab { "tab on" } else { "tab" };
@@ -1915,18 +1916,35 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
-{body}
+{nav}{body}
 </div>
 </body>
 </html>
 "#,
         title = escape_html(title),
-        inbox = tab("inbox", "/inbox", "Inbox"),
-        watch = tab("watch", "/", "Watch"),
-        history = tab("history", "/history", "History"),
-        guestbook = tab("guestbook", "/guestbook", "Guestbook"),
+        nav = if in_app() {
+            String::new()
+        } else {
+            format!(
+                "<nav class=\"top\"><a class=\"brand\" href=\"/\">sm</a>{}{}{}{}<span class=\"sp\"></span>{status}</nav>\n",
+                tab("inbox", "/inbox", "Inbox"),
+                tab("watch", "/", "Watch"),
+                tab("history", "/history", "History"),
+                tab("guestbook", "/guestbook", "Guestbook"),
+            )
+        },
     )
+}
+
+tokio::task_local! {
+    /// True while serving a request from the phone app's Access application
+    /// (set by the router's `mark_in_app` layer).
+    pub static IN_APP: bool;
+}
+
+/// The phone app has its own tabs, so its pages carry no web top bar (1782 J4).
+fn in_app() -> bool {
+    IN_APP.try_with(|value| *value).unwrap_or(false)
 }
 
 pub fn escape_html(value: &str) -> String {
@@ -1988,6 +2006,23 @@ fn decode_basic_entities(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn page_shell_drops_the_top_bar_only_in_the_app() {
+        let nav = r#"<nav class="top">"#;
+        assert!(page_shell("History", "history", "<p>x</p>").contains(nav));
+        let in_app = IN_APP
+            .scope(true, async { page_shell("History", "history", "<p>x</p>") })
+            .await;
+        assert!(!in_app.contains(nav));
+        assert!(in_app.contains("<p>x</p>"));
+        let browser = IN_APP
+            .scope(false, async {
+                page_shell("History", "history", "<p>x</p>")
+            })
+            .await;
+        assert!(browser.contains(nav));
+    }
 
     fn store() -> (OwnerDocStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!(

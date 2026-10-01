@@ -272,6 +272,16 @@ fun WatchScreen(
         }
     }
 
+    // An agent's ⌨ from the Inbox thread or the Board opens its terminal here.
+    val pendingTerminal = li.rajeshgo.sm.ui.navigation.TerminalOpenRequests.pending
+    LaunchedEffect(pendingTerminal, state.sessions) {
+        val sessionId = pendingTerminal ?: return@LaunchedEffect
+        if (state.sessions.isEmpty() && state.loading) return@LaunchedEffect
+        li.rajeshgo.sm.ui.navigation.TerminalOpenRequests.pending = null
+        val session = state.sessions.firstOrNull { it.id == sessionId }
+        if (session != null) openAttach(session) else toast = "That agent has no terminal now"
+    }
+
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) viewModel.setTerminalForeground(false)

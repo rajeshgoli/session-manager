@@ -2096,7 +2096,25 @@ pub fn router(state: AppState) -> Router {
         APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
     ))
     .layer(axum::middleware::map_response(stamp_build))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        mark_in_app,
+    ))
     .with_state(state)
+}
+
+/// Serves a request from the phone app's Access application with
+/// [`crate::owner_docs::IN_APP`] set, so owner pages drop the web tabs.
+async fn mark_in_app(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let in_app = request_cloudflare_access_application(&state, &request)
+        == Some(CloudflareAccessApplication::MobileApp);
+    crate::owner_docs::IN_APP
+        .scope(in_app, next.run(request))
+        .await
 }
 
 /// Every response names the web build this server embeds, so an open tab
@@ -20566,10 +20584,10 @@ mod tests {
         for uri in ["/inbox", "/history", "/guestbook"] {
             let response = app.clone().oneshot(app_host(uri)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
-            assert!(
-                !body_text(response).await.contains(r#"id="sm-config""#),
-                "{uri}"
-            );
+            let html = body_text(response).await;
+            assert!(!html.contains(r#"id="sm-config""#), "{uri}");
+            // The app has its own tabs; its pages carry no web top bar (1782 J4).
+            assert!(!html.contains(r#"<nav class="top">"#), "{uri}");
         }
         for uri in ["/inbox", "/history", "/history/agents", "/guestbook"] {
             let mut request = browser(uri);

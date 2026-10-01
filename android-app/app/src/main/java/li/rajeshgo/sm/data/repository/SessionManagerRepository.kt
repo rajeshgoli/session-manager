@@ -96,6 +96,12 @@ fun stripTerminalControls(text: String): String {
  * (spec 1782 J5). A screen whose view model is recreated starts from it and
  * refreshes in the background instead of showing a spinner. Sign-out clears it.
  */
+/** The thread key in a `/inbox/thread/{key}?…` redirect target, decoded; null for anything else. */
+fun threadKeyFromLocation(location: String?): String? {
+    val path = location?.substringAfter("/inbox/thread/", "")?.substringBefore('?')?.substringBefore('#')
+    return path?.takeIf { it.isNotBlank() && '/' !in it }?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+}
+
 object ScreenCache {
     @Volatile var watch: List<ClientSession>? = null
     @Volatile var board: li.rajeshgo.sm.data.model.BoardResponse? = null
@@ -583,8 +589,19 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).endBoardLane(laneId) }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun fetchBoardStartOptions(baseUrl: String, token: String, repo: String, number: Long): li.rajeshgo.sm.data.model.BoardStartOptions = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getBoardStartOptions(repo, number) }
+    suspend fun fetchBoardStartOptions(
+        baseUrl: String,
+        token: String,
+        repo: String,
+        number: Long,
+        startBlocked: Boolean = false,
+    ): li.rajeshgo.sm.data.model.BoardStartOptions = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getBoardStartOptions(repo, number, startBlocked.takeIf { it }) }
+    }
+
+    suspend fun closeBoardTicket(baseUrl: String, token: String, repo: String, number: Long): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 60).closeBoardTicket(li.rajeshgo.sm.data.model.BoardCloseRequest(repo, number)) }
+            .mapFailure(::classifyWriteFailure)
     }
 
     suspend fun startBoardTicket(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.BoardStartRequest): Result<li.rajeshgo.sm.data.model.BoardStarted> = withContext(Dispatchers.IO) {
@@ -627,6 +644,23 @@ class SessionManagerRepository(
     suspend fun restoreSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token, readTimeoutSeconds = 120).restoreSession(sessionId); Unit }.mapFailure(::classifyWriteFailure)
     }
+
+    /** A work thread by its key, or the thread an agent's newest item is in when [key] is null. */
+    suspend fun fetchInboxThread(baseUrl: String, token: String, key: String?, sessionId: String?): li.rajeshgo.sm.data.model.InboxThread =
+        withContext(Dispatchers.IO) {
+            executeReadRequest(baseUrl, token) { service ->
+                if (key != null) return@executeReadRequest service.getInboxThread(key)
+                val response = service.getAgentThread(requireNotNull(sessionId))
+                response.body()?.takeIf { response.isSuccessful }
+                    ?: threadKeyFromLocation(response.headers()["Location"])?.let { service.getInboxThread(it) }
+                    ?: throw retrofit2.HttpException(response)
+            }
+        }
+
+    suspend fun sendInboxThread(baseUrl: String, token: String, key: String, request: li.rajeshgo.sm.data.model.InboxSendRequest): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching { api(baseUrl, token).sendInboxThread(key, request); Unit }.mapFailure(::classifyWriteFailure)
+        }
 
     suspend fun markInboxDone(baseUrl: String, token: String, threadKey: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).markInboxDone(li.rajeshgo.sm.data.model.InboxDoneRequest(threadKey)) }.mapFailure(::classifyWriteFailure)

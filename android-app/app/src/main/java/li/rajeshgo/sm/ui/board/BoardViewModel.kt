@@ -75,6 +75,8 @@ class BoardBadgeRefresher(application: Application) {
 /** Start for one ticket: the sheet's prefilled values, then the request. */
 data class BoardStartState(
     val ticket: BoardTicket,
+    /** Start anyway on a blocked ticket (spec 1782 H3). */
+    val startBlocked: Boolean = false,
     val options: BoardStartOptions? = null,
     val busy: Boolean = false,
     val error: String? = null,
@@ -148,7 +150,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<BoardUiState> = _uiState
 
-    /** Lanes the owner opened or closed; the rest follow the default, lane 1 open. */
+    /** Lanes the owner closed or reopened; the rest are open (spec 1782 H1). */
     private val _expanded = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
     val expanded: StateFlow<Map<Long, Boolean>> = _expanded
 
@@ -172,10 +174,10 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun docReaderAuth(): DocReaderAuth? = loadDocReaderAuth(settingsRepository)
 
-    fun isExpanded(laneId: Long, rank: Int): Boolean = _expanded.value[laneId] ?: (rank == 1)
+    fun isExpanded(laneId: Long): Boolean = _expanded.value[laneId] ?: true
 
-    fun toggle(laneId: Long, rank: Int) {
-        val open = isExpanded(laneId, rank)
+    fun toggle(laneId: Long) {
+        val open = isExpanded(laneId)
         _expanded.update { it + (laneId to !open) }
     }
 
@@ -301,11 +303,21 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openStart(ticket: BoardTicket) {
-        _uiState.update { it.copy(start = BoardStartState(ticket)) }
+    /** Close for a ticket whose parts are all done; [onResult] gets the failure's text, or null. */
+    fun close(ticket: BoardTicket, onResult: (String?) -> Unit) {
+        write({ onResult(it) }) { url, token ->
+            repository.closeBoardTicket(url, token, ticket.repo, ticket.number).map {
+                load(url, token)
+                onResult(null)
+            }
+        }
+    }
+
+    fun openStart(ticket: BoardTicket, startBlocked: Boolean = false) {
+        _uiState.update { it.copy(start = BoardStartState(ticket, startBlocked = startBlocked)) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            runCatching { repository.fetchBoardStartOptions(url, token, ticket.repo, ticket.number) }
+            runCatching { repository.fetchBoardStartOptions(url, token, ticket.repo, ticket.number, startBlocked) }
                 .onSuccess { options -> updateStart(ticket) { it.copy(options = options) } }
                 .onFailure { error ->
                     if (!handleAuth(error)) updateStart(ticket) { it.copy(error = error.message ?: "Couldn't prepare Start") }

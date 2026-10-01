@@ -67,18 +67,25 @@ class DocReaderTest {
     }
 
     @Test fun ownerPagesStayInTheReader() {
-        val current = "$server/history"
+        val current = "$server/t/session-manager/1452"
+        listOf(
+            "$server/t/session-manager/1452",
+            "$server/docs/widgets/memo.md",
+            "$server/inbox",
+            "$server/inbox/thread/ticket%3Ao%2Fr%231782",
+            "$server/messages/msg-1",
+        ).forEach { assertEquals(it, DocNavigation.Reload, docNavigation(server, current, it)) }
+        // The app's own tabs (spec 1782 J4): the reader stays where it is.
         listOf(
             "$server/history",
             "$server/history?agent=1490-engineer&open=1",
+            "$server/history/agents",
             "$server/guestbook",
             "$server/guestbook?repo=rajeshgoli/session-manager",
-            "$server/t/session-manager/1452",
             "$server/watch",
             "$server/",
             server,
-            "$server/docs/widgets/memo.md",
-        ).forEach { assertEquals(it, DocNavigation.Reload, docNavigation(server, current, it)) }
+        ).forEach { assertEquals(it, DocNavigation.Ignore, docNavigation(server, current, it)) }
         listOf(
             "$server/historyx",
             "$server/guestbookx",

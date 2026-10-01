@@ -86,18 +86,6 @@ class BoardModelsTest {
         assertEquals("fractal-algo-rust#1774", boardShortRef("rajeshgoli/fractal-algo-rust", 1774, lane.goal.repo))
     }
 
-    @Test fun blockedFoldShowsThreeWithNewMarks() {
-        val base = "o/r"
-        val tickets = listOf(
-            BoardTicket(repo = base, number = 1763),
-            BoardTicket(repo = base, number = 1805, new = true),
-            BoardTicket(repo = base, number = 1766),
-            BoardTicket(repo = base, number = 1774),
-        )
-        assertEquals("#1763 #1805 NEW #1766 …", blockedPreview(tickets, base))
-        assertEquals("#1763", blockedPreview(tickets.take(1), base))
-    }
-
     @Test fun boardPathsNameTheirLane() {
         assertEquals(7L, boardLaneFromPath("/board#lane-7"))
         assertEquals(0L, boardLaneFromPath("/board"))
@@ -109,9 +97,8 @@ class BoardModelsTest {
         assertNull(boardLaneForLink("https://sm.example.com/history", "sm.example.com"))
     }
 
-    /** 1844-engineer idle on 29 Sep: its one job 6th to start, 1854's two running. */
-    @Test fun agentQueueSummarisesRunningAndWaitingJobs() {
-        val now = OffsetDateTime.parse("2026-09-30T00:23:00Z")
+    /** 29 Sep: 1844-engineer waits on two jobs, 1854 runs two and waits on one. */
+    @Test fun laneQueueLineCountsItsAgentsJobs() {
         val queue = QueueOverview(
             running = listOf(
                 SessionJob(id = "a", requesterSessionId = "e1854", startedAt = "2026-09-29T22:50:00Z"),
@@ -124,12 +111,6 @@ class BoardModelsTest {
                 SessionJob(id = "e", requesterSessionId = "helper", notifySessionId = "e1844", queuedAt = "2026-09-29T23:30:00Z", position = 7),
             ),
         )
-        val idle = agentQueue(queue, "e1844", now)!!
-        assertEquals("queue: 2 waiting 1h 29m, #6 to start", agentQueueText(idle))
-        assertEquals("queue: 2 running 1h 33m · 1 waiting 2h 21m, #1 to start", agentQueueText(agentQueue(queue, "e1854", now)!!))
-        assertNull(agentQueue(queue, "nobody", now))
-        assertNull(agentQueue(null, "e1844", now))
-
         val lane = board.lanes.single().copy(
             tickets = listOf(
                 BoardTicket(number = 1844, holder = BoardHolder(sessionId = "e1844")),
@@ -138,5 +119,91 @@ class BoardModelsTest {
         )
         assertEquals("Queue: 2 running · 3 waiting", laneQueueLine(lane, queue))
         assertNull(laneQueueLine(board.lanes.single().copy(tickets = emptyList()), queue))
+    }
+
+    private fun ticket(number: Long, state: String, closedAt: String? = null, blockers: List<Long> = emptyList()) = BoardTicket(
+        repo = "o/r",
+        number = number,
+        state = state,
+        closedAt = closedAt,
+        waitsOn = blockers.map { li.rajeshgo.sm.data.model.BoardWaitsOn("o/r", it, "in_progress") },
+    )
+
+    /** Spec 1782 H1: blocked rows up to 12 non-done tickets, three done rows, short lanes. */
+    @Test fun laneGroupsFollowTheVisibilityRules() {
+        val active = listOf(ticket(1, "needs_you"), ticket(2, "close_ready"))
+        val blocked = (10L..19L).map { ticket(it, "blocked", blockers = listOf(1)) }
+        val done = listOf(
+            ticket(30, "done", "2026-09-28T10:00:00Z"),
+            ticket(31, "done", "2026-09-30T10:00:00Z"),
+            ticket(32, "done", "2026-09-29T10:00:00Z"),
+            ticket(33, "done", "2026-09-27T10:00:00Z"),
+        )
+        val groups = laneGroups(active + blocked + done)
+        assertEquals(listOf(1L, 2L), groups.active.map { it.number })
+        assertTrue("12 non-done tickets stay rows", groups.showBlocked)
+        assertFalse(groups.short)
+        assertEquals(listOf(31L, 32L, 30L, 33L), groups.done.map { it.number })
+        val crowded = laneGroups(active + blocked + ticket(20, "blocked", blockers = listOf(2)))
+        assertFalse("13 non-done tickets fold the blocked ones", crowded.showBlocked)
+        assertEquals("11 blocked · waiting on #1, #2", blockedFoldCaption(crowded.blocked, "o/r"))
+        assertTrue(laneGroups(listOf(ticket(1, "in_progress")) + blocked).short)
+    }
+
+    @Test fun otherTicketsKeepNeedsYouAndTenMore() {
+        val tickets = (1L..12L).map { ticket(it, "ready") } + ticket(40, "needs_you") + ticket(41, "needs_you")
+        val shown = visibleOther(tickets)
+        assertEquals(10, shown.size)
+        assertEquals(listOf(40L, 41L), shown.take(2).map { it.number })
+        assertEquals((1L..8L).toList(), shown.drop(2).map { it.number })
+    }
+
+    @Test fun startAnywayNamesWhatIsNotDone() {
+        assertEquals("#1777 waits on #1776, which is not done.", startAnywayText(ticket(1777, "blocked", blockers = listOf(1776)), "o/r"))
+        assertEquals("#1778 waits on #1776 and #1777, which are not done.", startAnywayText(ticket(1778, "blocked", blockers = listOf(1776, 1777)), "o/r"))
+        assertEquals(
+            "#1779 waits on #1776, #1777 and #1778, which are not done.",
+            startAnywayText(ticket(1779, "blocked", blockers = listOf(1776, 1777, 1778)), "o/r"),
+        )
+        val blocked = ticket(1, "blocked", blockers = listOf(2))
+        assertTrue(boardCanStartAnyway(blocked))
+        assertFalse(boardCanStartAnyway(blocked.copy(warnings = listOf("cycle"))))
+        assertFalse(boardCanStartAnyway(blocked.copy(warnings = listOf("stale"))))
+        assertFalse(boardCanStartAnyway(ticket(3, "ready")))
+    }
+
+    /** The fields S3 added to the ticket JSON, and the Links line they make (spec 1782 H2-H4). */
+    @Test fun containerTicketsAndLinksParse() {
+        val parsed = json.decodeFromString(
+            BoardTicket.serializer(),
+            """{"repo":"o/r","number":1782,"title":"Fit and finish","url":"u","state":"close_ready",
+               "sub_issues":{"total":14,"done":14},"started_early":true,
+               "holder":{"session_id":"df9fec5a","name":"iter8-run","provider":"claude","since":"2026-09-30T11:55:00Z","state":"idle"},
+               "prs":[{"repo":"o/r","number":1785,"state":"OPEN","url":"p",
+                 "review":{"by":"you","round":3,"verdict":null,"verdict_at":null,"waiting_since":"2026-09-30T11:56:00Z"}}],
+               "jobs":[{"id":"j1","label":"1858-run","state":"running","type":"background","since":"2026-09-30T10:41:00Z","quiet_since":null},
+                       {"id":"j2","label":"b","state":"waiting","type":"tests","since":"2026-09-30T11:58:00Z","quiet_since":null},
+                       {"id":"j3","label":"c","state":"quiet","type":"tests","since":"2026-09-30T09:00:00Z","quiet_since":"2026-09-30T11:50:00Z"},
+                       {"id":"j4","label":"d","state":"running","type":"tests","since":"2026-09-30T11:00:00Z","quiet_since":null}],
+               "thread":{"key":"agent:df9fec5a","needs_you":true,"count":2,"at":"m1"},
+               "docs":[{"title":"Memo","reader_path":"/docs/x","state":"new"}]}""",
+        )
+        val now = OffsetDateTime.parse("2026-09-30T12:00:00Z")
+        assertEquals(14, parsed.subIssues.done)
+        assertTrue(parsed.startedEarly)
+        val pr = parsed.prs.single()
+        assertEquals("PR #1785 · open · your review, round 3 · waiting 4m", li.rajeshgo.sm.ui.links.prChipText(pr, now))
+        assertEquals(li.rajeshgo.sm.ui.theme.Fuchsia, li.rajeshgo.sm.ui.links.prChipColor(pr))
+        assertEquals("iter8-run · Claude · ○ Idle 5m", li.rajeshgo.sm.ui.links.agentChipText(parsed.holder!!, now))
+        val chips = li.rajeshgo.sm.ui.links.jobChips(parsed.jobs, now) {}
+        assertEquals(
+            listOf("1858-run · running 1h 19m", "b · waiting 2m", "c · quiet 10m", "+1 jobs"),
+            chips.map { it.text },
+        )
+        // A trailing lambda is the chip's click, never its ⌨.
+        assertTrue(chips.all { it.onClick != null && it.onTerminal == null })
+        assertEquals("Inbox · question", li.rajeshgo.sm.ui.links.threadChipText(parsed.thread!!))
+        assertEquals("Inbox · 2", li.rajeshgo.sm.ui.links.threadChipText(parsed.thread!!.copy(needsYou = false)))
+        assertEquals("/docs/x", parsed.docs.single().readerPath)
     }
 }

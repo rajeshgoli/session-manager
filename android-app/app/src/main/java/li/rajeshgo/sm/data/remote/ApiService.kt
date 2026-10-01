@@ -219,6 +219,20 @@ interface ApiService {
     suspend fun getInbox(@Query("filter") filter: String): li.rajeshgo.sm.data.model.InboxResponse
 
     /** Done on a thread: clears its open ask without messaging the agent. */
+    /** One work thread (sm#1835); [key] is its `thread_key`. */
+    @GET("inbox/thread/{key}?format=json")
+    suspend fun getInboxThread(@Path("key") key: String): li.rajeshgo.sm.data.model.InboxThread
+
+    /** The agent's current thread: a redirect to `/inbox/thread/{key}`, which the client does not follow itself. */
+    @GET("inbox/agent/{session_id}?format=json")
+    suspend fun getAgentThread(@Path("session_id") sessionId: String): retrofit2.Response<li.rajeshgo.sm.data.model.InboxThread>
+
+    @POST("inbox/thread/{key}/send")
+    suspend fun sendInboxThread(
+        @Path("key") key: String,
+        @Body request: li.rajeshgo.sm.data.model.InboxSendRequest,
+    ): kotlinx.serialization.json.JsonObject
+
     @POST("inbox/done")
     suspend fun markInboxDone(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
 
@@ -265,7 +279,13 @@ interface ApiService {
     suspend fun getBoardStartOptions(
         @Query("repo") repo: String,
         @Query("number") number: Long,
+        /** Start anyway: the brief gains the "started early" paragraph. */
+        @Query("start_blocked") startBlocked: Boolean? = null,
     ): li.rajeshgo.sm.data.model.BoardStartOptions
+
+    /** Close a container ticket whose parts are all done (spec 1782 H2). */
+    @POST("client/board/close")
+    suspend fun closeBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardCloseRequest)
 
     @POST("client/board/start")
     suspend fun startBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardStartRequest): li.rajeshgo.sm.data.model.BoardStarted
