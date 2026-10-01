@@ -54,7 +54,7 @@ data class InboxUiState(
     val signedOut: Boolean = false,
     /** Review requests no reviewer could take (sm#1768 D7), shown first on Open. */
     val noReviewer: List<li.rajeshgo.sm.data.model.NoReviewerRequest> = emptyList(),
-    /** A Retry now or Review it myself in flight, by request id. */
+    /** A Retry now, Review it myself or Dismiss in flight, by request id. */
     val reviewBusy: String? = null,
 )
 
@@ -136,17 +136,20 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * The no-reviewer item's Retry now ([owner] false) or Review it myself
-     * ([owner] true); [onResult] gets the failure's text, or null.
-     */
-    fun answerNoReviewer(requestId: String, owner: Boolean, onResult: (String?) -> Unit) {
+    /** The no-reviewer item's three answers that go to the server. */
+    enum class NoReviewerAnswer { Retry, Owner, Dismiss }
+
+    /** Sends [answer] for the no-reviewer item; [onResult] gets the failure's text, or null. */
+    fun answerNoReviewer(requestId: String, answer: NoReviewerAnswer, onResult: (String?) -> Unit) {
         if (_uiState.value.reviewBusy != null) return
         _uiState.update { it.copy(reviewBusy = requestId) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            val result = if (owner) repository.ownReviewRequest(url, token, requestId)
-            else repository.retryReviewRequest(url, token, requestId)
+            val result = when (answer) {
+                NoReviewerAnswer.Retry -> repository.retryReviewRequest(url, token, requestId)
+                NoReviewerAnswer.Owner -> repository.ownReviewRequest(url, token, requestId)
+                NoReviewerAnswer.Dismiss -> repository.dismissReviewRequest(url, token, requestId)
+            }
             _uiState.update { it.copy(reviewBusy = null) }
             onResult(result.exceptionOrNull()?.let { it.message ?: "Request failed" })
             loadJob?.cancel()

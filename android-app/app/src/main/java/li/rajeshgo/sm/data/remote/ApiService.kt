@@ -319,6 +319,10 @@ interface ApiService {
     @POST("client/review-requests/{request_id}/owner")
     suspend fun ownReviewRequest(@Path("request_id") requestId: String): kotlinx.serialization.json.JsonObject
 
+    /** Dismiss: the item closes; nothing goes to the author. */
+    @POST("client/review-requests/{request_id}/dismiss")
+    suspend fun dismissReviewRequest(@Path("request_id") requestId: String): kotlinx.serialization.json.JsonObject
+
     /** Brings a stopped or retired agent back, as `sm restore` does. */
     @POST("sessions/{session_id}/restore")
     suspend fun restoreSession(@Path("session_id") sessionId: String): kotlinx.serialization.json.JsonObject

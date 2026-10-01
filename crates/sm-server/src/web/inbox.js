@@ -237,7 +237,7 @@ export function Thread({ id, workKey, controls, agent }) {
     </div>
   </section>`;
 }
-/** "PR #n has no reviewer" (1768 G6): run the policy again, change it, or review it yourself. */
+/** "PR #n has no reviewer" (1768 G6): run the policy again, change it, review it yourself, or dismiss it. */
 function ReviewAsk({ ask, onDone }) {
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
@@ -245,14 +245,15 @@ function ReviewAsk({ ask, onDone }) {
     setBusy(true); setFailure('');
     try {
       const result = await api(`/client/review-requests/${encodeURIComponent(ask.request_id)}/${path}`, { method: 'POST', body: {} });
-      toast(result.state === 'no_reviewer' ? `Still no reviewer for PR #${ask.pr_number}` : text);
+      toast(path !== 'dismiss' && result.state === 'no_reviewer' ? `Still no reviewer for PR #${ask.pr_number}` : text);
       onDone();
     } catch (e) { setFailure(e.message); } finally { setBusy(false); }
   };
   return html`<div class="review-ask"><strong class="magenta">PR #${ask.pr_number} has no reviewer</strong>
     <div class="row"><button class="btn sm pri" disabled=${busy} onClick=${() => act('retry', `Review requested again for PR #${ask.pr_number}`)}>Retry now</button>
       <button class="btn sm" disabled=${busy} onClick=${() => navigate('/settings#reviews')}>Change policy</button>
-      <button class="btn sm" disabled=${busy} onClick=${() => act('owner', `You review PR #${ask.pr_number}; sm wakes the author when your review lands`)}>Review it myself</button></div>
+      <button class="btn sm" disabled=${busy} onClick=${() => act('owner', `You review PR #${ask.pr_number}; sm wakes the author when your review lands`)}>Review it myself</button>
+      <button class="btn sm" disabled=${busy} onClick=${() => act('dismiss', `Dismissed PR #${ask.pr_number}`)}>Dismiss</button></div>
     ${failure ? html`<p role="alert" class="err">${failure}</p>` : null}</div>`;
 }
 // In another page's reading pane the thread fetches its own agent.

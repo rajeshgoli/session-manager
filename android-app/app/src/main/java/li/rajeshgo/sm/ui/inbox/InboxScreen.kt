@@ -7,6 +7,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -200,14 +202,19 @@ fun InboxScreen(
                             request = request,
                             busy = state.reviewBusy != null,
                             onRetry = {
-                                viewModel.answerNoReviewer(request.id, owner = false) { error ->
+                                viewModel.answerNoReviewer(request.id, InboxViewModel.NoReviewerAnswer.Retry) { error ->
                                     Toast.makeText(context, error ?: "Asked for a review again", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             onChangePolicy = { ReviewSettingsRequests.pending = true },
                             onReviewMyself = {
-                                viewModel.answerNoReviewer(request.id, owner = true) { error ->
+                                viewModel.answerNoReviewer(request.id, InboxViewModel.NoReviewerAnswer.Owner) { error ->
                                     Toast.makeText(context, error ?: "The author waits for your PR review", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onDismiss = {
+                                viewModel.answerNoReviewer(request.id, InboxViewModel.NoReviewerAnswer.Dismiss) { error ->
+                                    Toast.makeText(context, error ?: "Dismissed", Toast.LENGTH_SHORT).show()
                                 }
                             },
                         )
@@ -323,7 +330,8 @@ fun InboxScreen(
     }
 }
 
-/** sm#1768 Figure 7C: a PR no reviewer could take, one line per reviewer tried, and three answers. */
+/** sm#1768 Figure 7C: a PR no reviewer could take, one line per reviewer tried, and its answers. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun NoReviewerCard(
     request: li.rajeshgo.sm.data.model.NoReviewerRequest,
@@ -331,6 +339,7 @@ private fun NoReviewerCard(
     onRetry: () -> Unit,
     onChangePolicy: () -> Unit,
     onReviewMyself: () -> Unit,
+    onDismiss: () -> Unit,
 ) {
     Surface(
         color = Panel,
@@ -349,10 +358,11 @@ private fun NoReviewerCard(
             request.steps.forEach { step ->
                 Text("${step.label}: ${step.reason}", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onRetry, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Retry now") }
                 TextButton(onClick = onChangePolicy, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Change policy") }
                 TextButton(onClick = onReviewMyself, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Review it myself") }
+                TextButton(onClick = onDismiss, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Dismiss") }
             }
         }
     }
