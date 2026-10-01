@@ -167,9 +167,12 @@ pub fn reviewer_name(short: &str, ticket: i64, taken: &dyn Fn(&str) -> bool) -> 
         .expect("an unused name")
 }
 
-/// `HEAD` plus tracked-file status: what B4 compares before posting.
+/// `HEAD`, then one line per changed tracked file: its status and a hash
+/// of its staged and unstaged diff, so an edit to a file that was already
+/// modified changes the snapshot too. This is what B4 compares before posting.
 pub fn snapshot(checkout: &Path) -> Result<String> {
-    let run = |args: &[&str]| -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let run = |args: &[&str]| -> Result<Vec<u8>> {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(checkout)
@@ -180,11 +183,29 @@ pub fn snapshot(checkout: &Path) -> Result<String> {
             "{}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        Ok(String::from_utf8(out.stdout)?)
+        Ok(out.stdout)
     };
-    let head = run(&["rev-parse", "HEAD"])?;
-    let status = run(&["status", "--porcelain", "--untracked-files=no"])?;
-    Ok(format!("{}\n{status}", head.trim()))
+    let head = String::from_utf8(run(&["rev-parse", "HEAD"])?)?;
+    let status = run(&["status", "--porcelain=v1", "-z", "--untracked-files=no"])?;
+    let mut entries = status
+        .split(|b| *b == 0)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned());
+    let mut lines = vec![head.trim().to_owned()];
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (code, path) = (&entry[..2], &entry[3..]);
+        if code.contains('R') || code.contains('C') {
+            // `-z` puts a rename's source path in its own entry.
+            entries.next();
+        }
+        let mut hash = Sha256::new();
+        hash.update(run(&["diff", "--cached", "--binary", "--", path])?);
+        hash.update(run(&["diff", "--binary", "--", path])?);
+        lines.push(format!("{code}\t{path}\t{:x}", hash.finalize()));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// B4's check 4 text: the changed files, or `HEAD` when it moved.
@@ -192,26 +213,29 @@ pub fn snapshot_change(before: &str, after: &str) -> Option<String> {
     if before == after {
         return None;
     }
-    let (head_before, status_before) = before.split_once('\n').unwrap_or((before, ""));
-    let (head_after, status_after) = after.split_once('\n').unwrap_or((after, ""));
+    let (head_before, files_before) = before.split_once('\n').unwrap_or((before, ""));
+    let (head_after, files_after) = after.split_once('\n').unwrap_or((after, ""));
     if head_before != head_after {
         return Some("HEAD".into());
     }
-    let files = |status: &str| -> std::collections::BTreeSet<String> {
-        status
-            .lines()
-            .filter(|l| l.len() > 3)
-            .map(|l| l[3..].to_owned())
+    let files = |text: &str| -> std::collections::BTreeMap<String, String> {
+        text.lines()
+            .filter_map(|line| {
+                let (code, rest) = line.split_once('\t')?;
+                let (path, hash) = rest.rsplit_once('\t')?;
+                Some((path.to_owned(), format!("{code} {hash}")))
+            })
             .collect()
     };
-    let (b, a) = (files(status_before), files(status_after));
-    let changed: Vec<String> = b.symmetric_difference(&a).cloned().collect();
-    // Same file set but different status letters: name them all.
-    let changed = if changed.is_empty() {
-        a.into_iter().collect()
-    } else {
-        changed
-    };
+    let (b, a) = (files(files_before), files(files_after));
+    let changed: Vec<String> = b
+        .keys()
+        .chain(a.keys())
+        .filter(|path| b.get(*path) != a.get(*path))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     Some(changed.join(", "))
 }
 
@@ -232,20 +256,63 @@ mod tests {
 
     #[test]
     fn snapshot_changes_name_files_or_head() {
-        let before = "aaa\n M src/a.rs\n";
+        let before = "aaa\n M\tsrc/a.rs\th1";
         assert_eq!(snapshot_change(before, before), None);
         assert_eq!(
-            snapshot_change(before, "aaa\n M src/a.rs\n M src/b.rs\n").as_deref(),
+            snapshot_change(before, "aaa\n M\tsrc/a.rs\th1\n M\tsrc/b.rs\th2").as_deref(),
             Some("src/b.rs")
         );
         assert_eq!(
-            snapshot_change(before, "bbb\n M src/a.rs\n").as_deref(),
+            snapshot_change(before, "bbb\n M\tsrc/a.rs\th1").as_deref(),
             Some("HEAD")
         );
+        // Same status, different content: an already-modified file edited again.
         assert_eq!(
-            snapshot_change("aaa\n", "aaa\n M Cargo.lock\n").as_deref(),
+            snapshot_change(before, "aaa\n M\tsrc/a.rs\th9").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            snapshot_change("aaa", "aaa\n M\tCargo.lock\th3").as_deref(),
             Some("Cargo.lock")
         );
+    }
+
+    #[test]
+    fn editing_an_already_modified_file_changes_the_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "sm-paired-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success())
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "one"]);
+        // The author left a.txt modified; the reviewer edits it further.
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let before = snapshot(&dir).unwrap();
+        assert_eq!(snapshot(&dir).unwrap(), before);
+        std::fs::write(dir.join("a.txt"), "three\n").unwrap();
+        let after = snapshot(&dir).unwrap();
+        assert_eq!(snapshot_change(&before, &after).as_deref(), Some("a.txt"));
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        assert_eq!(snapshot_change(&before, &snapshot(&dir).unwrap()), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -352,7 +352,10 @@ fn prepare_round(
         if at != head {
             text.push_str(&format!("\nThe checkout is at {}, not the PR head {}. Read the PR's diff with git this round, and do not build or run anything.", short7(&at), short7(head)));
         }
-        text.push_str(&format!("\n\nYou may build and run tests. Run anything longer than a minute with `sm queue run --type tests --cwd {checkout_text}`.\n\nWhen done, write your review as JSON matching this schema, and run `sm review submit --file <path>`:\n{}\nThen stay idle. If the author pushes and asks again, sm sends you the next round.", review::SCHEMA.trim_end()));
+        if at == head {
+            text.push_str(&format!("\n\nYou may build and run tests. Run anything longer than a minute with `sm queue run --type tests --cwd {checkout_text}`."));
+        }
+        text.push_str(&format!("\n\nWhen done, write your review as JSON matching this schema, and run `sm review submit --file <path>`:\n{}\nThen stay idle. If the author pushes and asks again, sm sends you the next round.", review::SCHEMA.trim_end()));
         text
     } else {
         let at_head = if at == head {
