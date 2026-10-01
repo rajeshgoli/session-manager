@@ -83,6 +83,17 @@ fun AppNavigation() {
         null -> return
     }
 
+    // Bottom tabs keep their state and view models while another tab shows (spec 1782 J5).
+    // Watch is the root and never popped, so it has no saved state of its own: the pop
+    // files the tab above it under Watch's id, and restoring that reopened the tab (sm#1924).
+    val toTab = { route: String ->
+        navController.navigate(route) {
+            popUpTo(Routes.WATCH) { saveState = true }
+            launchSingleTop = true
+            restoreState = route != Routes.WATCH
+        }
+    }
+
     val pendingEnrollmentUrl = EnrollmentLinkRequests.pending
     LaunchedEffect(pendingEnrollmentUrl) {
         if (!pendingEnrollmentUrl.isNullOrBlank() && navController.currentDestination?.route != Routes.SETTINGS) {
@@ -108,9 +119,7 @@ fun AppNavigation() {
         if (pendingFollowOpen != null && isLoggedIn == true &&
             navController.currentDestination?.route != route
         ) {
-            navController.navigate(route) {
-                launchSingleTop = true
-            }
+            toTab(route)
         }
     }
 
@@ -124,14 +133,6 @@ fun AppNavigation() {
             badgeRefresher.refresh()
             boardBadgeRefresher.refresh()
             delay(INBOX_BADGE_REFRESH_MS)
-        }
-    }
-    // Bottom tabs keep their state and view models while another tab shows (spec 1782 J5).
-    val toTab = { route: String ->
-        navController.navigate(route) {
-            popUpTo(Routes.WATCH) { saveState = true }
-            launchSingleTop = true
-            restoreState = true
         }
     }
     val toInbox = { toTab(Routes.INBOX) }
@@ -178,9 +179,7 @@ fun AppNavigation() {
         if (pendingReaderLink != null && isLoggedIn == true &&
             navController.currentDestination?.route != Routes.WATCH
         ) {
-            navController.navigate(Routes.WATCH) {
-                launchSingleTop = true
-            }
+            toTab(Routes.WATCH)
         }
     }
 
