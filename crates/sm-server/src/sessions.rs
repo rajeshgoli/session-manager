@@ -363,12 +363,13 @@ impl SessionStore {
         session_id: &str,
         provider: &str,
         at: OffsetDateTime,
+        turn_started: Option<OffsetDateTime>,
         text: &str,
     ) {
         let Some(store) = self.turn_message_store() else {
             return;
         };
-        if let Err(error) = store.record_turn(session_id, provider, at, text) {
+        if let Err(error) = store.record_turn(session_id, provider, at, turn_started, text) {
             eprintln!("last turn message for {session_id} not recorded: {error:#}");
         }
     }
@@ -2024,6 +2025,12 @@ impl SessionStore {
                 .is_some_and(|stored| timestamp_is_after(&stored, received_at))
         });
         let superseded = superseded_by_emission || superseded_by_arrival;
+        // The turn this Stop ends began at its turn-start hook, unless a newer
+        // turn already started.
+        let turn_started = (!superseded)
+            .then(|| json_text(session.get("activity_turn_start_hook_at")))
+            .flatten()
+            .and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok());
 
         let now = now_rfc3339();
         if !superseded {
@@ -2095,7 +2102,7 @@ impl SessionStore {
             let at = emitted_at
                 .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
                 .unwrap_or_else(OffsetDateTime::now_utc);
-            self.record_turn_message(session_id, &provider, at, last_message);
+            self.record_turn_message(session_id, &provider, at, turn_started, last_message);
         }
         for (provider_resume_id, artifact_path) in seat_session_appends {
             self.append_seat_session(
@@ -8295,7 +8302,13 @@ impl SessionStore {
         if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
             if let Some(text) = codex_fork_turn_message(event) {
                 // The stream is applied in order, so arrival orders turns.
-                self.record_turn_message(session_id, &provider, OffsetDateTime::now_utc(), &text);
+                self.record_turn_message(
+                    session_id,
+                    &provider,
+                    OffsetDateTime::now_utc(),
+                    None,
+                    &text,
+                );
             }
             if let (Some(prompt), Some(queue)) =
                 (codex_fork_user_prompt(event), self.queue_store.as_ref())

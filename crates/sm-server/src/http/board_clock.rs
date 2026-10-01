@@ -52,6 +52,8 @@ pub(super) fn clocks(
         .iter()
         .map(|record| (record.id.as_str(), record))
         .collect();
+    let notes = crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
+        .all()?;
     let paths = analytics::TimePaths::new(&state.config);
     let holders: Vec<&str> = tickets
         .iter()
@@ -146,6 +148,9 @@ pub(super) fn clocks(
             no_agent_since,
             jobs: jobs.get(key).cloned().unwrap_or_default(),
             review,
+            note: holder
+                .and_then(|holder| notes.get(&holder.session_id))
+                .map(|note| (parse_time(&note.at).unwrap_or(now), note.text.clone())),
         };
         let ball = clock::ball(&clock_facts, now, stall);
         let mut ticket_intervals = intervals.get(key).cloned().unwrap_or_default();

@@ -1255,6 +1255,7 @@ async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
             "child001",
             "claude",
             time::OffsetDateTime::now_utc(),
+            None,
             &"x".repeat(400),
         )
         .unwrap();
@@ -1280,9 +1281,192 @@ async fn an_unread_finished_thread_stays_open_past_the_open_window() {
             "eng00001",
             "claude",
             long_ago + time::Duration::minutes(1),
+            None,
             "Done long ago",
         )
         .unwrap();
     let listing = inbox(&f, "open").await;
     assert_eq!(row(&listing, "agent:eng00001")["group"], "finished");
+}
+
+// ---- An agent's answer to an Inbox send (sm#1844) --------------------------
+
+#[tokio::test]
+async fn the_agents_answer_to_an_inbox_send_appears_in_its_thread() {
+    let f = fixture();
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/inbox/agent/eng00001/send",
+        Some(json!({"submission_id": "send-1844-a", "body": "Is the run healthy?"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Hook times are sent with second precision; step past the send's second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(json!({"hook_event_name": "UserPromptSubmit",
+                    "session_manager_id": "eng00001",
+                    "prompt": "[Input from: Rajesh via sm app] Is the run healthy?"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    stop_hook(&f, "eng00001", "**Healthy.** 99 of 123 chunks uploaded.").await;
+
+    let listing = inbox(&f, "open").await;
+    let thread_row = row(&listing, "agent:eng00001");
+    assert_eq!(thread_row["group"], "new", "{listing}");
+    assert_eq!(
+        thread_row["preview"],
+        "**Healthy.** 99 of 123 chunks uploaded."
+    );
+
+    let (status, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    let turns: Vec<&Value> = thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "turn")
+        .collect();
+    assert_eq!(turns.len(), 1, "{thread}");
+    assert_eq!(turns[0]["finished"], false);
+    assert!(turns[0]["html"]
+        .as_str()
+        .unwrap()
+        .contains("<strong>Healthy.</strong>"));
+
+    // Reading the thread makes it earlier; a later turn adds nothing.
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:eng00001")["group"],
+        "earlier"
+    );
+    stop_hook(&f, "eng00001", "Unprompted progress note").await;
+    let (_, thread) = request(&f.app, "GET", "/inbox/agent/eng00001?format=json", None).await;
+    let turns = thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "turn")
+        .count();
+    assert_eq!(turns, 1, "{thread}");
+}
+
+#[tokio::test]
+async fn check_clears_a_review_request_and_a_finished_summary_from_the_agents_page() {
+    let f = fixture();
+    let doc = publish_doc(&f, "eng00001", "docs/memo.md", true);
+    let entry = watch_entry(&f, "eng00001").await;
+    assert_eq!(entry["facts"]["you"]["kind"], "doc_review", "{entry}");
+    assert_eq!(entry["facts"]["you"]["dismissible"], true);
+
+    // An empty body clears what the card shows: here, the review request.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/needs-you/answered",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "doc_review");
+    assert!(body["facts"]["you"].is_null(), "{body}");
+    let docs = inbox(&f, "docs").await;
+    assert_ne!(row(&docs, &format!("doc:{doc}"))["group"], "needs_you");
+
+    // Finished: ✓ marks it read, as Inbox Done does.
+    stop_hook(&f, "eng00001", "Working").await;
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/task-complete",
+        Some(json!({"requester_session_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    stop_hook(&f, "eng00001", "All done").await;
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:eng00001")["group"],
+        "finished"
+    );
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/needs-you/answered",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "finished");
+    assert!(body["facts"]["finished"].is_null(), "{body}");
+    assert_ne!(
+        row(&inbox(&f, "open").await, "agent:eng00001")["group"],
+        "finished"
+    );
+
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/needs-you/answered",
+        Some(json!({"kind": "bogus"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_note_is_pinned_shown_in_facts_and_removed() {
+    let f = fixture();
+    let (status, body) = request(
+        &f.app,
+        "PUT",
+        "/sessions/eng00001/note",
+        Some(json!({"text": "Waiting for the midnight window"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["note"]["text"], "Waiting for the midnight window");
+    let entry = watch_entry(&f, "eng00001").await;
+    assert_eq!(
+        entry["facts"]["note"]["text"],
+        "Waiting for the midnight window"
+    );
+    assert_eq!(entry["attention"]["reason"], "note", "{entry}");
+
+    let (status, body) = request(
+        &f.app,
+        "PUT",
+        "/sessions/eng00001/note",
+        Some(json!({"text": ""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["note"].is_null());
+    assert!(watch_entry(&f, "eng00001").await["facts"]["note"].is_null());
+
+    let (status, _) = request(&f.app, "PUT", "/sessions/eng00001/note", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/sessions/nobody01/note",
+        Some(json!({"text": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn last_turn_carries_sanitized_html() {
+    let f = fixture();
+    stop_hook(&f, "eng00001", "**Done.**\n- one\n<script>x</script>").await;
+    let (status, turn) = request(&f.app, "GET", "/sessions/eng00001/last-turn", None).await;
+    assert_eq!(status, StatusCode::OK, "{turn}");
+    let html = turn["html"].as_str().unwrap();
+    assert!(html.contains("<strong>Done.</strong>"), "{html}");
+    assert!(html.contains("<li>one</li>"), "{html}");
+    assert!(!html.contains("<script>"), "{html}");
 }

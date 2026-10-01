@@ -56,6 +56,7 @@ pub(super) async fn answer_session_needs_you(
     Path(session_id): Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let path = format!("/sessions/{session_id}/needs-you/answered");
     if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
@@ -65,11 +66,89 @@ pub(super) async fn answer_session_needs_you(
     if state.session_store.get_session(&session_id)?.is_none() {
         return Err(ApiError::NotFound("Session not found"));
     }
-    let _guard = state.owner_message_lock.lock().await;
-    owner_answered(&state, &session_id, "manual")?;
-    Ok(Json(
-        json!({"facts": super::watch::session_facts(&state, &session_id)?}),
-    ))
+    // ✓ clears what the card shows (sm#1851): an open question, a review
+    // request ("No review needed", as Inbox Done does), or a Finished
+    // summary. `kind` picks one; without it, the one shown is cleared.
+    let requested: Value = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).map_err(|_| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Body must be JSON".into(),
+        })?
+    };
+    let facts = super::watch::session_facts(&state, &session_id)?;
+    let shown = match facts["you"]["kind"].as_str() {
+        Some(kind) => kind,
+        None if !facts["finished"].is_null() => "finished",
+        None => "message",
+    };
+    let kind = requested["kind"].as_str().unwrap_or(shown);
+    match kind {
+        "message" => {
+            let _guard = state.owner_message_lock.lock().await;
+            owner_answered(&state, &session_id, "manual")?;
+        }
+        "doc_review" => {
+            if let Some(doc_id) = facts["you"]["doc_id"].as_str() {
+                let _guard = state.owner_doc_review_lock.lock().await;
+                super::docs::owner_doc_store(&state).dismiss_review(doc_id)?;
+                super::board::request_recompute(&state);
+            }
+        }
+        "finished" => {
+            if let Some(store) = state.session_store.turn_message_store() {
+                store.mark_read(&session_id, OffsetDateTime::now_utc())?;
+            }
+        }
+        "prompt" => {}
+        _ => {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: "kind must be message, doc_review or finished".into(),
+            })
+        }
+    }
+    Ok(Json(json!({
+        "kind": kind,
+        "facts": super::watch::session_facts(&state, &session_id)?,
+    })))
+}
+
+/// `PUT /sessions/{id}/note`: pin a note to an agent, or remove it with
+/// blank text (sm#1851). A pinned note replaces "stalled".
+pub(super) async fn put_agent_note(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let path = format!("/sessions/{session_id}/note");
+    if owner_web_guard(&state, &headers, Some(peer_addr), "PUT")?.is_none() {
+        ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), &path)?;
+    }
+    ensure_core_writes_enabled(&state)?;
+    if state.session_store.get_session(&session_id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    let payload: Value = serde_json::from_slice(&body).map_err(|_| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: "Body must be JSON with a text field".into(),
+    })?;
+    let Some(text) = payload["text"].as_str() else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "text is required; blank removes the note".into(),
+        });
+    };
+    let note = crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
+        .set(&session_id, text, &now_rfc3339())?;
+    super::board::request_recompute(&state);
+    Ok(Json(json!({
+        "note": note,
+        "facts": super::watch::session_facts(&state, &session_id)?,
+    })))
 }
 
 /// `GET /sessions/{id}/last-turn`: the text the agent wrote at the end of
@@ -91,7 +170,11 @@ pub(super) async fn get_last_turn(
         .transpose()?
         .flatten()
         .ok_or(ApiError::NotFound("No last turn message"))?;
-    Ok(Json(json!({"at": turn.at, "text": turn.text})))
+    Ok(Json(json!({
+        "at": turn.at,
+        "html": crate::owner_doc_render::render_markdown_sanitized(&turn.text),
+        "text": turn.text,
+    })))
 }
 
 /// Retired or killed: the session will never read another message.

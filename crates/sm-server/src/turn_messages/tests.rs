@@ -22,20 +22,20 @@ fn minutes(n: i64) -> OffsetDateTime {
 fn stop_then_task_complete_then_stop_fills_from_the_second_stop() {
     let store = store();
     store
-        .record_turn("s1", "claude", minutes(0), "Working on it")
+        .record_turn("s1", "claude", minutes(0), None, "Working on it")
         .unwrap();
     store.record_finished("s1", minutes(1)).unwrap();
     let row = &store.finished().unwrap()[0];
     assert_eq!(row.text, None);
     store
-        .record_turn("s1", "claude", minutes(2), "1855 done and closed")
+        .record_turn("s1", "claude", minutes(2), None, "1855 done and closed")
         .unwrap();
     let row = &store.finished().unwrap()[0];
     assert_eq!(row.text.as_deref(), Some("1855 done and closed"));
     assert_eq!(row.text_at.as_deref(), Some(stamp(minutes(2)).as_str()));
     // A later turn does not overwrite the filled row.
     store
-        .record_turn("s1", "claude", minutes(3), "Anything else?")
+        .record_turn("s1", "claude", minutes(3), None, "Anything else?")
         .unwrap();
     assert_eq!(
         store.finished().unwrap()[0].text.as_deref(),
@@ -51,18 +51,18 @@ fn stop_then_task_complete_then_stop_fills_from_the_second_stop() {
 fn an_older_stop_arriving_late_neither_replaces_the_last_turn_nor_fills_a_newer_finish() {
     let store = store();
     store
-        .record_turn("s1", "claude", minutes(5), "Newer turn")
+        .record_turn("s1", "claude", minutes(5), None, "Newer turn")
         .unwrap();
     store.record_finished("s1", minutes(6)).unwrap();
     // A Stop emitted at minute 2 arrives now.
     store
-        .record_turn("s1", "claude", minutes(2), "Older turn")
+        .record_turn("s1", "claude", minutes(2), None, "Older turn")
         .unwrap();
     assert_eq!(store.last_turn("s1").unwrap().unwrap().text, "Newer turn");
     assert_eq!(store.finished().unwrap()[0].text, None);
     // A Stop emitted after the completion fills it, even if it arrives late.
     store
-        .record_turn("s1", "claude", minutes(7), "Closing summary")
+        .record_turn("s1", "claude", minutes(7), None, "Closing summary")
         .unwrap();
     assert_eq!(
         store.finished().unwrap()[0].text.as_deref(),
@@ -74,7 +74,13 @@ fn an_older_stop_arriving_late_neither_replaces_the_last_turn_nor_fills_a_newer_
 fn task_complete_without_a_later_stop_falls_back_after_ten_minutes() {
     let store = store();
     store
-        .record_turn("s1", "claude", minutes(0), "Summary before completing")
+        .record_turn(
+            "s1",
+            "claude",
+            minutes(0),
+            None,
+            "Summary before completing",
+        )
         .unwrap();
     store.record_finished("s1", minutes(1)).unwrap();
     assert_eq!(store.sweep(minutes(10)).unwrap(), 0);
@@ -140,4 +146,94 @@ fn a_missing_database_reads_empty() {
     assert!(store.last_turns().unwrap().is_empty());
     assert!(store.finished().unwrap().is_empty());
     assert_eq!(store.sweep(T0).unwrap(), 0);
+}
+
+/// A store whose owner-note table holds sends to `s1` at the given times.
+fn store_with_notes(sent: &[OffsetDateTime]) -> TurnMessageStore {
+    let store = store();
+    let conn = store.open_write().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE owner_message_notes (id TEXT, session_id TEXT, body TEXT, \
+         delivered_text TEXT, delivered_to_session_id TEXT, created_at TEXT)",
+    )
+    .unwrap();
+    for (index, at) in sent.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO owner_message_notes VALUES (?1, 's1', 'b', 'b', 's1', ?2)",
+            params![
+                format!("n{index}"),
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    }
+    store
+}
+
+fn now_plus(minutes: i64) -> OffsetDateTime {
+    (OffsetDateTime::now_utc() + time::Duration::minutes(minutes))
+        .replace_nanosecond(0)
+        .unwrap()
+}
+
+#[test]
+fn the_first_turn_started_after_a_send_answers_it_once() {
+    let store = store_with_notes(&[now_plus(1)]);
+    // A turn that began before the send and ended after it is not the answer.
+    store
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(2),
+            Some(now_plus(0)),
+            "Unrelated work",
+        )
+        .unwrap();
+    assert!(store.thread_replies().unwrap().is_empty());
+    store
+        .record_turn(
+            "s1",
+            "claude",
+            now_plus(4),
+            Some(now_plus(3)),
+            "Here is my answer",
+        )
+        .unwrap();
+    store
+        .record_turn("s1", "claude", now_plus(6), Some(now_plus(5)), "Later turn")
+        .unwrap();
+    let replies = store.thread_replies().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].text, "Here is my answer");
+    assert_eq!(replies[0].input_at, stamp(now_plus(1)));
+}
+
+#[test]
+fn two_sends_before_one_turn_get_one_answer() {
+    let store = store_with_notes(&[now_plus(1), now_plus(2)]);
+    store
+        .record_turn("s1", "claude", now_plus(4), Some(now_plus(3)), "One answer")
+        .unwrap();
+    let replies = store.thread_replies().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].input_at, stamp(now_plus(2)));
+}
+
+#[test]
+fn sends_from_before_replies_were_recorded_get_no_answer() {
+    let store = store_with_notes(&[now_plus(-60)]);
+    store
+        .record_turn("s1", "claude", now_plus(2), Some(now_plus(1)), "Anything")
+        .unwrap();
+    assert!(store.thread_replies().unwrap().is_empty());
+}
+
+#[test]
+fn without_a_turn_start_the_message_time_decides() {
+    let store = store_with_notes(&[now_plus(1)]);
+    store
+        .record_turn("s1", "codex-fork", now_plus(2), None, "Codex answer")
+        .unwrap();
+    assert_eq!(store.thread_replies().unwrap()[0].text, "Codex answer");
 }

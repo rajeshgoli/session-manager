@@ -176,6 +176,8 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             .map(|entry| (entry.message.id.clone(), entry.message))
             .collect();
     let colliding = colliding_sessions(state, &directory)?;
+    let notes = crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
+        .all()?;
     let finished = state
         .session_store
         .turn_message_store()
@@ -209,6 +211,7 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
     let fact_context = FactContext {
         messages: &messages,
         finished: &finished,
+        notes: &notes,
         config,
         now,
     };
@@ -407,6 +410,8 @@ struct FactContext<'a> {
     messages: &'a BTreeMap<String, crate::owner_messages::OwnerMessage>,
     /// Each session's newest Finished row (spec 1782 D2).
     finished: &'a BTreeMap<String, crate::turn_messages::FinishedRow>,
+    /// Notes the owner pinned to agents (sm#1851).
+    notes: &'a BTreeMap<String, crate::agent_notes::AgentNote>,
     config: &'a AppConfig,
     now: OffsetDateTime,
 }
@@ -422,6 +427,7 @@ fn agent_facts(
     let FactContext {
         messages,
         finished,
+        notes,
         config,
         now,
     } = context;
@@ -584,9 +590,11 @@ fn agent_facts(
             "message_ids": open_messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
             "dismissible": true})
     } else if let Some(doc) = doc_review {
+        // ✓ answers it with "No review needed", as Inbox Done does (sm#1851).
         json!({"kind": "doc_review", "since": doc["since"],
             "text": format!("Review: {}", s(doc, "label").trim_start_matches("Owner review · ")),
-            "more": doc_reviews.len() - 1 + usize::from(prompt), "message_ids": [], "dismissible": false})
+            "more": doc_reviews.len() - 1 + usize::from(prompt), "message_ids": [],
+            "doc_id": doc["id"], "dismissible": true})
     } else if prompt {
         json!({"kind": "prompt", "since": activity_since,
             "text": "Allow prompt in its terminal", "more": 0,
@@ -603,8 +611,10 @@ fn agent_facts(
             Value::Null,
             |row| json!({"at": row.completed_at, "text": row.text, "read": false}),
         );
+    let note = notes.get(s(session, "id"));
     let facts = json!({"agent": {"state": agent_state, "since": activity_since},
-        "jobs": job_facts, "you": you, "finished": finished});
+        "jobs": job_facts, "you": you, "finished": finished,
+        "note": note.map_or(Value::Null, |note| json!({"text": note.text, "at": note.at}))});
     let last = s(session, "last_activity");
     let has_claim = claims
         .as_array()
@@ -612,13 +622,15 @@ fn agent_facts(
     let threshold = i64::from(config.web_watch.waiting_long_minutes);
     let waiting_long = oldest_wait.is_some_and(|at| old_enough(at, now, threshold));
     let review_long = review_since.is_some_and(|at| old_enough(at, now, threshold));
-    let stalled = !working
+    // A pinned note says why the agent waits, so it is not stalled.
+    let idle_with_claim = !working
         && running.is_empty()
         && pending.is_empty()
         && review.is_none()
         && has_claim
         && activity_since
             .is_some_and(|at| old_enough(at, now, i64::from(config.board.stall_minutes)));
+    let stalled = idle_with_claim && note.is_none();
     let (section, reason, key) = if stopped {
         ("stopped", Value::Null, inverse_time(last))
     } else if !you.is_null() {
@@ -654,6 +666,8 @@ fn agent_facts(
             .max()
             .unwrap_or(last);
         ("moving", Value::Null, inverse_time(latest))
+    } else if let Some(note) = note {
+        ("waiting", json!("note"), note.at.clone())
     } else if !pending.is_empty() || review.is_some() {
         (
             "waiting",
@@ -1125,6 +1139,7 @@ mod facts_tests {
         let context = FactContext {
             messages: &messages,
             finished: &finished,
+            notes: &BTreeMap::new(),
             config: &config,
             now,
         };
@@ -1221,6 +1236,7 @@ mod facts_tests {
         let context = FactContext {
             messages: &messages,
             finished: &finished,
+            notes: &BTreeMap::new(),
             config: &config,
             now,
         };
@@ -1248,8 +1264,53 @@ mod facts_tests {
             &context,
         );
         assert_eq!(facts["you"]["kind"], "doc_review");
-        assert_eq!(facts["you"]["dismissible"], false);
+        assert_eq!(facts["you"]["dismissible"], true);
         assert_eq!(attention["section"], "you");
+    }
+
+    /// sm-1784 waits for a clean midnight window: idle 34m with a ticket,
+    /// nothing running. Stalled, until the owner pins a note (sm#1851).
+    #[test]
+    fn a_pinned_note_turns_stalled_into_waiting() {
+        let now = OffsetDateTime::parse("2026-09-30T19:47:00Z", &Rfc3339).unwrap();
+        let config = AppConfig::default();
+        let messages = BTreeMap::new();
+        let finished = BTreeMap::new();
+        let session = json!({"id": "s1784", "status": "active", "activity_state": "idle",
+            "last_activity": "2026-09-30T19:13:00Z"});
+        let claims = json!([{"kind": "ticket"}]);
+        let facts_with = |notes: &BTreeMap<String, crate::agent_notes::AgentNote>| {
+            let context = FactContext {
+                messages: &messages,
+                finished: &finished,
+                notes,
+                config: &config,
+                now,
+            };
+            agent_facts(
+                &session,
+                &json!([]),
+                &claims,
+                &[],
+                Some("2026-09-30T19:13:00Z"),
+                &context,
+            )
+        };
+        let (facts, attention) = facts_with(&BTreeMap::new());
+        assert_eq!(attention["section"], "waiting_long");
+        assert_eq!(attention["reason"], "stalled");
+        assert!(facts["note"].is_null());
+        let notes = BTreeMap::from([(
+            "s1784".to_owned(),
+            crate::agent_notes::AgentNote {
+                text: "Waiting for the midnight window".to_owned(),
+                at: "2026-09-30T19:30:00Z".to_owned(),
+            },
+        )]);
+        let (facts, attention) = facts_with(&notes);
+        assert_eq!(attention["section"], "waiting");
+        assert_eq!(attention["reason"], "note");
+        assert_eq!(facts["note"]["text"], "Waiting for the midnight window");
     }
 
     /// far-1855: idle since 15:01:43, no claim, an unread Finished row at
@@ -1270,6 +1331,7 @@ mod facts_tests {
         let context = FactContext {
             messages: &messages,
             finished: &finished,
+            notes: &BTreeMap::new(),
             config: &config,
             now,
         };
@@ -1304,6 +1366,7 @@ mod facts_tests {
         let context = FactContext {
             messages: &messages,
             finished: &finished,
+            notes: &BTreeMap::new(),
             config: &config,
             now,
         };
@@ -1316,6 +1379,7 @@ mod facts_tests {
         let context = FactContext {
             messages: &messages,
             finished: &finished,
+            notes: &BTreeMap::new(),
             config: &config,
             now,
         };

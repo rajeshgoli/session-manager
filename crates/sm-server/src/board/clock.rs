@@ -59,6 +59,9 @@ pub struct ClockFacts {
     pub jobs: Vec<ClockJob>,
     /// The Codex review the holder waits on: PR number, requested at.
     pub review: Option<(i64, OffsetDateTime)>,
+    /// A note the owner pinned to the holder (sm#1851): it replaces Idle
+    /// and Stalled, since the owner knows why the agent waits.
+    pub note: Option<(OffsetDateTime, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +226,9 @@ pub fn ball(facts: &ClockFacts, now: OffsetDateTime, stall: Duration) -> Ball {
         );
     }
     if let Some((Activity::Idle, since)) = facts.holder {
+        if let Some((pinned, note)) = &facts.note {
+            return make("idle", *pinned, format!("📌 {note}"));
+        }
         let idle = now - since;
         return if idle < stall {
             make("idle", since, format!("Idle {}", age(idle)))

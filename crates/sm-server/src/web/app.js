@@ -5,7 +5,7 @@
 import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  html, api, bus, network, usePoll, useShared, setShared, stored, store, panels,
+  html, api, bus, build, network, usePoll, useShared, setShared, stored, store, panels,
   openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
@@ -86,6 +86,7 @@ function App() {
   const [creating, setCreating] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [offline, setOffline] = useState(network.offline);
+  const [stale, setStale] = useState(build.stale);
 
   const updateLayout = useCallback((patch) => {
     setLayout((prev) => {
@@ -102,8 +103,8 @@ function App() {
       bus.on('navigate', (path) => {
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
-        if (target && target.legacy) {
-          location.href = path;
+        if ((target && target.legacy) || build.stale) {
+          location.href = urlFor(path, null);
           return;
         }
         history.pushState(null, '', urlFor(path, null));
@@ -126,6 +127,7 @@ function App() {
       }),
       bus.on('new-agent', (prefill) => setCreating(prefill)),
       bus.on('network', setOffline),
+      bus.on('stale-build', setStale),
     ];
     return () => {
       window.removeEventListener('popstate', pop);
@@ -154,7 +156,7 @@ function App() {
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
       <${Rail} page=${page} layout=${layout} updateLayout=${updateLayout} />
       <main class="main">
-        <${TopBar} page=${page} offline=${offline} onSearch=${() => setPalette(true)}
+        <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
           creating=${creating} setCreating=${setCreating} />
         <${Page} page=${page} loc=${loc} />
       </main>
@@ -275,7 +277,7 @@ function Meter({ label, total, queue, text, className = '' }) {
     <i><s style=${`${width(total)};opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(Math.min(total || 0, queue))}></s>` : null}</i>${text}</span>`;
 }
 
-function TopBar({ page, offline, onSearch, creating, setCreating }) {
+function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
   const [host] = usePoll(() => api('/client/host-status'), 10000);
   const queue = useShared('queue');
   const current = PAGES.find((p) => p.key === page);
@@ -290,6 +292,7 @@ function TopBar({ page, offline, onSearch, creating, setCreating }) {
     <button type="button" class="search" onClick=${onSearch}><span>Search or jump…</span><kbd>⌘K</kbd></button>
     <span class="sp"></span>
     ${offline ? html`<span class="offline" role="status">Offline, retrying</span>` : null}
+    ${stale ? html`<button type="button" class="stale-build" onClick=${() => location.reload()}>sm was updated · Reload</button>` : null}
     <span class="meters">
       ${mac
         ? html`<${Meter} label="Memory" total=${memPct(mac.memory_used_bytes)}

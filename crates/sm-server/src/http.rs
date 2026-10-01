@@ -627,6 +627,9 @@ impl AppState {
         {
             crate::owner_messages::OwnerMessageStore::new(queue_db_path.clone()).ensure_schema()?;
         }
+        if config.rust_core.fixture_writes_enabled || config.rust_core.runtime_enabled {
+            crate::turn_messages::TurnMessageStore::new(queue_db_path.clone()).ensure_schema()?;
+        }
         let board_wake = Arc::new(board::BoardWake::default());
         let codex_board_wake = board_wake.clone();
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
@@ -1945,6 +1948,10 @@ pub fn router(state: AppState) -> Router {
             get(messages::get_last_turn),
         )
         .route(
+            "/sessions/{session_id}/note",
+            axum::routing::put(messages::put_agent_note),
+        )
+        .route(
             "/sessions/{session_id}/notify-on-stop",
             post(arm_stop_notify),
         )
@@ -2027,7 +2034,18 @@ pub fn router(state: AppState) -> Router {
     app.layer(DefaultBodyLimit::max(
         APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
     ))
+    .layer(axum::middleware::map_response(stamp_build))
     .with_state(state)
+}
+
+/// Every response names the web build this server embeds, so an open tab
+/// can tell it is running code from before a deploy (sm#1829).
+async fn stamp_build(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        "x-sm-build",
+        axum::http::HeaderValue::from_static(web::build_id()),
+    );
+    response
 }
 
 async fn health() -> Json<Value> {
@@ -20569,6 +20587,14 @@ mod tests {
         // The shell still needs the owner's login.
         let (status, _) = browser_host_get(&app, "/queue", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Every response names the build, so an open tab can see a deploy.
+        let response = app
+            .clone()
+            .oneshot(browser("/assets/missing.js"))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-sm-build"], build);
 
         // Assets: versioned by URL, so cached for a year.
         let response = app
