@@ -805,7 +805,8 @@ mod tests {
         )
         .unwrap();
         let step = json!({"kind":"codex","model":"gpt-6-sol","effort":"medium"});
-        RetainedQueueStore::initialize_review_chain(&db, &r.id, &review::chain(&step)).unwrap();
+        RetainedQueueStore::initialize_review_chain(&db, &r.id, &review::chain(&step), "default")
+            .unwrap();
         let r = RetainedQueueStore::get_codex_review_request_from_path(&db, &r.id)
             .unwrap()
             .unwrap();

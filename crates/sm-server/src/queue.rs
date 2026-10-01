@@ -677,9 +677,14 @@ impl RetainedQueueStore {
         Ok(())
     }
 
-    pub fn initialize_review_chain(db_path: &Path, id: &str, chain: &[JsonValue]) -> Result<()> {
+    pub fn initialize_review_chain(
+        db_path: &Path,
+        id: &str,
+        chain: &[JsonValue],
+        source: &str,
+    ) -> Result<()> {
         let conn = Connection::open(db_path)?;
-        conn.execute("UPDATE codex_review_request_registrations SET chain_json=?2, step_state='ready', reviewer_label=?3 WHERE id=?1 AND is_active=1",params![id,serde_json::to_string(chain)?,crate::review::label(&chain[0])])?;
+        conn.execute("UPDATE codex_review_request_registrations SET chain_json=?2, step_state='ready', reviewer_label=?3, policy_source=?4 WHERE id=?1 AND is_active=1",params![id,serde_json::to_string(chain)?,crate::review::label(&chain[0]),source])?;
         Ok(())
     }
 

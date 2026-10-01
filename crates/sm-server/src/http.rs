@@ -345,6 +345,7 @@ mod history;
 mod inbox;
 mod merge_holds;
 mod messages;
+mod review_policies;
 mod review_runs;
 mod settings;
 mod watch;
@@ -1696,6 +1697,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/review-requests",
             get(list_codex_review_requests).post(create_codex_review_request),
+        )
+        .route(
+            "/review-policies",
+            get(review_policies::get_policy).put(review_policies::put_policy),
         )
         .route(
             "/review-requests/{request_id}",
@@ -5027,10 +5032,21 @@ async fn create_review_request_core(
             }
         })?;
         let settings = state.session_store.owner_settings()?;
+        let policy = crate::review::policy::resolve(
+            &queue_db_path,
+            &repo,
+            Some(payload.pr_number),
+            None,
+            None,
+            &settings["reviews"]["reviewer"],
+        )?;
+        let mut chain = vec![policy["reviewer"].clone()];
+        chain.extend(policy["fallback"].as_array().into_iter().flatten().cloned());
         RetainedQueueStore::initialize_review_chain(
             &queue_db_path,
             &registration.id,
-            &crate::review::chain(&settings["reviews"]["reviewer"]),
+            &chain,
+            policy["source"].as_str().unwrap_or("default"),
         )?;
         let initialized = RetainedQueueStore::get_codex_review_request_from_path(
             &queue_db_path,

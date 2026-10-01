@@ -334,7 +334,70 @@ pub(super) fn board_payload(
             links.attach(ticket);
         }
     }
+    add_review_fields(state, &mut payload)?;
     Ok(payload)
+}
+
+fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()> {
+    let db = expand_home(&state.config.sm_send.db_path);
+    let policies = crate::review::policy::list(&db)?;
+    let mut by_key = BTreeMap::new();
+    for policy in policies {
+        by_key.insert(
+            (
+                policy["scope"].as_str().unwrap_or("").to_owned(),
+                policy["repo"].as_str().unwrap_or("").to_owned(),
+                policy["number"].as_i64().unwrap_or(0),
+            ),
+            policy,
+        );
+    }
+    let requests = RetainedQueueStore::list_active_codex_review_requests_from_path(&db)?;
+    let mut by_pr = BTreeMap::new();
+    for request in requests {
+        by_pr.insert((request.repo.clone(), request.pr_number), request);
+    }
+    let decorate_ticket = |ticket: &mut Value| {
+        let repo = ticket["repo"].as_str().unwrap_or("");
+        let number = ticket["number"].as_i64().unwrap_or(0);
+        ticket["review_policy"] = by_key
+            .get(&("ticket".into(), repo.to_owned(), number))
+            .map(|p| {
+                json!({"reviewer":p["reviewer"],"fallback":p["fallback"],
+                "set_by_name":p["set_by_name"],"set_at":p["set_at"]})
+            })
+            .unwrap_or(Value::Null);
+        ticket["review"] = ticket["prs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|pr| by_pr.get(&(pr["repo"].as_str()?.to_owned(), pr["number"].as_i64()?)))
+            .map(|r| {
+                json!({"state":r.state,"reviewer_label":r.reviewer_label,
+            "since":r.step_started_at.as_deref().unwrap_or(&r.requested_at)})
+            })
+            .unwrap_or(Value::Null);
+    };
+    for lane in payload["lanes"].as_array_mut().into_iter().flatten() {
+        let repo = lane["goal"]["repo"].as_str().unwrap_or("");
+        let number = lane["goal"]["number"].as_i64().unwrap_or(0);
+        lane["review_policy"] = by_key
+            .get(&("lane".into(), repo.to_owned(), number))
+            .map(|p| {
+                json!({"reviewer":p["reviewer"],"fallback":p["fallback"],
+                "set_by_name":p["set_by_name"],"set_at":p["set_at"]})
+            })
+            .unwrap_or(Value::Null);
+        for ticket in lane["tickets"].as_array_mut().into_iter().flatten() {
+            decorate_ticket(ticket);
+        }
+    }
+    for group in payload["other"].as_array_mut().into_iter().flatten() {
+        for ticket in group["tickets"].as_array_mut().into_iter().flatten() {
+            decorate_ticket(ticket);
+        }
+    }
+    Ok(())
 }
 
 fn mark_started_early(ticket: &mut Value, early: &BTreeSet<Key>) {
