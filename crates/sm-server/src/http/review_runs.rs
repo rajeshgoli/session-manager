@@ -34,6 +34,65 @@ pub(super) fn failure_lines(r: &CodexReviewRequestRegistration) -> String {
         .join("\n")
 }
 
+/// I2: a review job's `review` field — which request it serves and why this
+/// reviewer. `why` is `default` for the chosen reviewer, otherwise the step
+/// before it and the reason it failed.
+pub(super) fn job_fields(state: &AppState, job: &QueueJobRecord) -> Result<Option<Value>> {
+    if job.job_type != "review" {
+        return Ok(None);
+    }
+    let queue_db = queue_dir(state).join("queue_runner.db");
+    let Some(owner) = RetainedQueueStore::queue_job_owner_from_path(&queue_db, &job.id)? else {
+        return Ok(None);
+    };
+    let Some((id, index)) = owner
+        .strip_prefix("review_request:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .and_then(|(id, index)| Some((id, index.parse::<usize>().ok()?)))
+    else {
+        return Ok(None);
+    };
+    let db = expand_home(&state.config.sm_send.db_path);
+    let Some(r) = RetainedQueueStore::get_codex_review_request_from_path(&db, id)? else {
+        return Ok(None);
+    };
+    let chain: Vec<Value> =
+        serde_json::from_str(r.chain_json.as_deref().unwrap_or("[]")).unwrap_or_default();
+    let log: Vec<Value> =
+        serde_json::from_str(r.steps_log_json.as_deref().unwrap_or("[]")).unwrap_or_default();
+    let why = match index.checked_sub(1) {
+        None => "default".to_owned(),
+        Some(previous) => log
+            .iter()
+            .rev()
+            .find(|s| s["index"].as_u64() == Some(previous as u64))
+            .map_or_else(
+                || "fallback".to_owned(),
+                |s| {
+                    format!(
+                        "{}: {}, so its fallback",
+                        s["label"].as_str().unwrap_or("Reviewer"),
+                        s["reason"].as_str().unwrap_or("failed")
+                    )
+                },
+            ),
+    };
+    let author = r
+        .requester_session_id
+        .clone()
+        .unwrap_or_else(|| r.notify_session_id.clone());
+    let author_name = state
+        .session_store
+        .get_session(&author)?
+        .map(session_display_name)
+        .unwrap_or(author);
+    Ok(Some(json!({
+        "request_id": r.id, "repo": r.repo, "pr_number": r.pr_number, "round": r.round,
+        "reviewer_label": chain.get(index).map(review::label).or(r.reviewer_label),
+        "policy_source": r.policy_source, "why": why, "author_name": author_name,
+    })))
+}
+
 pub(super) async fn start_github(
     state: &AppState,
     db: &FsPath,
@@ -51,7 +110,10 @@ pub(super) async fn start_github(
             r,
             &format!(
                 "paused (out of quota since {})",
-                channel.paused_at.as_deref().unwrap_or("unknown")
+                channel
+                    .paused_at
+                    .as_deref()
+                    .map_or_else(|| "unknown".to_owned(), crate::queue::quiet::local_time)
             ),
             &now,
         )?;
@@ -856,6 +918,94 @@ mod tests {
         );
         assert!(advanced.run_job_id.is_none());
         drop(c);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn review_job_fields_name_the_request_and_why_this_reviewer() {
+        let dir = std::env::temp_dir().join(format!(
+            "sm-review-job-fields-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = dir.join("sessions.json").to_string_lossy().into_owned();
+        config.sm_send.db_path = dir.join("messages.db").to_string_lossy().into_owned();
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        let state = AppState::new(config);
+        let db = expand_home(&state.config.sm_send.db_path);
+        let r = RetainedQueueStore::create_codex_review_request_in_path(
+            &db,
+            CreateCodexReviewRequest {
+                repo: "example/far".into(),
+                pr_number: 1851,
+                requester_session_id: Some("author".into()),
+                notify_session_id: "author".into(),
+                steer: None,
+                requested_head_sha: "f9d61b2d48f9d61b2d48f9d61b2d48f9d61b2d48".into(),
+                latest_request_comment_id: None,
+                latest_request_comment_url: None,
+                latest_request_posted_at: now_rfc3339(),
+                poll_interval_seconds: 30,
+                retry_interval_seconds: 120,
+            },
+        )
+        .unwrap();
+        let chain = review::chain(&json!({"kind": "github_codex"}));
+        RetainedQueueStore::initialize_review_chain(&db, &r.id, &chain, "default").unwrap();
+        let job = |index: i64| {
+            RetainedQueueStore::create_owned_queue_job(
+                &queue_dir(&state),
+                CreateQueueJob {
+                    job_type: "review".into(),
+                    label: format!("review far #1851 r1 step {index}"),
+                    requester_session_id: Some("author".into()),
+                    notify_session_id: String::new(),
+                    cwd: dir.to_string_lossy().into_owned(),
+                    argv: None,
+                    script: Some("true".into()),
+                    env: Default::default(),
+                    timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                    rank_tickets: None,
+                },
+                &format!("review_request:{}:{index}", r.id),
+            )
+            .unwrap()
+        };
+        let first = job(0);
+        let fields = job_fields(&state, &first).unwrap().unwrap();
+        assert_eq!(fields["why"], "default");
+        assert_eq!(fields["reviewer_label"], "GitHub Codex");
+        assert_eq!(fields["author_name"], "author");
+        RetainedQueueStore::finish_github_review_step_in_path(
+            &db,
+            &r.id,
+            "out of code-review quota",
+            &now_rfc3339(),
+            "wake",
+        )
+        .unwrap();
+        let fallback = job(1);
+        let fields = job_fields(&state, &fallback).unwrap().unwrap();
+        assert_eq!(fields["request_id"], r.id.as_str());
+        assert_eq!(fields["pr_number"], 1851);
+        assert_eq!(fields["reviewer_label"], "Codex run (gpt-6-sol, medium)");
+        assert_eq!(fields["policy_source"], "default");
+        assert_eq!(
+            fields["why"],
+            "GitHub Codex: out of code-review quota, so its fallback"
+        );
+        let mut other = fallback.clone();
+        other.job_type = "tests".into();
+        assert!(job_fields(&state, &other).unwrap().is_none());
         drop(state);
         fs::remove_dir_all(dir).unwrap();
     }

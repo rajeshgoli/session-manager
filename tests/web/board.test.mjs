@@ -18,6 +18,15 @@ await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/prea
 await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults, canStartAnyway, blockedReasons } = modules.get(`${root}/board-start.js`).namespace;
+const { reviewFallback, reviewerText, switchKind, inheritedPolicy, tier } = modules.get(`${root}/reviews.js`).namespace;
+const queueModel = load(`${root}/queue-model.js`);
+await queueModel.link(() => { throw new Error('queue-model has no imports'); });
+await queueModel.evaluate();
+const { reviewJobText } = queueModel.namespace;
+const agents = load(`${root}/agents.js`);
+await agents.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
+await agents.evaluate();
+const { pairedText, reviewWaitText, jobsFact } = agents.namespace;
 const { threadHref } = modules.get(`${root}/ui.js`).namespace;
 const { tokens, tokensOf } = modules.get(`${root}/handoff.js`).namespace;
 test('handoff thresholds read in tokens with three significant figures', () => {
@@ -94,4 +103,66 @@ test('merged-but-open ready tickets cannot offer Start', () => {
   assert.equal(canStart({ state: 'ready', warnings: ['merged_not_closed'] }), false);
   assert.equal(canStart({ state: 'ready', warnings: [] }), true);
   assert.equal(canStart({ state: 'in_progress' }), false);
+});
+
+test('the shown fallback matches the spec table (1768 C2)', () => {
+  const text = (reviewer) => reviewFallback(reviewer).map(reviewerText).join(' > ');
+  assert.equal(text({ kind: 'github_codex' }), 'Codex run · gpt-6-sol · medium > Claude run · opus · high');
+  assert.equal(text({ kind: 'codex', model: 'gpt-6-astra', effort: 'medium' }), 'Claude run · fable · xhigh');
+  for (const model of ['gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5', 'unknown']) assert.equal(text({ kind: 'codex', model, effort: 'high' }), 'Claude run · opus · high');
+  for (const model of ['gpt-6-luna', 'gpt-5.6-luna']) assert.equal(text({ kind: 'codex', model, effort: 'high' }), 'Claude run · sonnet · high');
+  assert.equal(text({ kind: 'claude', model: 'fable', effort: 'max' }), 'Codex run · gpt-6-astra · high');
+  for (const model of ['opus', 'opus[1m]']) assert.equal(text({ kind: 'claude', model, effort: 'low' }), 'Codex run · gpt-6-sol · medium');
+  for (const model of ['sonnet', 'haiku']) assert.equal(text({ kind: 'claude', model, effort: 'low' }), 'Codex run · gpt-6-luna · high');
+  assert.equal(text({ kind: 'paired', provider: 'codex', model: 'gpt-6-astra', effort: 'high' }), 'Codex run · gpt-6-astra · high > Claude run · fable · xhigh');
+  assert.equal(tier('fable'), 'top'); assert.equal(tier('opus'), 'mid'); assert.equal(tier('haiku'), 'low');
+});
+
+test('switching reviewer kind keeps model and effort only on the same provider', () => {
+  assert.deepEqual(switchKind({ kind: 'github_codex' }, 'codex'), { kind: 'codex', model: 'gpt-6-sol', effort: 'medium' });
+  assert.deepEqual(switchKind({ kind: 'codex', model: 'gpt-6-astra', effort: 'high' }, 'paired'), { kind: 'paired', provider: 'codex', model: 'gpt-6-astra', effort: 'high' });
+  assert.deepEqual(switchKind({ kind: 'paired', provider: 'claude', model: 'fable', effort: 'max' }, 'claude'), { kind: 'claude', model: 'fable', effort: 'max' });
+  assert.deepEqual(switchKind({ kind: 'codex', model: 'gpt-6-astra', effort: 'high' }, 'claude'), { kind: 'claude', model: 'opus', effort: 'high' });
+  assert.deepEqual(switchKind({ kind: 'claude', model: 'fable', effort: 'max' }, 'github_codex'), { kind: 'github_codex' });
+});
+
+test('a scope without its own policy names the next scope out', () => {
+  const listing = { default: { reviewer: { kind: 'github_codex' } }, policies: [{ scope: 'repo', repo: 'o/a', reviewer: { kind: 'claude', model: 'opus', effort: 'high' } }] };
+  assert.equal(inheritedPolicy(listing, { scope: 'lane', repo: 'o/a' }).source, 'repo a');
+  assert.equal(inheritedPolicy(listing, { scope: 'lane', repo: 'o/b' }).source, 'the default');
+  assert.equal(inheritedPolicy(listing, { scope: 'repo', repo: 'o/a' }).source, 'the default');
+  assert.equal(inheritedPolicy(listing, { scope: 'ticket', repo: 'o/a', lanePolicy: { reviewer: { kind: 'github_codex' } } }).source, 'the lane');
+});
+
+test('Start sends the chosen reviewer and nothing when the ticket keeps its policy', () => {
+  const ticket = { repo: 'o/a', number: 1848, state: 'ready' };
+  const form = { provider: 'claude', name: 'far-1848', brief: 'b', model: null, reasoning_effort: null };
+  assert.equal(startBody(ticket, form).reviewer, undefined);
+  const reviewer = { kind: 'paired', provider: 'codex', model: 'gpt-6-astra', effort: 'high' };
+  assert.deepEqual(startBody(ticket, { ...form, reviewer }).reviewer, reviewer);
+});
+
+test('a review job card names the PR, reviewer, round, author and fallback reason', () => {
+  const job = { review: { repo: 'o/far', pr_number: 1851, round: 1, reviewer_label: 'Codex run (gpt-6-sol, medium)', author_name: 'far-1848',
+    why: 'GitHub Codex: paused (out of quota since 11:06 pm), so its fallback' } };
+  assert.deepEqual(reviewJobText(job), { title: 'review · far #1851', reviewer: 'Codex run', detail: 'gpt-6-sol · medium · round 1 · for far-1848',
+    why: 'GitHub Codex: paused (out of quota since 11:06 pm), so its fallback' });
+  assert.equal(reviewJobText({ review: { ...job.review, why: 'default' } }).why, null);
+  assert.equal(reviewJobText({ review: { ...job.review, policy_source: 'ticket #1848' } }).detail, 'gpt-6-sol · medium · round 1 · for far-1848 · ticket #1848 policy');
+  assert.equal(reviewJobText({ label: 'cargo' }), null);
+});
+
+test('authors and paired reviewers read their review state on the Agents page', () => {
+  const now = Date.parse('2026-10-01T03:00:00Z');
+  assert.equal(reviewWaitText({ reviewer_label: 'far-1848-reviewer', since: '2026-10-01T02:42:00Z' }, { pr_number: 1851 }, now), 'Waiting on review by far-1848-reviewer · 18m');
+  assert.equal(reviewWaitText(null, { pr_number: 1851, since: '2026-10-01T02:42:00Z' }, now), 'Waiting on review of PR #1851 · 18m');
+  const paired = { pr_number: 1851, author_name: 'far-1848', round: 1, ticket: 1848 };
+  for (const request_state of ['waiting_reviewer', 'reviewing', 'nudged']) {
+    assert.deepEqual(pairedText({ ...paired, request_state }), { active: true, text: 'Reviewing PR #1851 for far-1848 · round 1' });
+  }
+  assert.deepEqual(pairedText({ ...paired, request_state: null }), { active: false, text: 'Paired reviewer for #1848 · idle' });
+  assert.equal(pairedText(null), null);
+  assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { text: 'No jobs' } } }), { text: 'Reviewing PR #1851 for far-1848 · round 1', tone: 'amber' });
+  assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { running: 1, text: 'Tests running 3m', tone: 'green' } } }),
+    { text: 'Reviewing PR #1851 for far-1848 · round 1 · ▶ Tests running 3m', tone: 'green' });
 });

@@ -380,3 +380,42 @@ fn missing_db_reads_as_empty() {
         .is_empty());
     assert!(!dir.exists());
 }
+
+#[test]
+fn open_keyed_lists_unhandled_messages_by_key_prefix() {
+    let (store, dir) = store();
+    assert!(store
+        .open_keyed("eng", "review-no-reviewer:")
+        .unwrap()
+        .is_empty());
+    let first = created(
+        store
+            .create_once(new_message("eng", true), Some("review-no-reviewer:req1"))
+            .unwrap(),
+    );
+    created(
+        store
+            .create_once(new_message("eng", true), Some("other:req2"))
+            .unwrap(),
+    );
+    created(
+        store
+            .create_once(
+                new_message("someone", true),
+                Some("review-no-reviewer:req3"),
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        store.open_keyed("eng", "review-no-reviewer:").unwrap(),
+        vec![("req1".to_owned(), first.id.clone())]
+    );
+    store
+        .mark_handled_by_delivery_key("review-no-reviewer:req1")
+        .unwrap();
+    assert!(store
+        .open_keyed("eng", "review-no-reviewer:")
+        .unwrap()
+        .is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}

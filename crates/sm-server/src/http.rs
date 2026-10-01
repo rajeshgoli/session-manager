@@ -7206,6 +7206,7 @@ fn project_session_obligations(
                 "label": format!("Review · {} #{}", review.repo, review.pr_number),
                 "repo": review.repo, "pr_number": review.pr_number,
                 "state": review.state, "since": review.requested_at,
+                "reviewer_label": review.reviewer_label,
                 "requester_session_id": review.requester_session_id,
                 "last_polled_at": review.last_polled_at, "last_error": review.last_error,
             }));
@@ -7522,6 +7523,7 @@ async fn client_queue(
                 "perf": {"running": count("perf"), "max": policy.perf_max_concurrent},
                 "background": {"running": count("background"), "max": policy.background_max_concurrent},
                 "service": {"running": count("service"), "max": policy.service_max_concurrent},
+                "review": {"running": count("review"), "max": policy.review_max_concurrent},
             },
         },
         "running": running_json,
@@ -16803,6 +16805,13 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
+    // 1768 I2: what a review job reviews, for whom, and why this reviewer.
+    response["review"] = review_runs::job_fields(state, &job)
+        .unwrap_or_else(|error| {
+            eprintln!("review fields for queue job {} failed: {error:#}", job.id);
+            None
+        })
+        .unwrap_or(Value::Null);
     response
         .as_object_mut()
         .expect("job response is an object")

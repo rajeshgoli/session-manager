@@ -350,6 +350,8 @@ export function Popover({ onClose, children, align = 'left', className = '' }) {
     const rect = el.getBoundingClientRect();
     if (rect.right > window.innerWidth - 8) el.style.transform = `translateX(${window.innerWidth - 8 - rect.right}px)`;
     if (rect.left < 8) el.style.transform = `translateX(${8 - rect.left}px)`;
+    // A box opened near the bottom of a scrolled page scrolls into view.
+    if (rect.bottom > window.innerHeight) el.scrollIntoView({ block: 'nearest' });
   }, []);
   const style = align === 'right' ? 'right:0;top:calc(100% + 6px)' : 'left:0;top:calc(100% + 6px)';
   return html`<div class=${`pop ${className}`} ref=${box} style=${style} role="dialog">${children}</div>`;
