@@ -21,7 +21,7 @@ pub struct Choice {
     pub brief: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Record {
     pub repo: String,
     pub number: i64,

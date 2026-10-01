@@ -312,6 +312,17 @@ async fn process_auto_starts(
     }
     for record in starts {
         let key = record.key();
+        // A prior launch may take minutes. Owner writes take this same gate,
+        // so Pause and Cancel submitted during it apply before the next one.
+        let _launch_guard = state.board_auto_start_gate.lock().await;
+        match authorization_current(state, &record) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                eprintln!("auto-start recheck failed: {error:#}");
+                continue;
+            }
+        }
         let result = start(
             state.clone(),
             StartRequest {
@@ -385,6 +396,21 @@ async fn process_auto_starts(
         }
     }
     started
+}
+
+fn authorization_current(
+    state: &AppState,
+    record: &board::auto_start::Record,
+) -> anyhow::Result<bool> {
+    if new_agent_settings(state)?.auto_start_paused {
+        return Ok(false);
+    }
+    Ok(board_store(state)
+        .auto_starts()?
+        .into_iter()
+        .find(|row| row.key() == record.key())
+        .as_ref()
+        == Some(record))
 }
 
 fn auto_start_notice(state: &AppState, key: &Key, message: &str, now: time::OffsetDateTime) {
@@ -1408,6 +1434,7 @@ pub(super) async fn put_auto_start(
 ) -> Result<Json<Value>, ApiError> {
     owner_write_guard(&state, &headers, peer_addr, "PUT", &uri)?;
     ensure_core_writes_enabled(&state)?;
+    let _launch_guard = state.board_auto_start_gate.lock().await;
     blocking(&state, move |state| {
         let _guard = state
             .board_lock
@@ -1434,6 +1461,7 @@ pub(super) async fn delete_auto_start(
 ) -> Result<Json<Value>, ApiError> {
     owner_write_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
     ensure_core_writes_enabled(&state)?;
+    let _launch_guard = state.board_auto_start_gate.lock().await;
     let key = ticket_key(&query.repo, query.number)?;
     blocking(&state, move |state| {
         let _guard = state
@@ -1460,6 +1488,7 @@ pub(super) async fn put_auto_start_lane(
 ) -> Result<Json<Value>, ApiError> {
     owner_write_guard(&state, &headers, peer_addr, "PUT", &uri)?;
     ensure_core_writes_enabled(&state)?;
+    let _launch_guard = state.board_auto_start_gate.lock().await;
     blocking(&state, move |state| {
         let _guard = state
             .board_lock
@@ -1761,6 +1790,74 @@ async fn start(state: Arc<AppState>, payload: StartRequest, auto: bool) -> Resul
 #[cfg(test)]
 mod start_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_or_paused_later_ticket_fails_fresh_launch_check() {
+        let root = std::env::temp_dir().join(format!(
+            "board-auto-start-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = root.join("sessions.json").to_string_lossy().into_owned();
+        config.sm_send.db_path = root.join("queue.db").to_string_lossy().into_owned();
+        config.usage.enabled = false;
+        config.rust_core.fixture_writes_enabled = true;
+        let state = Arc::new(AppState::new(config));
+        let store = board_store(&state);
+        store.ensure_schema().unwrap();
+        let choice = board::auto_start::Choice {
+            repo: "acme/widgets".into(),
+            number: 2,
+            agent_type: None,
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            reasoning_effort: Some("high".into()),
+            brief: None,
+        };
+        store
+            .authorize_auto_starts(
+                std::slice::from_ref(&choice),
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let record = store.auto_starts().unwrap().remove(0);
+        assert!(authorization_current(&state, &record).unwrap());
+        // Represent the earlier launch. The owner's cancellation waits for it,
+        // then the next ticket must see the changed authorization.
+        let launch_guard = state.board_auto_start_gate.lock().await;
+        let cancelling_state = state.clone();
+        let cancellation = tokio::spawn(async move {
+            let _guard = cancelling_state.board_auto_start_gate.lock().await;
+            board_store(&cancelling_state)
+                .cancel_auto_start(
+                    &("acme/widgets".into(), 2),
+                    "cancelled by owner",
+                    time::OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancellation.is_finished());
+        drop(launch_guard);
+        cancellation.await.unwrap();
+        assert!(!authorization_current(&state, &record).unwrap());
+        store
+            .authorize_auto_starts(&[choice], time::OffsetDateTime::now_utc())
+            .unwrap();
+        let fresh = store.auto_starts().unwrap().remove(0);
+        assert!(authorization_current(&state, &fresh).unwrap());
+        state
+            .session_store
+            .update_owner_settings(&json!({"new_agent":{"auto_start_paused":true}}), |_| {
+                Ok(Ok(()))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!authorization_current(&state, &fresh).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn start_resolves_checkout() {

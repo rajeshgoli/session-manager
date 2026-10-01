@@ -29,8 +29,15 @@ pub(super) async fn put_settings(
 ) -> Result<Json<Value>, ApiError> {
     board::owner_guard(&state, &headers, peer_addr, "PUT", &uri, true)?;
     ensure_core_writes_enabled(&state)?;
+    let _launch_guard = if body.get("new_agent").is_some() {
+        Some(state.board_auto_start_gate.lock().await)
+    } else {
+        None
+    };
     let config_limits = terminal_config_limits(&state);
+    let work_state = state.clone();
     let settings = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
+        let state = work_state;
         let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
         // Store and apply under the live policy's lock, so overlapping PUTs
         // cannot leave admission on older limits than the stored ones.
@@ -68,7 +75,7 @@ pub(super) async fn put_settings(
         if next != current && state.config.rust_core.runtime_enabled {
             admit_now(&state, &queue_state_dir, next);
         }
-        if body["new_agent"].get("auto_start_paused").is_some() {
+        if body.get("new_agent").is_some() {
             board::request_recompute(&state);
         }
         Ok(settings)
