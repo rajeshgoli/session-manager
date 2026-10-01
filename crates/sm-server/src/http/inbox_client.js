@@ -33,6 +33,20 @@
         }, function (err) { b.disabled = false; b.textContent = err.message; });
       });
     });
+    Array.prototype.forEach.call(document.querySelectorAll('button.archive,button.unarchive'), function (b) {
+      b.addEventListener('click', function () {
+        b.disabled = true;
+        var method = b.classList.contains('unarchive') ? 'unarchive' : 'archive';
+        api('/inbox/' + method, { thread_key: b.getAttribute('data-key') }).then(function () {
+          location.reload();
+        }, function (err) { b.disabled = false; b.textContent = err.message; });
+      });
+    });
+    var fold = document.getElementById('folded');
+    if (fold) {
+      fold.open = localStorage.getItem('sm-inbox-folded-open') === 'true';
+      fold.addEventListener('toggle', function () { localStorage.setItem('sm-inbox-folded-open', String(fold.open)); });
+    }
     return;
   }
 
@@ -40,6 +54,8 @@
   var box = document.getElementById('box');
   var send = document.getElementById('send');
   var done = document.getElementById('done');
+  var archive = document.getElementById('archive');
+  var replyTarget = document.getElementById('reply-target');
   var qs = document.getElementById('qs');
   var quotes = [];
   // One id per attempt: a retry after a lost response is not sent twice.
@@ -94,8 +110,9 @@
       attempt = attempt || newId();
       send.disabled = true;
       say('Sending…');
-      api('/inbox/agent/' + encodeURIComponent(CONFIG.sessionId) + '/send', {
+      api('/inbox/thread/' + encodeURIComponent(CONFIG.threadKey) + '/send', {
         submission_id: attempt,
+        to: replyTarget ? replyTarget.value : CONFIG.sessionId,
         body: body,
         quotes: quotes.map(function (q) { return { message_id: q.message_id, quote: q.quote }; })
       }).then(function (res) {
@@ -110,6 +127,16 @@
     api('/inbox/done', { thread_key: CONFIG.threadKey }).then(function () {
       say('Done. This thread left your Inbox.');
     }, function (err) { done.disabled = false; say(err.message, true); });
+  });
+  if (archive) archive.addEventListener('click', function () {
+    archive.disabled = true;
+    api('/inbox/archive', { thread_key: CONFIG.threadKey }).then(function () {
+      location.replace('/inbox');
+    }, function (err) { archive.disabled = false; say(err.message, true); });
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'y' || !archive || e.target.closest('input,textarea,[contenteditable]')) return;
+    archive.click();
   });
 
   var target = CONFIG.at && document.getElementById(CONFIG.at);

@@ -32,6 +32,7 @@ pub struct ThreadMarks {
     /// Follow results the thread held when last read; more than this is
     /// new. A count, for the same reason as `done_items`.
     pub read_follows: Option<i64>,
+    pub archived_items: Option<i64>,
 }
 
 /// A message the owner started, with no agent message above it.
@@ -44,6 +45,7 @@ pub struct OwnerNote {
     pub delivered_text: String,
     pub delivered_to_session_id: String,
     pub created_at: String,
+    pub thread_key: Option<String>,
 }
 
 pub fn init_owner_inbox_schema(conn: &Connection) -> Result<()> {
@@ -68,6 +70,24 @@ pub fn init_owner_inbox_schema(conn: &Connection) -> Result<()> {
             ON owner_message_notes(session_id, created_at);
         "#,
     )?;
+    if conn
+        .prepare("SELECT archived_items FROM owner_inbox_threads LIMIT 0")
+        .is_err()
+    {
+        conn.execute(
+            "ALTER TABLE owner_inbox_threads ADD COLUMN archived_items INTEGER",
+            [],
+        )?;
+    }
+    if conn
+        .prepare("SELECT thread_key FROM owner_message_notes LIMIT 0")
+        .is_err()
+    {
+        conn.execute(
+            "ALTER TABLE owner_message_notes ADD COLUMN thread_key TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -77,7 +97,7 @@ pub struct OwnerInboxStore {
 }
 
 const NOTE_COLUMNS: &str =
-    "id, session_id, body, delivered_text, delivered_to_session_id, created_at";
+    "id, session_id, body, delivered_text, delivered_to_session_id, created_at, thread_key";
 
 impl OwnerInboxStore {
     pub fn new(db_path: PathBuf) -> Self {
@@ -117,11 +137,9 @@ impl OwnerInboxStore {
 
     /// Every thread the owner has marked Done or read.
     pub fn marks(&self) -> Result<BTreeMap<String, ThreadMarks>> {
-        let Some(conn) = self.open_read()? else {
-            return Ok(BTreeMap::new());
-        };
+        let conn = self.open_write()?;
         let mut statement = conn.prepare(
-            "SELECT thread_key, done_at, done_items, last_read_at, read_follows \
+            "SELECT thread_key, done_at, done_items, last_read_at, read_follows, archived_items \
                  FROM owner_inbox_threads",
         )?;
         let rows = statement
@@ -133,6 +151,7 @@ impl OwnerInboxStore {
                         done_items: row.get(2)?,
                         last_read_at: row.get(3)?,
                         read_follows: row.get(4)?,
+                        archived_items: row.get(5)?,
                     },
                 ))
             })?
@@ -146,6 +165,47 @@ impl OwnerInboxStore {
             "INSERT INTO owner_inbox_threads (thread_key, done_at, done_items) \
              VALUES (?1, ?2, ?3) ON CONFLICT(thread_key) DO UPDATE \
              SET done_at = excluded.done_at, done_items = excluded.done_items",
+            params![
+                thread_key,
+                now_rfc3339(),
+                i64::try_from(items).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_archive(&self, thread_key: &str, items: usize) -> Result<()> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "INSERT INTO owner_inbox_threads (thread_key, done_at, done_items, archived_items)
+             VALUES (?1, ?2, ?3, ?3) ON CONFLICT(thread_key) DO UPDATE SET
+             done_at = excluded.done_at, done_items = excluded.done_items,
+             archived_items = excluded.archived_items",
+            params![
+                thread_key,
+                now_rfc3339(),
+                i64::try_from(items).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn unarchive(&self, thread_key: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE owner_inbox_threads SET archived_items = NULL, done_at = NULL,
+             done_items = NULL WHERE thread_key = ?1",
+            params![thread_key],
+        )?;
+        Ok(())
+    }
+
+    /// Move an old Done mark without overwriting an action on the new key.
+    pub fn migrate_done(&self, thread_key: &str, items: usize) -> Result<()> {
+        self.open_write()?.execute(
+            "INSERT INTO owner_inbox_threads (thread_key, done_at, done_items)
+             VALUES (?1, ?2, ?3) ON CONFLICT(thread_key) DO UPDATE SET
+             done_at = COALESCE(owner_inbox_threads.done_at, excluded.done_at),
+             done_items = COALESCE(owner_inbox_threads.done_items, excluded.done_items)",
             params![
                 thread_key,
                 now_rfc3339(),
@@ -203,7 +263,7 @@ impl OwnerInboxStore {
         tx.execute(
             &format!(
                 "INSERT INTO owner_message_notes ({NOTE_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             ),
             params![
                 note.id,
@@ -211,7 +271,8 @@ impl OwnerInboxStore {
                 note.body,
                 note.delivered_text,
                 note.delivered_to_session_id,
-                now_rfc3339()
+                now_rfc3339(),
+                note.thread_key,
             ],
         )?;
         crate::queue::enqueue_message_once_in_conn(
@@ -234,6 +295,7 @@ fn note_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerNote> {
         delivered_text: row.get(3)?,
         delivered_to_session_id: row.get(4)?,
         created_at: row.get(5)?,
+        thread_key: row.get(6)?,
     })
 }
 
@@ -276,6 +338,53 @@ mod tests {
         assert_eq!(marks["agent:a"].done_items, Some(3));
         assert!(marks["agent:a"].last_read_at.is_some());
         assert_eq!(marks["agent:a"].read_follows, Some(2));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_and_archive_keep_item_watermarks() {
+        let (store, dir) = store();
+        store.mark_done("agent:old", 2).unwrap();
+        store.mark_read("ticket:owner/repo#7", 1).unwrap();
+        store.migrate_done("ticket:owner/repo#7", 2).unwrap();
+        store.migrate_done("ticket:owner/repo#7", 4).unwrap();
+        assert_eq!(
+            store.marks().unwrap()["ticket:owner/repo#7"].done_items,
+            Some(2)
+        );
+        assert_eq!(
+            store.marks().unwrap()["ticket:owner/repo#7"].read_follows,
+            Some(1)
+        );
+        store.mark_archive("ticket:owner/repo#7", 3).unwrap();
+        let marks = store.marks().unwrap();
+        assert_eq!(marks["ticket:owner/repo#7"].done_items, Some(3));
+        assert_eq!(marks["ticket:owner/repo#7"].archived_items, Some(3));
+        store.unarchive("ticket:owner/repo#7").unwrap();
+        assert_eq!(
+            store.marks().unwrap()["ticket:owner/repo#7"].archived_items,
+            None
+        );
+        assert_eq!(
+            store.marks().unwrap()["ticket:owner/repo#7"].done_items,
+            None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_schema_gains_archive_and_note_thread_columns() {
+        let (store, dir) = store();
+        let conn = Connection::open(&store.db_path).unwrap();
+        conn.execute_batch("CREATE TABLE owner_inbox_threads (thread_key TEXT PRIMARY KEY, done_at TEXT, done_items INTEGER, last_read_at TEXT, read_follows INTEGER); CREATE TABLE owner_message_notes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, body TEXT NOT NULL, delivered_text TEXT NOT NULL, delivered_to_session_id TEXT NOT NULL, created_at TEXT NOT NULL);").unwrap();
+        conn.execute(
+            "INSERT INTO owner_inbox_threads (thread_key, done_items) VALUES ('agent:old', 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(store.marks().unwrap()["agent:old"].done_items, Some(2));
+        assert!(store.notes().unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 }

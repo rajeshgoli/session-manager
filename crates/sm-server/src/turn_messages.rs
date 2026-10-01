@@ -332,6 +332,22 @@ impl TurnMessageStore {
         )?)
     }
 
+    /// Marks one Finished row read without changing later work by the same agent.
+    pub fn mark_finished_read(
+        &self,
+        session_id: &str,
+        completed_at: &str,
+        now: OffsetDateTime,
+    ) -> Result<usize> {
+        if self.open_read()?.is_none() {
+            return Ok(0);
+        }
+        Ok(self.open_write()?.execute(
+            "UPDATE finished SET read_at = ?3 WHERE session_id = ?1 AND completed_at = ?2 AND read_at IS NULL",
+            params![session_id, completed_at, stamp(now)],
+        )?)
+    }
+
     pub fn last_turn(&self, session_id: &str) -> Result<Option<TurnMessage>> {
         let Some(conn) = self.open_read()? else {
             return Ok(None);

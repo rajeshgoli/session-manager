@@ -155,7 +155,7 @@ function App() {
       <${Toasts} items=${toasts} />`;
   }
 
-  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread):/.test(loc.open));
+  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread|work):/.test(loc.open));
   const cls = ['app', layout.rail === 'folded' && 'folded', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>

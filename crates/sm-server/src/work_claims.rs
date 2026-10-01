@@ -775,6 +775,44 @@ impl WorkClaimStore {
         get_claim(&conn, id)
     }
 
+    /// Retained claims for time-based Inbox grouping, oldest first.
+    pub fn all_claims(&self) -> Result<Vec<WorkClaim>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        query_claims(
+            &conn,
+            "WHERE reserved_at IS NULL ORDER BY claimed_at, id",
+            [],
+        )
+    }
+
+    /// Work items whose cached titles label Inbox threads.
+    pub fn all_items(&self) -> Result<Vec<WorkItem>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!("SELECT {ITEM_COLUMNS} FROM work_items"))?;
+        let rows = statement
+            .query_map([], item_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// PR-to-ticket links for docs published by an agent with no ticket claim.
+    pub fn all_links(&self) -> Result<Vec<(String, i64, i64)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(
+            "SELECT repo, pr_number, ticket_number FROM work_links ORDER BY ticket_number",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Every claim row for an item, oldest first.
     pub fn claims_for_item(&self, repo: &str, number: i64) -> Result<Vec<WorkClaim>> {
         let Some(conn) = self.open_read()? else {
