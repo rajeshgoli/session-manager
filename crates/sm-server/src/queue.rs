@@ -10167,6 +10167,79 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_job_does_not_inherit_handed_over_listeners() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::net::{UnixListener, UnixStream},
+        };
+
+        let state_dir = unique_temp_path("handover-inheritance");
+        let job = create_test_job(&state_dir, "tests", "handover-inheritance");
+        let conn = Connection::open(state_dir.join("queue_runner.db")).unwrap();
+        let job = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let lan = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // macOS Unix socket paths have a small length limit.
+        let socket_dir = PathBuf::from(format!("/tmp/sm-1913-{}", job.id));
+        fs::create_dir_all(&socket_dir).unwrap();
+        let authority_path = socket_dir.join("authority.sock");
+        let handover_path = socket_dir.join("handover.sock");
+        let authority = UnixListener::bind(&authority_path).unwrap();
+        let handover = UnixListener::bind(&handover_path).unwrap();
+        let (old, new) = UnixStream::pair().unwrap();
+        let listeners = [
+            http.as_raw_fd(),
+            authority.as_raw_fd(),
+            handover.as_raw_fd(),
+            lan.as_raw_fd(),
+        ];
+        let markers = [
+            format!("127.0.0.1:{}", http.local_addr().unwrap().port()),
+            format!("127.0.0.1:{}", lan.local_addr().unwrap().port()),
+            authority_path.display().to_string(),
+            handover_path.display().to_string(),
+        ];
+        for has_lan in [false, true] {
+            crate::handover::send_listeners(&old, &listeners[..3 + usize::from(has_lan)], has_lan)
+                .unwrap();
+            let (received, received_lan) = crate::handover::receive_listeners(&new).unwrap();
+            assert_eq!(received_lan, has_lan);
+            write_queue_job_wrapper(
+                Path::new(job.wrapper_path.as_ref().unwrap()),
+                "/tmp",
+                Some(&[
+                    "/bin/zsh".into(),
+                    "-c".into(),
+                    // Inspect both the queue wrapper and its descendant command.
+                    "/usr/sbin/lsof -nP -a -p $$,$PPID -Fn; print stdout-ok; print -u2 stderr-ok"
+                        .into(),
+                ]),
+                None,
+                &BTreeMap::new(),
+                Path::new(job.exit_code_path.as_ref().unwrap()),
+            )
+            .unwrap();
+            let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
+            let log = fs::read_to_string(job.log_path.as_ref().unwrap()).unwrap();
+            assert!(status.success(), "{log}");
+            assert!(log.contains("n/dev/null"), "stdin missing: {log}");
+            assert!(
+                log.contains("stdout-ok") && log.contains("stderr-ok"),
+                "{log}"
+            );
+            for marker in &markers {
+                assert!(!log.contains(marker), "inherited {marker}: {log}");
+            }
+            // Keep the received listeners open until after the child exits.
+            drop(received);
+        }
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+        fs::remove_dir_all(socket_dir).unwrap();
+    }
+
     #[test]
     fn queue_job_starts_under_the_process_ceiling() {
         let job_dir = unique_temp_path("process-ceiling-spawn");
