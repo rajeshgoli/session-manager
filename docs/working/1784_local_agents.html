@@ -107,7 +107,7 @@
 </style>
 
 <h1>1784 — Local models as sm agents</h1>
-<p class="sans"><small>Author: Claude Opus 5.5 <code>sm-1784</code> (2aac7357) · Ticket #1784 · revision 4, 2026-10-01</small></p>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>sm-1784</code> (2aac7357) · Ticket #1784 · revision 5, 2026-10-01</small></p>
 
 <h2>Memo</h2>
 
@@ -132,12 +132,12 @@
 </thead>
 <tbody>
 <tr><td>1. Which harness drives the local model?</td><td><b>Claude Code, launched with a slim profile, pointed at LM Studio; opencode runs alongside it in the prototype as the control.</b> The slim profile drops MCP servers, skills and unused tools, so the first prompt shrinks from ~84K tokens to an expected 15–25K. If opencode clearly beats Claude Code on the same task and model, opencode becomes the harness despite the extra sm work.</td><td>sm already understands Claude Code completely (status, message delivery, usage, resume, compaction); a new harness means ~25 files of new integration.</td></tr>
-<tr><td>2. Which model?</td><td><b>Prototype two newer Qwen models: Qwen3.8-27B (58 GB) and Qwen3.6-35B-A3B (38 GB).</b> Add Qwen3.8-Flash-Next (112 GB, the best scores) once LM Studio can run it. Delete Qwen3-Coder-Next, MiniMax M2.5 and GLM-5.2 from disk (413 GB) after the prototype.</td><td>The models on disk are outclassed: the newer ones score higher on Qwen's coding benchmark (61.7 and 49.5 against 44.3) at a fraction of the memory.</td></tr>
+<tr><td>2. Which model?</td><td><b>Prototype the two best: Qwen3.8-Flash-Next (112 GB) and Qwen3.8-27B (58 GB).</b> The prototype ticket deletes Qwen3-Coder-Next, MiniMax M2.5 and GLM-5.2 from disk first (403 GB). If LM Studio cannot run Flash-Next yet, the ticket runs it on the MTPLX server, which also speaks Claude Code's request format. Qwen3.6-35B-A3B (38 GB) is the fallback if neither passes on speed.</td><td>They have the top two scores that fit (62.5 and 61.7 on Qwen's coding benchmark, against 44.3 for the model on disk).</td></tr>
 <tr><td>3. Who wins when memory runs short?</td><td><b>Your queue jobs, always.</b> The model is the first thing sm removes, before its memory guard stops any queue job. Local agents drain, park, and resume when memory returns.</td><td>Local agents are optional capacity; your queue jobs are the work.</td></tr>
 <tr><td>4. What happens during a perf run?</td><td><b>A perf run unloads the model for its duration.</b></td><td>Perf asks for a quiet machine; a model decoding at full GPU is the loudest thing on it.</td></tr>
 <tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-review</code> like everyone else's.</td><td>Vendor scores put the best of these near your Mid tier, but they are vendor-run. Until the prototype shows otherwise, treat them as Low tier, and the review gate keeps a weaker author safe.</td></tr>
 <tr><td>6. When may local agents run?</td><td><b>Whenever the model fits, not only overnight.</b> The yield rule handles contention.</td><td>Your queue is light 00:00–05:00 and around 08:00, but also between runs during the day; a fixed window wastes those gaps.</td></tr>
-<tr><td>7. What happens first?</td><td><b>The prototype, by hand, before any sm code.</b> Ticket #1913 runs on each prototype model in Claude Code, and on the better model in opencode, in isolated worktrees during a quiet window you give me. A Codex reviewer grades each result against the merged fix. If one combination passes, two more of last week's tickets run on it to rule out luck. Only then does sm engineering start.</td><td>It measures model and harness together on real work, and costs no engineering if the answer is no.</td></tr>
+<tr><td>7. What happens first?</td><td><b>One prototype ticket, by hand, before any sm code.</b> It clears out the superseded models and downloads the two candidates. Ticket #1913 then runs on each candidate in Claude Code, and on the better model in opencode, in isolated worktrees during a quiet window you give me. A Codex reviewer grades each result against the merged fix. If one combination passes, two more of last week's tickets run on it to rule out luck. The prototype ticket then rewrites this memo to match what it learned, or discards it. It also files the engineering tickets on the board, in order.</td><td>It measures model and harness together on real work, and costs no engineering if the answer is no.</td></tr>
 <tr><td>8. How many agents share the model?</td><td><b>Two, until the prototype shows LM Studio reusing each agent's earlier conversation between turns; then up to four.</b></td><td>Measured on both models: reading speed is shared, so four agents reading at once each wait up to four times longer.</td></tr>
 <tr><td>9. What may a local agent do without asking?</td><td><b>Run inside Claude Code's sandbox:</b> file writes are confined to its worktree, it has no network beyond the model server, and commands inside the sandbox are approved automatically. <b>Never auto mode.</b></td><td>Auto mode's safety check calls Anthropic directly, not the local model. It would fail, or bill your Claude subscription on every tool call if your login is present.</td></tr>
 </tbody>
@@ -321,9 +321,9 @@
 <table>
 <thead><tr><th style="width:8%">#</th><th>Ticket</th><th style="width:16%">Tier</th><th style="width:16%">Starts after</th></tr></thead>
 <tbody>
-<tr><td>P0</td><td><b>Prototype, no sm code.</b> Download the two candidate models (96 GB). Run ticket #1913 three ways in isolated worktrees: each model in Claude Code, and the better one in opencode. Grade each against the merged PR #1918 with a Codex reviewer. If one passes, confirm on two more of last week's tickets. The full protocol is appendix H.</td><td>Opus, high (driver)</td><td>a quiet window from you</td></tr>
-<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size, and check that LM Studio reuses an agent's earlier conversation between turns.</td><td>Opus, high</td><td>P0 passes</td></tr>
-<tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>P0 passes</td></tr>
+<tr><td>P0</td><td><b>Prototype, no sm code (ticket #1926).</b> Delete the superseded models. Download Qwen3.8-Flash-Next and Qwen3.8-27B (170 GB). Run ticket #1913 three ways in isolated worktrees: each model in Claude Code, and the better one in opencode. Grade each against the merged PR #1918 with a Codex reviewer. If one passes, confirm on two more of last week's tickets. Then update or discard this memo, and file P1 onward on the board as the memo now stands. The full protocol is appendix H.</td><td>Opus, high (driver)</td><td>a quiet window from you</td></tr>
+<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size, and check that LM Studio reuses an agent's earlier conversation between turns.</td><td>Opus, high</td><td>filed by P0 if it passes</td></tr>
+<tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>filed by P0 if it passes</td></tr>
 <tr><td>B1</td><td><b>Seat limit and yield.</b> Build the drain, park and resume behaviour in Figure 3, and wait-for-seat at spawn.</td><td>Opus, high</td><td>P1, P2</td></tr>
 <tr><td>B2</td><td><b>Spend and tier table.</b> Add the Local line in Spend (web and Android) and the Local row in the CLAUDE.md tier table.</td><td>Sonnet, high</td><td>B1</td></tr>
 </tbody>
@@ -338,7 +338,8 @@
 </ul>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>Since revision 3, which you reviewed on 1 Oct:</p>
+<p><b>Since revision 4:</b> the prototype now tests Qwen3.8-Flash-Next and Qwen3.8-27B, as you asked. The prototype ticket deletes the superseded models, rewrites or discards this memo, and files the engineering tickets itself. That makes it the only ticket filed now: decision 7, plan P0, appendix H.</p>
+<p>Since revision 3:</p>
 <ul>
 <li><b>The prototype comes first</b> and replaces the bake-off: one real ticket from last week, graded against the merged fix, before any sm code (decision 7, plan P0). You were right that the bake-off was the prototype. It now runs first, by hand.</li>
 <li><b>Newer models.</b> Qwen3-Coder-Next is superseded. Decision 2 now prototypes Qwen3.8-27B and Qwen3.6-35B-A3B, and a new "Model choice" table compares them against the older models.</li>
@@ -513,7 +514,8 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <p>The confirmation tickets run only on the combination that passed the main task. For each ticket the driver records the original agent's wall time and tokens. It finds the seat whose name carries the ticket number in <code>sessions.json</code> and sums that seat's rows in <code>usage.db</code> <code>message_ledger</code>.</p>
 <h4>H.2 Setup</h4>
 <ol>
-<li><b>Models.</b> <code>lms get</code> the LM Studio MLX 8-bit builds of Qwen3.6-35B-A3B (37.7 GB) and Qwen3.8-27B (58.1 GB). If a model does not load in the installed LM Studio 0.4.16, upgrade LM Studio, avoiding 0.4.19 (tool-calling regression), and record the version used. Qwen3.8-Flash-Next joins only if LM Studio lists its architecture as supported on the day.</li>
+<li><b>Clear the superseded models first.</b> Check that nothing is loaded with <code>lms ps</code>. Then delete Qwen3-Coder-Next (<code>~/.lmstudio/models/lmstudio-community/Qwen3-Coder-Next-MLX-8bit</code>), MiniMax M2.5 (<code>…/lmstudio-community/MiniMax-M2.5-MLX-4bit</code>) and GLM-5.2 (<code>~/.lmstudio/models/bearzi/GLM-5.2-JANGTQ</code>), 403 GB in total. On 1 Oct the disk had 314 GB free.</li>
+<li><b>Models.</b> Download <code>mlx-community/Qwen3.8-27B-8bit</code> (58.1 GB) and <code>mlx-community/Qwen3.8-Flash-Next-4bit</code> (111.5 GB) with <code>lms get</code>. If a model does not load in LM Studio 0.4.16, upgrade LM Studio, avoiding 0.4.19 (tool-calling regression), and record the version used. If no LM Studio release supports Flash-Next's architecture, serve it with MTPLX, which offers an Anthropic-compatible endpoint. Record which server each run used, and keep the 32 GB n-gram table on SSD if that build is used. If Flash-Next cannot run anywhere, substitute <code>lmstudio-community/Qwen3.6-35B-A3B-MLX-8bit</code> (37.7 GB) and say so in the report.</li>
 <li><b>Known template fixes, applied before the first run.</b> Qwen3.6 in LM Studio: turn on <code>preserve_thinking</code> if tool calls loop. Qwen3.8: its chat template rejects Claude Code's default effort, so set <code>CLAUDE_CODE_EFFORT_LEVEL=medium</code>. Record any other change made.</li>
 <li><b>Load.</b> <code>lms load &lt;key&gt; -c 131072 --parallel 1 --identifier proto -y</code>. Runs are sequential; one agent at a time.</li>
 <li><b>Worktree.</b> <code>git worktree add ~/worktrees/sm-1784-proto-&lt;model&gt;-&lt;harness&gt;-&lt;ticket&gt; &lt;start commit&gt;</code>. Create no branch on the remote.</li>
@@ -553,7 +555,12 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 </ol>
 <p>The pass bar is in the memo's plan section.</p>
 <h4>H.6 Report</h4>
-<p>The driver writes a readout memo, <code>docs/working/1784_prototype_readout.html</code>, from <code>docs/memo_template.html</code>. Its first page is a table with one row per run: model, harness, ticket, verdict, wall-time ratio, rescue fraction, and turns. It ends with the recommendation and is published with <code>sm doc publish --pr &lt;N&gt; --review</code>.</p>
+<p>The driver does three things, in this order:</p>
+<ol>
+<li><b>Readout.</b> Add a "Prototype results" section to this memo. Its first element is a table with one row per run: model, harness, ticket, verdict, wall-time ratio, rescue fraction, turns.</li>
+<li><b>Replan.</b> Revise every decision and appendix the results contradict. For example, if opencode wins, the harness decision, appendix C and the plan change. If nothing passes, mark the memo discarded with the reason, and file nothing further.</li>
+<li><b>File.</b> Open the engineering tickets the revised plan calls for, each sized to one agent. Record their order with <code>sm board after</code> and put them under a goal ticket with <code>sm board under</code>. Publish the revised memo with <code>sm doc publish --pr &lt;N&gt; --review</code>.</li>
+</ol>
 <h3 id="i">I. Measurements and method</h3>
 <h4>I.1 Machine and memory history</h4>
 <p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 1 is generated from the same table by a script that groups by local hour.</p>
