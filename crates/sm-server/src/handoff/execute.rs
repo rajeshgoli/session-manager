@@ -218,6 +218,7 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
     ("parent_wake_registrations", "parent_session_id"),
     ("parent_wake_registrations", "child_session_id"),
     ("owner_docs", "author_session_id"),
+    ("owner_doc_readers", "session_id"),
     ("owner_doc_reviews", "assigned_session_id"),
     ("owner_follows", "session_id"),
 ];
@@ -252,6 +253,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ("bug_reports", "selected_session_id", "history"),
     ("guestbook_entries", "session_id", "history"),
     ("owner_doc_publishes", "session_id", "history"),
+    (
+        "owner_doc_reader_sessions",
+        "session_id",
+        "history of which reader wrote each answer",
+    ),
     (
         "owner_doc_reviews",
         "delivered_to_session_id",

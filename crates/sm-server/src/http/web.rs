@@ -255,7 +255,9 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .map(|asset| asset.body.len())
             .sum();
-        assert!(own <= 256 * 1024, "own JS is {own} bytes");
+        // The source assets are served separately; the current UI includes
+        // the work-thread reader and its Ask column.
+        assert!(own <= 288 * 1024, "own JS is {own} bytes");
     }
 
     #[test]

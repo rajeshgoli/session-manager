@@ -466,6 +466,17 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
             viewed_at TEXT NOT NULL,
             PRIMARY KEY (doc_id, blob_sha)
         );
+        CREATE TABLE IF NOT EXISTS owner_doc_readers (
+            doc_id TEXT PRIMARY KEY REFERENCES owner_docs(id),
+            session_id TEXT NOT NULL,
+            worktree_path TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS owner_doc_reader_sessions (
+            session_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES owner_docs(id)
+        );
+        INSERT OR IGNORE INTO owner_doc_reader_sessions (session_id, doc_id)
+            SELECT session_id, doc_id FROM owner_doc_readers;
         CREATE TABLE IF NOT EXISTS owner_doc_drafts (
             id TEXT PRIMARY KEY,
             doc_id TEXT NOT NULL,
@@ -835,6 +846,64 @@ impl OwnerDocStore {
             return Ok(None);
         };
         get_doc_conn(&conn, doc_id)
+    }
+
+    pub fn reader(&self, doc_id: &str) -> Result<Option<(String, String)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT session_id, worktree_path FROM owner_doc_readers WHERE doc_id = ?1",
+                params![doc_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn reader_worktree_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT worktree_path FROM owner_doc_readers WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Keep every reader's doc association after a newer reader takes over.
+    pub fn reader_sessions(&self) -> Result<Vec<(String, String)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT session_id, doc_id FROM owner_doc_reader_sessions
+             UNION SELECT session_id, doc_id FROM owner_doc_readers",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sessions)
+    }
+
+    pub fn set_reader(&self, doc_id: &str, session_id: &str, worktree_path: &str) -> Result<()> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO owner_doc_reader_sessions (session_id, doc_id) VALUES (?1, ?2)",
+            params![session_id, doc_id],
+        )?;
+        tx.execute(
+            "INSERT INTO owner_doc_readers (doc_id, session_id, worktree_path)
+            VALUES (?1, ?2, ?3) ON CONFLICT(doc_id) DO UPDATE SET
+            session_id = excluded.session_id, worktree_path = excluded.worktree_path",
+            params![doc_id, session_id, worktree_path],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn publishes(&self, doc_id: &str) -> Result<Vec<OwnerDocPublish>> {

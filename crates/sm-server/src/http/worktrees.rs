@@ -238,6 +238,9 @@ pub(super) async fn cleanup_after_retire(
     let task_progress = progress.clone();
     let task_session = session_id.to_owned();
     let task = tokio::task::spawn_blocking(move || {
+        if let Err(error) = super::ask::cleanup_reader_worktree(&task_state, &task_session) {
+            eprintln!("reader worktree cleanup after retiring {task_session} failed: {error:#}");
+        }
         refresh_open_prs(&task_state, &task_session);
         let sessions = cleanup_sessions(&task_state)?;
         run_worktree_cleanup(

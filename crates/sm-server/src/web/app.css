@@ -502,7 +502,27 @@ button.sw-sec { cursor: pointer; }
 .inbox-reader,.doc-reader,.thread-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
 .inbox-actions,.reader-bar { display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
 .inbox-actions span,.reader-title { flex:1; min-width:2.667rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.doc-reader iframe { flex:1; width:100%; border:0; min-height:0; background:var(--panel); }
+.panel:has(.doc-reader.ask-open) { width:min(70vw, calc(var(--panel-w) + 17rem)); }
+@media (max-width: 720px) {
+  .panel:has(.doc-reader.ask-open) { width:100vw; }
+  .doc-reader.ask-open iframe { display:none; }
+  .doc-reader.ask-open .doc-ask { width:100%; }
+}
+.doc-reader-body { display:flex; flex:1; min-height:0; min-width:0; }
+.doc-reader iframe { flex:1; width:100%; border:0; min-height:0; min-width:0; background:var(--panel); }
+.doc-ask { width:17rem; flex:none; display:flex; flex-direction:column; min-height:0; border-left:1px solid var(--line); }
+.doc-ask-head,.doc-ask-actions { display:flex; align-items:center; justify-content:space-between; gap:6px; }
+.doc-ask-head { padding:8px; border-bottom:1px solid var(--line); }
+.doc-ask-items { flex:1; overflow:auto; padding:8px; font-size:.8rem; }
+.doc-ask-item { margin-bottom:8px; overflow-wrap:anywhere; }
+.doc-ask-item .b { padding:8px; border-radius:8px; background:var(--panel-2); }
+.doc-ask-item .ev { color:var(--ink-3); font-size:.72rem; }
+.doc-ask-item .m { color:var(--ink-3); font-size:.7rem; }
+.doc-ask-compose { display:flex; flex-direction:column; gap:7px; padding:8px; border-top:1px solid var(--line); }
+.doc-ask-compose select,.doc-ask-compose textarea { width:100%; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:6px; }
+.doc-ask-compose blockquote { margin:0; padding:6px; border-left:3px solid var(--accent); white-space:pre-wrap; max-height:6rem; overflow:auto; }
+.doc-ask-compose blockquote button { float:right; }
+.doc-ask-actions [role=alert] { color:var(--red); overflow-wrap:anywhere; }
 .reader-bar select { max-width:6.667rem; background:var(--panel); border:1px solid var(--line); }
 .reader-print { display:inline-flex; }
 .reader-print button + button { border-top-left-radius:0; border-bottom-left-radius:0; border-left:1px solid var(--line); }
