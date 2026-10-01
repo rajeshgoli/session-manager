@@ -21,6 +21,7 @@ HOST="127.0.0.1"
 PORT="8420"
 CONFIG="$REPO_ROOT/config.yaml"
 LOCAL_ENV=""
+TAKE_OVER=0
 BINARY="$REPO_ROOT/.local/bin/sm-server"
 RUST_LABEL="com.rajeshgoli.session-manager-rust"
 PYTHON_LABELS=("com.rajeshgoli.session-manager" "com.claude.session-manager")
@@ -75,6 +76,7 @@ Options:
   --label LABEL        Rust launchd label (default: $RUST_LABEL)
   --plist PATH         Rust plist destination (default: ~/Library/LaunchAgents/<label>.plist)
   --log-dir PATH       Rust launchd stdout/stderr directory (default: ~/.local/share/claude-sessions/launchd-logs)
+  --take-over          Start an idle slot beside the current serving slot.
 
 First canary shape:
   cargo build -p sm-server --release
@@ -121,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       LOG_DIR="$(_resolve_path "${2:?missing --log-dir value}")"
       shift 2
       ;;
+    --take-over)
+      TAKE_OVER=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -144,6 +150,9 @@ rust_command_args() {
   if [[ -n "$LOCAL_ENV" ]]; then
     printf '%s\n' "--local-env"
     printf '%s\n' "$LOCAL_ENV"
+  fi
+  if [[ "$TAKE_OVER" -eq 1 ]]; then
+    printf '%s\n' "--take-over"
   fi
 }
 
@@ -214,7 +223,7 @@ collect_blockers() {
   fi
   local pids
   pids="$(port_owner_pids)"
-  if [[ -n "$pids" ]]; then
+  if [[ -n "$pids" && "$TAKE_OVER" -eq 0 ]]; then
     blockers+=("port_in_use: $PORT is already listening")
   fi
   if [[ "${#blockers[@]}" -eq 0 ]]; then
@@ -332,7 +341,10 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <true/>
 
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>WorkingDirectory</key>
     <string>$(xml_text "$root")</string>
@@ -389,7 +401,8 @@ start_rust() {
     launchctl bootout "$DOMAIN/$RUST_LABEL" || true
   fi
   launchctl bootstrap "$DOMAIN" "$PLIST_DST"
-  launchctl kickstart -k "$DOMAIN/$RUST_LABEL"
+  # RunAtLoad may already have started a takeover. Do not kill it mid-handover.
+  launchctl kickstart "$DOMAIN/$RUST_LABEL"
   echo "started $RUST_LABEL"
 }
 

@@ -209,7 +209,12 @@ if [[ "$1" == "print" ]]; then
   (( idx > last )) && idx=$last
   echo "	state = $(cat "{state}/job_state")"
   echo "	program = $(cat "{state}/job_program")"
-  echo "	pid = ${{pids[$idx]}}"
+  active="$(cat "{state}/active-slot" 2>/dev/null || true)"
+  if [[ "$(cat "{state}/phase")" != after ]] \
+      || [[ "$label" != *.* ]] \
+      || [[ "$label" == *.$active ]]; then
+    echo "	pid = ${{pids[$idx]}}"
+  fi
   echo "		state = active"
   # Only walk the pid list once the service has been restarted, so that
   # preflight reads do not consume the sequence a crash loop is modelled with.
@@ -285,14 +290,29 @@ echo "cutover $* [registered=$reg]" >> "{log}"
 case "$1" in
   render-plist) cat "{state}/rendered_plist"; exit 0 ;;
   stop-rust)
+    label="{LABEL}"
+    for ((i=1; i<=$#; i++)); do
+      if [[ "${{!i}}" == --label ]]; then next=$((i+1)); label="${{!next}}"; fi
+    done
     if [[ "$(cat "{state}/stop_leaves_loaded")" == "0" ]]; then
-      grep -vx "{LABEL}" "{state}/loaded_labels" > "{state}/tmp_labels" || true
+      grep -vx "$label" "{state}/loaded_labels" > "{state}/tmp_labels" || true
       mv "{state}/tmp_labels" "{state}/loaded_labels"
     fi
     exit "$(cat "{state}/stop_rc")"
     ;;
   start-rust)
-    echo "{LABEL}" >> "{state}/loaded_labels"
+    label="{LABEL}"
+    plist=""
+    for ((i=1; i<=$#; i++)); do
+      if [[ "${{!i}}" == --label ]]; then next=$((i+1)); label="${{!next}}"; fi
+      if [[ "${{!i}}" == --plist ]]; then next=$((i+1)); plist="${{!next}}"; fi
+    done
+    [[ -n "$plist" ]] && cp "{state}/rendered_plist" "$plist"
+    echo "$label" >> "{state}/loaded_labels"
+    case "$label" in
+      *.blue) echo blue > "{state}/active-slot" ;;
+      *.green) echo green > "{state}/active-slot" ;;
+    esac
     echo after > "{state}/phase"
     exit "$(cat "{state}/start_rc")"
     ;;
@@ -378,6 +398,7 @@ def _make_runner(
             "SM_LABEL": LABEL,
             "SM_SIGN_IDENTITY": SIGN_IDENTITY,
             "SM_LOCK": str(binary_dir_lock),
+            "SM_ACTIVE_SLOT_FILE": str(config.parent / "state" / "active-slot"),
             "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
             "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
             # The script's own repo is a real checkout; the main-containment
@@ -840,6 +861,45 @@ def test_two_different_staged_binaries_require_the_same_certificate_requirement(
     assert requirements == [SIGN_REQUIREMENT, SIGN_REQUIREMENT]
 
 
+def test_live_slot_hands_over_before_old_slot_is_removed(env):
+    (env["state"] / "loaded_labels").write_text(f"{LABEL}.blue\n")
+    (env["state"] / "active-slot").write_text("blue\n")
+    old_plist = env["plist"].with_name("service.blue.plist")
+    old_plist.write_text("<plist>canned</plist>\n")
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    lines = calls(env).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("cutover start-rust"))
+    stop = next(i for i, line in enumerate(lines) if line.startswith("cutover stop-rust"))
+    assert start < stop
+    assert "--label com.example.test.green" in lines[start]
+    assert "--take-over" in lines[start]
+    assert "--label com.example.test.blue" in lines[stop]
+    assert not old_plist.exists()
+    assert env["plist"].with_name("service.green.plist").exists()
+    assert env["installed"].is_symlink()
+    assert env["installed"].resolve() == Path(f"{env['installed']}-green")
+
+
+def test_failed_build_leaves_active_slot_and_plist_serving(env):
+    (env["state"] / "loaded_labels").write_text(f"{LABEL}.blue\n")
+    (env["state"] / "active-slot").write_text("blue\n")
+    old_plist = env["plist"].with_name("service.blue.plist")
+    old_plist.write_text("<plist>canned</plist>\n")
+    (env["state"] / "cargo_rc").write_text("7")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "build failed" in result.stderr
+    assert "cutover start-rust" not in calls(env)
+    assert "cutover stop-rust" not in calls(env)
+    assert old_plist.exists()
+    assert (env["state"] / "active-slot").read_text() == "blue\n"
+
+
 def test_restart_goes_through_the_cutover_script(env):
     env["run"]()
 
@@ -861,8 +921,8 @@ def test_binary_is_installed_only_while_the_job_is_stopped(env):
     assert result.returncode == 0, result.stderr
     # Still the known-good build when the job is booted out...
     assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
-    # ...and only replaced once nothing can exec it.
-    assert "[registered=REBUILT]" in cutover_line(env, "start-rust")
+    # The old installed path remains untouched while the new slot starts.
+    assert "[registered=ORIGINAL]" in cutover_line(env, "start-rust")
     assert "MARKER=REBUILT" in env["installed"].read_text()
 
 
@@ -874,7 +934,7 @@ def test_job_still_loaded_after_stop_aborts_before_install(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "still loaded" in result.stderr
+    assert "remained loaded" in result.stderr
     assert "MARKER=ORIGINAL" in env["installed"].read_text()
     assert "cutover start-rust" not in calls(env)
 
@@ -962,7 +1022,7 @@ def test_plist_path_is_forwarded_to_the_cutover(env):
     env["run"]()
 
     line = cutover_line(env, "start-rust")
-    assert f"--plist {env['plist']}" in line
+    assert f"--plist {env['plist'].with_name('service.blue.plist')}" in line
     # The cutover recomputes the plist path from --label, so order matters.
     assert line.index("--label") < line.index("--plist")
 
@@ -1044,6 +1104,20 @@ def test_plist_divergence_blocks_before_any_restart(env):
     assert "would rewrite" in result.stderr
     assert "live plist vs what the restart would write" in result.stderr
     assert_service_untouched(env)
+
+
+def test_serving_slot_plist_divergence_blocks_before_handover(env):
+    (env["state"] / "loaded_labels").write_text(f"{LABEL}.blue\n")
+    (env["state"] / "active-slot").write_text("blue\n")
+    old_plist = env["plist"].with_name("service.blue.plist")
+    old_plist.write_text("<plist>has --local-env with secrets</plist>\n")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "would rewrite" in result.stderr
+    assert "cutover start-rust" not in calls(env)
+    assert old_plist.exists()
 
 
 def test_allow_plist_change_proceeds_with_a_warning(env):
@@ -1285,8 +1359,8 @@ def test_happy_path_succeeds(env):
     assert "queue authority peer verified" in result.stdout
     assert (
         f"verify-queue-authority job_000000000000 --socket "
-        f"{env['authority_socket_path']} --executable {env['installed']} "
-        f"--launchd-label {LABEL} --signing-id com.rajeshgoli.sm-server "
+        f"{env['authority_socket_path']} --executable {env['installed']}-blue "
+        f"--launchd-label {LABEL}.blue --signing-id com.rajeshgoli.sm-server "
         f"--expect-not-found"
     ) in calls(env)
 
@@ -1327,7 +1401,7 @@ def test_unhealthy_after_restart_fails(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "did not become healthy" in result.stderr
+    assert "did not finish handover" in result.stderr
 
 
 def test_start_failure_is_reported(env):
@@ -1336,7 +1410,7 @@ def test_start_failure_is_reported(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "start failed" in result.stderr
+    assert "destination slot did not start" in result.stderr
 
 
 def test_pid_churn_is_detected_as_a_crash_loop(env):
@@ -1728,6 +1802,7 @@ def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
     installer.write_text(
         f"""#!/bin/bash
 echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
+printf '%s' "$SM_CLI_BINARY" > "{env['state']}/cli-destination"
 """)
     git(checkout["deployed"], "commit", "-q", "-am", "installer that reports its source")
     cutover = env["tmp"] / "cutover.sh"
@@ -1742,6 +1817,7 @@ echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
     line = next(l for l in calls(env).splitlines() if l.startswith("install-sm-cli"))
     assert line.startswith("install-sm-cli --source ")
     assert line.endswith(" FROM-SERVER-BUILD")
+    assert (env["state"] / "cli-destination").read_text() == str(env["installed"].parent / "sm")
     assert not list(env["installed"].parent.glob("*.sm-cli.staging.*"))
 
 

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Rebuild, sign, and restart the Rust Session Manager service - sm#1134.
+# Rebuild, sign, and hand over the Rust Session Manager service.
 #
-# The ordering here is the point of the script, not the individual commands:
-# the build and the signature must BOTH fully succeed before anything stops the
-# running service, so a broken build can never take the server offline.
+# The build and signature must succeed before the idle blue or green launchd
+# slot starts. The serving slot keeps its listeners until handover completes.
 #
 # That guarantee only holds if the service does not run out of the build
 # directory. cargo writes to target/release/sm-server; launchd is registered
@@ -37,9 +36,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Overridable for tests and non-default deployments.
 SM_LABEL="${SM_LABEL:-com.rajeshgoli.session-manager-rust}"
+SM_BASE_LABEL="$SM_LABEL"
 # The installed path launchd is registered against. Deliberately NOT cargo's
 # output path - see the header.
 SM_BINARY="${SM_BINARY:-$REPO_ROOT/.local/bin/sm-server}"
+SM_BASE_BINARY="$SM_BINARY"
 # Passed to cargo as --target-dir, which outranks CARGO_TARGET_DIR and
 # build.target-dir. Without pinning it, a redirected target dir would leave us
 # installing a stale artifact from the expected location.
@@ -63,6 +64,8 @@ SM_LOG_DIR="${SM_LOG_DIR:-}"
 # tests/unit/test_restart_rust_server.py guards this against drift.
 CUTOVER_DEFAULT_LOG_DIR="$HOME/.local/share/claude-sessions/launchd-logs"
 SM_PLIST="${SM_PLIST:-$HOME/Library/LaunchAgents/$SM_LABEL.plist}"
+SM_BASE_PLIST="$SM_PLIST"
+SM_ACTIVE_SLOT_FILE="${SM_ACTIVE_SLOT_FILE:-$HOME/.local/share/claude-sessions/active-slot}"
 # The set rust-service-cutover.sh enforces in start_rust. It is hard-coded there
 # with no CLI override, so it is always checked here no matter what
 # SM_PYTHON_LABELS says: otherwise a narrowed override would let the preflight
@@ -115,14 +118,12 @@ usage() {
   cat <<EOF
 Usage: scripts/restart-rust-server.sh [options]
 
-Rebuilds, signs, and restarts the Rust Session Manager, then verifies it.
-A failing build or a failing signature leaves the running service untouched,
-including the binary launchd is registered against.
+Rebuilds, signs, and starts the idle blue or green slot, then verifies the
+handover. A failing build or signature leaves the serving slot untouched.
 
-The service runs from an installed copy ($SM_BINARY),
-not from cargo's output, so a build never disturbs the running server. The
-first run after adopting this script rewrites the plist to point at the
-installed path and therefore needs --allow-plist-change once.
+Each slot has an installed binary beside $SM_BINARY. The base path is a symlink
+to the serving slot after handover. The first run migrates the legacy job into
+the blue slot with one service gap.
 
 Options:
   --update              Fast-forward this checkout to $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH under the
@@ -381,10 +382,13 @@ PY
 }
 
 SM_BINARY="$(resolve_path "$SM_BINARY")"
+SM_BASE_BINARY="$SM_BINARY"
+SM_CLI_BINARY="${SM_CLI_BINARY:-$(dirname "$SM_BASE_BINARY")/sm}"
 SM_CARGO_OUTPUT="$(resolve_path "$SM_CARGO_OUTPUT")"
 SM_TARGET_DIR="$(resolve_path "$SM_TARGET_DIR")"
 SM_CONFIG="$(resolve_path "$SM_CONFIG")"
 SM_PLIST="$(resolve_path "$SM_PLIST")"
+SM_BASE_PLIST="$SM_PLIST"
 SM_CUTOVER="$(resolve_path "$SM_CUTOVER")"
 SM_SIGNING_CONFIG="$(resolve_path "$SM_SIGNING_CONFIG")"
 [[ -n "$SM_LOCAL_ENV" ]] && SM_LOCAL_ENV="$(resolve_path "$SM_LOCAL_ENV")"
@@ -508,6 +512,16 @@ job_loaded() {
 registration_runs_cargo_output() {
   local target program
   target="$(canonical_path "$SM_CARGO_OUTPUT")"
+  if [[ "${old_label:-}" == "$legacy_label" && "$legacy_loaded" -eq 1 ]]; then
+    program="$(launchctl print "$DOMAIN/$legacy_label" 2>/dev/null \
+      | awk -F' = ' '/^[[:space:]]*program = / {print $2; exit}')"
+    [[ -n "$program" && "$(canonical_path "$program")" == "$target" ]]
+    return
+  fi
+  if [[ -z "${old_label:-}" && -f "$legacy_plist" ]] \
+      && plist_runs_cargo_output "$legacy_plist"; then
+    return 0
+  fi
   if job_loaded; then
     program="$(launchctl_field program)"
     if [[ -n "$program" && "$(canonical_path "$program")" == "$target" ]]; then
@@ -530,7 +544,7 @@ registration_runs_cargo_output() {
 # Compared canonically rather than as a literal string, for the same reason as
 # the SM_BINARY check: an alias would otherwise hide the migration state.
 plist_runs_cargo_output() {
-  python3 - "$SM_PLIST" "$SM_CARGO_OUTPUT" <<'PY'
+  python3 - "${1:-$SM_PLIST}" "$SM_CARGO_OUTPUT" <<'PY'
 import os, re, sys
 
 plist_path, target = sys.argv[1], sys.argv[2]
@@ -664,6 +678,57 @@ if [[ "$UPDATE" -eq 1 ]]; then
   exec bash "$REPO_ROOT/scripts/restart-rust-server.sh" ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
 fi
 
+# Select the unloaded slot under the shared restart lock. The active marker is
+# written by the serving server; launchd registration confirms that it is live.
+active_slot=""
+if [[ -f "$SM_ACTIVE_SLOT_FILE" ]]; then
+  active_slot="$(tr -d '\n' < "$SM_ACTIVE_SLOT_FILE")"
+  [[ "$active_slot" == blue || "$active_slot" == green ]] \
+    || fail "invalid active slot in $SM_ACTIVE_SLOT_FILE: $active_slot"
+fi
+legacy_label="$SM_BASE_LABEL"
+legacy_plist="$SM_BASE_PLIST"
+legacy_loaded=0
+launchctl print "$DOMAIN/$legacy_label" >/dev/null 2>&1 && legacy_loaded=1
+blue_loaded=0
+green_loaded=0
+launchctl print "$DOMAIN/$SM_BASE_LABEL.blue" >/dev/null 2>&1 && blue_loaded=1
+launchctl print "$DOMAIN/$SM_BASE_LABEL.green" >/dev/null 2>&1 && green_loaded=1
+if (( legacy_loaded + blue_loaded + green_loaded > 1 )); then
+  fail "more than one Session Manager launchd job is loaded; resolve the interrupted handover before restarting"
+fi
+if (( legacy_loaded )); then
+  old_label="$legacy_label"
+  old_plist="$legacy_plist"
+  next_slot=blue
+elif (( blue_loaded )); then
+  [[ "$active_slot" == blue ]] || fail "loaded blue slot disagrees with $SM_ACTIVE_SLOT_FILE"
+  old_label="$SM_BASE_LABEL.blue"
+  old_plist="${SM_BASE_PLIST%.plist}.blue.plist"
+  next_slot=green
+elif (( green_loaded )); then
+  [[ "$active_slot" == green ]] || fail "loaded green slot disagrees with $SM_ACTIVE_SLOT_FILE"
+  old_label="$SM_BASE_LABEL.green"
+  old_plist="${SM_BASE_PLIST%.plist}.green.plist"
+  next_slot=blue
+else
+  old_label=""
+  old_plist=""
+  next_slot="${active_slot:-blue}"
+fi
+SM_LABEL="$SM_BASE_LABEL.$next_slot"
+SM_BINARY="${SM_BASE_BINARY}-$next_slot"
+SM_PLIST="${SM_BASE_PLIST%.plist}.$next_slot.plist"
+SM_STAGING="$SM_BINARY.staging.$$"
+cutover_args=(--label "$SM_LABEL" --plist "$SM_PLIST" --binary "$SM_BINARY"
+  --config "$SM_CONFIG" --host "$SM_HOST" --port "$SM_PORT")
+[[ -n "$SM_LOCAL_ENV" ]] && cutover_args+=(--local-env "$SM_LOCAL_ENV")
+[[ -n "$SM_LOG_DIR" ]] && cutover_args+=(--log-dir "$SM_LOG_DIR")
+if [[ -n "$old_label" && "$old_label" != "$legacy_label" ]]; then
+  cutover_args+=(--take-over)
+fi
+echo "active: ${old_label:-none}; installing: $SM_LABEL"
+
 # The copy --update handed off to must still be building what it fetched: a
 # checkout or commit in the gap before the exec would otherwise become the
 # baseline below and be deployed.
@@ -736,7 +801,8 @@ done
 # registered against cargo's output, or the next ordinary `cargo build` replaces
 # the live binary. Compared canonically, because a symlink or a `..` alias would
 # otherwise slip past and leave cargo writing the very executable launchd runs.
-if [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]]; then
+if [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]] \
+    || [[ "$(canonical_path "$SM_BASE_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]]; then
   fail "$SM_BINARY resolves to the same file as cargo's output
        ($SM_CARGO_OUTPUT). The service must not be registered against cargo's
        output path: a build would then write the registered binary directly, and
@@ -746,7 +812,7 @@ fi
 
 # start-rust refuses a binary inside a cargo target directory, and it only
 # checks after the service is stopped. Refuse here first, while nothing is.
-if path_in_cargo_target_dir "$SM_BINARY"; then
+if path_in_cargo_target_dir "$SM_BINARY" || path_in_cargo_target_dir "$SM_BASE_BINARY"; then
   fail "$SM_BINARY is inside a cargo target directory ($SM_TARGET_DIR,
        $REPO_ROOT/target, or CARGO_TARGET_DIR). start-rust refuses to register
        it, because a later build would replace the executable launchd runs.
@@ -780,6 +846,9 @@ if [[ -e "$SM_PLIST" && ! -w "$SM_PLIST" ]]; then
        service has been stopped, so this would leave it down. The running service
        was not touched."
 fi
+if [[ "$old_label" == "$legacy_label" && -e "$legacy_plist" && ! -w "$legacy_plist" ]]; then
+  fail "legacy launchd plist is not writable: $legacy_plist; it must be removed after migration. The running service was not touched."
+fi
 
 # Same reasoning for the launchd log directory: write_plist creates it, and that
 # also runs after the bootout.
@@ -793,15 +862,39 @@ mkdir -p "$effective_log_dir" 2>/dev/null || true
 # Restarting rewrites the plist. Anything in the live plist that we would not
 # regenerate is a deployment setting about to be silently dropped - a custom
 # --local-env carrying auth secrets, for instance.
-if [[ -f "$SM_PLIST" ]]; then
+compare_plist="$SM_PLIST"
+[[ -n "$old_plist" ]] && compare_plist="$old_plist"
+if [[ -f "$compare_plist" ]]; then
   RENDERED_PLIST="$(mktemp)"
   "$SM_CUTOVER" render-plist "${cutover_args[@]}" > "$RENDERED_PLIST" \
     || fail "could not render the plist for comparison - the running service was not touched"
-  if ! diff -u "$SM_PLIST" "$RENDERED_PLIST" > "$RENDERED_PLIST.diff" 2>&1; then
+  if ! python3 - "$compare_plist" "$RENDERED_PLIST" <<'PY'
+import plistlib
+import sys
+
+def normalized(path):
+    with open(path, "rb") as source:
+        value = plistlib.load(source)
+    value.pop("Label", None)
+    value.pop("KeepAlive", None)
+    args = value.get("ProgramArguments", [])
+    if args:
+        args[0] = "<slot binary>"
+    value["ProgramArguments"] = [arg for arg in args if arg != "--take-over"]
+    return value
+
+try:
+    equal = normalized(sys.argv[1]) == normalized(sys.argv[2])
+except Exception:
+    equal = open(sys.argv[1], "rb").read() == open(sys.argv[2], "rb").read()
+sys.exit(0 if equal else 1)
+PY
+  then
+    diff -u "$compare_plist" "$RENDERED_PLIST" > "$RENDERED_PLIST.diff" 2>&1 || true
     echo "--- live plist vs what the restart would write ---" >&2
     cat "$RENDERED_PLIST.diff" >&2
     if [[ "$ALLOW_PLIST_CHANGE" -eq 0 ]]; then
-      fail "restarting would rewrite $SM_PLIST with different contents (diff above).
+      fail "restarting would rewrite $compare_plist with different contents (diff above).
        If this is the first run after adopting this script, that diff should be
        the program path moving to the installed binary, or the launchd log
        paths moving to $CUTOVER_DEFAULT_LOG_DIR - re-run with
@@ -832,8 +925,8 @@ if [[ "$ADOPT" -eq 1 ]]; then
   SOURCE_BINARY="$SM_CARGO_OUTPUT"
 elif [[ "$SKIP_BUILD" -eq 1 ]]; then
   step "Skipping build (--skip-build)"
-  [[ -x "$SM_BINARY" ]] || fail "no installed binary at $SM_BINARY to re-deploy - the running service was not touched"
-  SOURCE_BINARY="$SM_BINARY"
+  [[ -x "$SM_BASE_BINARY" ]] || fail "no installed binary at $SM_BASE_BINARY to re-deploy - the running service was not touched"
+  SOURCE_BINARY="$(canonical_path "$SM_BASE_BINARY")"
 else
   step "Building sm-server (service still running)"
   # From REPO_ROOT: cargo reads .cargo/config.toml from the cwd, which
@@ -909,24 +1002,23 @@ echo "source unchanged"
 # Phase 2: from here on the service is affected.
 # ---------------------------------------------------------------------------
 
-step "Stopping the service (bootout)"
-"$SM_CUTOVER" stop-rust "${cutover_args[@]}" \
-  || fail "could not stop $SM_LABEL - the installed binary is untouched"
+step "Confirming the destination slot is unloaded"
+if job_loaded; then
+  fail "$SM_LABEL is loaded; refusing to replace a binary launchd can execute"
+fi
 
-step "Confirming the job is really unloaded"
-# stop_rust runs `launchctl bootout ... || true` and reports success either way,
-# so a job that refused to unload would otherwise let us install while KeepAlive
-# can still respawn it.
-unload_deadline=$((SECONDS + SM_UNLOAD_TIMEOUT))
-while job_loaded; do
-  if (( SECONDS >= unload_deadline )); then
-    fail "$SM_LABEL is still loaded ${SM_UNLOAD_TIMEOUT}s after stop-rust; refusing to
-       install while launchd can still respawn it. The installed binary is
-       untouched, so the service is still running its previous build."
-  fi
-  sleep 1
-done
-echo "job is unloaded"
+# The legacy job cannot pass its listeners. This is the one migration restart
+# with a service gap; subsequent restarts keep the serving slot alive.
+if [[ "$old_label" == "$legacy_label" ]]; then
+  step "Migrating the legacy launchd job (one service gap)"
+  "$SM_CUTOVER" stop-rust --label "$legacy_label" --plist "$legacy_plist" \
+    || fail "could not stop the legacy job"
+  unload_deadline=$((SECONDS + SM_UNLOAD_TIMEOUT))
+  while launchctl print "$DOMAIN/$legacy_label" >/dev/null 2>&1; do
+    (( SECONDS < unload_deadline )) || fail "legacy job remained loaded after bootout"
+    sleep 1
+  done
+fi
 
 step "Installing the verified build"
 # Nothing can exec the registered path right now, so this is the one safe moment
@@ -935,9 +1027,54 @@ mv -f "$SM_STAGING" "$SM_BINARY" \
   || fail "could not install the new binary at $SM_BINARY; the previous build is
        still in place - re-run '$SM_CUTOVER start-rust' to bring the service back"
 
-step "Starting the service (bootstrap -> kickstart)"
+step "Starting the destination slot (bootstrap -> kickstart)"
 "$SM_CUTOVER" start-rust "${cutover_args[@]}" \
-  || fail "start failed - see output above; service may be down"
+  || {
+    "$SM_CUTOVER" stop-rust "${cutover_args[@]}" || true
+    rm -f "$SM_PLIST"
+    fail "destination slot did not start; ${old_label:-no previous slot} is unchanged"
+  }
+
+step "Waiting for the new slot to serve and the old process to exit"
+handover_deadline=$((SECONDS + SM_HEALTH_TIMEOUT))
+while :; do
+  marked_slot=""
+  [[ -f "$SM_ACTIVE_SLOT_FILE" ]] && marked_slot="$(tr -d '\n' < "$SM_ACTIVE_SLOT_FILE")"
+  if [[ "$marked_slot" == "$next_slot" ]] && health_ok; then
+    if [[ -z "$old_label" || "$old_label" == "$legacy_label" ]] \
+        || [[ -z "$(launchctl print "$DOMAIN/$old_label" 2>/dev/null | awk -F' = ' '/^[[:space:]]*pid = / {print $2; exit}')" ]]; then
+      break
+    fi
+  fi
+  if (( SECONDS >= handover_deadline )); then
+    "$SM_CUTOVER" stop-rust "${cutover_args[@]}" || true
+    rm -f "$SM_PLIST"
+    fail "new slot did not finish handover; old slot remains the serving slot or has rolled back"
+  fi
+  sleep 1
+done
+
+if [[ -n "$old_label" ]]; then
+  "$SM_CUTOVER" stop-rust --label "$old_label" --plist "$old_plist" \
+    || fail "new slot serves, but old slot could not be booted out"
+  unload_deadline=$((SECONDS + SM_UNLOAD_TIMEOUT))
+  while launchctl print "$DOMAIN/$old_label" >/dev/null 2>&1; do
+    (( SECONDS < unload_deadline )) || fail "old slot remains loaded after bootout"
+    sleep 1
+  done
+  rm -f "$old_plist" || fail "old slot plist could not be removed: $old_plist"
+fi
+# A recovery start may have no loaded predecessor but a stale plist on disk.
+# Remove every non-serving registration before declaring the restart complete.
+for stale_plist in "$SM_BASE_PLIST" \
+    "${SM_BASE_PLIST%.plist}.blue.plist" \
+    "${SM_BASE_PLIST%.plist}.green.plist"; do
+  [[ "$stale_plist" == "$SM_PLIST" ]] && continue
+  rm -f "$stale_plist" || fail "could not remove inactive plist $stale_plist"
+done
+alias_staging="$SM_BASE_BINARY.staging.$$"
+ln -s "$SM_BINARY" "$alias_staging" || fail "could not stage active binary symlink"
+mv -f "$alias_staging" "$SM_BASE_BINARY" || fail "could not update active binary symlink"
 
 step "Waiting for /health (timeout ${SM_HEALTH_TIMEOUT}s)"
 deadline=$((SECONDS + SM_HEALTH_TIMEOUT))
@@ -1007,7 +1144,7 @@ if [[ "$SKIP_BUILD" -eq 1 ]]; then
 elif [[ -z "$SM_CLI_STAGING" ]]; then
   echo "WARNING: the build produced no sm CLI at $SM_TARGET_DIR/release/sm, so it was" >&2
   echo "         not reinstalled; $SM_LABEL itself is healthy." >&2
-elif "$REPO_ROOT/scripts/install-sm-cli.sh" --source "$SM_CLI_STAGING"; then
+elif SM_CLI_BINARY="$SM_CLI_BINARY" "$REPO_ROOT/scripts/install-sm-cli.sh" --source "$SM_CLI_STAGING"; then
   :
 else
   echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2

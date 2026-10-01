@@ -3,7 +3,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::fd::AsRawFd,
     os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -54,6 +54,7 @@ pub struct QueueAuthorityServer {
     queue_db_path: PathBuf,
     identity: QueueAuthorityServiceIdentity,
     unlink_on_drop: AtomicBool,
+    bound_socket_identity: Option<(u64, u64)>,
 }
 
 impl QueueAuthorityServer {
@@ -86,6 +87,9 @@ impl QueueAuthorityServer {
             queue_db_path: queue_state_dir.join("queue_runner.db"),
             identity,
             unlink_on_drop: AtomicBool::new(true),
+            bound_socket_identity: Some(socket_identity(
+                &queue_state_dir.join(AUTHORITY_SOCKET_FILE),
+            )?),
         })
     }
 
@@ -100,6 +104,7 @@ impl QueueAuthorityServer {
             queue_db_path: queue_state_dir.join("queue_runner.db"),
             identity,
             unlink_on_drop: AtomicBool::new(false),
+            bound_socket_identity: None,
         }
     }
 
@@ -117,6 +122,34 @@ impl QueueAuthorityServer {
 
     pub fn claim_socket(&self) {
         self.unlink_on_drop.store(true, Ordering::Release);
+    }
+
+    /// Publish a listener bound by this process after an inherited handover.
+    /// macOS LOCAL_PEERPID identifies the process that bound the socket, even
+    /// when a successor accepts on its inherited descriptor.
+    pub fn rebind_after_handover(&mut self) -> Result<()> {
+        let replacement_path = self
+            .socket_path
+            .with_file_name(format!(".a{}", process::id()));
+        if replacement_path.exists() {
+            bail!(
+                "queue authority replacement path already exists: {}",
+                replacement_path.display()
+            );
+        }
+        let replacement = UnixListener::bind(&replacement_path)
+            .with_context(|| format!("failed to bind {}", replacement_path.display()))?;
+        if let Err(error) =
+            fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600))
+                .and_then(|()| fs::rename(&replacement_path, &self.socket_path))
+        {
+            let _ = fs::remove_file(&replacement_path);
+            return Err(error).context("failed to publish replacement queue authority socket");
+        }
+        self.listener = replacement;
+        self.bound_socket_identity = Some(socket_identity(&self.socket_path)?);
+        self.claim_socket();
+        Ok(())
     }
 
     pub fn spawn(&self, shutdown: crate::handover::Shutdown) -> Result<thread::JoinHandle<()>> {
@@ -150,10 +183,21 @@ impl QueueAuthorityServer {
 
 impl Drop for QueueAuthorityServer {
     fn drop(&mut self) {
-        if self.unlink_on_drop.load(Ordering::Acquire) {
+        if self.unlink_on_drop.load(Ordering::Acquire)
+            && self.bound_socket_identity.is_some()
+            && self.bound_socket_identity == socket_identity(&self.socket_path).ok()
+        {
             let _ = fs::remove_file(&self.socket_path);
         }
     }
+}
+
+fn socket_identity(path: &Path) -> Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        bail!("queue authority path is not a socket: {}", path.display());
+    }
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,6 +510,71 @@ mod tests {
         assert!(server.socket_path().exists());
         drop(server);
         assert!(!stale_path.exists());
+    }
+
+    #[test]
+    fn inherited_authority_listener_is_replaced_at_the_same_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_dir = unique_temp_dir("rebind");
+        let mut server = QueueAuthorityServer::bind(&state_dir, fixture_identity()).unwrap();
+        let socket_path = server.socket_path().to_path_buf();
+        let old_inode = fs::metadata(&socket_path).unwrap().ino();
+        server.rebind_after_handover().unwrap();
+        let new_inode = fs::metadata(&socket_path).unwrap().ino();
+        assert_ne!(new_inode, old_inode);
+        server.rebind_after_handover().unwrap();
+        assert_ne!(fs::metadata(&socket_path).unwrap().ino(), new_inode);
+        assert_eq!(
+            fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let server_thread = thread::spawn(move || server.accept_once().unwrap());
+        let mut stream = UnixStream::connect(socket_path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"schema": REQUEST_SCHEMA, "job_id": "job_0123456789ab"})
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server_thread.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn rolled_back_replacement_does_not_unlink_restored_authority_socket() {
+        let state_dir = unique_temp_dir("rollback");
+        let mut old = QueueAuthorityServer::bind(&state_dir, fixture_identity()).unwrap();
+        let inherited = old.listener.try_clone().unwrap();
+        let mut replacement =
+            QueueAuthorityServer::from_listener(inherited, &state_dir, fixture_identity());
+        replacement.rebind_after_handover().unwrap();
+        old.rebind_after_handover().unwrap();
+        drop(replacement);
+
+        let path = old.socket_path().to_path_buf();
+        assert!(path.exists());
+        let server_thread = thread::spawn(move || old.accept_once().unwrap());
+        let mut stream = UnixStream::connect(path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"schema": REQUEST_SCHEMA, "job_id": "job_0123456789ab"})
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server_thread.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
+            "not_found"
+        );
     }
 
     #[test]
