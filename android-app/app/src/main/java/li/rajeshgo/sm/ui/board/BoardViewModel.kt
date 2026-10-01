@@ -25,6 +25,10 @@ import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.ui.watch.DocReaderAuth
 import li.rajeshgo.sm.ui.watch.loadDocReaderAuth
+import li.rajeshgo.sm.ui.watch.AgentTypeChoice
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /** How long after asking for a GitHub read the board is fetched again, as the web page does. */
 private const val READ_SETTLE_MS = 2_000L
@@ -77,6 +81,7 @@ data class BoardStartState(
     val ticket: BoardTicket,
     /** Start anyway on a blocked ticket (spec 1782 H3). */
     val startBlocked: Boolean = false,
+    val whenReady: Boolean = false,
     val options: BoardStartOptions? = null,
     val busy: Boolean = false,
     val error: String? = null,
@@ -133,6 +138,7 @@ data class BoardUiState(
     /** A lane move, add or end in flight. */
     val busy: Boolean = false,
     val start: BoardStartState? = null,
+    val agentTypes: List<AgentTypeChoice> = emptyList(),
     val reviewPolicy: ReviewPolicyEdit? = null,
     /** The queue, read with the board, so rows can show each agent's jobs. */
     val queue: li.rajeshgo.sm.data.model.QueueOverview? = null,
@@ -313,10 +319,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openStart(ticket: BoardTicket, startBlocked: Boolean = false) {
-        _uiState.update { it.copy(start = BoardStartState(ticket, startBlocked = startBlocked)) }
+    fun openStart(ticket: BoardTicket, startBlocked: Boolean = false, whenReady: Boolean = false) {
+        _uiState.update { it.copy(start = BoardStartState(ticket, startBlocked = startBlocked, whenReady = whenReady)) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
+            if (whenReady) runCatching { repository.fetchOwnerSettings(url, token) }.onSuccess { settings ->
+                val types = settings["new_agent"]?.jsonObject?.get("agent_types")?.jsonArray.orEmpty().mapNotNull { entry ->
+                    val item = entry.jsonObject
+                    val name = item["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+                    AgentTypeChoice(name, item["provider"]?.jsonPrimitive?.content ?: "claude",
+                        item["model"]?.jsonPrimitive?.content ?: "", item["effort"]?.jsonPrimitive?.content ?: "high")
+                }
+                _uiState.update { it.copy(agentTypes = types) }
+            }
             runCatching { repository.fetchBoardStartOptions(url, token, ticket.repo, ticket.number, startBlocked) }
                 .onSuccess { options -> updateStart(ticket) { it.copy(options = options) } }
                 .onFailure { error ->
@@ -365,6 +380,28 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             // After a refusal (the ticket was taken or is no longer ready) or a start, show the board as it is now.
+            load(url, token)
+        }
+    }
+
+    fun authorizeStart(choice: li.rajeshgo.sm.data.model.BoardAutoStartChoice, onSaved: (String) -> Unit) {
+        val ticket = _uiState.value.start?.ticket ?: return
+        updateStart(ticket) { it.copy(busy = true, error = null) }
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            repository.setBoardAutoStart(url, token, choice)
+                .onSuccess { _uiState.update { it.copy(start = null) }; onSaved("Starts #${ticket.number} when ready") }
+                .onFailure { error -> updateStart(ticket) { it.copy(busy = false, error = error.message ?: "Couldn't save start") } }
+            load(url, token)
+        }
+    }
+
+    fun cancelStart(ticket: BoardTicket, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            repository.cancelBoardAutoStart(url, token, ticket.repo, ticket.number)
+                .onSuccess { onResult("Cancelled #${ticket.number} automatic start") }
+                .onFailure { onResult(it.message ?: "Couldn't cancel start") }
             load(url, token)
         }
     }

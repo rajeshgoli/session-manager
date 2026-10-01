@@ -105,13 +105,13 @@ private fun rememberHandoffEditor(sessionId: String?): HandoffViewModel {
 }
 
 @Composable
-fun ContextHandoffDialog(session: ClientSession, onDismiss: () -> Unit) {
+fun ContextHandoffDialog(session: ClientSession, onDismiss: () -> Unit, showNow: Boolean = false) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Context handoff") },
+        title = { Text(if (showNow) "Hand off now" else "Context handoff") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                ContextHandoffSection(session)
+                ContextHandoffSection(session, showNow)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
@@ -120,7 +120,7 @@ fun ContextHandoffDialog(session: ClientSession, onDismiss: () -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ContextHandoffSection(session: ClientSession) {
+private fun ContextHandoffSection(session: ClientSession, showNow: Boolean = false) {
     val editor = rememberHandoffEditor(session.id)
     val state by editor.state.collectAsState()
     var confirm by remember(session.id) { mutableStateOf(false) }
@@ -129,17 +129,19 @@ private fun ContextHandoffSection(session: ClientSession) {
         Text(policy?.display ?: session.handoff?.display ?: "Loading handoff settings…", style = MaterialTheme.typography.bodySmall)
         if (policy != null) {
             val enabled = !state.saving && session.status != "stopped"
-            HandoffSwitch("Automatic handoff", policy.enabled, enabled) {
-                editor.update(buildJsonObject { put("enabled", it) })
+            if (!showNow) {
+                HandoffSwitch("Automatic handoff", policy.enabled, enabled) {
+                    editor.update(buildJsonObject { put("enabled", it) })
+                }
+                if (policy.enabled) PercentPicker("Threshold", policy.thresholdPercent, thresholdOptions(policy.thresholdPercent), enabled) {
+                    editor.update(buildJsonObject { put("threshold_percent", it) })
+                }
+                Text(if (policy.source == "override") "Custom settings for this agent" else "Using defaults", style = MaterialTheme.typography.bodySmall)
+                if (!policy.hasGauge) Text("No context reading; review requests can still ask this agent to hand off.", style = MaterialTheme.typography.bodySmall)
             }
-            if (policy.enabled) PercentPicker("Threshold", policy.thresholdPercent, thresholdOptions(policy.thresholdPercent), enabled) {
-                editor.update(buildJsonObject { put("threshold_percent", it) })
-            }
-            Text(if (policy.source == "override") "Custom settings for this agent" else "Using defaults", style = MaterialTheme.typography.bodySmall)
-            if (!policy.hasGauge) Text("No context reading; review requests and Hand off now can still ask this agent to hand off.", style = MaterialTheme.typography.bodySmall)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(enabled = enabled && policy.source == "override", onClick = { editor.update(buildJsonObject { put("use_default", true) }) }) { Text("Use default") }
-                TextButton(enabled = enabled, onClick = { confirm = true }) { Text("Hand off now") }
+                if (!showNow) TextButton(enabled = enabled && policy.source == "override", onClick = { editor.update(buildJsonObject { put("use_default", true) }) }) { Text("Use default") }
+                if (showNow) TextButton(enabled = enabled, onClick = { confirm = true }) { Text("Hand off now") }
             }
         }
         EditorStatus(state, editor::refresh)

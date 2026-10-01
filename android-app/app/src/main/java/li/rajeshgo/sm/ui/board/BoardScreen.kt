@@ -309,6 +309,8 @@ fun BoardScreen(
 
     val actions = BoardRowActions(
         onStart = { viewModel.openStart(it) },
+        onStartWhenReady = { viewModel.openStart(it, whenReady = true) },
+        onCancelStart = { viewModel.cancelStart(it, toast) },
         onStartAnyway = { startingAnyway = it },
         onClose = { closing = it },
         onOpenTerminal = { sessionId ->
@@ -543,6 +545,12 @@ fun BoardScreen(
             var reviewer by remember(start.ticket.repo, start.ticket.number, policy) {
                 mutableStateOf(if (ticketOwn) policy?.resolved else null)
             }
+            val selectedAgentType = if (start.whenReady) {
+                state.agentTypes.firstOrNull { it.name == (start.ticket.autoStart?.agentType ?: start.ticket.tier) }
+                    ?: state.agentTypes.firstOrNull {
+                        it.provider == defaults?.provider && it.model == defaults?.model && it.effort == defaults?.reasoningEffort
+                    }
+            } else null
             CreateSessionSheet(
                 source = null,
                 sessions = emptyList(),
@@ -554,10 +562,13 @@ fun BoardScreen(
                     label = "#${start.ticket.number} ${start.ticket.title}",
                     workingDir = options.workingDir,
                     name = options.name,
-                    brief = options.brief,
-                    provider = defaults?.provider ?: "claude",
-                    model = defaults?.model,
-                    effort = defaults?.reasoningEffort ?: "high",
+                    brief = if (start.whenReady) start.ticket.autoStart?.brief ?: options.brief else options.brief,
+                    provider = selectedAgentType?.provider ?: start.ticket.autoStart?.provider ?: defaults?.provider ?: "claude",
+                    model = selectedAgentType?.model ?: start.ticket.autoStart?.model ?: defaults?.model,
+                    effort = selectedAgentType?.effort ?: start.ticket.autoStart?.effort ?: defaults?.reasoningEffort ?: "high",
+                    whenReady = start.whenReady,
+                    agentTypes = state.agentTypes,
+                    selectedType = selectedAgentType?.name,
                 ),
                 extra = { enabled ->
                     StartReviewerRow(
@@ -568,6 +579,15 @@ fun BoardScreen(
                     )
                 },
             ) { request ->
+                if (start.whenReady) {
+                    val type = state.agentTypes.firstOrNull {
+                        it.provider == request.provider && it.model == request.model && it.effort == request.reasoningEffort
+                    }
+                    viewModel.authorizeStart(
+                        li.rajeshgo.sm.data.model.BoardAutoStartChoice(start.ticket.repo, start.ticket.number,
+                            type?.name, request.provider, request.model, request.reasoningEffort, request.initialMessage),
+                    ) { toast(it) }
+                } else {
                 viewModel.start(
                     BoardStartRequest(
                         repo = start.ticket.repo,
@@ -583,6 +603,7 @@ fun BoardScreen(
                     ),
                     clearTicketPolicy = ticketOwn && reviewer == null,
                 ) { name -> toast("Started $name") }
+                }
             }
         }
     }
@@ -591,6 +612,8 @@ fun BoardScreen(
 /** What a ticket row can open. */
 private class BoardRowActions(
     val onStart: (BoardTicket) -> Unit,
+    val onStartWhenReady: (BoardTicket) -> Unit,
+    val onCancelStart: (BoardTicket) -> Unit,
     /** Start anyway: a confirm, then Start with `start_blocked` (spec 1782 H3). */
     val onStartAnyway: (BoardTicket) -> Unit,
     /** Close a ticket whose parts are all done, after a confirm (spec 1782 H2). */
@@ -916,13 +939,21 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                 if (boardCanStart(ticket)) RowButton("Start", primary = true) { actions.onStart(ticket) }
                 if (boardCanStartAnyway(ticket)) RowButton("Start anyway", primary = false) { actions.onStartAnyway(ticket) }
                 if (ticket.state == "close_ready") RowButton("Close", primary = true, enabled = !actions.busy) { actions.onClose(ticket) }
-                if (ticket.state != "done" && !slim) {
+                if (ticket.state != "done") {
                     var menuOpen by remember { mutableStateOf(false) }
                     Box {
                         IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(28.dp)) {
                             Icon(Icons.Rounded.MoreVert, contentDescription = "Ticket menu", tint = TextMuted, modifier = Modifier.size(18.dp))
                         }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            if (ticket.state in setOf("blocked", "ready") && ticket.holder == null) {
+                                DropdownMenuItem(text = { Text(if (ticket.autoStart == null) "Start when ready…" else "Change automatic start…") }, onClick = {
+                                    menuOpen = false; actions.onStartWhenReady(ticket)
+                                })
+                            }
+                            if (ticket.autoStart != null) DropdownMenuItem(text = { Text("Cancel automatic start") }, onClick = {
+                                menuOpen = false; actions.onCancelStart(ticket)
+                            })
                             if (ticket.state == "close_ready") {
                                 DropdownMenuItem(text = { Text("Start instead") }, onClick = { menuOpen = false; actions.onStart(ticket) })
                             }
@@ -930,6 +961,12 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                         }
                     }
                 }
+            }
+            ticket.autoStart?.let { planned ->
+                Text("⏵ when ready · ${planned.agentType ?: "Custom"} · ${planned.model.orEmpty()} ${planned.effort.orEmpty()}" +
+                    if (planned.state == "failed") " · Failed: ${planned.lastError ?: "Retry"}" else "",
+                    style = MaterialTheme.typography.labelSmall, color = if (planned.state == "failed") Rose else Amber,
+                    modifier = Modifier.clickable { actions.onStartWhenReady(ticket) }.padding(top = 3.dp))
             }
             if (slim) {
                 val line = when (ticket.state) {

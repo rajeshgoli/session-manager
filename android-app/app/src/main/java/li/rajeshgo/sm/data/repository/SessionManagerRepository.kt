@@ -564,6 +564,43 @@ class SessionManagerRepository(
         ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getBoard() } }) { ScreenCache.board = it }
     }
 
+    suspend fun searchOwnerNotes(url: String, token: String, query: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(url, token) { it.searchOwnerNotes(query) }
+    }
+
+    suspend fun getOwnerNote(url: String, token: String, id: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(url, token) { it.getOwnerNote(id) }
+    }
+
+    suspend fun createOwnerNote(url: String, token: String, body: String) = withContext(Dispatchers.IO) {
+        runCatching { api(url, token).createOwnerNote(li.rajeshgo.sm.data.model.OwnerNoteWrite(body)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun saveOwnerNote(url: String, token: String, note: li.rajeshgo.sm.data.model.OwnerNote, body: String) = withContext(Dispatchers.IO) {
+        runCatching { api(url, token).saveOwnerNote(note.id, li.rajeshgo.sm.data.model.OwnerNoteWrite(body, ifVersion = note.version)) }
+            .mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun deleteOwnerNote(url: String, token: String, id: String) = withContext(Dispatchers.IO) {
+        runCatching { api(url, token).deleteOwnerNote(id) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun ownerNoteRevisions(url: String, token: String, id: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(url, token) { it.ownerNoteRevisions(id) }
+    }
+
+    suspend fun ownerNoteRevision(url: String, token: String, id: String, version: Long) = withContext(Dispatchers.IO) {
+        executeReadRequest(url, token) { it.ownerNoteRevision(id, version) }
+    }
+
+    suspend fun restoreOwnerNote(url: String, token: String, id: String, version: Long) = withContext(Dispatchers.IO) {
+        runCatching { api(url, token).restoreOwnerNote(id, li.rajeshgo.sm.data.model.OwnerNoteRestore(version)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fileOwnerIssue(url: String, token: String, repo: String, title: String, body: String) = withContext(Dispatchers.IO) {
+        runCatching { api(url, token, readTimeoutSeconds = 90).fileOwnerIssue(li.rajeshgo.sm.data.model.OwnerIssueRequest(repo, title, body)) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchBoardBadge(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardBadge = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getBoardBadge() }
     }
@@ -606,6 +643,14 @@ class SessionManagerRepository(
 
     suspend fun startBoardTicket(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.BoardStartRequest): Result<li.rajeshgo.sm.data.model.BoardStarted> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token, readTimeoutSeconds = 120).startBoardTicket(request) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun setBoardAutoStart(baseUrl: String, token: String, choice: li.rajeshgo.sm.data.model.BoardAutoStartChoice): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setBoardAutoStart(choice); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun cancelBoardAutoStart(baseUrl: String, token: String, repo: String, number: Long): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).cancelBoardAutoStart(repo, number); Unit }.mapFailure(::classifyWriteFailure)
     }
 
     suspend fun fetchBugReportOptions(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BugReportOptions = withContext(Dispatchers.IO) {
