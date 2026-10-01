@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1821 — Fit and finish, round 2</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<style>
+  /* Screen mockups use the proposed sm web palette (appendix A). Light by default; the memo's
+     dark toggle flips them, so each screen previews both themes. */
+  :root {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9;
+    --m-term:#0E0F14; --m-termink:#D7DAE3;
+  }
+  :root[data-theme="dark"] {
+    --m-bg:#09090D; --m-panel:#121219; --m-panel2:#1A1A23; --m-line:#2B2B37;
+    --m-ink:#F5F7FA; --m-ink2:#ADB2C2; --m-ink3:#777C8B; --m-accent:#5EE7FF; --m-sel:#143744;
+    --m-green:#4ADE80; --m-amber:#FBBF24; --m-mag:#F0ABFC; --m-red:#FB7185;
+    --m-cyan:#5EE7FF; --m-slate:#8B93A7; --m-claude:#FB923C; --m-codex:#A78BFA;
+    --m-term:#050507; --m-termink:#D7DAE3;
+  }
+  @media print { :root[data-theme="dark"] {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9; } }
+
+  .scrwrap { overflow-x: auto; margin: 1rem 0 .4rem; width: min(72rem, calc(100vw - 2rem)); position: relative; left: 50%; transform: translateX(-50%); }
+  .scr { min-width: 46rem; background: var(--m-bg); color: var(--m-ink); border: 1px solid var(--m-line);
+    border-radius: 10px; overflow: hidden; font: 12.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: grid; grid-template-columns: 8.2rem 1fr; }
+  .scr.pane { grid-template-columns: 8.2rem 1fr 21rem; }
+  .scr * { box-sizing: border-box; }
+  .scr code, .scr .mono { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: none; padding: 0; }
+  .rail { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .15rem; }
+  .rail .brand { font: 700 14px ui-monospace, Menlo, monospace; color: var(--m-accent); padding: 0 .5rem .6rem; }
+  .rail a { display: flex; justify-content: space-between; padding: .32rem .5rem; border-radius: 6px; color: var(--m-ink2); text-decoration: none; }
+  .rail a.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .rail a b { font-weight: 600; font-size: 11px; color: var(--m-ink3); }
+  .rail a b.hot { color: var(--m-amber); }
+  .rail .grow { flex: 1; }
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .bar { display: flex; align-items: center; gap: .8rem; padding: .55rem .9rem; border-bottom: 1px solid var(--m-line); background: var(--m-panel); }
+  .bar h5 { margin: 0; font-size: 13.5px; font-weight: 650; }
+  .bar .crumb { color: var(--m-ink3); font-size: 12.5px; }
+  .bar .sp { flex: 1; }
+  .search { color: var(--m-ink3); border: 1px solid var(--m-line); border-radius: 6px; padding: .2rem .55rem; min-width: 11rem; }
+  .meter { white-space: nowrap; display: inline-flex; align-items: center; gap: .3rem; color: var(--m-ink2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .meter i { display: inline-block; width: 2.4rem; height: 5px; border-radius: 3px; background: var(--m-panel2); position: relative; overflow: hidden; }
+  .meter i s { position: absolute; inset: 0 auto 0 0; background: var(--m-green); }
+  .btn { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .6rem; color: var(--m-ink); background: var(--m-panel); white-space: nowrap; }
+  .btn.pri { background: var(--m-accent); border-color: var(--m-accent); color: var(--m-panel); font-weight: 600; }
+  .btn.sm { padding: .1rem .45rem; font-size: 11.5px; }
+  .body { padding: .8rem .9rem; display: flex; flex-direction: column; gap: .7rem; }
+  .sum { display: flex; gap: 1.1rem; color: var(--m-ink2); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .sum b { color: var(--m-ink); }
+  .grp { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .5rem; }
+  .card { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .55rem .6rem; display: grid; grid-template-columns: 2.1rem 1fr; gap: .1rem .55rem; align-items: center; }
+  .card.sel { outline: 2px solid var(--m-accent); outline-offset: -1px; }
+  .card .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ln { grid-column: 2; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ring { grid-row: span 3; }
+  .ring { width: 2.1rem; height: 2.1rem; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 600; color: var(--m-ink2);
+    background: radial-gradient(closest-side, var(--m-panel) 76%, transparent 78%), conic-gradient(var(--rc) calc(var(--p) * 1%), var(--m-panel2) 0); }
+  .prov { font-size: 10.5px; font-weight: 600; }
+  .prov.cl { color: var(--m-claude); } .prov.cx { color: var(--m-codex); }
+  .tk { font: 11px ui-monospace, Menlo, monospace; color: var(--m-ink2); }
+  .ball { font-weight: 550; }
+  .ball::before { content: ""; display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; margin-right: .35rem; background: currentColor; vertical-align: .02rem; }
+  .gr { color: var(--m-green); } .am { color: var(--m-amber); } .mg { color: var(--m-mag); } .rd { color: var(--m-red); } .cy { color: var(--m-cyan); } .sl { color: var(--m-slate); } .mu { color: var(--m-ink3); }
+  .chip { display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; border-radius: 999px; padding: .08rem .45rem; background: color-mix(in srgb, currentColor 14%, transparent); }
+  /* board */
+  .lane { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; overflow: hidden; }
+  .lanehd { display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .lanehd .rk { font: 700 11px ui-monospace, Menlo, monospace; color: var(--m-ink3); }
+  .lanehd .t { font-weight: 650; }
+  .prog { display: flex; height: 6px; width: 8rem; border-radius: 3px; overflow: hidden; background: var(--m-panel2); }
+  .prog s { display: block; }
+  .row { display: grid; grid-template-columns: 5.6rem minmax(0,1fr) 13rem 14rem; gap: .6rem; align-items: center; padding: .42rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .row:last-child { border-bottom: 0; }
+  .row .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .who { font-size: 11.5px; color: var(--m-ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .now { font-size: 11.5px; }
+  .strip { position: relative; height: 10px; border-radius: 3px; background: var(--m-panel2); overflow: hidden; }
+  .strip s { position: absolute; top: 0; bottom: 0; }
+  .sw { background: var(--m-green); } .sj { background: repeating-linear-gradient(135deg, var(--m-green) 0 3px, color-mix(in srgb, var(--m-green) 45%, transparent) 3px 6px); }
+  .sq { background: var(--m-amber); } .sy { background: var(--m-mag); } .sx { background: var(--m-red); }
+  .axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--m-ink3); font-variant-numeric: tabular-nums; }
+  .fold { padding: .42rem .7rem; color: var(--m-ink2); font-size: 11.5px; border-top: 1px solid var(--m-line); }
+  /* queue */
+  .qhd { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: .5rem; }
+  .tile { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .6rem; }
+  .tile .k { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .tile .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .slots { display: flex; gap: .2rem; margin-top: .3rem; }
+  .slots s { display: block; width: .8rem; height: .5rem; border-radius: 2px; background: var(--m-panel2); }
+  .slots s.u { background: var(--m-green); } .slots s.f { background: var(--m-amber); }
+  .insight { border: 1px solid color-mix(in srgb, var(--m-amber) 45%, var(--m-line)); background: color-mix(in srgb, var(--m-amber) 8%, var(--m-panel)); border-radius: 8px; padding: .55rem .7rem; display: flex; gap: .8rem; align-items: center; }
+  .gantt { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .7rem; }
+  .gr2 { display: grid; grid-template-columns: 1.3rem 12.5rem minmax(0,1fr) 8.5rem; gap: .5rem; align-items: center; padding: .22rem 0; }
+  .gr2 .pos { color: var(--m-ink3); font-variant-numeric: tabular-nums; text-align: right; }
+  .gr2 .lb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gr2 .rt { font-size: 11.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .sub { font-size: 10.5px; color: var(--m-ink3); }
+  /* pane */
+  .side { border-left: 1px solid var(--m-line); background: var(--m-panel); display: flex; flex-direction: column; min-width: 0; }
+  .side .hd { padding: .65rem .8rem; border-bottom: 1px solid var(--m-line); display: grid; grid-template-columns: 2.6rem 1fr; gap: .1rem .6rem; align-items: center; }
+  .side .hd .ring { width: 2.6rem; height: 2.6rem; grid-row: span 2; font-size: 12px; }
+  .acts { display: flex; gap: .35rem; padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); flex-wrap: wrap; }
+  .tabs { display: flex; gap: 1rem; padding: .45rem .8rem 0; border-bottom: 1px solid var(--m-line); }
+  .tabs span { padding-bottom: .38rem; color: var(--m-ink3); box-shadow: inset 0 -2px 0 transparent; }
+  .tabs span.on { color: var(--m-ink); font-weight: 600; box-shadow: inset 0 -2px 0 var(--m-accent); }
+  .term { margin: .6rem .8rem; background: var(--m-term); color: var(--m-termink); border-radius: 6px; padding: .55rem .65rem; font: 10.8px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+  .term .d { color: #8a8f9c; } .term .p { color: #9fb7ff; } .term .y { color: #e8c15a; } .term .gg { color: #57d38c; }
+  .keys { display: flex; gap: .3rem; padding: 0 .8rem .45rem; }
+  .keys span { border: 1px solid var(--m-line); border-radius: 4px; padding: 0 .35rem; font-size: 11px; color: var(--m-ink2); }
+  .msg { margin: 0 .8rem .7rem; border: 1px solid var(--m-line); border-radius: 6px; padding: .35rem .55rem; color: var(--m-ink3); display: flex; justify-content: space-between; }
+  /* start popover */
+  .pop { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.14); padding: .7rem .8rem; display: flex; flex-direction: column; gap: .55rem; }
+  .seg { display: inline-flex; border: 1px solid var(--m-line); border-radius: 7px; overflow: hidden; }
+  .seg span { padding: .22rem .8rem; color: var(--m-ink2); }
+  .seg span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .fld { display: grid; grid-template-columns: 5rem 1fr; gap: .5rem; align-items: center; }
+  .fld .l { color: var(--m-ink3); font-size: 11.5px; }
+  .inp { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .5rem; background: var(--m-bg); }
+  .inp.ta { white-space: pre-wrap; font-size: 11.5px; line-height: 1.4; }
+  .ph { font: 11px ui-monospace, Menlo, monospace; color: var(--m-accent); }
+  .pop .seg { align-self: flex-start; }
+  .popgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; padding: .9rem; background: var(--m-bg); }
+  /* inbox */
+  .two { display: grid; grid-template-columns: 17rem 1fr; min-height: 0; }
+  .list { border-right: 1px solid var(--m-line); }
+  .it { padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); display: flex; flex-direction: column; gap: .1rem; }
+  .it.sel { background: var(--m-sel); }
+  .it .top { display: flex; justify-content: space-between; gap: .5rem; }
+  .it .top b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .it .pv { color: var(--m-ink2); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .reader { min-width: 0; display: flex; flex-direction: column; }
+  .rbar { display: flex; gap: .6rem; align-items: center; padding: .5rem .9rem; border-bottom: 1px solid var(--m-line); font-size: 12px; flex-wrap: wrap; }
+  .doc { padding: .9rem 1.4rem; font-family: Georgia, serif; font-size: 12.5px; line-height: 1.55; color: var(--m-ink); }
+  .doc h6 { font: 650 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 0 0 .35rem; }
+  .doc p { margin: .35rem 0; }
+  /* settings */
+  .set { display: grid; grid-template-columns: 9rem 1fr; }
+  .setnav { border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .1rem; }
+  .setnav span { padding: .28rem .5rem; border-radius: 6px; color: var(--m-ink2); }
+  .setnav span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .setbody { padding: .8rem 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .sgrp { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; }
+  .sgrp > div { display: grid; grid-template-columns: 9.5rem 1fr; gap: .8rem; padding: .5rem .75rem; border-bottom: 1px solid var(--m-line); align-items: center; }
+  .sgrp > div:last-child { border-bottom: 0; }
+  .sgrp .l { color: var(--m-ink2); }
+  .sgrp h6 { margin: 0; padding: .5rem .75rem; font-size: 12px; border-bottom: 1px solid var(--m-line); }
+  .scen { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-top: 2.2rem; }
+  .scen + h3 { margin-top: .2rem; }
+  ul.does { margin: .3rem 0 0; padding-left: 1.2rem; }
+  ul.does li { margin: .15rem 0; }
+  .swatch { display:inline-block; width:.75em; height:.75em; border-radius:50%; vertical-align:-.03em; margin-right:.3em; }
+  @media print { .scrwrap { overflow: visible; width: 100%; left: 0; transform: none; } .scr { min-width: 0; font-size: 10.5px; } }
+</style>
+<style>
+  /* 1782 additions. Mockups use the new, larger type (base 15 px; drawn here at 14 px so they fit the page). */
+  .scr { font-size: 14px; }
+  .scr .sub { font-size: 12px; }
+  .scr .card { grid-template-columns: 2.3rem minmax(0,1fr) auto; padding: .55rem .65rem; border-left: 3px solid var(--edge, var(--m-line)); }
+  .scr .card .ln { font-size: 13px; }
+  .cards2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .5rem; }
+  .facts { grid-column: 2 / span 2; display: grid; grid-template-columns: 7.2rem minmax(0,1fr); gap: .1rem .5rem; font-size: 13px; align-items: baseline; }
+  .facts .you, .facts .fin { grid-column: 1 / -1; }
+  .fact { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fact.none { color: var(--m-ink3); }
+  .fact.you { color: var(--m-mag); font-weight: 600; }
+  .fact.fin { color: var(--m-cyan); font-weight: 600; }
+  .icons { display: flex; gap: .25rem; grid-row: 1; grid-column: 3; }
+  .ico { border: 1px solid var(--m-line); border-radius: 5px; padding: 0 .35rem; font-size: 12px; color: var(--m-ink2); background: var(--m-panel); }
+  .ok { border: 1px solid currentColor; border-radius: 5px; padding: 0 .3rem; font-size: 11.5px; font-weight: 600; }
+  .sec { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; font-weight: 700; margin: .25rem 0 -.2rem; }
+  .card.fade { opacity: .6; }
+  .meter i s.lo { background: var(--m-green); } .meter i s.gp { background: var(--m-cyan); }
+  .meter i s.md { background: var(--m-amber); } .meter i s.hi { background: var(--m-red); }
+  .meter i s.tint { opacity: .4; }
+  .tsw { display: grid; grid-template-columns: 15.5rem minmax(0,1fr); min-height: 17rem; }
+  .tsw .list { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .45rem; display: flex; flex-direction: column; gap: .15rem; font-size: 13px; }
+  .tsw .it2 { display: grid; grid-template-columns: 1.1rem minmax(0,1fr) auto; gap: .1rem .4rem; align-items: center; padding: .3rem .4rem; border-radius: 6px; }
+  .tsw .it2.on { background: var(--m-sel); }
+  .tsw .it2 .n { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tsw .it2 .f { grid-column: 2 / span 2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; display: inline-block; background: currentColor; }
+  .tbar { display: flex; gap: .6rem; align-items: center; padding: .4rem .7rem; background: var(--m-panel); border-bottom: 1px solid var(--m-line); font-size: 13px; }
+  .tscreen { background: var(--m-term); color: var(--m-termink); font: 12.5px/1.5 ui-monospace, Menlo, monospace; padding: .6rem .8rem; white-space: pre-wrap; }
+  .detail { grid-column: 1 / -1; border: 1px solid var(--m-accent); border-radius: 8px; background: var(--m-panel); }
+  .detail .acts, .detail .tabs { border-bottom: 1px solid var(--m-line); }
+  .detail .dbody { padding: .55rem .8rem; display: grid; grid-template-columns: 1fr 1fr; gap: .4rem 1.4rem; font-size: 13px; }
+  .detail h6 { margin: 0; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); }
+  .lk { display: inline-flex; gap: .25rem; align-items: center; border: 1px solid var(--m-line); border-radius: 999px; padding: 0 .5rem; font-size: 12px; color: var(--m-ink2); background: var(--m-panel); white-space: nowrap; }
+  .lk.mg { color: var(--m-mag); border-color: color-mix(in srgb, var(--m-mag) 45%, var(--m-line)); }
+  .brow { display: grid; grid-template-columns: minmax(0,1fr) 7rem 10rem auto; gap: .6rem; align-items: center; padding: .45rem .7rem; border-top: 1px solid var(--m-line); }
+  .brow .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .brow.blk { grid-template-columns: minmax(0,1fr) 8rem auto; }
+  .brow.hist { grid-template-columns: minmax(0,1fr) 9rem auto; }
+  .brow .links { grid-column: 1 / -1; display: flex; gap: .3rem; flex-wrap: wrap; margin-top: -.1rem; }
+  .brow.blk { color: var(--m-ink2); padding: .3rem .7rem; }
+  .toggle { display: inline-block; width: 34px; height: 20px; border-radius: 10px; background: var(--m-panel2); position: relative; border: 1px solid var(--m-line); vertical-align: middle; }
+  .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--m-ink3); }
+  .toggle.on { background: var(--m-accent); border-color: var(--m-accent); }
+  .toggle.on::after { left: 16px; background: var(--m-panel); }
+  .pair { display: flex; gap: 1.4rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0 .4rem; }
+  .phone { width: 18.5rem; border: 7px solid #26262c; border-radius: 26px; background: #09090D; color: #F5F7FA; padding: .6rem .55rem; font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .phone .ph { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 700; margin: .5rem .1rem .25rem; }
+  .pc { background: #121219; border: 1px solid #2B2B37; border-radius: 12px; padding: .5rem .6rem; margin-bottom: .4rem; }
+  .pc .n { font-weight: 600; font-size: 14px; }
+  .pc .m { color: #ADB2C2; font-size: 12px; }
+  .ptag { border-radius: 4px; padding: 0 .3rem; font-size: 10.5px; font-weight: 700; }
+  .bub { background: #121219; border: 1px solid #2B2B37; border-radius: 10px; padding: .45rem .55rem; margin: .35rem 0; font-size: 12.5px; }
+  .bub.me { background: #143744; margin-left: 2.5rem; }
+  .cap { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .8rem; color: var(--ink-2); text-align: center; margin-top: .3rem; }
+  .map td:first-child { width: 36%; }
+  @media print { .phone { width: 16rem; } .scr { font-size: 11.5px; } .scr .sub, .facts, .scr .card .ln { font-size: 10.5px; } .tscreen { font-size: 10.5px; } }
+</style>
+<style>
+  /* 1821 additions */
+  .tsw3 { display: grid; grid-template-columns: 11.5rem minmax(0,1fr) 16.5rem; min-height: 17rem; }
+  .tsw3 .list { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .45rem; display: flex; flex-direction: column; gap: .15rem; font-size: 13px; }
+  .npane { background: var(--m-panel); border-left: 1px solid var(--m-line); padding: .5rem .6rem; font-size: 12.5px; display: flex; flex-direction: column; gap: .35rem; }
+  .npane .hit { border: 1px solid var(--m-line); border-radius: 7px; padding: .35rem .45rem; background: var(--m-bg); }
+  .npane .hit mark { background: color-mix(in srgb, var(--m-amber) 30%, transparent); color: inherit; }
+  .npane .hit .acts2 { display: flex; gap: .3rem; margin-top: .3rem; flex-wrap: wrap; }
+  .askcol { background: var(--m-panel); border-left: 1px solid var(--m-line); padding: .5rem .6rem; font-size: 12.5px; display: flex; flex-direction: column; gap: .4rem; }
+  .bub2 { border: 1px solid var(--m-line); border-radius: 9px; padding: .35rem .5rem; background: var(--m-bg); }
+  .bub2.me { background: var(--m-sel); margin-left: 1.5rem; }
+  .quote { border-left: 3px solid var(--m-accent); padding-left: .4rem; color: var(--m-ink2); font-style: italic; }
+  .fold { border-top: 1px dashed var(--m-line); padding: .35rem .5rem; color: var(--m-ink2); font-size: 12.5px; }
+  .tl td, .tl th { font-size: .86rem; }
+  figure.svg { margin: 1rem 0; }
+  figure.svg svg { width: 100%; height: auto; }
+  figure.svg figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .8rem; color: var(--ink-2); }
+</style>
+
+<h1>1821 — Fit and finish, round 2: restarts without downtime, notes, inbox threads, asking about a doc, auto-retire</h1>
+<p class="sans"><small>Author: Claude (design) <code>sm-1821</code> · Ticket #1821 · Revision 1, 30 September 2026 · An addendum to the round 1 memo, <code>docs/working/1782_fit_and_finish.html</code>, whose terms and screens it keeps</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Your seven notes become one design and ten tickets; two more tickets need no design and are already on the board.</b> sm stops going dark for about 14 seconds at every server restart: the new build starts beside the old one and takes over only once it is ready, so a broken build never takes sm down. A Notes page and a Notes pane give you one big, searchable text store on the server, reachable from every machine and the phone, with Copy, Type into terminal, Start agent and File ticket. The Inbox groups everything about one ticket into one thread, and folds away threads whose agents have all ended. A doc gets an Ask column for quick questions to its author, or to a cheap reader agent when the author is gone. Finished agents that sm started retire themselves after an hour idle, and a reply brings them back. Print (#1825) and the new agent action row (#1826) are filed under the round 1 lane.</p>
+
+<p><b>Terms used below.</b> A <b>restart</b> is deploying a new <code>sm-server</code> build with <code>scripts/restart-rust-server.sh</code>. <b>launchd</b> is the macOS service manager that keeps <code>sm-server</code> running; a <b>launchd job</b> is one registered service. A <b>hook</b> is the small script Claude runs at events such as the end of a turn, which tells sm what happened. An agent is <b>finished</b> when it ran <code>sm task-complete</code> and has not started a new turn since (round 1 term). <b>Retire</b> ends an agent: its tmux window closes, its ticket claim ends, and sm deletes its worktree when nothing would be lost. <b>Restore</b> brings a retired agent back with its full conversation (History › Restore today). A <b>work thread</b> is the new Inbox thread for one ticket. A <b>reader agent</b> is a small, cheap agent sm starts only to answer questions about one doc.</p>
+
+<h3>Your notes, and what changes</h3>
+<table class="map">
+<thead><tr><th>Your note</th><th>What changes</th></tr></thead>
+<tbody>
+<tr><td>1. Deploy without downtime, cheaply</td><td>The new server starts beside the old and takes the listening socket only when ready; requests wait about a second instead of failing for 14. Scenario 1. Two tickets.</td></tr>
+<tr><td>2. A big text editor for prompts, searchable, on every machine; a side pane for copy and paste</td><td>Notes page plus a Notes pane over any page, stored on the server with history. Search returns paragraphs with Copy, Type into terminal, Start agent and File ticket. Scenario 2. Three tickets including the phone.</td></tr>
+<tr><td>3a. Inbox threads, one per doc even across PRs</td><td>One work thread per ticket: its agents (including successors), every revision of its docs across PRs, and its finished summaries. Scenario 3.</td></tr>
+<tr><td>3b. Hide retired agents' messages under a fold</td><td>Threads whose agents have all ended, with nothing waiting for you, fold into “Ended · n”. Scenario 3.</td></tr>
+<tr><td>4. Print button for docs</td><td>Print in the reader and on the full-page doc; the browser's own print also drops sm's bar. <b>Filed as #1825</b>, no design needed.</td></tr>
+<tr><td>5. Chat with the agent beside a doc</td><td>An Ask column in the reader. It asks the author when live, else a reader agent; you can choose to bring the author back. Scenario 4.</td></tr>
+<tr><td>6. Retire hidden under ⋯ and two clicks; rarer actions take the space</td><td>Row: Terminal, Retire, Hand off…, ⋯ (Hand off now, Clone, Follow, Copy attach). One click retires a finished idle agent; a Finished card has its own Retire. <b>Filed as #1826</b>.</td></tr>
+<tr><td>7. Auto-retire finished idle agents; my reply restores them</td><td>Agents sm started retire after 60 minutes finished and idle. Anything addressed to one (your reply, your doc review, another agent's <code>sm send</code>) restores it first, worktree and ticket included. Scenario 5.</td></tr>
+</tbody></table>
+
+<p><b>Is copy attach command still useful?</b> Yes, a little: it is the way to attach from a Mac terminal with plain tmux when the web terminal lags. #1826 moves it into ⋯.</p>
+
+<div class="scen">Scenario 1 · An agent deploys a fix while you are reading</div>
+<h3>“Restart sm without taking it away from me.”</h3>
+<p><b>Today every restart takes sm away for 12 to 16 seconds</b>, and agents restart it often: the server's own 5-second machine samples show a gap of that size 48 times on 29 September and 25 times by 6 pm on the 30th. In the gap the web and the phone show errors, terminals drop, an agent's <code>sm send</code> fails, and a hook that fires is simply lost, because hooks give up after a 1 to 2 second connect timeout and never retry. A lost end-of-turn hook means sm misses that an agent went idle or finished.</p>
+<p><b>The gap exists because the old server is stopped first.</b> The restart script builds the new binary while the old one serves, then boots the old one out, starts the new one, and waits for it to finish its startup checks (recovering sessions, queue jobs, reviews and the board) before it answers anyone.</p>
+
+<figure class="svg">
+<svg viewBox="0 0 760 210" role="img" aria-label="Restart timeline today and proposed" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif" font-size="12">
+  <text x="0" y="16" font-weight="700">Today</text>
+  <rect x="90" y="4" width="250" height="18" fill="#15803D" opacity=".85"/><text x="96" y="17" fill="#fff">old server serving</text>
+  <rect x="340" y="4" width="150" height="18" fill="#BE123C" opacity=".85"/><text x="346" y="17" fill="#fff">nobody serving · ~14 s</text>
+  <rect x="490" y="4" width="260" height="18" fill="#0B7A90" opacity=".85"/><text x="496" y="17" fill="#fff">new server serving</text>
+  <text x="340" y="38" fill="#BE123C">refused: hooks lost, sm send fails, web errors, terminals drop</text>
+
+  <text x="0" y="80" font-weight="700">Proposed</text>
+  <rect x="90" y="68" width="370" height="18" fill="#15803D" opacity=".85"/><text x="96" y="81" fill="#fff">old server serving (unchanged while the new one prepares)</text>
+  <rect x="300" y="92" width="160" height="18" fill="#64748B" opacity=".55"/><text x="306" y="105">new server preparing</text>
+  <rect x="460" y="68" width="16" height="42" fill="#B45309" opacity=".9"/>
+  <rect x="476" y="68" width="274" height="18" fill="#0B7A90" opacity=".85"/><text x="482" y="81" fill="#fff">new server serving</text>
+  <text x="482" y="126" fill="#B45309">handover ≈ 1–2 s: requests wait,</text>
+  <text x="482" y="142" fill="#B45309">none refused; pages reconnect once</text>
+
+  <text x="0" y="186" font-weight="700">Bad build</text>
+  <rect x="90" y="174" width="660" height="18" fill="#15803D" opacity=".85"/><text x="96" y="187" fill="#fff">old server keeps serving; the new one fails its checks and exits; the script reports why</text>
+</svg>
+<figcaption>Gap sizes from <code>utilization.db</code> host samples, 28–30 September 2026. The proposed handover time is the target the ticket must measure and meet.</figcaption>
+</figure>
+
+<p><b>How it works.</b> sm gets two launchd jobs, a blue slot and a green slot, and runs in one at a time. A restart installs the new build into the idle slot and starts it. The new server prepares without touching anything shared, then asks the old one to hand over. The old server stops taking new work, finishes requests already in flight, and passes its listening socket to the new one. The socket never closes, so a request that arrives during the switch waits in line for a second instead of being refused. The old server stays parked for 30 seconds: if the new one dies in that time, the old one takes the socket back and serves again. A Mac reboot starts only the active slot.</p>
+<p><b>What you notice:</b> live pages and terminals reconnect once, as on a network blip. Nothing else. <b>Cost:</b> two Mid tickets, one for the server and one for the restart script.</p>
+
+<div class="scen">Scenario 2 · Writing a long prompt, then using it</div>
+<h3>“Give me one big notepad I can search, on every machine, next to the terminal.”</h3>
+<p>Notes is a new page in the rail, under Inbox. It holds any number of notes, each a long Markdown text in a plain monospace editor that saves as you type. The first note can be your <code>~/Desktop/prompts.md</code>, through Import. Notes live on the server, so the laptop, the Studio and the phone see the same text, and every save keeps a revision you can go back to.</p>
+<p>The <b>Notes pane</b> opens over any page with ⌘J, in the right-hand pane where docs open. Its search box finds earlier text and shows each hit as its whole paragraph, with buttons:</p>
+<div class="scrwrap"><div class="scr">
+ <div class="rail"><div class="brand">sm</div><a class="on">Agents</a><a>Board</a><a>Queue</a><a>Inbox</a><a>Notes</a><span class="grow"></span><a>Settings</a></div>
+ <div class="main">
+  <div class="tbar"><b>sm-1799</b><span class="sub">Claude · #1799</span><span style="flex:1"></span><span class="sub">Direct · 3 ms</span><span class="lk">Notes ⌘J</span></div>
+  <div class="tsw3">
+   <div class="list">
+    <div class="sec mg" style="font-size:11px">Needs you</div><div class="it2"><span class="n">sm-1799</span></div>
+    <div class="sec gr" style="font-size:11px">Moving</div><div class="it2"><span class="n">sm-1793</span></div><div class="it2"><span class="n">iter8-run</span></div>
+   </div>
+   <div class="tscreen">• Inbox finishes are in. Before I open the PR: should a
+  Finished row stay after its agent retires?
+
+› ▌</div>
+   <div class="npane">
+    <div class="inp">review loop▌</div>
+    <div class="sub">3 paragraphs in 2 notes</div>
+    <div class="hit"><span class="sub">prompts · 12 Sep</span><br>Request a <mark>review</mark> with sm request-review once tests pass. Treat P2s as optional; fix every P1 or answer it on the PR…
+     <div class="acts2"><span class="btn sm">Copy</span><span class="btn sm pri">Type into terminal</span><span class="btn sm">Start agent</span><span class="btn sm">File ticket</span></div></div>
+    <div class="hit"><span class="sub">prompts · 2 Aug</span><br>Close the <mark>review loop</mark> before merging: confirm the review is for your latest push…</div>
+   </div>
+  </div>
+ </div>
+</div></div>
+<ul>
+<li><b>Copy</b> puts the paragraph on the clipboard. <b>Type into terminal</b> (terminal page only) types it into the agent's input without pressing Enter, so you can edit before sending.</li>
+<li><b>Start agent</b> opens New agent with the text as its first prompt. <b>File ticket</b> opens a small form (repo, title from the first line, body) and creates the GitHub issue when you press Create.</li>
+<li>Select any text in a note and the same buttons act on the selection instead of the paragraph.</li>
+<li>Notes are yours alone: agents cannot read them, and they are not published anywhere.</li>
+</ul>
+
+<div class="scen">Scenario 3 · The Inbox after a day of work</div>
+<h3>“One thread per piece of work, and stop showing me agents that are gone.”</h3>
+<p>Today a thread is one agent, or one doc on one pull request. The same work therefore spreads across several rows: the memo on its first PR, the memo again on a later PR, the agent, and its successor after a handoff. Agents that retired stay as rows. A work thread gathers by ticket instead.</p>
+<div class="pair">
+<div class="phone" style="width:20rem"><div class="ph" style="color:#ADB2C2">Today</div>
+ <div class="pc"><div class="n">sm-1782</div><div class="m">Memo revision 3 is published for your review</div></div>
+ <div class="pc"><div class="n">Doc · Fit and finish memo</div><div class="m">PR #1785 · Reviewed</div></div>
+ <div class="pc"><div class="n">Doc · Fit and finish memo</div><div class="m">PR #1802 · New revision</div></div>
+ <div class="pc"><div class="n">sm-1782-2 <span class="ptag" style="background:#2B2B37">ended</span></div><div class="m">Picked up from sm-1782 at 350k tokens</div></div>
+ <div class="pc"><div class="n">sm-1768 <span class="ptag" style="background:#2B2B37">ended</span></div><div class="m">Memo 1768 is merged and published</div></div>
+ <div class="pc"><div class="n">sm-reviewer <span class="ptag" style="background:#2B2B37">ended</span></div><div class="m">Review posted on PR #1790</div></div>
+</div>
+<div class="phone" style="width:20rem"><div class="ph" style="color:#5EE7FF">Work threads</div>
+ <div class="ph" style="color:#F0ABFC">Needs you</div>
+ <div class="pc"><div class="n">#1782 Fit and finish</div><div class="m">Your review · memo revision 3 (PR #1802)<br>sm-1782 · sm-1782-2 · 2 docs, 5 revisions</div></div>
+ <div class="ph" style="color:#ADB2C2">Earlier</div>
+ <div class="pc"><div class="n">#1771 Browser certificate requests</div><div class="m">sm-1726-engineer · merged</div></div>
+ <div class="fold" style="border-color:#2B2B37;color:#ADB2C2">▸ Ended · 6 threads (sm-1768, sm-reviewer, …)</div>
+</div>
+</div>
+<p class="cap">The #1782 rows are illustrative; the folded names are agents that retired on 30 September.</p>
+<ul>
+<li><b>Which thread an item joins.</b> An agent's message joins the thread of the ticket the agent held when it sent it. A doc joins the thread of its author's ticket, else the ticket its PR closes. Anything with no ticket keeps today's thread: per doc (now across PRs, by its repo and path), else per agent.</li>
+<li><b>Inside a thread</b> every bubble names its sender, doc revisions appear as cards with Open and Review, and the reply box goes to the newest agent in the thread that is still live, or restores it (scenario 5). A ▾ beside the box picks another agent in the thread.</li>
+<li><b>The Ended fold.</b> A thread folds when every agent in it has ended and nothing in it needs you or holds an unread finished summary. Opening the fold shows the rows as today. A new message unfolds the thread.</li>
+</ul>
+
+<div class="scen">Scenario 4 · Reading a memo, with a question</div>
+<h3>“Why 60 minutes? Ask the agent that wrote this.”</h3>
+<div class="scrwrap"><div class="scr" style="grid-template-columns:1fr">
+ <div class="main">
+  <div class="rbar"><b>1821 — Fit and finish, round 2</b><span class="sub">PR #1827 · open</span><span style="flex:1"></span><span class="btn sm">Review</span><span class="btn sm">⎙ Print</span><span class="btn sm pri">Ask</span><span class="lk">⤢</span></div>
+  <div style="display:grid;grid-template-columns:minmax(0,1fr) 17rem;min-height:15rem">
+   <div class="doc"><h6>Scenario 5</h6><p>Finished agents that sm started retire after <span style="background:var(--m-sel)">60 minutes idle</span>…</p></div>
+   <div class="askcol">
+    <div><span class="seg"><span class="on">sm-1821 · author · idle 5m</span><span>Reader agent</span></span></div>
+    <div class="bub2 me"><div class="quote">60 minutes idle</div>Why not 15? I usually reply quickly.</div>
+    <div class="bub2"><b>sm-1821</b> · 1m<br>After an hour the provider's prompt cache has expired, so a reply reloads the whole conversation either way…</div>
+    <div class="inp">Ask about this doc…</div>
+   </div>
+  </div>
+ </div>
+</div></div>
+<ul>
+<li><b>Ask</b> opens a column beside the doc. Selecting text in the doc and pressing Ask quotes it. The conversation is the doc's work thread, so it also appears in the Inbox.</li>
+<li><b>Who answers.</b> The doc's author when it is live; its answer arrives when its current turn ends. When the author has ended, a <b>reader agent</b> answers: a Sonnet agent given the doc, its PR and the code at that commit, told to answer only and change nothing, retiring after an idle hour like any finished agent. You may instead pick <b>Bring back sm-1821</b>, which shows what that costs, for example “reloads about 380k tokens”.</li>
+<li>A doc published by a session sm does not know has no author, so the reader agent answers.</li>
+</ul>
+
+<div class="scen">Scenario 5 · An agent finishes at lunch</div>
+<h3>“Retire it for me, and bring it back if I answer.”</h3>
+<table class="tl">
+<thead><tr><th>Time</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>12:05</td><td>far-1855 runs <code>sm task-complete</code>. Its summary appears in Inbox › Finished, and its card in Agents › Finished.</td></tr>
+<tr><td>13:05</td><td>It has been finished and idle for 60 minutes, with nothing waiting on it. sm retires it: the tmux window closes, its ticket claim ends, and its worktree goes if nothing would be lost. History shows “retired automatically”. Its Inbox summary stays until you press Done.</td></tr>
+<tr><td>17:40</td><td>You reply in its thread: “Run the same views on YM.” The reply box said “far-1855 retired at 13:05; replying brings it back.” sm restores it, rebuilds its worktree at the same path from its branch, reopens its ticket claim, and delivers your reply. It answers as if it never left.</td></tr>
+</tbody></table>
+<ul>
+<li><b>Who qualifies.</b> Agents sm started for you or another agent: <code>sm spawn</code>, New agent, Board Start, Clone, handoff successors and reader agents. Never an agent registered in a role (the maintainer, for example), and never a session you started in your own terminal.</li>
+<li><b>Nothing waiting on it</b> means: no open question to you, no doc review it asked of you still outstanding, no queue job running or waiting, no review request outstanding, and no live child agents.</li>
+<li><b>Why an hour.</b> After an hour idle the provider's prompt cache has expired, so the next message reloads the whole conversation whether the agent is live or restored. Retiring at 60 minutes therefore costs no extra tokens; retiring at 15 would.</li>
+<li><b>Anything addressed to it restores it:</b> your Inbox reply, your doc review arriving, or another agent's <code>sm send</code>. A plain <code>sm retire</code> you or a parent ran keeps today's rule (a reply goes to the successor or the parent), because then you ended it on purpose.</li>
+<li>Settings › New agents gets “Retire finished agents automatically” (on) and the delay (60 minutes). #1826's retire toast gains Undo, which works once Restore rebuilds worktrees.</li>
+</ul>
+
+<h3>Decisions</h3>
+<table>
+<thead><tr><th>Question</th><th>Recommendation</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>1. Restarts: hand over between two launchd slots?</td><td><b>Yes.</b> Blue and green slots, socket passed from old to new, old parked 30 s for rollback.</td><td>Removes the 14 s gap and the lost hooks, and a bad build never takes sm down. Making every client retry would still lose hooks and still show errors.</td></tr>
+<tr><td>2. Where notes live</td><td><b>The server's database, with every revision kept</b>; Import and Download as <code>.md</code>.</td><td>One copy reachable from every machine and the phone; history protects a long text from a bad paste.</td></tr>
+<tr><td>3. Notes on the phone</td><td><b>Yes</b>: list, search, Copy, and plain editing.</td><td>Copying a saved prompt into a reply is common on the phone.</td></tr>
+<tr><td>4. Inbox thread key</td><td><b>Ticket, else doc (repo and path), else agent.</b></td><td>The ticket is what “the same work” means across PRs, handoffs and docs.</td></tr>
+<tr><td>5. Ended fold</td><td><b>Fold when every agent ended and nothing needs you or is unread-finished.</b></td><td>Hides the clutter without hiding anything you still have to read.</td></tr>
+<tr><td>6. Who answers Ask</td><td><b>The live author; else a Sonnet reader agent; Bring back the author only when you pick it.</b></td><td>A restored author reloads hundreds of thousands of tokens; a reader agent reads one doc.</td></tr>
+<tr><td>7. Which agents auto-retire</td><td><b>Agents sm started</b>, after <b>60 minutes</b> finished and idle, on by default.</td><td>I read “sm context created agents” as these; correct me if you meant only handoff successors. An hour is past the prompt cache, so it costs no extra tokens.</td></tr>
+<tr><td>8. What restores an auto-retired agent</td><td><b>Anything addressed to it.</b> Agents you or a parent retired keep today's routing.</td><td>The message was for that agent; it alone has the context.</td></tr>
+<tr><td>9. Plan</td><td><b>Ten tickets under #1821</b> (appendix G); #1821 becomes its own lane after #1782. Restart and notes-server start at once; the rest wait on named round 1 tickets.</td><td>The Inbox, Agents and reader files are still changing in round 1.</td></tr>
+</tbody></table>
+
+<h3>FAQ</h3>
+<p><b>Why not just make hooks and clients retry?</b> It turns errors into waits only for clients we write. The browser, the phone and Cloudflare would still see 14 seconds of nothing, and a broken build would still take sm down until someone fixes it.</p>
+<p><b>Why not keep finished agents alive forever?</b> An idle agent costs no tokens, but it holds memory, a tmux window, a worktree and a ticket claim, and it clutters Agents and the Board. After an hour it has lost its token advantage too.</p>
+<p><b>Will Restore always work?</b> For Claude and Codex agents on the Studio, yes, once it rebuilds the worktree; today Restore relaunches in the folder retire deleted, where Claude cannot find the conversation, because Claude looks a conversation up by its folder. Agents on another machine, and providers that cannot resume, are never auto-retired.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<p>For the implementing agents. Code references are to <code>crates/sm-server/src</code> at <code>e393fc4</code> unless a path says otherwise. The round 1 memo (<code>docs/working/1782_fit_and_finish.html</code>) and the base web spec (<code>docs/specs/1710_web_redesign.html</code>) still hold; this document changes only what it names.</p>
+
+<h3>A. Restart handover</h3>
+<h4>A1. Today</h4>
+<ul>
+<li><code>scripts/restart-rust-server.sh</code> phase 1 (lock, build, sign, <code>--check-config</code>) leaves the live job alone. Phase 2 (~line 911) boots the job out, waits up to 10 s, moves the staged binary onto <code>.local/bin/sm-server</code>, bootstraps and kickstarts the job, polls <code>/health</code> (60 s), requires a stable pid for 20 s, runs <code>scripts/verify_queue_authority.py</code>, compares session counts and refreshes the CLI.</li>
+<li><code>main.rs:125</code> binds 127.0.0.1:8420 (the only TCP listener until #1794 adds the home-network TLS listener); <code>main.rs:131</code> binds the queue authority socket <code>queue-runner/authority.sock</code>, whose <code>remove_stale_socket</code> refuses to start while another server answers on it. <code>AppState::try_new</code> (<code>http.rs:611</code>) and <code>router()</code> (<code>http.rs:1594-1615</code>) run recovery synchronously before <code>axum::serve</code>. There is no signal handling and no graceful shutdown.</li>
+<li>The plist (<code>scripts/rust-service-cutover.sh:316-358</code>): label <code>com.rajeshgoli.session-manager-rust</code>, <code>RunAtLoad</code>, <code>KeepAlive</code> true, <code>ThrottleInterval</code> 10.</li>
+<li>Hooks: <code>hooks/notify_server.sh:155</code> uses <code>--connect-timeout 2 --max-time 5</code>; <code>hooks/context_monitor.sh:75</code> uses 1 and 2. Neither retries.</li>
+<li>Queue jobs run in their own process group and survive restarts; startup recovery re-polls them (<code>queue.rs:1905-1987</code>, log line “recovered_running: 4”). Tmux and agents are separate processes and survive.</li>
+</ul>
+<h4>A2. Slots</h4>
+<ul>
+<li>Two launchd labels, <code>com.rajeshgoli.session-manager-rust.blue</code> and <code>….green</code>, with binaries <code>.local/bin/sm-server-blue</code> and <code>.local/bin/sm-server-green</code>. A slot's binary is written only while that slot's job is booted out, which keeps the launch-constraint lesson (<code>docs/product/lessons.md:77</code>).</li>
+<li><code>~/.local/share/claude-sessions/active-slot</code> holds <code>blue</code> or <code>green</code>, written by the new server after it takes over. <code>.local/bin/sm-server</code> becomes a symlink to the active slot's binary for anything that runs the server by path.</li>
+<li>Only the active slot's plist exists in <code>~/Library/LaunchAgents</code>; the script deletes the other after booting it out. A reboot therefore starts one server.</li>
+<li><code>KeepAlive</code> becomes <code>{SuccessfulExit: false}</code>: a server that exits 0 after handing over is not relaunched; a crash still is.</li>
+<li>Migration: the first run of the new script boots out the legacy label, installs blue, and starts it the old way (one last gap). <code>verify_queue_authority.py</code> takes the active slot's label.</li>
+</ul>
+<h4>A3. Protocol</h4>
+<ol>
+<li>The script installs the build into the idle slot, writes its plist with the extra argument <code>--take-over</code>, and bootstraps it.</li>
+<li>With <code>--take-over</code>, the new server loads config and opens nothing for writing. It may read databases to warm caches. It must not run schema changes, recovery, background loops, or bind any listener.</li>
+<li>It connects to <code>~/.local/share/claude-sessions/handover.sock</code> (mode 0600, served by every server) and sends <code>{"schema":"sm.handover.v1","version":…,"pid":…}</code>. The old server checks the peer is its own user and that the peer pid belongs to the other slot's launchd job (the same <code>SMJobCopyDictionary</code> check the verifier makes).</li>
+<li>The old server: stops accepting on every listener; sets the shutdown signal (A4) so every background loop exits at its next wake; closes terminal websockets and event streams with close code 1012 (“service restart”); waits for in-flight HTTP requests to finish, up to 10 s, then drops the rest; and stops serving the authority socket.</li>
+<li>It passes the listener file descriptors (8420, the #1794 TLS listener, the authority socket) to the new server with <code>SCM_RIGHTS</code> (<code>nix</code>, add the <code>socket</code> and <code>uio</code> features), keeping its own copies, and replies <code>{"handed_over":true}</code>.</li>
+<li>The new server runs today's startup steps that write (schema ensure, <code>try_new</code> recovery, the <code>router()</code> init calls), starts loops, adopts the listeners with <code>TcpListener::from_std</code> and the authority socket with <code>UnixListener::from_raw_fd</code>, serves, writes <code>active-slot</code>, and sends <code>{"serving":true}</code>.</li>
+<li>The old server waits 30 s. If the new server's connection closes or <code>/health</code> through the socket fails in that time, it runs its own startup recovery, accepts on its copies and serves; the script reports “rolled back” and boots out the new slot. Otherwise it closes its copies and exits 0.</li>
+<li>The script, seeing <code>serving</code> and then the old pid gone, boots out the old slot, deletes its plist, and runs today's checks (stable pid 20 s, queue authority, session count, CLI refresh).</li>
+</ol>
+<p>Any failure before step 5 leaves the old server serving: it resumes accepting and the new server exits non-zero. Steps 4 to 6 are the only time requests wait. <b>Target:</b> median under 2 s, never over 4 s (under the hooks' 5 s limit), measured on a scratch server against a copy of live state (<code>docs/product/lessons.md</code> scratch-server recipe) with 30 live-like sessions, and reported in the PR.</p>
+<h4>A4. Shutdown signal</h4>
+<ul>
+<li>One <code>tokio::sync::watch</code> plus an <code>AtomicBool</code> in <code>AppState</code>. Every loop started in <code>main.rs</code> and <code>router()</code> (follow delivery, reparent reconcile, queue completion retry, reminder dispatcher, handoff sweeper, memory guard, utilization recorder, usage scans, Studio SSH reconcile, board and review recovery, admission retries) checks it at each wake and returns.</li>
+<li>Queue job monitor threads stop polling without touching their jobs; the new server's recovery re-adopts them exactly as after today's restart.</li>
+<li>SIGTERM sets the same signal and then exits after the 10 s drain, so a plain <code>launchctl bootout</code> is also graceful.</li>
+</ul>
+<h4>A5. Tests</h4>
+<p>A handover between two in-process servers on a temporary port: a request in flight during the handover completes; a request sent during it waits and succeeds; no loop runs in both (a counter per loop); a new server that dies within 30 s gives the socket back; a bad <code>--take-over</code> peer is refused. Live proof: run <code>curl /health</code> every 100 ms during a real restart and report the longest wait and that nothing failed.</p>
+
+<h3>B. Notes</h3>
+<h4>B1. Store</h4>
+<pre>~/.local/share/claude-sessions/notes.db
+notes(id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, version INTEGER NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT)
+note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL, at TEXT NOT NULL,
+      PRIMARY KEY (note_id, version))</pre>
+<ul>
+<li>The path is a config key <code>paths.notes_db</code>, set explicitly in the installed config like the other stores.</li>
+<li>A save writes <code>notes</code> and a revision, but a revision is kept only when the previous kept revision is older than 10 minutes or differs by more than 2,000 characters; otherwise the latest revision is overwritten. Revisions older than 90 days thin to one per day. Deleting a note sets <code>deleted_at</code>; it is purged after 30 days.</li>
+<li>Body limit 2 MB. Title is the first line of the body without leading <code>#</code>, up to 80 characters, unless set.</li>
+</ul>
+<h4>B2. Routes (owner and phone guards only; no agent access)</h4>
+<ul>
+<li><code>GET /notes</code> → <code>[{id,title,updated_at,chars}]</code>. <code>GET /notes/{id}</code> → <code>{id,title,body,version,updated_at}</code>.</li>
+<li><code>POST /notes</code> <code>{title?,body}</code> → the note. <code>PUT /notes/{id}</code> <code>{body,title?,if_version}</code> → the note, or 409 with the current note when <code>if_version</code> is stale. <code>DELETE /notes/{id}</code>.</li>
+<li><code>GET /notes/{id}/revisions</code>, <code>GET /notes/{id}/revisions/{version}</code>, <code>POST /notes/{id}/restore {version}</code> (writes a new version).</li>
+<li><code>GET /notes/search?q=&amp;regex=0|1</code> → up to 50 hits <code>[{note_id,title,updated_at,start,end,text}]</code>. A hit is the <b>paragraph</b> containing the match: the text between blank lines, or a whole fenced code block when the match is inside one. Case-insensitive substring by default; <code>regex=1</code> uses Rust <code>regex</code> with a 100 ms budget. Newest note first, then position.</li>
+<li><code>POST /notes/import</code> (multipart <code>.md</code>/<code>.txt</code>) creates one note. Download is client-side.</li>
+<li><code>POST /github/issues {repo,title,body}</code> runs <code>gh issue create</code> as the Board's Close runs <code>gh issue close</code> (<code>http/board.rs:1150</code>) and returns <code>{number,url}</code>. Repos offered are those sm knows from claims and lanes.</li>
+</ul>
+<h4>B3. Web</h4>
+<ul>
+<li>Rail entry Notes (<code>web/app.js:26-32</code>), path <code>/notes</code>, key hint <code>n</code>, below Inbox. Page: list of notes left (title, updated age; New, Import); editor right: a full-height monospace <code>&lt;textarea&gt;</code> at the user's text size, Tab inserts two spaces, autosave 800 ms after the last keystroke and on blur, a “Saved · 2s” status, and History (revisions list with Restore). A Preview toggle renders Markdown with the doc renderer.</li>
+<li>Conflict: a 409 shows “Changed on another device” with <b>Load theirs</b> and <b>Keep mine</b> (which saves with the returned version). The page refetches the open note when the tab becomes visible.</li>
+<li><b>Notes pane</b>: ⌘J (Ctrl+J) toggles it on every page, in the reading-pane slot (round 1 appendix E); on the terminal page it takes the Details pane slot. It shows search on top and, with an empty search, the most recent note in a smaller editor. Hit buttons: Copy; Type into terminal (terminal page only: sends the text through the terminal socket as a bracketed paste, no Enter); Start agent (opens New agent with the text as the prompt); File ticket (form: repo select, title prefilled from the first line, body; Create calls B2). With a selection in the editor, the buttons act on the selection.</li>
+</ul>
+<h4>B4. Phone</h4>
+<p>A Notes entry in the overflow of the top bar (bottom navigation stays as is). A list, a search with paragraph hits and Copy, and an editor (<code>TextField</code>, autosave as on the web, the same conflict dialog).</p>
+<h4>B5. Tests</h4>
+<p>Stale <code>if_version</code> gives 409; revision thinning; search paragraph boundaries, fenced blocks, regex timeout; import; deleted notes vanish from search; agent credentials get 403.</p>
+
+<h3>C. Work threads and the Ended fold</h3>
+<h4>C1. Thread key</h4>
+<ul>
+<li>Today: <code>agent:&lt;session&gt;</code> and <code>doc:&lt;doc_id&gt;</code> (<code>owner_inbox.rs:15-19</code>; <code>http/inbox.rs</code> <code>agent_rows</code>, <code>doc_rows</code>). Docs are unique on repo, path and PR (<code>owner_docs.rs:448</code>).</li>
+<li>New keys, in order of preference:
+ <ol><li><code>ticket:&lt;owner/repo&gt;#&lt;n&gt;</code>. For an agent item (message, owner note, fired follow, finished row): the sender's ticket claim open at the item's time, the earliest-claimed when several. For a doc: the ticket claim of the author session open at its first publish, else the ticket that the doc's PR closes (the Board's PR-to-ticket link).</li>
+ <li><code>docpath:&lt;owner/repo&gt;/&lt;path&gt;</code> for a doc with no ticket: every PR's doc for that path joins.</li>
+ <li><code>agent:&lt;session&gt;</code> for an agent item with no ticket.</li></ol></li>
+<li><b>Example.</b> sm-1782 holds #1782 and sends two messages; its successor sm-1782-2 claims #1782 and sends one; the memo is published on PR #1785 and again on PR #1802 by those agents. All five items share <code>ticket:rajeshgoli/session-manager#1782</code>. sm-maintainer, holding no ticket, keeps <code>agent:…</code>.</li>
+<li><code>done_items</code> and Done move to the new keys. Migration maps an old agent or doc key's watermark onto the new key it falls under, taking the item count as of migration, so nothing marked done reappears.</li>
+<li>Row: title is <code>#n {ticket title}</code>, else the doc title, else the agent name. Group is the highest of its items (needs you, finished, new, earlier). Preview is the newest item that set the group. The second line lists the thread's agents and “{d} docs, {r} revisions”.</li>
+<li>Thread JSON (<code>GET /inbox/thread/{key}?format=json</code>, replacing <code>/inbox/agent/{id}</code> and the doc thread page, which redirect) lists items oldest first, each with <code>sender {id,name,status}</code>; doc revisions become <code>{"type":"doc_revision", doc_id, pr, sha, at, review_state}</code> cards.</li>
+<li>Reply target: the newest sender in the thread that is live; else the newest sender whose reply would restore it (appendix E3); else today's <code>live_recipient</code> on the newest sender. The JSON carries <code>reply_to {id,name,restores:bool,retired_at}</code> and <code>reply_options</code> (every sender in the thread), which the ▾ selector uses. <code>POST /inbox/thread/{key}/send {text, to?}</code>.</li>
+</ul>
+<h4>C2. Ended fold</h4>
+<ul>
+<li>A thread is <b>ended</b> when every sender in it has ended (<code>session_ended</code>, <code>http/messages.rs:76</code>, or absent from the registry), it is not needs-you, and it has no finished row with <code>read_at</code> null.</li>
+<li>Ended threads leave the groups and sort, newest first, under one fold row “Ended · {n} threads ({first three names}, …)”, collapsed by default (state in <code>localStorage["sm-inbox-ended-open"]</code>). JSON: <code>group:"ended"</code>.</li>
+<li>Any new item in an ended thread un-ends it, because its sender is live or was just restored.</li>
+</ul>
+
+<h3>D. Ask about a doc</h3>
+<ul>
+<li><b>Web.</b> The reader bar (<code>web/reader.js:62-77</code>, after #1825's Print) gains <b>Ask</b>. It opens a 17rem column to the right of the iframe within the reading pane (the pane widens by that much, up to 70% of the window). The column shows the doc's work thread (C1) filtered to items since the doc's first publish, and a composer. Selecting text in the iframe (same origin) and pressing Ask, or the <code>a</code> key, adds a quote block.</li>
+<li><b>Target selector</b>, from <code>GET /docs/{doc_id}/ask-target</code>: <code>{author:{id,name,state,live:bool,restorable:bool,context_tokens}, default:"author"|"reader", reader:{id,name}|null}</code>. Default is the author when live, else the doc's existing live reader agent, else a new reader agent. “Bring back {author}” appears when the author has ended and is restorable, labelled with <code>context_tokens</code> rounded (“reloads about 380k tokens”); context comes from the session's last context reading.</li>
+<li><b>Sending</b>: <code>POST /docs/{doc_id}/ask {text, quote?, target:"author"|"reader"|"restore_author"}</code>. The message is delivered as an Inbox reply is, prefixed <code>[Question from Rajesh about "{title}" rev {sha7}]</code>, with the quote, and ending with “Answer with sm send rajesh.” It is recorded as an owner reply item in the thread. A live author that is working gets it when its turn ends (today's delivery).</li>
+<li><b>Reader agent</b>: spawned like <code>sm spawn claude --model sonnet --effort high</code> with name <code>ask-{ticket or doc slug}</code>, parent none, provider Claude, working directory a detached worktree of the doc's repo at the doc's commit (<code>~/worktrees/{repo}-ask-{doc_id}</code>, removed at retire). Brief: the doc path and commit, the PR number, “answer Rajesh's questions about this doc with sm send rajesh; read code and the PR; do not edit files, commit, push, comment on GitHub, or message other agents; after each answer run sm task-complete.” It counts as an agent sm started, so E applies. One live reader agent per doc; later questions go to it.</li>
+<li><b>Phone</b>: the doc reader's overflow gains Ask, which opens the native thread (#1801's ThreadScreen) for the doc's work thread with the same target selector.</li>
+<li><b>Tests</b>: target selection for live, ended-restorable, ended-unrestorable and authorless docs; one reader agent per doc; the message prefix and quote; reader worktree at the doc commit.</li>
+</ul>
+
+<h3>E. Auto-retire and restore on message</h3>
+<h4>E1. Eligibility</h4>
+<p>A session is <b>auto-retire eligible</b> when all hold:</p>
+<ul>
+<li>It was started by sm: it has a spawn launch intent (<code>sessions.rs</code> <code>SpawnLaunchIntentRecord</code>), or is a handoff successor, or a reader agent; and it holds no role registration (<code>sm roster</code>), and its node is the primary node, and its provider is <code>claude</code>, <code>codex</code> or <code>codex-fork</code> (the providers History can restore, <code>http/agent_history.rs:116</code>).</li>
+<li>It is finished (<code>agent_task_completed_at</code> set) and idle, and both have held for the delay (default 60 minutes) measured from the later of task-complete and the last activity.</li>
+<li>Nothing waits on it: no open blocking owner message from it; no doc of its with an open review request; no queue job of its running or pending; no Codex or local review request of its outstanding; no live child session; Rajesh does not Follow it.</li>
+</ul>
+<h4>E2. The sweep</h4>
+<ul>
+<li>Every 60 s, and only on the serving server (A4 signal), sm retires each eligible session through <code>retire_core_session_with_runtime_authorized</code> with a new authority <code>RetireAuthority::auto_retire()</code>, recording <code>retirement_intent: "auto"</code> and terminal provenance “auto-retire after {n} minutes finished and idle”.</li>
+<li>Settings: <code>owner_settings</code> gains <code>auto_retire {enabled: true, idle_minutes: 60}</code> (range 15 to 1440). <code>GET/PUT /settings/auto-retire</code>, owner and phone guards. Web Settings › New agents and the phone's Settings show a toggle and the minutes (round 1 Toggle).</li>
+<li>History rows show “retired automatically”. The Finished Inbox row stays until Done (round 1 D3), and C2 keeps it out of the Ended fold until then.</li>
+</ul>
+<h4>E3. Restore on message</h4>
+<ul>
+<li><code>live_recipient</code> (<code>http/messages.rs:87-115</code>) gains a first step: when the session ended with <code>retirement_intent: "auto"</code> and has no live successor, the recipient is the session itself, marked <code>restores: true</code>. Sessions retired any other way keep today's chain (successor, then parent).</li>
+<li>Sending to a <code>restores</code> recipient restores it (<code>restore_session</code>, <code>http.rs:10726</code>), then queues the message; today's “a stopped one gets it on restore” delivery applies. This covers the Inbox reply, the doc review wake (<code>doc_agent</code>, <code>http/docs.rs:1540</code>, uses the same rule), and agent-to-agent <code>sm send</code> to that session.</li>
+<li><b>Worktree.</b> Before relaunch, when <code>working_dir</code> does not exist and a claim of the session recorded it as <code>worktree_path</code> with a <code>branch</code>: run <code>git worktree add {path} {branch}</code>, fetching the branch from origin when it is not local; when the branch is gone (merged and deleted), <code>git worktree add --detach {path} origin/{default}</code> and tell the agent so in a one-line note delivered before the message. The path must be identical, because Claude finds a conversation by its folder. When neither applies, restore fails with “worktree {path} is gone and has no branch to rebuild from”, and the message falls back to today's chain.</li>
+<li><b>Claims.</b> Claims that the auto-retire ended (<code>end_reason</code> “retired”, ended at the retire time) are reopened, unless another live session has claimed the same item since.</li>
+<li>Undo on #1826's retire toast calls the same restore, for 10 s.</li>
+<li><b>Tests</b>: each eligibility exclusion; the sweep respects the setting and delay; a reply to an auto-retired agent restores it and delivers; a reply to a manually retired one goes to the parent; worktree rebuilt at the same path from branch, from origin, detached; claims reopened unless taken; doc review wake restores.</li>
+</ul>
+
+<h3>F. Filed without design</h3>
+<ul>
+<li><b>#1825</b> Print: a Print button in the reader bar and the full-page sm bar, a Print memo / Print all split for docs with an appendix divider, ⌘P printing the doc, and print rules that hide sm's bar and review sheet. No dependencies.</li>
+<li><b>#1826</b> Agent actions: band row Terminal, Retire, Hand off… (automatic only), ⋯ (Hand off now, Clone, Follow, Copy attach); one-click Retire for finished idle agents, inline confirm otherwise; Retire on Finished cards. Starts after #1796.</li>
+</ul>
+
+<h3>G. Tickets and order</h3>
+<p>All go under #1821 with <code>sm board under</code>; order with <code>sm board after</code>. Round 1 ticket numbers: #1789 last turn message and Finished; #1792 generated names; #1794 home-network TLS listener; #1796 web Agents page; #1797 web terminal page; #1799 web Inbox; #1800 and #1801 phone.</p>
+<table>
+<thead><tr><th>Ticket</th><th>Covers</th><th>Main files</th><th>Starts after</th><th>Tier</th></tr></thead>
+<tbody>
+<tr><td>Restart handover: server</td><td>A3 server side, A4, A5</td><td>new <code>handover.rs</code>, <code>main.rs</code>, <code>http.rs</code> (startup split, loops), <code>queue_authority.rs</code>, <code>queue.rs</code> loop exits</td><td>#1794</td><td>Mid</td></tr>
+<tr><td>Restart handover: script and slots</td><td>A2, A3 steps 1 and 8, migration, lessons 75–78 updated</td><td><code>scripts/restart-rust-server.sh</code>, <code>rust-service-cutover.sh</code>, <code>verify_queue_authority.py</code>, <code>docs/product/lessons.md</code></td><td>the server ticket</td><td>Mid</td></tr>
+<tr><td>Notes: server</td><td>B1, B2, B5</td><td>new <code>notes.rs</code>, <code>http/notes.rs</code>, <code>config.rs</code></td><td>—</td><td>Low</td></tr>
+<tr><td>Notes: web</td><td>B3</td><td>new <code>web/notes.js</code>, <code>app.js</code>, <code>app.css</code>, <code>terminal.js</code> (Type into terminal)</td><td>Notes server, #1797</td><td>Mid</td></tr>
+<tr><td>Work threads: server</td><td>C1, C2</td><td><code>http/inbox.rs</code>, <code>owner_inbox.rs</code>, <code>http/messages.rs</code> (reply target)</td><td>#1789</td><td>Mid</td></tr>
+<tr><td>Work threads: web</td><td>C1 and C2 on the web, reply box hint</td><td><code>web/inbox.js</code></td><td>work threads server, #1799</td><td>Low</td></tr>
+<tr><td>Auto-retire and restore on message</td><td>E</td><td><code>sessions.rs</code> (sweep, restore worktree), <code>http/messages.rs</code>, <code>work_claims/worktrees.rs</code>, <code>owner_settings.rs</code>, <code>web/settings.js</code>, <code>web/agents.js</code> (Undo)</td><td>#1789, #1792, #1826, work threads server (both edit <code>messages.rs</code>)</td><td>Mid</td></tr>
+<tr><td>Ask about a doc</td><td>D (web and server)</td><td><code>http/docs.rs</code>, new <code>http/ask.rs</code>, <code>web/reader.js</code></td><td>#1825, work threads web, auto-retire</td><td>Mid</td></tr>
+<tr><td>Phone: notes, print, agent actions, auto-retire setting</td><td>B4, #1825 and #1826 on the phone (<code>PrintManager</code> in <code>DocReader.kt</code>), E2 setting</td><td><code>ui/notes</code> (new), <code>DocReader.kt</code>, <code>ui/watch</code>, <code>ui/settings</code></td><td>#1801, Notes server, auto-retire</td><td>Mid</td></tr>
+<tr><td>Phone: work threads and Ask</td><td>C and D on the phone</td><td><code>ui/inbox</code> (ThreadScreen), <code>DocReader.kt</code></td><td>the phone ticket above, work threads server, Ask</td><td>Mid</td></tr>
+</tbody></table>
+<p>Restart server and Notes server start at once. Every web ticket attaches screenshots at 1440 and 390 px, light and dark; phone tickets use the preview emulator on live data. Every server ticket runs <code>cargo clippy</code> and <code>fmt</code> per CLAUDE.md.</p>
+
+<h3>H. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo item</th><th>Spec</th><th>Proof</th></tr></thead>
+<tbody>
+<tr><td>No restart gap; bad build never takes sm down</td><td>A</td><td>A5 tests; live <code>curl</code> loop during a restart; a deliberately failing build leaves the old server serving</td></tr>
+<tr><td>Notes page, pane, search, actions, history, every machine</td><td>B1–B3</td><td>B5 tests; screenshots of the page and the pane on the terminal page; a note edited on the laptop shows on the phone</td></tr>
+<tr><td>Notes on the phone</td><td>B4</td><td>Emulator screenshots</td></tr>
+<tr><td>One thread per ticket, docs across PRs</td><td>C1</td><td>Fixture test of the #1782 example; screenshot of today's Inbox</td></tr>
+<tr><td>Ended fold</td><td>C2</td><td>Tests: unread finished stays out of the fold; new item unfolds</td></tr>
+<tr><td>Print</td><td>#1825</td><td>PDFs from #1825</td></tr>
+<tr><td>Ask about a doc</td><td>D</td><td>D tests; screenshot; a live question answered by a reader agent</td></tr>
+<tr><td>Retire up front, one click</td><td>#1826</td><td>#1826 screenshots</td></tr>
+<tr><td>Auto-retire; reply restores</td><td>E</td><td>E tests; live check: a finished agent retires after the delay, a reply restores it in its worktree</td></tr>
+</tbody></table>
+
+<h3>Z. FAQ</h3>
+<p><b>Why pass the socket rather than run a small proxy in front?</b> A proxy is one more always-on process that itself needs restarting, and it would still need the old and new servers to agree who runs the background work. Passing the socket needs only that agreement.</p>
+<p><b>Can both servers ever run background work at once?</b> No. The old server stops its loops and drains before it passes the socket, and the new one starts loops only after it has the socket. The 30-second parked old server runs nothing unless it takes the socket back.</p>
+<p><b>What about schema changes in a new build?</b> They run in step 6, after the old server stopped. A rollback in step 7 then runs old code against a newer schema; migrations in this repo only add tables and columns, which old code ignores. A ticket that needs a destructive migration must say so and restart the old way.</p>
+<p><b>Why not let agents read notes?</b> Notes are your scratch space, and may hold half-formed thoughts about agents' work. Start agent and File ticket are how a note reaches an agent.</p>
+<p><b>Why is a reader agent Sonnet?</b> It reads one doc and some code and answers questions: low-tier work under CLAUDE.md §2.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
