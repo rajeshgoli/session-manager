@@ -32,7 +32,7 @@ fn cli_output_lines() {
         "lanes": [{
             "id": 7, "rank": 2,
             "goal": {"repo": "rajeshgoli/session-manager", "number": 1651, "title": "Context handoff"},
-            "counts": {"needs_you": 1, "ready": 1, "in_progress": 1, "blocked": 1, "done": 1},
+            "counts": {"needs_you": 1, "close_ready": 0, "ready": 1, "in_progress": 1, "blocked": 1, "done": 1},
             "longest_chain": [
                 {"repo": "rajeshgoli/session-manager", "number": 1654},
                 {"repo": "rajeshgoli/session-manager", "number": 1651},
@@ -48,7 +48,7 @@ fn cli_output_lines() {
         vec![
             "Board: 1 unseen alert",
             "Lane 2  rajeshgoli/session-manager#1651  Context handoff   (read 20s ago)",
-            "  1 needs you · 1 ready · 1 in progress · 1 blocked · 1 done · longest chain 2: #1654 → #1651",
+            "  1 needs you · 0 all parts done · 1 ready · 1 in progress · 1 blocked · 1 done · longest chain 2: #1654 → #1651",
             "  needs you    #1662  Analytics                                PR #1668 waits for your review  new",
             "  ready        #1654  sm handoff, successor start, work transfer",
             "  in progress  #1660  Shared settings endpoint                 sm-1660-engineer (stopped)  ! agent stopped",

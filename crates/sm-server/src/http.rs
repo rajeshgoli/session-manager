@@ -333,10 +333,12 @@ mod agent_history;
 mod analytics;
 mod board;
 mod board_clock;
+mod board_links;
 mod browser_terminal;
 mod claims;
 mod docs;
 mod follows;
+mod github;
 mod guestbook_page;
 mod handoff;
 mod history;
@@ -1728,6 +1730,11 @@ pub fn router(state: AppState) -> Router {
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
         .route("/client/board/start", post(board::client_start))
+        .route("/client/board/close", post(board::client_close))
+        .route(
+            "/client/github/{owner}/{repo}/{number}",
+            get(github::get_item),
+        )
         .route("/client/board/start-options", get(board::start_options))
         .route(
             "/client/settings",
@@ -4466,6 +4473,7 @@ async fn spawn_session(
                 claims::SpawnTicket {
                     session_id: &id,
                     check_board: false,
+                    start_blocked: false,
                     name: payload.name.as_deref(),
                     parent: Some(&parent),
                     ticket,
@@ -14743,6 +14751,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/board"
         || path == "/client/board/badge"
         || path == "/client/board/start-options"
+        || path.starts_with("/client/github/")
         || path == "/client/settings"
         || path == "/history"
         || path == "/history/agents"
