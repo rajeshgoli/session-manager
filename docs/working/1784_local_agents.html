@@ -135,9 +135,10 @@
 <tr><td>2. Which model is resident?</td><td><b>Qwen3-Coder-Next 8-bit by default; MiniMax M2.5 enters only through the bake-off.</b> GLM-5.2 (204 GB) is excluded.</td><td>Qwen's per-agent memory is one-tenth of MiniMax's. With four agents on 100K-token conversations, Qwen needs ~95 GB in total and MiniMax ~230 GB, which leaves nothing for your queue.</td></tr>
 <tr><td>3. Who wins when memory runs short?</td><td><b>Your queue jobs, always.</b> The model is the first thing sm removes, before its memory guard stops any queue job. Local agents drain, park, and resume when memory returns.</td><td>Local agents are optional capacity; your queue jobs are the work.</td></tr>
 <tr><td>4. What happens during a perf run?</td><td><b>A perf run unloads the model for its duration.</b></td><td>Perf asks for a quiet machine; a model decoding at full GPU is the loudest thing on it.</td></tr>
-<tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-codex-review</code> like everyone else's.</td><td>These models are roughly Low-tier quality at best, and the review gate is what makes weaker authors safe.</td></tr>
+<tr><td>5. What work goes to local agents?</td><td><b>A new Local row in the tier table, below Low:</b> scouts and inventory, fixture plumbing, narrow doc edits, log and test-failure triage, first drafts of well-specified fixes. Never spec authorship, design, review, or maintainer seats. Their PRs go through <code>sm request-review</code> like everyone else's.</td><td>These models are roughly Low-tier quality at best, and the review gate is what makes weaker authors safe.</td></tr>
 <tr><td>6. When may local agents run?</td><td><b>Whenever the model fits, not only overnight.</b> The yield rule handles contention.</td><td>Your queue is light 00:00–05:00 and around 08:00, but also between runs during the day; a fixed window wastes those gaps.</td></tr>
 <tr><td>7. What gets built now?</td><td><b>The pilot only: three tickets, ending in the bake-off.</b> The seat limit, yield rule and app changes are built only if the bake-off passes.</td><td>If local models cannot finish a Low-tier ticket in your workflow, none of the contention machinery is worth building.</td></tr>
+<tr><td>8. How many agents share the model?</td><td><b>Two, until the pilot shows LM Studio reusing each agent's earlier conversation between turns; then up to four.</b></td><td>Measured: the machine reads ~1,500 tokens a second in total, so four agents reading at once each wait up to four times longer.</td></tr>
 </tbody>
 </table>
 
@@ -196,6 +197,7 @@
 <li><b>Queue jobs are the memory.</b> Queue jobs alone used 49 GB at the median sample, 173 GB at the 90th percentile and 247 GB at the 99th. Background jobs were running 61% of the time.</li>
 <li><b>The GPU is shared, too.</b> From 18:00 to 21:00 the GPU averaged 60–76% busy from queue work. A local model decoding at the same time slows both.</li>
 <li><b>sm's memory guard would hit the wrong target.</b> When available memory falls below 8 GiB, the guard stops the largest <i>queue job</i>. A model server started outside sm is not a queue job, so the guard would stop your job to protect the model. Part of this design is teaching the guard to unload the model first.</li>
+<li><b>Stopping the job that loaded a model does not free it.</b> When you asked me to free the machine tonight, I cancelled the benchmark job. Its process ended, but LM Studio kept MiniMax's 129 GB until I unloaded it by hand, because the model lives in LM Studio's process, not the job's. Only something that knows a model is loaded, and calls LM Studio to unload it, gets the memory back.</li>
 </ul>
 
 <h3>What local agents are worth</h3>
@@ -233,14 +235,21 @@
 <h3>Model choice and how many agents fit</h3>
 <p>Two models on disk are candidates. The number that decides between them is per-agent context-cache memory, which comes from the model's architecture and so is exact rather than estimated: Qwen3-Coder-Next keeps a full cache on only 12 of its 48 layers; MiniMax M2.5 keeps it on all 62.</p>
 <table>
-<thead><tr><th>Model (on disk)</th><th>Size</th><th>Weights</th><th>Cache per agent at 100K tokens</th><th>Weights + 4 agents</th><!--BENCHCOLS--></tr></thead>
+<thead><tr><th>Model (on disk)</th><th>Size</th><th>Weights</th><th>Cache per agent at 100K tokens</th><th>Weights + 4 agents</th><th>Reads (tokens/s)</th><th>Writes, one agent (tokens/s)</th></tr></thead>
 <tbody>
-<tr><td>Qwen3-Coder-Next, 8-bit</td><td>80B total, 3B active per token</td><td>85 GB</td><td>2.5 GB</td><td>~95 GB</td><!--BENCHQWEN--></tr>
-<tr><td>MiniMax M2.5, 4-bit</td><td>230B total, 10B active</td><td>129 GB</td><td>25 GB</td><td>~230 GB</td><!--BENCHMINIMAX--></tr>
-<tr><td>GLM-5.2, 2-bit experts</td><td>large MoE</td><td>204 GB</td><td>n/a</td><td>does not fit beside anything</td><!--BENCHGLM--></tr>
+<tr><td>Qwen3-Coder-Next, 8-bit</td><td>80B total, 3B active per token</td><td>85 GB</td><td>2.5 GB</td><td>~95 GB</td><td>1,300–1,700</td><td>47–58</td></tr>
+<tr><td>MiniMax M2.5, 4-bit</td><td>230B total, 10B active</td><td>129 GB</td><td>25 GB</td><td>~230 GB</td><td>not measured</td><td>not measured</td></tr>
+<tr><td>GLM-5.2, 2-bit experts</td><td>large MoE</td><td>204 GB</td><td>n/a</td><td>does not fit beside anything</td><td>—</td><td>—</td></tr>
 </tbody>
 </table>
-<p><b>Speed is not yet measured, and the attempt to measure it is itself evidence.</b> I queued a throughput benchmark (a background job that measures how fast each model reads and writes with one and with four agents). It waited 3.5 hours for a slot. When it started at 16:29, only 104 GB was reclaimable because queue jobs held 160 GB, so its own safety check refused to load even Qwen. That is the contention this design is about, on an ordinary Wednesday afternoon. The benchmark reruns tonight in the overnight quiet window, and its numbers go into the next revision.</p>
+<p><b>Qwen3-Coder-Next, measured on this machine</b> (30 Sep, 21:18, quiet machine; MiniMax's half was cancelled when you needed the machine back):</p>
+<ul>
+<li><b>Memory is as predicted.</b> 81 GB after loading, 28 seconds to load, and 95 GB with four agents each holding a 26K-token conversation.</li>
+<li><b>One agent is usable.</b> It reads 1,300–1,700 tokens a second and writes 47–58. A 26K-token prompt takes 15 seconds before the first word. For comparison, Claude in the cloud typically answers in a few seconds.</li>
+<li><b>Reading is shared, and four agents do not read faster than one.</b> Four agents sending 26K-token prompts at once waited 22–64 seconds each for their first word. Together they still read only ~1,600 tokens a second, the same as one agent. Writing barely scales either: 64 tokens a second in total across four agents, against 58 for one.</li>
+<li><b>No reuse of an already-read prompt.</b> Re-sending the same 26K-token prompt with one line added cost 15.3 seconds, the same as the first read. If agent turns behave the same way, every turn re-reads the whole conversation. An agent 60K tokens into a ticket would then wait ~40 seconds per turn, and ~2.5 minutes when four agents read at once.</li>
+</ul>
+<p>Hence decision 8: two seats until P1 proves prompt reuse. One fact holds either way: local agents are several times slower per turn than cloud agents. Their value has to come from being free and unmetered, not fast.</p>
 
 <h3>How it works</h3>
 <figure>
@@ -299,7 +308,7 @@
 <table>
 <thead><tr><th style="width:8%">#</th><th>Ticket</th><th style="width:16%">Tier</th><th style="width:16%">Starts after</th></tr></thead>
 <tbody>
-<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size.</td><td>Opus, high</td><td>—</td></tr>
+<tr><td>P1</td><td><b>Launch a local agent.</b> Add the host field, a per-host launch profile (environment and flags) and the slim Claude Code profile. Split local usage out of the quota fit. Add the LOCAL badge on web and Android. Measure the slim first-prompt size, and check that LM Studio reuses an agent's earlier conversation between turns.</td><td>Opus, high</td><td>—</td></tr>
 <tr><td>P2</td><td><b>sm owns the model.</b> Add <code>sm model load|unload|status</code> over LM Studio's <code>lms</code> command. Record the model's memory reservation. Have the memory guard unload the model before stopping any queue job. Have perf admission unload it. Turn off LM Studio's auto-load.</td><td>Opus, high</td><td>—</td></tr>
 <tr><td>P3</td><td><b>Bake-off.</b> Run 8 closed tickets from the last month (Low- and Mid-tier, with merged PRs) through local agents on each model. Score each: did it finish, did review pass within the normal round limit, wall time, and how much a Mid agent had to fix.</td><td>Opus, high (driver)</td><td>P1, P2</td></tr>
 <tr><td>B1</td><td><b>Seat limit and yield.</b> Build the drain, park and resume behaviour in Figure 3, and wait-for-seat at spawn.</td><td>Opus, high</td><td>P3 passes</td></tr>
@@ -310,13 +319,21 @@
 
 <h3>Risks I cannot close from here</h3>
 <ul>
-<li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent spends a long time reading its prompt before its first word, and every compaction pays that again. Tonight's benchmark measures how long. The fallback is opencode, at the cost in the harness table.</li>
+<li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent spends 20 seconds or more reading its prompt before its first word (the default 84K-token prompt would take about a minute), and every compaction pays that again. The fallback is opencode, at the cost in the harness table.</li>
+<li><b>Re-reading every turn.</b> In the benchmark, LM Studio did not reuse a prompt it had just read. If agents' turns behave the same way, every turn re-reads the whole conversation, and an agent 60K tokens into a ticket waits ~40 seconds per turn. P1 checks LM Studio's prompt-cache settings with real agent turns. If reuse cannot be made to work, local agents stay at two seats and short tickets only.</li>
 <li><b>Permission mode.</b> Claude Code's auto mode may consult Anthropic's servers to classify actions. If it will not run against a local endpoint, local agents use <code>acceptEdits</code> with a command allowlist, which is stricter.</li>
 <li><b>Instruction following.</b> Weaker models ignore standing rules more often (naming themselves, going idle, not polling). Local agents get a short dedicated brief addendum, and the bake-off scores rule-following explicitly.</li>
 </ul>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision.</p>
+<p><b>Revision 2 (after the benchmark).</b></p>
+<ul>
+<li><b>Qwen3-Coder-Next is now measured; MiniMax M2.5 is not.</b> I cancelled the run when you needed the machine, after the Qwen half finished. The memory prediction held (95 GB with four agents working). Speeds are in "Model choice" below.</li>
+<li><b>New decision 8: start at two agents per model, not four.</b> The benchmark shows reading speed is shared across agents and does not grow with more of them.</li>
+<li><b>New risk: re-reading every turn.</b> LM Studio did not reuse a prompt it had just read; P1 now checks this.</li>
+<li><b>New evidence for sm owning the model:</b> cancelling the benchmark job left 129 GB in use until I unloaded the model by hand.</li>
+<li>The review command is now <code>sm request-review</code>, matching the current CLAUDE.md.</li>
+</ul>
 
 <p id="fn1" class="sans"><small>1. LM Studio bug tracker issue 2164, "Regression in 0.4.19 Build 2: Anthropic /v1/messages endpoint breaks tool calling with Qwen models when used with Claude Code".</small></p>
 
@@ -390,10 +407,10 @@ export SM_HOST=local</code></pre>
 <h4>C.6 Restore and clear</h4>
 <p>Restore (<code>--resume</code>) re-runs <code>managed_session_command</code> with the stored host, so the environment is re-applied. This is a correctness requirement, not a nicety. A local session restored without it would resume against Anthropic, bill your quota, and send a local conversation to the cloud. Test: restoring a host-local record produces a command containing <code>ANTHROPIC_BASE_URL</code>. <code>/clear</code> is unchanged.</p>
 <h4>C.7 Brief addendum</h4>
-<p>sm prepends a short fixed block, about 150 words, to the spawn brief of every local agent. The block states: your tier is Local; do not delegate or spawn; use <code>sm status</code> on <code>[sm remind]</code>; open a PR and run <code>sm request-codex-review</code>; stop and report if blocked. The text lives in <code>docs/product/local_agent_addendum.md</code> so it can change without a rebuild; sm reads it at spawn.</p>
+<p>sm prepends a short fixed block, about 150 words, to the spawn brief of every local agent. The block states: your tier is Local; do not delegate or spawn; use <code>sm status</code> on <code>[sm remind]</code>; open a PR and run <code>sm request-review</code>; stop and report if blocked. The text lives in <code>docs/product/local_agent_addendum.md</code> so it can change without a rebuild; sm reads it at spawn.</p>
 <h4>C.8 Example</h4>
 <pre><code>$ sm model status
-qwen3-coder-next  loaded  seats 1/4 used  reservation 105 GB
+qwen3-coder-next  loaded  seats 1/2 used  reservation 94 GB
 $ sm spawn claude --host local --name sm-1901-inventory "Inventory every call site of …"
 spawned sm-1901-inventory (7c1e…) host=local model=qwen3-coder-next (effort ignored: local host)
 $ sm spawn claude --host local --model minimax-m2.5 "…"
@@ -418,7 +435,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <thead><tr><th>Command</th><th>Behaviour</th></tr></thead>
 <tbody>
 <tr><td><code>sm model status</code></td><td>Loaded model, seats used / total, reservation, state (E.3), last yield time and reason.</td></tr>
-<tr><td><code>sm model load &lt;key&gt; [--seats N] [--context T]</code></td><td>Defaults: seats 4, context 200000. Computes the reservation (E.4) and refuses if available memory minus reservation is below the yield line. Otherwise runs <code>lms load &lt;key&gt; -c T --parallel N --identifier &lt;short-id&gt; -y</code> and polls <code>GET /v1/models</code> until the identifier appears, with a 10-minute timeout. Only one model may be loaded; loading a second is refused.</td></tr>
+<tr><td><code>sm model load &lt;key&gt; [--seats N] [--context T]</code></td><td>Defaults: seats 2, context 200000. Computes the reservation (E.4) and refuses if available memory minus reservation is below the yield line. Otherwise runs <code>lms load &lt;key&gt; -c T --parallel N --identifier &lt;short-id&gt; -y</code> and polls <code>GET /v1/models</code> until the identifier appears, with a 10-minute timeout. Only one model may be loaded; loading a second is refused.</td></tr>
 <tr><td><code>sm model unload [--force]</code></td><td>Drains first (F), then runs <code>lms unload &lt;id&gt;</code>. <code>--force</code> skips the drain.</td></tr>
 </tbody>
 </table>
@@ -437,6 +454,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 </tbody>
 </table>
 <p>If <code>config.json</code> has no recognisable attention layout, sm refuses the load and asks for <code>--reservation &lt;GB&gt;</code>. The <b>yield line</b> is the guard's reserve plus 24 GB (config <code>local_host.yield_margin_bytes</code>), so 32.6 GB of available memory by default. Available memory means the kernel's value that the guard already uses (queue.rs:4519–4542).</p>
+<p><b>The model's memory is wired.</b> In the benchmark, wired memory rose from 9 GB to 98–108 GB while Qwen was answering. Wired memory cannot be compressed or paged out, so the kernel cannot relieve pressure from it; only an unload can. This is why the reservation must be counted in full and why the guard's first action is to unload, not to wait.</p>
 <p>Guard change (queue.rs:5263 <code>host_memory_guard_pass</code>): when available memory falls below the yield line and the model state is <code>ready</code> or <code>draining</code>, the pass starts a yield (F.2) instead of stopping a job. When available memory falls below the reserve itself, which means a yield was too slow, the guard force-unloads the model first. It returns to stopping queue jobs only if memory is still under the reserve after the unload. Test: extend <code>host_memory_guard_stops_the_largest_job_of_any_type_only_under_pressure</code> (queue.rs:8756) with a loaded model and assert the model is unloaded and no job is stopped.</p>
 <h4>E.5 Perf admission</h4>
 <p>When a perf job reaches the front of admission (queue.rs:3726) and the model is <code>ready</code>, sm starts a yield with reason <code>perf &lt;label&gt;</code>. The perf job waits for the model to reach <code>yielded</code>, counting against its existing wait. While any perf job is running or waiting on its cooldown, reload is blocked.</p>
@@ -456,7 +474,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <h4>F.3 Reload and resume</h4>
 <p>Reload condition: <code>desired</code> is true, no perf job is running or in cooldown, and available memory has stayed at or above the reservation plus the yield line for 10 continuous minutes (<code>local_host.reload_hold</code>). On reload, the model is loaded with the same seats and context. Each parked agent's held messages are then delivered in order. An agent flagged <code>resume_needed</code> with nothing held gets <code>[sm] The local model was unloaded while you were working (&lt;reason&gt;). Continue where you left off.</code></p>
 <h4>F.4 Worked example</h4>
-<p>At 18:02 Qwen is loaded (reservation 104 GB) with three local agents. A queue job grows to 140 GB. Available memory drops from 58 GB to 31 GB, below the 32.6 GB yield line. sm drains: two agents are idle and one finishes its turn at 18:05. sm unloads at 18:05 and parks all three. The job ends at 19:40. Available memory has been at or above 137 GB (104 + 32.6) since then, so at 19:50 sm reloads and delivers two held <code>sm send</code> messages to one of the agents.</p>
+<p>At 18:02 Qwen is loaded (two seats, reservation 94 GB) with two local agents. A queue job grows to 140 GB. Available memory drops from 58 GB to 31 GB, below the 32.6 GB yield line. sm drains: one agent is idle, and the other finishes its turn at 18:05. sm unloads at 18:05 and parks both. The job ends at 19:40. Available memory has been at or above 127 GB (94 + 32.6) since then, so at 19:50 sm reloads and delivers two held <code>sm send</code> messages to one of the agents.</p>
 
 <h3 id="g">G. B2: Spend line, tier table, UI</h3>
 <ul>
@@ -469,8 +487,8 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <h3 id="h">H. P3: bake-off protocol</h3>
 <ol>
 <li><b>Pick 8 tickets.</b> Take them from closed tickets merged in the last 30 days whose implementing agent ran at Low or Mid tier. Prefer tickets whose PR diff is under 400 lines and touches fewer than 6 files. Exclude specs and Android-only work. Record each ticket's original token use from usage.db and its wall time from the session record.</li>
-<li><b>Replay each ticket on each model.</b> Use a fresh worktree at the ticket's pre-merge base commit and the original brief, prefixed with C.7. Run Qwen3-Coder-Next 4 seats × 200K. Run MiniMax M2.5 2 seats × 100K in a quiet window.</li>
-<li><b>Review.</b> Each attempt that produces a PR-equivalent diff goes through <code>sm request-codex-review</code> on a draft PR. Close the draft afterwards and never merge it.</li>
+<li><b>Replay each ticket on each model.</b> Use a fresh worktree at the ticket's pre-merge base commit and the original brief, prefixed with C.7. Run Qwen3-Coder-Next at 2 seats × 200K, and at 4 seats if P1 showed prompt reuse working. Run MiniMax M2.5 2 seats × 100K in a quiet window.</li>
+<li><b>Review.</b> Each attempt that produces a PR-equivalent diff goes through <code>sm request-review</code> on a draft PR. Close the draft afterwards and never merge it.</li>
 <li><b>Rescue.</b> If an attempt stalls for 30 minutes or fails review twice, a Mid agent (Opus, high) finishes it. Record the Mid agent's tokens as a percentage of the original.</li>
 <li><b>Score each attempt:</b> finished (y/n), review rounds, rescue % of original tokens, wall time ÷ original wall time, and standing-rule violations (named itself, went idle when told, did not poll, used <code>sm status</code>).</li>
 <li><b>Pass bar (from the memo):</b> at least 5 of 8 reach clean review with rescue at or below 15%, and median wall-time ratio at or below 3. Report both models. The owner picks the resident model from the report.</li>
@@ -485,8 +503,26 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <h4>I.3 First-prompt size</h4>
 <p>From the first assistant message with usage in each of the 39 most recent Claude transcripts across all projects: input + cache creation + cache read. Minimum 34,473, median 84,241, maximum 95,791 tokens.</p>
 <h4>I.4 Model throughput</h4>
-<p><b>Method.</b> A Python script sends streaming <code>/v1/chat/completions</code> requests to LM Studio with the model loaded at 131,072 tokens of context and 4 parallel seats. It measures: time to first token and decode speed for a short prompt; prefill speed for a cold 30K-token prompt; the same 30K prompt again with a changed tail, to test whether LM Studio reuses the cached prefix; a cold 60K prompt; aggregate decode speed with 2 and 4 simultaneous 8K-token requests; and 4 simultaneous 30K-token requests. It also records the physical memory footprint of LM Studio's processes after load and after each concurrency step. Before loading, it refuses unless reclaimable memory (free + inactive + speculative + purgeable pages) is at least the weights plus 40 GB, so that it cannot push queue jobs into swap. It runs as an <code>sm queue</code> background job.</p>
-<p><b>Status.</b> First run, 2026-09-30 16:29: refused to load either model (104 GB reclaimable against 125 GB needed for Qwen; 109 GB against 169 GB for MiniMax). The rerun is scheduled for the overnight window, and this subsection will carry its numbers.</p>
+<p><b>Method.</b> A Python script sends streaming <code>/v1/chat/completions</code> requests to LM Studio 0.4.16 with the model loaded at 131,072 tokens of context and 4 parallel seats (<code>lms load … -c 131072 --parallel 4</code>). Prompts are cut from this repo's CLAUDE.md and lessons.md, and each begins with a unique tag so that concurrent requests cannot share a prefix. Temperature is 0. Time to first token comes from the first streamed content or reasoning delta. Prefill speed is prompt tokens divided by time to first token; decode speed is completion tokens divided by the time after the first token. Footprint is the summed <code>footprint</code> physical footprint of LM Studio's processes, and wired memory comes from <code>vm_stat</code>. Before loading, the script refuses unless reclaimable memory (free + inactive + speculative + purgeable pages) is at least the weights plus 40 GB. It runs as an <code>sm queue</code> background job.</p>
+<p><b>Qwen3-Coder-Next 8-bit (<code>qwen/qwen3-coder-next</code>), 2026-09-30 21:18 PDT:</b></p>
+<table>
+<thead><tr><th>Test</th><th>Prompt tokens</th><th>First word after (s)</th><th>Read speed (tok/s)</th><th>Write speed (tok/s)</th><th>LM Studio footprint / wired (GB)</th></tr></thead>
+<tbody>
+<tr><td>Before load</td><td></td><td></td><td></td><td></td><td>0.9 / 8.8</td></tr>
+<tr><td>After load (28.1 s)</td><td></td><td></td><td></td><td></td><td>80.9 / 8.8</td></tr>
+<tr><td>One agent, short</td><td>1,609</td><td>1.2</td><td>1,305</td><td>57.6</td><td></td></tr>
+<tr><td>One agent, 26K cold</td><td>25,749</td><td>15.5</td><td>1,658</td><td>32.8</td><td></td></tr>
+<tr><td>Same 26K + one line (reuse test)</td><td>25,753</td><td>15.3</td><td>1,681</td><td>49.4</td><td></td></tr>
+<tr><td>One agent, 52K cold</td><td>52,043</td><td>38.7</td><td>1,344</td><td>46.7</td><td></td></tr>
+<tr><td>Two agents, 8K each</td><td>~6.6K each</td><td>12.2, 12.3</td><td>~545 each</td><td>47 each; 38.3 total over the 20.8 s run</td><td>84.9 / 97.9</td></tr>
+<tr><td>Four agents, 8K each</td><td>~6.6K each</td><td>7.4–14.4</td><td>462–903</td><td>23–37 each; 63.6 total over the 25.1 s run</td><td>87.9 / 99.8</td></tr>
+<tr><td>Four agents, 26K each</td><td>~25.7K each</td><td>21.6–64.1</td><td>402–1,194</td><td>4–33 each; 11.4 total over the 70.0 s run</td><td>95.0 / 108.2</td></tr>
+<tr><td>After unload</td><td></td><td></td><td></td><td></td><td>1.0 / 7.3</td></tr>
+</tbody>
+</table>
+<p>"Total" write speed counts every completion token across agents divided by the wall time of the whole step, including the time agents spent waiting to read; it understates write speed once all are writing, and it is the number that matters for throughput. The reuse test appends one line inside the same user message. Whether LM Studio reuses prefixes across agent turns, where earlier messages are byte-identical, is the check assigned to P1.</p>
+<p><b>MiniMax M2.5 4-bit.</b> It loaded (128.7 GB, 4 seats, 131,072 context), and then I cancelled the job at the owner's request before any request completed. Not measured. The bake-off (P3) measures it in a quiet window.</p>
+<p><b>Lesson from the cancel.</b> Cancelling the queue job ended the script but left the model loaded: <code>lms ps</code> still showed <code>bench-minimax … 128.68 GB … IDLE</code>. <code>lms unload --all</code> freed it. E.2's unload path must therefore call <code>lms unload</code> explicitly, never rely on a process exit.</p>
 
 <h3 id="j">J. Requirement trace</h3>
 <table>
@@ -504,6 +540,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <tr><td>Bake-off gates the build-out</td><td>H</td><td>P3 report</td></tr>
 <tr><td>Local work goes through review</td><td>C.7, H.3</td><td>Addendum text</td></tr>
 <tr><td>Model choice by per-agent memory</td><td>E.4, I.4</td><td>Reservation computed from config.json</td></tr>
+<tr><td>Two seats until prompt reuse is proven</td><td>E.2 default; C.4 / P1 check</td><td>P1 PR records whether repeat turns re-read the conversation</td></tr>
 </tbody>
 </table>
 
@@ -511,7 +548,7 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <p><b>Why not make the model server a queue <code>service</code> job?</b> Service jobs count against the global limit of 2 running queue jobs (config.rs:1689). A resident model would permanently take half of your queue's concurrency. The memory guard also treats a service job as just another job to stop, not as the first thing to unload. The model needs its own small state machine, which is E and F.</p>
 <p><b>Why LM Studio and not vMLX, <code>mlx_lm.server</code> or Ollama?</b> LM Studio is already installed and running as a service and already has both models. It serves the Anthropic request format natively, which Claude Code needs; supports parallel requests on MLX since 0.4.2; and has a scriptable CLI with load, unload and estimate. The <code>opencode.json</code> in the repo root points at a vMLX server on port 8010 from an earlier experiment. vMLX would work behind the same design if it gains an Anthropic endpoint, because only E.2's three commands touch the server.</p>
 <p><b>Why not two models at once, a fast one and a smart one?</b> Qwen plus MiniMax is 214 GB of weights before any conversation cache. That leaves your queue nothing.</p>
-<p><b>Could a local agent be a reviewer?</b> Not as the gate. <code>sm request-codex-review</code> stays the correctness gate. A local first-pass review before a Codex review is a later idea for the bake-off to inform.</p>
+<p><b>Could a local agent be a reviewer?</b> Not as the gate. <code>sm request-review</code> stays the correctness gate. A local first-pass review before a Codex review is a later idea for the bake-off to inform.</p>
 <p><b>What if Claude Code changes its request format and LM Studio lags?</b> Claude Code updates itself. A breaking change shows up as local agents failing their first turn. The P3 smoke ticket, re-run on any Claude Code or LM Studio upgrade, catches it. If it recurs, the opencode fallback removes the dependency.</p>
 <p><b>Does this work on a second machine?</b> Not in this design. The host is <code>127.0.0.1</code>, and the memory logic reads this Mac's memory.</p>
 <p><b>Why keep provider <code>claude</code> instead of adding <code>claude-local</code>?</b> A new provider string would have to be added to every one of the ~25 files that branch on provider (B), for no behavioural difference. The host field touches only the sites that genuinely differ.</p>
