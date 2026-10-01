@@ -272,7 +272,25 @@ select.inp { padding: 3px 6px; }
 .term-page { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--term); color: var(--term-ink); z-index: 30; }
 .term-bar { height: 40px; flex: 0 0 40px; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
 .term-bar .t { font-weight: 650; }
-.term-body { flex: 1; min-height: 0; overflow: hidden; padding: 4px; }
+.term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); }
+.term-main.with-switch { grid-template-columns: 15.5rem minmax(0, 1fr); }
+.term-body { min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }
+.term-switch-wrap { min-height: 0; overflow-y: auto; background: var(--panel); color: var(--ink); border-right: 1px solid var(--line); }
+.term-switch { display: flex; flex-direction: column; padding: 4px 0 12px; }
+.sw-sec { font: 600 .8rem var(--ui); letter-spacing: .06em; text-transform: uppercase; padding: 10px 12px 3px; text-align: left; border: 0; background: none; color: var(--ink-3); }
+.sw-sec.magenta { color: var(--magenta); } .sw-sec.cyan { color: var(--cyan); } .sw-sec.amber { color: var(--amber); } .sw-sec.green { color: var(--green); }
+button.sw-sec { cursor: pointer; }
+.sw-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; column-gap: 8px; align-items: center; padding: 4px 8px 5px 12px; cursor: pointer; }
+.sw-row:hover { background: var(--panel-2); }
+.sw-row.cur { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+.sw-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.sw-dot.muted { background: var(--line); }
+.sw-nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-row .ok { font-weight: 700; padding: 0 6px; }
+.sw-fact { grid-column: 2 / 4; font-size: .867rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-fact.muted { color: var(--ink-2); }
+.term-route { white-space: nowrap; font-size: .9rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.term-bar .icon-btn.on { color: var(--accent); }
 .term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-keys { display: flex; gap: 4px; white-space: nowrap; }
 .term-connection { white-space: nowrap; font-size: .9rem; }
@@ -283,6 +301,11 @@ select.inp { padding: 3px 6px; }
   .term-bar > * { flex-shrink: 0; }
   .term-bar .t { max-width: 6.667rem; }
   .term-state { display: none; }
+}
+/* Below 900 px the switcher covers the terminal instead of squeezing it. */
+@media (max-width: 899.98px) {
+  .term-main.with-switch { grid-template-columns: minmax(0, 1fr); }
+  .term-switch-wrap { position: absolute; top: 0; bottom: 0; left: 0; z-index: 2; width: min(15.5rem, 85vw); box-shadow: var(--shadow); }
 }
 @media (max-width: 600px) { .term-panel { width: 100vw; } }
 
