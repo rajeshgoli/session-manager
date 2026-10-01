@@ -127,6 +127,14 @@ test('page, terminal pane, actions and a version conflict', async () => {
         await agentRequest;
         assert.equal(handler.calls.starts[0].working_dir, '/repo');
         assert.match(handler.calls.starts[0].initial_message, /Review loop brief/);
+        await page.keyboard.press('Meta+j');
+        await page.locator('.panel .note-card').first().waitFor();
+        if (!await page.locator('.panel .notes-editor').count()) await page.locator('.panel .note-card-main').first().click();
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('.panel').count(), 1, 'first Escape keeps the pane');
+        assert.equal(await page.locator('.panel .notes-editor').count(), 0, 'first Escape collapses the note');
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('.panel').count(), 0, 'second Escape closes the pane');
       }
       assert.deepEqual(errors, []);
       await context.close();

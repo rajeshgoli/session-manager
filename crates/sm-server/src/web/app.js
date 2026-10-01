@@ -561,6 +561,8 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       }
       if (paletteOpen || mod || event.altKey) return;
       if (event.key === 'Escape') {
+        // The first Escape in Notes collapses its open editor; the next closes the pane.
+        if (where.open === 'notes:view' && document.querySelector('.notes-pane .notes-editor')) return;
         if (where.open) closePanel();
         return;
       }
