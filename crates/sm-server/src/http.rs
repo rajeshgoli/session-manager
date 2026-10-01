@@ -1665,6 +1665,7 @@ pub fn router(state: AppState) -> Router {
             "/client/analytics/spend",
             get(analytics::client_analytics_spend),
         )
+        .route("/client/usage/meters", get(analytics::client_usage_meters))
         .route(
             "/client/analytics/time",
             get(analytics::client_analytics_time),
@@ -15180,6 +15181,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/apk"
         || path == "/client/analytics/spend"
         || path == "/client/analytics/time"
+        || path == "/client/usage/meters"
         || path == "/client/session-models"
         || path == "/client/host-status"
         || path == "/client/queue"
@@ -21094,7 +21096,7 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 19] = [
+    const OWNER_WEB_READS: [&str; 20] = [
         "/client/queue",
         "/client/queue/stats",
         "/client/queue/jobs/job-missing/start-check",
@@ -21105,6 +21107,7 @@ mod tests {
         "/queue-jobs/job-missing",
         "/client/analytics/spend",
         "/client/analytics/time",
+        "/client/usage/meters",
         "/client/sessions",
         "/client/sessions/fork1001",
         "/sessions/fork1001/output",
@@ -22135,6 +22138,7 @@ mod tests {
             ),
             (Method::GET, "/client/analytics/spend", "", false),
             (Method::GET, "/client/analytics/time", "", false),
+            (Method::GET, "/client/usage/meters", "", false),
             (
                 Method::GET,
                 "/client/session-models?provider=claude",

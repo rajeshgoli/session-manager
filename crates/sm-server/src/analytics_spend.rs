@@ -605,17 +605,33 @@ fn overlap_share(window: &Window, from: i128, to: i128) -> f64 {
 
 /// Linear burn since the window started, as `usage_report`'s projection.
 fn pace(window: &Window) -> Option<Pace> {
-    let elapsed = window.observed_at - window.start;
-    let horizon = window.resets_at - window.observed_at;
+    linear_pace(
+        window.percent,
+        window.start,
+        window.observed_at,
+        window.resets_at,
+    )
+}
+
+/// `percent` read at `observed_at`, burned linearly since `start`, carried
+/// to `resets_at`. All instants are Unix nanoseconds.
+pub(crate) fn linear_pace(
+    percent: f64,
+    start: i128,
+    observed_at: i128,
+    resets_at: i128,
+) -> Option<Pace> {
+    let elapsed = observed_at - start;
+    let horizon = resets_at - observed_at;
     if elapsed < MIN_PACE_ELAPSED_NANOS || horizon <= 0 {
         return None;
     }
-    let rate = window.percent.max(0.0) / elapsed as f64;
-    let projected = window.percent + rate * horizon as f64;
+    let rate = percent.max(0.0) / elapsed as f64;
+    let projected = percent + rate * horizon as f64;
     if projected >= 100.0 && rate > 0.0 {
-        let until_full = ((100.0 - window.percent).max(0.0) / rate) as i128;
+        let until_full = ((100.0 - percent).max(0.0) / rate) as i128;
         Some(Pace::RunsOut {
-            at: format_nanos(window.observed_at + until_full),
+            at: format_nanos(observed_at + until_full),
         })
     } else {
         Some(Pace::OnPace {
