@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
+import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
@@ -9,6 +9,7 @@ const title = (job) => job.label || job.id;
 const errorText = (error) => error ? html`<p class="err" role="alert">${error.message}</p>` : null;
 
 export function QueuePage() {
+  const [insightDismissed, setInsightDismissed] = useState(() => stored('queue-limits-insight-dismissed', false));
   const [queue, error, reloadQueue] = usePoll(async () => { const q = await api('/client/queue'); setShared('queue', q); return q; }, 5000);
   useEffect(() => bus.on('queue-changed', reloadQueue), [reloadQueue]);
   const [stats] = usePoll(() => api('/client/queue/stats?hours=24'), 60000);
@@ -21,7 +22,7 @@ export function QueuePage() {
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
     })}</div>
     <${MacChart} />
-    <${HeldBack} stats=${stats} insightOnly=${true} />
+    ${!insightDismissed ? html`<${HeldBack} stats=${stats} insightOnly=${true} onDismiss=${() => { store('queue-limits-insight-dismissed', true); setInsightDismissed(true); }} />` : null}
     <section class="q-card"><div class="q-heading"><h2>Running</h2><span class="muted">Last 3 hours → now</span></div>
       ${queue.running.length ? queue.running.map((job) => html`<${JobRow} key=${job.id} job=${job} now=${now} />`) : html`<p class="muted">No jobs running.</p>`}
       <h2>Waiting · in start order</h2>
@@ -64,10 +65,10 @@ export function MacChart() {
   </section>`;
 }
 
-export function HeldBack({ stats, insightOnly = false }) {
+export function HeldBack({ stats, insightOnly = false, onDismiss }) {
   const limits = limitsInsight(stats);
   if (insightOnly && !limits) return null;
-  return html`<section class="q-card q-insight"><h2>${insightOnly ? 'The queue limits are holding jobs back.' : 'Held back?'}</h2>
+  return html`<section class="q-card q-insight"><div class="q-heading"><h2>${insightOnly ? 'The queue limits are holding jobs back.' : 'Held back?'}</h2>${onDismiss ? html`<button class="btn sm" aria-label="Dismiss queue limits insight" onClick=${onDismiss}>Dismiss</button>` : null}</div>
     ${stats?.available ? (stats.waiting || []).filter((r) => r.job_seconds > 0 && (!insightOnly || r.group === 'limits')).map((row) => html`<p>${{ limits: 'Queue limits', perf_rules: 'Perf rules', memory: 'Memory', other: 'Other rules' }[row.group]} held jobs for ${(row.job_seconds / 3600).toFixed(1)} hours in total. The Mac had room to run ${Math.round(100 * row.headroom_job_seconds / row.job_seconds)}% of that.${row.unknown_job_seconds ? ` Headroom was unknown for ${duration(row.unknown_job_seconds)}.` : ''}</p>`) : html`<p class="muted">No utilization data recorded.</p>`}
     ${stats?.by_type?.filter((r) => r.peak_rss_p95_bytes != null).map((r) => html`<p class="sub">${r.type} jobs peak at ${gb(r.peak_rss_p95_bytes)} each (95th percentile).</p>`)}
     ${limits ? html`<a href="/settings#queue-limits">Queue limits…</a>` : null}
@@ -104,7 +105,7 @@ function JobPanel({ id, controls }) {
   const usageInterval = !before && job?.state === 'running' ? 5000 : 0;
   const [usage, usageError] = usePoll(() => api(`/client/queue/jobs/${encoded}/usage${before ? `?before_ms=${before}` : ''}`), usageInterval, [id, before, usageInterval]);
   const [follows, , reloadFollows] = usePoll(() => api('/client/follows'), 30000, [id]);
-  const [check, setCheck] = useState(null), [cancel, setCancel] = useState(false), [note, setNote] = useState('');
+  const [cancel, setCancel] = useState(false), [note, setNote] = useState('');
   const [ask, setAsk] = useState(jobQuestions.has(id)), [question, setQuestion] = useState(''), [busy, setBusy] = useState(false), [failure, setFailure] = useState('');
   const [request, setRequest] = useState(jobQuestions.get(id) || null);
   const queue = useShared('queue');
@@ -145,11 +146,10 @@ function JobPanel({ id, controls }) {
   return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${review ? `${review.title} · round ${job.review.round}` : title(job)}</span>${controls}<span class="s">${review ? job.review.reviewer_label : `${job.type} · ${jobAgentLabel(job)}`}</span></div>
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
-        ${job.state === 'pending' ? html`<button class="btn" disabled=${busy} onClick=${() => perform(async () => setCheck(await api(`/client/queue/jobs/${encoded}/start-check`)))}>Start now</button>` : null}
+        ${job.state === 'pending' ? html`<button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/start`, { method: 'POST', body: {} }); bus.emit('queue-changed'); })}>${busy ? 'Starting…' : 'Start now'}</button>` : null}
         ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>Cancel</button><button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>` : null}
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
-      ${check && job.state === 'pending' ? html`<section class="q-card"><h3>Start this job now?</h3>${check.warnings.map((warning) => html`<p class="amber">${warning}</p>`)}<p>Memory available ${gb(check.memory_available_bytes)} · reserve ${gb(check.memory_reserve_bytes)} · estimate ${gb(check.memory_estimate_bytes)} (${check.memory_estimate_source || 'unknown'})</p><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/start`, { method: 'POST', body: {} }); setCheck(null); })}>Start anyway</button> <button class="btn" onClick=${() => setCheck(null)}>Keep waiting</button></section>` : null}
       ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>Cancel job</button></section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}
