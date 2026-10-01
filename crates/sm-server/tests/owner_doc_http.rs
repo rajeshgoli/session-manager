@@ -13,6 +13,7 @@ use sm_server::{
     config::{AppConfig, PathsConfig, SmSendConfig},
     http::{router, AppState, DocFetchError, DocPullRequest, OwnerDocSource},
     owner_docs::{git_blob_sha, OwnerDocStore, OwnerDocVerdict, PostedOwnerDocReview},
+    owner_messages::{NewOwnerMessage, OwnerMessageStore},
 };
 use std::{
     collections::BTreeMap,
@@ -86,6 +87,7 @@ struct Fixture {
     app: axum::Router,
     dir: PathBuf,
     state_file: PathBuf,
+    source: Arc<Source>,
 }
 
 /// `author01` live (claude, opus, high); `retired1` retired with no parent
@@ -116,7 +118,7 @@ fn fixture() -> Fixture {
         .to_string(),
     )
     .unwrap();
-    let source = Source::default();
+    let source = Arc::new(Source::default());
     for sha in ["a", "b", "c"] {
         source
             .files
@@ -136,12 +138,14 @@ fn fixture() -> Fixture {
         ..AppConfig::default()
     };
     config.push.db_path = dir.join("owner_push.db").display().to_string();
+    config.work_claims.worktree_root = dir.join("worktrees").display().to_string();
     config.rust_core.fixture_writes_enabled = true;
     config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
     Fixture {
-        app: router(AppState::new(config).with_owner_doc_source(Arc::new(source))),
+        app: router(AppState::new(config).with_owner_doc_source(source.clone())),
         dir,
         state_file,
+        source,
     }
 }
 
@@ -189,6 +193,314 @@ async fn publish(
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
+}
+
+#[tokio::test]
+async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
+    let f = fixture();
+    let checkout = f.dir.join("ask-source");
+    fs::create_dir_all(checkout.join("specs")).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "reader@example.com"]);
+    git(&["config", "user.name", "Reader test"]);
+    fs::write(checkout.join("specs/memo.md"), MEMO).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "publish"]);
+    let sha = git(&["rev-parse", "HEAD"]);
+    f.source
+        .files
+        .lock()
+        .unwrap()
+        .insert(("specs/memo.md".into(), sha.clone()), MEMO.to_vec());
+    let (status, published) = request(
+        &f.app,
+        "POST",
+        "/docs",
+        Some(json!({
+            "repo": REPO, "path": "specs/memo.md", "pr_number": 12,
+            "commit_sha": sha, "session_id": "retired1", "checkout_root": checkout,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    let doc_id = published["id"].as_str().unwrap();
+    let endpoint = format!("/docs/{doc_id}/ask");
+    let (status, before) =
+        request(&f.app, "GET", &format!("/docs/{doc_id}/ask-target"), None).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["default"], "reader");
+    assert_eq!(before["author"]["live"], false);
+    assert_eq!(before["author"]["restorable"], true);
+    assert!(before["reader"].is_null());
+
+    let (status, first) = request(
+        &f.app,
+        "POST",
+        &endpoint,
+        Some(json!({
+            "text": "Why buy?", "quote": "Buy.", "target": "reader"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let reader_id = first["recipient"]["id"].as_str().unwrap();
+    let reader_path = f
+        .dir
+        .join("worktrees")
+        .join(format!("widgets-ask-{doc_id}"));
+    assert_eq!(git(&["rev-parse", "HEAD"]), sha);
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&reader_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), sha);
+    let sessions: Value =
+        serde_json::from_str(&fs::read_to_string(&f.state_file).unwrap()).unwrap();
+    let reader = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == reader_id)
+        .unwrap();
+    assert_eq!(reader["provider"], "claude");
+    assert_eq!(reader["model"], "sonnet");
+    assert_eq!(reader["reasoning_effort"], "high");
+    assert_eq!(reader["parent_session_id"], Value::Null);
+    assert_eq!(reader["working_dir"], reader_path.display().to_string());
+    let first_prompt = fs::read_to_string(reader["log_file"].as_str().unwrap()).unwrap();
+    assert!(first_prompt.contains("Answer this question now:"));
+    assert!(first_prompt.contains("Why buy?"));
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let (body, delivered): (String, String) = conn
+        .query_row(
+            "SELECT body, delivered_text FROM owner_message_notes WHERE id = ?1",
+            [first["id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(body, "> Buy.\n\nWhy buy?");
+    assert!(delivered.contains("[Question from Rajesh about \"Decision memo\" rev "));
+    assert!(delivered.ends_with("Answer with sm send rajesh."));
+    let first_delivery_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_queue WHERE id = ?1",
+            [format!("owner-note-{}", first["id"].as_str().unwrap())],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(first_delivery_count, 0);
+
+    let (status, second) = request(
+        &f.app,
+        "POST",
+        &endpoint,
+        Some(json!({
+            "text": "What changes the answer?", "target": "reader"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["recipient"]["id"], reader_id);
+    let later_delivery_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_queue WHERE id = ?1",
+            [format!("owner-note-{}", second["id"].as_str().unwrap())],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(later_delivery_count, 1);
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM owner_doc_readers WHERE doc_id = ?1",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    OwnerMessageStore::new(f.dir.join("message_queue.db"))
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: reader_id.into(),
+            sender_session_name: "ask-widgets".into(),
+            title: "Why buy?".into(),
+            body_markdown: "The memo's reader answer".into(),
+            blocking: false,
+        })
+        .unwrap();
+    let thread_key = before["thread_key"].as_str().unwrap();
+    let encoded_key = thread_key
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('#', "%23");
+    let thread_url = format!("/inbox/thread/{encoded_key}?format=json");
+    let (status, thread) = request(&f.app, "GET", &thread_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The memo's reader answer")));
+    fs::write(
+        checkout.join("specs/memo.md"),
+        "# Decision memo\n\nRevised.\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "republish"]);
+    let revised_sha = git(&["rev-parse", "HEAD"]);
+    f.source.files.lock().unwrap().insert(
+        ("specs/memo.md".into(), revised_sha.clone()),
+        b"# Decision memo\n\nRevised.\n".to_vec(),
+    );
+    let (status, republished) = request(
+        &f.app,
+        "POST",
+        "/docs",
+        Some(json!({
+            "repo": REPO, "path": "specs/memo.md", "pr_number": 12,
+            "commit_sha": revised_sha, "session_id": "retired1", "checkout_root": checkout,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{republished}");
+    assert_eq!(republished["id"], doc_id);
+    let (status, target) =
+        request(&f.app, "GET", &format!("/docs/{doc_id}/ask-target"), None).await;
+    assert_eq!(status, StatusCode::OK, "{target}");
+    assert!(target["reader"].is_null());
+    let (status, revised) = request(
+        &f.app,
+        "POST",
+        &endpoint,
+        Some(json!({"text": "What changed?", "target": "reader"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revised}");
+    let revised_reader_id = revised["recipient"]["id"].as_str().unwrap();
+    assert_ne!(revised_reader_id, reader_id);
+    let revised_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&reader_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&revised_head.stdout).trim(),
+        revised_sha
+    );
+    let sessions: Value =
+        serde_json::from_str(&fs::read_to_string(&f.state_file).unwrap()).unwrap();
+    let old_reader = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == reader_id)
+        .unwrap();
+    assert_eq!(old_reader["status"], "stopped");
+    let docs = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    docs.set_reader(doc_id, "later-reader", "/later/worktree")
+        .unwrap();
+    let (status, thread) = request(&f.app, "GET", &thread_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The memo's reader answer")));
+    git(&["worktree", "remove", reader_path.to_str().unwrap()]);
+    fs::remove_dir_all(f.dir).unwrap();
+}
+
+#[tokio::test]
+async fn ask_a_live_author_uses_the_author_and_the_docs_work_thread() {
+    let f = fixture();
+    let published = publish(&f, "author01", "a", false, None).await;
+    let doc_id = published["id"].as_str().unwrap();
+    let (status, target) =
+        request(&f.app, "GET", &format!("/docs/{doc_id}/ask-target"), None).await;
+    assert_eq!(status, StatusCode::OK, "{target}");
+    assert_eq!(target["default"], "author");
+    assert_eq!(target["author"]["live"], true);
+    assert_eq!(target["author"]["restorable"], false);
+    let (status, answer) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{doc_id}/ask"),
+        Some(json!({"text": "What makes this a buy?", "target": "author"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["recipient"]["id"], "author01");
+    assert_eq!(answer["thread_key"], target["thread_key"]);
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let (recipient, thread_key): (String, String) = conn
+        .query_row(
+            "SELECT delivered_to_session_id, thread_key FROM owner_message_notes WHERE id = ?1",
+            [answer["id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recipient, "author01");
+    assert_eq!(thread_key, target["thread_key"].as_str().unwrap());
+    OwnerMessageStore::new(f.dir.join("message_queue.db"))
+        .create(NewOwnerMessage {
+            human: "rajesh".into(),
+            sender_session_id: "author01".into(),
+            sender_session_name: "author01-writer".into(),
+            title: "Answer about the memo".into(),
+            body_markdown: "The author answer is here".into(),
+            blocking: false,
+        })
+        .unwrap();
+    let encoded_key = target["thread_key"]
+        .as_str()
+        .unwrap()
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('#', "%23");
+    let (status, thread) = request(
+        &f.app,
+        "GET",
+        &format!("/inbox/thread/{encoded_key}?format=json"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert!(thread["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains("The author answer is here")));
+    assert!(OwnerDocStore::new(f.dir.join("message_queue.db"))
+        .reader(doc_id)
+        .unwrap()
+        .is_none());
+    fs::remove_dir_all(f.dir).unwrap();
 }
 
 /// `(kind, subject_id, title, body, reader_path)` of every notice.

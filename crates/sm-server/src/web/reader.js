@@ -22,7 +22,58 @@ export function Reader({ id, controls, onBack = closePanel }) {
   const [current, setCurrent] = useState(id);
   const [doc, setDoc] = useState(null);
   const [error, setError] = useState('');
-  useEffect(() => { setCurrent(id); setDoc(null); }, [id]);
+  const [asking, setAsking] = useState(false);
+  const [askTarget, setAskTarget] = useState(null);
+  const [target, setTarget] = useState('reader');
+  const [items, setItems] = useState([]);
+  const [question, setQuestion] = useState('');
+  const [quote, setQuote] = useState('');
+  const [sending, setSending] = useState(false);
+  const [askError, setAskError] = useState('');
+  const targetInitialized = useRef(false);
+  useEffect(() => { setCurrent(id); setDoc(null); setAsking(false); setAskTarget(null); setItems([]); setQuote(''); targetInitialized.current = false; }, [id]);
+  useEffect(() => { setAskTarget(null); setItems([]); targetInitialized.current = false; }, [doc?.docId]);
+  const selectedQuote = () => {
+    try { return frame.current?.contentWindow?.getSelection()?.toString().trim() || ''; }
+    catch (_) { return ''; }
+  };
+  const openAsk = () => { setQuote(selectedQuote()); setAsking(true); };
+  const refreshAsk = async (docId = doc?.docId) => {
+    if (!docId) return;
+    try {
+      const response = await fetch(`/docs/${encodeURIComponent(docId)}/ask-target`);
+      if (!response.ok) throw Error(`Ask target: ${response.status}`);
+      const info = await response.json();
+      setAskTarget(info);
+      if (!targetInitialized.current) { setTarget(info.default); targetInitialized.current = true; }
+      else setTarget(previous => previous === 'author' && !info.author?.live ? info.default : previous);
+      const thread = await fetch(`/inbox/thread/${encodeURIComponent(info.thread_key)}?format=json`);
+      if (!thread.ok) throw Error(`Work thread: ${thread.status}`);
+      const data = await thread.json();
+      setItems((data.items || []).filter(item => item.at >= info.first_published_at));
+      setAskError('');
+    } catch (e) { setAskError(e.message); }
+  };
+  useEffect(() => {
+    if (!asking || !doc?.docId) return;
+    refreshAsk(doc.docId);
+    const timer = setInterval(() => refreshAsk(doc.docId), 10000);
+    return () => clearInterval(timer);
+  }, [asking, doc?.docId]);
+  const sendAsk = async () => {
+    if (sending || !question.trim()) return;
+    setSending(true);
+    try {
+      const response = await fetch(`/docs/${encodeURIComponent(doc.docId)}/ask`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-sm-doc-token': doc.token },
+        body: JSON.stringify({ text: question, quote: quote || undefined, target }),
+      });
+      if (!response.ok) throw Error((await response.text()).slice(0, 240));
+      setQuestion(''); setQuote('');
+      await refreshAsk(doc.docId);
+    } catch (e) { setAskError(e.message); }
+    finally { setSending(false); }
+  };
   const loaded = () => {
     try {
       const win = frame.current.contentWindow;
@@ -59,6 +110,9 @@ export function Reader({ id, controls, onBack = closePanel }) {
     if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
       e.preventDefault(); fullScreen(frame.current?.contentWindow.location.href || current);
     }
+    if (e.key === 'a' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e) && doc?.docId) {
+      e.preventDefault(); openAsk();
+    }
   };
   const printDoc = (all) => {
     const win = frame.current?.contentWindow;
@@ -79,8 +133,8 @@ export function Reader({ id, controls, onBack = closePanel }) {
   useEffect(() => {
     document.addEventListener('keydown', shortcut);
     return () => document.removeEventListener('keydown', shortcut);
-  }, [current]);
-  return html`<section class="doc-reader">
+  }, [current, doc?.docId]);
+  return html`<section class=${`doc-reader${asking ? ' ask-open' : ''}`}>
     <div class="reader-bar">
       <button class="icon-btn" title="Back" onClick=${onBack}>←</button>
       <span class="reader-title">${shellName()} / ${doc?.title || 'Document'}</span>
@@ -94,11 +148,28 @@ export function Reader({ id, controls, onBack = closePanel }) {
       }}>#${doc.prNumber} · ${doc.prState || 'unknown'}</button>` : null}
       ${doc?.docId ? html`<button class="btn sm" onClick=${() => frame.current.contentWindow.__smDoc.openReview()}>Review</button>` : null}
       ${doc ? html`<span class="reader-print"><button class="btn sm" onClick=${() => printDoc(false)}>⎙ ${doc.hasAppendix ? 'Print memo' : 'Print'}</button>${doc.hasAppendix ? html`<button class="btn sm" onClick=${() => printDoc(true)}>Print all</button>` : null}</span>` : null}
+      ${doc?.docId ? html`<button class="btn sm" aria-pressed=${asking} onClick=${() => asking ? setAsking(false) : openAsk()}>Ask</button>` : null}
       <button class="icon-btn" title="Full screen (f)" onClick=${() => fullScreen(current)}>⤢</button>
       <a href=${current} target="_blank" rel="noopener" title="Open in new tab">↗</a>${controls}
     </div>
     ${error ? html`<p role="alert">${error}</p>` : null}
-    <iframe ref=${frame} src=${readerPath(current) || 'about:blank'} title=${doc?.title || 'Document reader'} onLoad=${loaded}></iframe>
+    <div class="doc-reader-body">
+      <iframe ref=${frame} src=${readerPath(current) || 'about:blank'} title=${doc?.title || 'Document reader'} onLoad=${loaded}></iframe>
+      ${asking ? html`<aside class="doc-ask" aria-label="Ask about this doc">
+        <div class="doc-ask-head"><strong>Ask about this doc</strong><button class="icon-btn" title="Close Ask" onClick=${() => setAsking(false)}>×</button></div>
+        <div class="doc-ask-items">${items.map(item => html`<div class="doc-ask-item" dangerouslySetInnerHTML=${{ __html: item.html || '' }} />`)}</div>
+        <div class="doc-ask-compose">
+          ${quote ? html`<blockquote>${quote}<button title="Remove quote" onClick=${() => setQuote('')}>×</button></blockquote>` : null}
+          <select aria-label="Ask target" value=${target} onChange=${e => setTarget(e.target.value)}>
+            ${askTarget?.author?.live ? html`<option value="author">${askTarget.author.name}</option>` : null}
+            <option value="reader">${askTarget?.reader?.name || 'Reader agent'}</option>
+            ${askTarget?.author?.restorable && !askTarget.author.live ? html`<option value="restore_author">Bring back ${askTarget.author.name} · reloads about ${Math.round((askTarget.author.context_tokens || 0) / 1000)}k tokens</option>` : null}
+          </select>
+          <textarea rows="3" placeholder="Ask about this doc…" value=${question} onInput=${e => setQuestion(e.target.value)} onKeyDown=${e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendAsk(); } }} />
+          <div class="doc-ask-actions">${askError ? html`<span role="alert">${askError}</span>` : null}<button class="btn" disabled=${sending || !question.trim()} onClick=${sendAsk}>Send</button></div>
+        </div>
+      </aside>` : null}
+    </div>
   </section>`;
 }
 registerPanel('doc', Reader);

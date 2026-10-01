@@ -255,6 +255,16 @@ impl OwnerInboxStore {
     /// transaction. A second call with the same id returns the stored note
     /// and `false`, queueing nothing.
     pub fn record_note(&self, note: &OwnerNote) -> Result<(OwnerNote, bool)> {
+        self.record_note_inner(note, true)
+    }
+
+    /// The first Ask question is already part of a newly spawned reader's
+    /// initial prompt, so record it in the thread without a second delivery.
+    pub fn record_note_in_initial_prompt(&self, note: &OwnerNote) -> Result<(OwnerNote, bool)> {
+        self.record_note_inner(note, false)
+    }
+
+    fn record_note_inner(&self, note: &OwnerNote, enqueue: bool) -> Result<(OwnerNote, bool)> {
         let mut conn = self.open_write()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = get_note_conn(&tx, &note.id)? {
@@ -275,12 +285,14 @@ impl OwnerInboxStore {
                 note.thread_key,
             ],
         )?;
-        crate::queue::enqueue_message_once_in_conn(
-            &tx,
-            &format!("owner-note-{}", note.id),
-            &note.delivered_to_session_id,
-            &note.delivered_text,
-        )?;
+        if enqueue {
+            crate::queue::enqueue_message_once_in_conn(
+                &tx,
+                &format!("owner-note-{}", note.id),
+                &note.delivered_to_session_id,
+                &note.delivered_text,
+            )?;
+        }
         let stored = get_note_conn(&tx, &note.id)?.context("note row vanished")?;
         tx.commit()?;
         Ok((stored, true))
