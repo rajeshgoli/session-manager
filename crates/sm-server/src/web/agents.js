@@ -194,7 +194,17 @@ export function RetireButton({ agent, onRetired, small = false }) {
       await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, {
         method: 'POST', body: ifFinishedIdle ? { if_finished_idle: true } : {},
       });
-      toast(`Retired ${agent.name}`);
+      // Undo restores it, worktree and claims included (sm#1839), for 10 s.
+      let undone = false;
+      toast(`Retired ${agent.name}`, null, { ms: 10000, action: { label: 'Undo', run: async () => {
+        if (undone) return;
+        undone = true;
+        try {
+          await api(`/sessions/${encodeURIComponent(agent.id)}/restore`, { method: 'POST', body: {} });
+          toast(`Restored ${agent.name}`);
+          onRetired?.(true);
+        } catch (error) { toast(error.message); }
+      } } });
       setAsking(false);
       onRetired?.(true);
     } catch (error) {

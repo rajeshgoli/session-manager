@@ -219,6 +219,42 @@ pub(super) fn live_recipient(state: &AppState, session_id: &str) -> Option<Sessi
         .filter(|parent| !session_ended(parent))
 }
 
+/// An agent the auto-retire sweep ended, with nobody it handed off to: a
+/// message to it restores it (sm#1839, spec 1821 E3).
+pub(super) fn restores(session: &SessionRecord) -> bool {
+    session_ended(session) && session.auto_retired() && session.successor_session_id.is_none()
+}
+
+/// Who a reply to `session_id` goes to: an auto-retired session itself,
+/// which the send restores, else `live_recipient`'s chain.
+pub(super) fn reply_recipient(state: &AppState, session_id: &str) -> Option<SessionRecord> {
+    match state.session_store.get_session(session_id).ok().flatten() {
+        Some(session) if restores(&session) => Some(session),
+        _ => live_recipient(state, session_id),
+    }
+}
+
+/// `reply_recipient`, restored when it is auto-retired, right before a
+/// message is queued for it. A failed restore falls back to the chain.
+/// Blocking: git and the provider relaunch run here.
+pub(super) fn ready_recipient(state: &AppState, session_id: &str) -> Option<SessionRecord> {
+    let recipient = reply_recipient(state, session_id)?;
+    super::auto_retire::ready_for_message(state, recipient)
+        .or_else(|| live_recipient(state, session_id))
+}
+
+/// Async `ready_recipient`.
+pub(super) async fn ready_recipient_async(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<Option<SessionRecord>, ApiError> {
+    let work = state.clone();
+    let id = session_id.to_owned();
+    tokio::task::spawn_blocking(move || ready_recipient(&work, &id))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
+}
+
 /// Whether the sender has ended, for the needs-you state. A sender that is
 /// gone from the registry has ended too.
 fn sender_ended(state: &AppState, message: &OwnerMessage) -> bool {
@@ -433,12 +469,13 @@ pub(super) async fn get_owner_message(
     ensure_owner_page_read_allowed(&state, &request)?;
     let message = find_message(&state, &message_id)?;
     let store = owner_message_store(&state);
-    let recipient = live_recipient(&state, &message.sender_session_id);
+    let recipient = reply_recipient(&state, &message.sender_session_id);
     if query.format.as_deref() == Some("json") {
         let state_value = message_state(&state, &store, &message)?;
         let mut value = serde_json::to_value(&message)?;
         value["state"] = json!(state_value);
         value["reply_to_session_id"] = json!(recipient.as_ref().map(|session| &session.id));
+        value["reply_restores"] = json!(recipient.as_ref().is_some_and(restores));
         value["replies"] = json!(store
             .replies(&message.id)?
             .iter()
@@ -623,7 +660,7 @@ pub(super) async fn reply_to_owner_message(
         }
         return Ok(Json(reply_response(&state, &existing)));
     }
-    let Some(recipient) = live_recipient(&state, &message.sender_session_id) else {
+    let Some(recipient) = ready_recipient_async(&state, &message.sender_session_id).await? else {
         return Err(conflict(NO_RECIPIENT));
     };
     let drafts = store.drafts(&message.id)?;

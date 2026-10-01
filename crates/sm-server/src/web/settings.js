@@ -138,7 +138,7 @@ export function SettingsPage() {
           ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
           : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
-          : html`<${NewAgents} data=${data.new_agent} write=${write} />`}</${Resource}>`}
+          : html`<${NewAgents} data=${data.new_agent} retire=${data.auto_retire} write=${write} />`}</${Resource}>`}
     </div>
   </div>`;
 }
@@ -164,7 +164,15 @@ function Appearance() {
     <p class="sub">Saved in this browser only.</p><p role="status" class="saved">${status}</p>`;
 }
 
-function NewAgents({ data, write }) {
+// Auto-retire delay range in minutes; matches the server's check.
+const RETIRE_MINUTES = [15, 1440];
+export function retireMinutes(value) {
+  const n = Number(value);
+  if (!String(value).trim() || !Number.isInteger(n) || n < RETIRE_MINUTES[0] || n > RETIRE_MINUTES[1]) throw new Error(`Enter a whole number from ${RETIRE_MINUTES[0]} to ${RETIRE_MINUTES[1]}.`);
+  return n;
+}
+
+function NewAgents({ data, retire, write }) {
   const [draft, setDraft] = useState({});
   const [board] = useResource('/client/board');
   const [claude] = useResource('/client/session-models?provider=claude');
@@ -196,6 +204,12 @@ function NewAgents({ data, write }) {
     <${Field} label="Pause auto-start" type="checkbox" initial=${data.auto_start_paused}
       hint="Holds every Start when ready without losing it; ready tickets start when you turn it off."
       save=${value => save({ auto_start_paused: value })} />
+    ${retire ? html`<${Field} label="Retire finished agents automatically" type="checkbox" initial=${retire.enabled}
+      hint="Agents sm started retire once finished and idle with nothing waiting on them. A reply, a doc review or an sm send brings one back."
+      save=${value => write('/client/settings', { auto_retire: { enabled: value } })} />
+    <${Field} label="After (minutes idle)" type="number" min=${String(RETIRE_MINUTES[0])} max=${String(RETIRE_MINUTES[1])} initial=${retire.idle_minutes}
+      hint="An hour is past the provider's prompt cache, so retiring then costs no extra tokens."
+      save=${value => write('/client/settings', { auto_retire: { idle_minutes: retireMinutes(value) } })} />` : null}
     <h2>First message when starting a ticket</h2>
     <${Field} label="Template" type="textarea" initial=${data.message_template} onDraft=${value => patch('message_template', value)}
       hint="Placeholders: {ticket} {number} {repo} {repo_name} {repo_short} {title} {url}"

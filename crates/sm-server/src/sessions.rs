@@ -311,6 +311,20 @@ impl SessionStore {
         self.write_raw_json_value(&state)
     }
 
+    /// Sessions bound to an accepted spawn brief: started by sm before
+    /// `started_by_sm` was recorded (sm#1839).
+    pub fn spawn_intent_session_ids(&self) -> Result<BTreeSet<String>> {
+        let parsed_state = self.load_parsed_state()?;
+        Ok(parsed_state
+            .raw
+            .get("spawn_launch_intents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|intent| json_text(intent.get("session_id")))
+            .collect())
+    }
+
     pub fn read_spawn_brief(&self, artifact: &SpawnBriefArtifact) -> Result<String> {
         let bytes = fs::read(&artifact.path)
             .with_context(|| format!("failed to read accepted spawn brief {}", artifact.path))?;
@@ -8600,6 +8614,12 @@ impl SessionStore {
             handoff: None,
             successor_session_id: None,
             predecessor_session_id: None,
+            started_by_sm: request.started_by_sm
+                || request.spawn_brief.is_some()
+                || request
+                    .initial_message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty()),
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
             handoff_view: None,
@@ -9531,6 +9551,10 @@ pub struct CreateCoreSessionRequest {
     pub spawn_prompt_source: Option<SpawnBriefSource>,
     #[serde(skip)]
     pub spawn_brief: Option<SpawnBriefBinding>,
+    /// The owner started it from the web or phone, or sm started it for
+    /// work; a brief alone also counts. Never taken from a request body.
+    #[serde(skip)]
+    pub started_by_sm: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9866,11 +9890,27 @@ pub enum CoreRetireOutcome {
 
 #[derive(Debug, Clone)]
 pub enum RetireAuthority {
-    Operator { source: String },
-    AuthenticatedParent { session_id: String },
-    ServerLifecycle { source: String },
-    Handoff { successor_session_id: String },
+    Operator {
+        source: String,
+    },
+    AuthenticatedParent {
+        session_id: String,
+    },
+    ServerLifecycle {
+        source: String,
+    },
+    Handoff {
+        successor_session_id: String,
+    },
+    /// The auto-retire sweep (sm#1839): finished and idle this long.
+    AutoRetire {
+        idle_minutes: u64,
+    },
 }
+
+/// `terminal_provenance.source` of a session the auto-retire sweep ended.
+/// A message addressed to such a session restores it (sm#1839).
+pub const AUTO_RETIRE_SOURCE: &str = "auto_retire";
 
 impl RetireAuthority {
     pub fn operator(source: impl Into<String>) -> Self {
@@ -9900,6 +9940,10 @@ impl RetireAuthority {
         }
     }
 
+    pub fn auto_retire(idle_minutes: u64) -> Self {
+        Self::AutoRetire { idle_minutes }
+    }
+
     fn is_authorized(&self, sessions: &[SessionRecord], credential: Option<&str>) -> bool {
         match self {
             Self::AuthenticatedParent { session_id } => {
@@ -9911,7 +9955,10 @@ impl RetireAuthority {
                         session_credential_matches(sessions, session_id, credential)
                     })
             }
-            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => true,
+            Self::Operator { .. }
+            | Self::ServerLifecycle { .. }
+            | Self::Handoff { .. }
+            | Self::AutoRetire { .. } => true,
         }
     }
 
@@ -9920,7 +9967,10 @@ impl RetireAuthority {
             Self::AuthenticatedParent { session_id } => {
                 json_text(target.get("parent_session_id")).as_deref() == Some(session_id)
             }
-            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => true,
+            Self::Operator { .. }
+            | Self::ServerLifecycle { .. }
+            | Self::Handoff { .. }
+            | Self::AutoRetire { .. } => true,
         }
     }
 
@@ -9932,9 +9982,10 @@ impl RetireAuthority {
                 CoreRetireOutcome::RootProtected
             }
             Self::AuthenticatedParent { .. } => CoreRetireOutcome::NotChild,
-            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => {
-                CoreRetireOutcome::Forbidden
-            }
+            Self::Operator { .. }
+            | Self::ServerLifecycle { .. }
+            | Self::Handoff { .. }
+            | Self::AutoRetire { .. } => CoreRetireOutcome::Forbidden,
         }
     }
 
@@ -9974,6 +10025,18 @@ impl RetireAuthority {
                 crate::handoff::execute::RETIRE_SOURCE,
                 tmux_disposition,
             ),
+            Self::AutoRetire { idle_minutes } => TerminalProvenance {
+                detail: Some(format!(
+                    "auto-retire after {idle_minutes} minutes finished and idle"
+                )),
+                ..TerminalProvenance::explicit_retire(
+                    requested_at,
+                    None,
+                    "server_lifecycle",
+                    AUTO_RETIRE_SOURCE,
+                    tmux_disposition,
+                )
+            },
         }
     }
 }
@@ -16097,6 +16160,11 @@ pub struct SessionRecord {
     pub successor_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor_session_id: Option<String>,
+    /// sm started it with work to do (spawn, New agent, Board Start, Clone,
+    /// handoff, a reviewer), as opposed to `sm claude` in a terminal. Only
+    /// these auto-retire (sm#1839).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub started_by_sm: bool,
     #[serde(skip)]
     pub aliases: Vec<String>,
     #[serde(skip)]
@@ -16125,6 +16193,9 @@ pub struct TerminalProvenance {
     pub source: String,
     #[serde(default)]
     pub tmux_disposition: Option<String>,
+    /// Why, in words, when the source alone does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl TerminalProvenance {
@@ -16142,6 +16213,7 @@ impl TerminalProvenance {
             authority: authority.to_owned(),
             source: source.to_owned(),
             tmux_disposition: tmux_disposition.map(ToOwned::to_owned),
+            detail: None,
         }
     }
 
@@ -16153,6 +16225,7 @@ impl TerminalProvenance {
             authority: "provider_observed".to_owned(),
             source: source.to_owned(),
             tmux_disposition: None,
+            detail: None,
         }
     }
 
@@ -16164,6 +16237,7 @@ impl TerminalProvenance {
             authority: "runtime_observed".to_owned(),
             source: source.to_owned(),
             tmux_disposition: Some("absent".to_owned()),
+            detail: None,
         }
     }
 }
@@ -16205,6 +16279,15 @@ impl SessionRecord {
     /// the end of the seat's work, not a pause before `sm restore`.
     pub(crate) fn is_retired(&self) -> bool {
         completion_status_is_retired(self.completion_status.as_deref())
+    }
+
+    /// Retired by the auto-retire sweep and not restored since (sm#1839).
+    pub fn auto_retired(&self) -> bool {
+        self.is_retired()
+            && self
+                .terminal_provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.source == AUTO_RETIRE_SOURCE)
     }
 
     fn is_live_for_registry(&self) -> bool {
@@ -17032,6 +17115,7 @@ mod tests {
             wait: None,
             spawn_prompt_source: None,
             spawn_brief: None,
+            started_by_sm: false,
         }
     }
 
@@ -18411,6 +18495,7 @@ sleep 30
             wait: None,
             spawn_prompt_source: None,
             spawn_brief: None,
+            started_by_sm: false,
         };
 
         let error = store
@@ -19549,6 +19634,7 @@ sleep 30
             handoff: None,
             successor_session_id: None,
             predecessor_session_id: None,
+            started_by_sm: false,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
             handoff_view: None,

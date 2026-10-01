@@ -43,6 +43,9 @@ struct AgentRow {
     /// `retired` (ended by `sm retire` or `sm kill`) or `stopped` (a crash,
     /// a provider exit).
     state: &'static str,
+    /// The auto-retire sweep retired it (sm#1839); History says
+    /// "retired automatically".
+    retired_automatically: bool,
     /// When it stopped: `stopped_at`, else `completed_at`, else
     /// `last_activity`, the order `sm watch --restore` sorts by.
     ended_at: String,
@@ -152,6 +155,7 @@ fn row(
         } else {
             "stopped"
         },
+        retired_automatically: record.auto_retired(),
         ended_at: ended_at(&record).to_owned(),
         last_status: record
             .agent_status_text

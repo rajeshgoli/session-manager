@@ -114,7 +114,16 @@ pub(super) fn recipients(state: &AppState, repo: &str, pr: i64) -> anyhow::Resul
         {
             let doc = summary.doc;
             if doc.repo.eq_ignore_ascii_case(repo) && doc.pr_number == Some(pr) {
-                if let Some(id) = docs::review_wake_recipient(state, &doc) {
+                // An auto-retired author is not woken for a hold; its chain is.
+                let id = docs::review_wake_recipient(state, &doc).and_then(|id| {
+                    match state.session_store.get_session(&id).ok().flatten() {
+                        Some(session) if messages::restores(&session) => {
+                            messages::live_recipient(state, &id).map(|session| session.id)
+                        }
+                        _ => Some(id),
+                    }
+                });
+                if let Some(id) = id {
                     targets.insert(id);
                 }
             }

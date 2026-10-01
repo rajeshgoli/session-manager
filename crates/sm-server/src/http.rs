@@ -345,6 +345,7 @@ pub enum GitHubPullRequestState {
 
 mod agent_history;
 mod analytics;
+mod auto_retire;
 mod board;
 mod board_clock;
 mod board_links;
@@ -367,6 +368,7 @@ mod settings;
 mod watch;
 mod web;
 mod worktrees;
+pub use auto_retire::sweep_auto_retire;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
 };
@@ -1658,6 +1660,7 @@ pub fn router(state: AppState) -> Router {
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
         spawn_scheduled_reminder_dispatcher(state.clone());
+        auto_retire::spawn_auto_retire_sweeper(state.clone());
     }
     handoff::spawn_handoff_sweeper(state.clone());
     let mut app = Router::new()
@@ -4271,6 +4274,7 @@ async fn create_client_session(
         wait: None,
         spawn_prompt_source: payload.spawn_prompt_source,
         spawn_brief: None,
+        started_by_sm: true,
     };
     let session = create_session_from_request(state, request).await?;
     Ok(Json(
@@ -4549,6 +4553,7 @@ async fn spawn_child_session(
             intent_id: accepted.1,
             sha256: accepted.2,
         }),
+        started_by_sm: true,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     if state.config.rust_core.runtime_enabled {
@@ -9805,6 +9810,9 @@ async fn send_session_input(
             detail: "text is required".to_owned(),
         });
     }
+    let session_id = auto_retire::restore_send_target(&state, &session_id)
+        .await?
+        .unwrap_or(session_id);
     let Some(named) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -10510,10 +10518,13 @@ async fn send_session_input_batch(
         .then(|| TmuxRuntime::from_app_config(&state.config));
     let mut results = Vec::with_capacity(recipients.len());
     for identifier in recipients {
+        let target = auto_retire::restore_send_target(&state, &identifier)
+            .await?
+            .unwrap_or_else(|| identifier.clone());
         results.push(send_session_input_batch_one(
             &state,
             runtime.as_ref(),
-            &identifier,
+            &target,
             payload.input.clone(),
         )?);
     }
@@ -10932,39 +10943,15 @@ async fn restore_session(
         )?;
     }
     ensure_core_writes_enabled(&state)?;
-    let outcome = if state.config.rust_core.runtime_enabled {
-        ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .restore_core_session_with_runtime(&session_id, &runtime)?
-    } else {
-        state.session_store.restore_core_session(&session_id)?
-    };
-    let Some(outcome) = outcome else {
-        return Err(ApiError::NotFound("Session not found"));
-    };
-    match outcome {
-        CoreRestoreOutcome::Restored(session) => {
-            Ok(Json(session_response_with_live_activity(&state, *session)))
-        }
-        CoreRestoreOutcome::NotStopped => Err(ApiError::Status {
-            status: StatusCode::CONFLICT,
-            detail: "Session is not stopped".to_owned(),
-        }),
-        CoreRestoreOutcome::UnsupportedNode(node) => Err(ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: format!("Rust runtime does not support remote node {node}"),
-        }),
-        CoreRestoreOutcome::UnsupportedProvider(provider) => Err(ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: format!("Rust runtime does not support provider {provider}"),
-        }),
-        CoreRestoreOutcome::MissingProviderResumeId(provider) => Err(ApiError::Status {
-            status: StatusCode::CONFLICT,
-            detail: format!("Cannot restore {provider} session without provider_resume_id"),
-        }),
-    }
+    // Rebuilds a deleted worktree and reopens claims (sm#1839), so the
+    // retire toast's Undo and History's Restore bring the agent back whole.
+    let work = state.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        auto_retire::restore_session_with_work(&work, &session_id)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
 async fn clear_session(

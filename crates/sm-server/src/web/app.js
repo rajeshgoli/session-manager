@@ -128,7 +128,7 @@ function App() {
       bus.on('toast', (item) => {
         const id = Math.random();
         setToasts((prev) => [...prev, { ...item, id }]);
-        setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
+        setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), item.ms || 6000);
       }),
       bus.on('new-agent', (prefill) => setCreating(prefill)),
       bus.on('network', setOffline),
@@ -574,7 +574,10 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
 
 function Toasts({ items }) {
   return html`<div class="toasts" aria-live="polite">
-    ${items.map((item) => html`<button type="button" class="toast" key=${item.id}
+    ${items.map((item) => item.action
+    ? html`<div class="toast" key=${item.id}>${item.text}
+        <button type="button" class="toast-action" onClick=${() => item.action.run()}>${item.action.label}</button></div>`
+    : html`<button type="button" class="toast" key=${item.id}
       onClick=${() => item.onClick && item.onClick()}>${item.text}</button>`)}
   </div>`;
 }

@@ -754,3 +754,194 @@ fn a_keep_set_while_the_pass_runs_is_honoured() {
     );
     assert!(Path::new(&path).exists());
 }
+
+impl Repo {
+    /// A bare `origin` holding `main`, fetched into the main checkout.
+    fn origin(&self) -> PathBuf {
+        let origin = self.dir.join("origin.git");
+        run_git(
+            &self.dir,
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
+        run_git(
+            &self.main,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&self.main, &["push", "-q", "origin", "main"]);
+        run_git(&self.main, &["fetch", "-q", "origin"]);
+        origin
+    }
+
+    fn rebuild(&self, session: &str, path: &str) -> Result<WorktreeRebuild, String> {
+        rebuild_worktree(&self.store, session, path, &[])
+    }
+}
+
+#[test]
+fn restore_rebuilds_a_worktree_deleted_by_hand_at_the_same_path_on_its_branch() {
+    let repo = Repo::new();
+    let (path, _) = repo.worktree("wt", "7-fix");
+    repo.claim(
+        "c1",
+        "restorer1",
+        "ticket",
+        7,
+        Some(&path),
+        Some("7-fix"),
+        None,
+    );
+    fs::remove_dir_all(&path).unwrap();
+    // No removal recorded the repository: the main checkout is found by
+    // its origin, which here is not on GitHub, so only the event path works.
+    assert_eq!(
+        repo.rebuild("restorer1", &path),
+        Err(format!(
+            "worktree {path} is gone and no checkout of {REPO} is known"
+        ))
+    );
+    repo.pass(&[session("restorer1", &path, true)]);
+    assert!(repo
+        .worktree_events()
+        .iter()
+        .all(|(kind, _)| kind != "worktree.removed"));
+    // A removal by the cleanup pass records the repository instead.
+    let (path2, head2) = repo.worktree("wt2", "8-fix");
+    repo.merged_pr(8, "8-fix", &head2);
+    repo.claim(
+        "c2",
+        "restorer2",
+        "pr",
+        8,
+        Some(&path2),
+        Some("8-fix"),
+        None,
+    );
+    repo.pass(&[session("restorer2", "/elsewhere", true)]);
+    run_git(&repo.main, &["branch", "8-fix", &head2]);
+    assert_eq!(
+        repo.rebuild("restorer2", &path2),
+        Ok(WorktreeRebuild::Rebuilt {
+            branch: "8-fix".to_owned()
+        })
+    );
+    assert_eq!(run_git(Path::new(&path2), &["rev-parse", "HEAD"]), head2);
+    assert_eq!(
+        run_git(Path::new(&path2), &["branch", "--show-current"]),
+        "8-fix"
+    );
+    assert_eq!(
+        repo.rebuild("restorer2", &path2),
+        Ok(WorktreeRebuild::Present)
+    );
+}
+
+#[test]
+fn restore_fetches_a_branch_cleanup_deleted_or_detaches_when_origin_lost_it_too() {
+    let repo = Repo::new();
+    repo.origin();
+    let (path, head) = repo.worktree("wt", "9-fix");
+    run_git(&repo.main, &["push", "-q", "origin", "9-fix"]);
+    repo.merged_pr(9, "9-fix", &head);
+    repo.claim("c1", "restorer3", "pr", 9, Some(&path), Some("9-fix"), None);
+    repo.pass(&[session("restorer3", "/elsewhere", true)]);
+    assert!(!Path::new(&path).exists());
+    assert!(!repo.branch_exists("9-fix"));
+    let events = repo.worktree_events();
+    assert_eq!(
+        events[0].1["git_common_dir"],
+        path_key(&repo.main.join(".git").display().to_string())
+    );
+
+    assert_eq!(
+        repo.rebuild("restorer3", &path),
+        Ok(WorktreeRebuild::Rebuilt {
+            branch: "9-fix".to_owned()
+        })
+    );
+    assert_eq!(
+        run_git(Path::new(&path), &["branch", "--show-current"]),
+        "9-fix"
+    );
+    assert_eq!(run_git(Path::new(&path), &["rev-parse", "HEAD"]), head);
+
+    // Merged and deleted on origin too: detached at origin's main, and the
+    // timeline says so.
+    run_git(&repo.main, &["push", "-q", "origin", "--delete", "9-fix"]);
+    run_git(&repo.main, &["worktree", "remove", &path]);
+    run_git(&repo.main, &["branch", "-D", "9-fix"]);
+    assert_eq!(
+        repo.rebuild("restorer3", &path),
+        Ok(WorktreeRebuild::Detached {
+            branch: "9-fix".to_owned(),
+            base: "origin/main".to_owned()
+        })
+    );
+    assert_eq!(run_git(Path::new(&path), &["branch", "--show-current"]), "");
+    let rebuilt: Vec<_> = repo
+        .worktree_events()
+        .into_iter()
+        .filter(|(kind, _)| kind == "worktree.rebuilt")
+        .collect();
+    assert_eq!(rebuilt.len(), 2);
+    assert_eq!(rebuilt[1].1["detached_at"], "origin/main");
+}
+
+#[test]
+fn restore_refuses_a_missing_working_dir_no_claim_recorded() {
+    let repo = Repo::new();
+    let path = repo.dir.join("never").display().to_string();
+    assert_eq!(
+        repo.rebuild("restorer3", &path),
+        Err(format!(
+            "worktree {path} is gone and has no branch to rebuild from"
+        ))
+    );
+}
+
+#[test]
+fn restore_uses_the_branch_the_agent_renamed_to_and_refuses_when_origin_is_unreachable() {
+    let repo = Repo::new();
+    let origin = repo.origin();
+    let (path, _) = repo.worktree("wt", "11-fix");
+    repo.claim(
+        "c1",
+        "restorer4",
+        "pr",
+        11,
+        Some(&path),
+        Some("11-fix"),
+        None,
+    );
+    // The agent renamed setup's branch and pushed it under the new name.
+    run_git(Path::new(&path), &["branch", "-m", "11-fix-v2"]);
+    run_git(Path::new(&path), &["push", "-q", "origin", "11-fix-v2"]);
+    let head = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    repo.merged_pr(11, "11-fix-v2", &head);
+    repo.pass(&[session("restorer4", "/elsewhere", true)]);
+    assert!(!repo.branch_exists("11-fix-v2"));
+
+    // Origin unreachable: not proof the branch is gone, so no detached
+    // rebuild and no worktree.
+    let moved = repo.dir.join("origin-moved.git");
+    fs::rename(&origin, &moved).unwrap();
+    let refused = repo.rebuild("restorer4", &path).unwrap_err();
+    assert!(
+        refused.starts_with(&format!(
+            "rebuilding worktree {path} failed: cannot read origin"
+        )),
+        "{refused}"
+    );
+    assert!(!Path::new(&path).exists());
+
+    fs::rename(&moved, &origin).unwrap();
+    assert_eq!(
+        repo.rebuild("restorer4", &path),
+        Ok(WorktreeRebuild::Rebuilt {
+            branch: "11-fix-v2".to_owned()
+        })
+    );
+    assert_eq!(
+        run_git(Path::new(&path), &["branch", "--show-current"]),
+        "11-fix-v2"
+    );
+}

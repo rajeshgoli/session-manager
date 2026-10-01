@@ -409,6 +409,7 @@ async fn create_successor(
         wait: None,
         spawn_prompt_source: None,
         spawn_brief: None,
+        started_by_sm: true,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let created = if state.config.rust_core.runtime_enabled {

@@ -8,7 +8,7 @@
 
 use super::docs::{doc_reader_path, owner_doc_store, DOC_TOKEN_HEADER};
 use super::messages::{
-    deliver_now, live_recipient, owner_message_store, relative_time, reply_response, session_ended,
+    deliver_now, owner_message_store, relative_time, reply_response, session_ended,
     valid_submission_id, NO_RECIPIENT,
 };
 use super::*;
@@ -996,7 +996,7 @@ async fn send_to_agent(
     if own.is_empty() && !world.sessions.contains_key(session_id) {
         return Err(ApiError::NotFound("Thread not found"));
     }
-    let Some(recipient) = live_recipient(state, session_id) else {
+    let Some(recipient) = super::messages::ready_recipient_async(state, session_id).await? else {
         return Err(conflict(NO_RECIPIENT));
     };
     let mut quotes = Vec::new();

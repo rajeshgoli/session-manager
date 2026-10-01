@@ -25,7 +25,7 @@ function AgentRow({ row, busy, restore }) {
       <button class="text-button history-name" onClick=${() => openPanel(`agent:${row.id}`)}>${row.name}</button>
       <span class=${`prov ${row.provider.startsWith('codex') ? 'codex' : 'claude'}`}>${providerLabel(row.provider).toUpperCase()}</span>
       ${ticket ? html`<span class="mono">#${ticket.number}</span>` : null}
-      <span>· ${row.state === 'retired' ? 'retired' : 'stopped'} ${age(row.ended_at)} ago</span>
+      <span>· ${row.retired_automatically ? 'retired automatically' : row.state === 'retired' ? 'retired' : 'stopped'} ${age(row.ended_at)} ago</span>
       <span class="mono">${basename(row.working_dir)}</span>
       <button class="btn pri sm history-restore" disabled=${!row.restorable || !!busy} title=${row.unrestorable_reason || 'Restore agent'}
         onClick=${() => restore(row)}>${busy === row.id ? 'Restoring…' : 'Restore'}</button>

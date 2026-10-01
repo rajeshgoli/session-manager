@@ -144,9 +144,28 @@ pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -
             }
         }
     }
-    super::super::messages::live_recipient(state, &doc.author_session_id)
+    super::super::messages::reply_recipient(state, &doc.author_session_id)
         .map(|session| session.id)
         .or_else(|| assigned_review_recipient(state, doc))
+}
+
+/// Who a finished review wakes: `review_wake_recipient`, restored first when
+/// it is an auto-retired agent (sm#1839, spec 1821 E3). A failed restore
+/// falls back to its parent chain, then the assigned agent. Blocking.
+pub(in crate::http) fn review_wake_target(state: &AppState, doc: &OwnerDoc) -> Option<String> {
+    let session_id = review_wake_recipient(state, doc)?;
+    match state.session_store.get_session(&session_id).ok().flatten() {
+        Some(session) if super::super::messages::restores(&session) => {
+            super::super::auto_retire::ready_for_message(state, session)
+                .map(|session| session.id)
+                .or_else(|| {
+                    super::super::messages::live_recipient(state, &session_id)
+                        .map(|session| session.id)
+                        .or_else(|| assigned_review_recipient(state, doc))
+                })
+        }
+        _ => Some(session_id),
+    }
 }
 
 pub(super) fn assigned_review_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
@@ -691,7 +710,8 @@ fn finish(
         })
         .map(|h| h.placed_message());
     let target = owner_doc_store(state).review_target(&review.id)?;
-    let wake = review_wake_recipient(state, doc).map(|session_id| {
+    let wake_session = review_wake_target(state, doc);
+    let wake = wake_session.map(|session_id| {
         (session_id, {
             let mut text = render_owner_review_wake(
                 &state.config.owner_name,
@@ -847,6 +867,7 @@ pub(super) async fn assign_review(
             path: None,
         }),
         spawn_brief: None,
+        started_by_sm: true,
     };
     let session = super::super::create_session_from_request(state.clone(), payload).await?;
     store.assign_review(&review.id, &session.id)?;

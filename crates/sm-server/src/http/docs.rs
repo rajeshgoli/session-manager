@@ -14,6 +14,8 @@ mod reopen;
 mod review;
 pub(super) use review::recover_owner_doc_reviews;
 pub(super) use review::review_wake_recipient;
+#[cfg(test)]
+pub(super) use review::review_wake_target;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocFetchError {

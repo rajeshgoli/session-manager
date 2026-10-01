@@ -1090,6 +1090,69 @@ impl WorkClaimStore {
         Ok(claims.len())
     }
 
+    /// Restore (sm#1839, spec 1821 E3): reopens the claims the session's
+    /// retire ended, those ended `retired` at or after `retired_at`, unless
+    /// another session holds the item now. Returns the claims reopened.
+    pub fn reopen_retired_claims(
+        &self,
+        session_id: &str,
+        retired_at: &str,
+    ) -> Result<Vec<WorkClaim>> {
+        let Some(retired_at) = parse_rfc3339(retired_at) else {
+            return Ok(Vec::new());
+        };
+        let Some(mut conn) = self.open_existing()? else {
+            return Ok(Vec::new());
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let claims = query_claims(
+            &tx,
+            "WHERE session_id = ?1 AND end_reason = 'retired' AND reserved_at IS NULL \
+             ORDER BY claimed_at, id",
+            params![session_id],
+        )?;
+        let now = now_rfc3339();
+        let mut reopened = Vec::new();
+        for claim in claims {
+            if claim
+                .ended_at
+                .as_deref()
+                .and_then(parse_rfc3339)
+                .is_none_or(|ended| ended < retired_at)
+            {
+                continue;
+            }
+            let held: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM work_claims \
+                  WHERE repo = ?1 AND number = ?2 AND ended_at IS NULL",
+                params![claim.repo, claim.number],
+                |row| row.get(0),
+            )?;
+            if held > 0 {
+                continue;
+            }
+            tx.execute(
+                "UPDATE work_claims SET ended_at = NULL, end_reason = NULL, \
+                        ended_by_session_id = NULL WHERE id = ?1",
+                params![claim.id],
+            )?;
+            let (ticket, pr) = item_keys(&tx, &claim.repo, claim.kind(), claim.number)?;
+            write_event(
+                &tx,
+                "claim.reopened",
+                Some(session_id),
+                Some(&claim.repo),
+                ticket,
+                pr,
+                json!({"claim_id": claim.id}),
+                &now,
+            )?;
+            reopened.push(claim);
+        }
+        tx.commit()?;
+        Ok(reopened)
+    }
+
     /// Context handoff (sm#1651, Appendix G): re-point the predecessor's
     /// active claims and worktree keeps to the successor in place, keeping
     /// every other column, with one `claim.handed_off` event per claim and no
@@ -2522,6 +2585,10 @@ fn random_claim_id() -> String {
     let mut bytes = [0u8; 4];
     OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
 fn now_rfc3339() -> String {
