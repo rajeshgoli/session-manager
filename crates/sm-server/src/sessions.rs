@@ -7291,6 +7291,7 @@ impl SessionStore {
             authority,
             session_credential,
             false,
+            &|_| false,
         )
     }
 
@@ -7300,6 +7301,7 @@ impl SessionStore {
         authority: RetireAuthority,
         session_credential: Option<&str>,
         if_finished_idle: bool,
+        live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -7328,6 +7330,14 @@ impl SessionStore {
         let Some(recipient_name) = recipient_name else {
             return self.retire_stopped_session(state, session_id, &authority);
         };
+        if if_finished_idle
+            && sessions_snapshot
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_none_or(live_activity_blocks_retire)
+        {
+            return Ok(CoreRetireOutcome::PreconditionFailed);
+        }
         // A terminal write and its rotation finalization share this one atomic
         // state replacement, so recovery cannot later relaunch the seat.
         finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
@@ -7373,6 +7383,7 @@ impl SessionStore {
             session_credential,
             runtime,
             false,
+            &|_| false,
         )
     }
 
@@ -7383,6 +7394,7 @@ impl SessionStore {
         session_credential: Option<&str>,
         runtime: &TmuxRuntime,
         if_finished_idle: bool,
+        live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -7418,6 +7430,14 @@ impl SessionStore {
         };
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
+        }
+        if if_finished_idle
+            && sessions_snapshot
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_none_or(live_activity_blocks_retire)
+        {
+            return Ok(CoreRetireOutcome::PreconditionFailed);
         }
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
         let requested_at = now_rfc3339();
@@ -17449,6 +17469,7 @@ esac
                     RetireAuthority::operator("test"),
                     None,
                     true,
+                    &|_| false,
                 )
                 .unwrap(),
             CoreRetireOutcome::PreconditionFailed
@@ -17463,6 +17484,7 @@ esac
                     None,
                     &runtime,
                     true,
+                    &|_| false,
                 )
                 .unwrap(),
             CoreRetireOutcome::PreconditionFailed
@@ -17481,6 +17503,32 @@ esac
                     RetireAuthority::operator("test"),
                     None,
                     true,
+                    &|_| true,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        assert!(matches!(
+            store
+                .retire_core_session_with_runtime_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    &runtime,
+                    true,
+                    &|_| true,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        assert!(matches!(
+            store
+                .retire_core_session_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    true,
+                    &|_| false,
                 )
                 .unwrap(),
             CoreRetireOutcome::Retired(_)

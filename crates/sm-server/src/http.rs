@@ -10986,6 +10986,9 @@ async fn retire_session_after_auth(
                 session_credential.as_deref(),
                 &runtime,
                 payload.if_finished_idle,
+                &|session| {
+                    live_activity_state(&state, session).is_some_and(|state| state != "idle")
+                },
             )?
     } else {
         state
@@ -10995,6 +10998,9 @@ async fn retire_session_after_auth(
                 authority,
                 session_credential.as_deref(),
                 payload.if_finished_idle,
+                &|session| {
+                    live_activity_state(&state, session).is_some_and(|state| state != "idle")
+                },
             )?
     };
     match outcome {
