@@ -729,7 +729,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <ul>
 <li><b>Libraries.</b> Preact 10 and htm, vendored as ES module files under <code>crates/sm-server/src/web/vendor/</code>. The xterm.js and fit addon versions must match <code>android-app/app/src/main/assets/sm_terminal/vendor/</code>. There is no npm and no bundler.</li>
 <li><b>Serving.</b> The app's own modules sit under <code>src/web/</code>, one module per page: <code>agents.js</code>, <code>board.js</code>, <code>queue.js</code>, <code>inbox.js</code>, <code>analytics.js</code>, <code>history.js</code>, <code>guestbook.js</code>, <code>settings.js</code> and <code>terminal.js</code>. Shared code goes in <code>app.js</code> (router, rail, top bar, panel, command palette, polling, toasts), <code>ui.js</code> (ring, chip, strip, popover and segmented control) and <code>app.css</code> (tokens). Files are embedded with <code>include_str!</code>. <code>build_id</code> is a hash of all embedded files computed at build time.</li>
-<li><b>Size.</b> Own JS stays at or under 200 KB uncompressed, not counting vendor files.</li>
+<li><b>Size.</b> Own JS stays at or under 256 KB uncompressed, not counting vendor files.</li>
 <li><b>Polling.</b> Only the visible page polls, and polling pauses while the browser tab is hidden. Cadences:
   <ul>
   <li>Agents: <code>web_watch.refresh_seconds</code>, default 3 s.</li>

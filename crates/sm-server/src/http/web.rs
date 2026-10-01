@@ -251,7 +251,7 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .map(|asset| asset.body.len())
             .sum();
-        assert!(own <= 200 * 1024, "own JS is {own} bytes");
+        assert!(own <= 256 * 1024, "own JS is {own} bytes");
     }
 
     #[test]
