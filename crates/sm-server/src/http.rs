@@ -1773,6 +1773,14 @@ pub fn router(state: AppState) -> Router {
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
         .route("/client/board/start", post(board::client_start))
+        .route(
+            "/client/board/auto-start",
+            put(board::put_auto_start).delete(board::delete_auto_start),
+        )
+        .route(
+            "/client/board/auto-start/lane",
+            put(board::put_auto_start_lane),
+        )
         .route("/client/board/close", post(board::client_close))
         .route(
             "/client/github/{owner}/{repo}/{number}",

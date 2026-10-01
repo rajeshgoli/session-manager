@@ -38,6 +38,7 @@ impl RefNode {
 pub struct IssueNode {
     pub number: i64,
     pub title: String,
+    pub body: Option<String>,
     pub url: String,
     pub updated_at: Option<String>,
     pub state_reason: Option<String>,
@@ -154,7 +155,7 @@ pub fn issues_query(repo: &str, cursor: Option<&str>) -> String {
     issues(states: OPEN, first: 100{after}) {{
       pageInfo {{ hasNextPage endCursor }}
       nodes {{
-        number title url updatedAt stateReason
+        number title body url updatedAt stateReason
         parent {{ ...Ref }}
         blockedBy(first: {CONNECTION_PAGE}) {{ totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ ...Ref }} }}
         subIssues(first: {CONNECTION_PAGE}) {{ totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ ...Ref }} }}
@@ -327,6 +328,7 @@ pub fn parse_issues_page(stdout: &[u8]) -> Result<IssuesPage, String> {
             Some(IssueNode {
                 number: node["number"].as_i64()?,
                 title: node["title"].as_str().unwrap_or_default().to_owned(),
+                body: node["body"].as_str().map(str::to_owned),
                 url: node["url"].as_str().unwrap_or_default().to_owned(),
                 updated_at: opt_string(&node["updatedAt"]),
                 state_reason: opt_string(&node["stateReason"]),

@@ -29,6 +29,14 @@ pub struct Alert {
 /// The alerts one recompute calls for. `last_holder` names the session
 /// whose claim on a ticket ended most recently.
 pub fn decide(recomputed: &Recomputed, last_holder: &dyn Fn(&Key) -> Option<String>) -> Vec<Alert> {
+    decide_excluding(recomputed, last_holder, &Default::default())
+}
+
+pub fn decide_excluding(
+    recomputed: &Recomputed,
+    last_holder: &dyn Fn(&Key) -> Option<String>,
+    excluded: &std::collections::BTreeSet<Key>,
+) -> Vec<Alert> {
     let board = &recomputed.board;
     let input = &recomputed.input;
     let ended_ranks: Vec<i64> = recomputed.ended.iter().map(|(lane, _)| lane.rank).collect();
@@ -50,6 +58,7 @@ pub fn decide(recomputed: &Recomputed, last_holder: &dyn Fn(&Key) -> Option<Stri
             .filter(|key| {
                 let facts = &board.facts[*key];
                 facts.state == TicketState::Ready
+                    && !excluded.contains(*key)
                     && previous
                         .get(*key)
                         .is_some_and(|member| member.state != TicketState::Ready)
@@ -163,9 +172,22 @@ pub fn send(
     recomputed: &Recomputed,
     now: OffsetDateTime,
 ) -> Result<Vec<Alert>> {
-    let alerts = decide(recomputed, &|key| {
-        store.last_holder_name(key).ok().flatten()
-    });
+    send_excluding(store, push, user_id, recomputed, now, &Default::default())
+}
+
+pub fn send_excluding(
+    store: &BoardStore,
+    push: &OwnerPushStore,
+    user_id: &str,
+    recomputed: &Recomputed,
+    now: OffsetDateTime,
+    excluded: &std::collections::BTreeSet<Key>,
+) -> Result<Vec<Alert>> {
+    let alerts = decide_excluding(
+        recomputed,
+        &|key| store.last_holder_name(key).ok().flatten(),
+        excluded,
+    );
     if alerts.is_empty() {
         return Ok(alerts);
     }

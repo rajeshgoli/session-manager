@@ -77,6 +77,7 @@ impl BoardSource for FakeBoard {
             .map(|(number, (_, blocked_by, parent))| IssueNode {
                 number: *number,
                 title: format!("Ticket {number}"),
+                body: None,
                 url: String::new(),
                 updated_at: None,
                 state_reason: None,
@@ -1041,6 +1042,48 @@ async fn start_refuses_needs_you_and_held_ticket() {
         owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["detail"], "#2 is waiting on you");
+}
+
+#[tokio::test]
+async fn auto_start_routes_store_blocked_choice_and_lane_is_all_or_nothing() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&2)
+        .unwrap()
+        .1
+        .push(3);
+    pass(&f).await;
+    assert_eq!(f.ticket(2).await["state"], "blocked");
+    let choice = |number| {
+        json!({"repo":REPO,"number":number,"agent_type":"Mid",
+        "provider":"claude","model":"opus[1m]","reasoning_effort":"high"})
+    };
+    let (status, _) = request(&f.app, "PUT", "/client/board/auto-start", Some(choice(2))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) =
+        owner_request(&f, "PUT", "/client/board/auto-start", Some(choice(2))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.ticket(2).await["auto_start"]["state"], "waiting");
+    assert_eq!(f.ticket(2).await["auto_start"]["agent_type"], "Mid");
+    let (status, _) = owner_request(
+        &f,
+        "DELETE",
+        "/client/board/auto-start?repo=acme/widgets&number=2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(f.ticket(2).await["auto_start"].is_null());
+    f.claim(3, "eng00001");
+    let lane = json!({"goal_repo":REPO,"goal_number":1,"tickets":[choice(2),choice(3)]});
+    let (status, body) =
+        owner_request(&f, "PUT", "/client/board/auto-start/lane", Some(lane)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(f.ticket(2).await["auto_start"].is_null());
 }
 
 #[tokio::test]

@@ -10,8 +10,8 @@ use crate::board::{
         self as board_sync, BoardSource, IssueConnection, IssuesPage, LinkMutation, RefNode,
         ResolvedIssue, WriteError,
     },
-    BoardStore, JsonContext, LinkRequest, Outside, Refusal, Unseen, NOTICE_BOARD_LANE_DONE,
-    NOTICE_BOARD_READY,
+    BoardStore, JsonContext, LinkRequest, Outside, Refusal, Unseen, NOTICE_BOARD_AUTO_START,
+    NOTICE_BOARD_LANE_DONE, NOTICE_BOARD_READY,
 };
 use crate::owner_docs::{doc_readable_path, OwnerDocState, OwnerDocStore};
 use crate::owner_messages::{derive_message_state, message_reader_path, OwnerMessageState};
@@ -169,6 +169,10 @@ pub(super) fn outside(state: &AppState) -> anyhow::Result<Outside> {
 
 /// One read pass under the board lock.
 pub(super) fn run_pass(state: &AppState) -> anyhow::Result<board::Recomputed> {
+    run_pass_inner(state, true)
+}
+
+fn run_pass_inner(state: &AppState, alerts: bool) -> anyhow::Result<board::Recomputed> {
     let _guard = state
         .board_lock
         .lock()
@@ -179,19 +183,23 @@ pub(super) fn run_pass(state: &AppState) -> anyhow::Result<board::Recomputed> {
         &outside(state)?,
         time::OffsetDateTime::now_utc(),
     )?;
-    send_alerts(state, &recomputed);
+    if alerts {
+        send_alerts(state, &recomputed);
+    }
     Ok(recomputed)
 }
 
 /// A recompute under the board lock.
-pub(super) fn recompute(state: &AppState) -> anyhow::Result<board::Recomputed> {
+fn recompute_inner(state: &AppState, alerts: bool) -> anyhow::Result<board::Recomputed> {
     let _guard = state
         .board_lock
         .lock()
         .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
     let recomputed =
         board_store(state).recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
-    send_alerts(state, &recomputed);
+    if alerts {
+        send_alerts(state, &recomputed);
+    }
     Ok(recomputed)
 }
 
@@ -199,13 +207,22 @@ pub(super) fn recompute(state: &AppState) -> anyhow::Result<board::Recomputed> {
 /// board lock after every recompute; a failure is logged and the board
 /// still shows the change.
 fn send_alerts(state: &AppState, recomputed: &board::Recomputed) {
+    send_alerts_excluding(state, recomputed, &BTreeSet::new());
+}
+
+fn send_alerts_excluding(
+    state: &AppState,
+    recomputed: &board::Recomputed,
+    excluded: &BTreeSet<Key>,
+) {
     let owner = follows::follow_owner_id(&state.config, None);
-    if let Err(error) = board::pushes::send(
+    if let Err(error) = board::pushes::send_excluding(
         &board_store(state),
         &follows::push_store(state),
         &owner,
         recomputed,
         time::OffsetDateTime::now_utc(),
+        excluded,
     ) {
         eprintln!("board alerts failed: {error:#}");
     }
@@ -243,21 +260,164 @@ pub(super) fn init_board(state: Arc<AppState>) {
                 let idle = config_repos(&pass_state.config).is_empty()
                     && board_store(&pass_state).active_lanes()?.is_empty();
                 if idle {
-                    Ok(())
+                    Ok(None)
                 } else if pass {
-                    run_pass(&pass_state).map(|_| ())
+                    run_pass_inner(&pass_state, false).map(Some)
                 } else {
-                    recompute(&pass_state).map(|_| ())
+                    recompute_inner(&pass_state, false).map(Some)
                 }
             })
             .await;
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(Some(recomputed))) => {
+                    let started = process_auto_starts(&state, &recomputed).await;
+                    send_alerts_excluding(&state, &recomputed, &started);
+                }
+                Ok(Ok(None)) => {}
                 Ok(Err(error)) => eprintln!("board pass failed: {error:#}"),
                 Err(error) => eprintln!("board pass task failed: {error}"),
             }
         }
     });
+}
+
+/// The single board loop is the start worker. Reservation rechecks readiness
+/// under board_lock, so a concurrent manual Start or claim wins exactly once.
+async fn process_auto_starts(
+    state: &Arc<AppState>,
+    recomputed: &board::Recomputed,
+) -> BTreeSet<Key> {
+    let mut started = BTreeSet::new();
+    let settings = match new_agent_settings(state) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("auto-start settings failed: {error:#}");
+            return started;
+        }
+    };
+    let store = board_store(state);
+    let records = match store.auto_starts() {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("auto-start read failed: {error:#}");
+            return started;
+        }
+    };
+    let (starts, cancellations) =
+        board::auto_start::plan(recomputed, records, settings.auto_start_paused);
+    for (key, reason) in cancellations {
+        if let Err(error) = store.cancel_auto_start(&key, reason, time::OffsetDateTime::now_utc()) {
+            eprintln!("auto-start cancel failed: {error:#}");
+        }
+    }
+    for record in starts {
+        let key = record.key();
+        let result = start(
+            state.clone(),
+            StartRequest {
+                repo: key.0.clone(),
+                number: key.1,
+                provider: record.provider.clone(),
+                model: record.model.clone(),
+                reasoning_effort: record.effort.clone(),
+                name: None,
+                brief: record.brief.clone(),
+                start_blocked: false,
+                reviewer: None,
+            },
+            true,
+        )
+        .await;
+        let now = time::OffsetDateTime::now_utc();
+        match result {
+            Ok(session) => {
+                let id = session["session_id"].as_str().unwrap_or_default();
+                if let Err(error) = store.auto_start_result(&key, Ok(id), now) {
+                    eprintln!("auto-start success record failed: {error:#}");
+                }
+                started.insert(key.clone());
+                let name = session["name"].as_str().unwrap_or("agent");
+                auto_start_notice(
+                    state,
+                    &key,
+                    &format!(
+                        "Started #{} as {name} ({}, {})",
+                        key.1,
+                        record.model.as_deref().unwrap_or("default model"),
+                        record.effort.as_deref().unwrap_or("default effort")
+                    ),
+                    now,
+                );
+            }
+            Err(error) => {
+                match store.ticket_claimed(&key) {
+                    Ok(true) => {
+                        if let Err(error) =
+                            store.cancel_auto_start(&key, "ticket claimed or started by hand", now)
+                        {
+                            eprintln!("auto-start claim cancellation failed: {error:#}");
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!("auto-start claim check failed: {error:#}"),
+                }
+                let message = match &error {
+                    ApiError::Internal(error) => format!("{error:#}"),
+                    ApiError::NotFound(detail) | ApiError::Auth { detail, .. } => {
+                        (*detail).to_owned()
+                    }
+                    ApiError::Status { detail, .. } => detail.clone(),
+                    ApiError::StatusBody { body, .. } => {
+                        body["detail"].as_str().unwrap_or("start failed").to_owned()
+                    }
+                };
+                if let Err(error) = store.auto_start_result(&key, Err(&message), now) {
+                    eprintln!("auto-start failure record failed: {error:#}");
+                }
+                auto_start_notice(
+                    state,
+                    &key,
+                    &format!("Could not start #{}: {message}", key.1),
+                    now,
+                );
+            }
+        }
+    }
+    started
+}
+
+fn auto_start_notice(state: &AppState, key: &Key, message: &str, now: time::OffsetDateTime) {
+    let owner = follows::follow_owner_id(&state.config, None);
+    let event_id = match board::record_event(
+        &board_store(state),
+        "auto_start_notice",
+        None,
+        Some(key),
+        None,
+        Some(message),
+        now,
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("auto-start notice event failed: {error:#}");
+            return;
+        }
+    };
+    let notice = crate::owner_push::NewNotice {
+        user_id: owner,
+        kind: NOTICE_BOARD_AUTO_START.to_owned(),
+        session_id: "board".to_owned(),
+        session_name: "sm board".to_owned(),
+        subject_id: format!("board:0:{event_id}"),
+        title: message.to_owned(),
+        body: message.to_owned(),
+        reader_path: "/board".to_owned(),
+        blocking: false,
+    };
+    if let Err(error) = follows::push_store(state).create_notice(&notice, now) {
+        eprintln!("auto-start notice failed: {error:#}");
+    }
 }
 
 /// The Board count (appendix I): unacked, unopened board notices plus
@@ -273,7 +433,10 @@ fn unseen(
     let mut unseen = board::needs_you_unseen(board, &store.needs_you_since()?, seen_event_id);
     let now = time::OffsetDateTime::now_utc();
     for notice in follows::push_store(state).list_notices(&owner, now)? {
-        if notice.kind != NOTICE_BOARD_READY && notice.kind != NOTICE_BOARD_LANE_DONE {
+        if notice.kind != NOTICE_BOARD_READY
+            && notice.kind != NOTICE_BOARD_LANE_DONE
+            && notice.kind != NOTICE_BOARD_AUTO_START
+        {
             continue;
         }
         let opened =
@@ -283,7 +446,9 @@ fn unseen(
         }
         unseen.count += 1;
         if let Some((lane_id, _)) = board::pushes::subject_event(&notice.subject_id) {
-            unseen.lane_ids.insert(lane_id);
+            if lane_id > 0 {
+                unseen.lane_ids.insert(lane_id);
+            }
         }
     }
     Ok(unseen)
@@ -324,17 +489,37 @@ pub(super) fn board_payload(
             clocks: &clocks,
         },
     );
+    payload["auto_start_paused"] = json!(new_agent_settings(state)?.auto_start_paused);
     let early = store.started_early()?;
+    let types = new_agent_settings(state)?.agent_types;
+    let tiers: BTreeMap<Key, String> = store
+        .ticket_tiers()?
+        .into_iter()
+        .filter_map(|(key, tier)| {
+            types
+                .iter()
+                .find(|kind| kind.name.eq_ignore_ascii_case(&tier))
+                .map(|kind| (key, kind.name.clone()))
+        })
+        .collect();
+    let auto_starts: BTreeMap<Key, Value> = store
+        .auto_starts()?
+        .into_iter()
+        .filter(|record| record.state == "waiting" || record.state == "failed")
+        .map(|record| (record.key(), record.chip()))
+        .collect();
     let links = super::board_links::BoardLinks::load(state, &input)?;
     for lane in payload["lanes"].as_array_mut().into_iter().flatten() {
         for ticket in lane["tickets"].as_array_mut().into_iter().flatten() {
             mark_started_early(ticket, &early);
+            add_auto_start_fields(ticket, &tiers, &auto_starts);
             links.attach(ticket);
         }
     }
     for group in payload["other"].as_array_mut().into_iter().flatten() {
         for ticket in group["tickets"].as_array_mut().into_iter().flatten() {
             mark_started_early(ticket, &early);
+            add_auto_start_fields(ticket, &tiers, &auto_starts);
             links.attach(ticket);
         }
     }
@@ -410,6 +595,19 @@ fn mark_started_early(ticket: &mut Value, early: &BTreeSet<Key>) {
         ticket["number"].as_i64().unwrap_or_default(),
     );
     ticket["started_early"] = json!(ticket["state"] != "done" && early.contains(&key));
+}
+
+fn add_auto_start_fields(
+    ticket: &mut Value,
+    tiers: &BTreeMap<Key, String>,
+    auto_starts: &BTreeMap<Key, Value>,
+) {
+    let key = (
+        ticket["repo"].as_str().unwrap_or_default().to_owned(),
+        ticket["number"].as_i64().unwrap_or_default(),
+    );
+    ticket["tier"] = tiers.get(&key).map_or(Value::Null, |tier| json!(tier));
+    ticket["auto_start"] = auto_starts.get(&key).cloned().unwrap_or(Value::Null);
 }
 
 async fn blocking<T: Send + 'static>(
@@ -1117,7 +1315,181 @@ pub(super) async fn client_start(
 ) -> Result<Json<Value>, ApiError> {
     owner_write_guard(&state, &headers, peer_addr, "POST", &uri)?;
     ensure_core_writes_enabled(&state)?;
-    start(state, payload).await.map(Json)
+    start(state, payload, false).await.map(Json)
+}
+
+#[derive(Deserialize)]
+pub(super) struct AutoStartKey {
+    repo: String,
+    number: i64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AutoStartLane {
+    goal_repo: String,
+    goal_number: i64,
+    tickets: Vec<board::auto_start::Choice>,
+}
+
+fn validate_auto_choice(
+    state: &AppState,
+    board: &board::model::Board,
+    choice: &board::auto_start::Choice,
+) -> Result<Key, ApiError> {
+    let key = ticket_key(&choice.repo, choice.number)?;
+    let settings = new_agent_settings(state)?;
+    if !matches!(choice.provider.as_str(), "claude" | "codex-fork") {
+        return Err(bad_request("provider must be claude or codex-fork"));
+    }
+    if let Some(name) = &choice.agent_type {
+        let agent = settings
+            .agent_types
+            .iter()
+            .find(|agent| agent.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| bad_request(format!("unknown agent type {name}")))?;
+        if choice.provider != agent.provider
+            || choice.model.as_deref() != Some(agent.model.as_str())
+            || choice.reasoning_effort.as_deref() != Some(agent.effort.as_str())
+        {
+            return Err(bad_request(format!(
+                "agent type {name} does not match its provider, model and effort"
+            )));
+        }
+    }
+    if choice
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(bad_request("model must be non-empty or null"));
+    }
+    let efforts: &[&str] = if choice.provider == "claude" {
+        &["low", "medium", "high", "xhigh", "max"]
+    } else {
+        &["medium", "high", "xhigh"]
+    };
+    if choice
+        .reasoning_effort
+        .as_deref()
+        .is_some_and(|effort| !efforts.contains(&effort))
+    {
+        return Err(bad_request("reasoning_effort is invalid for the provider"));
+    }
+    let facts = board
+        .facts
+        .get(&key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if !facts.item.is_open()
+        || !matches!(
+            facts.state,
+            crate::board::model::TicketState::Blocked | crate::board::model::TicketState::Ready
+        )
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("#{} is not open for auto-start", key.1),
+        });
+    }
+    if facts.holder.is_some() {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("#{} is already claimed", key.1),
+        });
+    }
+    Ok(key)
+}
+
+pub(super) async fn put_auto_start(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(mut choice): Json<board::auto_start::Choice>,
+) -> Result<Json<Value>, ApiError> {
+    owner_write_guard(&state, &headers, peer_addr, "PUT", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    blocking(&state, move |state| {
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let store = board_store(state);
+        let (board, _) = store.board(&outside(state)?, time::OffsetDateTime::now_utc())?;
+        let key = validate_auto_choice(state, &board, &choice)?;
+        choice.repo = key.0;
+        store.authorize_auto_starts(&[choice], time::OffsetDateTime::now_utc())?;
+        request_recompute(state);
+        Ok(json!({"state":"waiting"}))
+    })
+    .await
+    .map(Json)
+}
+
+pub(super) async fn delete_auto_start(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<AutoStartKey>,
+) -> Result<Json<Value>, ApiError> {
+    owner_write_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    let key = ticket_key(&query.repo, query.number)?;
+    blocking(&state, move |state| {
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        board_store(state).cancel_auto_start(
+            &key,
+            "cancelled by owner",
+            time::OffsetDateTime::now_utc(),
+        )?;
+        Ok(json!({"state":"cancelled"}))
+    })
+    .await
+    .map(Json)
+}
+
+pub(super) async fn put_auto_start_lane(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(mut body): Json<AutoStartLane>,
+) -> Result<Json<Value>, ApiError> {
+    owner_write_guard(&state, &headers, peer_addr, "PUT", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    blocking(&state, move |state| {
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let store = board_store(state);
+        let (board, _) = store.board(&outside(state)?, time::OffsetDateTime::now_utc())?;
+        let goal = ticket_key(&body.goal_repo, body.goal_number)?;
+        let lane = board
+            .lanes
+            .iter()
+            .find(|lane| lane.lane.goal == goal)
+            .ok_or(ApiError::NotFound("Lane not on the board"))?;
+        let mut seen = BTreeSet::new();
+        for choice in &mut body.tickets {
+            let key = validate_auto_choice(state, &board, choice)?;
+            if !lane.contains(&key) || !seen.insert(key.clone()) {
+                return Err(bad_request(format!(
+                    "#{} is not a distinct ticket in this lane",
+                    key.1
+                )));
+            }
+            choice.repo = key.0;
+        }
+        store.authorize_auto_starts(&body.tickets, time::OffsetDateTime::now_utc())?;
+        request_recompute(state);
+        Ok(json!({"state":"waiting", "count":body.tickets.len()}))
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1266,7 +1638,7 @@ pub(super) fn validate_start(
     })
 }
 
-async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, ApiError> {
+async fn start(state: Arc<AppState>, payload: StartRequest, auto: bool) -> Result<Value, ApiError> {
     if !matches!(payload.provider.as_str(), "claude" | "codex-fork") {
         return Err(bad_request("provider must be claude or codex-fork"));
     }
@@ -1356,6 +1728,15 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     .await;
     claims::finish_spawn_ticket(&state, &reservation, created.is_ok());
     let session = created?;
+    if !auto {
+        if let Err(error) = board_store(&state).cancel_auto_start(
+            &key,
+            "started by hand",
+            time::OffsetDateTime::now_utc(),
+        ) {
+            eprintln!("board auto-start cancellation after manual start failed: {error:#}");
+        }
+    }
     if reservation.started_early {
         board_store(&state).record_started_early(&key, time::OffsetDateTime::now_utc())?;
     }

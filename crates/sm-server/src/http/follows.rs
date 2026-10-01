@@ -626,7 +626,9 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                 super::board::board_store(self.state).ready_notice_wanted(&notice.subject_id)
             }
             // The lane has ended already: only opening the board clears it.
-            crate::board::NOTICE_BOARD_LANE_DONE => Ok(true),
+            crate::board::NOTICE_BOARD_LANE_DONE | crate::board::NOTICE_BOARD_AUTO_START => {
+                Ok(true)
+            }
             // Wanted while the same wait the sweep last saw is still open.
             NOTICE_APPROVAL_NEEDED => {
                 let waits = push_store(self.state).approval_waits()?;
@@ -658,7 +660,9 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                     .zip(owner_push::parse_ts(&notice.created_at))
                     .is_some_and(|(viewed_at, created_at)| viewed_at >= created_at))
             }
-            crate::board::NOTICE_BOARD_READY | crate::board::NOTICE_BOARD_LANE_DONE => {
+            crate::board::NOTICE_BOARD_READY
+            | crate::board::NOTICE_BOARD_LANE_DONE
+            | crate::board::NOTICE_BOARD_AUTO_START => {
                 let seen = super::board::board_store(self.state).seen(&notice.user_id)?;
                 Ok(crate::board::pushes::notice_opened(
                     &notice.subject_id,

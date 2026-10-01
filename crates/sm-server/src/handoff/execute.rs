@@ -271,6 +271,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     ("owner_notices", "session_id", "history"),
     (
+        "auto_starts",
+        "session_id",
+        "history of the agent started for the ticket",
+    ),
+    (
         "turn_messages",
         "session_id",
         "the predecessor's own last words; the successor writes its own",

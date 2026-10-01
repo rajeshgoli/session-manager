@@ -68,6 +68,9 @@ pub(super) async fn put_settings(
         if next != current && state.config.rust_core.runtime_enabled {
             admit_now(&state, &queue_state_dir, next);
         }
+        if body["new_agent"].get("auto_start_paused").is_some() {
+            board::request_recompute(&state);
+        }
         Ok(settings)
     })
     .await
