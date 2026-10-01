@@ -296,6 +296,7 @@ div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
 .term-page { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--term); color: var(--term-ink); z-index: 30; }
 .term-bar { height: 40px; flex: 0 0 40px; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
 .term-bar .t { font-weight: 650; }
+.term-home { font: 700 1.133rem var(--mono); color: var(--accent); text-decoration: none; }
 .term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); }
 .term-main.with-switch { grid-template-columns: 15.5rem minmax(0, 1fr); }
 .term-body { min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }

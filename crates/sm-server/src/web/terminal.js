@@ -305,6 +305,7 @@ export function TerminalPage({ id, open }) {
 
   return html`<div class="term-page">
     <div class="term-bar" onClick=${refocus}>
+      <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
       <button type="button" class=${`icon-btn${switcher ? ' on' : ''}`} title="Agents (⌘\\)" aria-label="Agents"
         aria-pressed=${switcher} onClick=${toggleSwitcher}><${Icon} name=${switcher ? 'fold' : 'unfold'} /></button>
