@@ -141,12 +141,37 @@ select.inp { padding: 3px 6px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 6px 8px 9px; display: grid; grid-template-columns: 2.1rem minmax(0, 1fr) auto; gap: 1px 9px; align-items: center; cursor: pointer; text-align: left; }
 .card:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
 .card.sel { background: var(--sel); border-color: var(--sel); }
-.card.faded { opacity: .55; }
+.card.faded { opacity: .6; }
 .card .ring { grid-row: span 3; }
 .card .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .ln { grid-column: 2; font-size: .867rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .act { grid-column: 3; grid-row: 1 / span 3; align-self: center; }
 .card.child { margin-left: 18px; }
+/* Agent cards (1782 F): name and icons; provider, ticket, repo; Agent | Jobs; then You. */
+.acard { border-left: 3px solid var(--edge, var(--line)); padding-left: 7px; }
+.edge-magenta { --edge: var(--magenta); } .edge-cyan { --edge: var(--cyan); } .edge-amber { --edge: var(--amber); }
+.edge-green { --edge: var(--green); } .edge-red { --edge: var(--red); } .edge-line { --edge: var(--line); }
+.acard .ring { grid-row: 1 / span 3; }
+.acard.tall .ring { grid-row: 1 / span 4; }
+.acard .icons { grid-column: 3; grid-row: 1; display: flex; }
+.acard .icons .icon-btn { padding: 1px 4px; }
+.acard .ln { grid-column: 2 / -1; }
+.acard .repo { color: var(--ink-3); }
+.card.kb { outline: 2px solid var(--accent); outline-offset: 1px; }
+.acard.sel { border-left-color: var(--edge, var(--line)); }
+.facts { grid-column: 2 / -1; display: grid; grid-template-columns: 7.2rem minmax(0, 1fr); gap: 0 8px; font-size: .867rem; min-width: 0; }
+.fa { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.you { grid-column: 2 / -1; display: flex; align-items: center; gap: 4px; font-size: .867rem; min-width: 0; }
+.you .ok { color: inherit; font-weight: 700; padding: 0 6px; margin-left: auto; }
+.acard-facts { display: flex; flex-direction: column; gap: 2px; }
+.grp.sec.magenta { color: var(--magenta); } .grp.sec.cyan { color: var(--cyan); } .grp.sec.amber { color: var(--amber); }
+.grp.sec.green { color: var(--green); }
+.sum .dot { color: var(--ink-3); margin: 0 -8px; }
+.sum .plain-btn.magenta { color: var(--magenta); } .sum .plain-btn.cyan { color: var(--cyan); }
+.sum .plain-btn.amber { color: var(--amber); } .sum .plain-btn.green { color: var(--green); }
+.sum .plain-btn:not(.muted) b { color: inherit; } .sum .plain-btn.muted { color: var(--ink-2); }
+.fold-more { grid-column: 1 / -1; text-align: left; border: 1px dashed var(--line); background: none; border-radius: 8px; padding: 6px 10px; color: var(--ink-3); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fold-more:hover { color: var(--ink); border-color: var(--ink-3); }
 
 /* ---- side panel ------------------------------------------------------------ */
 .panel { width: var(--panel-w); border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
