@@ -566,6 +566,25 @@ impl HistoryData {
         ids
     }
 
+    /// The sessions that worked on a ticket or PR numbered `number`, in any
+    /// repository, as [`Self::agent_work`] counts it: a claim, or a Codex
+    /// review request on the PR. History's agent search by number.
+    pub fn sessions_claiming(&self, number: i64) -> BTreeSet<&str> {
+        let mut ids: BTreeSet<&str> = self
+            .claims
+            .iter()
+            .filter(|claim| claim.number == number)
+            .map(|claim| claim.session_id.as_str())
+            .collect();
+        ids.extend(
+            self.reviews
+                .iter()
+                .filter(|review| review.pr == number)
+                .filter_map(|review| review.requester_session_id.as_deref()),
+        );
+        ids
+    }
+
     /// What each of `session_ids` worked on, for the agent list (sm#1661):
     /// tickets and PRs it claimed or requested a Codex review on, and docs it
     /// authored or published. Newest first, at most [`AGENT_WORK_LIMIT`] of

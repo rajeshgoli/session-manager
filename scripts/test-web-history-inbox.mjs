@@ -18,7 +18,7 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
       const requests = [];
-      let count = 80, failSend = false, threadLoads = 0;
+      let count = 80, failSend = false, threadLoads = 0, answered = 0, retired = 0;
       await page.clock.install();
       await page.route('http://localhost/**', async route => {
         const request = route.request(), url = new URL(request.url());
@@ -30,7 +30,18 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
         let data = {};
         if (url.pathname.startsWith('/history')) {
           requests.push(url);
-          data = {rows:[{repo:'owner/repo',number:1,title:'Fixture ticket',state:'open'}], agents:[], next_before:'older-cursor'};
+          data = {rows:[{repo:'owner/repo',number:1,title:'Fixture ticket',state:'open'}], next_before:'older-cursor',
+            agents:[{id:'abc12345',name:'sm-1768',provider:'claude',state:'retired',ended_at:new Date(Date.now()-240000).toISOString(),
+              working_dir:'/Users/fixture/projects/session-manager',restorable:false,unrestorable_reason:'Runs on node mini',
+              last_turn:{at:'2026-09-30T12:00:00Z',text:'Memo 1768 is merged and published.'},
+              work:{tickets:[{repo:'owner/repo',number:1768,title:'Memo',state:'closed'}],prs:[],docs:[]}}]};
+        } else if (url.pathname === '/watch/state') {
+          data = {sessions:retired ? [] : [{id:'fixture',name:'fixture-agent',provider:'claude',state:'idle',claims:[{kind:'ticket',repo:'owner/repo',number:1782}],jobs:[],
+            facts:{agent:{state:'idle',since:new Date(Date.now()-300000).toISOString()},you:answered ? null : {kind:'message',dismissible:true}}}]};
+        } else if (url.pathname === '/sessions/fixture/retire') {
+          retired++;
+        } else if (url.pathname === '/sessions/fixture/needs-you/answered') {
+          answered++;
         } else if (url.pathname.endsWith('/send')) {
           if (failSend) return route.fulfill({status:500,json:{detail:'Send failed'}});
           count++;
@@ -47,11 +58,26 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
         await action();
         await requested;
       };
-      for (const filter of ['agent=sm-test','repo=owner%2Frepo','open=1','limit=7','agent=sm-test&repo=owner%2Frepo&open=1&limit=7&before=initial-cursor']) {
+      // History opens on agents: name, ticket, age, folder, last turn, Restore.
+      await page.goto('http://localhost/history');
+      await page.getByRole('heading', {name:'Bring back an agent'}).waitFor();
+      const agent = page.locator('.history-agent');
+      await agent.waitFor();
+      assert.equal(new URL(requests.at(-1)).pathname, '/history/agents');
+      assert.match(await agent.textContent(), /sm-1768.*CLAUDE.*#1768.*retired 4m ago.*session-manager/s);
+      assert.match(await agent.locator('.history-last-turn').textContent(), /Last turn: “Memo 1768 is merged/);
+      const restore = agent.getByRole('button', {name:'Restore'});
+      assert.ok(await restore.isDisabled());
+      assert.equal(await restore.getAttribute('title'), 'Runs on node mini');
+      await page.getByRole('radio', {name:'Tickets'}).click();
+      await page.waitForFunction(() => location.pathname === '/history/tickets' && document.querySelector('.history-card button.text-button')?.textContent.includes('Fixture ticket'));
+      // An older `/history` link that filters tickets lands on the tickets tab.
+      for (const filter of ['agent=sm-test','repo=owner%2Frepo','open=1','agent=sm-test&repo=owner%2Frepo&open=1&limit=7&before=initial-cursor']) {
         const previous = requests.length;
         await page.goto(`http://localhost/history?${filter}`);
         await page.waitForFunction(() => document.querySelector('.history-card'));
         assert.ok(requests.length > previous);
+        assert.equal(new URL(page.url()).pathname, '/history/tickets');
         for (const [key,value] of new URLSearchParams(filter)) assert.equal(latest().get(key),value);
         assert.equal(await page.locator('.list-filter input').inputValue(), new URLSearchParams(filter).get('repo') || '');
         assert.equal(await page.locator('.panel').count(), 0, 'open=1 is a filter, not a panel');
@@ -71,11 +97,22 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       assert.equal(new URL(page.url()).searchParams.get('open'),'1');
       assert.equal(await page.locator('.list-filter input').inputValue(),'');
 
-      await change('q','former',() => page.goto('http://localhost/history/agents?q=former&limit=3'));
+      // Wait for the data request, not the page navigation, which also carries `q`.
+      const agentsRequest = page.waitForRequest(request => { const url = new URL(request.url());
+        return url.pathname === '/history/agents' && url.searchParams.get('format') === 'json' && url.searchParams.get('q') === 'former'; });
+      await page.goto('http://localhost/history/agents?q=former&limit=3');
+      await agentsRequest;
       await page.waitForFunction(() => document.querySelector('.list-filter input')?.value === 'former');
       assert.equal(latest().get('limit'),'3');
 
       await page.goto('http://localhost/inbox?open=thread:fixture');
+      // The thread header carries its agent's links and clears a question answered elsewhere.
+      await page.locator('.thread-links').getByText('#1782 ↗').waitFor();
+      assert.match(await page.locator('.thread-links').textContent(), /fixture-agent · Claude · ○ Idle 5m/);
+      await page.getByRole('button', {name:'✓ Answered'}).click();
+      await page.getByText('Marked answered').waitFor();
+      await page.getByRole('button', {name:'✓ Answered'}).waitFor({state:'detached'});
+      assert.equal(answered, 1);
       const atBottom = () => {
         const el = document.querySelector('.thread-items');
         return el && el.scrollTop > 0 && Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop) < 2;
@@ -101,6 +138,13 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       await page.locator('.thread-items').evaluate(el => {el.scrollTop=300;});
       await page.clock.runFor(30100);
       assert.equal(await page.locator('.thread-items').evaluate(el => el.scrollTop),300,'post-send polling preserves reading position');
+      // Retire sits beside Done while the agent is live, behind an inline confirm.
+      await page.getByRole('button', {name:'Retire…'}).click();
+      await page.getByText('Retire fixture-agent?').waitFor();
+      await page.getByRole('button', {name:'Retire',exact:true}).click();
+      await page.getByText('Retired fixture-agent').waitFor();
+      await page.getByRole('button', {name:'Retire…'}).waitFor({state:'detached'});
+      assert.equal(retired, 1);
       assert.deepEqual(errors,[]);
       await page.close();
     }

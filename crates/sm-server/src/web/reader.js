@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, registerPanel, closePanel, openPanel, bus, typingIn } from './ui.js';
 
 export function shellName(path = location.pathname) {
-  return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
+  return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/history/tickets': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
 }
 export function fullScreen(path) {
   const url = new URL(path, location.origin);

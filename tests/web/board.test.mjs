@@ -19,6 +19,14 @@ await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults, canStartAnyway, blockedReasons } = modules.get(`${root}/board-start.js`).namespace;
 const { threadHref } = modules.get(`${root}/ui.js`).namespace;
+const { tokens, tokensOf } = modules.get(`${root}/handoff.js`).namespace;
+test('handoff thresholds read in tokens with three significant figures', () => {
+  assert.deepEqual([350000, 1000000, 206720, 258400, 999999, 1250000, 512].map(tokens), ['350k', '1M', '207k', '258k', '1M', '1.25M', '512']);
+  assert.equal(tokensOf(35, 1000000), '350k of 1M tokens');
+  assert.equal(tokensOf('80', 258400), '207k of 258k tokens');
+  assert.equal(tokensOf('', 258400), '');
+  assert.equal(tokensOf(35, undefined), '');
+});
 test('rows preserve every actionable ticket and sort done by closure time', () => {
   const states = ['needs_you', 'close_ready', 'ready', 'in_progress', 'blocked', 'done'];
   const rows = states.map((state, number) => ({ state, number }));

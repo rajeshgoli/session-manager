@@ -19,7 +19,8 @@ const LAST_TURN_CHARS: usize = 300;
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct AgentHistoryParams {
     /// Case-insensitive substring of the name, alias, role or working
-    /// directory, or an id prefix.
+    /// directory, or an id prefix; a number (`1768`, `#1768`) also matches
+    /// the agents that claimed a ticket or PR with that number.
     #[serde(default)]
     q: Option<String>,
     /// The previous page's `next_before`.
@@ -188,12 +189,20 @@ pub(super) async fn get_agent_history(
         _ => None,
     };
     let query = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    let data = HistoryData::load(&expand_home(&state.config.sm_send.db_path))?;
+    // `1768` or `#1768` also finds the agents that claimed that number.
+    let claimants = query
+        .and_then(|q| q.trim_start_matches('#').parse::<i64>().ok())
+        .map(|number| data.sessions_claiming(number))
+        .unwrap_or_default();
     let mut records: Vec<SessionRecord> = state
         .session_store
         .list_sessions(true)?
         .into_iter()
         .filter(SessionRecord::is_stopped)
-        .filter(|record| query.is_none_or(|q| matches_query(record, q)))
+        .filter(|record| {
+            query.is_none_or(|q| matches_query(record, q)) || claimants.contains(record.id.as_str())
+        })
         .collect();
     let total = records.len();
     records.sort_by_cached_key(|record| std::cmp::Reverse(key(record)));
@@ -203,7 +212,6 @@ pub(super) async fn get_agent_history(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let next_before = (records.len() > limit).then(|| encode_cursor(&key(&records[limit - 1])));
     records.truncate(limit);
-    let data = HistoryData::load(&expand_home(&state.config.sm_send.db_path))?;
     let mut work = data.agent_work(&records.iter().map(|r| r.id.as_str()).collect());
     let mut turns = state
         .session_store

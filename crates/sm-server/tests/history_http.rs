@@ -512,6 +512,13 @@ fn agent_ids(page: &Value) -> Vec<&str> {
 #[tokio::test]
 async fn agent_history_lists_stopped_agents_with_their_work_and_drops_restored_ones() {
     let f = seeded().await;
+    // A review request without a claim; History's search finds it below.
+    post(
+        &f.app,
+        "/review-requests",
+        json!({"pr_number": 4242, "repo": REPO, "requester_session_id": "eng00001"}),
+    )
+    .await;
     post(&f.app, "/sessions/eng00001/retire", json!({})).await;
 
     let (status, body) = get_json(&f.app, "/history/agents").await;
@@ -533,8 +540,14 @@ async fn agent_history_lists_stopped_agents_with_their_work_and_drops_restored_o
                 "url": "https://github.com/acme/widgets/issues/1",
                 "history_path": "/t/widgets/1"}])
     );
-    assert_eq!(eng["work"]["prs"][0]["number"], 9);
-    assert_eq!(eng["work"]["prs"].as_array().unwrap().len(), 1);
+    // The review request on PR 4242 is newer than the claim on PR 9.
+    let prs: Vec<i64> = eng["work"]["prs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pr| pr["number"].as_i64().unwrap())
+        .collect();
+    assert_eq!(prs, vec![4242, 9]);
     assert_eq!(eng["work"]["docs"][0]["title"], "Memo <draft>");
     let gone = &body["agents"][1];
     assert_eq!(gone["state"], "stopped");
@@ -555,6 +568,17 @@ async fn agent_history_lists_stopped_agents_with_their_work_and_drops_restored_o
     let (_, found) = get_json(&f.app, "/history/agents?q=GONE").await;
     assert_eq!(agent_ids(&found), vec!["gone0001"]);
     assert_eq!(found["total"], 1);
+    // A number finds the agents that claimed it, with or without `#`; no
+    // name or folder here contains a 9.
+    for q in ["9", "%239"] {
+        let (_, by_ticket) = get_json(&f.app, &format!("/history/agents?q={q}")).await;
+        assert_eq!(agent_ids(&by_ticket), vec!["eng00001"], "{q}");
+    }
+    let (_, unclaimed) = get_json(&f.app, "/history/agents?q=4343").await;
+    assert_eq!(agent_ids(&unclaimed), Vec::<&str>::new());
+    // A Codex review request counts too, as it does for the row's links.
+    let (_, reviewer) = get_json(&f.app, "/history/agents?q=%234242").await;
+    assert_eq!(agent_ids(&reviewer), vec!["eng00001"]);
 
     post(&f.app, "/sessions/gone0001/restore", json!({})).await;
     let (_, after) = get_json(&f.app, "/history/agents").await;

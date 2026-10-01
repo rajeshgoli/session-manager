@@ -5,6 +5,7 @@ import {
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
   openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
+import { HandoffPopover } from './handoff.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -434,8 +435,8 @@ function AgentActions({ agent }) {
     <${FollowButton} id=${agent.id} />
     ${live
       ? html`<span class="anchor"><button type="button" class="btn" data-pop-anchor
-          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off</button>
-          ${menu === 'handoff' ? html`<${HandoffPopover} id=${agent.id} onClose=${close} />` : null}</span>`
+          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
+          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} onClose=${close} />` : null}</span>`
       : null}
     <button type="button" class="btn" onClick=${() => newAgent({
       provider: agent.provider, model: agent.model, effort: agent.reasoning_effort, workspace: agent.working_dir,
@@ -465,52 +466,6 @@ function FollowButton({ id }) {
   };
   return html`<button type="button" class=${following ? 'btn on' : 'btn'} aria-pressed=${following}
     disabled=${busy || !follows} onClick=${toggle}>${following ? 'Following' : 'Follow'}</button>`;
-}
-
-/** The phone's handoff controls (GET/PUT /sessions/{id}/handoff-policy). */
-function HandoffPopover({ id, onClose }) {
-  const path = `/sessions/${encodeURIComponent(id)}/handoff-policy`;
-  const [policy, setPolicy] = useState(null);
-  const [note, setNote] = useState('Loading…');
-  const [asking, setAsking] = useState(false);
-  useEffect(() => {
-    api(path).then((value) => { setPolicy(value); setNote(`Using ${value.source} policy`); })
-      .catch((error) => setNote(error.message));
-  }, [path]);
-  const write = async (body) => {
-    setNote('Saving…');
-    try {
-      const value = await api(path, { method: 'PUT', body });
-      setPolicy(value);
-      setNote(body.ask_now ? 'Asked the agent to hand off' : 'Saved');
-    } catch (error) {
-      setNote(error.message);
-    }
-  };
-  const threshold = (event) => {
-    const number = Number(event.target.value);
-    if (!Number.isInteger(number) || number < 1 || number > 100) setNote('Enter an integer from 1 to 100');
-    else write({ threshold_percent: number });
-  };
-  return html`<${Popover} onClose=${onClose}>
-    <h2>Context handoff</h2>
-    ${policy
-      ? html`<label class="check"><${Toggle} label="Hand off automatically" checked=${policy.enabled}
-            onChange=${enabled => write({ enabled })} /> Hand off automatically</label>
-          <div class="fld"><span class="l">Threshold (%)</span>
-            <input class="inp num" type="number" min="1" max="100" step="1" style="width:6rem"
-              value=${policy.threshold_percent} onChange=${threshold} /></div>
-          <div class="row" style="justify-content:flex-start">
-            <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button>
-            ${asking
-              ? html`<span class="confirm">Ask this agent to hand off?
-                  <button type="button" class="btn sm danger" onClick=${() => { setAsking(false); write({ ask_now: true }); }}>Confirm handoff</button>
-                  <button type="button" class="btn sm" onClick=${() => setAsking(false)}>Cancel</button></span>`
-              : html`<button type="button" class="btn sm" onClick=${() => setAsking(true)}>Hand off now</button>`}
-          </div>`
-      : null}
-    <span class="sub" role="status">${note}</span>
-  <//>`;
 }
 
 function MoreMenu({ agent, onClose }) {
