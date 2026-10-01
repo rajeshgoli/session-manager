@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.ui.settings
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -26,6 +27,7 @@ import li.rajeshgo.sm.ui.theme.*
 import li.rajeshgo.sm.util.LocalDefaults
 import kotlinx.coroutines.launch
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun SettingsScreen(
     onNavigateToWatch: () -> Unit,
@@ -56,6 +58,18 @@ fun SettingsScreen(
         }
     }
     var advanced by rememberSaveable { mutableStateOf(false) }
+    val reviews = remember { androidx.compose.foundation.relocation.BringIntoViewRequester() }
+    val reviewsAsked = li.rajeshgo.sm.ui.navigation.ReviewSettingsRequests.pending
+    LaunchedEffect(reviewsAsked, state.isLoggedIn) {
+        if (!reviewsAsked || !state.isLoggedIn) return@LaunchedEffect
+        // Once after the screen's transition, and again once the section has loaded and grown.
+        kotlinx.coroutines.delay(600)
+        reviews.bringIntoView()
+        kotlinx.coroutines.delay(1_200)
+        reviews.bringIntoView()
+        // Cleared last: changing the key restarts this effect, cancelling any scroll still to come.
+        li.rajeshgo.sm.ui.navigation.ReviewSettingsRequests.pending = false
+    }
     val clientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() } ?: LocalDefaults.googleServerClientId
     Column(
         Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()
@@ -129,6 +143,9 @@ fun SettingsScreen(
         }
         if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
             li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
+        }
+        if (state.isLoggedIn) Box(Modifier.bringIntoViewRequester(reviews)) {
+            SettingsGroup("Reviews") { ReviewsSection() }
         }
         if (state.isLoggedIn) SettingsGroup("Terminals") {
             TerminalLimitsSection()

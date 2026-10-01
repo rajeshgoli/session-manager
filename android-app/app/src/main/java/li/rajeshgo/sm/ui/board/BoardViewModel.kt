@@ -80,6 +80,45 @@ data class BoardStartState(
     val error: String? = null,
 )
 
+/** A lane's or ticket's review policy sheet (sm#1768 Figure 7B). */
+data class ReviewPolicyEdit(
+    val title: String,
+    val inheritLabel: String,
+    val ownLabel: String,
+    /** `lane` or `ticket`. */
+    val scope: String,
+    val repo: String,
+    /** The lane's goal ticket, or the ticket. */
+    val number: Long,
+    val current: li.rajeshgo.sm.data.model.ReviewPolicy?,
+    val busy: Boolean = false,
+    val error: String? = null,
+) {
+    val allowPaired: Boolean get() = scope == "ticket"
+
+    companion object {
+        fun lane(lane: li.rajeshgo.sm.data.model.BoardLane) = ReviewPolicyEdit(
+            title = "Reviews for lane ${lane.rank} · ${lane.goal.title}",
+            inheritLabel = "Default",
+            ownLabel = "This lane",
+            scope = "lane",
+            repo = lane.goal.repo,
+            number = lane.goal.number,
+            current = lane.reviewPolicy,
+        )
+
+        fun ticket(ticket: BoardTicket) = ReviewPolicyEdit(
+            title = "Reviews for #${ticket.number} ${ticket.title}",
+            inheritLabel = "Lane default",
+            ownLabel = "This ticket",
+            scope = "ticket",
+            repo = ticket.repo,
+            number = ticket.number,
+            current = ticket.reviewPolicy,
+        )
+    }
+}
+
 data class BoardUiState(
     val board: BoardResponse? = null,
     val loading: Boolean = true,
@@ -92,6 +131,7 @@ data class BoardUiState(
     /** A lane move, add or end in flight. */
     val busy: Boolean = false,
     val start: BoardStartState? = null,
+    val reviewPolicy: ReviewPolicyEdit? = null,
     /** The queue, read with the board, so rows can show each agent's jobs. */
     val queue: li.rajeshgo.sm.data.model.QueueOverview? = null,
 )
@@ -234,6 +274,33 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openReviewPolicy(edit: ReviewPolicyEdit) {
+        _uiState.update { it.copy(reviewPolicy = edit) }
+    }
+
+    fun closeReviewPolicy() {
+        _uiState.update { if (it.reviewPolicy?.busy == true) it else it.copy(reviewPolicy = null) }
+    }
+
+    /** Stores the sheet's policy, or clears it when [reviewer] is null, then rereads the board. */
+    fun saveReviewPolicy(reviewer: li.rajeshgo.sm.data.model.Reviewer?) {
+        val edit = _uiState.value.reviewPolicy ?: return
+        _uiState.update { it.copy(reviewPolicy = edit.copy(busy = true, error = null)) }
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            repository.putReviewPolicy(url, token, li.rajeshgo.sm.data.model.PutReviewPolicyRequest(edit.scope, edit.repo, edit.number, reviewer))
+                .onSuccess {
+                    _uiState.update { it.copy(reviewPolicy = null) }
+                    load(url, token)
+                }
+                .onFailure { error ->
+                    if (!handleAuth(error)) {
+                        _uiState.update { it.copy(reviewPolicy = edit.copy(busy = false, error = error.message ?: "Couldn't save")) }
+                    }
+                }
+        }
+    }
+
     fun openStart(ticket: BoardTicket) {
         _uiState.update { it.copy(start = BoardStartState(ticket)) }
         viewModelScope.launch {
@@ -262,12 +329,19 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         return repository.fetchSessionModels(url, token, provider, workingDir)
     }
 
-    fun start(request: BoardStartRequest, onStarted: (String) -> Unit) {
+    /**
+     * Starts the author. [clearTicketPolicy] first removes the ticket's own
+     * review policy, when the owner switched the Reviewer row back to the lane's.
+     */
+    fun start(request: BoardStartRequest, clearTicketPolicy: Boolean = false, onStarted: (String) -> Unit) {
         val ticket = _uiState.value.start?.ticket ?: return
         updateStart(ticket) { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            repository.startBoardTicket(url, token, request)
+            val cleared = if (!clearTicketPolicy) Result.success(Unit) else repository.putReviewPolicy(
+                url, token, li.rajeshgo.sm.data.model.PutReviewPolicyRequest("ticket", request.repo, request.number, null),
+            )
+            cleared.mapCatching { repository.startBoardTicket(url, token, request).getOrThrow() }
                 .onSuccess { started ->
                     _uiState.update { it.copy(start = null) }
                     onStarted(started.name)

@@ -62,7 +62,12 @@ class MainActivity : ComponentActivity() {
     private fun takeFollowOpen(intent: Intent?) {
         val open = FollowOpen.fromIntent(intent) ?: return
         val lane = open.readerPath?.let(::boardLaneFromPath)
-        if (lane != null) BoardLinkRequests.pending = lane else FollowOpenRequests.pending = open
+        when {
+            open.readerPath?.startsWith("/settings") == true ->
+                li.rajeshgo.sm.ui.navigation.ReviewSettingsRequests.pending = true
+            lane != null -> BoardLinkRequests.pending = lane
+            else -> FollowOpenRequests.pending = open
+        }
         setIntent(Intent(this, MainActivity::class.java))
     }
 

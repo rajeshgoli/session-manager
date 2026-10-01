@@ -75,7 +75,20 @@ fun jobAgentLabel(job: SessionJob): String =
         ?: job.notifySessionId?.takeIf { it.isNotBlank() }?.take(8)
         ?: "no agent"
 
-fun jobTitle(job: SessionJob): String = job.label.ifBlank { job.id }
+fun jobTitle(job: SessionJob): String =
+    job.review?.let { "review · ${it.repo.substringAfter('/')} #${it.prNumber}" } ?: job.label.ifBlank { job.id }
+
+/**
+ * A review job's second line (sm#1768 Figure 5): `Codex run (gpt-6-sol, medium) · round 1 · for far-1848`,
+ * then why this reviewer when it is a fallback.
+ */
+fun reviewJobLine(job: SessionJob): String? = job.review?.let { review ->
+    listOfNotNull(
+        review.reviewerLabel?.takeIf { it.isNotBlank() },
+        "round ${review.round}",
+        review.authorName?.takeIf { it.isNotBlank() }?.let { "for $it" },
+    ).joinToString(" · ") + (review.why?.takeIf { it.isNotBlank() && it != "default" }?.let { "\n$it" } ?: "")
+}
 
 /** "tests · 4m of 15m · 12G · cpu 25% · gpu 3%"; use is the job's share of the whole Mac. */
 fun runningLine(job: SessionJob, now: OffsetDateTime): String {

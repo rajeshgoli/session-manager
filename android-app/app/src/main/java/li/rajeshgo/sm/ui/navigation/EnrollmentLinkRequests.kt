@@ -25,3 +25,8 @@ object ReaderLinkRequests {
 object NewSessionRequests {
     var pending by mutableStateOf(false)
 }
+
+/** Settings › Reviews asked for, by a "GitHub Codex paused" tap or "Change policy" (sm#1768 G5, D7). */
+object ReviewSettingsRequests {
+    var pending by mutableStateOf(false)
+}

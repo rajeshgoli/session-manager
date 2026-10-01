@@ -65,6 +65,14 @@ fun AppNavigation() {
         }
     }
 
+    // "GitHub Codex paused" and an Inbox item's "Change policy" open Settings › Reviews.
+    val reviewSettingsAsked = ReviewSettingsRequests.pending
+    LaunchedEffect(reviewSettingsAsked, isLoggedIn) {
+        if (reviewSettingsAsked && isLoggedIn == true && navController.currentDestination?.route != Routes.SETTINGS) {
+            navController.navigate(Routes.SETTINGS) { launchSingleTop = true }
+        }
+    }
+
     // A tapped notification opens when signed in: messages and review
     // requests in the Inbox (sm#1647), follow results on the watch screen.
     val pendingFollowOpen = FollowOpenRequests.pending

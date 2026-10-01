@@ -176,6 +176,7 @@ fun QueueScreen(
                                 title = jobTitle(job),
                                 agent = jobAgentLabel(job),
                                 line = runningLine(job, now),
+                                reason = reviewJobLine(job),
                                 progress = runningProgress(job, now),
                                 onClick = { sheetJob = job; viewModel.loadLog(job) },
                             )
@@ -188,7 +189,7 @@ fun QueueScreen(
                                 title = jobTitle(job),
                                 agent = jobAgentLabel(job),
                                 line = queuedLine(job, now),
-                                reason = queuedReason(job),
+                                reason = reviewJobLine(job) ?: queuedReason(job),
                                 prefix = job.position?.toString(),
                                 onClick = { sheetJob = job; viewModel.loadLog(job) },
                             )
@@ -419,6 +420,12 @@ private fun JobSheet(
         ) {
             Text(jobTitle(job), style = MaterialTheme.typography.titleLarge)
             Text(listOfNotNull(job.type, job.state, jobAgentLabel(job)).joinToString(" · "), color = TextSecondary)
+            job.review?.let { review ->
+                Detail("Reviews", "${review.repo} PR #${review.prNumber} · round ${review.round}")
+                review.reviewerLabel?.let { Detail("Reviewer", it) }
+                review.authorName?.let { Detail("For", it) }
+                Detail("Why", review.why?.takeIf { it.isNotBlank() } ?: review.policySource ?: "default")
+            }
             jobCommand(job)?.let { Detail("Command", it, mono = true) }
             job.cwd?.let { Detail("Folder", it, mono = true) }
             Detail(

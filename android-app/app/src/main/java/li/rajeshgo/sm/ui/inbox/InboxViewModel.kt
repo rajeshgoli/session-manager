@@ -52,6 +52,10 @@ data class InboxUiState(
     val revalidating: Boolean = false,
     val error: String? = null,
     val signedOut: Boolean = false,
+    /** Review requests no reviewer could take (sm#1768 D7), shown first on Open. */
+    val noReviewer: List<li.rajeshgo.sm.data.model.NoReviewerRequest> = emptyList(),
+    /** A Retry now or Review it myself in flight, by request id. */
+    val reviewBusy: String? = null,
 )
 
 /** The Inbox as last seen for [filter], or a loading state when it has never been read. */
@@ -104,12 +108,16 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
         val filter = _uiState.value.filter
         loadJob = viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
+            // An older server has no review status; the Inbox still loads.
+            val noReviewer = if (filter != InboxFilter.Open) emptyList() else runCatching {
+                repository.fetchReviewStatus(url, token).needsYou
+            }.getOrElse { if (it is CancellationException) throw it else _uiState.value.noReviewer }
             runCatching { repository.fetchInbox(url, token, filter.query) }
                 .onSuccess { response ->
                     InboxBadge.update(response)
                     _uiState.update {
                         if (it.filter != filter) it
-                        else it.copy(rows = response.rows, loading = false, refreshing = false, revalidating = false, error = null, signedOut = false)
+                        else it.copy(rows = response.rows, noReviewer = noReviewer, loading = false, refreshing = false, revalidating = false, error = null, signedOut = false)
                     }
                 }
                 .onFailure { error ->
@@ -125,6 +133,25 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
+        }
+    }
+
+    /**
+     * The no-reviewer item's Retry now ([owner] false) or Review it myself
+     * ([owner] true); [onResult] gets the failure's text, or null.
+     */
+    fun answerNoReviewer(requestId: String, owner: Boolean, onResult: (String?) -> Unit) {
+        if (_uiState.value.reviewBusy != null) return
+        _uiState.update { it.copy(reviewBusy = requestId) }
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            val result = if (owner) repository.ownReviewRequest(url, token, requestId)
+            else repository.retryReviewRequest(url, token, requestId)
+            _uiState.update { it.copy(reviewBusy = null) }
+            onResult(result.exceptionOrNull()?.let { it.message ?: "Request failed" })
+            loadJob?.cancel()
+            loadJob = null
+            refresh()
         }
     }
 
