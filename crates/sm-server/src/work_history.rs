@@ -1369,6 +1369,7 @@ impl HistoryData {
                     other => format!("claim on {subject} ended: {other}"),
                 }
             }
+            "claim.reopened" => format!("restored; claim on {subject} reopened"),
             "claim.handed_off" => {
                 let to = payload["successor_session_id"].as_str().unwrap_or_default();
                 format!("handed {subject} off to {} ({to})", name_of(to))
@@ -1433,6 +1434,16 @@ impl HistoryData {
                 "worktree {} removed",
                 payload["path"].as_str().unwrap_or_default()
             ),
+            "worktree.rebuilt" => {
+                let path = payload["path"].as_str().unwrap_or_default();
+                match payload["detached_at"].as_str() {
+                    Some(base) => format!("worktree {path} rebuilt detached at {base}"),
+                    None => format!(
+                        "worktree {path} rebuilt on {}",
+                        payload["branch"].as_str().unwrap_or_default()
+                    ),
+                }
+            }
             "worktree.left" => {
                 let path = payload["path"].as_str().unwrap_or_default();
                 match payload["reason"].as_str().unwrap_or_default() {

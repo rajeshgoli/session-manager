@@ -41,7 +41,8 @@ export const typingIn = (event) => {
   const target = event.composedPath?.()[0] || event.target;
   return !!target?.closest?.('input,textarea,select,[contenteditable]') || !!target?.isContentEditable;
 };
-export const toast = (text, onClick) => bus.emit('toast', { text, onClick });
+/** `action` adds a button, e.g. `{ label: 'Undo', run }`; `ms` how long it shows (6 s). */
+export const toast = (text, onClick, { action, ms } = {}) => bus.emit('toast', { text, onClick, action, ms });
 /** Open New agent, optionally filled in (Clone). */
 export const newAgent = (prefill) => bus.emit('new-agent', prefill || {});
 

@@ -1782,6 +1782,7 @@ pub(super) async fn start(
             wait: None,
             spawn_prompt_source: None,
             spawn_brief: None,
+            started_by_sm: true,
         },
     )
     .await;

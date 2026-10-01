@@ -134,3 +134,14 @@ test('agent types need distinct names and a model before Save', () => {
   assert.equal(problem([row('Mid'), row('mid ')]), 'Agent type names must be different.');
   assert.equal(problem([row('Mid', '  ')]), 'Give every agent type a model.');
 });
+
+test('auto-retire minutes accept 15 to 1440 whole minutes only', () => {
+  const { evaluate } = harness();
+  const minutes = evaluate('retireMinutes');
+  assert.equal(minutes('60'), 60);
+  assert.equal(minutes('15'), 15);
+  assert.equal(minutes('1440'), 1440);
+  for (const bad of ['', '14', '1441', '30.5', 'soon']) {
+    assert.throws(() => minutes(bad), /Enter a whole number from 15 to 1440/);
+  }
+});

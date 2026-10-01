@@ -640,11 +640,12 @@ impl ThreadCatalog {
         ordered
             .into_iter()
             .map(|(id, _)| {
-                let recipient = live_recipient(state, &id);
+                let recipient = super::super::messages::reply_recipient(state, &id);
+                let restores = recipient.as_ref().is_some_and(super::super::messages::restores);
                 json!({"id": id, "name": self.world.agent_name(&id),
                 "status": if self.world.live(&id) { "live" } else { "ended" },
                 "can_send": recipient.is_some(), "recipient_id": recipient.as_ref().map(|s| s.id.as_str()),
-                "recipient_name": recipient.map(session_display_name), "restores": false,
+                "recipient_name": recipient.map(session_display_name), "restores": restores,
                 "retired_at": self.world.sessions.get(&id).and_then(|s| s.completed_at.clone())})
             })
             .collect()

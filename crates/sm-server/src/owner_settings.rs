@@ -21,7 +21,13 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 4] = ["new_agent", "queue_limits", "terminal_limits", "reviews"];
+const KEYS: [&str; 5] = [
+    "new_agent",
+    "queue_limits",
+    "terminal_limits",
+    "reviews",
+    "auto_retire",
+];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
 const WHOLE_VALUES: [&str; 3] = ["repo_short", "reviewer", "agent_types"];
 const PLACEHOLDERS: [&str; 7] = [
@@ -53,6 +59,8 @@ pub const TERMINAL_LIMITS: [(&str, i64, i64); 4] = [
     ("max_attach_seconds", 60, 86_400),
 ];
 const AGENT_NAME_MAX_CHARS: usize = 32;
+/// Auto-retire delay range in minutes (sm#1839, spec 1821 E2).
+pub const AUTO_RETIRE_MINUTES: (i64, i64) = (15, 1440);
 
 pub const DEFAULT_NAME_PATTERN: &str = "{repo_short}-{number}";
 pub const DEFAULT_MESSAGE_TEMPLATE: &str = "Work ticket {ticket} in {repo}: {title}\n{url}\n\nYou already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree` and work in the worktree it prints, then follow this repo's CLAUDE.md.";
@@ -104,6 +112,10 @@ pub fn defaults() -> Value {
         "reviews": {
             "reviewer": { "kind": "github_codex" },
             "skip_meter_percent": 95,
+        },
+        "auto_retire": {
+            "enabled": true,
+            "idle_minutes": 60,
         },
     })
 }
@@ -243,6 +255,19 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
                 .is_some_and(|percent| (50..=100).contains(&percent))
             {
                 return Err("reviews.skip_meter_percent must be 50–100".to_owned());
+            }
+            Ok(())
+        }
+        "auto_retire" => {
+            if !value["enabled"].is_boolean() {
+                return Err("auto_retire.enabled must be a boolean".to_owned());
+            }
+            let (min, max) = AUTO_RETIRE_MINUTES;
+            if !value["idle_minutes"]
+                .as_i64()
+                .is_some_and(|minutes| (min..=max).contains(&minutes))
+            {
+                return Err(format!("auto_retire.idle_minutes must be {min}–{max}"));
             }
             Ok(())
         }
@@ -465,6 +490,16 @@ pub struct AgentType {
     pub provider: String,
     pub model: String,
     pub effort: String,
+}
+
+/// Whether finished idle agents retire on their own, and after how many
+/// minutes; `None` when off. From an object `effective` returned.
+pub fn auto_retire_minutes(settings: &Value) -> Option<u64> {
+    let auto_retire = &settings["auto_retire"];
+    auto_retire["enabled"]
+        .as_bool()
+        .filter(|enabled| *enabled)
+        .and_then(|_| auto_retire["idle_minutes"].as_u64())
 }
 
 /// The first ticket body line beginning `Tier:` names an agent type.
@@ -860,9 +895,26 @@ mod tests {
             (json!({"queue_limits": {"perf": 1.5}}), "queue_limits.perf must be an integer from 0 to 16, or null"),
             (json!({"queue_limits": 3}), "queue_limits must be an object"),
             (json!([]), "body must be a JSON object"),
+            (json!({"auto_retire": {"idle_minutes": 14}}), "auto_retire.idle_minutes must be 15–1440"),
+            (json!({"auto_retire": {"idle_minutes": 1441}}), "auto_retire.idle_minutes must be 15–1440"),
+            (json!({"auto_retire": {"enabled": "yes"}}), "auto_retire.enabled must be a boolean"),
         ] {
             assert_eq!(apply_patch(None, &patch).unwrap_err(), error, "{patch}");
         }
+    }
+
+    #[test]
+    fn auto_retire_is_on_after_an_hour_by_default_and_the_owner_can_change_both() {
+        assert_eq!(auto_retire_minutes(&effective(None)), Some(60));
+        let fifteen = json!({"auto_retire": {"idle_minutes": 15}});
+        let quarter = stored(None, apply_patch(None, &fifteen).unwrap());
+        assert_eq!(auto_retire_minutes(&effective(Some(&quarter))), Some(15));
+        let off = stored(
+            Some(&quarter),
+            apply_patch(Some(&quarter), &json!({"auto_retire": {"enabled": false}})).unwrap(),
+        );
+        assert_eq!(auto_retire_minutes(&effective(Some(&off))), None);
+        assert_eq!(effective(Some(&off))["auto_retire"]["idle_minutes"], 15);
     }
 
     #[test]

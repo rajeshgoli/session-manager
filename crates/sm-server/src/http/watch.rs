@@ -113,7 +113,7 @@ fn generated_at(now: OffsetDateTime) -> String {
 
 /// The same sources `sm watch` polls (`/sessions`, `/queue-jobs`,
 /// `/session-obligations`), read in-process, in `sm watch`'s tree order.
-fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError> {
+pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError> {
     let include_stopped = flag(&params.stopped);
     let records = state.session_store.list_sessions(true)?;
     let directory = SessionDirectory::new(records.iter().map(claims::session_info));

@@ -287,6 +287,8 @@ select.inp { padding: 3px 6px; }
 /* ---- toasts ----------------------------------------------------------------- */
 .toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 60; display: flex; flex-direction: column; gap: 6px; align-items: center; }
 .toast { background: var(--ink); color: var(--bg); padding: 7px 14px; border-radius: 8px; box-shadow: var(--shadow); cursor: pointer; border: 0; font-size: .9rem; }
+div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
+.toast-action { background: none; border: 0; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer; padding: 0; }
 
 /* ---- placeholder and terminal pages ------------------------------------------- */
 .stub { max-width: 34rem; color: var(--ink-2); display: flex; flex-direction: column; gap: 10px; }
