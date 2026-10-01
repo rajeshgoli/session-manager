@@ -7286,6 +7286,23 @@ impl SessionStore {
         authority: RetireAuthority,
         session_credential: Option<&str>,
     ) -> Result<CoreRetireOutcome> {
+        self.retire_core_session_authorized_if_finished_idle(
+            session_id,
+            authority,
+            session_credential,
+            false,
+            &|_| false,
+        )
+    }
+
+    pub fn retire_core_session_authorized_if_finished_idle(
+        &self,
+        session_id: &str,
+        authority: RetireAuthority,
+        session_credential: Option<&str>,
+        if_finished_idle: bool,
+        live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
+    ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
@@ -7301,6 +7318,9 @@ impl SessionStore {
             if !authority.can_retire(session) {
                 return Ok(authority.rejection_outcome(session));
             }
+            if if_finished_idle && !raw_session_is_finished_idle(session) {
+                return Ok(CoreRetireOutcome::PreconditionFailed);
+            }
             if raw_session_is_stopped(session) {
                 None
             } else {
@@ -7310,6 +7330,14 @@ impl SessionStore {
         let Some(recipient_name) = recipient_name else {
             return self.retire_stopped_session(state, session_id, &authority);
         };
+        if if_finished_idle
+            && sessions_snapshot
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_none_or(live_activity_blocks_retire)
+        {
+            return Ok(CoreRetireOutcome::PreconditionFailed);
+        }
         // A terminal write and its rotation finalization share this one atomic
         // state replacement, so recovery cannot later relaunch the seat.
         finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
@@ -7349,6 +7377,25 @@ impl SessionStore {
         session_credential: Option<&str>,
         runtime: &TmuxRuntime,
     ) -> Result<CoreRetireOutcome> {
+        self.retire_core_session_with_runtime_authorized_if_finished_idle(
+            session_id,
+            authority,
+            session_credential,
+            runtime,
+            false,
+            &|_| false,
+        )
+    }
+
+    pub fn retire_core_session_with_runtime_authorized_if_finished_idle(
+        &self,
+        session_id: &str,
+        authority: RetireAuthority,
+        session_credential: Option<&str>,
+        runtime: &TmuxRuntime,
+        if_finished_idle: bool,
+        live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
+    ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
@@ -7363,6 +7410,9 @@ impl SessionStore {
             };
             if !authority.can_retire(session) {
                 return Ok(authority.rejection_outcome(session));
+            }
+            if if_finished_idle && !raw_session_is_finished_idle(session) {
+                return Ok(CoreRetireOutcome::PreconditionFailed);
             }
             if raw_session_is_stopped(session) {
                 None
@@ -7380,6 +7430,14 @@ impl SessionStore {
         };
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
+        }
+        if if_finished_idle
+            && sessions_snapshot
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_none_or(live_activity_blocks_retire)
+        {
+            return Ok(CoreRetireOutcome::PreconditionFailed);
         }
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
         let requested_at = now_rfc3339();
@@ -9798,6 +9856,7 @@ pub struct CoreRetireResult {
 #[derive(Debug, Clone, Serialize)]
 pub enum CoreRetireOutcome {
     Retired(CoreRetireResult),
+    PreconditionFailed,
     NotFound,
     NotChild,
     RootProtected,
@@ -16476,6 +16535,11 @@ fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
         || completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
 }
 
+fn raw_session_is_finished_idle(session: &Map<String, Value>) -> bool {
+    !raw_session_is_stopped(session)
+        && json_text(session.get("agent_task_completed_at")).is_some_and(|at| !at.is_empty())
+}
+
 fn effective_raw_session_status(session: &Map<String, Value>) -> String {
     if raw_session_is_stopped(session) {
         "stopped".to_owned()
@@ -17385,6 +17449,90 @@ esac
         assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(state["sessions"][0]["completion_status"], "retired");
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn conditional_retire_rejects_an_agent_that_resumed_after_task_complete() {
+        let state_file = unique_temp_path("conditional-retire-resumed");
+        let mut session = reparent_test_session("resumed1", None, "secret");
+        session["agent_task_completed_at"] = json!("2026-06-01T00:01:00Z");
+        fs::write(&state_file, json!({ "sessions": [session] }).to_string()).unwrap();
+        let store = SessionStore::new(state_file.clone());
+        store
+            .apply_claude_pre_tool_use_hook("resumed1", Some("Read"))
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .retire_core_session_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    true,
+                    &|_| false,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test("/nonexistent/tmux".to_owned());
+        assert!(matches!(
+            store
+                .retire_core_session_with_runtime_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    &runtime,
+                    true,
+                    &|_| false,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_ne!(state["sessions"][0]["status"], "stopped");
+
+        // A fresh task-complete marker still permits the guarded one-click path.
+        let mut state = state;
+        state["sessions"][0]["agent_task_completed_at"] = json!("2026-06-01T00:02:00Z");
+        fs::write(&state_file, state.to_string()).unwrap();
+        assert!(matches!(
+            store
+                .retire_core_session_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    true,
+                    &|_| true,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        assert!(matches!(
+            store
+                .retire_core_session_with_runtime_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    &runtime,
+                    true,
+                    &|_| true,
+                )
+                .unwrap(),
+            CoreRetireOutcome::PreconditionFailed
+        ));
+        assert!(matches!(
+            store
+                .retire_core_session_authorized_if_finished_idle(
+                    "resumed1",
+                    RetireAuthority::operator("test"),
+                    None,
+                    true,
+                    &|_| false,
+                )
+                .unwrap(),
+            CoreRetireOutcome::Retired(_)
+        ));
     }
 
     #[test]
