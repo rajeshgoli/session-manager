@@ -1337,8 +1337,13 @@ async fn job_with_empty_rank_tickets_links_to_tickets_of_requesters_claimed_pr()
     assert_eq!(rank_tickets.as_deref(), Some("[]"));
     f.link_pr(77, 3);
     let ticket = f.ticket(3).await;
+    assert_eq!(ticket["jobs"].as_array().unwrap().len(), 1, "{ticket}");
     assert_eq!(ticket["jobs"][0]["id"], job["id"], "{ticket}");
     assert_eq!(ticket["jobs"][0]["state"], "waiting");
+    // Claiming the PR's ticket too names that ticket once.
+    f.claim(3, "eng00001");
+    let ticket = f.ticket(3).await;
+    assert_eq!(ticket["jobs"].as_array().unwrap().len(), 1, "{ticket}");
 }
 
 #[tokio::test]

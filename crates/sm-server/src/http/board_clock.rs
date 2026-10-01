@@ -292,6 +292,11 @@ pub(super) fn held_tickets(
             .or_default()
             .extend(numbers.into_iter().map(|number| (repo.clone(), number)));
     }
+    // A ticket claim and a claimed PR linked to it name the same ticket.
+    for tickets in held.values_mut() {
+        tickets.sort();
+        tickets.dedup();
+    }
     Ok(held)
 }
 
