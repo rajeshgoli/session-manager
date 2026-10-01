@@ -1801,6 +1801,10 @@ pub fn router(state: AppState) -> Router {
             "/client/review-requests/{request_id}/owner",
             post(client_owner_review_request),
         )
+        .route(
+            "/client/review-requests/{request_id}/dismiss",
+            post(client_dismiss_review_request),
+        )
         .route("/btw-requests/{request_id}", get(get_btw_request))
         .route(
             "/docs",
@@ -7043,6 +7047,25 @@ async fn client_owner_review_request(
     deliver_codex_review_wake_now(&state, &assigned);
     spawn_codex_review_request_watcher(state.clone(), assigned.id.clone());
     Ok(Json(codex_review_request_response(&state, assigned)?))
+}
+
+/// Dismiss on a "PR #n has no reviewer" item: the owner has nothing to do
+/// (the PR merged, or another review already landed). The item closes; the
+/// request stays `no_reviewer` and nothing goes to the author.
+async fn client_dismiss_review_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "POST", &uri, true)?;
+    let db_path = expand_home(&state.config.sm_send.db_path);
+    let request = RetainedQueueStore::get_codex_review_request_from_path(&db_path, &request_id)?
+        .ok_or(ApiError::NotFound("Review request not found"))?;
+    crate::owner_messages::OwnerMessageStore::new(db_path)
+        .mark_handled_by_delivery_key(&format!("review-no-reviewer:{request_id}"))?;
+    Ok(Json(codex_review_request_response(&state, request)?))
 }
 
 /// Read-only projection for watch and desktop clients. Activity remains a
@@ -22910,8 +22933,20 @@ mod tests {
 
     #[tokio::test]
     async fn review_status_lists_only_open_unreplaced_no_reviewer_requests() {
-        let signing_key = SigningKey::random(&mut OsRng);
-        let mut config = mobile_ticket_config(&signing_key);
+        let mut config = google_auth_config();
+        let bearer = format!(
+            "Bearer {}",
+            issue_device_access_token(&config, "rajeshgoli@gmail.com", "Rajesh")
+                .unwrap()
+                .access_token
+        );
+        let dismiss = |uri: &str| {
+            let mut request = local_request(Method::POST, uri, Body::empty());
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, bearer.parse().unwrap());
+            request
+        };
         let dir = std::env::temp_dir().join(format!(
             "sm-review-needs-you-{}-{}",
             std::process::id(),
@@ -22986,6 +23021,7 @@ mod tests {
         create(3, "2026-09-30T12:05:00Z");
         let app = router(AppState::new(config));
         let response = app
+            .clone()
             .oneshot(local_request(
                 Method::GET,
                 "/client/reviews/status",
@@ -23006,6 +23042,35 @@ mod tests {
             first["steps"],
             json!([{"label":"GitHub Codex","reason":"out of code-review quota"}])
         );
+        // Dismiss closes the item and leaves the request as it was.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(dismiss(&format!("/client/review-requests/{open}/dismiss")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "no_reviewer", "{body}");
+        let (_, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/client/reviews/status",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["needs_you"], json!([]), "{body}");
+        let (status, _) = response_json(
+            app.oneshot(dismiss("/client/review-requests/missing/dismiss"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(dir);
     }
 

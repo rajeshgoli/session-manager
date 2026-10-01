@@ -641,6 +641,10 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).ownReviewRequest(requestId); Unit }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun dismissReviewRequest(baseUrl: String, token: String, requestId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).dismissReviewRequest(requestId); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchGuestbook(baseUrl: String, token: String, repo: String?, before: Long?): li.rajeshgo.sm.data.model.GuestbookResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getGuestbook(repo, before) }
     }
