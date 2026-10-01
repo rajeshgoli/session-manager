@@ -82,6 +82,8 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
           let sessions = fixture();
           const answered = [];
           const opened = [];
+          const retired = [];
+          const handoffs = [];
           await page.clock.install({ time: new Date(NOW) });
           await page.exposeFunction('recordOpen', (url) => opened.push(url));
           await page.addInitScript(() => { window.open = (url) => { window.recordOpen(url); return null; }; });
@@ -99,6 +101,15 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
               answered.push(id);
               sessions = sessions.map((s) => (s.id === id ? { ...s, facts: { ...s.facts, you: null }, attention: { section: 'idle', reason: null, order_key: '0' } } : s));
               return route.fulfill({ json: { facts: null } });
+            }
+            const retire = /^\/sessions\/([^/]+)\/retire$/.exec(url.pathname);
+            if (retire && request.method() === 'POST') {
+              retired.push(decodeURIComponent(retire[1]));
+              return route.fulfill({ json: {} });
+            }
+            if (url.pathname.endsWith('/handoff-policy') && request.method() === 'PUT') {
+              handoffs.push(JSON.parse(request.postData()));
+              return route.fulfill({ json: {} });
             }
             if (url.pathname.endsWith('/last-turn')) return route.fulfill({ status: 404, json: { detail: 'none' } });
             if (url.pathname === '/watch/state') {
@@ -125,7 +136,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
           assert.equal((await card('sm-1726-engineer').locator('.you').innerText()).startsWith('◆ 6m: one manual Chrome check'), true);
           assert.equal(await card('sm-1790-reviewer').locator('.facts .fa').first().innerText(), '● Working 3m');
           assert.equal(await card('sm-1790-reviewer').locator('.ok').count(), 0, 'a doc review has no ✓');
-          assert.equal(await card('far-1855').locator('.you').innerText(), '✔ 1855 done and closed: 68 views built, all checks pass, PR merged and the ticket closed.');
+          assert.ok((await card('far-1855').locator('.you').innerText()).startsWith('✔ 1855 done and closed: 68 views built, all checks pass, PR merged and the ticket closed.'));
           assert.equal(await card('iter8-run').locator('.facts .fa').nth(1).innerText(), '▶ 2 running · 2h 56m');
           assert.equal(await card('sm-1782').locator('.facts .fa').nth(1).innerText(), '⏸ Waiting 8m · 1st in line');
           assert.equal(await card('iter8-run').locator('.you').count(), 0);
@@ -139,6 +150,47 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
           const name = `agents-${viewport.width}-${colorScheme}-${size}`;
           if (shots) await page.screenshot({ path: `${shots}/${name}.png`, fullPage: true });
           assert.deepEqual(errors, []);
+
+          if (size === 15) {
+            // The finished card retires directly without opening the details band.
+            if (shots) await page.screenshot({ path: `${shots}/retire-card-${viewport.width}-${colorScheme}.png`, fullPage: true });
+            await card('far-1855').getByRole('button', { name: 'Retire' }).click();
+            assert.deepEqual(retired, ['far-1855']);
+            assert.equal(new URL(page.url()).searchParams.get('open'), null);
+            await card('far-1855').click();
+            await page.locator('.details-band').waitFor();
+            if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
+            const actions = page.locator('.details-band .acts');
+            assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button').allInnerTexts(),
+              ['Open in Claude ↗', '⌨ Terminal', 'Retire', 'Hand off…', '⋯']);
+            if (shots) await page.screenshot({ path: `${shots}/retire-band-${viewport.width}-${colorScheme}.png`, fullPage: true });
+            await actions.getByRole('button', { name: 'More' }).click();
+            const menu = actions.locator('.pop.menu');
+            assert.deepEqual(await menu.locator(':scope > button').allInnerTexts(),
+              ['Hand off now', 'Clone', 'Follow', 'Copy attach command']);
+            const menuBox = await menu.boundingBox();
+            const bandBox = await page.locator('.details-band').boundingBox();
+            assert.ok(menuBox.x >= bandBox.x && menuBox.x + menuBox.width <= bandBox.x + bandBox.width,
+              `menu fits inside the details band at ${viewport.width} px`);
+            if (shots) await page.screenshot({ path: `${shots}/retire-menu-${viewport.width}-${colorScheme}.png`, fullPage: true });
+            await menu.getByRole('button', { name: 'Hand off now' }).click();
+            await menu.getByRole('button', { name: 'Confirm handoff' }).click();
+            assert.deepEqual(handoffs, [{ ask_now: true }]);
+            await card('sm-1776').click();
+            await page.waitForFunction(() => document.querySelector('.details-band .phd .t')?.textContent === 'sm-1776');
+            if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
+            await page.locator('.details-band .acts').getByRole('button', { name: 'Retire' }).click();
+            assert.equal((await page.locator('.details-band .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Retire Cancel');
+            assert.deepEqual(retired, ['far-1855']);
+            if (shots) await page.screenshot({ path: `${shots}/retire-confirm-${viewport.width}-${colorScheme}.png`, fullPage: true });
+            await page.locator('.details-band .retire-confirm').getByRole('button', { name: 'Cancel' }).click();
+            await page.locator('.details-band').getByRole('button', { name: 'Close (Esc)' }).click();
+            await page.locator('.details-band').waitFor({ state: 'hidden' });
+            if (viewport.width === 1440 && colorScheme === 'light') {
+              await page.reload();
+              await page.waitForFunction(() => document.querySelectorAll('.acard').length > 5);
+            }
+          }
 
           if (viewport.width === 1440 && colorScheme === 'light' && size === 15) {
             // Clicking an icon does not open the band.

@@ -1,5 +1,5 @@
 // Hand off… (spec 1782 appendix I): automatic handoff for an agent and its
-// successors, or for the ticket it holds, then Hand off now. Opened from the
+// successors, or for the ticket it holds. Opened from the
 // agent band and from a Board ticket's ⋯.
 import { useEffect, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, Toggle } from './ui.js';
@@ -27,7 +27,7 @@ const SOURCE = { override: 'Set for this agent', ticket: 'From its ticket', defa
  * number}` or null; without it the agent's ticket claim is used. `scope`
  * picks the first view: `agent` or `ticket`.
  */
-export function HandoffPopover({ agent: given, ticket, scope: initialScope, align, onClose }) {
+export function HandoffPopover({ agent: given, ticket, scope: initialScope, align, onClose, showAskNow = true }) {
   // A Board holder carries only its id and name; its provider and model,
   // which set the window, come from `/watch/state`.
   const [watched, setWatched] = useState(null);
@@ -103,7 +103,7 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
           <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>`
       : null}
     <span class="sub" role="status">${note}</span>
-    ${live ? html`<hr class="pop-rule" />
+    ${live && showAskNow ? html`<hr class="pop-rule" />
       <div class="row" style="justify-content:flex-start">${asking
         ? html`<span class="confirm">Ask ${agent.name || 'this agent'} to hand off now?
             <button type="button" class="btn sm danger" onClick=${() => { setAsking(false); write({ ask_now: true }); }}>Confirm handoff</button>

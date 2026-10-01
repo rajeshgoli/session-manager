@@ -180,8 +180,41 @@ const openTerminal = (agent) => navigate(`/terminal/${encodeURIComponent(agent.i
 // A long finished summary stays readable on hover without a huge tooltip.
 const hoverText = (text) => (text.length > 1000 ? `${text.slice(0, 1000)}…` : text);
 
+/** A finished agent is safe to retire immediately only after its current turn is idle. */
+export const canRetireImmediately = (agent) => !!agent.facts?.finished && agent.facts?.agent?.state === 'idle';
+
+function RetireButton({ agent, onRetired, small = false }) {
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const retire = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, { method: 'POST', body: {} });
+      toast(`Retired ${agent.name}`);
+      setAsking(false);
+      onRetired?.();
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const click = (event) => {
+    event.stopPropagation();
+    if (canRetireImmediately(agent)) retire();
+    else setAsking(true);
+  };
+  return asking
+    ? html`<span class="confirm retire-confirm" onClick=${(event) => event.stopPropagation()}>Retire ${agent.name}?
+        <button type="button" class="btn sm danger" disabled=${busy} onClick=${retire}>Retire</button>
+        <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></span>`
+    : html`<button type="button" class=${`btn danger ${small ? 'sm' : ''}`} disabled=${busy}
+        onClick=${click}>Retire</button>`;
+}
+
 /** The Agent, Jobs and You facts (1782 F), shared by the card and the details band. */
-function Facts({ agent, now, onAnswered }) {
+function Facts({ agent, now, onAnswered, onRetired, cardSection }) {
   const working = agentFact(agent, now);
   const jobs = jobsFact(agent);
   const you = youFact(agent, now);
@@ -195,7 +228,9 @@ function Facts({ agent, now, onAnswered }) {
           ${you.dismissible
             ? html`<button type="button" class="icon-btn ok" title=${you.tone === 'cyan' ? 'Mark read (x)' : 'Mark answered (x)'} aria-label=${you.tone === 'cyan' ? 'Mark read' : 'Mark answered'}
                 onClick=${(event) => { event.stopPropagation(); markAnswered(agent, onAnswered); }}>✓</button>`
-            : null}</span>`
+            : null}
+          ${cardSection === 'finished' && agent.state !== 'stopped'
+            ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} small />` : null}</span>`
       : null}
     ${agent.facts?.note
       ? html`<span class="you note" title=${agent.facts.note.text}><span class="fa">📌 ${agent.facts.note.text}</span></span>`
@@ -278,7 +313,7 @@ export function AgentsPage({ openRef }) {
   const card = (agent, depth = 0) => {
     order.push(agent);
     return html`<${AgentCard} key=${agent.id} agent=${agent} depth=${depth} now=${now} showRepo=${view === 'attention'}
-      selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} />`;
+      selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} onRetired=${reload} />`;
   };
   const sections = view === 'attention' ? sectionAgents(sessions) : [];
   const groups = view === 'repo' ? groupAgents(sessions) : [];
@@ -398,7 +433,7 @@ export function groupAgents(sessions) {
     .sort((a, b) => Number(b.busy) - Number(a.busy) || basename(a.repo).localeCompare(basename(b.repo)));
 }
 
-function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered }) {
+function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered, onRetired }) {
   const codex = (agent.provider || '').startsWith('codex');
   const section = sectionOf(agent);
   const faded = ['idle', 'stopped'].includes(section) && !hasTicket(agent);
@@ -421,7 +456,7 @@ function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered }
     <span class="ln"><span class=${`prov ${codex ? 'codex' : 'claude'}`}>${codex ? 'CODEX' : 'CLAUDE'}</span>
       <span class="tk"> ${ticketText(agent)}</span>
       ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
-    <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} />
+    <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} onRetired=${onRetired} cardSection=${section} />
   </div>`;
 }
 
@@ -458,7 +493,7 @@ export function AgentPanel({ id, controls }) {
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
-    <${AgentActions} agent=${agent} />
+    <${AgentActions} agent=${agent} onRetired=${reload} />
     <${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
       prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
       jobs=${agent.jobs || []} thread=${agent.thread}
@@ -478,7 +513,7 @@ export function AgentPanel({ id, controls }) {
   `;
 }
 
-function AgentActions({ agent }) {
+function AgentActions({ agent, onRetired }) {
   const [menu, setMenu] = useState(null);
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
@@ -487,24 +522,21 @@ function AgentActions({ agent }) {
     ${linked ? html`<button type="button" class="btn pri" onClick=${() => openInClaude(agent)}>Open in Claude ↗</button>` : null}
     ${live
       ? html`<button type="button" class=${linked ? 'btn' : 'btn pri'}
-          onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>Terminal</button>`
+          onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨ Terminal</button>`
       : null}
-    <${FollowButton} id=${agent.id} />
+    ${live ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} />` : null}
     ${live
       ? html`<span class="anchor"><button type="button" class="btn" data-pop-anchor
           onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
-          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} onClose=${close} />` : null}</span>`
+          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} onClose=${close} showAskNow=${false} />` : null}</span>`
       : null}
-    <button type="button" class="btn" onClick=${() => newAgent({
-      provider: agent.provider, model: agent.model, effort: agent.reasoning_effort, workspace: agent.working_dir,
-    })}>Clone</button>
     <span class="anchor"><button type="button" class="btn" data-pop-anchor aria-label="More"
       onClick=${() => setMenu(menu === 'more' ? null : 'more')}>⋯</button>
       ${menu === 'more' ? html`<${MoreMenu} agent=${agent} onClose=${close} />` : null}</span>
   </div>`;
 }
 
-function FollowButton({ id }) {
+function FollowButton({ id, menu = false, onClose }) {
   const [follows, , reload] = usePoll(() => api('/client/follows'), 30000, [id]);
   const [busy, setBusy] = useState(false);
   const following = !!(follows && (follows.follows || []).some(
@@ -515,18 +547,20 @@ function FollowButton({ id }) {
     try {
       await api(`/sessions/${encodeURIComponent(id)}/follow`, { method: following ? 'DELETE' : 'POST', body: {} });
       reload();
+      onClose?.();
     } catch (error) {
       toast(error.message);
     } finally {
       setBusy(false);
     }
   };
-  return html`<button type="button" class=${following ? 'btn on' : 'btn'} aria-pressed=${following}
-    disabled=${busy || !follows} onClick=${toggle}>${following ? 'Following' : 'Follow'}</button>`;
+  return html`<button type="button" class=${menu ? '' : following ? 'btn on' : 'btn'} aria-pressed=${following}
+    disabled=${busy || !follows} onClick=${toggle}>${following ? menu ? 'Unfollow' : 'Following' : 'Follow'}</button>`;
 }
 
 function MoreMenu({ agent, onClose }) {
-  const [retiring, setRetiring] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(agent.attach);
@@ -536,24 +570,31 @@ function MoreMenu({ agent, onClose }) {
     }
     onClose();
   };
-  const retire = async () => {
+  const handoffNow = async () => {
+    setBusy(true);
     try {
-      await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, { method: 'POST', body: {} });
-      toast(`Retired ${agent.name}`);
+      await api(`/sessions/${encodeURIComponent(agent.id)}/handoff-policy`, { method: 'PUT', body: { ask_now: true } });
+      toast(`Asked ${agent.name} to hand off`);
       onClose();
     } catch (error) {
       toast(error.message);
+    } finally {
+      setBusy(false);
     }
   };
-  return html`<${Popover} onClose=${onClose} align="right" className="menu">
+  return html`<${Popover} onClose=${onClose} className="menu">
+    ${agent.state !== 'stopped'
+      ? asking
+        ? html`<div class="confirm" style="padding:6px 10px">Ask ${agent.name} to hand off now?
+            <button type="button" class="btn sm danger" disabled=${busy} onClick=${handoffNow}>Confirm handoff</button>
+            <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></div>`
+        : html`<button type="button" onClick=${() => setAsking(true)}>Hand off now</button>`
+      : null}
+    <button type="button" onClick=${() => { onClose(); newAgent({
+      provider: agent.provider, model: agent.model, effort: agent.reasoning_effort, workspace: agent.working_dir,
+    }); }}>Clone</button>
+    <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
-    ${agent.state === 'stopped'
-      ? null
-      : retiring
-        ? html`<div class="confirm" style="padding:6px 10px">Retire ${agent.name}?
-            <button type="button" class="btn sm danger" onClick=${retire}>Retire</button>
-            <button type="button" class="btn sm" onClick=${() => setRetiring(false)}>Cancel</button></div>`
-        : html`<button type="button" class="red" onClick=${() => setRetiring(true)}>Retire…</button>`}
   <//>`;
 }
 

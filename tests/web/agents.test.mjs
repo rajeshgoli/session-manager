@@ -16,7 +16,7 @@ function load(path) {
 const agents = load(`${root}/agents.js`);
 await agents.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await agents.evaluate();
-const { sectionAgents, foldIdle, foldText, summaryCounts, agentFact, jobsFact, youFact, edgeTone, groupAgents } = agents.namespace;
+const { sectionAgents, foldIdle, foldText, summaryCounts, agentFact, jobsFact, youFact, edgeTone, groupAgents, canRetireImmediately } = agents.namespace;
 
 // Spec 1782 appendix B's worked examples, as GET /watch/state draws them at 19:47 UTC.
 const now = Date.parse('2026-09-30T19:47:00Z');
@@ -125,4 +125,13 @@ test('By repo puts busy repos first and children after their parent', () => {
   const groups = groupAgents([other, child, parent]);
   assert.deepEqual(groups.map((g) => g.repo), ['/r/b', '/r/a']);
   assert.deepEqual(groups[0].agents.map((e) => [e.agent.name, e.depth]), [['parent', 0], ['child', 1]]);
+});
+
+test('only a finished idle agent retires without confirmation', () => {
+  assert.equal(canRetireImmediately(fixtures.far), true);
+  assert.equal(canRetireImmediately(fixtures.idle), false);
+  assert.equal(canRetireImmediately(fixtures.working), false);
+  assert.equal(canRetireImmediately({ ...fixtures.far, facts: {
+    ...fixtures.far.facts, agent: { state: 'working' },
+  } }), false);
 });
