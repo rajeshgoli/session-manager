@@ -109,6 +109,7 @@ fun SettingsScreen(
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
+        SettingsGroup("Appearance") { TextSizeSetting() }
         ConnectionSettings(
             state,
             viewModel,
@@ -138,6 +139,30 @@ fun SettingsScreen(
         }
         if (advanced) AdvancedSettings(state, viewModel)
     }
+}
+
+/** Text size, 85% to 130% in 5% steps; it applies as the slider moves (spec 1782 A1). */
+@Composable
+private fun TextSizeSetting() {
+    val context = LocalContext.current
+    val settings = remember(context) { li.rajeshgo.sm.data.repository.SettingsRepository(context.applicationContext) }
+    val saved by settings.textScale.collectAsState(initial = li.rajeshgo.sm.data.repository.TEXT_SCALE_DEFAULT)
+    val scope = rememberCoroutineScope()
+    val save = { scale: Float -> scope.launch { settings.saveTextScale(scale) }; Unit }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Text size", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Text("${Math.round(saved * 100)}%", style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+        TextButton(
+            onClick = { save(li.rajeshgo.sm.data.repository.TEXT_SCALE_DEFAULT) },
+            enabled = saved != li.rajeshgo.sm.data.repository.TEXT_SCALE_DEFAULT,
+        ) { Text("Reset") }
+    }
+    Slider(
+        value = saved,
+        onValueChange = { save(li.rajeshgo.sm.data.repository.normalizeTextScale(it)) },
+        valueRange = li.rajeshgo.sm.data.repository.TEXT_SCALE_MIN..li.rajeshgo.sm.data.repository.TEXT_SCALE_MAX,
+        steps = 8,
+    )
 }
 
 @Composable

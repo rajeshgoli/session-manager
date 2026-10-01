@@ -81,6 +81,13 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -164,6 +171,9 @@ fun WatchScreen(
     var followDialogSession by remember { mutableStateOf<ClientSession?>(null) }
     var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
+    // By attention (the server's sections) unless the owner picked By repo in the menu (spec 1782 J2).
+    var byRepo by rememberSaveable { mutableStateOf(false) }
+    val attention = remember(state.sessions, filter, query) { attentionGroups(state.sessions, filter, query) }
     val sections = remember(state.sessions, filter, query) {
         filterSections(buildSections(state.sessions), filter, query)
     }
@@ -311,7 +321,7 @@ fun WatchScreen(
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 128.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             item {
                 AppTopBar(
@@ -325,6 +335,13 @@ fun WatchScreen(
                     busy = state.refreshing,
                     current = Routes.WATCH,
                     onRefresh = { viewModel.refresh() },
+                    refreshBar = state.revalidating,
+                    menuEntries = { close ->
+                        DropdownMenuItem(
+                            text = { Text(if (byRepo) "By attention" else "By repo") },
+                            onClick = { close(); byRepo = !byRepo },
+                        )
+                    },
                     updateViewModel = updateViewModel,
                 )
             }
@@ -358,115 +375,77 @@ fun WatchScreen(
                 }
             }
 
-            if (sections.isEmpty()) {
+            val rowActions = WatchRowActions(
+                onToggleExpanded = { viewModel.toggleExpanded(it) },
+                onOpenAttach = openAttach,
+                onClone = { cloneSource = it; createError = null; creating = true },
+                onCopyAttach = { session ->
+                    val command = session.termuxAttach?.let(::termuxAttachCommand)
+                    if (command == null) {
+                        toast = "Attach command unavailable"
+                    } else {
+                        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm attach", command))
+                        toast = "Attach command copied"
+                    }
+                },
+                onOpenTelegram = { session ->
+                    val link = telegramLink(session)
+                    if (link == null) {
+                        toast = "Telegram thread unavailable"
+                    } else {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                        }.onFailure { error ->
+                            toast = error.message ?: "Unable to open Telegram"
+                        }
+                    }
+                },
+                onWhat = viewModel::requestWhat,
+                onUpdateWhat = viewModel::updateWhat,
+                onRegenerateWhat = viewModel::regenerateWhat,
+                onKill = { session ->
+                    viewModel.retireSession(session.id) { result ->
+                        toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
+                    }
+                },
+                onAnswered = { session ->
+                    viewModel.answerNeedsYou(session) { result -> toast = result.exceptionOrNull()?.message ?: result.getOrNull() }
+                },
+                onOpenPage = { openPage = it },
+                follow = follow,
+            )
+            val rowState = WatchRowState(sessionsById, state.expandedSessionIds, state.detailsBySessionId, state.whatBySessionId)
+            if (if (byRepo) sections.isEmpty() else attention.isEmpty()) {
                 item {
                     EmptyState(query = query, filter = filter)
+                }
+            } else if (!byRepo) {
+                attention.forEach { group ->
+                    item(key = "section-${group.section}") {
+                        SectionHeading(group.label, sectionColor(group.section))
+                    }
+                    items(group.sessions, key = { "attention-${it.id}" }) { session ->
+                        SessionRow(session, depth = 0, rowState, rowActions)
+                    }
                 }
             } else {
                 activeSections.forEach { section ->
                     item(key = "repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Active")
+                        SectionHeading("${section.repoLabel.removeSuffix("/")} · Active", Cyan)
                     }
                     items(section.roots, key = { "active-${it.session.id}" }) { root ->
-                        WatchTree(
-                            node = root,
-                            depth = 0,
-                            slice = TreeSlice.Active,
-                            sessionsById = sessionsById,
-                            expandedSessionIds = state.expandedSessionIds,
-                            detailsById = state.detailsBySessionId,
-                            whatById = state.whatBySessionId,
-                            onToggleExpanded = { viewModel.toggleExpanded(it) },
-                            onOpenAttach = openAttach,
-                            onClone = { cloneSource = it; createError = null; creating = true },
-                            onCopyAttach = { session ->
-                                val command = session.termuxAttach?.let(::termuxAttachCommand)
-                                if (command == null) {
-                                    toast = "Attach command unavailable"
-                                } else {
-                                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm attach", command))
-                                    toast = "Attach command copied"
-                                }
-                            },
-                            onOpenTelegram = { session ->
-                                val link = telegramLink(session)
-                                if (link == null) {
-                                    toast = "Telegram thread unavailable"
-                                } else {
-                                    runCatching {
-                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        })
-                                    }.onFailure { error ->
-                                        toast = error.message ?: "Unable to open Telegram"
-                                    }
-                                }
-                            },
-                            onWhat = viewModel::requestWhat,
-                            onUpdateWhat = viewModel::updateWhat,
-                            onRegenerateWhat = viewModel::regenerateWhat,
-                            onKill = { session ->
-                                viewModel.retireSession(session.id) { result ->
-                                    toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
-                                }
-                            },
-                            onOpenPage = { openPage = it },
-                            follow = follow,
-                        )
+                        WatchTree(root, depth = 0, slice = TreeSlice.Active, rowState, rowActions)
                     }
                 }
                 idleSections.forEach { section ->
                     item(key = "idle-repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Idle")
+                        SectionHeading("${section.repoLabel.removeSuffix("/")} · Idle", TextMuted)
                     }
                     items(section.roots, key = { "idle-${it.session.id}" }) { root ->
-                        WatchTree(
-                            node = root,
-                            depth = 0,
-                            slice = TreeSlice.Idle,
-                            sessionsById = sessionsById,
-                            expandedSessionIds = state.expandedSessionIds,
-                            detailsById = state.detailsBySessionId,
-                            whatById = state.whatBySessionId,
-                            onToggleExpanded = { viewModel.toggleExpanded(it) },
-                            onOpenAttach = openAttach,
-                            onClone = { cloneSource = it; createError = null; creating = true },
-                            onCopyAttach = { session ->
-                                val command = session.termuxAttach?.let(::termuxAttachCommand)
-                                if (command == null) {
-                                    toast = "Attach command unavailable"
-                                } else {
-                                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm attach", command))
-                                    toast = "Attach command copied"
-                                }
-                            },
-                            onOpenTelegram = { session ->
-                                val link = telegramLink(session)
-                                if (link == null) {
-                                    toast = "Telegram thread unavailable"
-                                } else {
-                                    runCatching {
-                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        })
-                                    }.onFailure { error ->
-                                        toast = error.message ?: "Unable to open Telegram"
-                                    }
-                                }
-                            },
-                            onWhat = viewModel::requestWhat,
-                            onUpdateWhat = viewModel::updateWhat,
-                            onRegenerateWhat = viewModel::regenerateWhat,
-                            onKill = { session ->
-                                viewModel.retireSession(session.id) { result ->
-                                    toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
-                                }
-                            },
-                            onOpenPage = { openPage = it },
-                            follow = follow,
-                        )
+                        WatchTree(root, depth = 0, slice = TreeSlice.Idle, rowState, rowActions)
                     }
                 }
             }
@@ -1157,36 +1136,81 @@ private fun SummaryBadge(label: String, tint: Color) {
     }
 }
 
+/** A coloured bold section word, as in the Inbox. */
 @Composable
-private fun RepoHeader(title: String) {
+private fun SectionHeading(title: String, color: Color) {
     Text(
         text = title,
         style = MaterialTheme.typography.labelSmall,
-        color = Cyan,
-        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Bold,
+        color = color,
+        modifier = Modifier.padding(top = 8.dp, start = 2.dp),
     )
 }
+
+/** Section heading colours (spec 1782 A3). */
+private fun sectionColor(section: String): Color = when (section) {
+    "you" -> Fuchsia
+    "finished" -> Cyan
+    "waiting_long", "waiting" -> Amber
+    "moving" -> Emerald
+    else -> TextMuted
+}
+
+/** A row's left edge: its section colour; red for a quiet job or a stalled agent. */
+private fun sectionEdgeColor(session: ClientSession): Color {
+    val section = attentionSection(session)
+    return when {
+        section == "waiting_long" && session.attention?.reason in setOf("quiet", "stalled") -> Rose
+        section == "idle" || section == "stopped" -> Border
+        else -> sectionColor(section)
+    }
+}
+
+private fun jobsToneColor(tone: String?): Color = when (tone) {
+    "green" -> Emerald
+    "amber" -> Amber
+    "red" -> Rose
+    else -> TextSecondary
+}
+
+private fun providerTag(provider: String?): String = when (provider) {
+    null, "", "claude" -> "CLAUDE"
+    "codex", "codex-fork", "codex-app" -> "CODEX"
+    else -> provider.uppercase()
+}
+
+/** What every Watch row reads. */
+private class WatchRowState(
+    val sessionsById: Map<String, ClientSession>,
+    val expandedSessionIds: Set<String>,
+    val detailsById: Map<String, SessionDetail>,
+    val whatById: Map<String, WhatUiState>,
+)
+
+/** What every Watch row can do. */
+private class WatchRowActions(
+    val onToggleExpanded: (ClientSession) -> Unit,
+    val onOpenAttach: (ClientSession) -> Unit,
+    val onClone: (ClientSession) -> Unit,
+    val onCopyAttach: (ClientSession) -> Unit,
+    val onOpenTelegram: (ClientSession) -> Unit,
+    val onWhat: (ClientSession) -> Unit,
+    val onUpdateWhat: (ClientSession) -> Unit,
+    val onRegenerateWhat: (ClientSession) -> Unit,
+    val onKill: (ClientSession) -> Unit,
+    val onAnswered: (ClientSession) -> Unit,
+    val onOpenPage: (ReaderPage) -> Unit,
+    val follow: FollowUi,
+)
 
 @Composable
 private fun WatchTree(
     node: WatchSessionNode,
     depth: Int,
     slice: TreeSlice,
-    sessionsById: Map<String, ClientSession>,
-    expandedSessionIds: Set<String>,
-    detailsById: Map<String, SessionDetail>,
-    whatById: Map<String, WhatUiState>,
-    onToggleExpanded: (ClientSession) -> Unit,
-    onOpenAttach: (ClientSession) -> Unit,
-    onClone: (ClientSession) -> Unit,
-    onCopyAttach: (ClientSession) -> Unit,
-    onOpenTelegram: (ClientSession) -> Unit,
-    onWhat: (ClientSession) -> Unit,
-    onUpdateWhat: (ClientSession) -> Unit,
-    onRegenerateWhat: (ClientSession) -> Unit,
-    onKill: (ClientSession) -> Unit,
-    onOpenPage: (ReaderPage) -> Unit,
-    follow: FollowUi,
+    rowState: WatchRowState,
+    actions: WatchRowActions,
 ) {
     if (!nodeMatchesSlice(node, slice)) {
         return
@@ -1194,25 +1218,7 @@ private fun WatchTree(
 
     val renderNode = shouldRenderNode(node, slice)
     if (renderNode) {
-        SessionRow(
-            session = node.session,
-            depth = depth,
-            parentLabel = parentLabel(node.session, sessionsById),
-            expanded = expandedSessionIds.contains(node.session.id),
-            detail = detailsById[node.session.id],
-            whatState = whatById[node.session.id],
-            onToggleExpanded = { onToggleExpanded(node.session) },
-            onOpenAttach = { onOpenAttach(node.session) },
-            onClone = { onClone(node.session) },
-            onCopyAttach = { onCopyAttach(node.session) },
-            onOpenTelegram = { onOpenTelegram(node.session) },
-            onWhat = { onWhat(node.session) },
-            onUpdateWhat = { onUpdateWhat(node.session) },
-            onRegenerateWhat = { onRegenerateWhat(node.session) },
-            onKill = { onKill(node.session) },
-            onOpenPage = onOpenPage,
-            follow = follow,
-        )
+        SessionRow(node.session, depth, rowState, actions)
     }
 
     val childDepth = if (renderNode) depth + 1 else depth
@@ -1220,7 +1226,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage, follow)
+            WatchTree(child, childDepth, slice, rowState, actions)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1237,32 +1243,39 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage, follow)
+            WatchTree(child, groupDepth + 1, slice, rowState, actions)
         }
     }
 }
 
+/**
+ * One agent in the Board and Inbox style (spec 1782 J1): a panel with a left edge
+ * in its section colour, the name and tags, then the facts line (J2), then what it
+ * needs from the owner, with ✓, or its finished summary.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SessionRow(
     session: ClientSession,
     depth: Int,
-    parentLabel: String,
-    expanded: Boolean,
-    detail: SessionDetail?,
-    whatState: WhatUiState?,
-    onToggleExpanded: () -> Unit,
-    onOpenAttach: () -> Unit,
-    onClone: () -> Unit,
-    onCopyAttach: () -> Unit,
-    onOpenTelegram: () -> Unit,
-    onWhat: () -> Unit,
-    onUpdateWhat: () -> Unit,
-    onRegenerateWhat: () -> Unit,
-    onKill: () -> Unit,
-    onOpenPage: (ReaderPage) -> Unit,
-    follow: FollowUi,
+    rowState: WatchRowState,
+    actions: WatchRowActions,
 ) {
+    val parentLabel = parentLabel(session, rowState.sessionsById)
+    val expanded = session.id in rowState.expandedSessionIds
+    val detail = rowState.detailsById[session.id]
+    val whatState = rowState.whatById[session.id]
+    val onToggleExpanded = { actions.onToggleExpanded(session) }
+    val onOpenAttach = { actions.onOpenAttach(session) }
+    val onClone = { actions.onClone(session) }
+    val onCopyAttach = { actions.onCopyAttach(session) }
+    val onOpenTelegram = { actions.onOpenTelegram(session) }
+    val onWhat = { actions.onWhat(session) }
+    val onUpdateWhat = { actions.onUpdateWhat(session) }
+    val onRegenerateWhat = { actions.onRegenerateWhat(session) }
+    val onKill = { actions.onKill(session) }
+    val onOpenPage = actions.onOpenPage
+    val follow = actions.follow
     val followed = session.id in follow.followedSessionIds
     var showHandoff by remember(session.id) { mutableStateOf(false) }
     if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session) { showHandoff = false }
@@ -1275,88 +1288,88 @@ private fun SessionRow(
     }
     val canOpenAgent = remoteControlUrl != null || attachSupported
     val hasSummary = whatState?.entries?.isNotEmpty() == true
+    val section = attentionSection(session)
+    val edge = sectionEdgeColor(session)
+    // Idle and stopped agents without a ticket recede (spec 1782 A3).
+    val faded = (section == "idle" || section == "stopped") && ticketLabel(session) == null
+    val now = java.time.OffsetDateTime.now()
     Surface(
-        modifier = Modifier.padding(start = (depth * 14).dp),
-        shape = RoundedCornerShape(22.dp),
+        modifier = Modifier.padding(start = (depth * 14).dp).alpha(if (faded) 0.6f else 1f),
+        shape = RoundedCornerShape(12.dp),
         color = Panel,
         border = androidx.compose.foundation.BorderStroke(1.dp, Border),
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .drawBehind { drawRect(edge, size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height)) }
+                .padding(start = 3.dp),
+        ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { if (canOpenAgent) openAgent() else onToggleExpanded() }
-                    .padding(14.dp),
+                    .padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                    Box(modifier = Modifier.size(9.dp).background(statusDot(session), CircleShape))
-                    Spacer(Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = sessionDisplayName(session),
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            if (session.isMaintainer) {
-                                Spacer(Modifier.width(8.dp))
-                                InlineBadge("maintainer", Cyan)
-                            }
-                            if (followed) {
-                                Spacer(Modifier.width(6.dp))
-                                Icon(Icons.Rounded.NotificationsActive, contentDescription = "Following", tint = Amber, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                        Spacer(Modifier.height(3.dp))
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
-                            text = "${session.provider ?: "claude"} · ${projectedStatusLabel(session)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        waitingSummary(session)?.let { waiting ->
-                            Text(waiting, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        statusSummary(session)?.let { status ->
-                            Text(
-                                text = status,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Cyan,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        if (session.handoff != null || session.contextPercent != null || detail?.contextPercentage != null) {
-                            li.rajeshgo.sm.ui.handoff.ContextHandoffStatus(session, session.contextPercent ?: detail?.contextPercentage)
-                            Spacer(Modifier.height(6.dp))
-                        }
-                        val secondaryLine = buildString {
-                            if (parentLabel != "-") {
-                                append("Parent ")
-                                append(parentLabel)
-                                append(" • ")
-                            }
-                            append(lastSummary(session))
-                            append(" • ")
-                            append(formatAge(session.lastActivity, session.activityState))
-                        }
-                        Text(
-                            text = secondaryLine,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted,
-                            maxLines = 2,
+                            text = sessionDisplayName(session),
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
                         )
+                        Tag(providerTag(session.provider), providerTint(session.provider))
+                        if (session.isMaintainer) Tag("MAINTAINER", Cyan)
+                        if (followed) {
+                            Icon(Icons.Rounded.NotificationsActive, contentDescription = "Following", tint = Amber, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    val facts = rowFactsLine(session, now)
+                    val jobsText = session.facts?.jobs?.text
+                    Text(
+                        text = buildAnnotatedString {
+                            if (jobsText != null && facts.endsWith(jobsText)) {
+                                append(facts.removeSuffix(jobsText))
+                                withStyle(SpanStyle(color = jobsToneColor(session.facts?.jobs?.tone))) { append(jobsText) }
+                            } else {
+                                append(facts)
+                            }
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    val you = youLine(session, now)
+                    val finished = finishedLine(session)
+                    if (you != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(you, style = MaterialTheme.typography.bodySmall, color = Fuchsia, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            if (session.facts?.you?.dismissible == true) {
+                                Text(
+                                    "✓",
+                                    color = Fuchsia,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier
+                                        .padding(start = 8.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Fuchsia.copy(alpha = 0.16f))
+                                        .clickable(onClickLabel = "Mark answered") { actions.onAnswered(session) }
+                                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                                )
+                            }
+                        }
+                    } else if (finished != null) {
+                        Text(finished, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     }
                 }
-                Spacer(Modifier.width(10.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (remoteControlUrl != null) {
                         IconButton(onClick = openAgent) {
@@ -1379,7 +1392,25 @@ private fun SessionRow(
 
             if (expanded) {
                 HorizontalDivider(color = Border)
-                Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    statusSummary(session)?.let { status ->
+                        Text(status, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (session.handoff != null || session.contextPercent != null || detail?.contextPercentage != null) {
+                        li.rajeshgo.sm.ui.handoff.ContextHandoffStatus(session, session.contextPercent ?: detail?.contextPercentage)
+                    }
+                    Text(
+                        text = buildString {
+                            if (parentLabel != "-") append("Parent $parentLabel • ")
+                            append(lastSummary(session))
+                            append(" • ")
+                            append(formatAge(session.lastActivity, session.activityState))
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
@@ -1447,7 +1478,7 @@ private fun SessionRow(
 @Composable
 private fun AgentDisclosure(title: String, subtitle: String, content: @Composable () -> Unit) {
     var open by remember { mutableStateOf(false) }
-    Surface(color = Panel, shape = RoundedCornerShape(12.dp)) {
+    Surface(color = Panel, shape = RoundedCornerShape(10.dp)) {
         Column {
             Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -1537,7 +1568,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
     if (claims.isNotEmpty()) WorkLine(claims, onOpenPage)
     val messages = session.obligations?.messages.orEmpty()
     if (messages.isNotEmpty()) {
-        Surface(color = Fuchsia.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+        Surface(color = Fuchsia.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
             Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                 Text("Messages", style = MaterialTheme.typography.titleSmall, color = Fuchsia, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
                 messages.forEach { message -> MessageRow(message, onClick = { onOpenPage(messageReaderPage(message)) }) }
@@ -1546,7 +1577,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
     }
     val docs = session.obligations?.docs.orEmpty()
     if (docs.isNotEmpty()) {
-        Surface(color = Emerald.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+        Surface(color = Emerald.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
             Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                 Text("Docs", style = MaterialTheme.typography.titleSmall, color = Emerald, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
                 docs.forEach { doc -> DocRow(doc, onClick = { onOpenPage(docReaderPage(doc)) }) }
@@ -1557,7 +1588,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
     val reviews = waiting.filter { it.kind == "review" }
     val reviewHistory = session.obligations?.reviewHistory.orEmpty()
     if (reviews.isNotEmpty() || reviewHistory.isNotEmpty()) {
-        Surface(color = Violet.copy(alpha = 0.07f), shape = RoundedCornerShape(12.dp)) {
+        Surface(color = Violet.copy(alpha = 0.07f), shape = RoundedCornerShape(10.dp)) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Reviews", style = MaterialTheme.typography.titleSmall, color = Violet)
                 if (reviews.isEmpty()) Text("No reviews pending", style = MaterialTheme.typography.bodySmall, color = TextMuted)
@@ -1577,7 +1608,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
     }
     val activeJobs = session.jobs.filter { it.state in listOf("pending", "running") }
     if (waiting.any { it.kind != "review" } || activeJobs.isNotEmpty()) {
-        Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+        Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (isWaitingForResult(session)) "Waiting for results" else "In progress", style = MaterialTheme.typography.titleSmall, color = Cyan)
                 activeJobs.take(2).forEach { job ->
@@ -1610,7 +1641,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
 @Composable
 private fun WorkLine(claims: List<SessionClaim>, onOpenPage: (ReaderPage) -> Unit) {
     val withRepo = claims.map { it.repo }.distinct().size > 1
-    Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+    Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1804,12 +1835,23 @@ internal fun MarkdownText(markdown: String) {
     )
 }
 
+/** A 4 dp tag with a faint tint, as on the Board and Inbox (spec 1782 J1). */
 @Composable
-private fun StatusChip(label: String, tint: Color) {
-    Surface(shape = RoundedCornerShape(999.dp), color = tint.copy(alpha = 0.18f), border = androidx.compose.foundation.BorderStroke(1.dp, tint.copy(alpha = 0.32f))) {
-        Text(label.uppercase(), modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, color = tint)
-    }
+private fun Tag(label: String, tint: Color) {
+    Text(
+        label,
+        color = tint,
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        modifier = Modifier
+            .background(tint.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 1.dp),
+    )
 }
+
+@Composable
+private fun StatusChip(label: String, tint: Color) = Tag(label, tint)
 
 @Composable
 private fun ActionPill(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit, tint: Color = Emerald) {
@@ -1820,13 +1862,6 @@ private fun ActionPill(label: String, icon: androidx.compose.ui.graphics.vector.
         colors = AssistChipDefaults.assistChipColors(containerColor = PanelMuted, labelColor = MaterialTheme.colorScheme.onSurface),
         border = AssistChipDefaults.assistChipBorder(enabled = true, borderColor = tint.copy(alpha = 0.32f)),
     )
-}
-
-@Composable
-private fun InlineBadge(label: String, tint: Color) {
-    Surface(shape = RoundedCornerShape(999.dp), color = tint.copy(alpha = 0.16f)) {
-        Text(label.uppercase(), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall, color = tint)
-    }
 }
 
 @Composable
@@ -1905,12 +1940,6 @@ private fun nodeSliceFreshness(node: WatchSessionNode, slice: TreeSlice): Long {
 
 private fun sessionLastActivityEpoch(session: ClientSession): Long {
     return parseIso(session.lastActivity)?.toEpochSecond() ?: Long.MIN_VALUE
-}
-
-private fun statusDot(session: ClientSession): Color = if (isWaitingForResult(session)) Cyan else when (sessionVisualState(session)) {
-    SessionVisualState.Active -> Emerald
-    SessionVisualState.Stopped -> Rose
-    SessionVisualState.Inactive -> TextMuted
 }
 
 private fun statusTint(session: ClientSession): Color = when (sessionVisualState(session)) {
