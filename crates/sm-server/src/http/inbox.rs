@@ -477,7 +477,10 @@ fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize
     let mut rows = world.agent_rows();
     rows.extend(world.doc_rows(state)?);
     let cutoff = format_ts(OffsetDateTime::now_utc() - OPEN_WINDOW);
-    let open = |row: &InboxRow| !row.done && (row.group == "needs_you" || row.newest_at >= cutoff);
+    // Needs-you and unread Finished threads stay open until dealt with.
+    let open = |row: &InboxRow| {
+        !row.done && (matches!(row.group, "needs_you" | "finished") || row.newest_at >= cutoff)
+    };
     let needs_you_count = rows
         .iter()
         .filter(|row| open(row) && row.group == "needs_you")

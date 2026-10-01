@@ -124,9 +124,10 @@ impl TurnMessageStore {
         Ok(has_tables.then_some(conn))
     }
 
-    /// Records a session's latest turn message, and fills every Finished
-    /// row of that session still without text whose completion is at or
-    /// before it. Blank text records nothing.
+    /// Records a session's latest turn message, unless one written later is
+    /// already stored (hooks can arrive out of order), and fills every
+    /// Finished row of that session still without text whose completion is
+    /// at or before it. Blank text records nothing.
     pub fn record_turn(
         &self,
         session_id: &str,
@@ -145,7 +146,7 @@ impl TurnMessageStore {
         tx.execute(
             "INSERT INTO turn_messages (session_id, provider, at, text) VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(session_id) DO UPDATE SET provider = excluded.provider, \
-             at = excluded.at, text = excluded.text",
+             at = excluded.at, text = excluded.text WHERE excluded.at >= turn_messages.at",
             params![session_id, provider, at, text],
         )?;
         tx.execute(

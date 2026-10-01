@@ -1268,3 +1268,21 @@ async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
     let orphan = agents.iter().find(|a| a["id"] == "orphan01").unwrap();
     assert!(orphan["last_turn"].is_null());
 }
+
+#[tokio::test]
+async fn an_unread_finished_thread_stays_open_past_the_open_window() {
+    let f = fixture();
+    let store = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"));
+    let long_ago = time::OffsetDateTime::now_utc() - time::Duration::days(40);
+    store.record_finished("eng00001", long_ago).unwrap();
+    store
+        .record_turn(
+            "eng00001",
+            "claude",
+            long_ago + time::Duration::minutes(1),
+            "Done long ago",
+        )
+        .unwrap();
+    let listing = inbox(&f, "open").await;
+    assert_eq!(row(&listing, "agent:eng00001")["group"], "finished");
+}

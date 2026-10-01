@@ -48,6 +48,29 @@ fn stop_then_task_complete_then_stop_fills_from_the_second_stop() {
 }
 
 #[test]
+fn an_older_stop_arriving_late_neither_replaces_the_last_turn_nor_fills_a_newer_finish() {
+    let store = store();
+    store
+        .record_turn("s1", "claude", minutes(5), "Newer turn")
+        .unwrap();
+    store.record_finished("s1", minutes(6)).unwrap();
+    // A Stop emitted at minute 2 arrives now.
+    store
+        .record_turn("s1", "claude", minutes(2), "Older turn")
+        .unwrap();
+    assert_eq!(store.last_turn("s1").unwrap().unwrap().text, "Newer turn");
+    assert_eq!(store.finished().unwrap()[0].text, None);
+    // A Stop emitted after the completion fills it, even if it arrives late.
+    store
+        .record_turn("s1", "claude", minutes(7), "Closing summary")
+        .unwrap();
+    assert_eq!(
+        store.finished().unwrap()[0].text.as_deref(),
+        Some("Closing summary")
+    );
+}
+
+#[test]
 fn task_complete_without_a_later_stop_falls_back_after_ten_minutes() {
     let store = store();
     store
