@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, meterBand } from './ui.js';
+import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
@@ -19,7 +19,7 @@ export function QueuePage() {
       const slot = queue.slots?.by_type?.[type];
       const waiting = queue.queued.filter((job) => job.type === type).length;
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
-    })}<${MacNow} host=${queue.host} /></div>
+    })}</div>
     <${MacChart} />
     <${HeldBack} stats=${stats} insightOnly=${true} />
     <section class="q-card"><div class="q-heading"><h2>Running</h2><span class="muted">Last 3 hours → now</span></div>
@@ -30,21 +30,6 @@ export function QueuePage() {
     </section>
     ${queue.ended.length ? html`<a href="/analytics/queue" onClick=${(e) => { e.preventDefault(); navigate('/analytics/queue'); }}>${queue.ended.length} stopped in the last 24h ›</a>` : null}
   </div>`;
-}
-
-export function MacNow({ host }) {
-  if (!host || host.available === false) return html`<div class="q-card q-mac">Mac now · unavailable</div>`;
-  const metrics = [
-    ['MEM', host.memory_used_bytes, host.queue_memory_bytes, host.memory_total_bytes, `${gigabytes(host.memory_used_bytes)}/${gigabytes(host.memory_total_bytes)}G${typeof host.queue_memory_bytes === 'number' ? ` · queue ${gb(host.queue_memory_bytes)}` : ''}`],
-    ['CPU', host.cpu_percent, host.queue_cpu_percent, 100, `${Math.round(host.cpu_percent || 0)}%`],
-    ['GPU', host.gpu_percent, host.queue_gpu_percent, 100, `${Math.round(host.gpu_percent || 0)}%`],
-  ];
-  return html`<div class="q-card q-mac"><span class="q-label">Mac now</span>${metrics.map(([label, total, queue, max, text]) => {
-    const totalWidth = Math.max(0, Math.min(100, (total || 0) / (max || 1) * 100));
-    const shareWidth = Math.max(0, Math.min(totalWidth, (queue || 0) / (max || 1) * 100));
-    const color = meterBand(totalWidth / 100, label.toLowerCase());
-    return html`<div class="q-meter" style=${`--meter-color:var(--${color})`}><span>${label}</span><i><s style=${`width:${totalWidth}%;opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${`width:${shareWidth}%`}></s>` : null}</i><span>${text}</span></div>`;
-  })}</div>`;
 }
 
 export function MacChart() {
