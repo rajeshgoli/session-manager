@@ -180,7 +180,11 @@ pub(super) fn cleanup_reader_worktree(state: &AppState, session_id: &str) -> any
     Ok(())
 }
 
-async fn start_reader(state: &Arc<AppState>, doc: &OwnerDoc) -> Result<SessionRecord, ApiError> {
+async fn start_reader(
+    state: &Arc<AppState>,
+    doc: &OwnerDoc,
+    first_question: &str,
+) -> Result<SessionRecord, ApiError> {
     let publish = latest_publish(state, doc)?;
     let work = state.clone();
     let d = doc.clone();
@@ -193,7 +197,8 @@ async fn start_reader(state: &Arc<AppState>, doc: &OwnerDoc) -> Result<SessionRe
         "You are a reader agent for {repo}/{path} at commit {sha}. PR: {pr}. \
          Answer the owner's questions about this doc with sm send rajesh. Read the doc, its code and PR \
          before answering. Do not edit files, commit, push, comment on GitHub, or message other agents. \
-         After each answer run sm task-complete. Stay available for later questions about this doc.",
+         After each answer run sm task-complete. Stay available for later questions about this doc.\n\n\
+         Answer this question now:\n{first_question}",
         repo = doc.repo, path = doc.path, sha = publish.commit_sha,
         pr = doc.pr_number.map_or_else(|| "none".to_owned(), |n| format!("https://github.com/{}/pull/{n}", doc.repo)),
     );
@@ -266,32 +271,41 @@ pub(super) async fn send(
     }
     let doc = docs::find_doc(&state, &doc_id)?;
     let publish = latest_publish(&state, &doc)?;
+    let (question, delivered_text) = question_text(
+        &state.config.owner_name,
+        &doc.title,
+        &publish.commit_sha,
+        text,
+        quote,
+    );
     let (thread_key, _) = inbox::work_threads::ThreadCatalog::load(&state)?
         .doc_key(&doc_id)
         .ok_or(ApiError::NotFound("Doc thread not found"))?;
     let _guard = state.owner_message_lock.lock().await;
     let author = author_session(&state, &doc)?;
     let current_reader = reader_session(&state, &doc_id)?;
-    let recipient = match payload.target.as_str() {
+    let (recipient, launched_with_question) = match payload.target.as_str() {
         "author" => author
             .filter(|s| !s.is_stopped())
+            .map(|s| (s, false))
             .ok_or_else(|| conflict("The author has ended; select Reader or Bring back author"))?,
         "restore_author" => {
             let author = author.ok_or_else(|| conflict("This doc has no known author"))?;
             if !author.is_stopped() {
-                author
+                (author, false)
             } else {
                 let work = state.clone();
                 let id = author.id.clone();
-                tokio::task::spawn_blocking(move || {
+                let restored = tokio::task::spawn_blocking(move || {
                     auto_retire::restore_session_with_work(&work, &id)
                 })
                 .await
-                .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??
+                .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+                (restored, false)
             }
         }
         "reader" => match current_reader {
-            Some(reader) if !reader.is_stopped() => reader,
+            Some(reader) if !reader.is_stopped() => (reader, false),
             Some(reader) => {
                 let work = state.clone();
                 let id = reader.id.clone();
@@ -303,21 +317,14 @@ pub(super) async fn send(
                             "Cannot retire the previous reader worktree: {error}"
                         ))
                     })?;
-                start_reader(&state, &doc).await?
+                (start_reader(&state, &doc, &delivered_text).await?, true)
             }
-            _ => start_reader(&state, &doc).await?,
+            _ => (start_reader(&state, &doc, &delivered_text).await?, true),
         },
         _ => return Err(bad("target must be author, reader or restore_author")),
     };
-    let (question, delivered_text) = question_text(
-        &state.config.owner_name,
-        &doc.title,
-        &publish.commit_sha,
-        text,
-        quote,
-    );
     let id = format!("ask-{}", state.session_store.allocate_session_id()?);
-    let (note, inserted) = inbox::inbox_store(&state).record_note(&OwnerNote {
+    let note = OwnerNote {
         id,
         session_id: recipient.id.clone(),
         body: question,
@@ -325,8 +332,13 @@ pub(super) async fn send(
         delivered_to_session_id: recipient.id.clone(),
         created_at: String::new(),
         thread_key: Some(thread_key.clone()),
-    })?;
-    if inserted {
+    };
+    let (note, inserted) = if launched_with_question {
+        inbox::inbox_store(&state).record_note_in_initial_prompt(&note)?
+    } else {
+        inbox::inbox_store(&state).record_note(&note)?
+    };
+    if inserted && !launched_with_question {
         messages::deliver_now(&state, &recipient.id, &note.id);
     }
     Ok(Json(json!({"id": note.id, "thread_key": thread_key,

@@ -283,6 +283,9 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
     assert_eq!(reader["reasoning_effort"], "high");
     assert_eq!(reader["parent_session_id"], Value::Null);
     assert_eq!(reader["working_dir"], reader_path.display().to_string());
+    let first_prompt = fs::read_to_string(reader["log_file"].as_str().unwrap()).unwrap();
+    assert!(first_prompt.contains("Answer this question now:"));
+    assert!(first_prompt.contains("Why buy?"));
     let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
     let (body, delivered): (String, String) = conn
         .query_row(
@@ -294,6 +297,14 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
     assert_eq!(body, "> Buy.\n\nWhy buy?");
     assert!(delivered.contains("[Question from Rajesh about \"Decision memo\" rev "));
     assert!(delivered.ends_with("Answer with sm send rajesh."));
+    let first_delivery_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_queue WHERE id = ?1",
+            [format!("owner-note-{}", first["id"].as_str().unwrap())],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(first_delivery_count, 0);
 
     let (status, second) = request(
         &f.app,
@@ -306,6 +317,14 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
     .await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["recipient"]["id"], reader_id);
+    let later_delivery_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_queue WHERE id = ?1",
+            [format!("owner-note-{}", second["id"].as_str().unwrap())],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(later_delivery_count, 1);
     let count: i64 = conn
         .query_row(
             "SELECT count(*) FROM owner_doc_readers WHERE doc_id = ?1",
