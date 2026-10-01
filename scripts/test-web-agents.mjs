@@ -114,6 +114,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
                 return route.fulfill({ status: 409, json: { detail: 'Agent is no longer finished and idle' } });
               }
               retired.push(decodeURIComponent(retire[1]));
+              if (decodeURIComponent(retire[1]) === 'sm-1776') sessions = sessions.filter((s) => s.id !== 'sm-1776');
               return route.fulfill({ json: {} });
             }
             if (url.pathname.endsWith('/handoff-policy') && request.method() === 'PUT') {
@@ -173,13 +174,18 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             await page.locator('.details-band').waitFor();
             if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
             const actions = page.locator('.details-band .acts');
-            assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button').allInnerTexts(),
+            assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button, :scope > .retire-action > button').allInnerTexts(),
               ['Open in Claude ↗', '⌨ Terminal', 'Retire', 'Hand off…', '⋯']);
             if (shots) await page.screenshot({ path: `${shots}/retire-band-${viewport.width}-${colorScheme}.png`, fullPage: true });
             rejectConditionalRetire = true;
-            await actions.getByRole('button', { name: 'Retire' }).click();
+            const farRetire = actions.locator('.retire-action > button');
+            const farPosition = await farRetire.boundingBox();
+            await farRetire.click();
             await actions.locator('.retire-confirm').waitFor();
             assert.deepEqual(retired, ['far-1855']);
+            const farConfirmedPosition = await farRetire.boundingBox();
+            assert.deepEqual([farConfirmedPosition.x, farConfirmedPosition.y], [farPosition.x, farPosition.y],
+              'conditional confirmation keeps Retire in place');
             await actions.locator('.retire-confirm').getByRole('button', { name: 'Cancel' }).click();
             rejectConditionalRetire = false;
             await actions.getByRole('button', { name: 'More' }).click();
@@ -197,14 +203,26 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             await card('sm-1776').click();
             await page.waitForFunction(() => document.querySelector('.details-band .phd .t')?.textContent === 'sm-1776');
             if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
-            await page.locator('.details-band .acts').getByRole('button', { name: 'Retire' }).click();
-            assert.equal((await page.locator('.details-band .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Retire Cancel');
+            const retire = page.locator('.details-band .acts .retire-action > button');
+            const position = await retire.boundingBox();
+            await retire.click();
+            assert.equal((await page.locator('.details-band .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Cancel');
             assert.deepEqual(retired, ['far-1855']);
+            const confirmedPosition = await retire.boundingBox();
+            assert.deepEqual([confirmedPosition.x, confirmedPosition.y], [position.x, position.y],
+              'confirmation keeps Retire in place');
+            const prompt = await page.locator('.details-band .retire-confirm').boundingBox();
+            assert.ok(prompt.x >= 0 && prompt.x + prompt.width <= viewport.width,
+              `confirmation fits inside ${viewport.width} px`);
             if (shots) await page.screenshot({ path: `${shots}/retire-confirm-${viewport.width}-${colorScheme}.png`, fullPage: true });
-            await page.locator('.details-band .retire-confirm').getByRole('button', { name: 'Cancel' }).click();
-            await page.locator('.details-band').getByRole('button', { name: 'Close (Esc)' }).click();
+            await retire.click();
+            await page.waitForFunction(() => !new URL(location.href).searchParams.has('open'));
+            assert.deepEqual(retired, ['far-1855', 'sm-1776']);
             await page.locator('.details-band').waitFor({ state: 'hidden' });
+            assert.equal(new URL(page.url()).searchParams.get('open'), null);
+            await card('sm-1776').waitFor({ state: 'hidden' });
             if (viewport.width === 1440 && colorScheme === 'light') {
+              sessions = fixture();
               await page.reload();
               await page.waitForFunction(() => document.querySelectorAll('.acard').length > 5);
             }

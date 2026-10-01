@@ -219,7 +219,7 @@ test('Retire in the bar: a finished agent retires at once and the page moves to 
     await page.goto(`${ORIGIN}/terminal/sm-1776`);
     await page.getByText('Live', { exact: true }).waitFor();
     await page.locator('.term-bar').getByRole('button', { name: 'Retire', exact: true }).click();
-    assert.equal((await page.locator('.term-bar .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Retire Cancel');
+    assert.equal((await page.locator('.term-bar .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Cancel');
     assert.equal(await page.locator('.term-bar').evaluate((bar) => bar.scrollHeight <= bar.clientHeight), true, 'the confirmation stays on one line');
     await page.locator('.term-bar .retire-confirm').getByRole('button', { name: 'Cancel' }).click();
     assert.deepEqual(state.retired, []);
