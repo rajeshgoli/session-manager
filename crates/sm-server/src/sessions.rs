@@ -81,6 +81,8 @@ const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
+const POEM_NAMES: &str = "ozymandias kubla-khan dover-beach the-raven invictus jabberwocky ulysses tintern-abbey the-tyger annabel-lee daffodils ode-to-autumn fern-hill birches mending-wall still-i-rise the-lake-isle byzantium the-lamb lycidas the-eagle crossing-the-bar the-kraken the-listeners adlestrop pied-beauty the-windhover gods-grandeur the-wild-swans prufrock digging the-fish one-art the-moose wild-geese the-summer-day the-flea the-garden the-prelude bright-star la-belle-dame to-a-skylark the-cloud lady-of-shalott my-last-duchess the-owl stopping-by-woods fire-and-ice nothing-gold red-wheelbarrow anecdote-of-the-jar thirteen-ways richard-cory chicago fog harlem sympathy o-captain i-wandered-lonely the-solitary-reaper kubla endymion the-snow-man the-good-morrow";
+const STAR_NAMES: &str = "vega rigel sirius altair deneb polaris capella arcturus aldebaran antares betelgeuse procyon spica regulus castor pollux canopus achernar fomalhaut bellatrix mira algol alcor mizar dubhe merak alioth alkaid shaula sadr albireo alnilam alnitak mintaka saiph hadar acrux mimosa markab scheat alpheratz hamal menkar nunki kochab thuban denebola algieba elnath alhena wezen adhara avior suhail orion lyra cygnus carina perseus draco auriga pleiades hyades andromeda";
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -4443,10 +4445,11 @@ impl SessionStore {
         if let Some(parent_id) = request.parent_session_id.as_deref() {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
+        let naming_sessions = sessions_with_registered_aliases(&state);
         let record = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let record = self.build_core_session_record(
-                sessions,
+                &naming_sessions,
                 &request,
                 log_dir.as_deref(),
                 false,
@@ -4519,10 +4522,10 @@ impl SessionStore {
         if let Some(parent_id) = request.parent_session_id.as_deref() {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
+        let naming_sessions = sessions_with_registered_aliases(&state);
         let mut record = {
-            let sessions = ensure_sessions_array_mut(&mut state)?;
             self.build_core_session_record(
-                sessions,
+                &naming_sessions,
                 &request,
                 log_dir.as_deref(),
                 true,
@@ -4820,6 +4823,7 @@ impl SessionStore {
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(record.id.clone(), artifacts.event_stream_path)?;
         }
+        self.queue_initial_native_rename(&record);
         Ok(record)
     }
 
@@ -5612,13 +5616,25 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
+        let naming_sessions = sessions_with_registered_aliases(&state);
         let sessions = ensure_sessions_array_mut(&mut state)?;
+        let new_name = sessions
+            .iter()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+            .and_then(|session| {
+                session
+                    .get("friendly_name")
+                    .and_then(Value::as_str)
+                    .or_else(|| session.get("name").and_then(Value::as_str))
+            })
+            .and_then(|name| restored_name(&naming_sessions, session_id, name));
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
         if !raw_session_is_stopped(session) {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
+        apply_restored_name(session, new_name);
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("stopped_at".to_owned(), Value::Null);
@@ -5637,6 +5653,7 @@ impl SessionStore {
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
+        self.queue_initial_native_rename(&restored);
         Ok(Some(CoreRestoreOutcome::Restored(Box::new(restored))))
     }
 
@@ -5943,11 +5960,18 @@ impl SessionStore {
             }
         }
 
+        let naming_sessions = sessions_with_registered_aliases(&state);
         let sessions = ensure_sessions_array_mut(&mut state)?;
+        let new_name = record
+            .friendly_name
+            .as_deref()
+            .or(Some(record.name.as_str()))
+            .and_then(|name| restored_name(&naming_sessions, session_id, name));
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
         let now = now_rfc3339();
+        apply_restored_name(session, new_name);
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("stopped_at".to_owned(), Value::Null);
         session.insert("completion_status".to_owned(), Value::Null);
@@ -6002,6 +6026,7 @@ impl SessionStore {
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
         }
+        self.queue_initial_native_rename(&restored);
         Ok(Some(CoreRestoreOutcome::Restored(Box::new(restored))))
     }
 
@@ -7032,6 +7057,17 @@ impl SessionStore {
             Some("native_rename"),
         )?;
         Ok(true)
+    }
+
+    fn queue_initial_native_rename(&self, session: &SessionRecord) {
+        if let Some(friendly_name) = session.friendly_name.as_deref() {
+            if let Err(error) = self.queue_provider_native_rename(session, friendly_name) {
+                eprintln!(
+                    "initial native rename for session {} could not be queued: {error:#}",
+                    session.id
+                );
+            }
+        }
     }
 
     pub fn register_agent_role(
@@ -8368,12 +8404,20 @@ impl SessionStore {
         });
         let parent_node = parent_session.and_then(|value| json_text(value.get("node")));
         let (provider, working_dir) = core_session_provider_and_working_dir(sessions, request);
-        let name = request
+        let explicit_name = request
             .name
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
+            .map(ToOwned::to_owned);
+        let generated_name = if explicit_name.is_none() {
+            generated_session_name(sessions, &provider, OffsetDateTime::now_utc())
+        } else {
+            None
+        };
+        let name = explicit_name
+            .clone()
+            .or_else(|| generated_name.clone())
             .unwrap_or_else(|| format!("{provider}-{session_id}"));
         let node = request
             .node
@@ -8410,7 +8454,7 @@ impl SessionStore {
             forked_provider_resume_id: None,
             forked_at: None,
             forked_by_session_id: None,
-            friendly_name: request.name.clone(),
+            friendly_name: explicit_name.or(generated_name),
             friendly_name_is_explicit: true,
             friendly_name_updated_at_ns: None,
             native_title: None,
@@ -11051,7 +11095,7 @@ fn deliver_runtime_native_rename_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let status = effective_raw_session_status(session);
+    let mut status = effective_raw_session_status(session);
     if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
@@ -11097,6 +11141,22 @@ fn deliver_runtime_native_rename_to_session_raw(
     };
     if delivered {
         session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+    } else if let Some(tmux_session) = json_text(session.get("tmux_session")) {
+        let socket_name = json_text(session.get("tmux_socket_name"));
+        if !runtime
+            .for_socket_name(socket_name.as_deref())
+            .session_exists(&tmux_session)?
+        {
+            let now = now_rfc3339();
+            status = "stopped".to_owned();
+            session.insert("status".to_owned(), Value::String(status.clone()));
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now.clone()));
+            set_terminal_provenance_if_absent(
+                session,
+                TerminalProvenance::tmux_disappearance(&now, "native_rename_delivery_failed"),
+            );
+        }
     }
     Ok((status, delivered))
 }
@@ -13208,6 +13268,145 @@ fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
         return Some(parsed);
     }
     parse_python_naive_datetime(value).map(PrimitiveDateTime::assume_utc)
+}
+
+/// A stopped name remains unavailable for a week, so recent history stays
+/// unambiguous. Missing or malformed stop times reserve the name safely.
+fn session_reserves_name(session: &Value, now: OffsetDateTime) -> bool {
+    let Some(object) = session.as_object() else {
+        return false;
+    };
+    if !raw_session_is_stopped(object) {
+        return true;
+    }
+    let stopped_at =
+        json_text(object.get("stopped_at")).or_else(|| json_text(object.get("completed_at")));
+    stopped_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .is_none_or(|stopped_at| now - stopped_at < TimeDuration::days(7))
+}
+
+fn sessions_with_registered_aliases(state: &Value) -> Vec<Value> {
+    let mut sessions = state
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let registrations = state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for registration in registrations {
+        let (Some(session_id), Some(role)) = (
+            registration.get("session_id").and_then(Value::as_str),
+            registration.get("role").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if let Some(aliases) = sessions
+            .iter_mut()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+            .and_then(Value::as_object_mut)
+            .map(|session| {
+                session
+                    .entry("aliases".to_owned())
+                    .or_insert_with(|| json!([]))
+            })
+            .and_then(Value::as_array_mut)
+        {
+            aliases.push(Value::String(role.to_owned()));
+        }
+    }
+    sessions
+}
+
+fn name_is_reserved(
+    sessions: &[Value],
+    candidate: &str,
+    except_id: Option<&str>,
+    now: OffsetDateTime,
+) -> bool {
+    sessions.iter().any(|session| {
+        if (except_id.is_some() && session.get("id").and_then(Value::as_str) == except_id)
+            || !session_reserves_name(session, now)
+        {
+            return false;
+        }
+        ["name", "friendly_name", "role"]
+            .into_iter()
+            .filter_map(|key| session.get(key).and_then(Value::as_str))
+            .chain(
+                session
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .any(|name| name.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn first_free_name(
+    sessions: &[Value],
+    base: &str,
+    except_id: Option<&str>,
+    now: OffsetDateTime,
+) -> String {
+    if !name_is_reserved(sessions, base, except_id, now) {
+        return base.to_owned();
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base}-{suffix}");
+        if !name_is_reserved(sessions, &candidate, except_id, now) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn restored_name(sessions: &[Value], session_id: &str, base: &str) -> Option<String> {
+    let now = OffsetDateTime::now_utc();
+    let held_by_live = sessions.iter().any(|session| {
+        session.get("id").and_then(Value::as_str) != Some(session_id)
+            && session
+                .as_object()
+                .is_some_and(|object| !raw_session_is_stopped(object))
+            && name_is_reserved(std::slice::from_ref(session), base, None, now)
+    });
+    held_by_live.then(|| first_free_name(sessions, base, Some(session_id), now))
+}
+
+fn apply_restored_name(session: &mut Map<String, Value>, new_name: Option<String>) {
+    if let Some(name) = new_name {
+        session.insert("name".to_owned(), Value::String(name.clone()));
+        session.insert("friendly_name".to_owned(), Value::String(name));
+        session.insert("friendly_name_is_explicit".to_owned(), Value::Bool(true));
+        session.insert("native_title".to_owned(), Value::Null);
+    }
+}
+
+fn generated_session_name(
+    sessions: &[Value],
+    provider: &str,
+    now: OffsetDateTime,
+) -> Option<String> {
+    let list = match provider {
+        "claude" => POEM_NAMES,
+        "codex" | "codex-fork" | "codex-app" => STAR_NAMES,
+        _ => return None,
+    };
+    let names = list.split_whitespace().collect::<Vec<_>>();
+    let start = (OsRng.next_u64() as usize) % names.len();
+    for offset in 0..names.len() {
+        let name = names[(start + offset) % names.len()];
+        if !name_is_reserved(sessions, name, None, now) {
+            return Some(name.to_owned());
+        }
+    }
+    Some(first_free_name(sessions, names[start], None, now))
 }
 
 fn file_mtime_ns(path: impl AsRef<Path>) -> Result<i128> {
@@ -16709,6 +16908,129 @@ mod tests {
         sync::{Arc, Barrier},
         time::Duration,
     };
+
+    fn naming_request(provider: &str, name: Option<&str>) -> CreateCoreSessionRequest {
+        CreateCoreSessionRequest {
+            id: Some("new-agent".to_owned()),
+            name: name.map(str::to_owned),
+            working_dir: Some("/tmp".to_owned()),
+            provider: Some(provider.to_owned()),
+            parent_session_id: None,
+            node: None,
+            initial_message: None,
+            model: None,
+            reasoning_effort: None,
+            wait: None,
+            spawn_prompt_source: None,
+            spawn_brief: None,
+        }
+    }
+
+    #[test]
+    fn generated_names_follow_provider_and_keep_explicit_names() {
+        let store = SessionStore::new(unique_temp_path("generated-names"));
+        for (provider, list) in [("claude", POEM_NAMES), ("codex-fork", STAR_NAMES)] {
+            let record = store
+                .build_core_session_record(&[], &naming_request(provider, None), None, false, None)
+                .unwrap();
+            assert!(list.split_whitespace().any(|name| name == record.name));
+            assert_eq!(record.friendly_name.as_deref(), Some(record.name.as_str()));
+        }
+        let explicit = store
+            .build_core_session_record(
+                &[],
+                &naming_request("claude", Some("my-agent")),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(explicit.name, "my-agent");
+        assert_eq!(explicit.friendly_name.as_deref(), Some("my-agent"));
+    }
+
+    #[test]
+    fn names_respect_recent_retirement_and_exhausted_lists() {
+        let now = OffsetDateTime::now_utc();
+        let stopped = |name: &str, days: i64| {
+            json!({
+                "id": format!("old-{name}"), "name": name, "status": "stopped",
+                "stopped_at": (now - TimeDuration::days(days)).format(&Rfc3339).unwrap()
+            })
+        };
+        assert!(!name_is_reserved(&[stopped("Vega", 8)], "vega", None, now));
+        assert!(name_is_reserved(&[stopped("Vega", 6)], "vega", None, now));
+        let used = STAR_NAMES
+            .split_whitespace()
+            .map(|name| json!({"id": format!("used-{name}"), "friendly_name": name, "status": "running"}))
+            .collect::<Vec<_>>();
+        let generated = generated_session_name(&used, "codex", now).unwrap();
+        assert!(generated.ends_with("-2"));
+        assert!(STAR_NAMES
+            .split_whitespace()
+            .any(|name| generated == format!("{name}-2")));
+        let free = generated_session_name(
+            &[json!({"name": "vega", "status": "running"})],
+            "codex",
+            now,
+        )
+        .unwrap();
+        assert_ne!(free, "vega");
+        let registered = sessions_with_registered_aliases(&json!({
+            "sessions": [{"id": "holder", "status": "running"}],
+            "agent_registrations": [{"session_id": "holder", "role": "VEGA"}]
+        }));
+        assert!(name_is_reserved(&registered, "vega", None, now));
+    }
+
+    #[test]
+    fn restored_name_gets_first_free_suffix_when_live_agent_reuses_it() {
+        let sessions = vec![
+            json!({"id": "old", "name": "vega", "status": "stopped", "stopped_at": "2026-01-01T00:00:00Z"}),
+            json!({"id": "live", "friendly_name": "VEGA", "status": "running"}),
+            json!({"id": "also-live", "aliases": ["vega-2"], "status": "running"}),
+        ];
+        assert_eq!(
+            restored_name(&sessions, "old", "vega").as_deref(),
+            Some("vega-3")
+        );
+    }
+
+    #[test]
+    fn fixture_restore_persists_suffix_after_name_reuse() {
+        let path = unique_temp_path("restore-reused-name");
+        let store = SessionStore::new(path.clone());
+        let old = store
+            .create_core_session(naming_request("codex", Some("vega")), None)
+            .unwrap();
+        let mut state = store.load_raw_json_value().unwrap();
+        let old_value = state["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|session| session["id"] == old.id)
+            .unwrap();
+        old_value["status"] = json!("stopped");
+        old_value["stopped_at"] = json!("2026-01-01T00:00:00Z");
+        store.write_raw_json_value(&state).unwrap();
+        let mut live_request = naming_request("codex", Some("vega"));
+        live_request.id = Some("live-agent".to_owned());
+        store.create_core_session(live_request, None).unwrap();
+
+        let CoreRestoreOutcome::Restored(restored) =
+            store.restore_core_session(&old.id).unwrap().unwrap()
+        else {
+            panic!("stopped session should restore");
+        };
+        assert_eq!(restored.name, "vega-2");
+        assert_eq!(restored.friendly_name.as_deref(), Some("vega-2"));
+        assert_eq!(store.get_session(&old.id).unwrap().unwrap().name, "vega-2");
+        assert_eq!(
+            store.get_session("live-agent").unwrap().unwrap().name,
+            "vega"
+        );
+        let _ = fs::remove_file(path);
+    }
 
     #[cfg(unix)]
     #[test]

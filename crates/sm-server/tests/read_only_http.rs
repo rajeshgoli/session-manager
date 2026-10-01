@@ -15494,6 +15494,7 @@ async fn runtime_core_materializes_send_delivery_side_effects() {
                        notify_on_stop, remind_soft_threshold, parent_session_id
                 FROM message_queue
                 WHERE target_session_id = 'runtimechild'
+                  AND COALESCE(message_category, '') != 'native_rename'
                 "#,
             [],
             |row| {
@@ -15823,7 +15824,7 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
     assert_eq!(payload["status"], "retired");
     let stale_sender_notification_count: i64 = queue_conn
         .query_row(
-            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimegoneem'",
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimegoneem' AND COALESCE(message_category, '') != 'native_rename'",
             [],
             |row| row.get(0),
         )
@@ -17293,6 +17294,7 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
             SELECT text, delivered_at, notify_on_delivery
             FROM message_queue
             WHERE target_session_id = 'runtimemissingsend'
+              AND COALESCE(message_category, '') != 'native_rename'
             "#,
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),

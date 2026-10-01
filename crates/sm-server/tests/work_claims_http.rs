@@ -434,6 +434,12 @@ async fn spawn_with_a_ticket_claims_before_the_first_turn_or_creates_nothing() {
     let ended = f.store().claims_for_session("kid00002", false).unwrap();
     assert_eq!(ended[0].claim.end_reason.as_deref(), Some("retired"));
 
+    let mut unnamed = spawn("eng00001", "kid00003");
+    unnamed.as_object_mut().unwrap().remove("name");
+    let (status, body) = request(&f.app, "POST", "/sessions/spawn", Some(unnamed)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["friendly_name"], "widgets-1");
+
     // Retiring a session that is already stopped still ends its claims.
     f.items.put(3, WorkKind::Ticket, "open");
     let (status, body) = claim(&f, "asleep01", "ticket", 3, json!({})).await;

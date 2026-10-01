@@ -4550,15 +4550,46 @@ async fn spawn_session(
         }
         None => None,
     };
-    let created = spawn_child_session(
-        &state,
-        &payload,
-        &parent,
-        child_id,
-        provider,
-        working_dir,
-        node,
-    )
+    let created = async {
+        let name = if payload
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            payload.name.clone()
+        } else if let (Some(number), Some(repo), Some(reservation)) = (
+            payload.ticket,
+            payload.ticket_repo.as_deref(),
+            ticket_reservation.as_ref(),
+        ) {
+            let item = claims::claim_json(&state, &reservation.claim_id)?;
+            let settings = crate::owner_settings::OwnerSettings::from_effective(
+                &state.session_store.owner_settings()?,
+            )?;
+            Some(
+                settings
+                    .new_agent
+                    .agent_name(crate::owner_settings::Ticket {
+                        repo,
+                        number,
+                        title: item["title"].as_str().unwrap_or_default(),
+                        url: item["url"].as_str().unwrap_or_default(),
+                    }),
+            )
+        } else {
+            None
+        };
+        spawn_child_session(
+            &state,
+            &payload,
+            &parent,
+            SpawnChildIdentity { id: child_id, name },
+            provider,
+            working_dir,
+            node,
+        )
+        .await
+    }
     .await;
     let ticket_claim = ticket_reservation
         .as_ref()
@@ -4584,11 +4615,16 @@ async fn spawn_session(
     Ok(Json(response))
 }
 
+struct SpawnChildIdentity {
+    id: Option<String>,
+    name: Option<String>,
+}
+
 async fn spawn_child_session(
     state: &Arc<AppState>,
     payload: &SpawnCoreSessionRequest,
     parent: &SessionRecord,
-    child_id: Option<String>,
+    identity: SpawnChildIdentity,
     provider: String,
     working_dir: String,
     node: String,
@@ -4604,14 +4640,14 @@ async fn spawn_child_session(
         provider.clone(),
         payload.model.clone(),
         payload.reasoning_effort.clone(),
-        payload.name.clone(),
+        identity.name.clone(),
         Some(parent.id.clone()),
         Some(node.clone()),
         Some(working_dir.clone()),
     )?;
     let create_payload = CreateCoreSessionRequest {
-        id: child_id,
-        name: payload.name.clone(),
+        id: identity.id,
+        name: identity.name,
         working_dir: Some(working_dir),
         provider: Some(provider),
         parent_session_id: Some(parent.id.clone()),
