@@ -66,7 +66,11 @@ export function Reader({ id, controls, onBack = closePanel }) {
       if (win.location.origin !== location.origin) return;
       if (all) {
         win.document.documentElement.setAttribute('data-print', 'all');
-        win.addEventListener('afterprint', () => win.document.documentElement.removeAttribute('data-print'), { once: true });
+        win.addEventListener('afterprint', () => {
+          const toggle = win.document.getElementById('memo-print-toggle');
+          if (toggle) toggle.click(); // Let the template update its own label and setting.
+          else win.document.documentElement.removeAttribute('data-print');
+        }, { once: true });
       }
       win.print();
     } catch (_) { /* The frame may have navigated away from the document. */ }

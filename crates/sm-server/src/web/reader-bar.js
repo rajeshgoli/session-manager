@@ -50,7 +50,11 @@
   const printDoc = all => {
     if (all) {
       document.documentElement.setAttribute('data-print', 'all');
-      window.addEventListener('afterprint', () => document.documentElement.removeAttribute('data-print'), { once: true });
+      window.addEventListener('afterprint', () => {
+        const toggle = document.getElementById('memo-print-toggle');
+        if (toggle) toggle.click(); // Let the template update its own label and setting.
+        else document.documentElement.removeAttribute('data-print');
+      }, { once: true });
     }
     window.print();
   };
