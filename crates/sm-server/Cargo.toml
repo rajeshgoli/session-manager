@@ -18,7 +18,7 @@ hmac = { workspace = true }
 instant-acme = { version = "0.8.5", features = ["rcgen"] }
 jsonwebtoken = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true, features = ["fs", "poll", "resource", "signal", "term"] }
+nix = { workspace = true, features = ["fs", "poll", "resource", "signal", "socket", "term", "uio"] }
 p256 = { workspace = true, features = ["ecdsa", "pem"] }
 pulldown-cmark = { workspace = true }
 qrcode = { workspace = true }

@@ -758,6 +758,9 @@ pub(super) fn start_sweeper(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(RETIRE_SWEEP_SECONDS)).await;
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let task_state = state.clone();
             if let Ok(Err(error)) = tokio::task::spawn_blocking(move || sweep(&task_state)).await {
                 eprintln!("paired reviewer sweep: {error:#}");

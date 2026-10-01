@@ -18,6 +18,7 @@ pub mod email;
 pub mod google_auth;
 pub mod guestbook;
 pub mod handoff;
+pub mod handover;
 pub mod http;
 pub mod mobile_devices;
 pub mod notes;

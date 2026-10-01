@@ -267,11 +267,16 @@ pub(super) fn init_board(state: Arc<AppState>) {
     let interval = state.config.board.sync_interval();
     tokio::spawn(async move {
         let mut next_pass = tokio::time::Instant::now();
+        let mut stopped = state.shutdown().subscribe();
         loop {
             let timed_out = tokio::select! {
                 _ = tokio::time::sleep_until(next_pass) => true,
                 _ = state.board_wake.notify.notified() => false,
+                _ = stopped.changed() => return,
             };
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let pass = state.board_wake.pass.swap(false, Ordering::SeqCst) || timed_out;
             let recompute_only = state.board_wake.recompute.swap(false, Ordering::SeqCst);
             if !pass && !recompute_only {

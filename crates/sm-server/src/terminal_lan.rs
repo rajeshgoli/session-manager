@@ -5,12 +5,13 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::Path,
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     RetryPolicy,
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{AppConfig, TerminalDirectLanConfig},
+    handover::Shutdown,
     http::{terminal_lan_router, AppState},
     sessions::expand_home,
 };
@@ -28,26 +30,131 @@ const CERT_INTERVAL: Duration = Duration::from_secs(86_400);
 const CERT_RENEW_BEFORE_SECONDS: u64 = 30 * 86_400;
 const DNS_PERMISSION: &str = "Cloudflare token needs Zone > DNS > Edit on rajeshgo.li";
 
+#[derive(Clone, Default)]
+pub struct LanControl {
+    inner: Arc<Mutex<LanServing>>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Default)]
+struct LanServing {
+    listener: Option<std::net::TcpListener>,
+    tls: Option<RustlsConfig>,
+    handle: Option<Handle<SocketAddr>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LanControl {
+    /// Stop accepting TLS connections, but retain a descriptor for the next
+    /// server or for rollback in this process.
+    pub async fn pause(&self) -> Result<Option<std::net::TcpListener>> {
+        let _transition = self.transition.lock().await;
+        let (listener, handle, task) = {
+            let mut inner = self.inner.lock().unwrap();
+            (
+                inner
+                    .listener
+                    .as_ref()
+                    .map(std::net::TcpListener::try_clone)
+                    .transpose()?,
+                inner.handle.take(),
+                inner.task.take(),
+            )
+        };
+        if let Some(handle) = handle {
+            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        }
+        if let Some(mut task) = task {
+            if tokio::time::timeout(Duration::from_secs(10), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.listener = None;
+        inner.tls = None;
+        Ok(listener)
+    }
+
+    async fn reload_certificate(&self, lan: &TerminalDirectLanConfig) -> Result<()> {
+        let tls = self.inner.lock().unwrap().tls.clone();
+        if let Some(tls) = tls {
+            let dir = expand_home(&lan.cert_dir);
+            tls.reload_from_pem(
+                fs::read(dir.join("fullchain.pem"))?,
+                fs::read(dir.join("privkey.pem"))?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        let (handle, task) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.listener = None;
+            inner.tls = None;
+            (inner.handle.take(), inner.task.take())
+        };
+        if let Some(handle) = handle {
+            handle.shutdown();
+        }
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+}
+
 /// Keep the listener off unless its DNS record and certificate are both ready.
 /// Reconcile immediately, then every ten minutes; certificate checks run daily.
-pub async fn run(state: Arc<AppState>) {
+pub async fn run(
+    state: Arc<AppState>,
+    control: LanControl,
+    inherited: Option<std::net::TcpListener>,
+    shutdown: Shutdown,
+) {
     let lan = state.config().terminal_direct.lan.clone();
     if !lan.enabled {
         return;
     }
     let config = state.config().clone();
-    let mut serving: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(listener) = inherited {
+        if let Err(error) =
+            start_listener(state.clone(), &lan, &control, Some(listener), &shutdown).await
+        {
+            eprintln!("inherited terminal LAN listener unavailable: {error:#}");
+            return;
+        }
+    }
     let mut last_cert_check: Option<tokio::time::Instant> = None;
     let mut ticker = tokio::time::interval(DNS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stopped = shutdown.subscribe();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stopped.changed() => return,
+        }
+        if shutdown.is_stopped() {
+            return;
+        }
         let dns = tokio::task::spawn_blocking({
             let config = config.clone();
             let lan = lan.clone();
             move || sync_address_record(&config, &lan)
         })
         .await;
+        if shutdown.is_stopped() {
+            return;
+        }
         let dns_ok = match dns {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
@@ -60,71 +167,99 @@ pub async fn run(state: Arc<AppState>) {
             }
         };
         if !dns_ok {
-            stop(&mut serving).await;
+            // A failed DNS reconciliation does not invalidate an already
+            // serving listener. Keep its inherited socket for the next pass.
             continue;
         }
         if last_cert_check.is_none_or(|at| at.elapsed() >= CERT_INTERVAL) {
             let certificate = ensure_certificate(&config, &lan).await;
+            if shutdown.is_stopped() {
+                return;
+            }
             match certificate {
                 Ok(renewed) => {
                     last_cert_check = Some(tokio::time::Instant::now());
                     if renewed {
-                        stop(&mut serving).await;
+                        if let Err(error) = control.reload_certificate(&lan).await {
+                            eprintln!("terminal LAN certificate reload failed: {error:#}");
+                            last_cert_check = None;
+                        }
                     }
                 }
                 Err(error) => {
                     eprintln!("terminal LAN certificate unavailable: {error:#}");
                     let dir = expand_home(&lan.cert_dir);
                     if !certificate_is_valid_for(&dir, &lan.hostname, 0).unwrap_or(false) {
-                        stop(&mut serving).await;
+                        control.stop().await;
                         continue;
                     }
                 }
             }
         }
-        if serving.as_ref().is_some_and(|task| task.is_finished()) {
-            stop(&mut serving).await;
+        if shutdown.is_stopped() {
+            return;
         }
-        if serving.is_none() {
-            match start_listener(state.clone(), &lan).await {
-                Ok(task) => serving = Some(task),
+        if !control.is_running() {
+            control.stop().await;
+            match start_listener(state.clone(), &lan, &control, None, &shutdown).await {
+                Ok(()) => {}
                 Err(error) => eprintln!("terminal LAN listener unavailable: {error:#}"),
             }
         }
     }
 }
 
-async fn stop(serving: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(task) = serving.take() {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
 async fn start_listener(
     state: Arc<AppState>,
     lan: &TerminalDirectLanConfig,
-) -> Result<tokio::task::JoinHandle<()>> {
+    control: &LanControl,
+    inherited: Option<std::net::TcpListener>,
+    shutdown: &Shutdown,
+) -> Result<()> {
+    let _transition = control.transition.lock().await;
+    if shutdown.is_stopped() {
+        bail!("terminal LAN startup stopped for handover");
+    }
     let dir = expand_home(&lan.cert_dir);
     let cert = fs::read(dir.join("fullchain.pem"))?;
     let key = fs::read(dir.join("privkey.pem"))?;
     let tls = RustlsConfig::from_pem(cert, key).await?;
     let addr: SocketAddr = format!("0.0.0.0:{}", lan.port).parse()?;
-    let listener = std::net::TcpListener::bind(addr)
-        .with_context(|| format!("cannot bind terminal LAN listener on {addr}"))?;
+    let listener = match inherited {
+        Some(listener) => listener,
+        None => std::net::TcpListener::bind(addr)
+            .with_context(|| format!("cannot bind terminal LAN listener on {addr}"))?,
+    };
     listener.set_nonblocking(true)?;
+    let retained = listener.try_clone()?;
     eprintln!(
         "terminal LAN listening on https://{}:{}",
         lan.hostname, lan.port
     );
-    let server = axum_server::from_tcp_rustls(listener, tls)?;
-    Ok(tokio::spawn(async move {
+    let handle = Handle::new();
+    let server = axum_server::from_tcp_rustls(listener, tls.clone())?.handle(handle.clone());
+    let task = tokio::spawn(async move {
         let server = server
             .serve(terminal_lan_router(state).into_make_service_with_connect_info::<SocketAddr>());
         if let Err(error) = server.await {
             eprintln!("terminal LAN listener stopped: {error:#}");
         }
-    }))
+    });
+    if handle.listening().await.is_none() {
+        task.abort();
+        bail!("terminal LAN listener did not start");
+    }
+    if shutdown.is_stopped() {
+        task.abort();
+        let _ = task.await;
+        bail!("terminal LAN startup stopped for handover");
+    }
+    let mut inner = control.inner.lock().unwrap();
+    inner.listener = Some(retained);
+    inner.tls = Some(tls);
+    inner.handle = Some(handle);
+    inner.task = Some(task);
+    Ok(())
 }
 
 fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
@@ -538,6 +673,56 @@ mod tests {
         assert!(certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
         write_private(&key, b"invalid key").unwrap();
         assert!(!certificate_is_valid_for(&dir, "studio-lan.example.com", 0).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn certificate_reload_keeps_inherited_listener_bound() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!(
+            "sm-terminal-lan-reload-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        write_test_certificate(&dir, 1);
+        let first_cert = fs::read(dir.join("fullchain.pem")).unwrap();
+        let tls = RustlsConfig::from_pem(
+            first_cert.clone(),
+            fs::read(dir.join("privkey.pem")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let old_slot_listener = listener.try_clone().unwrap();
+        let control = LanControl::default();
+        {
+            let mut serving = control.inner.lock().unwrap();
+            serving.listener = Some(listener);
+            serving.tls = Some(tls);
+        }
+        write_test_certificate(&dir, 90);
+        assert_ne!(first_cert, fs::read(dir.join("fullchain.pem")).unwrap());
+        let lan = TerminalDirectLanConfig {
+            cert_dir: dir.to_string_lossy().into_owned(),
+            ..TerminalDirectLanConfig::default()
+        };
+        control.reload_certificate(&lan).await.unwrap();
+        assert_eq!(
+            control
+                .inner
+                .lock()
+                .unwrap()
+                .listener
+                .as_ref()
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+            address
+        );
+        assert_eq!(old_slot_listener.local_addr().unwrap(), address);
+        assert!(std::net::TcpListener::bind(address).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

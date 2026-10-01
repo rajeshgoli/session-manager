@@ -913,7 +913,7 @@ impl Recorder {
 }
 
 /// Start the recorder task. Callers decide whether it should run at all.
-pub fn spawn_recorder(settings: RecorderSettings) {
+pub fn spawn_recorder(settings: RecorderSettings, shutdown: crate::handover::Shutdown) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(settings.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -928,6 +928,9 @@ pub fn spawn_recorder(settings: RecorderSettings) {
         }));
         loop {
             ticker.tick().await;
+            if shutdown.is_stopped() {
+                break;
+            }
             let recorder = recorder.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let mut recorder = recorder

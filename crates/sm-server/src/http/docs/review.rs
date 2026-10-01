@@ -903,6 +903,9 @@ pub(in crate::http) fn recover_owner_doc_reviews(state: Arc<AppState>) {
             }
         };
         for review in pending {
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let id = review.id.clone();
             match run_blocking(&state, review, None).await {
                 Ok(_) => eprintln!("Owner doc review {id} recovered"),

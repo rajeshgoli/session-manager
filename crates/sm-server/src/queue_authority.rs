@@ -1,12 +1,15 @@
 use std::{
     env, fs,
     io::{ErrorKind, Read, Write},
+    os::fd::AsRawFd,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::Duration,
 };
 
@@ -50,6 +53,7 @@ pub struct QueueAuthorityServer {
     socket_path: PathBuf,
     queue_db_path: PathBuf,
     identity: QueueAuthorityServiceIdentity,
+    unlink_on_drop: AtomicBool,
 }
 
 impl QueueAuthorityServer {
@@ -81,33 +85,74 @@ impl QueueAuthorityServer {
             socket_path,
             queue_db_path: queue_state_dir.join("queue_runner.db"),
             identity,
+            unlink_on_drop: AtomicBool::new(true),
         })
+    }
+
+    pub fn from_listener(
+        listener: UnixListener,
+        queue_state_dir: &Path,
+        identity: QueueAuthorityServiceIdentity,
+    ) -> Self {
+        Self {
+            listener,
+            socket_path: queue_state_dir.join(AUTHORITY_SOCKET_FILE),
+            queue_db_path: queue_state_dir.join("queue_runner.db"),
+            identity,
+            unlink_on_drop: AtomicBool::new(false),
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
-    pub fn spawn(self) {
-        thread::spawn(move || loop {
-            if let Err(error) = self.accept_once() {
-                eprintln!("queue authority request failed: {error:#}");
-            }
-        });
+    pub fn listener_fd(&self) -> std::os::fd::RawFd {
+        self.listener.as_raw_fd()
     }
 
+    pub fn keep_socket_for_successor(&self) {
+        self.unlink_on_drop.store(false, Ordering::Release);
+    }
+
+    pub fn claim_socket(&self) {
+        self.unlink_on_drop.store(true, Ordering::Release);
+    }
+
+    pub fn spawn(&self, shutdown: crate::handover::Shutdown) -> Result<thread::JoinHandle<()>> {
+        let listener = self.listener.try_clone()?;
+        listener.set_nonblocking(true)?;
+        let queue_db_path = self.queue_db_path.clone();
+        let identity = self.identity.clone();
+        Ok(thread::spawn(move || {
+            while !shutdown.is_stopped() {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Err(error) = handle_connection(stream, &queue_db_path, &identity) {
+                            eprintln!("queue authority request failed: {error:#}");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) => eprintln!("queue authority accept failed: {error}"),
+                }
+            }
+        }))
+    }
+
+    #[cfg(test)]
     fn accept_once(&self) -> Result<()> {
-        let (stream, _) = self
-            .listener
-            .accept()
-            .context("failed to accept queue authority connection")?;
+        let (stream, _) = self.listener.accept()?;
         handle_connection(stream, &self.queue_db_path, &self.identity)
     }
 }
 
 impl Drop for QueueAuthorityServer {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.socket_path);
+        if self.unlink_on_drop.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.socket_path);
+        }
     }
 }
 

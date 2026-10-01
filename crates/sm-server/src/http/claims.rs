@@ -690,6 +690,9 @@ pub(super) fn init_work_claims(state: Arc<AppState>) {
     let interval = state.config.work_claims.sync_interval();
     tokio::spawn(async move {
         loop {
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let pass_state = state.clone();
             match tokio::task::spawn_blocking(move || run_sync_pass(&pass_state)).await {
                 Ok(Ok(())) => {}

@@ -10,7 +10,7 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -565,9 +565,93 @@ impl GitHubReviewPoster for GhCliReviewPoster {
     }
 }
 
+/// Counts provider side-command workers across rollback generations in one process.
+#[derive(Clone, Default)]
+pub struct BtwWorkers(Arc<(Mutex<BtwWorkerState>, Condvar)>);
+
+#[derive(Default)]
+struct BtwWorkerState {
+    active: usize,
+    recovery_blocked: bool,
+}
+
+struct BtwWorkerGuard(BtwWorkers);
+
+impl BtwWorkers {
+    fn begin(&self) -> BtwWorkerGuard {
+        let (state, _) = &*self.0;
+        state.lock().unwrap().active += 1;
+        BtwWorkerGuard(self.clone())
+    }
+
+    pub fn wait_empty(&self, limit: Duration) -> bool {
+        let (state, changed) = &*self.0;
+        let state = state.lock().unwrap();
+        let (state, _) = changed
+            .wait_timeout_while(state, limit, |state| state.active != 0)
+            .unwrap();
+        state.active == 0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let (state, _) = &*self.0;
+        state.lock().unwrap().active == 0
+    }
+
+    pub fn block_recovery(&self) {
+        let (state, _) = &*self.0;
+        state.lock().unwrap().recovery_blocked = true;
+    }
+
+    pub fn allow_recovery(&self) {
+        let (state, changed) = &*self.0;
+        state.lock().unwrap().recovery_blocked = false;
+        changed.notify_all();
+    }
+
+    fn wait_ready_for_recovery(&self, limit: Duration) -> bool {
+        let (state, changed) = &*self.0;
+        let state = state.lock().unwrap();
+        let (state, _) = changed
+            .wait_timeout_while(state, limit, |state| {
+                state.active != 0 || state.recovery_blocked
+            })
+            .unwrap();
+        state.active == 0 && !state.recovery_blocked
+    }
+}
+
+impl Drop for BtwWorkerGuard {
+    fn drop(&mut self) {
+        let (state, changed) = &*self.0 .0;
+        state.lock().unwrap().active -= 1;
+        changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn btw_worker_blocks_handover_across_rollback_generations() {
+    let workers = BtwWorkers::default();
+    let old_worker = workers.begin();
+    let resumed_generation = workers.clone();
+    assert!(!workers.is_empty());
+    assert!(!workers.wait_empty(Duration::from_millis(1)));
+    assert!(!resumed_generation.wait_empty(Duration::from_millis(1)));
+    drop(old_worker);
+    assert!(workers.is_empty());
+    assert!(resumed_generation.wait_empty(Duration::from_millis(1)));
+    workers.block_recovery();
+    assert!(!resumed_generation.wait_ready_for_recovery(Duration::from_millis(1)));
+    workers.allow_recovery();
+    assert!(resumed_generation.wait_ready_for_recovery(Duration::from_millis(1)));
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
+    shutdown: crate::handover::Shutdown,
+    btw_workers: BtwWorkers,
     listen_port: u16,
     server_instance: String,
     session_store: SessionStore,
@@ -746,6 +830,8 @@ impl AppState {
         ));
         Ok(Self {
             config,
+            shutdown: crate::handover::Shutdown::default(),
+            btw_workers: BtwWorkers::default(),
             listen_port: 8420,
             server_instance: random_urlsafe_token(24),
             session_store,
@@ -782,6 +868,24 @@ impl AppState {
             queue_admission,
             terminal_limits,
         })
+    }
+
+    pub fn with_shutdown(mut self, shutdown: crate::handover::Shutdown) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    pub fn with_btw_workers(mut self, workers: BtwWorkers) -> Self {
+        self.btw_workers = workers;
+        self
+    }
+
+    pub fn btw_workers(&self) -> BtwWorkers {
+        self.btw_workers.clone()
+    }
+
+    pub fn shutdown(&self) -> crate::handover::Shutdown {
+        self.shutdown.clone()
     }
 
     pub fn with_listen_port(mut self, port: u16) -> Self {
@@ -3719,27 +3823,36 @@ async fn events_stream(
 ) -> Result<Response, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
     let receiver = state.tmux_client_event_tx.subscribe();
+    let shutdown = state.shutdown();
     let data = serde_json::to_string(&state.event_state_payload())?;
-    let updates = stream::unfold(receiver, |mut receiver| async move {
-        loop {
-            match receiver.recv().await {
-                Ok(payload) => {
-                    let event_type = payload
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("message")
-                        .to_owned();
-                    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
-                    return Some((
-                        Ok::<Event, Infallible>(Event::default().event(event_type).data(data)),
-                        receiver,
-                    ));
+    let updates = stream::unfold(
+        (receiver, shutdown.subscribe()),
+        |(mut receiver, mut stopped)| async move {
+            loop {
+                let message = tokio::select! {
+                    message = receiver.recv() => message,
+                    _ = stopped.changed() => return None,
+                };
+                match message {
+                    Ok(payload) => {
+                        let event_type = payload
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("message")
+                            .to_owned();
+                        let data =
+                            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                        return Some((
+                            Ok::<Event, Infallible>(Event::default().event(event_type).data(data)),
+                            (receiver, stopped),
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    });
+        },
+    );
     let stream =
         stream::once(
             async move { Ok::<Event, Infallible>(Event::default().event("hello").data(data)) },
@@ -4642,6 +4755,9 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
         let mut idle_since = Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
+            if state.shutdown().is_stopped() {
+                break;
+            }
             let Ok(Some(child)) = state.session_store.get_session(&child_session_id) else {
                 break;
             };
@@ -5512,7 +5628,11 @@ async fn wait_for_codex_review_poll_or_terminal(
     let poll_deadline = Instant::now()
         .checked_add(poll_wait)
         .ok_or_else(|| "Codex review poll deadline overflowed after TTL bounding".to_owned())?;
+    let mut stopped = state.shutdown().subscribe();
     loop {
+        if state.shutdown().is_stopped() {
+            return Ok(None);
+        }
         let until_poll = poll_deadline.saturating_duration_since(Instant::now());
         let sleep_for = std::cmp::min(
             until_poll,
@@ -5524,6 +5644,7 @@ async fn wait_for_codex_review_poll_or_terminal(
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {},
             _ = crate::queue::owned_job_terminal_notify().notified() => return Ok(Some(registration.clone())),
+            _ = stopped.changed() => return Ok(None),
         }
 
         let Some(current) =
@@ -5884,6 +6005,9 @@ async fn run_codex_review_request_watcher(
 ) -> Result<(), String> {
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
     loop {
+        if state.shutdown().is_stopped() {
+            return Ok(());
+        }
         let Some(registration) =
             RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)
                 .map_err(|error| error.to_string())?
@@ -6513,6 +6637,9 @@ fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let state = state.clone();
             let compaction_wait_started = compaction_wait_started.clone();
             match tokio::task::spawn_blocking(move || {
@@ -9022,8 +9149,14 @@ async fn run_mobile_terminal_bridge_inner(
     let mut close_code = 1000u16;
     let mut close_reason = "transport_closed".to_owned();
     let mut last_heard = tokio::time::Instant::now();
+    let mut restart = state.shutdown().subscribe();
 
     loop {
+        if state.shutdown().is_stopped() {
+            close_code = 1012;
+            close_reason = "service_restart".to_owned();
+            break;
+        }
         if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
             let _ = send_mobile_terminal_bounded(
                 &mut sender,
@@ -9060,6 +9193,11 @@ async fn run_mobile_terminal_bridge_inner(
         }
 
         tokio::select! {
+            _ = restart.changed() => {
+                close_code = 1012;
+                close_reason = "service_restart".to_owned();
+                break;
+            }
             _ = keepalive.tick() => {
                 if last_heard.elapsed() >= Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS) {
                     close_code = 1001;
@@ -9982,7 +10120,9 @@ async fn create_btw_request(
 
     let worker_state = state.clone();
     let worker_request_id = record.request_id.clone();
+    let worker_guard = state.btw_workers.begin();
     tokio::task::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
         if let Err(error) = run_btw_request(&worker_state, &worker_request_id) {
             eprintln!("sm what worker {worker_request_id} failed: {error:#}");
         }
@@ -10008,6 +10148,22 @@ async fn get_btw_request(
 }
 
 fn recover_btw_requests(state: Arc<AppState>) {
+    thread::spawn(move || {
+        while !state
+            .btw_workers
+            .wait_ready_for_recovery(Duration::from_secs(1))
+        {
+            if state.shutdown.is_stopped() {
+                return;
+            }
+        }
+        if !state.shutdown.is_stopped() {
+            recover_btw_requests_ready(state);
+        }
+    });
+}
+
+fn recover_btw_requests_ready(state: Arc<AppState>) {
     if !btw_db_path(&state).exists() {
         return;
     }
@@ -10018,9 +10174,17 @@ fn recover_btw_requests(state: Arc<AppState>) {
         return;
     };
     for request in requests {
+        if state.shutdown.is_stopped() {
+            break;
+        }
         let worker_state = state.clone();
         let worker_store = store.clone();
+        let worker_guard = state.btw_workers.begin();
         thread::spawn(move || {
+            let _worker_guard = worker_guard;
+            if worker_state.shutdown.is_stopped() {
+                return;
+            }
             if !matches!(request.status.as_str(), "pending" | "running") {
                 let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
                 return;

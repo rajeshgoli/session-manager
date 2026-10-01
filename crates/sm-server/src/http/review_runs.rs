@@ -814,6 +814,9 @@ pub(super) fn cleanup_request(state: &AppState, id: &str) -> Result<()> {
 pub(super) fn start_sweeper(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
+            if state.shutdown().is_stopped() {
+                return;
+            }
             let state = state.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<()> {
                 let dir = root(&state);

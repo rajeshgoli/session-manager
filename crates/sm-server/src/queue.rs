@@ -31,6 +31,19 @@ use time::{
     PrimitiveDateTime,
 };
 
+fn queue_shutdown_cell() -> &'static RwLock<crate::handover::Shutdown> {
+    static SHUTDOWN: OnceLock<RwLock<crate::handover::Shutdown>> = OnceLock::new();
+    SHUTDOWN.get_or_init(|| RwLock::new(crate::handover::Shutdown::default()))
+}
+
+pub fn set_live_queue_shutdown(shutdown: crate::handover::Shutdown) {
+    *queue_shutdown_cell().write().unwrap() = shutdown;
+}
+
+fn queue_shutdown() -> crate::handover::Shutdown {
+    queue_shutdown_cell().read().unwrap().clone()
+}
+
 #[derive(Debug, Clone)]
 pub struct RetainedQueueStore {
     db_path: PathBuf,
@@ -1700,6 +1713,7 @@ impl RetainedQueueStore {
         let monitor_job_id = job_id.to_owned();
         let timeout_seconds = job.timeout_seconds;
         let memory_bytes = job.memory_bytes;
+        let monitor_shutdown = queue_shutdown();
         thread::spawn(move || {
             monitor_queue_job_completion(
                 monitor_state_dir,
@@ -1711,6 +1725,7 @@ impl RetainedQueueStore {
                 process_limit,
                 cancel_grace_seconds,
                 admission_policy,
+                monitor_shutdown,
             );
         });
         started
@@ -4597,8 +4612,12 @@ fn schedule_queue_admission_retry(
         return;
     }
     let retry_key = state_dir.clone();
+    let shutdown = queue_shutdown();
     thread::spawn(move || {
         thread::sleep(delay);
+        if shutdown.is_stopped() {
+            return;
+        }
         if !release_queue_admission_retry_if_current(&retry_key, deadline) {
             return;
         }
@@ -5403,6 +5422,7 @@ fn monitor_queue_job_completion(
     process_limit: Option<i64>,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
+    shutdown: crate::handover::Shutdown,
 ) {
     let started = Instant::now();
     let mut process_guard = ProcessGuard::new(process_limit);
@@ -5411,6 +5431,9 @@ fn monitor_queue_job_completion(
     let mut next_memory_check = Instant::now();
     let mut failed_memory_samples = 0u8;
     loop {
+        if shutdown.is_stopped() {
+            return;
+        }
         let child_status = match child.try_wait() {
             Ok(status) => status,
             Err(_) => {
@@ -5802,11 +5825,15 @@ pub fn spawn_host_memory_guard(
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
+    let shutdown = queue_shutdown();
     thread::spawn(move || {
         let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
         let mut last_stop: Option<Instant> = None;
         loop {
             thread::sleep(HOST_MEMORY_GUARD_INTERVAL);
+            if shutdown.is_stopped() {
+                break;
+            }
             if last_stop.is_some_and(|stopped| stopped.elapsed() < HOST_MEMORY_GUARD_STOP_SPACING) {
                 continue;
             }
@@ -6370,6 +6397,7 @@ fn recover_running_queue_job_conn(
     let state_dir = state_dir.to_path_buf();
     let message_queue_db_path = message_queue_db_path.to_path_buf();
     let job_id = job.id.clone();
+    let recovered_shutdown = queue_shutdown();
     thread::spawn(move || {
         poll_recovered_queue_job(
             state_dir,
@@ -6378,6 +6406,7 @@ fn recover_running_queue_job_conn(
             pid,
             cancel_grace_seconds,
             admission_policy,
+            recovered_shutdown,
         );
     });
     Ok(RecoveredQueueJobAction::Polling)
@@ -6393,6 +6422,7 @@ fn poll_recovered_queue_job(
     pid: i64,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
+    shutdown: crate::handover::Shutdown,
 ) {
     let mut next_memory_check = Instant::now();
     let mut failed_memory_samples = 0u8;
@@ -6432,6 +6462,9 @@ fn poll_recovered_queue_job(
         true
     };
     loop {
+        if shutdown.is_stopped() {
+            return;
+        }
         thread::sleep(StdDuration::from_millis(100));
         let conn = match open_queue_jobs_connection(&db_path) {
             Ok(conn) => conn,
