@@ -333,10 +333,12 @@ mod agent_history;
 mod analytics;
 mod board;
 mod board_clock;
+mod board_links;
 mod browser_terminal;
 mod claims;
 mod docs;
 mod follows;
+mod github;
 mod guestbook_page;
 mod handoff;
 mod history;
@@ -1733,6 +1735,11 @@ pub fn router(state: AppState) -> Router {
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
         .route("/client/board/start", post(board::client_start))
+        .route("/client/board/close", post(board::client_close))
+        .route(
+            "/client/github/{owner}/{repo}/{number}",
+            get(github::get_item),
+        )
         .route("/client/board/start-options", get(board::start_options))
         .route(
             "/client/settings",
@@ -1929,6 +1936,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/handoff-defaults",
             get(handoff::get_handoff_defaults).put(handoff::put_handoff_defaults),
+        )
+        .route(
+            "/handoff-policy/ticket/{owner}/{repo}/{number}",
+            get(handoff::get_ticket_handoff_policy).put(handoff::put_ticket_handoff_policy),
         )
         .route(
             "/sessions/{session_id}/maintainer",
@@ -2413,6 +2424,11 @@ async fn context_usage_hook(
             .map(ToOwned::to_owned),
         used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
         total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+        context_window_tokens: payload_i64(payload.get("context_window_tokens")),
+        model_id: payload
+            .get("model_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         five_hour_percent: five_hour
             .and_then(|window| window.get("used_percentage"))
             .and_then(Value::as_f64)
@@ -4462,6 +4478,7 @@ async fn spawn_session(
                 claims::SpawnTicket {
                     session_id: &id,
                     check_board: false,
+                    start_blocked: false,
                     name: payload.name.as_deref(),
                     parent: Some(&parent),
                     ticket,
@@ -14750,6 +14767,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/board"
         || path == "/client/board/badge"
         || path == "/client/board/start-options"
+        || path.starts_with("/client/github/")
         || path == "/client/settings"
         || path == "/history"
         || path == "/history/agents"
@@ -23782,6 +23800,33 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert_eq!(body["display"], "hands off at 45%");
         assert_eq!(body["source"], "override");
 
+        let ticket_uri = "/handoff-policy/ticket/acme/widgets/1782";
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(
+                        ticket_uri,
+                        json!({"enabled": true, "threshold_percent": 30}),
+                        false,
+                    ),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["threshold_percent"], 30);
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(Method::GET, ticket_uri, Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], true);
+
         // Remote owner (the app): passes.
         let (status, body) = response_json(
             app.clone()
@@ -23801,6 +23846,18 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             app.clone()
                 .oneshot(handoff_json_request(
                     put(&policy_uri, json!({"enabled": false}), true),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(ticket_uri, json!({"enabled": false}), true),
                     &[],
                 ))
                 .await

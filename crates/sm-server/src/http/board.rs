@@ -320,6 +320,20 @@ pub(super) fn board_payload(
             clocks: &clocks,
         },
     );
+    let early = store.started_early()?;
+    let links = super::board_links::BoardLinks::load(state, &input)?;
+    for lane in payload["lanes"].as_array_mut().into_iter().flatten() {
+        for ticket in lane["tickets"].as_array_mut().into_iter().flatten() {
+            mark_started_early(ticket, &early);
+            links.attach(ticket);
+        }
+    }
+    for group in payload["other"].as_array_mut().into_iter().flatten() {
+        for ticket in group["tickets"].as_array_mut().into_iter().flatten() {
+            mark_started_early(ticket, &early);
+            links.attach(ticket);
+        }
+    }
     add_review_fields(state, &mut payload)?;
     Ok(payload)
 }
@@ -384,6 +398,14 @@ fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+fn mark_started_early(ticket: &mut Value, early: &BTreeSet<Key>) {
+    let key = (
+        ticket["repo"].as_str().unwrap_or_default().to_owned(),
+        ticket["number"].as_i64().unwrap_or_default(),
+    );
+    ticket["started_early"] = json!(ticket["state"] != "done" && early.contains(&key));
 }
 
 async fn blocking<T: Send + 'static>(
@@ -932,6 +954,8 @@ fn checkout_in(
 pub(super) struct StartOptionsQuery {
     repo: String,
     number: i64,
+    #[serde(default)]
+    start_blocked: bool,
 }
 
 fn new_agent_settings(state: &AppState) -> anyhow::Result<NewAgentSettings> {
@@ -955,14 +979,18 @@ fn start_defaults(state: &AppState) -> anyhow::Result<Value> {
 /// What Start fills in (spec 1710 appendix D4): the checkout, and the
 /// provider, model, effort, name and first message from owner settings. A
 /// null model or effort leaves the choice to the provider.
-fn start_options_payload(state: &AppState, key: &Key) -> Result<Value, ApiError> {
+fn start_options_payload(
+    state: &AppState,
+    key: &Key,
+    start_blocked: bool,
+) -> Result<Value, ApiError> {
     let input = board_store(state).input(&outside(state)?)?;
     let item = input
         .items
         .get(key)
         .ok_or(ApiError::NotFound("Ticket not on the board"))?;
     let settings = new_agent_settings(state)?;
-    Ok(start_options_json(
+    let mut options = start_options_json(
         &settings,
         Ticket {
             repo: &key.0,
@@ -971,7 +999,44 @@ fn start_options_payload(state: &AppState, key: &Key) -> Result<Value, ApiError>
             url: &item.url,
         },
         checkout(&state.config, &key.0)?,
-    ))
+    );
+    if start_blocked {
+        let blockers: Vec<i64> = input
+            .edges
+            .iter()
+            .filter(|edge| {
+                &edge.waiter == key
+                    && input
+                        .items
+                        .get(&edge.blocker)
+                        .is_some_and(|item| item.is_open())
+            })
+            .map(|edge| edge.blocker.1)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !blockers.is_empty() {
+            let names: Vec<String> = blockers.iter().map(|number| format!("#{number}")).collect();
+            let list = match names.as_slice() {
+                [one] => one.clone(),
+                [first, second] => format!("{first} and {second}"),
+                _ => format!(
+                    "{} and {}",
+                    names[..names.len() - 1].join(", "),
+                    names.last().unwrap()
+                ),
+            };
+            let plural = blockers.len() > 1;
+            let paragraph = format!("Started early by {}. {list} {} not done yet: check what {} delivered so far and build on it; do not redo {} work.",
+                state.config.owner_name, if plural { "are" } else { "is" },
+                if plural { "they have" } else { "it has" },
+                if plural { "their" } else { "its" });
+            let brief = options["brief"].as_str().unwrap_or_default();
+            options["brief"] = json!(format!("{brief}\n\n{paragraph}"));
+            options["early_start_paragraph"] = json!(paragraph);
+        }
+    }
+    Ok(options)
 }
 
 pub(super) fn start_options_json(
@@ -999,8 +1064,12 @@ pub(super) async fn start_options(
 ) -> Result<Json<Value>, ApiError> {
     owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let key = ticket_key(&query.repo, query.number)?;
+    let start_blocked = query.start_blocked;
     Ok(Json(
-        blocking(&state, move |state| start_options_payload(state, &key)).await?,
+        blocking(&state, move |state| {
+            start_options_payload(state, &key, start_blocked)
+        })
+        .await?,
     ))
 }
 
@@ -1013,6 +1082,8 @@ pub(super) struct StartRequest {
     reasoning_effort: Option<String>,
     name: Option<String>,
     brief: Option<String>,
+    #[serde(default)]
+    start_blocked: bool,
 }
 
 pub(super) async fn client_start(
@@ -1027,8 +1098,92 @@ pub(super) async fn client_start(
     start(state, payload).await.map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct CloseRequest {
+    repo: String,
+    number: i64,
+}
+
+pub(super) async fn client_close(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(payload): Json<CloseRequest>,
+) -> Result<Json<Value>, ApiError> {
+    owner_write_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    let key = ticket_key(&payload.repo, payload.number)?;
+    blocking(&state, move |state| {
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let (board, _) =
+            board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
+        let facts = board
+            .facts
+            .get(&key)
+            .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+        if facts.state != crate::board::model::TicketState::CloseReady {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!("#{} is not ready to close; refresh the board", key.1),
+            });
+        }
+        let refs = facts
+            .sub_issues
+            .iter()
+            .map(|child| format!("#{}", child.1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let comment = format!(
+            "All {} sub-issues are done: {refs}. Closed from the sm board.",
+            facts.sub_issues.len()
+        );
+        let args = vec![
+            "issue".into(),
+            "close".into(),
+            key.1.to_string(),
+            "-R".into(),
+            key.0.clone(),
+            "--comment".into(),
+            comment,
+        ];
+        let output = gh_command_output(&args, Duration::from_secs(30)).map_err(|detail| {
+            ApiError::Status {
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+            }
+        })?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("GitHub close failed")
+                .to_owned();
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_GATEWAY,
+                detail,
+            });
+        }
+        request_pass(state);
+        Ok(Json(json!({"closed": true})))
+    })
+    .await
+}
+
 /// Called again under the board lock immediately before reserving the claim.
-pub(super) fn validate_start(state: &AppState, key: &Key) -> Result<Vec<i64>, ApiError> {
+pub(super) struct StartValidation {
+    pub lanes: Vec<i64>,
+    pub started_early: bool,
+}
+
+pub(super) fn validate_start(
+    state: &AppState,
+    key: &Key,
+    start_blocked: bool,
+) -> Result<StartValidation, ApiError> {
     let (board, input) =
         board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
     let item = input
@@ -1064,9 +1219,14 @@ pub(super) fn validate_start(state: &AppState, key: &Key) -> Result<Vec<i64>, Ap
         .facts
         .get(key)
         .ok_or(ApiError::NotFound("Ticket not on the board"))?;
-    if facts.state != crate::board::model::TicketState::Ready
-        || facts.warnings.contains(&"merged_not_closed")
-    {
+    let startable = matches!(
+        facts.state,
+        crate::board::model::TicketState::Ready | crate::board::model::TicketState::CloseReady
+    ) || (start_blocked
+        && facts.state == crate::board::model::TicketState::Blocked
+        && !facts.warnings.contains(&"stale")
+        && !facts.warnings.contains(&"cycle"));
+    if !startable || facts.warnings.contains(&"merged_not_closed") {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: format!("#{} is no longer ready to start; refresh the board", key.1),
@@ -1078,7 +1238,10 @@ pub(super) fn validate_start(state: &AppState, key: &Key) -> Result<Vec<i64>, Ap
         .filter(|lane| lane.contains(key))
         .map(|lane| lane.lane.id)
         .collect();
-    Ok(lanes)
+    Ok(StartValidation {
+        lanes,
+        started_early: facts.state == crate::board::model::TicketState::Blocked,
+    })
 }
 
 async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, ApiError> {
@@ -1088,15 +1251,18 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     let key = ticket_key(&payload.repo, payload.number)?;
     let checked_key = key.clone();
     let (options, lanes) = blocking(&state, move |state| {
-        let lanes = validate_start(state, &checked_key)?;
-        Ok((start_options_payload(state, &checked_key)?, lanes))
+        let validation = validate_start(state, &checked_key, payload.start_blocked)?;
+        Ok((
+            start_options_payload(state, &checked_key, false)?,
+            validation.lanes,
+        ))
     })
     .await?;
     let id = state.session_store.allocate_session_id()?;
     let name = trimmed(&payload.name)
         .unwrap_or_else(|| options["name"].as_str().unwrap_or_default().to_owned());
     let reservation = claims::reserve_spawn_ticket(&state, claims::SpawnTicket {
-        session_id: &id, check_board: true, name: Some(&name), parent: None, ticket: key.1, repo: &key.0,
+        session_id: &id, check_board: true, start_blocked: payload.start_blocked, name: Some(&name), parent: None, ticket: key.1, repo: &key.0,
         worktree_path: None, branch: None,
     }).await.map_err(|error| match error {
         ApiError::StatusBody { status: StatusCode::CONFLICT, body } => ApiError::StatusBody {
@@ -1105,6 +1271,22 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
         },
         other => other,
     })?;
+    let options = if reservation.started_early {
+        let early_key = key.clone();
+        match blocking(&state, move |state| {
+            start_options_payload(state, &early_key, true)
+        })
+        .await
+        {
+            Ok(options) => options,
+            Err(error) => {
+                claims::finish_spawn_ticket(&state, &reservation, false);
+                return Err(error);
+            }
+        }
+    } else {
+        options
+    };
     let created = create_session_from_request(
         state.clone(),
         CreateCoreSessionRequest {
@@ -1115,10 +1297,16 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
             // Absent or blank leaves the choice to the provider.
             model: crate::config::trimmed(&payload.model),
             reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
-            initial_message: Some(
-                trimmed(&payload.brief)
-                    .unwrap_or_else(|| options["brief"].as_str().unwrap_or_default().to_owned()),
-            ),
+            initial_message: Some(match trimmed(&payload.brief) {
+                Some(brief) if reservation.started_early => format!(
+                    "{brief}\n\n{}",
+                    options["early_start_paragraph"]
+                        .as_str()
+                        .unwrap_or_default()
+                ),
+                Some(brief) => brief,
+                None => options["brief"].as_str().unwrap_or_default().to_owned(),
+            }),
             parent_session_id: None,
             node: None,
             wait: None,
@@ -1129,6 +1317,9 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     .await;
     claims::finish_spawn_ticket(&state, &reservation, created.is_ok());
     let session = created?;
+    if reservation.started_early {
+        board_store(&state).record_started_early(&key, time::OffsetDateTime::now_utc())?;
+    }
     // Session creation is committed. A reporting failure must not invite a duplicate Start.
     for lane in lanes {
         if let Err(error) = board::record_event(

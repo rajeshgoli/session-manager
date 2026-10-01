@@ -82,6 +82,14 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS work_claims_session ON work_claims(session_id);
         CREATE UNIQUE INDEX IF NOT EXISTS work_claims_one_active
             ON work_claims(repo, number, session_id) WHERE ended_at IS NULL;
+        CREATE TABLE IF NOT EXISTS handoff_ticket_overrides (
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            enabled INTEGER,
+            threshold_percent REAL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number)
+        );
         CREATE TABLE IF NOT EXISTS worktree_keeps (
             path TEXT PRIMARY KEY,
             session_id TEXT,
@@ -524,6 +532,19 @@ pub struct WorkClaim {
     pub check_b_due_at: Option<String>,
 }
 
+/// The fields the board needs to preserve PR links after a claim ends.
+#[derive(Debug, Clone)]
+pub struct BoardLinkClaim {
+    pub repo: String,
+    pub number: i64,
+    pub kind: String,
+    pub session_id: String,
+    pub claimed_at: String,
+    pub ended_at: Option<String>,
+    pub state: Option<String>,
+    pub url: Option<String>,
+}
+
 impl WorkClaim {
     pub fn kind(&self) -> WorkKind {
         WorkKind::parse(&self.kind).unwrap_or(WorkKind::Ticket)
@@ -613,6 +634,93 @@ pub struct WorkClaimStore {
 }
 
 impl WorkClaimStore {
+    pub fn handoff_ticket_override(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<Option<crate::handoff::policy::HandoffOverride>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT enabled, threshold_percent, updated_at FROM handoff_ticket_overrides WHERE repo = ?1 AND number = ?2",
+            params![repo, number],
+            |row| Ok(crate::handoff::policy::HandoffOverride {
+                enabled: row.get::<_, Option<bool>>(0)?,
+                threshold_percent: row.get(1)?,
+                set_at: row.get(2)?,
+            }),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn set_handoff_ticket_override(
+        &self,
+        repo: &str,
+        number: i64,
+        value: Option<&crate::handoff::policy::HandoffOverride>,
+    ) -> Result<()> {
+        let conn = self.open_write()?;
+        if let Some(value) = value {
+            conn.execute("INSERT INTO handoff_ticket_overrides (repo, number, enabled, threshold_percent, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(repo, number) DO UPDATE SET enabled = excluded.enabled,
+                threshold_percent = excluded.threshold_percent, updated_at = excluded.updated_at",
+                params![repo, number, value.enabled, value.threshold_percent, value.set_at])?;
+        } else {
+            conn.execute(
+                "DELETE FROM handoff_ticket_overrides WHERE repo = ?1 AND number = ?2",
+                params![repo, number],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn first_ticket_for_session(&self, session_id: &str) -> Result<Option<(String, i64)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT repo, number FROM work_claims WHERE session_id = ?1 AND kind = 'ticket'
+                AND ended_at IS NULL AND reserved_at IS NULL ORDER BY claimed_at, id LIMIT 1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn handoff_ticket_overrides_by_session(
+        &self,
+    ) -> Result<BTreeMap<String, crate::handoff::policy::HandoffOverride>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut statement = conn.prepare(
+            "WITH ranked AS (
+                SELECT session_id, repo, number,
+                    ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY claimed_at, id) AS rank
+                FROM work_claims WHERE kind = 'ticket' AND ended_at IS NULL AND reserved_at IS NULL
+            )
+            SELECT ranked.session_id, overrides.enabled, overrides.threshold_percent, overrides.updated_at
+            FROM ranked JOIN handoff_ticket_overrides AS overrides
+                ON overrides.repo = ranked.repo AND overrides.number = ranked.number
+            WHERE ranked.rank = 1",
+        )?;
+        let overrides = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    crate::handoff::policy::HandoffOverride {
+                        enabled: row.get(1)?,
+                        threshold_percent: row.get(2)?,
+                        set_at: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .map_err(Into::into);
+        overrides
+    }
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
     }
@@ -755,6 +863,36 @@ impl WorkClaimStore {
             [],
         )?;
         claim_views(&conn, claims)
+    }
+
+    /// Confirmed ticket and PR claims, including ended ones, for durable board links.
+    pub fn board_link_claims(&self) -> Result<Vec<BoardLinkClaim>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(
+            "SELECT c.repo, c.number, c.kind, c.session_id, c.claimed_at, c.ended_at,
+                    i.state, i.url
+             FROM work_claims c LEFT JOIN work_items i
+               ON i.repo = c.repo AND i.number = c.number
+             WHERE c.reserved_at IS NULL AND c.kind IN ('ticket', 'pr')
+             ORDER BY c.claimed_at, c.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(BoardLinkClaim {
+                    repo: row.get(0)?,
+                    number: row.get(1)?,
+                    kind: row.get(2)?,
+                    session_id: row.get(3)?,
+                    claimed_at: row.get(4)?,
+                    ended_at: row.get(5)?,
+                    state: row.get(6)?,
+                    url: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Stores a claim-time or sync fetch for `repo`. Items found are

@@ -127,6 +127,7 @@ pub struct WaitingRecord {
 #[serde(rename_all = "snake_case")]
 pub enum TicketState {
     NeedsYou,
+    CloseReady,
     Ready,
     InProgress,
     Blocked,
@@ -137,6 +138,7 @@ impl TicketState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NeedsYou => "needs_you",
+            Self::CloseReady => "close_ready",
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
@@ -147,6 +149,7 @@ impl TicketState {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "needs_you" => Some(Self::NeedsYou),
+            "close_ready" => Some(Self::CloseReady),
             "ready" => Some(Self::Ready),
             "in_progress" => Some(Self::InProgress),
             "blocked" => Some(Self::Blocked),
@@ -211,6 +214,8 @@ pub struct TicketFacts {
     pub waits_on: Vec<Key>,
     pub warnings: Vec<&'static str>,
     pub sub_issues_done: bool,
+    pub sub_issues: Vec<Key>,
+    pub sub_issues_closed: usize,
 }
 
 /// A ticket's row in a lane.
@@ -594,12 +599,23 @@ fn ticket_facts(
         created_at: record.created_at.clone(),
     });
 
+    let children = sub_issues.get(key);
+    let sub_issues_closed = children.map_or(0, |children| {
+        children
+            .iter()
+            .filter(|child| !is_open(input, child))
+            .count()
+    });
+    let sub_issues_done = children
+        .is_some_and(|children| !children.is_empty() && sub_issues_closed == children.len());
     let state = if !item.is_open() {
         TicketState::Done
     } else if needs_you.is_some() {
         TicketState::NeedsYou
     } else if holder.is_some() || open_pr {
         TicketState::InProgress
+    } else if sub_issues_done && !any_stale && !in_cycle {
+        TicketState::CloseReady
     } else if !open_blocker && !any_stale && !in_cycle {
         TicketState::Ready
     } else {
@@ -628,11 +644,6 @@ fn ticket_facts(
         }
     }
 
-    let children = sub_issues.get(key);
-    let sub_issues_done = children.is_some_and(|children| {
-        !children.is_empty() && children.iter().all(|child| !is_open(input, child))
-    });
-
     TicketFacts {
         item,
         state,
@@ -646,6 +657,8 @@ fn ticket_facts(
         waits_on: blockers,
         warnings,
         sub_issues_done,
+        sub_issues: children.into_iter().flatten().cloned().collect(),
+        sub_issues_closed,
     }
 }
 

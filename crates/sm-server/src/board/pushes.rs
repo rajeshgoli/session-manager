@@ -85,7 +85,7 @@ pub fn decide(recomputed: &Recomputed, last_holder: &dyn Fn(&Key) -> Option<Stri
                     },
                 }
             }
-            TicketState::Blocked | TicketState::Ready => {
+            TicketState::Blocked | TicketState::Ready | TicketState::CloseReady => {
                 let closed: Vec<String> = board.facts[*first]
                     .waits_on
                     .iter()

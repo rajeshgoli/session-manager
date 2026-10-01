@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   html, api, bus, network, usePoll, useShared, setShared, stored, store, panels,
-  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename,
+  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
@@ -52,11 +52,15 @@ function urlFor(path, open) {
   const key = path === '/history' ? 'panel' : 'open';
   params.delete('panel');
   if (key === 'open' || params.get('open')?.includes(':')) params.delete('open');
+  if (!open?.startsWith('thread:')) params.delete('at');
   if (open) params.set(key, open);
   // Keep panel links readable: `?open=agent:65203ac8`.
   const query = params.toString().replace(/%3A/gi, ':');
   return `${path}${query ? `?${query}` : ''}`;
 }
+
+const bandKind = ref => /^(agent|job):/.test(ref || '');
+let openOrigin = null;
 
 // ---- layout (D2 folding and sizing) ------------------------------------------
 
@@ -92,22 +96,27 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const pop = () => setLoc(readLocation());
+    const pop = () => { openOrigin = null; setLoc(readLocation()); };
     window.addEventListener('popstate', pop);
     const offs = [
       bus.on('navigate', (path) => {
+        openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
         if (target && target.legacy) {
           location.href = path;
           return;
         }
-        history.pushState(null, '', urlFor(path, path.startsWith('/terminal/') ? null : readLocation().open));
+        history.pushState(null, '', urlFor(path, null));
         setLoc(readLocation());
       }),
       bus.on('open', (ref) => {
         const current = readLocation();
         if (current.open === ref) return;
-        history.pushState(null, '', urlFor(current.path, ref));
+        openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
+        const kind = ref?.split(':', 1)[0];
+        const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')
+          ? kind === 'agent' ? '/' : '/queue' : current.path;
+        history.pushState(null, '', urlFor(path, ref));
         setLoc(readLocation());
       }),
       bus.on('toast', (item) => {
@@ -127,6 +136,7 @@ function App() {
   const page = pageFor(loc.path);
   useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating });
   useRailData();
+  useDetailsBand(loc.open, page);
 
   useEffect(() => {
     const current = PAGES.find((p) => p.key === page);
@@ -138,7 +148,7 @@ function App() {
       <${Toasts} items=${toasts} />`;
   }
 
-  const panelOpen = !!loc.open && !(page === 'inbox' && /^(doc|thread):/.test(loc.open));
+  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread):/.test(loc.open));
   const cls = ['app', layout.rail === 'folded' && 'folded', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
@@ -152,6 +162,40 @@ function App() {
     </div>
     ${palette ? html`<${Palette} onClose=${() => setPalette(false)} />` : null}
     <${Toasts} items=${toasts} />`;
+}
+
+/** Mount the detail renderer in the clicked row without making it part of the page's data tree. */
+function useDetailsBand(openRef, page) {
+  useEffect(() => {
+    if (!bandKind(openRef) || page === 'terminal') return;
+    const host = document.createElement('section');
+    host.className = 'details-band';
+    host.setAttribute('aria-label', 'Details');
+    const split = openRef.indexOf(':');
+    const Renderer = panels.get(openRef.slice(0, split));
+    const controls = html`<span class="ctl"><button class="icon-btn" type="button" title="Close (Esc)" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`;
+    render(Renderer ? html`<${Renderer} id=${openRef.slice(split + 1)} controls=${controls} />` : null, host);
+    const place = () => {
+      const content = document.querySelector('.main > .content');
+      if (!content) return;
+      const anchor = [...content.querySelectorAll('[data-open-ref]')].find(node => node.dataset.openRef === openRef)
+        || (openOrigin?.isConnected ? openOrigin : null);
+      if (!anchor) { if (host.parentElement !== content) content.append(host); return; }
+      if (anchor.classList.contains('card')) {
+        const top = anchor.offsetTop;
+        const cards = [...anchor.parentElement.children].filter(node => node.classList.contains('card') && node.offsetTop === top);
+        const last = cards.at(-1) || anchor;
+        if (last.nextElementSibling === host) return;
+        last.after(host);
+      } else { if (anchor.nextElementSibling === host) return; anchor.after(host); }
+      host.scrollIntoView({ block: 'nearest' });
+    };
+    place();
+    const observer = new MutationObserver(place);
+    observer.observe(document.querySelector('.main'), { childList: true, subtree: true });
+    window.addEventListener('resize', place);
+    return () => { observer.disconnect(); window.removeEventListener('resize', place); render(null, host); host.remove(); };
+  }, [openRef, page]);
 }
 
 function Page({ page, loc }) {
@@ -226,8 +270,9 @@ function Rail({ page, layout, updateLayout }) {
 
 function Meter({ label, total, queue, text, className = '' }) {
   const width = (value) => `width:${Math.max(0, Math.min(100, value || 0))}%`;
-  return html`<span class=${`meter ${className}`} title=${label}>${label}
-    <i><s style=${width(total)}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(queue)}></s>` : null}</i>${text}</span>`;
+  const color = meterBand((total || 0) / 100, label.toLowerCase());
+  return html`<span class=${`meter ${className}`} style=${`--meter-color:var(--${color})`} title=${label}>${label}
+    <i><s style=${`${width(total)};opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(Math.min(total || 0, queue))}></s>` : null}</i>${text}</span>`;
 }
 
 function TopBar({ page, offline, onSearch, creating, setCreating }) {
@@ -239,6 +284,7 @@ function TopBar({ page, offline, onSearch, creating, setCreating }) {
   const memPct = (bytes) => (memTotal ? (100 * bytes) / memTotal : 0);
   const running = queue ? (queue.running || []).length : null;
   const waiting = queue ? (queue.queued || []).length : null;
+  const waitingLong = queue?.queued?.some(job => Date.now() - Date.parse(job.queued_at) >= 30 * 60 * 1000);
   return html`<header class="bar">
     <h1>${current ? current.label : ''}</h1>
     <button type="button" class="search" onClick=${onSearch}><span>Search or jump…</span><kbd>⌘K</kbd></button>
@@ -246,16 +292,16 @@ function TopBar({ page, offline, onSearch, creating, setCreating }) {
     ${offline ? html`<span class="offline" role="status">Offline, retrying</span>` : null}
     <span class="meters">
       ${mac
-        ? html`<${Meter} label="CPU" total=${mac.cpu_percent} queue=${mac.queue_cpu_percent}
-            text=${`${Math.round(mac.cpu_percent || 0)}%`} />
-          <${Meter} label="GPU" total=${mac.gpu_percent} queue=${mac.queue_gpu_percent}
-            text=${typeof mac.gpu_percent === 'number' ? `${Math.round(mac.gpu_percent)}%` : '–'} className="opt" />
-          <${Meter} label="Memory" total=${memPct(mac.memory_used_bytes)}
+        ? html`<${Meter} label="Memory" total=${memPct(mac.memory_used_bytes)}
             queue=${typeof mac.queue_memory_bytes === 'number' ? memPct(mac.queue_memory_bytes) : undefined}
-            text=${`${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)} GB`} className="opt" />`
+            text=${`${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G${typeof mac.queue_memory_bytes === 'number' ? ` · queue ${gigabytes(mac.queue_memory_bytes)}G` : ''}`} className="memory" />
+          <${Meter} label="CPU" total=${mac.cpu_percent} queue=${mac.queue_cpu_percent}
+            text=${`${Math.round(mac.cpu_percent || 0)}%`} className="cpu" />
+          <${Meter} label="GPU" total=${mac.gpu_percent} queue=${mac.queue_gpu_percent}
+            text=${typeof mac.gpu_percent === 'number' ? `${Math.round(mac.gpu_percent)}%` : '–'} className="gpu" />`
         : null}
       ${queue
-        ? html`<a class="meter link" href="/queue" onClick=${(e) => { e.preventDefault(); navigate('/queue'); }}>
+        ? html`<a class=${`meter link ${waitingLong ? 'amber' : ''}`} href="/queue" onClick=${(e) => { e.preventDefault(); navigate('/queue'); }}>
             Queue ${running} running · ${waiting} waiting</a>`
         : null}
     </span>
@@ -419,7 +465,7 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
         return;
       }
       if (mod && event.key === '.') {
-        if (where.open) {
+        if (where.open && !bandKind(where.open)) {
           event.preventDefault();
           updateLayout({ panel_mode: now.panel_mode === 'wide' ? 'side' : 'wide' });
         }
@@ -427,7 +473,7 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       }
       if (paletteOpen || mod || event.altKey) return;
       if (event.key === 'Escape') {
-        if (where.open && !typingIn(event)) closePanel();
+        if (where.open) closePanel();
         return;
       }
       if (typingIn(event)) return;

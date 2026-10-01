@@ -133,6 +133,12 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             -- that share a second.
             seen_event_id INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS board_started_early (
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            started_early_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number)
+        );
         "#,
     )?;
     Ok(())
@@ -358,6 +364,32 @@ impl BoardStore {
 
     pub fn ensure_schema(&self) -> Result<()> {
         self.open_write().map(|_| ())
+    }
+
+    pub fn record_started_early(&self, key: &Key, now: OffsetDateTime) -> Result<()> {
+        let conn = self.open_write()?;
+        conn.execute("INSERT OR REPLACE INTO board_started_early(repo, number, started_early_at) VALUES (?1, ?2, ?3)",
+            params![key.0, key.1, format_ts(now)])?;
+        Ok(())
+    }
+
+    pub fn started_early(&self) -> Result<BTreeSet<Key>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeSet::new());
+        };
+        let mut statement = match conn.prepare("SELECT repo, number FROM board_started_early") {
+            Ok(statement) => statement,
+            Err(rusqlite::Error::SqliteFailure(_, Some(detail)))
+                if detail.contains("no such table") =>
+            {
+                return Ok(BTreeSet::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        Ok(rows)
     }
 
     /// The model input as the tables hold it now.
@@ -1790,6 +1822,7 @@ fn ticket_json(
         })),
         "prs": facts.prs,
         "sub_issues_done": facts.sub_issues_done,
+        "sub_issues": { "total": facts.sub_issues.len(), "done": facts.sub_issues_closed },
         "warnings": facts.warnings,
         "closed_at": facts.item.closed_at,
     });
@@ -1928,6 +1961,7 @@ pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) 
             let goal = board.facts.get(&view.lane.goal);
             let counts = json!({
                 "needs_you": view.count(board, TicketState::NeedsYou),
+                "close_ready": view.count(board, TicketState::CloseReady),
                 "ready": view.count(board, TicketState::Ready),
                 "in_progress": view.count(board, TicketState::InProgress),
                 "blocked": view.count(board, TicketState::Blocked),
@@ -1941,6 +1975,10 @@ pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) 
                     "number": view.lane.goal.1,
                     "title": goal.map(|facts| facts.item.title.clone()).unwrap_or_default(),
                     "url": goal.map(|facts| facts.item.url.clone()).unwrap_or_default(),
+                    "state": goal.map(|facts| facts.state.as_str()),
+                    "sub_issues": goal.map(|facts| json!({
+                        "total": facts.sub_issues.len(), "done": facts.sub_issues_closed,
+                    })),
                 },
                 "added_at": view.lane.added_at,
                 "added_by_name": view.lane.added_by_name,
