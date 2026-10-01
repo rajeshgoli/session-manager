@@ -591,6 +591,30 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token, readTimeoutSeconds = 120).startBoardTicket(request) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun fetchReviewPolicies(baseUrl: String, token: String): li.rajeshgo.sm.data.model.ReviewPoliciesResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getReviewPolicies() }
+    }
+
+    suspend fun putReviewPolicy(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.PutReviewPolicyRequest): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).putReviewPolicy(request); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fetchReviewStatus(baseUrl: String, token: String): li.rajeshgo.sm.data.model.ReviewStatus = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getReviewStatus() }
+    }
+
+    suspend fun checkGithubCodex(baseUrl: String, token: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).checkGithubCodex(); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun retryReviewRequest(baseUrl: String, token: String, requestId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).retryReviewRequest(requestId); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun ownReviewRequest(baseUrl: String, token: String, requestId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).ownReviewRequest(requestId); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchGuestbook(baseUrl: String, token: String, repo: String?, before: Long?): li.rajeshgo.sm.data.model.GuestbookResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getGuestbook(repo, before) }
     }

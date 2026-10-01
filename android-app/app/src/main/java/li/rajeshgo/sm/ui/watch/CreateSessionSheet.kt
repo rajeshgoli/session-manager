@@ -48,6 +48,8 @@ fun CreateSessionSheet(
     error: String?,
     onDismiss: () -> Unit,
     ticket: TicketStart? = null,
+    /** More rows above the error and button, such as the board Start's Reviewer row; gets whether input is enabled. */
+    extra: (@Composable (Boolean) -> Unit)? = null,
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     val sheetKey = ticket?.label ?: source?.id
@@ -127,6 +129,7 @@ fun CreateSessionSheet(
             }
             OutlinedTextField(name, { name = it }, label = { Text(if (ticket != null) "Name" else "Name · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
             OutlinedTextField(prompt, { prompt = it }, label = { Text(if (ticket != null) "Brief" else "First message · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = if (ticket != null) 8 else 5)
+            extra?.invoke(!busy)
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Button(onClick = { onCreate(CreateSessionRequest(provider, directory.trim(), model.ifBlank { null }, effort.ifBlank { null }, name.trim().ifBlank { null }, prompt.trim().ifBlank { null })) }, enabled = !busy && directory.trim().startsWith('/') && (ticket == null || (model.isNotBlank() && !modelsLoading)), modifier = Modifier.fillMaxWidth().height(52.dp)) {
                 if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text(if (ticket != null) "Start" else "Create session")

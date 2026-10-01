@@ -59,6 +59,8 @@ import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.AppMenuActions
 import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
+import li.rajeshgo.sm.ui.navigation.ReviewSettingsRequests
+import androidx.compose.material3.TextButton
 import li.rajeshgo.sm.ui.queue.rememberResumed
 import li.rajeshgo.sm.ui.queue.shortDuration
 import li.rajeshgo.sm.ui.theme.Amber
@@ -181,6 +183,25 @@ fun InboxScreen(
                     state.error?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall) }
                     if (state.signedOut) Text("Sign in to load the Inbox", color = Rose)
                 }
+                if (state.filter == InboxFilter.Open) {
+                    items(state.noReviewer, key = { "review-${it.id}" }) { request ->
+                        NoReviewerCard(
+                            request = request,
+                            busy = state.reviewBusy != null,
+                            onRetry = {
+                                viewModel.answerNoReviewer(request.id, owner = false) { error ->
+                                    Toast.makeText(context, error ?: "Asked for a review again", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onChangePolicy = { ReviewSettingsRequests.pending = true },
+                            onReviewMyself = {
+                                viewModel.answerNoReviewer(request.id, owner = true) { error ->
+                                    Toast.makeText(context, error ?: "The author waits for your PR review", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                        )
+                    }
+                }
                 val sections = inboxSections(state.filter, state.rows)
                 if (state.loading && state.rows.isEmpty()) {
                     item {
@@ -188,7 +209,7 @@ fun InboxScreen(
                             CircularProgressIndicator(color = Cyan)
                         }
                     }
-                } else if (sections.isEmpty() && !state.signedOut) {
+                } else if (sections.isEmpty() && state.noReviewer.isEmpty() && !state.signedOut) {
                     item {
                         Text(
                             when (state.filter) {
@@ -272,6 +293,41 @@ fun InboxScreen(
                         }
                     },
                 )
+            }
+        }
+    }
+}
+
+/** sm#1768 Figure 7C: a PR no reviewer could take, one line per reviewer tried, and three answers. */
+@Composable
+private fun NoReviewerCard(
+    request: li.rajeshgo.sm.data.model.NoReviewerRequest,
+    busy: Boolean,
+    onRetry: () -> Unit,
+    onChangePolicy: () -> Unit,
+    onReviewMyself: () -> Unit,
+) {
+    Surface(
+        color = Panel,
+        shape = RoundedCornerShape(12.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Amber.copy(alpha = 0.55f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Needs you", color = Amber, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+            Text("PR #${request.prNumber} has no reviewer", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            Text(
+                "${request.repo.substringAfter('/')} · ${request.authorName}",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextMuted,
+            )
+            request.steps.forEach { step ->
+                Text("${step.label}: ${step.reason}", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onRetry, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Retry now") }
+                TextButton(onClick = onChangePolicy, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Change policy") }
+                TextButton(onClick = onReviewMyself, enabled = !busy, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("Review it myself") }
             }
         }
     }

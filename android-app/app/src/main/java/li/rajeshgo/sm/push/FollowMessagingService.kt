@@ -38,6 +38,10 @@ class FollowMessagingService : FirebaseMessagingService() {
         // Turned off in Settings: nothing is shown or acknowledged, so sm emails
         // instead, even when unregistering the token failed (offline, say).
         if (!enabled) return
+        if (message.data["kind"] == NoticePush.KIND_GITHUB_CODEX_PAUSED) {
+            NoticePush.showGithubCodexPaused(applicationContext, message.data)
+            return
+        }
         if (message.data["kind"] in NoticePush.KINDS) {
             val notice = NoticeMessage.fromData(message.data) ?: return
             // Acknowledged only when actually shown, as follows are (sm#1580).

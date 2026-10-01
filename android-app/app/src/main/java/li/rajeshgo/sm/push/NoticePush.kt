@@ -84,6 +84,33 @@ object NoticePush {
         return runCatching { NotificationManagerCompat.from(context).notify(message.notificationId, notification) }.isSuccess
     }
 
+    /** sm#1768 G5: GitHub Codex ran out of review quota; tapping opens Settings › Reviews. */
+    const val KIND_GITHUB_CODEX_PAUSED = "github_codex_paused"
+
+    /** Shows the once-per-pause GitHub Codex notice. It has no notice id, so nothing acknowledges it. */
+    fun showGithubCodexPaused(context: Context, data: Map<String, String>): Boolean {
+        if (!canNotify(context)) return false
+        val title = data["title"]?.takeIf { it.isNotBlank() } ?: "GitHub Codex is out of review quota"
+        val body = data["body"].orEmpty()
+        val intent = Intent(context, MainActivity::class.java).apply {
+            action = FollowPush.ACTION_OPEN_FOLLOW
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(FollowPush.EXTRA_READER_PATH, data["reader_path"]?.takeIf { it.isNotBlank() } ?: "/settings#reviews")
+            putExtra(FollowPush.EXTRA_TITLE, title)
+        }
+        val id = KIND_GITHUB_CODEX_PAUSED.hashCode()
+        val pendingIntent = PendingIntent.getActivity(context, id, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        return runCatching { NotificationManagerCompat.from(context).notify(id, notification) }.isSuccess
+    }
+
     /**
      * Removes the notification while it still shows [noticeId]. A newer notice
      * from the same agent reuses the slot, and stays.

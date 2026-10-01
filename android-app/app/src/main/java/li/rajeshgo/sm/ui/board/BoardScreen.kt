@@ -86,6 +86,9 @@ import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.queue.rememberResumed
 import li.rajeshgo.sm.ui.queue.secondsBetween
 import li.rajeshgo.sm.ui.queue.shortDuration
+import li.rajeshgo.sm.ui.reviews.ReviewPolicySheet
+import li.rajeshgo.sm.ui.reviews.StartReviewerRow
+import li.rajeshgo.sm.ui.reviews.reviewerLabel
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
 import li.rajeshgo.sm.ui.theme.Cyan
@@ -264,6 +267,7 @@ fun BoardScreen(
         },
         onShowLane = { laneId -> showLane(laneId).takeIf { it >= 0 }?.let { scrollTo = it } },
         onOpenQueue = onNavigateToQueue,
+        onReviewPolicy = { ticket -> viewModel.openReviewPolicy(ReviewPolicyEdit.ticket(ticket)) },
         queue = state.queue,
         now = now,
     )
@@ -333,6 +337,7 @@ fun BoardScreen(
                                 onToggle = { viewModel.toggle(lane.id, lane.rank) },
                                 onMove = { delta -> viewModel.move(lane.id, delta, toast) },
                                 onEnd = { ending = lane },
+                                onReviewPolicy = { viewModel.openReviewPolicy(ReviewPolicyEdit.lane(lane)) },
                             )
                         }
                     }
@@ -394,6 +399,20 @@ fun BoardScreen(
         )
     }
 
+    state.reviewPolicy?.let { edit ->
+        ReviewPolicySheet(
+            title = edit.title,
+            inheritLabel = edit.inheritLabel,
+            ownLabel = edit.ownLabel,
+            current = edit.current,
+            allowPaired = edit.allowPaired,
+            busy = edit.busy,
+            error = edit.error,
+            onDismiss = viewModel::closeReviewPolicy,
+            onSave = viewModel::saveReviewPolicy,
+        )
+    }
+
     state.start?.let { start ->
         val options = start.options
         if (options == null) {
@@ -410,6 +429,12 @@ fun BoardScreen(
             }
         } else {
             val defaults = board?.startDefaults
+            val policy = options.reviewPolicy
+            // The row starts on the ticket's own reviewer if it has one, else on the lane's.
+            val ticketOwn = policy?.source?.startsWith("ticket") == true
+            var reviewer by remember(start.ticket.repo, start.ticket.number, policy) {
+                mutableStateOf(if (ticketOwn) policy?.resolved else null)
+            }
             CreateSessionSheet(
                 source = null,
                 sessions = emptyList(),
@@ -426,6 +451,14 @@ fun BoardScreen(
                     model = defaults?.model,
                     effort = defaults?.reasoningEffort ?: "high",
                 ),
+                extra = { enabled ->
+                    StartReviewerRow(
+                        laneDefault = policy?.takeUnless { ticketOwn },
+                        value = reviewer,
+                        onChange = { reviewer = it },
+                        enabled = enabled,
+                    )
+                },
             ) { request ->
                 viewModel.start(
                     BoardStartRequest(
@@ -436,7 +469,10 @@ fun BoardScreen(
                         reasoningEffort = request.reasoningEffort,
                         name = request.name,
                         brief = request.initialMessage,
+                        // Unchanged from the ticket's stored policy: leave it as it was set.
+                        reviewer = reviewer?.takeUnless { ticketOwn && it == policy?.resolved },
                     ),
+                    clearTicketPolicy = ticketOwn && reviewer == null,
                 ) { name -> toast("Started $name") }
             }
         }
@@ -450,6 +486,8 @@ private class BoardRowActions(
     val onOpenNeedsYou: (BoardTicket) -> Unit,
     val onShowLane: (Long) -> Unit,
     val onOpenQueue: () -> Unit,
+    /** Opens the ticket's review policy sheet (sm#1768 Figure 7B). */
+    val onReviewPolicy: (BoardTicket) -> Unit,
     /** The queue as last read, for each agent's jobs; null until the first read. */
     val queue: QueueOverview?,
     val now: OffsetDateTime,
@@ -466,6 +504,7 @@ private fun LaneCard(
     onToggle: () -> Unit,
     onMove: (Int) -> Unit,
     onEnd: () -> Unit,
+    onReviewPolicy: () -> Unit,
 ) {
     Surface(
         color = Panel,
@@ -477,7 +516,7 @@ private fun LaneCard(
         Row(Modifier.height(IntrinsicSize.Min)) {
             if (lane.unseen) Box(Modifier.width(4.dp).fillMaxHeight().background(Orange))
             Column(Modifier.weight(1f).padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp)) {
-                LaneHeader(lane, laneQueueLine(lane, actions.queue), canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd, actions.onOpenQueue)
+                LaneHeader(lane, laneQueueLine(lane, actions.queue), canMoveUp, canMoveDown, busy, onToggle, onMove, onEnd, actions.onOpenQueue, onReviewPolicy)
                 if (expanded) LaneBody(lane, actions)
             }
         }
@@ -495,6 +534,7 @@ private fun LaneHeader(
     onMove: (Int) -> Unit,
     onEnd: () -> Unit,
     onOpenQueue: () -> Unit,
+    onReviewPolicy: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.Top) {
@@ -535,6 +575,15 @@ private fun LaneHeader(
                     )
                 }
                 if (lane.stale) Text("stale — GitHub reads are failing", style = MaterialTheme.typography.labelSmall, color = Amber)
+                lane.reviewPolicy?.let { policy ->
+                    Text(
+                        "Reviews: ${reviewerLabel(policy.reviewer)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Cyan,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 2.dp).clickable(onClick = onReviewPolicy),
+                    )
+                }
             }
         }
         Box {
@@ -544,6 +593,7 @@ private fun LaneHeader(
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(text = { Text("Move up") }, enabled = canMoveUp, onClick = { menuOpen = false; onMove(-1) })
                 DropdownMenuItem(text = { Text("Move down") }, enabled = canMoveDown, onClick = { menuOpen = false; onMove(1) })
+                DropdownMenuItem(text = { Text("Review policy…") }, onClick = { menuOpen = false; onReviewPolicy() })
                 DropdownMenuItem(text = { Text("End lane", color = Rose) }, onClick = { menuOpen = false; onEnd() })
             }
         }
@@ -695,6 +745,17 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                         )
                     }
                 }
+                if (ticket.state != "done") {
+                    var menuOpen by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Rounded.MoreVert, contentDescription = "Ticket menu", tint = TextMuted, modifier = Modifier.size(18.dp))
+                        }
+                        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            DropdownMenuItem(text = { Text("Review policy…") }, onClick = { menuOpen = false; actions.onReviewPolicy(ticket) })
+                        }
+                    }
+                }
             }
             val details = ticketDetails(ticket, base, head, actions) { uriHandler.openUri(it) }
             if (details.isNotEmpty()) {
@@ -718,6 +779,14 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
 }
 
 private data class Detail(val text: String, val color: Color, val onClick: (() -> Unit)? = null)
+
+/** A ticket PR's active review: `Review: Codex run (gpt-6-sol, medium), 6 min`. */
+fun boardReviewText(review: li.rajeshgo.sm.data.model.BoardTicketReview, now: OffsetDateTime): String {
+    val since = review.since?.let { runCatching { OffsetDateTime.parse(it) }.getOrNull() }
+    val age = since?.let { ", " + shortDuration(Duration.between(it, now).seconds.coerceAtLeast(0)) }.orEmpty()
+    val who = review.reviewerLabel?.takeIf { it.isNotBlank() } ?: "a reviewer"
+    return if (review.state == "owner") "You are reviewing$age" else "Review: $who$age"
+}
 
 /** A row's detail line (appendix J2), in the order the web board shows it. */
 private fun ticketDetails(
@@ -750,6 +819,12 @@ private fun ticketDetails(
     }
     ticket.prs.forEach { pr ->
         details += Detail("PR #${pr.number} · ${pr.state.lowercase()}", Violet) { openUrl(pr.url) }
+    }
+    ticket.review?.let { review ->
+        details += Detail(boardReviewText(review, actions.now), Amber)
+    }
+    ticket.reviewPolicy?.let { policy ->
+        details += Detail("Review: ${reviewerLabel(policy.reviewer)}", Cyan) { actions.onReviewPolicy(ticket) }
     }
     if (ticket.state == "done") ticket.doneReason?.let { details += Detail(it.replace('_', ' '), TextMuted) }
     ticket.warnings.forEach { details += Detail("! " + boardWarningText(it), Rose) }

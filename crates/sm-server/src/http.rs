@@ -6937,6 +6937,7 @@ async fn client_review_status(
             )
         },
     );
+    let needs_you = review_requests_needing_owner(&state, &db_path, &requests)?;
     let running = requests
         .into_iter()
         .filter(|request| request.is_active)
@@ -6953,8 +6954,63 @@ async fn client_review_status(
             "next_check_at": channel.next_check_at, "refusal_url": channel.refusal_url },
         "last_24h": { "github_codex": github_codex, "codex_runs": codex_runs, "claude_runs": claude_runs,
             "no_reviewer": no_reviewer },
-        "running": running, "meters": { "codex": crate::review::meter(&expand_home(&state.config.usage.db_path), "codex")?, "claude": crate::review::meter(&expand_home(&state.config.usage.db_path), "claude")? },
+        "running": running, "needs_you": needs_you, "meters": { "codex": crate::review::meter(&expand_home(&state.config.usage.db_path), "codex")?, "claude": crate::review::meter(&expand_home(&state.config.usage.db_path), "claude")? },
     })))
+}
+
+/// The "Needs you" items of D7 for the app's Inbox: requests no reviewer could
+/// take whose owner message is still open and that no later request on the
+/// same PR replaced. Each carries what the item's three buttons need.
+fn review_requests_needing_owner(
+    state: &AppState,
+    db_path: &StdPath,
+    requests: &[CodexReviewRequestRegistration],
+) -> Result<Vec<Value>, ApiError> {
+    let messages = crate::owner_messages::OwnerMessageStore::new(db_path.to_path_buf());
+    let mut latest = std::collections::HashMap::new();
+    for request in requests {
+        let at = codex_review_request_requested_at(&request.requested_at);
+        let entry = latest
+            .entry((request.repo.as_str(), request.pr_number))
+            .or_insert(at);
+        if at > *entry {
+            *entry = at;
+        }
+    }
+    let mut items = Vec::new();
+    for request in requests.iter().filter(|r| r.state == "no_reviewer") {
+        let at = codex_review_request_requested_at(&request.requested_at);
+        let replaced = latest
+            .get(&(request.repo.as_str(), request.pr_number))
+            .is_some_and(|newest| *newest > at);
+        if replaced
+            || !messages.is_open_by_delivery_key(&format!("review-no-reviewer:{}", request.id))?
+        {
+            continue;
+        }
+        let author = request
+            .requester_session_id
+            .as_deref()
+            .unwrap_or(&request.notify_session_id);
+        let author_name = state
+            .session_store
+            .get_session(author)?
+            .map(session_display_name)
+            .unwrap_or_else(|| author.to_owned());
+        let steps: Vec<Value> =
+            serde_json::from_str(request.steps_log_json.as_deref().unwrap_or("[]"))
+                .unwrap_or_default();
+        items.push(json!({
+            "id": request.id, "repo": request.repo, "pr_number": request.pr_number,
+            "requested_head_sha": request.requested_head_sha, "requested_at": request.requested_at,
+            "author_name": author_name,
+            "steps": steps.iter().map(|step| json!({
+                "label": step["label"].as_str().unwrap_or("Reviewer"),
+                "reason": step["reason"].as_str().unwrap_or("failed"),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(items)
 }
 
 async fn client_check_github_codex(
@@ -22940,6 +22996,107 @@ mod tests {
                 assert_eq!(body["root"]["kind"], "root", "{uri}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn review_status_lists_only_open_unreplaced_no_reviewer_requests() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let dir = std::env::temp_dir().join(format!(
+            "sm-review-needs-you-{}-{}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("queue.db");
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        config.sm_send.db_path = db.to_string_lossy().into_owned();
+        let messages = crate::owner_messages::OwnerMessageStore::new(db.clone());
+        // Each request: created, refused by its only reviewer, and announced to the owner.
+        let create = |pr: i64, at: &str| {
+            RetainedQueueStore::create_codex_review_request_in_path(
+                &db,
+                crate::queue::CreateCodexReviewRequest {
+                    repo: "example/repo".into(),
+                    pr_number: pr,
+                    requester_session_id: Some("author".into()),
+                    notify_session_id: "author".into(),
+                    steer: None,
+                    requested_head_sha: "0123456789012345678901234567890123456789".into(),
+                    latest_request_comment_id: None,
+                    latest_request_comment_url: None,
+                    latest_request_posted_at: at.into(),
+                    poll_interval_seconds: 30,
+                    retry_interval_seconds: 120,
+                },
+            )
+            .unwrap()
+        };
+        let no_reviewer = |pr: i64, at: &str| {
+            let request = create(pr, at);
+            RetainedQueueStore::initialize_review_chain(
+                &db,
+                &request.id,
+                &[json!({"kind":"github_codex"})],
+                "default",
+            )
+            .unwrap();
+            RetainedQueueStore::finish_github_review_step_in_path(
+                &db,
+                &request.id,
+                "out of code-review quota",
+                at,
+                "no reviewer",
+            )
+            .unwrap()
+            .unwrap();
+            let message = messages
+                .create_once(
+                    crate::owner_messages::NewOwnerMessage {
+                        human: "rajesh".into(),
+                        sender_session_id: "author".into(),
+                        sender_session_name: "author".into(),
+                        title: format!("PR #{pr} has no reviewer"),
+                        body_markdown: "GitHub Codex: out of code-review quota".into(),
+                        blocking: true,
+                    },
+                    Some(&format!("review-no-reviewer:{}", request.id)),
+                )
+                .unwrap();
+            let crate::owner_messages::CreateOwnerMessage::Created(message) = message else {
+                panic!("message not created");
+            };
+            (request.id, message.id)
+        };
+        let (open, _) = no_reviewer(1, "2026-09-30T12:00:00Z");
+        let (_, handled_message) = no_reviewer(2, "2026-09-30T12:00:00Z");
+        messages.mark_handled(&handled_message).unwrap();
+        no_reviewer(3, "2026-09-30T12:00:00Z");
+        // The author asked again on #3, so the refused request is no longer the PR's.
+        create(3, "2026-09-30T12:05:00Z");
+        let app = router(AppState::new(config));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/reviews/status",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["needs_you"].as_array().unwrap();
+        let ids: Vec<_> = items.iter().map(|item| item["id"].clone()).collect();
+        assert!(ids.contains(&json!(open)), "{body}");
+        assert_eq!(items.len(), 1, "{body}");
+        let first = items.iter().find(|i| i["id"] == json!(open)).unwrap();
+        assert_eq!(first["repo"], "example/repo");
+        assert_eq!(first["author_name"], "author");
+        assert_eq!(
+            first["steps"],
+            json!([{"label":"GitHub Codex","reason":"out of code-review quota"}])
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

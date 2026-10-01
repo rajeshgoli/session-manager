@@ -1019,7 +1019,7 @@ Submit with `sm review submit` as before.</code></pre>
 <tr><td><code>GET /review-policies[?repo=&amp;pr=|ticket=|lane=]</code></td><td>any</td><td>All stored policies, or <code>{reviewer, fallback[], source}</code> resolved.</td></tr>
 <tr><td><code>PUT /review-policies</code></td><td>signed owner app request, or credential-bound session under B2's rules</td><td>Body <code>{scope, repo, number, reviewer | null, session_id?}</code>. <code>null</code> clears.</td></tr>
 <tr><td><code>GET/PUT /client/settings</code></td><td>owner</td><td>Adds the <code>reviews</code> key and <code>queue_limits.review</code> (C2), with the same merge rules.</td></tr>
-<tr><td><code>GET /client/reviews/status</code></td><td>owner</td><td><code>{github_codex: {state, paused_at, next_check_at, refusal_url}, last_24h: {github_codex, codex_runs, claude_runs, no_reviewer}, running: [...], meters: {codex, claude}}</code></td></tr>
+<tr><td><code>GET /client/reviews/status</code></td><td>owner</td><td><code>{github_codex: {state, paused_at, next_check_at, refusal_url}, last_24h: {github_codex, codex_runs, claude_runs, no_reviewer}, running: [...], needs_you: [...], meters: {codex, claude}}</code>. <code>needs_you</code> lists each <code>no_reviewer</code> request whose G6 inbox item is still open and that no later request on the same PR replaced, as <code>{id, repo, pr_number, author_name, requested_head_sha, requested_at, steps: [{label, reason}]}</code>, for the app's D7 buttons.</td></tr>
 <tr><td><code>POST /client/reviews/github-codex/check</code></td><td>owner</td><td>Try now.</td></tr>
 <tr><td><code>POST /client/review-requests/{id}/retry</code>, <code>…/owner</code></td><td>owner</td><td>D7's Retry now and Review it myself.</td></tr>
 </tbody>
@@ -1061,7 +1061,7 @@ Submit with `sm review submit` as before.</code></pre>
       <li>a new <code>ui/settings/ReviewsSection.kt</code> in <code>SettingsScreen.kt</code> (Figure 7A);</li>
       <li>the Board lane ⋮ and ticket menus open a bottom sheet with the editor (7B), and the Board's Start sheet gains the Reviewer row;</li>
       <li>the Queue tab shows review jobs' fields;</li>
-      <li>the G6 inbox item and push (7C);</li>
+      <li>the G6 inbox item and push (7C): the Inbox's Open filter shows each <code>needs_you</code> entry of <code>/client/reviews/status</code> as a card with Retry now, Change policy and Review it myself; the G5 push (<code>kind</code> <code>github_codex_paused</code>) opens Settings › Reviews;</li>
       <li><code>ApiService.kt</code> gains the routes in I1.</li>
     </ul></li>
 </ul>

@@ -270,6 +270,28 @@ interface ApiService {
     @POST("client/board/start")
     suspend fun startBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardStartRequest): li.rajeshgo.sm.data.model.BoardStarted
 
+    /** Every stored review policy and the default (sm#1768 appendix B2). */
+    @GET("review-policies")
+    suspend fun getReviewPolicies(): li.rajeshgo.sm.data.model.ReviewPoliciesResponse
+
+    @PUT("review-policies")
+    suspend fun putReviewPolicy(@Body request: li.rajeshgo.sm.data.model.PutReviewPolicyRequest): kotlinx.serialization.json.JsonObject
+
+    @GET("client/reviews/status")
+    suspend fun getReviewStatus(): li.rajeshgo.sm.data.model.ReviewStatus
+
+    /** Try now: the next request asks GitHub Codex again. */
+    @POST("client/reviews/github-codex/check")
+    suspend fun checkGithubCodex(): kotlinx.serialization.json.JsonObject
+
+    /** Retry now: a fresh request for the same PR, resolving the policy again. */
+    @POST("client/review-requests/{request_id}/retry")
+    suspend fun retryReviewRequest(@Path("request_id") requestId: String): kotlinx.serialization.json.JsonObject
+
+    /** Review it myself: the author waits for the owner's own PR review. */
+    @POST("client/review-requests/{request_id}/owner")
+    suspend fun ownReviewRequest(@Path("request_id") requestId: String): kotlinx.serialization.json.JsonObject
+
     /** Brings a stopped or retired agent back, as `sm restore` does. */
     @POST("sessions/{session_id}/restore")
     suspend fun restoreSession(@Path("session_id") sessionId: String): kotlinx.serialization.json.JsonObject

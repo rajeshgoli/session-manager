@@ -666,6 +666,31 @@ impl OwnerMessageStore {
         Ok(rows)
     }
 
+    /// Whether the message sent under `key` still waits on the owner: it exists
+    /// and nobody handled it. False when no message was sent under `key`.
+    pub fn is_open_by_delivery_key(&self, key: &str) -> Result<bool> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(false);
+        };
+        let open = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM owner_message_delivery_keys k \
+               JOIN owner_messages m ON m.id = k.message_id \
+               WHERE k.key = ?1 AND m.handled_at IS NULL)",
+            params![key],
+            |row| row.get::<_, bool>(0),
+        );
+        match open {
+            Ok(open) => Ok(open),
+            // No keyed message was ever sent, so the table does not exist yet.
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Messages the obligations projection needs: every message created at
     /// or after `since`, plus older blocking messages nobody has answered.
     /// Each comes with whether it has a reply. Newest first.

@@ -621,6 +621,8 @@ data class SessionJob(
     @SerialName("ended_summary") val endedSummary: String? = null,
     /** Live use while running (sm#1714). */
     val usage: JobUsage? = null,
+    /** Review jobs only (sm#1768 appendix I2). */
+    val review: JobReview? = null,
 ) {
     fun isAwaitedBy(sessionId: String): Boolean =
         (notifySessionId?.takeIf(String::isNotBlank) ?: requesterSessionId) == sessionId
@@ -1001,6 +1003,8 @@ data class BoardLane(
     /** In row order: needs you, ready, in progress, blocked, then done. */
     val tickets: List<BoardTicket> = emptyList(),
     val changes: List<BoardChange> = emptyList(),
+    /** The lane's review policy, keyed by its goal; null uses the repo's or the default. */
+    @SerialName("review_policy") val reviewPolicy: ReviewPolicy? = null,
 )
 
 @Serializable
@@ -1046,6 +1050,10 @@ data class BoardTicket(
     val warnings: List<String> = emptyList(),
     val new: Boolean = false,
     @SerialName("closed_at") val closedAt: String? = null,
+    /** Set only when the ticket has its own review policy. */
+    @SerialName("review_policy") val reviewPolicy: ReviewPolicy? = null,
+    /** The active review request on the ticket's PR. */
+    val review: BoardTicketReview? = null,
 )
 
 @Serializable
@@ -1105,6 +1113,7 @@ data class BoardStartOptions(
     @SerialName("working_dir") val workingDir: String = "",
     val name: String = "",
     val brief: String = "",
+    @SerialName("review_policy") val reviewPolicy: StartReviewPolicy? = null,
 )
 
 @Serializable
@@ -1117,6 +1126,8 @@ data class BoardStartRequest(
     @SerialName("reasoning_effort") val reasoningEffort: String? = null,
     val name: String? = null,
     val brief: String? = null,
+    /** Stores the ticket's review policy, set by the owner, before the author starts. */
+    val reviewer: Reviewer? = null,
 )
 
 @Serializable
