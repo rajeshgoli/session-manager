@@ -6,7 +6,7 @@
 //! buffer (64 KB on macOS): the child blocks on write and never exits (#1471).
 
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Command, Output, Stdio},
     sync::mpsc,
     thread,
@@ -18,12 +18,36 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Spawn `command` with piped stdout/stderr and wait up to `timeout` for it to
 /// exit and for both pipes to reach EOF. On timeout the child is killed and an
 /// error of the form `timed out after {N}s` is returned.
-pub fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+pub fn output_with_timeout(command: Command, timeout: Duration) -> Result<Output, String> {
+    run(command, None, timeout)
+}
+
+/// `output_with_timeout`, with `input` written to the child's stdin and
+/// stdin then closed.
+pub fn output_with_timeout_input(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<Output, String> {
+    run(command, Some(input.to_vec()), timeout)
+}
+
+fn run(mut command: Command, input: Option<Vec<u8>>, timeout: Duration) -> Result<Output, String> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
+    // Written on its own thread: a child that fills its output pipes before
+    // reading all of stdin would otherwise block us both.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let stdout_reader = child.stdout.take().map(spawn_reader);
     let stderr_reader = child.stderr.take().map(spawn_reader);
     let started = Instant::now();
@@ -93,6 +117,18 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 1_048_576);
         assert_eq!(output.stderr.len(), 262_144);
+    }
+
+    #[test]
+    fn writes_input_to_stdin() {
+        let output = output_with_timeout_input(
+            Command::new("/bin/cat"),
+            b"filed body",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"filed body");
     }
 
     #[test]

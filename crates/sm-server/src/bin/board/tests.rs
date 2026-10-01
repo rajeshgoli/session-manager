@@ -83,3 +83,17 @@ fn cli_ticket_refs() {
         Some(("rajeshgoli/session-manager".to_owned(), 1654))
     );
 }
+
+#[test]
+fn standing_bugs_ticket_shows_its_open_bugs() {
+    let mut bugs = ticket(1869, "standing", "Bugs");
+    bugs["waits_on"] = json!([
+        {"repo": "rajeshgoli/session-manager", "number": 1870, "state": "ready"},
+        {"repo": "rajeshgoli/session-manager", "number": 1871, "state": "in_progress"},
+        {"repo": "rajeshgoli/session-manager", "number": 1872, "state": "done"},
+    ]);
+    let line = ticket_line(&bugs, "rajeshgoli/session-manager");
+    assert!(line.starts_with("  standing     #1869  Bugs"), "{line}");
+    assert!(line.ends_with("2 open bugs"), "{line}");
+    assert!(!line.contains("waits on"), "{line}");
+}

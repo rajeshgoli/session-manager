@@ -94,7 +94,10 @@ pub fn decide_excluding(
                     },
                 }
             }
-            TicketState::Blocked | TicketState::Ready | TicketState::CloseReady => {
+            TicketState::Blocked
+            | TicketState::Ready
+            | TicketState::CloseReady
+            | TicketState::Standing => {
                 let closed: Vec<String> = board.facts[*first]
                     .waits_on
                     .iter()

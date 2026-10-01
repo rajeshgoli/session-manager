@@ -1203,174 +1203,6 @@ async fn obsolete_analytics_summary_is_not_routed() {
 }
 
 #[tokio::test]
-async fn client_bug_report_persists_sqlite_row_and_debug_state() {
-    let state_file = write_session_fixture();
-    let bug_db = unique_temp_path();
-    let app = router(AppState::new(AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        bug_reports: BugReportsConfig {
-            db_path: bug_db.display().to_string(),
-            max_reports: 30,
-        },
-        ..AppConfig::default()
-    }));
-
-    let (status, payload) = post_json(
-        app,
-        "/client/bug-reports",
-        json!({
-            "report_text": "mobile bug report",
-            "include_debug_state": true,
-            "selected_session_id": "run12345",
-            "client_state": {"route": "/watch/", "screen": "sessions"},
-            "app_version": "0.3.0",
-            "artifact_hash": "deadbeef"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "submitted");
-    assert_eq!(payload["maintainer_notified"], false);
-    let bug_id = payload["bug_id"].as_str().unwrap();
-    assert!(bug_id.starts_with("BR-"));
-    let conn = Connection::open(&bug_db).unwrap();
-    let row: (
-        String,
-        Option<String>,
-        String,
-        String,
-        i64,
-        String,
-        String,
-        Option<String>,
-    ) = conn
-        .query_row(
-            r#"
-            SELECT report_text, reported_by, route, app_version, include_debug_state,
-                   client_state_json, server_state_json, maintainer_delivery_result
-            FROM bug_reports
-            WHERE id = ?
-            "#,
-            [bug_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(row.0, "mobile bug report");
-    assert_eq!(row.1, None);
-    assert_eq!(row.2, "/watch/");
-    assert_eq!(row.3, "0.3.0");
-    assert_eq!(row.4, 1);
-    assert!(row.5.contains("\"screen\":\"sessions\""));
-    assert!(row.6.contains("\"selected_session\""));
-    assert_eq!(row.7.as_deref(), Some("maintainer_not_found"));
-}
-
-#[tokio::test]
-async fn client_bug_report_notifies_registered_maintainer() {
-    let state_file = unique_temp_path();
-    let maintainer_log = unique_temp_path();
-    let selected_log = unique_temp_path();
-    let bug_db = unique_temp_path();
-    fs::write(&maintainer_log, "").unwrap();
-    fs::write(&selected_log, "").unwrap();
-    fs::write(
-        &state_file,
-        json!({
-            "sessions": [
-                {
-                    "id": "maint01",
-                    "name": "claude-maint01",
-                    "working_dir": "/repo",
-                    "tmux_session": "claude-maint01",
-                    "tmux_socket_name": null,
-                    "node": "primary",
-                    "provider": "claude",
-                    "log_file": maintainer_log.display().to_string(),
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00",
-                    "friendly_name": "maintainer"
-                },
-                {
-                    "id": "run12345",
-                    "name": "claude-run12345",
-                    "working_dir": "/repo",
-                    "tmux_session": "claude-run12345",
-                    "node": "primary",
-                    "provider": "claude",
-                    "log_file": selected_log.display().to_string(),
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                }
-            ],
-            "agent_registrations": [
-                {
-                    "role": "maintainer",
-                    "session_id": "maint01",
-                    "created_at": "2026-06-01T00:02:00"
-                }
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let app = router(AppState::new(AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        bug_reports: BugReportsConfig {
-            db_path: bug_db.display().to_string(),
-            max_reports: 30,
-        },
-        ..AppConfig::default()
-    }));
-
-    let (status, payload) = post_json(
-        app,
-        "/client/bug-reports",
-        json!({
-            "report_text": "important   mobile\nfailure",
-            "include_debug_state": false,
-            "selected_session_id": "run12345"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["maintainer_notified"], true);
-    let bug_id = payload["bug_id"].as_str().unwrap();
-    let maintainer_output = fs::read_to_string(&maintainer_log).unwrap();
-    assert!(maintainer_output.contains(&format!("[app bug] {bug_id}")));
-    assert!(maintainer_output.contains("report: important mobile failure"));
-    assert!(maintainer_output.contains("session: run12345"));
-    assert!(maintainer_output.contains(&format!("db: {}", bug_db.display())));
-    let conn = Connection::open(&bug_db).unwrap();
-    let delivery_result: String = conn
-        .query_row(
-            "SELECT maintainer_delivery_result FROM bug_reports WHERE id = ?",
-            [bug_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(delivery_result, "delivered");
-}
-
-#[tokio::test]
 async fn client_bug_report_enforces_auth_and_payload_bounds() {
     let state_file = write_session_fixture();
     let bug_db = unique_temp_path();
@@ -1380,7 +1212,71 @@ async fn client_bug_report_enforces_auth_and_payload_bounds() {
         },
         bug_reports: BugReportsConfig {
             db_path: bug_db.display().to_string(),
-            max_reports: 30,
+            ..BugReportsConfig::default()
+        },
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client-id".to_owned()),
+            android_client_id: Some("android-client-id".to_owned()),
+            client_secret: Some("web-client-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["rajesh@example.com".to_owned()],
+            session_cookie_secret: Some("session-cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    let report = |page_data: Value| json!({"text": "Board is wrong", "client": "android", "page": "Board", "page_data": page_data});
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/client/bug-reports",
+        report(json!({})),
+        &[("host", "sm.example.com")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+
+    // Signed in, an oversized report is refused before anything is stored
+    // or sent to GitHub.
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/client/bug-reports",
+        report(json!({"blob": "x".repeat(300_001)})),
+        &[
+            ("host", "sm.example.com"),
+            ("authorization", &format!("Bearer {token}")),
+        ],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("page_data exceeds"));
+    assert!(!bug_db.exists());
+}
+
+/// The agent read needs a session: the CLI's local bypass or a sign-in.
+#[tokio::test]
+async fn bug_agent_route_guard() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        bug_reports: BugReportsConfig {
+            db_path: unique_temp_path().display().to_string(),
+            ..BugReportsConfig::default()
         },
         google_auth: GoogleAuthConfig {
             enabled: true,
@@ -1395,39 +1291,33 @@ async fn client_bug_report_enforces_auth_and_payload_bounds() {
         },
         ..AppConfig::default()
     }));
-
-    let (status, payload) = post_json_with_headers_and_peer(
-        app.clone(),
-        "/client/bug-reports",
-        json!({ "report_text": "public unauth" }),
-        &[("host", "sm.example.com")],
-        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(payload["detail"], "Authentication required");
-
+    let public = Some(SocketAddr::from(([203, 0, 113, 10], 49152)));
     let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
-    let (status, payload) = post_json_with_headers_and_peer(
-        app,
-        "/client/bug-reports",
-        json!({
-            "report_text": "ok",
-            "include_debug_state": true,
-            "client_state": {"blob": "x".repeat(100_001)}
-        }),
-        &[
-            ("host", "sm.example.com"),
-            ("authorization", &format!("Bearer {token}")),
-        ],
-        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
-    )
-    .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(payload["detail"]
-        .as_str()
-        .unwrap()
-        .contains("client_state exceeds"));
+    for path in ["/bugs/BR-missing", "/bugs/BR-missing/screenshot.png"] {
+        let (status, _) = json_request_with_headers_and_peer(
+            app.clone(),
+            "GET",
+            path,
+            Value::Null,
+            &[("host", "sm.example.com")],
+            public,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let (status, _) = json_request_with_headers_and_peer(
+            app.clone(),
+            "GET",
+            path,
+            Value::Null,
+            &[
+                ("host", "sm.example.com"),
+                ("authorization", &format!("Bearer {token}")),
+            ],
+            public,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[tokio::test]

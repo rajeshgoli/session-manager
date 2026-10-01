@@ -17,23 +17,64 @@ pub struct BugReportStore {
     max_reports: usize,
 }
 
+/// One press of the app's bug button (spec 1859 A2). The report is stored
+/// before the issue is filed, so nothing typed is lost if GitHub refuses.
 #[derive(Debug, Clone)]
 pub struct CreateBugReport {
     pub report_text: String,
     pub reported_by: Option<String>,
-    pub selected_session_id: Option<String>,
+    /// `web` or `android`.
+    pub client: String,
+    pub client_version: Option<String>,
+    /// The page's human name, e.g. `Board`.
+    pub page: String,
     pub route: Option<String>,
-    pub app_version: Option<String>,
-    pub artifact_hash: Option<String>,
-    pub include_debug_state: bool,
-    pub client_state: Option<Value>,
-    pub server_state: Option<Value>,
+    pub page_data: Value,
+    pub server_state: Value,
+    pub screenshot_png: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CreatedBugReport {
     pub id: String,
 }
+
+/// The issue a report was filed as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiledIssue {
+    pub repo: String,
+    pub number: i64,
+    pub url: String,
+}
+
+/// A stored report as the owner page and `sm bug show` read it.
+#[derive(Debug, Clone)]
+pub struct StoredBugReport {
+    pub id: String,
+    pub created_at: String,
+    pub reported_by: Option<String>,
+    pub client: Option<String>,
+    pub client_version: Option<String>,
+    pub page: Option<String>,
+    pub route: Option<String>,
+    pub text: String,
+    pub status: String,
+    pub issue: Option<FiledIssue>,
+    pub page_data: Value,
+    pub server_facts: Value,
+    pub has_screenshot: bool,
+}
+
+/// Columns the bug button added to the original table.
+const ADDED_COLUMNS: [(&str, &str); 7] = [
+    ("client", "TEXT"),
+    ("client_version", "TEXT"),
+    ("page", "TEXT"),
+    ("page_data_json", "TEXT"),
+    ("issue_repo", "TEXT"),
+    ("issue_number", "INTEGER"),
+    ("issue_url", "TEXT"),
+];
 
 impl BugReportStore {
     pub fn new(db_path: PathBuf, max_reports: usize) -> Self {
@@ -51,43 +92,40 @@ impl BugReportStore {
         let conn = self.open()?;
         let id = bug_id();
         let created_at = now_rfc3339();
-        let client_state_json = report
-            .include_debug_state
-            .then(|| report.client_state.as_ref().map(compact_json))
-            .flatten()
-            .transpose()?;
-        let server_state_json = report
-            .include_debug_state
-            .then(|| report.server_state.as_ref().map(compact_json))
-            .flatten()
-            .transpose()?;
+        let page_data_json = compact_json(&report.page_data)?;
+        let server_state_json = compact_json(&report.server_state)?;
 
         conn.execute("BEGIN IMMEDIATE", [])?;
         let result = (|| -> Result<()> {
             conn.execute(
                 r#"
                 INSERT INTO bug_reports (
-                    id, created_at, reported_by, report_text, selected_session_id,
-                    route, app_version, artifact_hash, include_debug_state,
-                    client_state_json, server_state_json, status,
-                    maintainer_delivery_result
+                    id, created_at, reported_by, report_text, route,
+                    include_debug_state, server_state_json, status,
+                    client, client_version, page, page_data_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', NULL)
+                VALUES (?, ?, ?, ?, ?, 1, ?, 'unfiled', ?, ?, ?, ?)
                 "#,
                 params![
                     id,
                     created_at,
                     report.reported_by,
                     report.report_text,
-                    report.selected_session_id,
                     report.route,
-                    report.app_version,
-                    report.artifact_hash,
-                    if report.include_debug_state { 1 } else { 0 },
-                    client_state_json,
                     server_state_json,
+                    report.client,
+                    report.client_version,
+                    report.page,
+                    page_data_json,
                 ],
             )?;
+            if let Some(png) = &report.screenshot_png {
+                conn.execute(
+                    "INSERT INTO bug_report_attachments (bug_report_id, kind, mime_type, payload)
+                     VALUES (?, 'screenshot', 'image/png', ?)",
+                    params![id, png],
+                )?;
+            }
             self.prune_locked(&conn)?;
             Ok(())
         })();
@@ -102,13 +140,84 @@ impl BugReportStore {
         Ok(CreatedBugReport { id })
     }
 
-    pub fn update_delivery_result(&self, bug_id: &str, result: &str) -> Result<()> {
+    /// Records the issue the report was filed as.
+    pub fn mark_filed(&self, bug_id: &str, issue: &FiledIssue) -> Result<()> {
         let conn = self.open()?;
         conn.execute(
-            "UPDATE bug_reports SET maintainer_delivery_result = ?, status = 'submitted' WHERE id = ?",
-            params![result, bug_id],
+            "UPDATE bug_reports
+             SET status = 'filed', issue_repo = ?2, issue_number = ?3, issue_url = ?4
+             WHERE id = ?1",
+            params![bug_id, issue.repo, issue.number, issue.url],
         )?;
         Ok(())
+    }
+
+    pub fn report(&self, bug_id: &str) -> Result<Option<StoredBugReport>> {
+        if !self.db_path.exists() {
+            return Ok(None);
+        }
+        let conn = self.open()?;
+        let report = conn
+            .query_row(
+                r#"
+                SELECT id, created_at, reported_by, client, client_version, page, route,
+                       report_text, status, issue_repo, issue_number, issue_url,
+                       page_data_json, server_state_json,
+                       EXISTS (SELECT 1 FROM bug_report_attachments
+                               WHERE bug_report_id = bug_reports.id AND kind = 'screenshot')
+                FROM bug_reports WHERE id = ?
+                "#,
+                [bug_id],
+                |row| {
+                    let issue = match (
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                    ) {
+                        (Some(repo), Some(number), Some(url)) => {
+                            Some(FiledIssue { repo, number, url })
+                        }
+                        _ => None,
+                    };
+                    let json = |text: Option<String>| {
+                        text.and_then(|text| serde_json::from_str(&text).ok())
+                            .unwrap_or(Value::Null)
+                    };
+                    Ok(StoredBugReport {
+                        id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        reported_by: row.get(2)?,
+                        client: row.get(3)?,
+                        client_version: row.get(4)?,
+                        page: row.get(5)?,
+                        route: row.get(6)?,
+                        text: row.get(7)?,
+                        status: row.get(8)?,
+                        issue,
+                        page_data: json(row.get(12)?),
+                        server_facts: json(row.get(13)?),
+                        has_screenshot: row.get(14)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(report)
+    }
+
+    pub fn screenshot(&self, bug_id: &str) -> Result<Option<Vec<u8>>> {
+        if !self.db_path.exists() {
+            return Ok(None);
+        }
+        let conn = self.open()?;
+        let png = conn
+            .query_row(
+                "SELECT payload FROM bug_report_attachments
+                 WHERE bug_report_id = ? AND kind = 'screenshot' ORDER BY id LIMIT 1",
+                [bug_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        Ok(png)
     }
 
     pub fn report_exists(&self, bug_id: &str) -> Result<bool> {
@@ -156,6 +265,18 @@ impl BugReportStore {
             CREATE INDEX IF NOT EXISTS idx_bug_reports_selected_session ON bug_reports(selected_session_id, created_at);
             "#,
         )?;
+        let existing = conn
+            .prepare("SELECT name FROM pragma_table_info('bug_reports')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (column, kind) in ADDED_COLUMNS {
+            if !existing.iter().any(|name| name == column) {
+                conn.execute(
+                    &format!("ALTER TABLE bug_reports ADD COLUMN {column} {kind}"),
+                    [],
+                )?;
+            }
+        }
         Ok(conn)
     }
 

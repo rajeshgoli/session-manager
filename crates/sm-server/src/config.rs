@@ -740,6 +740,9 @@ pub struct BugReportsConfig {
     pub db_path: String,
     #[serde(default = "default_bug_reports_max_reports")]
     pub max_reports: usize,
+    /// Where the app's bug button files issues (spec 1859 A1).
+    #[serde(default = "default_bug_reports_repo")]
+    pub repo: String,
 }
 
 impl Default for BugReportsConfig {
@@ -747,8 +750,13 @@ impl Default for BugReportsConfig {
         Self {
             db_path: default_bug_reports_db_path(),
             max_reports: default_bug_reports_max_reports(),
+            repo: default_bug_reports_repo(),
         }
     }
+}
+
+fn default_bug_reports_repo() -> String {
+    "rajeshgoli/session-manager".to_owned()
 }
 
 fn default_bug_reports_max_reports() -> usize {
@@ -2278,6 +2286,7 @@ impl From<RawConfig> for AppConfig {
             bug_reports: BugReportsConfig {
                 db_path: paths.bug_reports_db,
                 max_reports: raw.bug_reports.max_reports,
+                repo: raw.bug_reports.repo,
             },
             google_auth: raw.auth.google,
             external_access: raw.external_access,
@@ -2343,12 +2352,15 @@ impl Default for RawPathsConfig {
 struct RawBugReportsConfig {
     #[serde(default = "default_bug_reports_max_reports")]
     max_reports: usize,
+    #[serde(default = "default_bug_reports_repo")]
+    repo: String,
 }
 
 impl Default for RawBugReportsConfig {
     fn default() -> Self {
         Self {
             max_reports: default_bug_reports_max_reports(),
+            repo: default_bug_reports_repo(),
         }
     }
 }

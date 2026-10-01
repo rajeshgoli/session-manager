@@ -235,6 +235,21 @@ impl BoardSource for FakeGitHub {
         }
         Ok(())
     }
+
+    fn create_issue(&self, repo: &str, title: &str, _body: &str) -> Result<(i64, String), String> {
+        let mut issues = self.issues.lock().unwrap();
+        let number = issues.keys().map(|key| key.1).max().unwrap_or(0) + 1;
+        let key = (repo.to_owned(), number);
+        issues.insert(
+            key,
+            FakeIssue {
+                title: title.to_owned(),
+                open: true,
+                ..FakeIssue::default()
+            },
+        );
+        Ok((number, format!("https://github.com/{repo}/issues/{number}")))
+    }
 }
 
 fn temp_store() -> (BoardStore, PathBuf) {
@@ -1984,4 +1999,67 @@ fn board_notice_opened_by_seen_event() {
         "2026-09-29T11:00:00Z",
         None
     ));
+}
+
+/// spec 1859 A6: the Bugs goal is `standing` however many of its bugs are
+/// open, is in no count, and raises no notice.
+#[test]
+fn standing_goal_state() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    let goal = k(1869);
+    github.open(goal.clone());
+    store.set_bugs_goal(&goal).unwrap();
+    assert_eq!(store.bugs_goal().unwrap(), Some(goal.clone()));
+    let lane_id = add_lane(&store, &github, &goal);
+    let board = |store: &BoardStore| store.board(&outside(), now()).unwrap().0;
+    // No bugs: Ready for any other goal, Standing for this one.
+    assert_eq!(state(&board(&store), &goal), TicketState::Standing);
+    for bug in [1870, 1871] {
+        github.open(k(bug));
+        github.after(&goal, &k(bug));
+    }
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    let current = board(&store);
+    assert_eq!(state(&current, &goal), TicketState::Standing);
+    let lane = lane_of(&current, &goal);
+    assert_eq!(lane.count(&current, TicketState::Ready), 2);
+    let json = board_json(
+        &current,
+        &store.input(&outside()).unwrap(),
+        &JsonContext {
+            events: &[],
+            repos: &[],
+            unseen: &Unseen::default(),
+            start_defaults: Value::Null,
+            lane_filter: None,
+            now: now(),
+            clocks: &BTreeMap::new(),
+        },
+    );
+    let lane_json = lane_json(&json, lane_id);
+    assert_eq!(lane_json["goal"]["state"], "standing");
+    let counted: i64 = lane_json["counts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_i64().unwrap())
+        .sum();
+    assert_eq!(counted, 2);
+    // Some, then all, bugs closed: still Standing, never close-ready, and
+    // the lane goes on.
+    github.close(&k(1870), "COMPLETED");
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    assert_eq!(state(&board(&store), &goal), TicketState::Standing);
+    github.close(&k(1871), "COMPLETED");
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    let current = board(&store);
+    assert_eq!(state(&current, &goal), TicketState::Standing);
+    assert!(current.lane(lane_id).is_some());
+    assert_eq!(store.active_lanes().unwrap().len(), 1);
+    // A goal that is no longer the Bugs ticket is an ordinary one again.
+    store.set_bugs_goal(&k(2000)).unwrap();
+    assert_eq!(state(&board(&store), &goal), TicketState::Ready);
+    fs::remove_dir_all(dir).unwrap();
 }

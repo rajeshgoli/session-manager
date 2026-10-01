@@ -41,6 +41,8 @@ pub const CHANGES_SHOWN: usize = 10;
 pub const NOTICE_BOARD_READY: &str = "board_ready";
 pub const NOTICE_BOARD_LANE_DONE: &str = "board_lane_done";
 pub const NOTICE_BOARD_AUTO_START: &str = "board_auto_start";
+/// `board_settings` key of the standing Bugs ticket, `owner/name#N`.
+pub const BUGS_GOAL_SETTING: &str = "bugs_goal";
 
 pub fn init_board_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -148,6 +150,10 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, session_id TEXT,
             authorized_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
+        );
+        CREATE TABLE IF NOT EXISTS board_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
         "#,
     )?;
@@ -380,6 +386,24 @@ impl BoardStore {
 
     pub fn ensure_schema(&self) -> Result<()> {
         self.open_write().map(|_| ())
+    }
+
+    /// The standing Bugs ticket, if sm has made one.
+    pub fn bugs_goal(&self) -> Result<Option<Key>> {
+        match self.open_read()? {
+            Some(conn) if table_exists(&conn, "board_settings")? => bugs_goal(&conn),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn set_bugs_goal(&self, goal: &Key) -> Result<()> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "INSERT INTO board_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![BUGS_GOAL_SETTING, format!("{}#{}", goal.0, goal.1)],
+        )?;
+        Ok(())
     }
 
     pub fn record_started_early(&self, key: &Key, now: OffsetDateTime) -> Result<()> {
@@ -1288,6 +1312,18 @@ fn replace_parent(conn: &Connection, key: &Key, parent: Option<Key>, now: &str) 
     Ok(())
 }
 
+/// The standing Bugs ticket as `board_settings` records it (spec 1859 A5).
+fn bugs_goal(conn: &Connection) -> Result<Option<Key>> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM board_settings WHERE key = ?1",
+            [BUGS_GOAL_SETTING],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.and_then(|value| parse_ticket_ref(&value, "")))
+}
+
 fn lane_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lane> {
     Ok(Lane {
         id: row.get(0)?,
@@ -1528,6 +1564,9 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
                 .or_default()
                 .insert(ticket);
         }
+    }
+    if table_exists(conn, "board_settings")? {
+        input.bugs_goal = bugs_goal(conn)?;
     }
     input.waiting = outside.waiting.clone();
     let syncs = repo_syncs(conn)?;
