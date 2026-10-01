@@ -60,7 +60,7 @@ pub async fn run(state: Arc<AppState>) {
             }
         };
         if !dns_ok {
-            stop(&mut serving);
+            stop(&mut serving).await;
             continue;
         }
         if last_cert_check.is_none_or(|at| at.elapsed() >= CERT_INTERVAL) {
@@ -69,18 +69,18 @@ pub async fn run(state: Arc<AppState>) {
                 Ok(renewed) => {
                     last_cert_check = Some(tokio::time::Instant::now());
                     if renewed {
-                        stop(&mut serving);
+                        stop(&mut serving).await;
                     }
                 }
                 Err(error) => {
                     eprintln!("terminal LAN certificate unavailable: {error:#}");
-                    stop(&mut serving);
+                    stop(&mut serving).await;
                     continue;
                 }
             }
         }
         if serving.as_ref().is_some_and(|task| task.is_finished()) {
-            stop(&mut serving);
+            stop(&mut serving).await;
         }
         if serving.is_none() {
             match start_listener(state.clone(), &lan).await {
@@ -91,9 +91,10 @@ pub async fn run(state: Arc<AppState>) {
     }
 }
 
-fn stop(serving: &mut Option<tokio::task::JoinHandle<()>>) {
+async fn stop(serving: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(task) = serving.take() {
         task.abort();
+        let _ = task.await;
     }
 }
 
@@ -128,7 +129,7 @@ fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
     if !cert.exists() || !dir.join("privkey.pem").exists() {
         return Ok(false);
     }
-    let valid = Command::new("openssl")
+    let valid = openssl_command()
         .args(["x509", "-in"])
         .arg(&cert)
         .args([
@@ -138,7 +139,7 @@ fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
         ])
         .status()
         .context("cannot inspect terminal LAN certificate expiry")?;
-    let matching = Command::new("openssl")
+    let matching = openssl_command()
         .args(["x509", "-in"])
         .arg(&cert)
         .args(["-noout", "-checkhost", hostname])
@@ -147,13 +148,13 @@ fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
     if !valid.success() || !matching.success() {
         return Ok(false);
     }
-    let certificate_key = Command::new("openssl")
+    let certificate_key = openssl_command()
         .args(["x509", "-in"])
         .arg(&cert)
         .args(["-pubkey", "-noout"])
         .output()
         .context("cannot read terminal LAN certificate public key")?;
-    let private_key = Command::new("openssl")
+    let private_key = openssl_command()
         .args(["pkey", "-in"])
         .arg(dir.join("privkey.pem"))
         .arg("-pubout")
@@ -162,6 +163,20 @@ fn certificate_is_fresh(dir: &Path, hostname: &str) -> Result<bool> {
     Ok(certificate_key.status.success()
         && private_key.status.success()
         && certificate_key.stdout == private_key.stdout)
+}
+
+fn openssl_command() -> Command {
+    // macOS ships LibreSSL, whose x509 command lacks -checkhost.
+    #[cfg(target_os = "macos")]
+    for path in [
+        "/opt/homebrew/opt/openssl@3/bin/openssl",
+        "/usr/local/opt/openssl@3/bin/openssl",
+    ] {
+        if Path::new(path).is_file() {
+            return Command::new(path);
+        }
+    }
+    Command::new("openssl")
 }
 
 async fn ensure_certificate(config: &AppConfig, lan: &TerminalDirectLanConfig) -> Result<bool> {
@@ -475,7 +490,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let cert = dir.join("fullchain.pem");
         let key = dir.join("privkey.pem");
-        let output = Command::new("openssl")
+        let output = openssl_command()
             .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
             .args(["-days", "90", "-subj", "/CN=studio-lan.example.com"])
             .args(["-addext", "subjectAltName=DNS:studio-lan.example.com"])
