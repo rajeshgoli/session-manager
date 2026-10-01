@@ -334,6 +334,7 @@
   .bub2.me { background: var(--m-sel); margin-left: 1.5rem; }
   .quote { border-left: 3px solid var(--m-accent); padding-left: .4rem; color: var(--m-ink2); font-style: italic; }
   .fold { border-top: 1px dashed var(--m-line); padding: .35rem .5rem; color: var(--m-ink2); font-size: 12.5px; }
+  .lane6 .brow { grid-template-columns: minmax(0,1fr) 7rem 15rem auto; }
   .tl td, .tl th { font-size: .86rem; }
   figure.svg { margin: 1rem 0; }
   figure.svg svg { width: 100%; height: auto; }
@@ -341,13 +342,13 @@
 </style>
 
 <h1>1821 — Fit and finish, round 2: restarts without downtime, notes, inbox threads, asking about a doc, auto-retire</h1>
-<p class="sans"><small>Author: Claude (design) <code>sm-1821</code> · Ticket #1821 · Revision 2, 30 September 2026 · An addendum to the round 1 memo, <code>docs/working/1782_fit_and_finish.html</code>, whose terms and screens it keeps</small></p>
+<p class="sans"><small>Author: Claude (design) <code>sm-1821</code> · Ticket #1821 · Revision 3, 30 September 2026 · An addendum to the round 1 memo, <code>docs/working/1782_fit_and_finish.html</code>, whose terms and screens it keeps</small></p>
 
 <h2>Memo</h2>
 
-<p><b>Your seven notes become one design and ten tickets; two more tickets need no design and are already on the board.</b> sm stops going dark for about 14 seconds at every server restart: the new build starts beside the old one and takes over only once it is ready, so a broken build never takes sm down. Notes holds many short, individual notes on the server, searched inline as you type, in one view that works as a full page for long writing and as a side pane for quick copying, on every machine and the phone. The Inbox groups everything about one ticket (or one PR) into one thread, folds away threads whose agents have all ended, and keeps docs until you archive them. A doc gets an Ask column for quick questions to its author, or to a cheap reader agent when the author is gone. Finished agents that sm started retire themselves after an hour idle, and a reply brings them back. Print (#1825) and the new agent action row (#1826) are filed under the round 1 lane.</p>
+<p><b>Your seven notes and your auto-start idea become one design and twelve tickets; two more tickets need no design and are already on the board.</b> sm stops going dark for about 14 seconds at every server restart: the new build starts beside the old one and takes over only once it is ready, so a broken build never takes sm down. Notes holds many short, individual notes on the server, searched inline as you type, in one view that works as a full page for long writing and as a side pane for quick copying, on every machine and the phone. The Inbox groups everything about one ticket (or one PR) into one thread, folds away threads whose agents have all ended, and keeps docs until you archive them. A doc gets an Ask column for quick questions to its author, or to a cheap reader agent when the author is gone. Finished agents that sm started retire themselves after an hour idle, and a reply brings them back. Tickets you pre-authorize start by themselves the moment they unblock, with the agent type you chose. Print (#1825) and the new agent action row (#1826) are filed under the round 1 lane.</p>
 
-<p><b>Terms used below.</b> A <b>restart</b> is deploying a new <code>sm-server</code> build with <code>scripts/restart-rust-server.sh</code>. <b>launchd</b> is the macOS service manager that keeps <code>sm-server</code> running; a <b>launchd job</b> is one registered service. A <b>hook</b> is the small script Claude runs at events such as the end of a turn, which tells sm what happened. An agent is <b>finished</b> when it ran <code>sm task-complete</code> and has not started a new turn since (round 1 term). <b>Retire</b> ends an agent: its tmux window closes, its ticket claim ends, and sm deletes its worktree when nothing would be lost. <b>Restore</b> brings a retired agent back with its full conversation (History › Restore today). A <b>work thread</b> is the new Inbox thread for one ticket, or for one PR when there is no ticket. A <b>reader agent</b> is a small, cheap agent sm starts only to answer questions about one doc.</p>
+<p><b>Terms used below.</b> A <b>restart</b> is deploying a new <code>sm-server</code> build with <code>scripts/restart-rust-server.sh</code>. <b>launchd</b> is the macOS service manager that keeps <code>sm-server</code> running; a <b>launchd job</b> is one registered service. A <b>hook</b> is the small script Claude runs at events such as the end of a turn, which tells sm what happened. An agent is <b>finished</b> when it ran <code>sm task-complete</code> and has not started a new turn since (round 1 term). <b>Retire</b> ends an agent: its tmux window closes, its ticket claim ends, and sm deletes its worktree when nothing would be lost. <b>Restore</b> brings a retired agent back with its full conversation (History › Restore today). A <b>work thread</b> is the new Inbox thread for one ticket, or for one PR when there is no ticket. A <b>reader agent</b> is a small, cheap agent sm starts only to answer questions about one doc. An <b>agent type</b> is a named choice of provider, model and effort, such as Mid = Claude Opus 1M at high effort.</p>
 
 <h3>Your notes, and what changes</h3>
 <table class="map">
@@ -361,6 +362,7 @@
 <tr><td>5. Chat with the agent beside a doc</td><td>An Ask column in the reader. It asks the author when live, else a reader agent; you can choose to bring the author back. Scenario 4.</td></tr>
 <tr><td>6. Retire hidden under ⋯ and two clicks; rarer actions take the space</td><td>Row: Terminal, Retire, Hand off…, ⋯ (Hand off now, Clone, Follow, Copy attach). One click retires a finished idle agent; a Finished card has its own Retire. <b>Filed as #1826</b>.</td></tr>
 <tr><td>7. Auto-retire finished idle agents; my reply restores them</td><td>Agents sm started retire after 60 minutes finished and idle. Anything addressed to one (your reply, your doc review, another agent's <code>sm send</code>) restores it first, worktree and ticket included. Scenario 5.</td></tr>
+<tr><td>Review: pre-authorize lane tickets with an agent type and prompt; start each when it unblocks</td><td>Start when ready… on a ticket, and Start lane when ready… on a lane. sm starts each the moment its blockers are done, and your phone hears “Started #n”. Scenario 6.</td></tr>
 </tbody></table>
 
 <p><b>Is copy attach command still useful?</b> Yes, a little: it is the way to attach from a Mac terminal with plain tmux when the web terminal lags. #1826 moves it into ⋯.</p>
@@ -495,6 +497,27 @@
 <li>Settings › New agents gets “Retire finished agents automatically” (on) and the delay (60 minutes). #1826's retire toast gains Undo, which works once Restore rebuilds worktrees.</li>
 </ul>
 
+<div class="scen">Scenario 6 · Lining up a lane before bed</div>
+<h3>“Start each ticket the moment it unblocks, with the agent I chose.”</h3>
+<div class="scrwrap"><div class="scr" style="grid-template-columns:1fr">
+ <div class="main"><div class="body">
+  <div class="lane lane6"><div class="lanehd"><span class="rk">Lane 3</span><span class="t">#1821 Fit and finish, round 2</span><span style="flex:1"></span><span class="btn sm">Start lane when ready…</span></div>
+   <div class="brow"><span class="ti">#1825 Docs: Print button</span><span class="sub">Ready</span><span></span><span class="btn sm pri">Start</span></div>
+   <div class="brow"><span class="ti">#1826 Agents: Retire up front</span><span class="sub">waits on #1796</span><span class="lk">⏵ when ready · Low · Sonnet high</span><span class="btn sm">⋯</span></div>
+   <div class="brow"><span class="ti">Work threads: server</span><span class="sub">waits on #1789</span><span class="lk">⏵ when ready · Mid · Opus high</span><span class="btn sm">⋯</span></div>
+   <div class="brow"><span class="ti">Restart handover: script</span><span class="sub">waits on server</span><span class="sub">Start when ready…</span><span class="btn sm">⋯</span></div>
+  </div>
+ </div></div>
+</div></div>
+<ul>
+<li><b>Start when ready…</b> on a waiting ticket opens the Start form you already use: an agent type (Top, Mid, Low, or your own provider, model and effort) and the first message. Its button says Start when ready. The row then carries a chip such as “⏵ when ready · Mid · Opus high”; click it to change or cancel.</li>
+<li><b>Start lane when ready…</b> lists every ticket in the lane not yet started, each with its agent type, so one form lines up the whole lane. A ticket whose text says <code>Tier: Mid</code>, as sm's tickets do, starts out as Mid.</li>
+<li><b>Agent types</b> live in Settings › New agents. The three defaults follow CLAUDE.md's tiers: Top = Claude Fable, xhigh effort; Mid = Claude Opus 1M, high; Low = Claude Sonnet 1M, high. You can edit them or add Codex ones.</li>
+<li><b>When a ticket's blockers are all done</b>, the next Board refresh starts it exactly as Start would: your name pattern, your first message, its worktree. The phone alert that today says “Ready in lane 3” then says “Started #1826 as sm-1826 (Sonnet, high)”.</li>
+<li>It never starts a ticket early (that stays Start anyway), never one that an agent already holds, and never a container ticket whose parts are all done. If a start fails, the alert says why, and sm tries again at the next two refreshes. A <b>Pause auto-start</b> toggle in Settings holds every authorization without losing it.</li>
+<li>With auto-retire, a lane runs itself: each ticket starts when its blockers finish, its agent finishes and retires, and the next one starts. You watch on the Board and step in through the Inbox.</li>
+</ul>
+
 <h3>Decisions</h3>
 <table>
 <thead><tr><th>Question</th><th>Recommendation</th><th>Why</th></tr></thead>
@@ -507,11 +530,12 @@
 <tr><td>6. Who answers Ask</td><td><b>The live author; else a Sonnet reader agent; Bring back the author only when you pick it.</b></td><td>A restored author reloads hundreds of thousands of tokens; a reader agent reads one doc.</td></tr>
 <tr><td>7. Which agents auto-retire</td><td><b>Agents sm started</b>, after <b>60 minutes</b> finished and idle, on by default.</td><td>I read “sm context created agents” as these; correct me if you meant only handoff successors. An hour is past the prompt cache, so it costs no extra tokens.</td></tr>
 <tr><td>8. What restores an auto-retired agent</td><td><b>Anything addressed to it.</b> Agents you or a parent retired keep today's routing.</td><td>The message was for that agent; it alone has the context.</td></tr>
-<tr><td>9. Plan</td><td><b>Ten tickets under #1821</b> (appendix G); #1821 becomes its own lane after #1782. Restart and notes-server start at once; the rest wait on named round 1 tickets.</td><td>The Inbox, Agents and reader files are still changing in round 1.</td></tr>
+<tr><td>9. Auto-start</td><td><b>Yes: per ticket and per lane, with editable agent types</b> (Top, Mid, Low by default, matching CLAUDE.md); a <code>Tier:</code> line picks the default; Pause in Settings.</td><td>Lanes stop waiting on you between tickets; you choose every agent and prompt in advance, so nothing starts that you did not authorize.</td></tr>
+<tr><td>10. Plan</td><td><b>Twelve tickets under #1821</b> (appendix H); #1821 becomes its own lane after #1782. Restart, notes-server and auto-start-server tickets start at once; the rest wait on named round 1 tickets.</td><td>The Inbox, Agents and reader files are still changing in round 1.</td></tr>
 </tbody></table>
 
-<h3>FAQ — what changed since revision 1</h3>
-<p><b>Notes</b> are many individual notes, filtered inline, in one view at two sizes (page and pane) with the same four buttons; Start agent and File ticket ask their one question in a popover rather than a form. <code>prompts.md</code> is not imported. <b>Inbox</b> threads also gather by PR when there is no ticket, and a thread with a doc never folds by itself: you Archive it.</p>
+<h3>FAQ — what changed since revision 2</h3>
+<p><b>Auto-start</b> is new, from your review: scenario 6, decision 9, appendix F, and two tickets (twelve in all). Agent types are named in Settings, and the auto-retire ticket now also waits on the auto-start tickets because both edit the same settings files.</p>
 <h3>FAQ</h3>
 <p><b>Why not just make hooks and clients retry?</b> It turns errors into waits only for clients we write. The browser, the phone and Cloudflare would still see 14 seconds of nothing, and a broken build would still take sm down until someone fixes it.</p>
 <p><b>Why not keep finished agents alive forever?</b> An idle agent costs no tokens, but it holds memory, a tmux window, a worktree and a ticket claim, and it clutters Agents and the Board. After an hour it has lost its token advantage too.</p>
@@ -652,13 +676,49 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <li><b>Tests</b>: each eligibility exclusion; the sweep respects the setting and delay; a reply to an auto-retired agent restores it and delivers; a reply to a manually retired one goes to the parent; worktree rebuilt at the same path from branch, from origin, detached; claims reopened unless taken; doc review wake restores.</li>
 </ul>
 
-<h3>F. Filed without design</h3>
+<h3>F. Auto-start</h3>
+<h4>F1. Agent types</h4>
+<ul>
+<li><code>owner_settings</code> new-agent settings gain <code>agent_types: [{name, provider, model, effort}]</code>, at most 8, names unique. Defaults: <code>Top</code> claude / Fable / xhigh; <code>Mid</code> claude / Opus 1M / high; <code>Low</code> claude / Sonnet 1M / high, using the model ids <code>/client/session-models</code> lists for those models (the ticket confirms them there). Also <code>auto_start_paused: false</code>. Both ride <code>GET/PUT /client/settings</code>.</li>
+<li><b>Tier line.</b> The first line of a ticket body matching <code>^\s*Tier:\s*(\w+)</code> (case-insensitive) names an agent type; a name that matches none is ignored.</li>
+</ul>
+<h4>F2. Store and routes</h4>
+<pre>board database:
+auto_starts(repo TEXT, number INTEGER, agent_type TEXT NULL, provider TEXT NOT NULL, model TEXT NULL,
+            effort TEXT NULL, brief TEXT NULL, state TEXT NOT NULL CHECK (state IN
+            ('waiting','started','failed','cancelled')), attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, session_id TEXT, authorized_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number))</pre>
+<ul>
+<li><code>brief</code> null means render the New agent message template at start time (<code>owner_settings.rs:434</code>), so later template edits apply; a non-null brief is used as is.</li>
+<li><code>PUT /client/board/auto-start {repo, number, agent_type?, provider, model?, reasoning_effort?, brief?}</code> sets <code>waiting</code>, resetting attempts. <code>DELETE /client/board/auto-start?repo=&amp;number=</code> sets <code>cancelled</code>. <code>PUT /client/board/auto-start/lane {goal_repo, goal_number, tickets:[same items]}</code> applies several in one transaction. Owner and phone guards, <code>ensure_core_writes_enabled</code>, as <code>client_start</code> (<code>http/board.rs:1093</code>).</li>
+<li>Board JSON ticket facts gain <code>auto_start: {agent_type, provider, model, effort, state, last_error, attempts} | null</code> while the row is <code>waiting</code> or <code>failed</code>. A ticket's <code>tier</code> (F1) is included so the lane form can default.</li>
+</ul>
+<h4>F3. Trigger</h4>
+<ul>
+<li>In each board recompute (<code>board.rs:1534</code> <code>run_pass</code>), after <code>pushes::decide</code> (<code>board/pushes.rs:31</code>) finds the tickets that just became Ready, and also for any <code>waiting</code> row whose ticket is Ready (so a missed pass or a restart catches up): unless <code>auto_start_paused</code>, and when the ticket has no open ticket claim, call the same start path as <code>client_start</code> with the stored choice and the rendered or stored brief, under <code>board_lock</code> so one ticket starts once.</li>
+<li>Success: <code>state = started</code>, <code>session_id</code> set. The ready alert for that lane drops the started ticket and a per-ticket owner notice “Started #{n} as {name} ({model}, {effort})” goes out the same way (follow worker push).</li>
+<li>Failure: <code>attempts + 1</code>, <code>last_error</code>, notice “Could not start #{n}: {error}”; retried on later passes while <code>attempts &lt; 3</code>, then <code>failed</code>, shown on the chip with Retry (which PUTs again).</li>
+<li>Never starts a ticket while it is Blocked, nor one in Close ready (container) or Done state. A ticket that closes, or that someone claims or starts by hand, moves its row to <code>cancelled</code> with that reason.</li>
+<li>Only the serving server runs the trigger (A4 shutdown signal).</li>
+</ul>
+<h4>F4. Web and phone</h4>
+<ul>
+<li><code>web/board-start.js</code> <code>TicketStart</code> gains a mode <code>when_ready</code>: an Agent type selector (each type, then Custom) on top that fills provider, model and effort; the primary button reads Start when ready and PUTs F2. Shown from the row ⋯ for Blocked tickets, and from the chip (with Cancel).</li>
+<li><code>web/board.js</code>: the chip “⏵ when ready · {type} · {model short} {effort}” (amber with Retry when failed; “paused” when paused); the lane header gains Start lane when ready…, a table of the lane's tickets not started, closed or claimed, each with its agent type selector (default: tier line, else last used) and “first message: default | edited”, with one Save.</li>
+<li><code>web/settings.js</code> › New agents: Agent types editor (rows of name, provider, model, effort; add, remove) and the Pause auto-start toggle.</li>
+<li>Phone: the chip on board rows and Start when ready in the row menu (per ticket; no lane form).</li>
+</ul>
+<h4>F5. Tests</h4>
+<p>A waiting ticket becoming Ready starts once across repeated passes; a claimed ticket does not start and is cancelled; a container ticket never starts; a closed ticket cancels; three failures then <code>failed</code>; Pause holds; a null brief renders the template at start; the tier line picks the type; a lane PUT is all or nothing.</p>
+
+<h3>G. Filed without design</h3>
 <ul>
 <li><b>#1825</b> Print: a Print button in the reader bar and the full-page sm bar, a Print memo / Print all split for docs with an appendix divider, ⌘P printing the doc, and print rules that hide sm's bar and review sheet. No dependencies.</li>
 <li><b>#1826</b> Agent actions: band row Terminal, Retire, Hand off… (automatic only), ⋯ (Hand off now, Clone, Follow, Copy attach); one-click Retire for finished idle agents, inline confirm otherwise; Retire on Finished cards. Starts after #1796.</li>
 </ul>
 
-<h3>G. Tickets and order</h3>
+<h3>H. Tickets and order</h3>
 <p>All go under #1821 with <code>sm board under</code>; order with <code>sm board after</code>. Round 1 ticket numbers: #1789 last turn message and Finished; #1792 generated names; #1794 home-network TLS listener; #1796 web Agents page; #1797 web terminal page; #1799 web Inbox; #1800 and #1801 phone.</p>
 <table>
 <thead><tr><th>Ticket</th><th>Covers</th><th>Main files</th><th>Starts after</th><th>Tier</th></tr></thead>
@@ -669,14 +729,16 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <tr><td>Notes: web</td><td>B3</td><td>new <code>web/notes.js</code>, <code>app.js</code>, <code>app.css</code>, <code>terminal.js</code> (Type into terminal)</td><td>Notes server, #1797</td><td>Mid</td></tr>
 <tr><td>Work threads: server</td><td>C1, C2</td><td><code>http/inbox.rs</code>, <code>owner_inbox.rs</code>, <code>http/messages.rs</code> (reply target)</td><td>#1789</td><td>Mid</td></tr>
 <tr><td>Work threads: web</td><td>C1 and C2 on the web, reply box hint</td><td><code>web/inbox.js</code></td><td>work threads server, #1799</td><td>Low</td></tr>
-<tr><td>Auto-retire and restore on message</td><td>E</td><td><code>sessions.rs</code> (sweep, restore worktree), <code>http/messages.rs</code>, <code>work_claims/worktrees.rs</code>, <code>owner_settings.rs</code>, <code>web/settings.js</code>, <code>web/agents.js</code> (Undo)</td><td>#1789, #1792, #1826, work threads server (both edit <code>messages.rs</code>)</td><td>Mid</td></tr>
+<tr><td>Auto-retire and restore on message</td><td>E</td><td><code>sessions.rs</code> (sweep, restore worktree), <code>http/messages.rs</code>, <code>work_claims/worktrees.rs</code>, <code>owner_settings.rs</code>, <code>web/settings.js</code>, <code>web/agents.js</code> (Undo)</td><td>#1789, #1792, #1826, work threads server (both edit <code>messages.rs</code>), auto-start web (both edit settings)</td><td>Mid</td></tr>
 <tr><td>Ask about a doc</td><td>D (web and server)</td><td><code>http/docs.rs</code>, new <code>http/ask.rs</code>, <code>web/reader.js</code></td><td>#1825, work threads web, auto-retire</td><td>Mid</td></tr>
-<tr><td>Phone: notes, print, agent actions, auto-retire setting</td><td>B4, #1825 and #1826 on the phone (<code>PrintManager</code> in <code>DocReader.kt</code>), E2 setting</td><td><code>ui/notes</code> (new), <code>DocReader.kt</code>, <code>ui/watch</code>, <code>ui/settings</code></td><td>#1801, Notes server, auto-retire</td><td>Mid</td></tr>
+<tr><td>Auto-start: server</td><td>F1–F3, F5</td><td><code>board.rs</code>, <code>board/pushes.rs</code>, <code>http/board.rs</code>, <code>owner_settings.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>Auto-start: web</td><td>F4 web</td><td><code>web/board-start.js</code>, <code>web/board.js</code>, <code>web/settings.js</code></td><td>auto-start server</td><td>Low</td></tr>
+<tr><td>Phone: notes, print, agent actions, auto-retire and auto-start</td><td>B4, #1825 and #1826 on the phone (<code>PrintManager</code> in <code>DocReader.kt</code>), E2 setting, F4 phone</td><td><code>ui/notes</code> (new), <code>DocReader.kt</code>, <code>ui/watch</code>, <code>ui/board</code>, <code>ui/settings</code></td><td>#1801, Notes server, auto-retire, auto-start server</td><td>Mid</td></tr>
 <tr><td>Phone: work threads and Ask</td><td>C and D on the phone</td><td><code>ui/inbox</code> (ThreadScreen), <code>DocReader.kt</code></td><td>the phone ticket above, work threads server, Ask</td><td>Mid</td></tr>
 </tbody></table>
-<p>Restart server and Notes server start at once. Every web ticket attaches screenshots at 1440 and 390 px, light and dark; phone tickets use the preview emulator on live data. Every server ticket runs <code>cargo clippy</code> and <code>fmt</code> per CLAUDE.md.</p>
+<p>Restart server, Notes server and Auto-start server start at once. Every web ticket attaches screenshots at 1440 and 390 px, light and dark; phone tickets use the preview emulator on live data. Every server ticket runs <code>cargo clippy</code> and <code>fmt</code> per CLAUDE.md.</p>
 
-<h3>H. Requirement trace</h3>
+<h3>I. Requirement trace</h3>
 <table>
 <thead><tr><th>Memo item</th><th>Spec</th><th>Proof</th></tr></thead>
 <tbody>
@@ -688,6 +750,7 @@ note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NU
 <tr><td>Print</td><td>#1825</td><td>PDFs from #1825</td></tr>
 <tr><td>Ask about a doc</td><td>D</td><td>D tests; screenshot; a live question answered by a reader agent</td></tr>
 <tr><td>Retire up front, one click</td><td>#1826</td><td>#1826 screenshots</td></tr>
+<tr><td>Auto-start when unblocked, per ticket and per lane</td><td>F</td><td>F5 tests; live check: authorize a blocked ticket, close its blocker, watch it start and the phone alert arrive</td></tr>
 <tr><td>Auto-retire; reply restores</td><td>E</td><td>E tests; live check: a finished agent retires after the delay, a reply restores it in its worktree</td></tr>
 </tbody></table>
 
