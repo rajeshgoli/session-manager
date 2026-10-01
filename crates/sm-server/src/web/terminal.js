@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4): switcher, phone keys, route and round-trip time.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store } from './ui.js';
-import { openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
+import { RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-route.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -43,6 +43,14 @@ export function stepRow(order, currentId, step) {
   const at = order.findIndex((a) => a.id === currentId);
   if (at < 0) return step > 0 ? order[0] : order[order.length - 1];
   return order[Math.max(0, Math.min(order.length - 1, at + step))];
+}
+
+/** After retiring the current agent: the row below it, else the row above; null when none is left. */
+export function rowAfterRetire(order, currentId) {
+  const rest = order.filter((a) => a.id !== currentId);
+  if (!rest.length) return null;
+  const at = order.findIndex((a) => a.id === currentId);
+  return rest[Math.min(Math.max(at, 0), rest.length - 1)];
 }
 
 const narrow = () => window.innerWidth < 900;
@@ -108,6 +116,13 @@ export function TerminalPage({ id, open }) {
     if (next.id !== id) navigate(`/terminal/${encodeURIComponent(next.id)}`);
   };
   const refocus = () => setTimeout(() => control.current?.focus(), 0);
+  // A retired agent's terminal has nothing left to show, so move on to the next agent.
+  const retired = (done) => {
+    if (!done) { reload(); return; }
+    const next = rowAfterRetire(order, id);
+    if (next) navigate(`/terminal/${encodeURIComponent(next.id)}`);
+    else back();
+  };
 
   // ⌘\ toggles the switcher; ⌘⌥↑ and ⌘⌥↓ switch agents. xterm lets these through.
   const latest = useRef({});
@@ -302,6 +317,7 @@ export function TerminalPage({ id, open }) {
         <button type="button" class="btn sm" disabled=${connection !== 'Live'} onClick=${() => control.current?.model()}>/model</button></span>` : null}
       <span class="sp"></span>
       ${agent?.remote_control?.url?.startsWith('https://claude.ai/code/') ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
+      ${agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null}
       <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
     </div>
     <div class=${`term-main${switcher ? ' with-switch' : ''}`}>

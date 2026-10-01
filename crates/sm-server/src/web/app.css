@@ -297,6 +297,7 @@ button.sw-sec { cursor: pointer; }
 .term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-keys { display: flex; gap: 4px; white-space: nowrap; }
 .term-connection { white-space: nowrap; font-size: .9rem; }
+.term-bar .retire-confirm { flex-wrap: nowrap; white-space: nowrap; }
 .term-notice { position: absolute; bottom: 16px; left: 12px; right: 12px; padding: 10px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
 .term-panel { position: fixed; top: 40px; right: 0; bottom: 0; z-index: 31; width: 28rem; max-width: 100vw; }
 @media (max-width: 900px) {
