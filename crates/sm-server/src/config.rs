@@ -38,6 +38,7 @@ pub struct AppConfig {
     pub cloudflare_access: CloudflareAccessConfig,
     pub public_edge: PublicEdgeConfig,
     pub mobile_terminal: MobileTerminalConfig,
+    pub terminal_direct: TerminalDirectConfig,
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
@@ -97,6 +98,7 @@ impl Default for AppConfig {
             cloudflare_access: CloudflareAccessConfig::default(),
             public_edge: PublicEdgeConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
+            terminal_direct: TerminalDirectConfig::default(),
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
@@ -997,6 +999,47 @@ impl Default for MobileTerminalConfig {
             device_enrollment_ttl_minutes: default_mobile_terminal_device_enrollment_ttl_minutes(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TerminalDirectConfig {
+    #[serde(default)]
+    pub lan: TerminalDirectLanConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalDirectLanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_terminal_direct_lan_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_terminal_direct_lan_port")]
+    pub port: u16,
+    #[serde(default = "default_terminal_direct_lan_cert_dir")]
+    pub cert_dir: String,
+}
+
+impl Default for TerminalDirectLanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: default_terminal_direct_lan_hostname(),
+            port: default_terminal_direct_lan_port(),
+            cert_dir: default_terminal_direct_lan_cert_dir(),
+        }
+    }
+}
+
+fn default_terminal_direct_lan_hostname() -> String {
+    "studio-lan.rajeshgo.li".to_owned()
+}
+
+fn default_terminal_direct_lan_port() -> u16 {
+    8443
+}
+
+fn default_terminal_direct_lan_cert_dir() -> String {
+    "~/.config/session-manager/certs/lan".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2095,6 +2138,8 @@ struct RawConfig {
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
+    terminal_direct: TerminalDirectConfig,
+    #[serde(default)]
     bug_reports: RawBugReportsConfig,
     #[serde(default)]
     tmux: TmuxConfig,
@@ -2239,6 +2284,7 @@ impl From<RawConfig> for AppConfig {
             cloudflare_access: raw.cloudflare_access,
             public_edge: raw.public_edge,
             mobile_terminal: raw.mobile_terminal,
+            terminal_direct: raw.terminal_direct,
             tmux: raw.tmux,
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
