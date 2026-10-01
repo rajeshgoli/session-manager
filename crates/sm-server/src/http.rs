@@ -10,7 +10,7 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -562,10 +562,54 @@ impl GitHubReviewPoster for GhCliReviewPoster {
     }
 }
 
+/// Counts provider side-command workers across rollback generations in one process.
+#[derive(Clone, Default)]
+pub struct BtwWorkers(Arc<(Mutex<usize>, Condvar)>);
+
+struct BtwWorkerGuard(BtwWorkers);
+
+impl BtwWorkers {
+    fn begin(&self) -> BtwWorkerGuard {
+        let (count, _) = &*self.0;
+        *count.lock().unwrap() += 1;
+        BtwWorkerGuard(self.clone())
+    }
+
+    pub fn wait_empty(&self, limit: Duration) -> bool {
+        let (count, changed) = &*self.0;
+        let count = count.lock().unwrap();
+        let (count, _) = changed
+            .wait_timeout_while(count, limit, |count| *count != 0)
+            .unwrap();
+        *count == 0
+    }
+}
+
+impl Drop for BtwWorkerGuard {
+    fn drop(&mut self) {
+        let (count, changed) = &*self.0 .0;
+        *count.lock().unwrap() -= 1;
+        changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn btw_worker_blocks_handover_across_rollback_generations() {
+    let workers = BtwWorkers::default();
+    let old_worker = workers.begin();
+    let resumed_generation = workers.clone();
+    assert!(!workers.wait_empty(Duration::from_millis(1)));
+    assert!(!resumed_generation.wait_empty(Duration::from_millis(1)));
+    drop(old_worker);
+    assert!(resumed_generation.wait_empty(Duration::from_millis(1)));
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     shutdown: crate::handover::Shutdown,
+    btw_workers: BtwWorkers,
     listen_port: u16,
     server_instance: String,
     session_store: SessionStore,
@@ -745,6 +789,7 @@ impl AppState {
         Ok(Self {
             config,
             shutdown: crate::handover::Shutdown::default(),
+            btw_workers: BtwWorkers::default(),
             listen_port: 8420,
             server_instance: random_urlsafe_token(24),
             session_store,
@@ -786,6 +831,15 @@ impl AppState {
     pub fn with_shutdown(mut self, shutdown: crate::handover::Shutdown) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    pub fn with_btw_workers(mut self, workers: BtwWorkers) -> Self {
+        self.btw_workers = workers;
+        self
+    }
+
+    pub fn btw_workers(&self) -> BtwWorkers {
+        self.btw_workers.clone()
     }
 
     pub fn shutdown(&self) -> crate::handover::Shutdown {
@@ -9963,7 +10017,9 @@ async fn create_btw_request(
 
     let worker_state = state.clone();
     let worker_request_id = record.request_id.clone();
+    let worker_guard = state.btw_workers.begin();
     tokio::task::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
         if let Err(error) = run_btw_request(&worker_state, &worker_request_id) {
             eprintln!("sm what worker {worker_request_id} failed: {error:#}");
         }
@@ -9989,6 +10045,19 @@ async fn get_btw_request(
 }
 
 fn recover_btw_requests(state: Arc<AppState>) {
+    thread::spawn(move || {
+        while !state.btw_workers.wait_empty(Duration::from_secs(1)) {
+            if state.shutdown.is_stopped() {
+                return;
+            }
+        }
+        if !state.shutdown.is_stopped() {
+            recover_btw_requests_ready(state);
+        }
+    });
+}
+
+fn recover_btw_requests_ready(state: Arc<AppState>) {
     if !btw_db_path(&state).exists() {
         return;
     }
@@ -9999,9 +10068,17 @@ fn recover_btw_requests(state: Arc<AppState>) {
         return;
     };
     for request in requests {
+        if state.shutdown.is_stopped() {
+            break;
+        }
         let worker_state = state.clone();
         let worker_store = store.clone();
+        let worker_guard = state.btw_workers.begin();
         thread::spawn(move || {
+            let _worker_guard = worker_guard;
+            if worker_state.shutdown.is_stopped() {
+                return;
+            }
             if !matches!(request.status.as_str(), "pending" | "running") {
                 let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
                 return;

@@ -16,7 +16,7 @@ use sm_server::{
     activity_ledger::ActivityRecorder,
     config::AppConfig,
     handover::{self, Shutdown},
-    http::{router, AppState},
+    http::{router, AppState, BtwWorkers},
     owner_settings,
     queue::{QueueRecoverySummary, RetainedQueueStore},
     queue_authority::{QueueAuthorityServer, QueueAuthorityServiceIdentity},
@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
         "sm-server queue authority on {}",
         authority_server.socket_path().display()
     );
+    let btw_workers = BtwWorkers::default();
     'generations: loop {
         let shutdown = Shutdown::default();
         sm_server::queue::set_live_queue_shutdown(shutdown.clone());
@@ -261,7 +262,8 @@ async fn main() -> Result<()> {
         let state = AppState::try_new(config.clone())
             .context("failed to initialize server state")?
             .with_listen_port(args.port)
-            .with_shutdown(shutdown.clone());
+            .with_shutdown(shutdown.clone())
+            .with_btw_workers(btw_workers.clone());
         let lan_control = terminal_lan::LanControl::default();
         let expected_lan = inherited_lan.is_some();
         if state.config().terminal_direct.lan.enabled {
@@ -597,6 +599,16 @@ async fn main() -> Result<()> {
                 }
                     let _ = authority_thread.join();
                     let _ = handover_acceptor.join();
+                    let workers = btw_workers.clone();
+                    let workers_clear = tokio::task::spawn_blocking(move || {
+                        workers.wait_empty(Duration::from_secs(10))
+                    }).await?;
+                    if !workers_clear {
+                        eprintln!("handover refused: /btw workers did not stop within ten seconds");
+                        drop(stream);
+                        inherited_lan = lan_listener;
+                        continue 'generations;
+                    }
                     let mut fds = vec![listener.as_raw_fd(), authority_server.listener_fd(), handover_listener.as_raw_fd()];
                     if let Some(lan) = &lan_listener { fds.push(lan.as_raw_fd()); }
                     let result = match handover::send_listeners(&stream, &fds, lan_listener.is_some()) {

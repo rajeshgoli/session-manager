@@ -33,6 +33,7 @@ const DNS_PERMISSION: &str = "Cloudflare token needs Zone > DNS > Edit on rajesh
 #[derive(Clone, Default)]
 pub struct LanControl {
     inner: Arc<Mutex<LanServing>>,
+    transition: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -46,6 +47,7 @@ impl LanControl {
     /// Stop accepting TLS connections, but retain a descriptor for the next
     /// server or for rollback in this process.
     pub async fn pause(&self) -> Result<Option<std::net::TcpListener>> {
+        let _transition = self.transition.lock().await;
         let (listener, handle, task) = {
             let mut inner = self.inner.lock().unwrap();
             (
@@ -108,7 +110,9 @@ pub async fn run(
     }
     let config = state.config().clone();
     if let Some(listener) = inherited {
-        if let Err(error) = start_listener(state.clone(), &lan, &control, Some(listener)).await {
+        if let Err(error) =
+            start_listener(state.clone(), &lan, &control, Some(listener), &shutdown).await
+        {
             eprintln!("inherited terminal LAN listener unavailable: {error:#}");
             return;
         }
@@ -176,7 +180,7 @@ pub async fn run(
         }
         if !control.is_running() {
             control.stop().await;
-            match start_listener(state.clone(), &lan, &control, None).await {
+            match start_listener(state.clone(), &lan, &control, None, &shutdown).await {
                 Ok(()) => {}
                 Err(error) => eprintln!("terminal LAN listener unavailable: {error:#}"),
             }
@@ -189,7 +193,12 @@ async fn start_listener(
     lan: &TerminalDirectLanConfig,
     control: &LanControl,
     inherited: Option<std::net::TcpListener>,
+    shutdown: &Shutdown,
 ) -> Result<()> {
+    let _transition = control.transition.lock().await;
+    if shutdown.is_stopped() {
+        bail!("terminal LAN startup stopped for handover");
+    }
     let dir = expand_home(&lan.cert_dir);
     let cert = fs::read(dir.join("fullchain.pem"))?;
     let key = fs::read(dir.join("privkey.pem"))?;
@@ -218,6 +227,11 @@ async fn start_listener(
     if handle.listening().await.is_none() {
         task.abort();
         bail!("terminal LAN listener did not start");
+    }
+    if shutdown.is_stopped() {
+        task.abort();
+        let _ = task.await;
+        bail!("terminal LAN startup stopped for handover");
     }
     let mut inner = control.inner.lock().unwrap();
     inner.listener = Some(retained);
