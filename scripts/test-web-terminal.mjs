@@ -79,7 +79,7 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
   if (failDirect) await page.addInitScript(() => { window.failDirect = true; });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  const state = { sessions: fixture(), answered: [], tickets: 0 };
+  const state = { sessions: fixture(), answered: [], retired: [], tickets: 0 };
   await page.route('**/*', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -105,6 +105,13 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
       state.answered.push(id);
       state.sessions = state.sessions.map((s) => (s.id === id ? { ...s, facts: { ...s.facts, you: null }, attention: { section: 'idle', reason: null, order_key: '0' } } : s));
       return route.fulfill({ json: { facts: null } });
+    }
+    const retire = /^\/sessions\/([^/]+)\/retire$/.exec(url.pathname);
+    if (retire && request.method() === 'POST') {
+      const id = decodeURIComponent(retire[1]);
+      state.retired.push({ id, body: request.postDataJSON() });
+      state.sessions = state.sessions.filter((s) => s.id !== id);
+      return route.fulfill({ json: {} });
     }
     if (url.pathname === '/watch/state') return route.fulfill({ json: { sessions: state.sessions, counts: {} } });
     return route.fulfill({ json: {} });
@@ -197,6 +204,30 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     await page.keyboard.press('Meta+Backslash');
     await page.waitForFunction(() => !document.querySelector('.term-switch'));
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'false');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Retire in the bar: a finished agent retires at once and the page moves to the next row', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors, state } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    // A working agent asks first; Cancel leaves it alone.
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-bar').getByRole('button', { name: 'Retire', exact: true }).click();
+    assert.equal((await page.locator('.term-bar .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Retire Cancel');
+    assert.equal(await page.locator('.term-bar').evaluate((bar) => bar.scrollHeight <= bar.clientHeight), true, 'the confirmation stays on one line');
+    await page.locator('.term-bar .retire-confirm').getByRole('button', { name: 'Cancel' }).click();
+    assert.deepEqual(state.retired, []);
+    // The finished, idle agent retires on one click and the terminal moves to the row below it.
+    await page.locator('.sw-row', { hasText: 'far-1855' }).click();
+    await page.waitForFunction(() => location.pathname === '/terminal/far-1855');
+    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-bar').getByRole('button', { name: 'Retire', exact: true }).click();
+    await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
+    assert.deepEqual(state.retired, [{ id: 'far-1855', body: { if_finished_idle: true } }]);
+    await page.waitForFunction(() => ![...document.querySelectorAll('.sw-row .sw-nm')].some((n) => n.textContent === 'far-1855'));
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
