@@ -556,8 +556,16 @@ async fn main() -> Result<()> {
 
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut lan_stability = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
+                _ = lan_stability.tick(), if expected_lan && decision_rx.is_some() => {
+                    if !lan_control.is_running() {
+                        shutdown.stop();
+                        let _ = tokio::time::timeout(Duration::from_secs(10), &mut server_task).await;
+                        return Err(anyhow::anyhow!("inherited terminal LAN listener stopped during handover"));
+                    }
+                }
                 decision = async {
                     match decision_rx.as_mut() {
                         Some(receiver) => receiver.recv().await,

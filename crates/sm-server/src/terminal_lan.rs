@@ -167,7 +167,8 @@ pub async fn run(
             }
         };
         if !dns_ok {
-            control.stop().await;
+            // A failed DNS reconciliation does not invalidate an already
+            // serving listener. Keep its inherited socket for the next pass.
             continue;
         }
         if last_cert_check.is_none_or(|at| at.elapsed() >= CERT_INTERVAL) {
