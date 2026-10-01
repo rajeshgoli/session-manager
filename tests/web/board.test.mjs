@@ -16,16 +16,24 @@ function load(path) {
 const board = load(`${root}/board.js`);
 await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await board.evaluate();
-const { groupTickets, clockSegments, BALL_TONE, canStart } = board.namespace;
+const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults } = modules.get(`${root}/board-start.js`).namespace;
-test('rows preserve every actionable ticket and fold only blocked/done', () => {
-  const states = ['needs_you', 'ready', 'in_progress', 'blocked', 'done'];
+test('rows preserve every actionable ticket and sort done by closure time', () => {
+  const states = ['needs_you', 'close_ready', 'ready', 'in_progress', 'blocked', 'done'];
   const rows = states.map((state, number) => ({ state, number }));
   const g = groupTickets(rows);
-  assert.deepEqual(g.active.map((t) => t.state), states.slice(0, 3));
-  assert.deepEqual(g.blocked, [rows[3]]);
-  assert.deepEqual(g.done, [rows[4]]);
-  assert.equal(groupTickets(rows.slice(2)).active.length, 1);
+  assert.deepEqual(g.active.map((t) => t.state), states.slice(0, 4));
+  assert.deepEqual(g.blocked, [rows[4]]);
+  assert.deepEqual(g.done, [rows[5]]);
+  assert.deepEqual(groupTickets([{state:'done',closed_at:'2026-09-01'}, {state:'done',closed_at:'2026-09-20'}]).done.map(t => t.closed_at), ['2026-09-20','2026-09-01']);
+});
+test('other tickets always expose needs-you rows and blockers omit closed dependencies', () => {
+  const tickets = Array.from({length:15}, (_,number) => ({state:'ready',number}));
+  tickets[14].state = 'needs_you';
+  assert.deepEqual(visibleOther(tickets).map(t => t.number), [14,0,1,2,3,4,5,6,7,8]);
+  const blocked = {waits_on:[{number:2,state:'done'},{number:3,state:'in_progress'}]};
+  assert.deepEqual(openBlockers(blocked).map(t => t.number), [3]);
+  assert.equal(blockedText(blocked), '#3');
 });
 test('clock clips at the chosen window and preserves gaps and quiet segments', () => {
   const end = '2026-09-30T03:00:00Z';
@@ -49,6 +57,7 @@ test('Start uses rendered name and brief and omits provider-default model/effort
   const form = { provider: 'claude', name: 'sm-42-engineer', brief: 'Work ticket #42: widgets', model: null, reasoning_effort: null, working_dir: '/work/widgets' };
   assert.deepEqual(startBody(ticket, form), { ...ticket, provider: 'claude', name: form.name, brief: form.brief });
   assert.equal(startBody(ticket, { ...form, model: 'opus', reasoning_effort: 'high' }).model, 'opus');
+  assert.equal(startBody({ ...ticket, state: 'blocked' }, form).start_blocked, true);
   const settings = { new_agent: { claude: { model: null, effort: null }, codex: { model: 'astra', effort: 'high' } } };
   const codex = providerDefaults(settings, 'codex-fork');
   assert.deepEqual(codex, { provider: 'codex-fork', model: 'astra', reasoning_effort: 'high' });

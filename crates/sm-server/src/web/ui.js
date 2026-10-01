@@ -270,12 +270,12 @@ export function Links({ ticket, prs = [], agent, jobs = [], thread, docs = [] })
   return html`<div class="links">
     ${ticket ? html`<button class="link-chip" onClick=${() => openPanel(ticketRef(ticket))}>#${ticket.number} ↗</button>` : null}
     ${prs.map(pr => html`<button class=${`link-chip ${pending(pr.review) ? pr.review.by === 'you' ? 'magenta' : 'amber' : ''}`}
-      onClick=${() => openPanel(ticketRef(pr))}>PR #${pr.number} · ${pr.state || 'open'}${reviewText(pr.review)}</button>`)}
+      onClick=${() => openPanel(ticketRef(pr))}>PR #${pr.number} · ${(pr.state || 'open').toLowerCase()}${reviewText(pr.review)}</button>`)}
     ${agent ? html`<span class="link-pair"><button class="link-chip" onClick=${() => openPanel(`agent:${agent.id}`)}>${agent.name} · ${providerLabel(agent.provider)} · ${agent.fact || agent.state || ''}</button><button class="link-chip" aria-label=${`Terminal for ${agent.name}`} onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨</button></span>` : null}
     ${visibleJobs.slice(0, 3).map(job => html`<button class=${`link-chip ${job.quiet_since ? 'red' : job.state === 'running' ? 'green' : 'amber'}`}
       onClick=${() => { navigate('/queue'); openPanel(`job:${job.id}`); }}>${job.label || job.id} · ${job.quiet_since ? 'quiet' : job.state === 'running' ? 'running' : 'waiting'} ${age(job.quiet_since || job.since || job.started_at || job.queued_at)}</button>`)}
     ${visibleJobs.length > 3 ? html`<span class="link-chip">+${visibleJobs.length - 3} jobs</span>` : null}
-    ${thread ? html`<button class=${`link-chip ${thread.needs_you ? 'magenta' : ''}`} onClick=${() => { location.href = `/inbox?open=thread:${encodeURIComponent(thread.key)}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`; }}>Inbox · ${thread.needs_you ? 'question' : thread.count}</button>` : null}
+    ${thread ? html`<button class=${`link-chip ${thread.needs_you ? 'magenta' : ''}`} onClick=${() => { location.href = `/inbox?open=thread:${encodeURIComponent(thread.key.replace(/^agent:/, ''))}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`; }}>Inbox · ${thread.needs_you ? 'question' : thread.count}</button>` : null}
     ${docs.map(doc => html`<button class="link-chip" onClick=${() => openPanel(`doc:${doc.reader_path}`)}>${doc.title}</button>`)}
   </div>`;
 }

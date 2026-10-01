@@ -11,6 +11,7 @@ pub(super) struct BoardLinks {
     jobs: BTreeMap<Key, Vec<Value>>,
     docs: BTreeMap<String, Vec<Value>>,
     threads: BTreeMap<String, Value>,
+    holders: BTreeMap<String, Value>,
 }
 
 impl BoardLinks {
@@ -143,18 +144,36 @@ impl BoardLinks {
 
         let messages = super::messages::owner_message_store(state);
         let sessions = claims::session_directory(state)?;
+        let holders = state
+            .session_store
+            .list_sessions(true)?
+            .into_iter()
+            .map(|record| {
+                let since = record
+                    .activity_turn_start_hook_at
+                    .as_deref()
+                    .unwrap_or(&record.last_activity);
+                (
+                    record.id,
+                    json!({ "provider": record.provider, "since": since }),
+                )
+            })
+            .collect();
         let replies = messages.all_replies()?;
         let replied: BTreeSet<String> = replies
             .iter()
             .map(|reply| reply.message_id.clone())
             .collect();
         let mut threads = BTreeMap::<String, Value>::new();
+        let mut newest_message = BTreeMap::<String, String>::new();
+        let mut newest_open = BTreeMap::<String, String>::new();
         let all_messages = messages.all()?;
         let sender_of: BTreeMap<String, String> = all_messages
             .iter()
             .map(|message| (message.id.clone(), message.sender_session_id.clone()))
             .collect();
         for message in all_messages {
+            newest_message.insert(message.sender_session_id.clone(), message.id.clone());
             let thread = threads.entry(message.sender_session_id.clone()).or_insert_with(|| json!({
                 "key": format!("agent:{}", message.sender_session_id), "needs_you": false, "count": 0,
             }));
@@ -169,6 +188,7 @@ impl BoardLinks {
             ) == crate::owner_messages::OwnerMessageState::NeedsYou
             {
                 thread["needs_you"] = json!(true);
+                newest_open.insert(message.sender_session_id.clone(), message.id.clone());
             }
         }
         for reply in replies {
@@ -185,6 +205,14 @@ impl BoardLinks {
                 })
             });
             thread["count"] = json!(thread["count"].as_u64().unwrap_or(0) + 1);
+        }
+        for (session, thread) in &mut threads {
+            if let Some(at) = newest_open
+                .get(session)
+                .or_else(|| newest_message.get(session))
+            {
+                thread["at"] = json!(at);
+            }
         }
 
         // PR review state comes from sm's durable requests, not GitHub review counts.
@@ -244,6 +272,7 @@ impl BoardLinks {
             jobs,
             docs,
             threads,
+            holders,
         })
     }
 
@@ -260,6 +289,10 @@ impl BoardLinks {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        if let Some(holder) = self.holders.get(&session) {
+            ticket["holder"]["provider"] = holder["provider"].clone();
+            ticket["holder"]["since"] = holder["since"].clone();
+        }
         ticket["thread"] = self.threads.get(&session).cloned().unwrap_or(Value::Null);
         ticket["docs"] = json!(self.docs.get(&session).cloned().unwrap_or_default());
     }
