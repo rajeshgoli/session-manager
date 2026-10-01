@@ -8,7 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use rand_core::RngCore;
 use regex::RegexBuilder;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
@@ -143,7 +143,7 @@ impl NotesStore {
     pub fn save(&self, id: &str, body: &str, title: Option<&str>, expected: i64) -> Result<Save> {
         check_body(body)?;
         let mut conn = self.open()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(old) = read_note(&tx, id)? else {
             return Ok(Save::Missing);
         };
@@ -152,7 +152,11 @@ impl NotesStore {
         }
         let now = now();
         let version = old.version + 1;
-        let title = note_title(body, title);
+        let title = match title {
+            Some(title) => note_title(body, Some(title)),
+            None if old.title == note_title(&old.body, None) => note_title(body, None),
+            None => old.title.clone(),
+        };
         tx.execute(
             "UPDATE notes SET title=?2,body=?3,version=?4,updated_at=?5 WHERE id=?1",
             params![id, title, body, version, now],
@@ -463,6 +467,49 @@ mod tests {
         assert!(store.delete(&note.id).unwrap());
         assert!(store.get(&note.id).unwrap().is_none());
         assert!(store.search("", false).unwrap().is_empty());
+
+        let custom = store.create("# Body title", Some("My title")).unwrap();
+        let saved = store.save(&custom.id, "# Changed body", None, 1).unwrap();
+        assert!(matches!(saved, Save::Saved(note) if note.title == "My title"));
+    }
+
+    #[test]
+    fn simultaneous_saves_return_one_version_conflict() {
+        use std::sync::{Arc, Barrier};
+        let store = fixture();
+        let note = store.create("original", None).unwrap();
+        let gate = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = ["device one", "device two"]
+            .into_iter()
+            .map(|body| {
+                let store = store.clone();
+                let id = note.id.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    store.save(&id, body, None, 1).unwrap()
+                })
+            })
+            .collect();
+        gate.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Save::Saved(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Save::Stale(note) if note.version == 2))
+                .count(),
+            1
+        );
     }
 
     #[test]
