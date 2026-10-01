@@ -308,7 +308,9 @@ function DashMeter({ label, short, total, queue, text, brief = text, lines = [],
 }
 
 function usageMeter(spec, meter) {
-  const [label, short] = spec.scope ? [`${spec.scope} week`, spec.scope.slice(0, 2)] : WINDOW_LABEL[spec.window];
+  const [windowLabel, windowShort] = WINDOW_LABEL[spec.window];
+  const [label, short] = spec.scope
+    ? [`${spec.scope} ${spec.window === 'five_hour' ? '5-hour' : 'week'}`, spec.scope.slice(0, 2)] : [windowLabel, windowShort];
   spec = { ...spec, label: spec.account ? `${label} · ${spec.account}` : label, short };
   if (!meter) return { ...spec, total: 0, text: '–', lines: [[spec.idle]] };
   const pct = Math.round(meter.percent);
