@@ -8419,6 +8419,9 @@ impl SessionStore {
             .clone()
             .or_else(|| generated_name.clone())
             .unwrap_or_else(|| format!("{provider}-{session_id}"));
+        let friendly_name = explicit_name.or(generated_name);
+        let friendly_name_updated_at_ns =
+            friendly_name.as_ref().map(|_| now_unix_timestamp_nanos());
         let node = request
             .node
             .as_deref()
@@ -8454,9 +8457,9 @@ impl SessionStore {
             forked_provider_resume_id: None,
             forked_at: None,
             forked_by_session_id: None,
-            friendly_name: explicit_name.or(generated_name),
+            friendly_name,
             friendly_name_is_explicit: true,
-            friendly_name_updated_at_ns: None,
+            friendly_name_updated_at_ns,
             native_title: None,
             native_title_updated_at_ns: None,
             native_title_source_mtime_ns: None,
@@ -13279,12 +13282,16 @@ fn session_reserves_name(session: &Value, now: OffsetDateTime) -> bool {
     if !raw_session_is_stopped(object) {
         return true;
     }
-    let stopped_at =
-        json_text(object.get("stopped_at")).or_else(|| json_text(object.get("completed_at")));
-    stopped_at
-        .as_deref()
-        .and_then(parse_timestamp)
-        .is_none_or(|stopped_at| now - stopped_at < TimeDuration::days(7))
+    let mut terminal_at = None;
+    for field in ["stopped_at", "completed_at"] {
+        if let Some(value) = json_text(object.get(field)) {
+            let Some(at) = parse_timestamp(&value) else {
+                return true;
+            };
+            terminal_at = Some(terminal_at.map_or(at, |latest: OffsetDateTime| latest.max(at)));
+        }
+    }
+    terminal_at.is_none_or(|at| now - at < TimeDuration::days(7))
 }
 
 fn sessions_with_registered_aliases(state: &Value) -> Vec<Value> {
@@ -13384,6 +13391,10 @@ fn apply_restored_name(session: &mut Map<String, Value>, new_name: Option<String
         session.insert("name".to_owned(), Value::String(name.clone()));
         session.insert("friendly_name".to_owned(), Value::String(name));
         session.insert("friendly_name_is_explicit".to_owned(), Value::Bool(true));
+        session.insert(
+            "friendly_name_updated_at_ns".to_owned(),
+            json!(now_unix_timestamp_nanos()),
+        );
         session.insert("native_title".to_owned(), Value::Null);
     }
 }
@@ -16127,16 +16138,16 @@ impl SessionRecord {
             .or(self.native_title_source_mtime_ns)
             .unwrap_or(0);
 
+        if self.friendly_name_is_explicit {
+            if let Some(friendly_name) = friendly_name {
+                return Some(friendly_name.to_owned());
+            }
+        }
         if let (Some(friendly_name), Some(native_title)) = (friendly_name, native_title) {
             if friendly_name_updated_at_ns >= native_title_updated_at_ns {
                 return Some(friendly_name.to_owned());
             }
             return Some(native_title.to_owned());
-        }
-        if self.friendly_name_is_explicit {
-            if let Some(friendly_name) = friendly_name {
-                return Some(friendly_name.to_owned());
-            }
         }
         if let Some(native_title) = native_title {
             return Some(native_title.to_owned());
@@ -16935,6 +16946,14 @@ mod tests {
                 .unwrap();
             assert!(list.split_whitespace().any(|name| name == record.name));
             assert_eq!(record.friendly_name.as_deref(), Some(record.name.as_str()));
+            let mut with_later_title = record.clone();
+            with_later_title.native_title = Some("provider title".to_owned());
+            with_later_title.native_title_updated_at_ns =
+                record.friendly_name_updated_at_ns.map(|at| at + 1);
+            assert_eq!(
+                with_later_title.cached_display_name().as_deref(),
+                Some(record.name.as_str())
+            );
         }
         let explicit = store
             .build_core_session_record(
@@ -16960,6 +16979,12 @@ mod tests {
         };
         assert!(!name_is_reserved(&[stopped("Vega", 8)], "vega", None, now));
         assert!(name_is_reserved(&[stopped("Vega", 6)], "vega", None, now));
+        let recently_retired = json!({
+            "id": "retired-vega", "name": "vega", "status": "stopped",
+            "stopped_at": (now - TimeDuration::days(8)).format(&Rfc3339).unwrap(),
+            "completed_at": (now - TimeDuration::days(1)).format(&Rfc3339).unwrap()
+        });
+        assert!(name_is_reserved(&[recently_retired], "vega", None, now));
         let used = STAR_NAMES
             .split_whitespace()
             .map(|name| json!({"id": format!("used-{name}"), "friendly_name": name, "status": "running"}))
@@ -17024,6 +17049,14 @@ mod tests {
         };
         assert_eq!(restored.name, "vega-2");
         assert_eq!(restored.friendly_name.as_deref(), Some("vega-2"));
+        let mut with_later_title = (*restored).clone();
+        with_later_title.native_title = Some("vega".to_owned());
+        with_later_title.native_title_updated_at_ns =
+            restored.friendly_name_updated_at_ns.map(|at| at + 1);
+        assert_eq!(
+            with_later_title.cached_display_name().as_deref(),
+            Some("vega-2")
+        );
         assert_eq!(store.get_session(&old.id).unwrap().unwrap().name, "vega-2");
         assert_eq!(
             store.get_session("live-agent").unwrap().unwrap().name,
