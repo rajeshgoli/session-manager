@@ -138,7 +138,9 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
           assert.equal(await page.locator('.sw-row.cur .sw-nm').innerText(), 'iter8-run');
           assert.equal(await page.locator('.sw-row.cur .sw-fact').innerText(), '▶ 2 running · 2h 56m');
           assert.match(await page.locator('.sw-row').first().locator('.sw-fact').innerText(), /^◆ 7m: one manual Chrome check/);
-          assert.equal(await page.locator('.sw-row .ok').count(), 1, 'only the dismissible question has ✓');
+          // ✓ on the open question and on the finished agent (Mark read); none elsewhere.
+          assert.deepEqual(await page.locator('.sw-row .ok').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label'))),
+            ['Mark sm-1726-engineer answered', 'Mark far-1855 read']);
           const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
           assert.ok(pageWidth <= viewport.width, `no horizontal scroll at ${viewport.width} px (got ${pageWidth})`);
           if (shots) await page.screenshot({ path: `${shots}/terminal-${viewport.width}-${colorScheme}-${size}.png` });
@@ -181,7 +183,7 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher-idle')), 'true');
     // ✓ clears the question without switching.
     await page.getByRole('button', { name: 'Mark sm-1726-engineer answered', exact: true }).click();
-    await page.waitForFunction(() => document.querySelectorAll('.sw-row .ok').length === 0);
+    await page.waitForFunction(() => document.querySelectorAll('.sw-row .ok').length === 1);
     assert.deepEqual(state.answered, ['sm-1726-engineer']);
     assert.equal(new URL(page.url()).pathname, '/terminal/iter8-run');
     // ⌘\ hides the switcher and remembers it.

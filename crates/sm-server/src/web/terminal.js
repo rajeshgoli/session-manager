@@ -16,10 +16,10 @@ const session = () => { try { return window.sessionStorage; } catch (e) { return
 
 // ---- switcher (1782 G1) ---------------------------------------------------------
 
-/** The row's second line: the you or finished text, else jobs when there are any, else the agent fact. */
+/** The row's second line: the you or finished text (with its ✓), else jobs when there are any, else the agent fact. */
 export function switcherFact(agent, now = Date.now()) {
   const you = youFact(agent, now);
-  if (you) return { text: you.text, tone: you.tone };
+  if (you) return you;
   const jobs = agent.facts && agent.facts.jobs;
   return jobs && jobs.tone ? jobsFact(agent) : agentFact(agent, now);
 }
@@ -68,13 +68,13 @@ function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
         : html`<div class=${`sw-sec ${SECTION_TONE[section]}`}>${SECTION_LABEL[section]}</div>`}
       ${agents.map((agent) => {
         const fact = switcherFact(agent);
-        const you = agent.facts && agent.facts.you;
+        const label = fact.tone === 'cyan' ? 'read' : 'answered';
         return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
             class=${`sw-row${agent.id === currentId ? ' cur' : ''}`} onClick=${() => pick(agent)}>
           <i class=${`sw-dot ${SECTION_TONE[section]}`}></i>
           <span class="sw-nm" title=${agent.name}>${agent.name}</span>
-          ${you && you.dismissible
-            ? html`<button type="button" class="icon-btn ok magenta" title="Mark answered" aria-label=${`Mark ${agent.name} answered`}
+          ${fact.dismissible
+            ? html`<button type="button" class=${`icon-btn ok ${fact.tone}`} title=${`Mark ${label}`} aria-label=${`Mark ${agent.name} ${label}`}
                 onClick=${(event) => { event.stopPropagation(); markAnswered(agent, reload); }}>✓</button>`
             : html`<span></span>`}
           <span class=${`sw-fact ${fact.tone}`} title=${fact.text}>${fact.text}</span>
