@@ -67,7 +67,7 @@ fun cachedInboxState(filter: InboxFilter): InboxUiState {
 /** Open rows in their groups, in order; other filters are one untitled group. */
 fun inboxSections(filter: InboxFilter, rows: List<InboxRow>): List<Pair<String?, List<InboxRow>>> {
     if (filter != InboxFilter.Open) return if (rows.isEmpty()) emptyList() else listOf(null to rows)
-    return listOf("needs_you" to "NEEDS YOU", "finished" to "FINISHED", "new" to "NEW", "earlier" to "EARLIER")
+    return listOf("needs_you" to "NEEDS YOU", "finished" to "FINISHED", "new" to "NEW", "earlier" to "EARLIER", "folded" to "FOLDED")
         .mapNotNull { (group, label) ->
             rows.filter { it.group == group }.takeIf { it.isNotEmpty() }?.let { "$label · ${it.size}" to it }
         }
@@ -177,6 +177,15 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(rows = before) }
                     onResult(error.message ?: "Done failed")
                 }
+        }
+    }
+
+    fun archive(row: InboxRow, onResult: (String?) -> Unit) {
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            repository.archiveInbox(url, token, row.threadKey, row.foldedBy == "archived")
+                .onSuccess { onResult(null); loadJob?.cancel(); loadJob = null; refresh() }
+                .onFailure { onResult(it.message ?: "Archive failed") }
         }
     }
 }

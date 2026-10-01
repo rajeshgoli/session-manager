@@ -3,6 +3,7 @@ package li.rajeshgo.sm.ui.inbox
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.InboxRow
 import li.rajeshgo.sm.data.model.InboxThread
+import li.rajeshgo.sm.data.model.DocAskTarget
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -36,6 +37,19 @@ class ThreadModelsTest {
         assertEquals("Keep it?", thread.items[1].quotes.single().quote)
         assertEquals("/docs/session-manager/memo.html", thread.items[3].link)
         assertEquals("sm-1801", thread.replyTo?.name)
+    }
+
+    @Test fun askTargetAndWorkThreadReplyOptionsParse() {
+        val ask = json.decodeFromString(DocAskTarget.serializer(),
+            """{"author":{"id":"s1","name":"sm-1821","state":"ended","live":false,"restorable":true,"context_tokens":380000},"default":"reader","reader":null,"thread_key":"ticket:o/r#1821"}""")
+        assertEquals("ticket:o/r#1821", ask.threadKey)
+        assertEquals(380000L, ask.author?.contextTokens)
+        val work = json.decodeFromString(InboxThread.serializer(),
+            """{"thread_key":"ticket:o/r#1821","can_send":true,"reply_to":{"id":"s2","name":"sm-1821-2","restores":true,"retired_at":"2026-09-30T10:00:00Z"},"reply_options":[{"id":"s1","name":"sm-1821","status":"ended","can_send":false},{"id":"s2","name":"sm-1821-2","status":"ended","can_send":true,"recipient_id":"s2","recipient_name":"sm-1821-2","restores":true}],"items":[{"kind":"event","type":"doc_revision","doc_id":"abc","pr":1827,"sha":"1234567890abcdef","review_state":"requested","at":"2026-09-30T10:00:00Z","text":"Published: Memo","link":"/docs/session-manager/memo.html?version=1234567890ab"}]}""")
+        assertEquals(true, work.replyTo?.restores)
+        assertEquals("s2", work.replyOptions.last().recipientId)
+        assertEquals("abc", work.items.single().docId)
+        assertEquals("requested", work.items.single().reviewState)
     }
 
     @Test fun answeredClearsTheAgentsThatAsked() {

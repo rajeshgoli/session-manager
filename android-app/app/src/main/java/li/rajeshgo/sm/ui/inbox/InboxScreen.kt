@@ -91,18 +91,20 @@ fun inboxReaderPage(row: InboxRow): ReaderPage = ReaderPage(
 
 /** Doc rows open the doc; ticket, PR and agent threads open natively (spec 1782 J3). */
 fun inboxThreadTarget(row: InboxRow): ThreadTarget? =
-    if (row.kind == "doc") null else ThreadTarget(row.threadKey.ifBlank { null }, row.sessionId, row.title)
+    if (row.kind == "doc") null else ThreadTarget(row.threadKey.ifBlank { null }, row.sessionId, row.title, foldedBy = row.foldedBy)
 
 /** The row's third line: repo, then what kind of thread it is. */
 fun inboxRowDetail(row: InboxRow): String {
     val parts = mutableListOf<String>()
-    if (row.repo.isNotBlank()) parts += row.repo
+    if (row.agents.isNotEmpty()) parts += row.agents.joinToString(" · ")
+    if (row.docCount > 0) parts += "${row.docCount} ${if (row.docCount == 1) "doc" else "docs"}, ${row.revisionCount} ${if (row.revisionCount == 1) "revision" else "revisions"}"
+    if (parts.isEmpty() && row.repo.isNotBlank()) parts += row.repo
     if (row.kind == "doc") {
         row.prNumber?.let { parts += "PR #$it" }
         row.author?.takeIf { it.isNotBlank() }?.let { parts += it }
     } else {
         if (row.messageCount > 0) parts += if (row.messageCount == 1) "1 message" else "${row.messageCount} messages"
-        parts += when {
+        if (row.agents.isEmpty() && row.docCount == 0) parts += when {
             row.group == "needs_you" -> "asks you"
             row.status == "ended" -> "agent ended"
             row.preview.startsWith("You: ") -> "you replied"
@@ -126,6 +128,7 @@ fun InboxScreen(
     val context = LocalContext.current
     var openRow by remember { mutableStateOf<InboxRow?>(null) }
     var openThread by remember { mutableStateOf<ThreadTarget?>(null) }
+    var foldedOpen by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
     val reading = openRow != null || openThread != null
     var now by remember { mutableStateOf(OffsetDateTime.now()) }
 
@@ -244,7 +247,7 @@ fun InboxScreen(
                     if (heading != null) {
                         item(key = "h-$heading") {
                             Text(
-                                heading,
+                                if (heading.startsWith("FOLDED")) "${if (foldedOpen) "▾" else "▸"} Folded · ${rows.size} threads (${rows.take(3).joinToString(", ") { it.title }})" else heading,
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = when {
@@ -252,21 +255,21 @@ fun InboxScreen(
                                     heading.startsWith("NEW") -> Fuchsia
                                     else -> TextMuted
                                 },
-                                modifier = Modifier.padding(top = 10.dp, start = 2.dp),
+                                modifier = Modifier.padding(top = 10.dp, start = 2.dp).let { if (heading.startsWith("FOLDED")) it.clickable { foldedOpen = !foldedOpen } else it },
                             )
                         }
                     }
-                    items(rows, key = { it.threadKey }) { row ->
+                    items(if (heading?.startsWith("FOLDED") == true && !foldedOpen) emptyList() else rows, key = { it.threadKey }) { row ->
                         val open = { inboxThreadTarget(row)?.let { openThread = it } ?: run { openRow = row } }
-                        if (row.done) {
-                            InboxRowCard(row, now, onClick = open)
-                        } else {
-                            key(row.threadKey) {
+                        Column {
+                            if (row.done || row.group == "folded") InboxRowCard(row, now, onClick = open)
+                            else key(row.threadKey) {
                                 SwipeToDone(onDone = {
-                                    viewModel.markDone(row) { error ->
-                                        if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show()
-                                    }
+                                    viewModel.markDone(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() }
                                 }) { InboxRowCard(row, now, onClick = open) }
+                            }
+                            TextButton(onClick = { viewModel.archive(row) { error -> if (error != null) Toast.makeText(context, error, Toast.LENGTH_SHORT).show() } }) {
+                                Text(if (row.foldedBy == "archived") "Unarchive" else "Archive")
                             }
                         }
                     }
