@@ -1,87 +1,127 @@
-// Agents page and agent panel (spec 1710 D6.1, D6.2). Data: GET /watch/state.
-import { useEffect, useMemo, useState } from 'preact/hooks';
+// Agents page and agent panel (spec 1710 D6.1, D6.2; 1782 F). Data: GET /watch/state.
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
-  html, api, usePoll, useNow, useShared, config, age, duration, limitText, clock, ordinal,
+  html, api, usePoll, useNow, config, age, limitText, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
-  openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store,
+  openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
 
-// ---- who has the ball --------------------------------------------------------
+// ---- facts and attention (1782 B: the server computes both) ------------------
 
-/** Card order within a repo (D6.1). */
-export const BALL_ORDER = ['you', 'stalled', 'working', 'job_running', 'queue', 'review', 'idle', 'stopped'];
-export const BALL_TONE = {
-  you: 'magenta', stalled: 'red', working: 'green', job_running: 'green',
-  queue: 'amber', review: 'amber', idle: 'muted', stopped: 'muted',
+/** Attention sections, in display order. */
+export const SECTIONS = ['you', 'finished', 'waiting_long', 'moving', 'waiting', 'idle', 'stopped'];
+export const SECTION_LABEL = {
+  you: 'Needs you', finished: 'Finished', waiting_long: 'Waiting long', moving: 'Moving',
+  waiting: 'Waiting', idle: 'Idle', stopped: 'Stopped',
+};
+/** The summary strip's words for each count. */
+const COUNT_LABEL = {
+  you: 'needs you', finished: 'finished', waiting_long: 'waiting long', moving: 'moving', waiting: 'waiting', idle: 'idle',
+};
+/** Section colours (1782 A3). */
+export const SECTION_TONE = {
+  you: 'magenta', finished: 'cyan', waiting_long: 'amber', moving: 'green', waiting: 'amber', idle: 'muted', stopped: 'muted',
 };
 
-const capital = (text) => (text ? text[0].toUpperCase() + text.slice(1) : '');
-const earliest = (values) => values.filter(Boolean).sort()[0];
+const sectionOf = (agent) => (agent.attention && agent.attention.section) || 'idle';
+const sectionIndex = (agent) => {
+  const index = SECTIONS.indexOf(sectionOf(agent));
+  return index < 0 ? SECTIONS.indexOf('idle') : index;
+};
+const hasTicket = (agent) => (agent.claims || []).some((claim) => claim.kind === 'ticket');
 
-/**
- * The agent's ball and its line, by D7's text rules computed from the
- * agent's own jobs and waits. `ctx` carries the inbox's needs-you rows by
- * session, queue positions by job, and the stall threshold.
- */
-export function agentBall(agent, ctx, now = Date.now()) {
-  if (agent.state === 'stopped') return { ball: 'stopped', text: `Stopped ${age(agent.last_activity, now)}`.trim() };
-  const waits = agent.waiting_on || [];
-  const ask = ctx.needsYou && ctx.needsYou.get(agent.id);
-  if (ask) return { ball: 'you', text: `Waiting on you ${age(ask.newest_at, now)}: ${ask.preview || ask.title}` };
-  // Blocked on an Allow prompt in its terminal (sm#1743).
-  if (agent.state === 'waiting_permission') return { ball: 'you', text: 'Waiting on you: approval prompt in its terminal' };
-  const docReview = waits.find((w) => w.kind === 'owner_review');
-  if (docReview) {
-    return { ball: 'you', text: `Waiting on you ${age(docReview.since, now)}: ${(docReview.label || '').replace(/^Owner review · /, '')}` };
-  }
-  if (agent.state === 'working') return { ball: 'working', text: `Agent working ${age(agent.activity_since, now)}`.trim() };
-  const jobs = agent.jobs || [];
-  const running = jobs.filter((job) => job.state === 'running');
-  const waiting = jobs.filter((job) => job.state === 'pending');
-  const oldestWait = age(earliest(waiting.map((job) => job.queued_at)), now);
-  if (running.length) {
-    if (running.length === 1 && !waiting.length) {
-      const job = running[0];
-      const limit = limitText(job.timeout_seconds);
-      return { ball: 'job_running', text: `${capital(job.type || 'Job')} running ${age(job.started_at, now)}${limit ? ` of ${limit}` : ''}` };
-    }
-    if (!waiting.length) return { ball: 'job_running', text: `${running.length} jobs running ${age(earliest(running.map((j) => j.started_at)), now)}` };
-    return { ball: 'job_running', text: `${running.length} running · ${waiting.length} waiting ${oldestWait}` };
-  }
-  if (waiting.length) {
-    const positions = ctx.positions || new Map();
-    if (waiting.length === 1) {
-      const position = positions.get(waiting[0].id);
-      return { ball: 'queue', text: `Job waiting ${oldestWait}${position ? ` · ${ordinal(position.position)} in line` : ''}` };
-    }
-    const reasons = new Set(waiting.map((job) => (positions.get(job.id) || {}).holding_reason));
-    const forSlot = reasons.size === 1 && reasons.has('concurrency_cap');
-    return { ball: 'queue', text: `${waiting.length} jobs waiting ${oldestWait}${forSlot ? ' for a slot' : ''}` };
-  }
-  const review = waits.find((w) => w.kind === 'review');
-  if (review) return { ball: 'review', text: `Codex review on PR #${review.pr_number}, ${age(review.since, now)}` };
-  const since = agent.activity_since || agent.last_activity;
-  const idleSeconds = (now - Date.parse(since)) / 1000;
-  const hasTicket = (agent.claims || []).some((claim) => claim.kind === 'ticket');
-  if (hasTicket && idleSeconds >= (ctx.stallMinutes || 15) * 60) {
-    return { ball: 'stalled', text: `Stalled ${duration(idleSeconds)}: agent idle, nothing running` };
-  }
-  return { ball: 'idle', text: `Idle ${age(since, now)}`.trim() };
+/** Section, then the server's order key, then name (1782 B). */
+export function attentionOrder(a, b) {
+  const keyA = (a.attention && a.attention.order_key) || '';
+  const keyB = (b.attention && b.attention.order_key) || '';
+  return sectionIndex(a) - sectionIndex(b) || (keyA < keyB ? -1 : keyA > keyB ? 1 : 0) || a.name.localeCompare(b.name);
 }
 
-/** Context the ball rules read, from the shell's shared queue and inbox data. */
-export function useBallContext() {
-  const queue = useShared('queue');
-  const inbox = useShared('inbox');
-  return useMemo(() => {
-    const positions = new Map();
-    for (const job of (queue && queue.queued) || []) positions.set(job.id, job);
-    const needsYou = new Map();
-    for (const row of (inbox && inbox.rows) || []) {
-      if (row.group === 'needs_you' && row.session_id && !row.done) needsYou.set(row.session_id, row);
-    }
-    return { positions, needsYou, stallMinutes: config.stall_minutes || 15 };
-  }, [queue, inbox]);
+/** The card's left edge: its section colour, red for quiet or stalled, the line colour when idle. */
+export function edgeTone(agent) {
+  const section = sectionOf(agent);
+  const reason = agent.attention && agent.attention.reason;
+  if (section === 'waiting_long' && (reason === 'quiet' || reason === 'stalled')) return 'red';
+  if (section === 'idle' || section === 'stopped') return 'line';
+  return SECTION_TONE[section];
+}
+
+/** Non-empty sections in order, each sorted by attention. */
+export function sectionAgents(sessions) {
+  const sorted = [...sessions].sort(attentionOrder);
+  return SECTIONS
+    .map((section) => ({ section, agents: sorted.filter((agent) => sectionOf(agent) === section) }))
+    .filter((group) => group.agents.length);
+}
+
+/**
+ * Idle agents without a ticket beyond the fourth fold away (1782 F); nothing
+ * else folds, and the open agent (`keepId`) stays out of the fold.
+ */
+export function foldIdle(agents, keepId = null, keep = 4) {
+  const shown = [];
+  const folded = [];
+  let loose = 0;
+  for (const agent of agents) {
+    if (hasTicket(agent) || agent.id === keepId || loose++ < keep) shown.push(agent);
+    else folded.push(agent);
+  }
+  return { shown, folded };
+}
+
+/** "+ 3 more idle: sm-1768 (11m), …" */
+export function foldText(folded, now = Date.now()) {
+  const names = folded.map((agent) => `${agent.name} (${age(agent.facts && agent.facts.agent && agent.facts.agent.since, now) || '–'})`);
+  return `+ ${folded.length} more idle: ${names.join(', ')}`;
+}
+
+/** The summary strip: zero counts drop out, except needs you. */
+export function summaryCounts(counts) {
+  const c = counts || {};
+  return Object.keys(COUNT_LABEL)
+    .map((section) => ({ section, n: c[section === 'you' ? 'needs_you' : section] || 0, label: COUNT_LABEL[section] }))
+    .filter(({ section, n }) => n > 0 || section === 'you');
+}
+
+/** "● Working 3m" or "○ Idle 7m". */
+export function agentFact(agent, now = Date.now()) {
+  const fact = (agent.facts && agent.facts.agent) || { state: agent.state === 'stopped' ? 'stopped' : 'idle' };
+  const since = age(fact.since, now);
+  if (fact.state === 'working') return { text: `● Working ${since}`.trim(), tone: 'green' };
+  return { text: `○ ${fact.state === 'stopped' ? 'Stopped' : 'Idle'} ${since}`.trim(), tone: 'muted' };
+}
+
+/** "▶ 2 running · 2h 56m", "⏸ Waiting 8m · 1st in line", or "No jobs". */
+export function jobsFact(agent) {
+  const jobs = agent.facts && agent.facts.jobs;
+  if (!jobs || !jobs.tone) return { text: (jobs && jobs.text) || 'No jobs', tone: 'muted' };
+  return { text: `${jobs.running > 0 ? '▶' : '⏸'} ${jobs.text}`, tone: jobs.tone };
+}
+
+/** The You line: an open question, else the finished summary, else nothing. */
+export function youFact(agent, now = Date.now()) {
+  const facts = agent.facts || {};
+  if (facts.you) {
+    const more = facts.you.more ? ` +${facts.you.more}` : '';
+    return {
+      text: `◆ ${age(facts.you.since, now) || 'now'}: ${facts.you.text}${more}`,
+      tone: 'magenta',
+      dismissible: !!facts.you.dismissible,
+    };
+  }
+  if (facts.finished) return { text: `✔ ${facts.finished.text || 'Finishing…'}`, tone: 'cyan', dismissible: false };
+  return null;
+}
+
+/** Clear "needs you" after answering where sm cannot see (1782 C4). */
+export async function markAnswered(agent, after) {
+  try {
+    await api(`/sessions/${encodeURIComponent(agent.id)}/needs-you/answered`, { method: 'POST', body: {} });
+    toast('Marked answered');
+    if (after) after();
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 /** "#1854" and "+1" for more claims (D6.1). */
@@ -108,10 +148,28 @@ export function openInClaude(agent) {
     `popup,left=${left},top=${s.availTop || 0},width=${s.availWidth / 2},height=${s.availHeight}`);
 }
 
-/** The card icon's action (D6.1): Open in Claude when linked, else Terminal. */
-function mainAction(agent) {
-  if (claudeLink(agent)) openInClaude(agent);
-  else navigate(`/terminal/${encodeURIComponent(agent.id)}`);
+const openTerminal = (agent) => navigate(`/terminal/${encodeURIComponent(agent.id)}`);
+
+// A long finished summary stays readable on hover without a huge tooltip.
+const hoverText = (text) => (text.length > 1000 ? `${text.slice(0, 1000)}…` : text);
+
+/** The Agent, Jobs and You facts (1782 F), shared by the card and the details band. */
+function Facts({ agent, now, onAnswered }) {
+  const working = agentFact(agent, now);
+  const jobs = jobsFact(agent);
+  const you = youFact(agent, now);
+  return html`<span class="facts">
+      <span class=${`fa ${working.tone}`} title=${working.text}>${working.text}</span>
+      <span class=${`fa ${jobs.tone}`} title=${jobs.text}>${jobs.text}</span>
+    </span>
+    ${you
+      ? html`<span class=${`you ${you.tone}`}>
+          <span class="fa" title=${hoverText(you.text)}>${you.text}</span>
+          ${you.dismissible
+            ? html`<button type="button" class="icon-btn ok" title="Mark answered (x)" aria-label="Mark answered"
+                onClick=${(event) => { event.stopPropagation(); markAnswered(agent, onAnswered); }}>✓</button>`
+            : null}</span>`
+      : null}`;
 }
 
 // ---- page -------------------------------------------------------------------
@@ -120,73 +178,142 @@ const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 
 export function AgentsPage({ openRef }) {
   const [filter, setFilter] = useState(() => stored('sm-agents-filter', 'live'));
-  const [doc, error] = usePoll(
+  const [view, setView] = useState(() => (stored('sm-agents-view', 'attention') === 'repo' ? 'repo' : 'attention'));
+  const [unfold, setUnfold] = useState(false);
+  const [cursor, setCursor] = useState(null);
+  const [jump, setJump] = useState(null);
+  const [doc, error, reload] = usePoll(
     () => api(`/watch/state${filter === 'stopped' ? '?stopped=1' : ''}`),
     // Stopped agents make the state large and slow, so that view polls less.
     filter === 'stopped' ? 30000 : refreshMs(),
     [filter],
   );
-  const ctx = useBallContext();
   const now = useNow(15000);
   const selected = openRef && openRef.startsWith('agent:') ? openRef.slice(6) : null;
+  const keys = useRef({ order: [], cursor: null });
   const choose = (value) => {
     setFilter(value);
     store('sm-agents-filter', value);
   };
+  const chooseView = (value) => {
+    setView(value);
+    store('sm-agents-view', value);
+  };
+  useEffect(() => { if (selected) setCursor(selected); }, [selected]);
+  useAgentKeys(keys, setCursor, reload);
+  useEffect(() => {
+    if (!jump || view !== 'attention') return;
+    const target = document.getElementById(`sec-${jump}`);
+    if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    setJump(null);
+  }, [jump, view]);
+  useEffect(() => {
+    const node = cursor && document.querySelector('.card.kb');
+    if (node) node.scrollIntoView({ block: 'nearest' });
+  }, [cursor]);
 
   if (!doc) {
     return html`<div class="content">${error ? html`<p class="err">${error.message}</p>` : html`<p class="muted">Loading…</p>`}</div>`;
   }
   const sessions = doc.sessions || [];
-  const balls = new Map(sessions.map((agent) => [agent.id, agentBall(agent, ctx, now)]));
-  const groups = groupAgents(sessions, balls);
-  const counts = {};
-  for (const { ball } of balls.values()) counts[ball] = (counts[ball] || 0) + 1;
-  const n = (ball) => counts[ball] || 0;
+  const order = [];
+  const card = (agent, depth = 0) => {
+    order.push(agent);
+    return html`<${AgentCard} key=${agent.id} agent=${agent} depth=${depth} now=${now} showRepo=${view === 'attention'}
+      selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} />`;
+  };
+  const sections = view === 'attention' ? sectionAgents(sessions) : [];
+  const groups = view === 'repo' ? groupAgents(sessions) : [];
+  const body = view === 'attention'
+    ? sections.map(({ section, agents }) => {
+      let shown = agents;
+      let folded = [];
+      if (section === 'idle' && !unfold) ({ shown, folded } = foldIdle(agents, selected));
+      return html`<div class=${`grp sec ${SECTION_TONE[section]}`} id=${`sec-${section}`}>
+          ${SECTION_LABEL[section]}${['idle', 'stopped'].includes(section) ? ` · ${agents.length}` : ''}</div>
+        <div class="cards">
+          ${shown.map((agent) => card(agent))}
+          ${folded.length
+            ? html`<button type="button" class="fold-more" onClick=${() => setUnfold(true)}>${foldText(folded, now)}</button>`
+            : null}
+        </div>`;
+    })
+    : groups.map((group) => html`<div class="grp">${basename(group.repo)}</div>
+        <div class="cards">${group.agents.map(({ agent, depth }) => card(agent, depth))}</div>`);
+  keys.current = { order, cursor };
 
   return html`<div class="content">
     <div class="toolbar">
       <div class="sum">
-        <span><b>${n('working')}</b> working</span>
-        <span><b>${n('job_running')}</b> running jobs</span>
-        <span><b>${n('queue')}</b> waiting on the queue</span>
-        <span><b>${n('review')}</b> waiting on review</span>
-        <span class=${n('you') ? 'magenta' : ''}><b>${n('you')}</b> need you</span>
-        ${n('stalled') ? html`<span class="red"><b>${n('stalled')}</b> stalled</span>` : null}
-        <span><b>${n('idle')}</b> idle</span>
+        ${summaryCounts(doc.counts).map(({ section, n, label }, index) => html`${index ? html`<span class="dot">·</span>` : null}
+          <button type="button" class=${`plain-btn ${n ? SECTION_TONE[section] : ''}`}
+            onClick=${() => { chooseView('attention'); setJump(section); }}><b>${n}</b> ${label}</button>`)}
       </div>
       <span style="flex:1"></span>
+      <${Seg} label="Order" value=${view} onChange=${chooseView}
+        options=${[{ value: 'attention', label: 'By attention' }, { value: 'repo', label: 'By repo' }]} />
       <${Seg} label="Show" value=${filter} onChange=${choose}
         options=${[{ value: 'live', label: 'Live' }, { value: 'stopped', label: 'With stopped' }]} />
     </div>
     ${!sessions.some((agent) => agent.state !== 'stopped')
       ? html`<p class="empty">No live agents. Start one with New agent.</p>`
       : null}
-    ${groups.map(
-      (group) => html`<div class="grp">${basename(group.repo)}</div>
-        <div class="cards">
-          ${group.agents.map(({ agent, depth }) => html`<${AgentCard}
-            key=${agent.id} agent=${agent} ball=${balls.get(agent.id)} depth=${depth} selected=${agent.id === selected} />`)}
-        </div>`,
-    )}
+    ${body}
   </div>`;
 }
 
 /**
- * Repos with any agent not idle or stopped first, then by name; within a
- * repo, top-level agents by ball, then most recent activity; children follow
- * their parent one step in (D6.1).
+ * The page's keys, when not typing (1782 F): j and k move the selection ring,
+ * Enter opens the details band, t the terminal, c Claude, x presses ✓.
  */
-export function groupAgents(sessions, balls) {
+function useAgentKeys(keys, setCursor, reload) {
+  useEffect(() => {
+    let lastG = 0;
+    const down = (event) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || typingIn(event)) return;
+      // "g a" and friends belong to the shell's page jumps.
+      if (event.key === 'g') { lastG = Date.now(); return; }
+      if (lastG && Date.now() - lastG < 1500) { lastG = 0; return; }
+      const { order, cursor } = keys.current;
+      const index = order.findIndex((agent) => agent.id === cursor);
+      const agent = index >= 0 ? order[index] : null;
+      if (event.key === 'j' || event.key === 'k') {
+        if (!order.length) return;
+        event.preventDefault();
+        const next = index < 0 ? 0 : Math.min(order.length - 1, Math.max(0, index + (event.key === 'j' ? 1 : -1)));
+        setCursor(order[next].id);
+        return;
+      }
+      if (!agent) return;
+      if (event.key === 'Enter') {
+        // A focused button or card handles its own Enter.
+        const target = event.composedPath?.()[0] || event.target;
+        if (target?.closest?.('button,a,[role=button]')) return;
+        event.preventDefault();
+        openPanel(`agent:${agent.id}`);
+      } else if (event.key === 't' && agent.state !== 'stopped') {
+        event.preventDefault();
+        openTerminal(agent);
+      } else if (event.key === 'c' && claudeLink(agent)) {
+        event.preventDefault();
+        openInClaude(agent);
+      } else if (event.key === 'x' && agent.facts && agent.facts.you && agent.facts.you.dismissible) {
+        event.preventDefault();
+        markAnswered(agent, reload);
+      }
+    };
+    document.addEventListener('keydown', down);
+    return () => document.removeEventListener('keydown', down);
+  }, [keys, setCursor, reload]);
+}
+
+/**
+ * By repo: repos with any agent not idle or stopped first, then by name;
+ * within a repo, top-level agents in attention order; children follow their
+ * parent one step in (D6.1).
+ */
+export function groupAgents(sessions) {
   const byId = new Map(sessions.map((agent) => [agent.id, agent]));
-  const rank = (agent) => {
-    const { ball } = balls.get(agent.id);
-    // Idle agents without a ticket sink to the bottom.
-    const noTicket = ball === 'idle' && !(agent.claims || []).length;
-    return BALL_ORDER.indexOf(ball) + (noTicket ? 0.5 : 0);
-  };
-  const recent = (agent) => Date.parse(agent.activity_since || agent.last_activity) || 0;
-  const order = (a, b) => rank(a) - rank(b) || recent(b) - recent(a) || a.name.localeCompare(b.name);
   const children = new Map();
   const roots = [];
   for (const agent of sessions) {
@@ -196,56 +323,60 @@ export function groupAgents(sessions, balls) {
   }
   const repos = new Map();
   for (const agent of roots) (repos.get(agent.repo) || repos.set(agent.repo, []).get(agent.repo)).push(agent);
-  const busy = (agents) => agents.some((agent) => !['idle', 'stopped'].includes(balls.get(agent.id).ball));
+  const busy = (agents) => agents.some((agent) => !['idle', 'stopped'].includes(sectionOf(agent)));
   const walk = (agent, depth, out, seen) => {
     if (seen.has(agent.id)) return;
     seen.add(agent.id);
     out.push({ agent, depth });
-    for (const child of (children.get(agent.id) || []).sort(order)) walk(child, depth + 1, out, seen);
+    for (const child of (children.get(agent.id) || []).sort(attentionOrder)) walk(child, depth + 1, out, seen);
   };
   return [...repos.entries()]
     .map(([repo, agents]) => {
       const out = [];
       const seen = new Set();
-      for (const agent of agents.sort(order)) walk(agent, 0, out, seen);
+      for (const agent of agents.sort(attentionOrder)) walk(agent, 0, out, seen);
       return { repo, agents: out, busy: busy(out.map((entry) => entry.agent)) };
     })
     .sort((a, b) => Number(b.busy) - Number(a.busy) || basename(a.repo).localeCompare(basename(b.repo)));
 }
 
-function AgentCard({ agent, ball, depth, selected }) {
+function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered }) {
   const codex = (agent.provider || '').startsWith('codex');
-  const faded = ball.ball === 'stopped' || (ball.ball === 'idle' && !(agent.claims || []).length);
+  const section = sectionOf(agent);
+  const faded = ['idle', 'stopped'].includes(section) && !hasTicket(agent);
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
-  const cls = ['card', selected && 'sel', faded && 'faded', depth && 'child'].filter(Boolean).join(' ');
+  const tall = !!youFact(agent, now);
+  const cls = ['card', 'acard', `edge-${edgeTone(agent)}`, tall && 'tall', selected && 'sel', cursor && 'kb',
+    faded && 'faded', depth && 'child'].filter(Boolean).join(' ');
+  const iconButton = (title, name, action) => html`<button type="button" class="icon-btn" title=${title} aria-label=${title}
+    onClick=${(event) => { event.stopPropagation(); action(); }}><${Icon} name=${name} /></button>`;
   return html`<div class=${cls} data-open-ref=${`agent:${agent.id}`} style=${depth > 1 ? `margin-left:${depth * 18}px` : ''} role="button" tabindex="0"
     onClick=${() => openPanel(`agent:${agent.id}`)}
-    onKeyDown=${(event) => event.key === 'Enter' && openPanel(`agent:${agent.id}`)}>
+    onKeyDown=${(event) => event.key === 'Enter' && event.target === event.currentTarget && openPanel(`agent:${agent.id}`)}>
     <${Ring} percent=${agent.context_percent} />
     <span class="nm" title=${agent.name}>${agent.name}</span>
+    <span class="icons">
+      ${live ? iconButton('Terminal (t)', 'terminal', () => openTerminal(agent)) : null}
+      ${linked ? iconButton('Open in Claude (c)', 'external', () => openInClaude(agent)) : null}
+    </span>
     <span class="ln"><span class=${`prov ${codex ? 'codex' : 'claude'}`}>${codex ? 'CODEX' : 'CLAUDE'}</span>
-      <span class="tk"> ${ticketText(agent)}</span></span>
-    <span class=${`ln ball ${BALL_TONE[ball.ball]}`} title=${ball.text}>${ball.text}</span>
-    ${live
-      ? html`<button type="button" class="icon-btn act" title=${linked ? 'Open in Claude' : 'Terminal'}
-          onClick=${(event) => { event.stopPropagation(); mainAction(agent); }}>
-          <${Icon} name=${linked ? 'external' : 'terminal'} /></button>`
-      : html`<span></span>`}
+      <span class="tk"> ${ticketText(agent)}</span>
+      ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
+    <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} />
   </div>`;
 }
 
 // ---- agent panel -------------------------------------------------------------
 
 function useAgent(id) {
-  const [doc, error] = usePoll(() => api(`/watch/state?session=${encodeURIComponent(id)}`), refreshMs(), [id]);
+  const [doc, error, reload] = usePoll(() => api(`/watch/state?session=${encodeURIComponent(id)}`), refreshMs(), [id]);
   const agent = doc && (doc.sessions || []).find((session) => session.id === id);
-  return { agent, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
+  return { agent, reload, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
 }
 
 export function AgentPanel({ id, controls }) {
-  const { agent, loading, error } = useAgent(id);
-  const ctx = useBallContext();
+  const { agent, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
   const [tab, setTab] = useState('work');
   useEffect(() => setTab('work'), [id]);
@@ -253,7 +384,6 @@ export function AgentPanel({ id, controls }) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
   }
-  const ball = agentBall(agent, ctx, now);
   const claim = (agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0];
   const since = agent.state === 'stopped' ? agent.last_activity : agent.activity_since || agent.last_activity;
   const parts = [
@@ -282,7 +412,7 @@ export function AgentPanel({ id, controls }) {
       )}
     </div>
     <div class="pbody">
-      ${tab === 'work' ? html`<${WorkTab} agent=${agent} ball=${ball} now=${now} />` : null}
+      ${tab === 'work' ? html`<${WorkTab} agent=${agent} now=${now} onAnswered=${reload} />` : null}
       ${tab === 'activity' ? html`<${ActivityTab} id=${agent.id} />` : null}
       ${tab === 'summary' ? html`<${SummaryTab} agent=${agent} />` : null}
     </div>
@@ -417,7 +547,7 @@ function MoreMenu({ agent, onClose }) {
 
 const DOC_LINK = (doc) => doc.reader_path || doc.browser_url || doc.url;
 
-function WorkTab({ agent, ball, now }) {
+function WorkTab({ agent, now, onAnswered }) {
   const claims = agent.claims || [];
   const jobs = (agent.jobs || []).filter((job) => ['running', 'pending'].includes(job.state));
   const reviews = (agent.waiting_on || []).filter((w) => w.kind === 'review');
@@ -427,7 +557,7 @@ function WorkTab({ agent, ball, now }) {
   const itemButton = (kind, id, href, children) => html`<button type="button" class="plain-btn"
     onClick=${() => openItem(kind, id, href)}>${children}</button>`;
   return html`
-    <div><span class=${`ball ${BALL_TONE[ball.ball]}`}>${ball.text}</span></div>
+    <div class="acard-facts"><${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} /></div>
     ${ticketClaims.length
       ? html`<section><h3>Ticket</h3><ul>${ticketClaims.map((claim) => html`<li>
           ${itemButton('ticket', `${claim.repo}#${claim.number}`, claim.url,
