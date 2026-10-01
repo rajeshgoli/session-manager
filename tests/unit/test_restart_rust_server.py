@@ -1788,6 +1788,7 @@ def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
     installer.write_text(
         f"""#!/bin/bash
 echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
+printf '%s' "$SM_CLI_BINARY" > "{env['state']}/cli-destination"
 """)
     git(checkout["deployed"], "commit", "-q", "-am", "installer that reports its source")
     cutover = env["tmp"] / "cutover.sh"
@@ -1802,6 +1803,7 @@ echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
     line = next(l for l in calls(env).splitlines() if l.startswith("install-sm-cli"))
     assert line.startswith("install-sm-cli --source ")
     assert line.endswith(" FROM-SERVER-BUILD")
+    assert (env["state"] / "cli-destination").read_text() == str(env["installed"].parent / "sm")
     assert not list(env["installed"].parent.glob("*.sm-cli.staging.*"))
 
 

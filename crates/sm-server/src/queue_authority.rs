@@ -119,6 +119,33 @@ impl QueueAuthorityServer {
         self.unlink_on_drop.store(true, Ordering::Release);
     }
 
+    /// Publish a listener bound by this process after an inherited handover.
+    /// macOS LOCAL_PEERPID identifies the process that bound the socket, even
+    /// when a successor accepts on its inherited descriptor.
+    pub fn rebind_after_handover(&mut self) -> Result<()> {
+        let replacement_path = self
+            .socket_path
+            .with_file_name(format!(".a{}", process::id()));
+        if replacement_path.exists() {
+            bail!(
+                "queue authority replacement path already exists: {}",
+                replacement_path.display()
+            );
+        }
+        let replacement = UnixListener::bind(&replacement_path)
+            .with_context(|| format!("failed to bind {}", replacement_path.display()))?;
+        if let Err(error) =
+            fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o600))
+                .and_then(|()| fs::rename(&replacement_path, &self.socket_path))
+        {
+            let _ = fs::remove_file(&replacement_path);
+            return Err(error).context("failed to publish replacement queue authority socket");
+        }
+        self.listener = replacement;
+        self.claim_socket();
+        Ok(())
+    }
+
     pub fn spawn(&self, shutdown: crate::handover::Shutdown) -> Result<thread::JoinHandle<()>> {
         let listener = self.listener.try_clone()?;
         listener.set_nonblocking(true)?;
@@ -466,6 +493,41 @@ mod tests {
         assert!(server.socket_path().exists());
         drop(server);
         assert!(!stale_path.exists());
+    }
+
+    #[test]
+    fn inherited_authority_listener_is_replaced_at_the_same_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_dir = unique_temp_dir("rebind");
+        let mut server = QueueAuthorityServer::bind(&state_dir, fixture_identity()).unwrap();
+        let socket_path = server.socket_path().to_path_buf();
+        let old_inode = fs::metadata(&socket_path).unwrap().ino();
+        server.rebind_after_handover().unwrap();
+        let new_inode = fs::metadata(&socket_path).unwrap().ino();
+        assert_ne!(new_inode, old_inode);
+        server.rebind_after_handover().unwrap();
+        assert_ne!(fs::metadata(&socket_path).unwrap().ino(), new_inode);
+        assert_eq!(
+            fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let server_thread = thread::spawn(move || server.accept_once().unwrap());
+        let mut stream = UnixStream::connect(socket_path).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"schema": REQUEST_SCHEMA, "job_id": "job_0123456789ab"})
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server_thread.join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
+            "not_found"
+        );
     }
 
     #[test]

@@ -383,6 +383,7 @@ PY
 
 SM_BINARY="$(resolve_path "$SM_BINARY")"
 SM_BASE_BINARY="$SM_BINARY"
+SM_CLI_BINARY="${SM_CLI_BINARY:-$(dirname "$SM_BASE_BINARY")/sm}"
 SM_CARGO_OUTPUT="$(resolve_path "$SM_CARGO_OUTPUT")"
 SM_TARGET_DIR="$(resolve_path "$SM_TARGET_DIR")"
 SM_CONFIG="$(resolve_path "$SM_CONFIG")"
@@ -1142,7 +1143,7 @@ if [[ "$SKIP_BUILD" -eq 1 ]]; then
 elif [[ -z "$SM_CLI_STAGING" ]]; then
   echo "WARNING: the build produced no sm CLI at $SM_TARGET_DIR/release/sm, so it was" >&2
   echo "         not reinstalled; $SM_LABEL itself is healthy." >&2
-elif "$REPO_ROOT/scripts/install-sm-cli.sh" --source "$SM_CLI_STAGING"; then
+elif SM_CLI_BINARY="$SM_CLI_BINARY" "$REPO_ROOT/scripts/install-sm-cli.sh" --source "$SM_CLI_STAGING"; then
   :
 else
   echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2

@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     let handover_dir = state_file
         .parent()
         .context("session state has no parent directory")?;
-    let (listener, authority_server, handover_listener, mut takeover_stream, mut inherited_lan) =
+    let (listener, mut authority_server, handover_listener, mut takeover_stream, mut inherited_lan) =
         if args.take_over {
             let mut stream = UnixStream::connect(handover::socket_path(handover_dir))
                 .context("cannot connect to serving slot for handover")?;
@@ -182,6 +182,12 @@ async fn main() -> Result<()> {
     );
     let btw_workers = BtwWorkers::default();
     'generations: loop {
+        if takeover_stream.is_some() {
+            // The inherited Unix listener still reports the previous binder's
+            // PID to LOCAL_PEERPID. Publish this process's listener before it
+            // serves queue authority requests during the rollback window.
+            authority_server.rebind_after_handover()?;
+        }
         let shutdown = Shutdown::default();
         sm_server::queue::set_live_queue_shutdown(shutdown.clone());
         let authority_thread = authority_server.spawn(shutdown.clone())?;
@@ -574,7 +580,9 @@ async fn main() -> Result<()> {
                 } => {
                     decision_rx = None;
                     match decision {
-                        Some((handover::Decision::Commit | handover::Decision::PeerExited, _connection)) => authority_server.claim_socket(),
+                        Some((handover::Decision::Commit | handover::Decision::PeerExited, _connection)) => {
+                            authority_server.claim_socket();
+                        }
                         Some((handover::Decision::Rollback, _connection)) => {
                             shutdown.stop();
                             let _ = lan_control.pause().await;
@@ -646,12 +654,16 @@ async fn main() -> Result<()> {
                             authority_server.claim_socket();
                             eprintln!("handover commit failed: {error:#}");
                         } else {
-                            return Ok(());
+                            // The listener and all shared work now belong to the
+                            // replacement. Runtime teardown would wait forever
+                            // for legacy blocking monitor threads, so exit now.
+                            std::process::exit(0);
                         }
                     }
                     if let Err(error) = result {
                         eprintln!("handover rolled back: {error:#}");
                     }
+                    authority_server.rebind_after_handover()?;
                     btw_workers.block_recovery();
                     let _ = handover::send_decision(&mut stream, handover::Decision::Rollback);
                     let recovery_workers = btw_workers.clone();
