@@ -9810,7 +9810,9 @@ async fn send_session_input(
             detail: "text is required".to_owned(),
         });
     }
-    auto_retire::restore_send_target(&state, &session_id).await?;
+    let session_id = auto_retire::restore_send_target(&state, &session_id)
+        .await?
+        .unwrap_or(session_id);
     let Some(named) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -10516,11 +10518,13 @@ async fn send_session_input_batch(
         .then(|| TmuxRuntime::from_app_config(&state.config));
     let mut results = Vec::with_capacity(recipients.len());
     for identifier in recipients {
-        auto_retire::restore_send_target(&state, &identifier).await?;
+        let target = auto_retire::restore_send_target(&state, &identifier)
+            .await?
+            .unwrap_or_else(|| identifier.clone());
         results.push(send_session_input_batch_one(
             &state,
             runtime.as_ref(),
-            &identifier,
+            &target,
             payload.input.clone(),
         )?);
     }

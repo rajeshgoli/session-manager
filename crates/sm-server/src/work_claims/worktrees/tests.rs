@@ -897,3 +897,51 @@ fn restore_refuses_a_missing_working_dir_no_claim_recorded() {
         ))
     );
 }
+
+#[test]
+fn restore_uses_the_branch_the_agent_renamed_to_and_refuses_when_origin_is_unreachable() {
+    let repo = Repo::new();
+    let origin = repo.origin();
+    let (path, _) = repo.worktree("wt", "11-fix");
+    repo.claim(
+        "c1",
+        "restorer4",
+        "pr",
+        11,
+        Some(&path),
+        Some("11-fix"),
+        None,
+    );
+    // The agent renamed setup's branch and pushed it under the new name.
+    run_git(Path::new(&path), &["branch", "-m", "11-fix-v2"]);
+    run_git(Path::new(&path), &["push", "-q", "origin", "11-fix-v2"]);
+    let head = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    repo.merged_pr(11, "11-fix-v2", &head);
+    repo.pass(&[session("restorer4", "/elsewhere", true)]);
+    assert!(!repo.branch_exists("11-fix-v2"));
+
+    // Origin unreachable: not proof the branch is gone, so no detached
+    // rebuild and no worktree.
+    let moved = repo.dir.join("origin-moved.git");
+    fs::rename(&origin, &moved).unwrap();
+    let refused = repo.rebuild("restorer4", &path).unwrap_err();
+    assert!(
+        refused.starts_with(&format!(
+            "rebuilding worktree {path} failed: cannot read origin"
+        )),
+        "{refused}"
+    );
+    assert!(!Path::new(&path).exists());
+
+    fs::rename(&moved, &origin).unwrap();
+    assert_eq!(
+        repo.rebuild("restorer4", &path),
+        Ok(WorktreeRebuild::Rebuilt {
+            branch: "11-fix-v2".to_owned()
+        })
+    );
+    assert_eq!(
+        run_git(Path::new(&path), &["branch", "--show-current"]),
+        "11-fix-v2"
+    );
+}

@@ -363,24 +363,29 @@ pub(super) fn ready_for_message(
 }
 
 /// `sm send` to an auto-retired agent restores it before the send, which
-/// then queues as for any live agent. A failed restore leaves the send to
-/// report the agent stopped, as before.
+/// then queues as for any live agent. When the restore fails, the send goes
+/// where a reply would: its successor, else its parent (spec 1821 E3).
+/// Returns the session to send to instead, if any.
 pub(super) async fn restore_send_target(
     state: &Arc<AppState>,
     identifier: &str,
-) -> Result<(), ApiError> {
+) -> Result<Option<String>, ApiError> {
     let Some(session) = state.session_store.get_session(identifier)? else {
-        return Ok(());
+        return Ok(None);
     };
     let session = forward_handed_off(state, session)?;
     if !messages::restores(&session) {
-        return Ok(());
+        return Ok(None);
     }
     let work = state.clone();
-    tokio::task::spawn_blocking(move || ready_for_message(&work, session))
+    let id = session.id.clone();
+    let restored = tokio::task::spawn_blocking(move || ready_for_message(&work, session))
         .await
         .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
-    Ok(())
+    Ok(match restored {
+        Some(_) => None,
+        None => messages::live_recipient(state, &id).map(|fallback| fallback.id),
+    })
 }
 
 #[cfg(test)]

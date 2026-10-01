@@ -920,8 +920,21 @@ pub fn rebuild_worktree(
             .is_some_and(|recorded| missing_path_key(recorded) == path)
     })
     .ok_or_else(gone)?;
-    let branch = claim.branch.clone().unwrap_or_default();
-    let git_dir = removed_git_dir(&conn, &path)
+    // The removal recorded the branch actually checked out, which an agent
+    // may have renamed since its claim (sm#1567), and the repository.
+    let removed = removed_event(&conn, &path);
+    let branch = removed
+        .as_ref()
+        .and_then(|payload| payload["branch"].as_str())
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .or_else(|| claim.branch.clone())
+        .unwrap_or_default();
+    let git_dir = removed
+        .as_ref()
+        .and_then(|payload| payload["git_common_dir"].as_str())
+        .filter(|dir| Path::new(dir).is_dir())
+        .map(str::to_owned)
         .or_else(|| {
             repo_dirs.iter().find_map(|dir| {
                 (crate::work_attribution::git_origin_github_repo(dir)
@@ -942,25 +955,30 @@ pub fn rebuild_worktree(
             )
         })?;
     let git_dir = Path::new(&git_dir);
-    let run = |args: &[&str]| -> std::result::Result<(), String> {
+    // `Err((exit code, first stderr line))`.
+    let run_status = |args: &[&str]| -> std::result::Result<(), (Option<i32>, String)> {
         let output = Command::new("git")
             .arg("--git-dir")
             .arg(git_dir)
             .args(args)
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| (None, error.to_string()))?;
         if output.status.success() {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("git failed")
-            .trim_start_matches("fatal: ")
-            .to_owned())
+        Err((
+            output.status.code(),
+            stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("git failed")
+                .trim_start_matches("fatal: ")
+                .to_owned(),
+        ))
     };
+    let run = |args: &[&str]| run_status(args).map_err(|(_, line)| line);
     let failed = |error: String| format!("rebuilding worktree {path} failed: {error}");
     // A worktree deleted by hand is still registered until pruned.
     let _ = run(&["worktree", "prune"]);
@@ -971,14 +989,30 @@ pub fn rebuild_worktree(
         &format!("refs/heads/{branch}"),
     ])
     .is_ok();
-    let fetched = !local
-        && run(&[
+    // Gone only when origin answers that it has no such branch (exit 2); an
+    // unreachable origin fails the restore so it can be retried.
+    let on_origin = local
+        || match run_status(&[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ]) {
+            Ok(()) => true,
+            Err((Some(2), _)) => false,
+            Err((_, error)) => return Err(failed(format!("cannot read origin: {error}"))),
+        };
+    let fetched = !local && on_origin && {
+        run(&[
             "fetch",
             "--quiet",
             "origin",
             &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
         ])
-        .is_ok();
+        .map_err(failed)?;
+        true
+    };
     let outcome = if local {
         run(&["worktree", "add", &path, &branch]).map_err(failed)?;
         WorktreeRebuild::Rebuilt { branch }
@@ -1010,7 +1044,7 @@ pub fn rebuild_worktree(
     };
     let (ticket, pr) = item_keys(&conn, &claim.repo, claim.kind(), claim.number)
         .map_err(|error| format!("{error:#}"))?;
-    let mut payload = json!({"path": path, "branch": claim.branch, "claim_id": claim.id});
+    let mut payload = json!({"path": path, "branch": branch_name(&outcome), "claim_id": claim.id});
     if let WorktreeRebuild::Detached { base, .. } = &outcome {
         payload["detached_at"] = json!(base);
     }
@@ -1042,9 +1076,8 @@ fn missing_path_key(path: &str) -> String {
     }
 }
 
-/// The repository the latest removal of `path` recorded, when it still
-/// exists.
-fn removed_git_dir(conn: &Connection, path: &str) -> Option<String> {
+/// The latest `worktree.removed` payload for `path`.
+fn removed_event(conn: &Connection, path: &str) -> Option<Value> {
     let mut statement = conn
         .prepare("SELECT payload FROM events WHERE kind = ?1 ORDER BY id DESC")
         .ok()?;
@@ -1056,8 +1089,15 @@ fn removed_git_dir(conn: &Connection, path: &str) -> Option<String> {
         .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
         .find(|payload| payload["path"].as_str() == Some(path));
     found
-        .and_then(|payload| payload["git_common_dir"].as_str().map(str::to_owned))
-        .filter(|dir| Path::new(dir).is_dir())
+}
+
+fn branch_name(outcome: &WorktreeRebuild) -> Option<&str> {
+    match outcome {
+        WorktreeRebuild::Present => None,
+        WorktreeRebuild::Rebuilt { branch } | WorktreeRebuild::Detached { branch, .. } => {
+            Some(branch)
+        }
+    }
 }
 
 /// `--path` for `sm worktree keep`, as stored: absolute, symlinks resolved.
