@@ -325,12 +325,15 @@ fn cap_facts(mut facts: Value, cap: usize) -> Value {
         }
     }
     facts["truncated"] = json!(true);
-    while size(&facts) > cap {
-        match facts["sessions"].as_array_mut() {
-            Some(sessions) if !sessions.is_empty() => {
-                sessions.pop();
+    // Then whole entries: sessions, then queue jobs, then lanes.
+    for list in ["/sessions", "/queue", "/board/lanes", "/board/stale_repos"] {
+        while size(&facts) > cap {
+            match facts.pointer_mut(list).and_then(Value::as_array_mut) {
+                Some(entries) if !entries.is_empty() => {
+                    entries.pop();
+                }
+                _ => break,
             }
-            _ => break,
         }
     }
     facts
@@ -923,5 +926,14 @@ mod tests {
         let capped = cap_facts(facts, 200);
         assert!(capped.to_string().len() <= 200);
         assert!(capped["sessions"].as_array().unwrap().len() < 50);
+        // A queue backlog alone over the cap is cut too.
+        let queue: Vec<Value> = (0..500)
+            .map(|n| json!({"id": format!("job_{n}")}))
+            .collect();
+        let facts =
+            json!({"sessions": [], "queue": queue, "board": {"lanes": []}, "truncated": false});
+        let capped = cap_facts(facts, 1000);
+        assert!(capped.to_string().len() <= 1000);
+        assert_eq!(capped["truncated"], true);
     }
 }

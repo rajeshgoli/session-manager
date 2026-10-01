@@ -1,6 +1,6 @@
 # App Bug Reporting With SQLite Spool
 
-> Superseded by `specs/1859_bug_button.html` (sm#1859): `POST /client/bug-reports` now files a GitHub issue that holds only the typed text and links, and no longer messages a maintainer.
+> Superseded by `docs/working/1859_bug_button.html` (sm#1859): `POST /client/bug-reports` now files a GitHub issue that holds only the typed text and links, and no longer messages a maintainer.
 
 Issue: #538
 
