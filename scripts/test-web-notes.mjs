@@ -215,8 +215,10 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await first.locator('.panel .note-card-main').first().evaluate(button => button.click());
     assert.equal(await first.locator('.panel .notes-editor textarea').inputValue(), 'Keep the first browser text');
     assert.equal(await first.getByRole('dialog').count(), 1, 'collapse keeps the conflict dialog');
-    const historySettled = first.evaluate(() => new Promise(resolve =>
-      window.addEventListener('popstate', () => setTimeout(resolve, 0), { once: true })));
+    const historySettled = first.evaluate(() => new Promise(resolve => {
+      let changes = 0;
+      window.addEventListener('popstate', () => { if (++changes === 2) resolve(); });
+    }));
     await first.goBack();
     await historySettled;
     assert.equal(new URL(first.url()).searchParams.get('open'), 'notes:view', 'browser history cannot dismiss the conflict');
@@ -234,6 +236,10 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await second.keyboard.press('b');
     assert.equal(new URL(second.url()).pathname, '/notes', 'keyboard navigation keeps the full-page conflict');
     assert.equal(await second.getByRole('dialog').count(), 1);
+    await second.getByRole('button', { name: 'Load theirs' }).click();
+    await second.getByRole('dialog').waitFor({ state: 'hidden' });
+    await second.getByText('Board', { exact: true }).first().click();
+    await second.waitForURL(`${origin}/board`);
     await secondContext.close();
     await context.close();
   } finally { await browser.close(); }
@@ -335,6 +341,31 @@ test('navigation saves text typed while an earlier save is pending', async () =>
     release();
     await page.waitForURL(`${origin}/board`);
     assert.equal(handler.notes.find(note => note.id === 'one').body, 'Second edit during save');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('Back and Forward keep their entries, and New clears an active search', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    await context.route('**/*', server());
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    await page.keyboard.press('Meta+j');
+    await page.locator('.panel').waitFor();
+    await page.goBack();
+    await page.locator('.panel').waitFor({ state: 'hidden' });
+    await page.goForward();
+    await page.locator('.panel').waitFor();
+    await page.keyboard.press('Meta+j');
+    await page.locator('.panel').waitFor({ state: 'hidden' });
+    await page.getByRole('searchbox', { name: 'Search notes' }).fill('no such note');
+    await page.getByText('No matching notes.').waitFor();
+    await page.getByRole('button', { name: '+ New' }).click();
+    await page.locator('.notes-editor textarea').waitFor();
+    assert.equal(await page.getByRole('searchbox', { name: 'Search notes' }).inputValue(), '');
     await context.close();
   } finally { await browser.close(); }
 });

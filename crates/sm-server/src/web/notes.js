@@ -257,7 +257,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const choose = async id => { if (await save() === false) return; store('sm-notes-open', id); load(id); };
   const create = async () => {
     if (await save() === false) return;
-    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); await search(); load(note.id); }
+    try { const note = await api('/notes', { method: 'POST', body: { body: '' } }); setQuery(''); await search(''); load(note.id); }
     catch (err) { setError(err.message); }
   };
   const importFile = async e => {
@@ -268,7 +268,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', body: form });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
-      await search(); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
+      setQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
     } catch (err) { setError(err.message); }
     e.target.value = '';
   };
@@ -313,7 +313,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     ${!pane && !compact ? html`<div class="notes-editor-slot">${open ? editorView() : html`<p class="notes-empty">Choose a note or create one.</p>`}</div>` : null}</div>
     ${conflict ? html`<div class="notes-dialog-backdrop"><div class="notes-dialog" role="dialog" aria-modal="true" aria-label="Changed on another device">
       <h2>Changed on another device</h2><p>Choose which version to keep.</p>
-      <button class="btn" onClick=${() => { loadSerial.current++; current.current = { open: conflict, body: conflict.body }; setOpen(conflict); setBody(conflict.body); setConflict(null); setStatus('Saved · now'); }}>Load theirs</button>
+      <button class="btn" onClick=${() => { loadSerial.current++; saving.current = Promise.resolve(true); current.current = { open: conflict, body: conflict.body }; setOpen(conflict); setBody(conflict.body); setConflict(null); setStatus('Saved · now'); }}>Load theirs</button>
       <button class="btn pri" onClick=${() => { const version = conflict.version; setConflict(null); save(version); }}>Keep mine</button>
     </div></div>` : null}
   </section>`;

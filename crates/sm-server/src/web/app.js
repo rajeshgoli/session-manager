@@ -105,16 +105,21 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let committedUrl = location.href;
+    let committedIndex = Number.isInteger(history.state?.smHistoryIndex) ? history.state.smHistoryIndex : 0;
+    history.replaceState({ ...history.state, smHistoryIndex: committedIndex }, '', location.href);
+    let reversing = false;
     const canLeaveNotes = async () => (await Promise.all(bus.request('notes-before-leave'))).every(Boolean);
     const pop = async () => {
-      const targetUrl = location.href;
-      if (document.querySelector('.notes-view')) {
-        history.pushState(null, '', committedUrl);
-        if (!(await canLeaveNotes())) return;
-        history.pushState(null, '', targetUrl);
+      if (reversing) { reversing = false; return; }
+      const targetIndex = Number.isInteger(history.state?.smHistoryIndex)
+        ? history.state.smHistoryIndex : committedIndex - 1;
+      const step = Math.sign(targetIndex - committedIndex) || -1;
+      if (document.querySelector('.notes-view') && !(await canLeaveNotes())) {
+        reversing = true;
+        history.go(-step);
+        return;
       }
-      committedUrl = location.href;
+      committedIndex = targetIndex;
       openOrigin = null; setLoc(readLocation());
     };
     window.addEventListener('popstate', pop);
@@ -127,8 +132,7 @@ function App() {
           location.href = urlFor(path, null);
           return;
         }
-        history.pushState(null, '', urlFor(path, null));
-        committedUrl = location.href;
+        history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, null));
         setLoc(readLocation());
       }),
       bus.on('open', async (ref) => {
@@ -139,8 +143,7 @@ function App() {
         const kind = ref?.split(':', 1)[0];
         const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')
           ? kind === 'agent' ? '/' : '/queue' : current.path;
-        history.pushState(null, '', urlFor(path, ref));
-        committedUrl = location.href;
+        history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, ref));
         setLoc(readLocation());
       }),
       bus.on('toast', (item) => {
