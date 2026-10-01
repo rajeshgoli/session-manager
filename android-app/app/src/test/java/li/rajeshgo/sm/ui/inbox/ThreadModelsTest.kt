@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.InboxRow
 import li.rajeshgo.sm.data.model.InboxThread
 import li.rajeshgo.sm.data.model.DocAskTarget
+import li.rajeshgo.sm.data.model.InboxReplyOption
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -54,6 +55,8 @@ class ThreadModelsTest {
         val earlier = work.items.single().copy(at = "2026-09-29T10:00:00Z", id = "old")
         val visible = docAskThread(work.copy(items = listOf(earlier) + work.items), ask.firstPublishedAt)
         assertEquals(listOf("abc"), visible.items.map { it.docId })
+        val fractional = docAskThread(work, "2026-09-30T10:00:00.789Z")
+        assertEquals(1, fractional.items.size)
     }
 
     @Test fun answeredClearsTheAgentsThatAsked() {
@@ -72,6 +75,15 @@ class ThreadModelsTest {
         assertEquals("PR #12 ↗" to "https://github.com/o/r/pull/12", threadWorkLink("pr:o/r#12"))
         assertNull(threadWorkLink("agent:c26eb47e"))
         assertNull(threadWorkLink("docpath:o/r/docs/memo.html"))
+    }
+
+    @Test fun defaultReplyNamesTheLiveSuccessorRatherThanTheEndedForwarder() {
+        val options = listOf(
+            InboxReplyOption(id = "ended", name = "sm-old", status = "ended", canSend = true, recipientId = "live"),
+            InboxReplyOption(id = "live", name = "sm-new", status = "live", canSend = true, recipientId = "live"),
+        )
+        assertEquals("live", defaultReplyOptionId(thread.copy(replyOptions = options)))
+        assertEquals("ended", defaultReplyOptionId(thread.copy(replyOptions = options.take(1))))
     }
 
     @Test fun notificationPathsOpenTheirThread() {

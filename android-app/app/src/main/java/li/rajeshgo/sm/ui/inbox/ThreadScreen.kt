@@ -142,7 +142,18 @@ fun threadTerminalAgent(thread: InboxThread): Pair<String, String>? {
 
 /** Ask shows the doc's conversation starting with its first published revision. */
 fun docAskThread(thread: InboxThread, firstPublishedAt: String): InboxThread =
-    if (firstPublishedAt.isBlank()) thread else thread.copy(items = thread.items.filter { it.at >= firstPublishedAt })
+    if (firstPublishedAt.isBlank()) thread else {
+        val firstSecond = runCatching { OffsetDateTime.parse(firstPublishedAt).toEpochSecond() }.getOrNull() ?: return thread
+        thread.copy(items = thread.items.filter { item ->
+            val itemSecond = runCatching { OffsetDateTime.parse(item.at).toEpochSecond() }.getOrNull()
+            itemSecond == null || itemSecond >= firstSecond
+        })
+    }
+
+/** Match the server's live-first reply choice even when an ended sender forwards to that agent. */
+fun defaultReplyOptionId(thread: InboxThread): String? =
+    thread.replyOptions.firstOrNull { it.status == "live" && it.canSend }?.id
+        ?: thread.replyOptions.firstOrNull { it.canSend }?.id
 
 data class ThreadUiState(
     val thread: InboxThread? = null,
@@ -527,7 +538,7 @@ private fun ReplyBox(
                 add("reader" to (askTarget.reader?.name ?: "Reader agent"))
                 if (askTarget.author?.restorable == true) add("restore_author" to "Bring back ${askTarget.author.name} · reloads about ${((askTarget.author.contextTokens ?: 0) + 500) / 1000}k tokens")
             } else thread.replyOptions.filter { it.canSend }.map { it.id to (it.name + if (it.restores) " · restores" else "") }
-            val chosen = recipient ?: (if (askTarget != null) askTarget.default else thread.replyOptions.firstOrNull { it.recipientId == thread.replyTo?.id && it.canSend }?.id ?: thread.replyOptions.firstOrNull { it.canSend }?.id)
+            val chosen = recipient ?: (if (askTarget != null) askTarget.default else defaultReplyOptionId(thread))
             val target = choices.firstOrNull { it.first == chosen }?.second ?: thread.replyTo?.name
             if (choices.isEmpty() && (askTarget == null && !thread.canSend)) {
                 Text("No agent is left to reply to.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
