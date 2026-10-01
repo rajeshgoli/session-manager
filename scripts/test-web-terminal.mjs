@@ -235,6 +235,32 @@ test('Retire in the bar: a finished agent retires at once and the page moves to 
   } finally { await browser.close(); }
 });
 
+test('Retire confirmation stays usable above details with a long name on a phone', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state } = await open(browser, { viewport: { width: 390, height: 844 } });
+    state.sessions = state.sessions.map((agent) => agent.id === 'sm-1776'
+      ? { ...agent, name: 'sm-1776-with-a-very-long-name-that-must-wrap-inside-the-confirmation' }
+      : agent);
+    await page.goto(`${ORIGIN}/terminal/sm-1776?open=agent:sm-1776`);
+    await page.locator('.term-panel').waitFor();
+    await page.locator('.term-bar .retire-action > button').click();
+    const prompt = page.locator('.term-bar .retire-confirm');
+    await prompt.waitFor();
+    const cancel = prompt.getByRole('button', { name: 'Cancel' });
+    const box = await prompt.boundingBox();
+    const cancelBox = await cancel.boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= 390, 'confirmation fits inside the phone viewport');
+    assert.ok(cancelBox.x >= 0 && cancelBox.x + cancelBox.width <= 390, 'Cancel stays in view');
+    assert.equal(await cancel.evaluate((button) => {
+      const box = button.getBoundingClientRect();
+      return document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2) === button;
+    }), true, 'details panel does not cover Cancel');
+    await cancel.click();
+    assert.deepEqual(state.retired, []);
+  } finally { await browser.close(); }
+});
+
 test('route: another server on localhost and a failed direct socket both use Cloudflare', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
