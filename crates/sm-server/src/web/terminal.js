@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store } from './ui.js';
 import { RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
+import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-route.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -318,6 +319,7 @@ export function TerminalPage({ id, open }) {
       <span class="sp"></span>
       ${agent?.remote_control?.url?.startsWith('https://claude.ai/code/') ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
       ${agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null}
+      <${BugButton} page="Terminal" />
       <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
     </div>
     <div class=${`term-main${switcher ? ' with-switch' : ''}`}>

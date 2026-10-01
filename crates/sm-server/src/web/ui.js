@@ -91,6 +91,43 @@ function noteBuild(id) {
   }
 }
 
+/**
+ * The latest parsed JSON answer per GET path (query dropped), at most `limit`
+ * paths, oldest evicted (1859 B3). A bug report sends what the page fetched.
+ */
+export function pageDataRing(limit = 12) {
+  const entries = new Map();
+  let seq = 0;
+  let pageMark = 0;
+  const since = (mark) => Object.fromEntries([...entries].filter(([, e]) => e.seq > mark).map(([key, e]) => [key, e.value]));
+  return {
+    put(path, value) {
+      const key = path.split('?')[0];
+      entries.delete(key);
+      entries.set(key, { value, seq: ++seq });
+      while (entries.size > limit) entries.delete(entries.keys().next().value);
+    },
+    /** A mark; `since` returns the paths fetched after it. */
+    mark: () => seq,
+    since,
+    /** The shell marks each page switch; `forPage` is what was fetched since. */
+    markPage() { pageMark = seq; },
+    forPage: () => since(pageMark),
+  };
+}
+export const pageData = pageDataRing();
+
+/** Drops the largest entries until the serialized whole fits `cap` characters. */
+export function trimPageData(data, cap = 300000) {
+  const out = { ...data };
+  const size = (value) => JSON.stringify(value)?.length || 0;
+  while (Object.keys(out).length && size(out) > cap) {
+    const largest = Object.keys(out).reduce((a, b) => (size(out[b]) > size(out[a]) ? b : a));
+    delete out[largest];
+  }
+  return out;
+}
+
 export async function api(path, { method = 'GET', body, headers = {} } = {}) {
   const options = { method, credentials: 'same-origin', cache: 'no-store', headers: { ...headers } };
   if (body !== undefined) {
@@ -110,6 +147,7 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
     const detail = value && (typeof value.detail === 'string' ? value.detail : value.error);
     throw new ApiError(detail || `HTTP ${response.status}`, response.status);
   }
+  if (method === 'GET' && value !== null) pageData.put(path, value);
   return value;
 }
 

@@ -53,6 +53,7 @@ const ASSETS: &[Asset] = &[
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("board.js", JS),
     asset!("board-start.js", JS),
+    asset!("bug.js", JS),
     asset!("reviews.js", JS),
     asset!("inbox.js", JS),
     asset!("reader.js", JS),
@@ -62,6 +63,7 @@ const ASSETS: &[Asset] = &[
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
+    asset!("vendor/html-to-image.js", JS),
 ];
 
 /// Bare module names the app imports, mapped to their vendored files.
@@ -69,6 +71,7 @@ const VENDOR_IMPORTS: &[(&str, &str)] = &[
     ("preact", "vendor/preact.module.js"),
     ("preact/hooks", "vendor/hooks.module.js"),
     ("htm", "vendor/htm.module.js"),
+    ("html-to-image", "vendor/html-to-image.js"),
 ];
 
 /// When this process built its router, the server's start for About.
