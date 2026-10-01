@@ -4,6 +4,7 @@ use super::*;
 use crate::board::model::{Key, ModelInput};
 use crate::owner_docs::{doc_readable_path, OwnerDocStore};
 use crate::queue::{CodexReviewRequestFilters, QueueJobFilters, RetainedQueueStore};
+use crate::work_claims::canonical_repo;
 
 pub(super) struct BoardLinks {
     prs: BTreeMap<Key, Vec<Value>>,
@@ -16,17 +17,14 @@ impl BoardLinks {
     pub fn load(state: &AppState, input: &ModelInput) -> anyhow::Result<Self> {
         let mut prs = BTreeMap::<Key, Vec<Value>>::new();
         let claim_store = claims::work_claim_store(state);
-        let claims = claim_store.active_claims()?;
-        let mut held = BTreeMap::<String, Vec<Key>>::new();
-        for view in &claims {
-            let claim = &view.claim;
-            if claim.kind == "ticket" {
-                let key = (claim.repo.clone(), claim.number);
-                held.entry(claim.session_id.clone())
-                    .or_default()
-                    .push(key.clone());
-            }
-        }
+        // A PR GitHub also links to a board ticket takes its state from that
+        // reference: a claim's state can predate the merge.
+        let current: BTreeMap<(String, i64), &crate::board::model::PrRef> = input
+            .prs
+            .values()
+            .flatten()
+            .map(|pr| ((canonical_repo(&pr.repo), pr.number), pr))
+            .collect();
         let all_claims = claim_store.board_link_claims()?;
         let mut tickets_by_session =
             BTreeMap::<String, Vec<&crate::work_claims::BoardLinkClaim>>::new();
@@ -56,18 +54,24 @@ impl BoardLinks {
                 {
                     continue;
                 }
-                prs.entry((ticket.repo.clone(), ticket.number))
-                    .or_default()
-                    .push(json!({
+                let value = match current.get(&(canonical_repo(&pr.repo), pr.number)) {
+                    Some(reference) => json!(reference),
+                    None => json!({
                         "repo": pr.repo, "number": pr.number,
                         "state": pr.state.as_deref().unwrap_or("open").to_ascii_uppercase(),
                         "url": pr.url.as_deref().unwrap_or_default(),
-                    }));
+                    }),
+                };
+                prs.entry((ticket.repo.clone(), ticket.number))
+                    .or_default()
+                    .push(value);
             }
         }
 
         let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
             .join("queue_runner.db");
+        // The same tickets the ticket clock gives each job.
+        let held = super::board_clock::held_tickets(state, input)?;
         let mut jobs = BTreeMap::<Key, Vec<Value>>::new();
         for job in
             RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?
@@ -75,13 +79,7 @@ impl BoardLinks {
             if !matches!(job.state.as_str(), "pending" | "running") || job.job_type == "service" {
                 continue;
             }
-            let keys: Vec<Key> = job.rank_tickets.clone().unwrap_or_else(|| {
-                job.requester_session_id
-                    .as_ref()
-                    .and_then(|id| held.get(id))
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            let keys = super::board_clock::job_tickets(&job, &held);
             let quiet = crate::utilization::quiet::status(&queue_path, &job);
             let since = if job.state == "running" {
                 job.started_at.as_ref().unwrap_or(&job.queued_at)

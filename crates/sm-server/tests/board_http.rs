@@ -11,7 +11,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sm_server::{
     board::{
-        model::Key,
+        model::{Key, PrRef},
         sync::{
             BoardSource, IssueConnection, IssueNode, IssuesPage, LinkMutation, RefNode,
             ResolvedIssue, WriteError,
@@ -45,6 +45,8 @@ type FakeIssue = (bool, Vec<i64>, Option<i64>);
 #[derive(Clone, Default)]
 struct FakeBoard {
     issues: Arc<Mutex<BTreeMap<i64, FakeIssue>>>,
+    /// PRs GitHub links to each issue.
+    prs: Arc<Mutex<BTreeMap<i64, Vec<PrRef>>>>,
 }
 
 impl FakeBoard {
@@ -68,6 +70,7 @@ impl BoardSource for FakeBoard {
             return Ok(IssuesPage::default());
         }
         let issues = self.issues.lock().unwrap().clone();
+        let prs = self.prs.lock().unwrap().clone();
         let nodes = issues
             .iter()
             .filter(|(_, (open, _, _))| *open)
@@ -86,7 +89,7 @@ impl BoardSource for FakeBoard {
                     .map(|(child, _)| self.node(*child))
                     .collect(),
                 sub_issues_more: None,
-                prs: Vec::new(),
+                prs: prs.get(number).cloned().unwrap_or_default(),
             })
             .collect();
         Ok(IssuesPage {
@@ -1291,4 +1294,70 @@ async fn start_rechecks_readiness_after_github_fetch_before_claiming() {
         .query_row("SELECT count(*) FROM work_claims", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+/// Claims PR 77 for `session`, with its sm-recorded state.
+fn claim_pr_77(f: &Fixture, session: &str, state: &str) {
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO work_items(repo, number, kind, title, state, url, synced_at)
+        VALUES (?1, 77, 'pr', 'PR 77', ?2, 'https://github.com/acme/widgets/pull/77', '2026-09-29T11:00:00Z')", params![REPO, state]).unwrap();
+    conn.execute(
+        "INSERT INTO work_claims(id, repo, number, kind, session_id, source, claimed_at)
+        VALUES ('pr77', ?1, 77, 'pr', ?2, 'explicit', '2026-09-29T11:00:00Z')",
+        params![REPO, session],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn job_with_empty_rank_tickets_links_to_tickets_of_requesters_claimed_pr() {
+    let f = fixture();
+    add_goal(&f).await;
+    // A PR claim with no ticket link yet: the job is queued with no tickets.
+    claim_pr_77(&f, "eng00001", "OPEN");
+    let (status, job) = request(
+        &f.app,
+        "POST",
+        "/queue-jobs",
+        Some(json!({
+            "type": "tests", "argv": ["true"], "cwd": f.dir.display().to_string(),
+            "requester_session_id": "eng00001", "timeout_seconds": 60,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    let rank_tickets: Option<String> = Connection::open(f.dir.join("queue/queue_runner.db"))
+        .unwrap()
+        .query_row(
+            "SELECT rank_tickets FROM queue_jobs WHERE id = ?1",
+            [job["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rank_tickets.as_deref(), Some("[]"));
+    f.link_pr(77, 3);
+    let ticket = f.ticket(3).await;
+    assert_eq!(ticket["jobs"][0]["id"], job["id"], "{ticket}");
+    assert_eq!(ticket["jobs"][0]["state"], "waiting");
+}
+
+#[tokio::test]
+async fn claimed_pr_takes_its_state_from_the_board_reference() {
+    let f = start_fixture();
+    f.board.prs.lock().unwrap().insert(
+        2,
+        vec![PrRef {
+            repo: REPO.into(),
+            number: 77,
+            state: "MERGED".into(),
+            url: format!("https://github.com/{REPO}/pull/77"),
+        }],
+    );
+    add_goal(&f).await;
+    f.claim(2, "eng00001");
+    claim_pr_77(&f, "eng00001", "OPEN");
+    let ticket = f.ticket(2).await;
+    assert_eq!(ticket["prs"].as_array().unwrap().len(), 1, "{ticket}");
+    assert_eq!(ticket["prs"][0]["number"], 77);
+    assert_eq!(ticket["prs"][0]["state"], "MERGED");
 }
