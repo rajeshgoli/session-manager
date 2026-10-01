@@ -90,9 +90,10 @@ test('reverting to the old value while a save is pending still submits the rever
   assert.equal(h.input(h.render(props)).value, 'old');
 });
 
-test('shared handoff controls exclude the desktop app and retain future providers', () => {
-  const providers = harness().evaluate('handoffProviders')({ 'codex-app': true, future: false });
-  assert.deepEqual(Array.from(providers), ['claude', 'codex-fork', 'codex', 'future']);
+test('handoff settings list only the providers with a context gauge', () => {
+  const providers = harness().evaluate('HANDOFF_PROVIDERS.map(([provider]) => provider).join()');
+  assert.equal(providers, 'claude,codex-fork');
+  assert.equal(harness().evaluate('THRESHOLDS.map(([key]) => key).join()'), 'threshold_percent,reminder_percent,review_floor_percent');
 });
 
 test('terminal limits accept blank as reset and refuse values outside the range', () => {

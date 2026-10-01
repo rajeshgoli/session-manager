@@ -6490,20 +6490,24 @@ impl SessionStore {
                 return Ok(ContextUsageOutcome::UnknownSession);
             };
             let tokens_used = event.total_input_tokens.unwrap_or(0);
-            let context_window_tokens = event
-                .context_window_tokens
-                .filter(|window| *window > 0)
-                .unwrap_or_else(|| {
-                    if event
-                        .model_id
-                        .as_deref()
-                        .is_some_and(|id| id.ends_with("[1m]"))
-                    {
-                        1_000_000
-                    } else {
-                        200_000
-                    }
-                });
+            // Claude Code's status line reports a 200k `context_window_size`
+            // for 1M models, so a `[1m]` model (the payload's id, else the
+            // session's own model) decides first.
+            let one_million = [
+                event.model_id.as_deref(),
+                session.get("model").and_then(Value::as_str),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| id.ends_with("[1m]"));
+            let context_window_tokens = if one_million {
+                1_000_000
+            } else {
+                event
+                    .context_window_tokens
+                    .filter(|window| *window > 0)
+                    .unwrap_or(200_000)
+            };
             let sampled_at = event
                 .emitted_at
                 .as_deref()

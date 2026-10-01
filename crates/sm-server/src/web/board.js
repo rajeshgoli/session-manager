@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, age } from './ui.js';
 import { TicketStart, blockedReasons, canStartAnyway } from './board-start.js';
+import { HandoffPopover } from './handoff.js';
 
 export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
 export const BLOCKED_ROW_LIMIT = 12;
@@ -52,17 +53,24 @@ function Clock({ ticket, end, hours }) {
 export const canStart = (ticket) => ticket.state === 'ready' && !(ticket.warnings || []).includes('merged_not_closed');
 
 function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false }) {
-  const [menu, setMenu] = useState(false);
+  const [menu, setMenu] = useState(null);
   const parts = ticket.sub_issues;
   const agent = ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name,
     provider: ticket.holder.provider, fact: `${ticket.holder.state === 'working' ? '● Working' : '○ Idle'}${ticket.holder.since ? ` ${age(ticket.holder.since)}` : ''}` } : null;
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
-    ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
-    ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
-    ${ticket.state === 'close_ready' ? html`<span class="ticket-actions"><button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>
-      <span class="anchor"><button class="icon-btn" title="More ticket actions" onClick=${() => setMenu(!menu)}>⋯</button>
-        ${menu ? html`<${Popover} onClose=${() => setMenu(false)}><button class="btn sm" onClick=${() => { setMenu(false); onStart(ticket); }}>Start instead</button><//>` : null}</span></span>` : null}
+    <span class="ticket-actions">
+      ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
+      ${ticket.state === 'blocked' ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
+      ${ticket.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
+      ${ticket.state !== 'done' ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
+        ${menu === 'more' ? html`<${Popover} onClose=${() => setMenu(null)} align="right" className="menu">
+          ${ticket.state === 'close_ready' ? html`<button onClick=${() => { setMenu(null); onStart(ticket); }}>Start instead</button>` : null}
+          <button onClick=${() => setMenu('handoff')}>Hand off…</button><//>` : null}
+        ${menu === 'handoff' ? html`<${HandoffPopover} scope="ticket" align="right" ticket=${{ repo: ticket.repo, number: ticket.number }}
+          agent=${ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name, provider: ticket.holder.provider, state: ticket.holder.state } : null}
+          onClose=${() => setMenu(null)} />` : null}</span>` : null}
+    </span>
     ${ticket.state !== 'blocked' && (ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
     ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">${blockedReasons(ticket).join(' ')}</span>` : null}
     ${ticket.state === 'close_ready' ? html`<span class="sub ticket-state cyan">${parts?.done || 0} of ${parts?.total || 0} parts done · All parts done</span>` : null}

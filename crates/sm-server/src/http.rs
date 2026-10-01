@@ -1612,6 +1612,7 @@ pub fn router(state: AppState) -> Router {
         .map(|bridge| bridge.webhook_path())
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
     let state = Arc::new(state);
+    web::server_started_at();
     if let Err(error) = RetainedQueueStore::ensure_codex_review_requests_schema_from_path(
         &expand_home(&state.config.sm_send.db_path),
     ) {
@@ -1799,6 +1800,7 @@ pub fn router(state: AppState) -> Router {
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/history", get(history::get_history))
         .route("/history/agents", get(agent_history::get_agent_history))
+        .route("/history/tickets", get(history::get_history))
         .route("/guestbook", get(guestbook_page::get_guestbook))
         .route("/t/{repo}/{number}", get(history::get_timeline))
         .route("/", get(watch::get_watch_page))
@@ -15049,6 +15051,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/settings"
         || path == "/history"
         || path == "/history/agents"
+        || path == "/history/tickets"
         || path == "/guestbook"
         || path.starts_with("/t/")
         || path == "/"
@@ -20427,7 +20430,13 @@ mod tests {
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
-        for uri in ["/history", "/history/agents", "/t/widgets/1", "/guestbook"] {
+        for uri in [
+            "/history",
+            "/history/agents",
+            "/history/tickets",
+            "/t/widgets/1",
+            "/guestbook",
+        ] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
             for assertion in [Some(stranger.as_str()), None] {
@@ -20513,6 +20522,7 @@ mod tests {
             "/inbox",
             "/history",
             "/history/agents",
+            "/history/tickets?repo=widgets",
             "/guestbook",
             "/queue",
             "/analytics",
@@ -20527,6 +20537,9 @@ mod tests {
             assert!(html.contains(r#"id="sm-config""#), "{uri}");
             assert!(html.contains(&format!("/assets/app.js?v={build}")), "{uri}");
             assert!(!html.contains("Handoff defaults"), "{uri}");
+            // About shows the server's uptime from the router's start.
+            let started = format!(r#""server_started_at":"{}""#, web::server_started_at());
+            assert!(html.contains(&started), "{uri}");
         }
         // `/watch` moves to `/`, keeping a panel link.
         let response = app

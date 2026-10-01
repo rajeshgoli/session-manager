@@ -555,6 +555,14 @@ async fn agent_history_lists_stopped_agents_with_their_work_and_drops_restored_o
     let (_, found) = get_json(&f.app, "/history/agents?q=GONE").await;
     assert_eq!(agent_ids(&found), vec!["gone0001"]);
     assert_eq!(found["total"], 1);
+    // A number finds the agents that claimed it, with or without `#`; no
+    // name or folder here contains a 9.
+    for q in ["9", "%239"] {
+        let (_, by_ticket) = get_json(&f.app, &format!("/history/agents?q={q}")).await;
+        assert_eq!(agent_ids(&by_ticket), vec!["eng00001"], "{q}");
+    }
+    let (_, unclaimed) = get_json(&f.app, "/history/agents?q=4242").await;
+    assert_eq!(agent_ids(&unclaimed), Vec::<&str>::new());
 
     post(&f.app, "/sessions/gone0001/restore", json!({})).await;
     let (_, after) = get_json(&f.app, "/history/agents").await;

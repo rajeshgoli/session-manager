@@ -1,8 +1,8 @@
 // Injected only on the browser hostname. Never shown inside a reader frame.
 (() => {
   if (window.top !== window || document.getElementById('sm-reader-bar')) return;
-  const shellPaths = new Set(['/', '/watch', '/inbox', '/board', '/queue', '/history', '/history/agents', '/guestbook', '/analytics', '/settings']);
-  const names = { '/': 'Agents', '/watch': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/queue': 'Queue', '/history': 'History', '/history/agents': 'History', '/guestbook': 'Guestbook', '/analytics': 'Analytics', '/settings': 'Settings' };
+  const shellPaths = new Set(['/', '/watch', '/inbox', '/board', '/queue', '/history', '/history/agents', '/history/tickets', '/guestbook', '/analytics', '/settings']);
+  const names = { '/': 'Agents', '/watch': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/queue': 'Queue', '/history': 'History', '/history/agents': 'History', '/history/tickets': 'History', '/guestbook': 'Guestbook', '/analytics': 'Analytics', '/settings': 'Settings' };
   const safeFrom = value => {
     if (!value) return null;
     try {

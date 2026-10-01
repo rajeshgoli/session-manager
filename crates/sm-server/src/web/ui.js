@@ -263,14 +263,14 @@ export function Toggle({ checked, onChange, label, disabled = false }) {
 export const threadHref = thread => `/inbox?open=thread:${encodeURIComponent(thread.key.replace(/^agent:/, ''))}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`;
 
 /** Shared related-item chips. Empty kinds do not occupy space. */
-export function Links({ ticket, prs = [], agent, jobs = [], thread, docs = [] }) {
+export function Links({ ticket, tickets = [], prs = [], agent, jobs = [], thread, docs = [] }) {
   const ticketRef = item => `ticket:${item.repo || ticket?.repo}#${item.number}`;
   const pending = review => !!review?.waiting_since;
   const reviewText = review => review ? ` · ${review.by === 'you' ? 'your review' : 'Codex review'}, round ${review.round}${review.verdict ? ` · ${review.verdict.replace('_', ' ')}` : ''}${pending(review) ? ` · waiting ${age(review.waiting_since)}` : ''}` : '';
   const visibleJobs = jobs.filter(job => ['running', 'pending', 'waiting', 'queued'].includes(job.state));
-  if (!ticket && !prs.length && !agent && !visibleJobs.length && !thread && !docs.length) return null;
+  if (!ticket && !tickets.length && !prs.length && !agent && !visibleJobs.length && !thread && !docs.length) return null;
   return html`<div class="links">
-    ${ticket ? html`<button class="link-chip" onClick=${() => openPanel(ticketRef(ticket))}>#${ticket.number} ↗</button>` : null}
+    ${[ticket, ...tickets].filter(Boolean).map(item => html`<button class="link-chip" onClick=${() => openPanel(ticketRef(item))}>#${item.number} ↗</button>`)}
     ${prs.map(pr => html`<button class=${`link-chip ${pending(pr.review) ? pr.review.by === 'you' ? 'magenta' : 'amber' : ''}`}
       onClick=${() => openPanel(ticketRef(pr))}>PR #${pr.number} · ${(pr.state || 'open').toLowerCase()}${reviewText(pr.review)}</button>`)}
     ${agent ? html`<span class="link-pair"><button class="link-chip" onClick=${() => openPanel(`agent:${agent.id}`)}>${agent.name} · ${providerLabel(agent.provider)} · ${agent.fact || agent.state || ''}</button><button class="link-chip" aria-label=${`Terminal for ${agent.name}`} onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨</button></span>` : null}

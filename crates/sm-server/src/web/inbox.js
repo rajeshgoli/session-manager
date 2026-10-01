@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast, typingIn } from './ui.js';
+import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast, typingIn, Links, age } from './ui.js';
 import { Reader } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -19,6 +19,13 @@ export function safeThreadHtml(source) {
   }
   return doc.body.innerHTML;
 }
+// The thread's agent as `/watch/state` shows it: claims, jobs and facts.
+function useWatchedAgent(id) {
+  const [doc, , reload] = usePoll(() => id ? api(`/watch/state?session=${encodeURIComponent(id)}`) : Promise.resolve(null), 30000, [id]);
+  return [doc?.sessions?.find(session => session.id === id) || null, reload];
+}
+const factText = facts => !facts ? '' : facts.agent?.state === 'stopped' ? 'Stopped'
+  : `${facts.agent?.state === 'working' ? '● Working' : '○ Idle'}${facts.agent?.since ? ` ${age(facts.agent.since)}` : ''}`;
 const write = (path, body) => api(path, { method: 'POST', headers: { 'X-SM-Doc-Token': config.inbox_token }, body });
 
 export function InboxPage({ openRef }) {
@@ -30,6 +37,24 @@ export function InboxPage({ openRef }) {
     new URL(row.url, location.origin).pathname === new URL(openRef.slice(4), location.origin).pathname
   ));
   const [busy, setBusy] = useState(false);
+  const threadId = openRef?.startsWith('thread:') ? openRef.slice(7) : null;
+  const [agent, reloadAgent] = useWatchedAgent(threadId);
+  const [retiring, setRetiring] = useState(false);
+  useEffect(() => setRetiring(false), [threadId]);
+  const retire = async () => {
+    if (!agent || busy) return;
+    setBusy(true);
+    try { await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, { method: 'POST', body: {} }); toast(`Retired ${agent.name}`); setRetiring(false); reloadAgent(); reload(); }
+    catch (e) { toast(e.message); }
+    finally { setBusy(false); }
+  };
+  const answered = async () => {
+    if (!threadId || busy) return;
+    setBusy(true);
+    try { await api(`/sessions/${encodeURIComponent(threadId)}/needs-you/answered`, { method: 'POST', body: {} }); toast('Marked answered'); reloadAgent(); reload(); }
+    catch (e) { toast(e.message); }
+    finally { setBusy(false); }
+  };
   const done = async () => {
     if (!selected || busy) return;
     setBusy(true);
@@ -62,15 +87,21 @@ export function InboxPage({ openRef }) {
     </section>
     <section class="inbox-reader">
       ${inline ? html`<div class="inbox-actions"><button class="btn sm" onClick=${closePanel}>← Inbox</button><span></span>
-        ${selected ? html`<button class="btn sm" disabled=${busy} onClick=${done}>Done <kbd>e</kbd></button>` : null}</div>` : null}
+        ${agent?.facts?.you?.dismissible ? html`<button class="btn sm" disabled=${busy} title="You answered elsewhere; clear the question" onClick=${answered}>✓ Answered</button>` : null}
+        ${selected ? html`<button class="btn sm" disabled=${busy} onClick=${done}>Done <kbd>e</kbd></button>` : null}
+        ${agent && agent.state !== 'stopped' ? retiring
+          ? html`<span class="confirm">Retire ${agent.name}?
+              <button class="btn sm danger" disabled=${busy} onClick=${retire}>Retire</button>
+              <button class="btn sm" onClick=${() => setRetiring(false)}>Cancel</button></span>`
+          : html`<button class="btn sm" onClick=${() => setRetiring(true)}>Retire…</button>` : null}</div>` : null}
       ${openRef?.startsWith('doc:') ? html`<${Reader} key=${openRef} id=${openRef.slice(4)} />`
-        : openRef?.startsWith('thread:') ? html`<${Thread} key=${openRef} id=${openRef.slice(7)} />`
+        : threadId ? html`<${Thread} key=${openRef} id=${threadId} agent=${agent} />`
         : html`<div class="empty">Choose a thread or document to read.</div>`}
     </section>
   </div>`;
 }
 
-export function Thread({ id, controls }) {
+export function Thread({ id, controls, agent }) {
   const [data, error, reload] = usePoll(() => api(`/inbox/agent/${encodeURIComponent(id)}?format=json`), 30000, [id]);
   const [body, setBody] = useState('');
   const [quotes, setQuotes] = useState([]);
@@ -79,6 +110,7 @@ export function Thread({ id, controls }) {
   const attempt = useRef(null);
   const items = useRef(null);
   const scrollOnLoad = useRef(true);
+  const pinned = useRef(false);
   useLayoutEffect(() => {
     if (data && scrollOnLoad.current && items.current) {
       const at = new URLSearchParams(location.search).get('at');
@@ -87,10 +119,21 @@ export function Thread({ id, controls }) {
         target.scrollIntoView({block:'center'});
         target.classList.add('thread-highlight');
         setTimeout(() => target.classList.remove('thread-highlight'), 2000);
-      } else items.current.scrollTop = items.current.scrollHeight;
+      } else { items.current.scrollTop = items.current.scrollHeight; pinned.current = true; }
       scrollOnLoad.current = false;
     }
   }, [data]);
+  // Keep the newest message in view when the links row arrives above the
+  // thread while the reader is at the bottom.
+  useEffect(() => {
+    const el = items.current;
+    const watch = () => { pinned.current = Math.abs(el.scrollHeight - el.clientHeight - el.scrollTop) < 2; };
+    el?.addEventListener('scroll', watch);
+    return () => el?.removeEventListener('scroll', watch);
+  }, []);
+  useLayoutEffect(() => {
+    if (pinned.current && items.current) items.current.scrollTop = items.current.scrollHeight;
+  }, [!!agent]);
   const quote = e => {
     const link = e.target.closest('a');
     if (link) {
@@ -123,6 +166,10 @@ export function Thread({ id, controls }) {
   };
   return html`<section class="thread-reader">
     <div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>
+    ${agent ? html`<div class="thread-links"><${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
+      prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
+      agent=${{ id: agent.id, name: agent.name, provider: agent.provider, fact: factText(agent.facts) }}
+      jobs=${agent.jobs || []} /></div>` : null}
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => item.type === 'turn'
       ? html`<div key=${i} class="b turn"><div class="lbl">Last turn · ${new Date(item.at).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}</div><div class="md" dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} /></div>`
@@ -135,4 +182,9 @@ export function Thread({ id, controls }) {
     </div>
   </section>`;
 }
-registerPanel('thread', Thread);
+// In another page's reading pane the thread fetches its own agent.
+function ThreadPanel({ id, controls }) {
+  const [agent] = useWatchedAgent(id);
+  return html`<${Thread} id=${id} controls=${controls} agent=${agent} />`;
+}
+registerPanel('thread', ThreadPanel);

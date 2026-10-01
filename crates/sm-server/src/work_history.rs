@@ -566,6 +566,16 @@ impl HistoryData {
         ids
     }
 
+    /// The sessions that ever claimed a ticket or PR numbered `number`, in
+    /// any repository: History's agent search by ticket.
+    pub fn sessions_claiming(&self, number: i64) -> BTreeSet<&str> {
+        self.claims
+            .iter()
+            .filter(|claim| claim.number == number)
+            .map(|claim| claim.session_id.as_str())
+            .collect()
+    }
+
     /// What each of `session_ids` worked on, for the agent list (sm#1661):
     /// tickets and PRs it claimed or requested a Codex review on, and docs it
     /// authored or published. Newest first, at most [`AGENT_WORK_LIMIT`] of

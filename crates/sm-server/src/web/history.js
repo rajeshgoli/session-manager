@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast } from './ui.js';
+import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, providerLabel, age, basename } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 
 export function WorkLinks({ work = {} }) {
@@ -9,12 +9,31 @@ export function WorkLinks({ work = {} }) {
   </div>`;
 }
 export function HistoryPage({ path }) {
-  const agents = path === '/history/agents';
+  const agents = path !== '/history/tickets';
   return html`<div class="content history-page">
-    <${Seg} label="History" value=${agents ? 'agents' : 'tickets'} onChange=${value => navigate(value === 'agents' ? '/history/agents' : '/history')}
-      options=${[{value:'tickets',label:'Tickets'},{value:'agents',label:'Agents'}]} />
-    <${HistoryList} key=${path} agents=${agents} />
+    <div class="history-top"><h2>${agents ? 'Bring back an agent' : 'Tickets agents worked on'}</h2>
+      <${Seg} label="History" value=${agents ? 'agents' : 'tickets'} onChange=${value => navigate(value === 'agents' ? '/history' : '/history/tickets')}
+        options=${[{value:'agents',label:'Agents'},{value:'tickets',label:'Tickets'}]} /></div>
+    <${HistoryList} key=${agents} agents=${agents} />
   </div>`;
+}
+function AgentRow({ row, busy, restore }) {
+  const work = row.work || {};
+  const [ticket, ...tickets] = work.tickets || [];
+  return html`<article class="history-card history-agent" data-open-ref=${`agent:${row.id}`}>
+    <div class="history-heading">
+      <button class="text-button history-name" onClick=${() => openPanel(`agent:${row.id}`)}>${row.name}</button>
+      <span class=${`prov ${row.provider.startsWith('codex') ? 'codex' : 'claude'}`}>${providerLabel(row.provider).toUpperCase()}</span>
+      ${ticket ? html`<span class="mono">#${ticket.number}</span>` : null}
+      <span>· ${row.state === 'retired' ? 'retired' : 'stopped'} ${age(row.ended_at)} ago</span>
+      <span class="mono">${basename(row.working_dir)}</span>
+      <button class="btn pri sm history-restore" disabled=${!row.restorable || !!busy} title=${row.unrestorable_reason || 'Restore agent'}
+        onClick=${() => restore(row)}>${busy === row.id ? 'Restoring…' : 'Restore'}</button>
+    </div>
+    ${row.last_turn?.text ? html`<p class="history-last-turn">Last turn: “${row.last_turn.text}”</p>`
+      : row.last_status ? html`<p class="history-last-turn">Last words: “${row.last_status}”</p>` : null}
+    <${Links} ticket=${ticket} tickets=${tickets} prs=${work.prs || []} docs=${work.docs || []} />
+  </article>`;
 }
 function HistoryList({ agents }) {
   const [filters] = useState(() => new URLSearchParams(location.search));
@@ -38,16 +57,15 @@ function HistoryList({ agents }) {
     finally { setBusy(null); }
   };
   const rows = data?.[agents ? 'agents' : 'rows'] || [];
-  return html`<label class="list-filter">${agents ? 'Find agent' : 'Repository'} <input value=${query} placeholder=${agents ? 'Name or folder' : 'All repositories'} onInput=${e => {setQuery(e.target.value);setBefore('');}} /></label>
+  return html`<label class="list-filter">${agents ? 'Find' : 'Repository'} <input value=${query} placeholder=${agents ? 'By name, ticket or folder' : 'All repositories'} onInput=${e => {setQuery(e.target.value);setBefore('');}} /></label>
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     ${!data ? html`<p>Loading…</p>` : !rows.length ? html`<p class="empty">No history matches.</p>` : null}
-    ${rows.map(row => html`<article class="history-card">
-      ${agents ? html`<div class="history-heading"><button class="text-button" onClick=${() => openPanel(`agent:${row.id}`)}>${row.name}</button><span>${row.provider} · ${row.state}</span>
-        <button class="btn sm" disabled=${!row.restorable || !!busy} title=${row.unrestorable_reason || 'Restore agent'} onClick=${() => restore(row)}>${busy === row.id ? 'Restoring…' : 'Restore'}</button></div>
-        <p>${row.last_status || row.working_dir}</p><small>${row.ended_at}</small><${WorkLinks} work=${row.work} />`
-        : html`<button class="text-button" onClick=${() => openPanel(`ticket:${row.repo}#${row.number}`)}>#${row.number} ${row.title}</button>
-          <p>${row.repo} · ${row.state} · ${(row.flags || []).join(' · ')}</p><${WorkLinks} work=${row} />`}
-    </article>`)}
+    ${rows.map(row => agents ? html`<${AgentRow} key=${row.id} row=${row} busy=${busy} restore=${restore} />`
+      : html`<article class="history-card">
+        <button class="text-button" onClick=${() => openPanel(`ticket:${row.repo}#${row.number}`)}>#${row.number} ${row.title}</button>
+        <p class="history-meta">${row.repo} · ${row.state}${(row.flags || []).length ? ` · ${row.flags.join(' · ')}` : ''}</p>
+        <${Links} prs=${(row.prs || []).map(pr => ({...pr, repo: row.repo}))} docs=${row.docs || []} />
+      </article>`)}
     <div class="list-pagination">${before ? html`<button class="btn" onClick=${() => setBefore('')}>Newest</button>` : null}
     ${data?.next_before ? html`<button class="btn" onClick=${() => setBefore(data.next_before)}>Older →</button>` : null}</div>`;
 }
