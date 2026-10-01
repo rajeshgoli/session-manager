@@ -37,6 +37,7 @@ const ASSETS: &[Asset] = &[
     asset!("app.js", JS),
     asset!("ui.js", JS),
     asset!("start.js", JS),
+    asset!("notes.js", JS),
     asset!("agents.js", JS),
     asset!("queue.js", JS),
     asset!("queue-model.js", JS),
@@ -255,9 +256,8 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .map(|asset| asset.body.len())
             .sum();
-        // The source assets are served separately; the current UI includes
-        // the work-thread reader and its Ask column.
-        assert!(own <= 288 * 1024, "own JS is {own} bytes");
+        // The separate source assets include the work-thread Ask column and Notes editor.
+        assert!(own <= 320 * 1024, "own JS is {own} bytes");
     }
 
     #[test]

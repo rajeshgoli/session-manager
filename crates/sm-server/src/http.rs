@@ -1925,6 +1925,7 @@ pub fn router(state: AppState) -> Router {
         .route("/board", get(board::get_board))
         .route("/notes", get(notes::list).post(notes::create))
         .route("/notes/search", get(notes::search))
+        .route("/notes/preview", post(notes::preview))
         .route(
             "/notes/import",
             post(notes::import).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
@@ -15266,6 +15267,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/analytics"
         || path.starts_with("/analytics/")
         || path == "/settings"
+        || path == "/notes"
         || path.starts_with("/terminal/")
         || path.starts_with("/assets/")
         || path == "/docs"
