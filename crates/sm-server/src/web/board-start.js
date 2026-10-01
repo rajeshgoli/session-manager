@@ -194,7 +194,7 @@ export function TicketStart({ ticket, mode = 'start', onClose, onStarted }) {
     ` : startable && !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable && !later ? 'Cancel' : 'Close'}</button>
-      ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast(`#${ticket.number} will not start by itself`))}>Cancel auto-start</button>` : null}
+      ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast('Cancelled'))}>Cancel auto-start</button>` : null}
       ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
 }
@@ -255,22 +255,22 @@ export function LaneWhenReady({ lane, onClose, onSaved }) {
     if (busy) return;
     setBusy(true); setError(null);
     try {
+      // Cancel first: the PUT's recompute could start a dropped ticket.
+      for (const t of tickets.filter((t) => t.auto_start && !rows[key(t)].type)) await api(autoStartPath(t), { method: 'DELETE' });
       const chosen = tickets.filter((t) => rows[key(t)].type);
       if (chosen.length) {
         await api('/client/board/auto-start/lane', { method: 'PUT',
           body: { goal_repo: lane.goal.repo, goal_number: lane.goal.number, tickets: chosen.map(item) } });
       }
-      const dropped = tickets.filter((t) => t.auto_start && !rows[key(t)].type);
-      for (const t of dropped) await api(autoStartPath(t), { method: 'DELETE' });
       onClose(); onSaved();
-      toast(`${chosen.length} ${chosen.length === 1 ? 'ticket starts' : 'tickets start'} when ready`);
+      toast(`Lane ${lane.rank} saved`);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   };
   return html`<${Popover} onClose=${onClose} className="ticket-start lane-when-ready">
     <h2>Start lane ${lane.rank} when ready</h2>
     <p class="sub">${lane.goal.title}</p>
-    ${!tickets.length ? html`<p>Every ticket in this lane has started, closed or been claimed.</p>` : types ? html`
+    ${types ? html`
       <div class="lwr-table">
         <div class="lwr-row lwr-head"><span>Ticket</span><span>Agent type</span><span>First message</span></div>
         ${tickets.map((t) => { const row = rows[key(t)]; const auto = t.auto_start; return html`<div class="lwr-row" key=${key(t)}>
@@ -288,6 +288,6 @@ export function LaneWhenReady({ lane, onClose, onSaved }) {
       </div>` : !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>Cancel</button>
-      ${tickets.length ? html`<button class="btn pri" disabled=${!types || busy} onClick=${save}>${busy ? 'Saving…' : 'Save'}</button>` : null}</div>
+      <button class="btn pri" disabled=${!types || busy} onClick=${save}>${busy ? 'Saving…' : 'Save'}</button></div>
   <//>`;
 }

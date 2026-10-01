@@ -66,11 +66,13 @@ function WhenReadyChip({ ticket, onStart }) {
   const failed = auto.state === 'failed';
   const retry = async () => {
     setRetrying(true);
-    try { await api('/client/board/auto-start', { method: 'PUT', body: retryBody(ticket) }); boardChanged(); }
+    // An edited type no longer matches: retry as Custom.
+    const put = (body) => api('/client/board/auto-start', { method: 'PUT', body });
+    try { await put(retryBody(ticket)).catch(() => put({ ...retryBody(ticket), agent_type: null })); boardChanged(); }
     catch (e) { toast(e.message); }
     finally { setRetrying(false); }
   };
-  return html`<button class=${`when-ready-chip ${failed ? 'amber' : paused ? 'muted' : ''}`} title=${failed ? auto.last_error || 'Start failed' : 'Change or cancel'}
+  return html`<button class=${`when-ready-chip ${failed ? 'amber' : paused ? 'muted' : ''}`} title=${auto.last_error || ''}
     onClick=${() => onStart(ticket, 'when_ready')}>${chipText(auto, paused)}</button>
     ${failed ? html`<button class="btn sm" disabled=${retrying} onClick=${retry}>Retry</button>` : null}`;
 }
