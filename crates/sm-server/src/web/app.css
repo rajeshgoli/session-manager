@@ -410,6 +410,24 @@ button.sw-sec { cursor: pointer; }
 .board-start-overlay .pop.ticket-start { position: relative; left: auto !important; top: auto !important; transform: none !important; max-height: calc(100dvh - 32px); overflow: auto; }
 .ticket-start .sub { margin: 0; }
 .ticket-start .fld .mono { overflow-wrap: anywhere; }
+/* Start when ready (1821 F4). */
+.when-ready-chip { border: 1px solid var(--line); background: var(--panel-2); color: var(--ink-2); border-radius: 999px; padding: 2px 10px; font-size: .8rem; cursor: pointer; white-space: nowrap; }
+.when-ready-chip.amber { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 50%, var(--line)); }
+.when-ready-chip.muted { color: var(--ink-3); }
+.when-ready-link { font-size: .867rem; white-space: nowrap; }
+.ticket-start .seg { flex-wrap: wrap; }
+.board-start-overlay .pop.lane-when-ready { width: min(46rem, calc(100vw - 24px)); }
+.lwr-table { display: flex; flex-direction: column; }
+.lwr-row { display: grid; grid-template-columns: minmax(0, 1fr) 15rem 6.5rem; gap: 6px 12px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+.lwr-head { font-size: .8rem; color: var(--ink-3); border-top: 0; padding-top: 0; }
+.lwr-ticket { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.lwr-row select { width: 100%; }
+.lwr-message { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.lwr-message textarea { width: 100%; }
+.agent-types { display: flex; flex-direction: column; gap: 6px; margin: 0 0 8px; }
+.agent-type { display: grid; grid-template-columns: 7rem 7rem minmax(0, 1fr) 6rem auto; gap: 6px; align-items: center; }
+.agent-type.head { font-size: .8rem; color: var(--ink-3); }
+.agent-types + .settings-feedback { margin-bottom: 16px; }
 .brief-preview { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel-2); padding: 8px; margin: 0; max-height: 14rem; overflow: auto; font: .9rem/1.5 var(--mono); }
 @media (max-width: 600px) {
   .ticket-clock { grid-template-columns: 1fr; gap: 5px; }
@@ -418,6 +436,16 @@ button.sw-sec { cursor: pointer; }
   .board-toolbar > .sub { width: 100%; }
   .ticket-start .fld { grid-template-columns: 1fr; gap: 3px; }
   .ticket-start .seg button { padding: 3px 8px; }
+  .board-ticket:has(.when-ready-chip, .when-ready-link) .ticket-actions { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
+  .lwr-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .lwr-row .lwr-ticket { grid-column: 1 / -1; }
+  .lwr-head { display: none; }
+  .agent-type { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .agent-type.head { display: none; }
+  .agent-type > :nth-child(3) { grid-row: 2; grid-column: 1; }
+  .agent-type > :nth-child(4) { grid-row: 2; grid-column: 2; }
+  .agent-type > :nth-child(5) { grid-row: 1; grid-column: 3; }
+  .agent-type { padding-bottom: 6px; border-bottom: 1px solid var(--line); }
 }
 
 /* Inbox, document reader, History and Guestbook (1710 D6.7–8). */

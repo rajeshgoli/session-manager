@@ -1069,6 +1069,15 @@ async fn auto_start_routes_store_blocked_choice_and_lane_is_all_or_nothing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(f.ticket(2).await["auto_start"]["state"], "waiting");
     assert_eq!(f.ticket(2).await["auto_start"]["agent_type"], "Mid");
+    assert!(f.ticket(2).await["auto_start"]["brief"].is_null());
+    let mut edited = choice(2);
+    edited["brief"] = json!("Read the spec first.");
+    let (status, body) = owner_request(&f, "PUT", "/client/board/auto-start", Some(edited)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        f.ticket(2).await["auto_start"]["brief"],
+        "Read the spec first."
+    );
     let (status, _) = owner_request(
         &f,
         "DELETE",

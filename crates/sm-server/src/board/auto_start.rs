@@ -42,8 +42,8 @@ impl Record {
     }
     pub fn chip(&self) -> Value {
         json!({"agent_type":self.agent_type,"provider":self.provider,"model":self.model,
-            "effort":self.effort,"state":self.state,"last_error":self.last_error,
-            "attempts":self.attempts})
+            "effort":self.effort,"brief":self.brief,"state":self.state,
+            "last_error":self.last_error,"attempts":self.attempts})
     }
 }
 

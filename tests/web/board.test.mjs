@@ -17,7 +17,8 @@ const board = load(`${root}/board.js`);
 await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
-const { startBody, providerDefaults, canStartAnyway, blockedReasons } = modules.get(`${root}/board-start.js`).namespace;
+const { startBody, providerDefaults, canStartAnyway, blockedReasons, modelShort, matchType, chipText, autoStartBody, retryBody, defaultType, laneCandidates, CUSTOM } = modules.get(`${root}/board-start.js`).namespace;
+const { canStartWhenReady } = board.namespace;
 const { reviewFallback, reviewerText, switchKind, inheritedPolicy, tier } = modules.get(`${root}/reviews.js`).namespace;
 const queueModel = load(`${root}/queue-model.js`);
 await queueModel.link(() => { throw new Error('queue-model has no imports'); });
@@ -165,4 +166,43 @@ test('authors and paired reviewers read their review state on the Agents page', 
   assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { text: 'No jobs' } } }), { text: 'Reviewing PR #1851 for far-1848 · round 1', tone: 'amber' });
   assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { running: 1, text: 'Tests running 3m', tone: 'green' } } }),
     { text: 'Reviewing PR #1851 for far-1848 · round 1 · ▶ Tests running 3m', tone: 'green' });
+});
+
+const TYPES = [{ name: 'Top', provider: 'claude', model: 'fable', effort: 'xhigh' },
+  { name: 'Mid', provider: 'claude', model: 'opus[1m]', effort: 'high' },
+  { name: 'Low', provider: 'claude', model: 'sonnet', effort: 'high' }];
+test('start when ready chip names the type, short model and effort', () => {
+  assert.deepEqual(['opus[1m]', 'claude-sonnet-4-5', 'fable', null].map(modelShort), ['Opus', 'Sonnet', 'Fable', 'default']);
+  const auto = { agent_type: 'Mid', provider: 'claude', model: 'opus[1m]', effort: 'high', state: 'waiting' };
+  assert.equal(chipText(auto, false), '⏵ when ready · Mid · Opus high');
+  assert.equal(chipText(auto, true), '⏵ paused · Mid · Opus high');
+  assert.equal(chipText({ ...auto, state: 'failed' }, true), '⏵ failed · Mid · Opus high');
+  assert.equal(chipText({ ...auto, agent_type: null, model: 'astra', effort: 'medium' }, false), '⏵ when ready · Astra medium');
+});
+test('auto-start bodies send a brief only when edited and keep the stored choice on retry', () => {
+  const ticket = { repo: 'o/r', number: 7 };
+  assert.deepEqual(autoStartBody(ticket, { provider: 'claude', model: 'sonnet', reasoning_effort: 'high' }, 'Low', null),
+    { repo: 'o/r', number: 7, provider: 'claude', agent_type: 'Low', model: 'sonnet', reasoning_effort: 'high' });
+  assert.deepEqual(autoStartBody(ticket, { provider: 'codex-fork', model: null, reasoning_effort: null }, null, 'Go'),
+    { repo: 'o/r', number: 7, provider: 'codex-fork', brief: 'Go' });
+  assert.deepEqual(retryBody({ ...ticket, auto_start: { agent_type: 'Mid', provider: 'claude', model: 'opus[1m]', effort: 'high', brief: null } }),
+    { repo: 'o/r', number: 7, provider: 'claude', agent_type: 'Mid', model: 'opus[1m]', reasoning_effort: 'high' });
+});
+test('agent type defaults: stored choice by value, then Tier line, then last used', () => {
+  assert.equal(matchType(TYPES, { provider: 'claude', model: 'sonnet', reasoning_effort: 'high' }), 'Low');
+  assert.equal(matchType(TYPES, { provider: 'claude', model: 'sonnet', reasoning_effort: 'max' }), '');
+  assert.equal(defaultType({ tier: 'mid' }, TYPES, 'Low'), 'Mid');
+  assert.equal(defaultType({ tier: null }, TYPES, 'Low'), 'Low');
+  assert.equal(defaultType({ tier: 'Huge' }, TYPES, 'Gone'), '');
+  assert.equal(defaultType({ tier: 'Top', auto_start: { agent_type: 'Mid', provider: 'claude', model: 'opus[1m]', effort: 'high' } }, TYPES, ''), 'Mid');
+  // Mid was edited in Settings after this ticket was authorized: show the stored values as Custom.
+  assert.equal(defaultType({ auto_start: { agent_type: 'Mid', provider: 'claude', model: 'opus', effort: 'high' } }, TYPES, ''), CUSTOM);
+});
+test('lane form and row entry offer only open tickets nobody holds', () => {
+  const tickets = [{ number: 1, state: 'blocked' }, { number: 2, state: 'ready' }, { number: 3, state: 'in_progress' },
+    { number: 4, state: 'blocked', holder: { session_id: 'a' } }, { number: 5, state: 'done' }, { number: 6, state: 'ready', warnings: ['merged_not_closed'] },
+    { number: 7, state: 'close_ready' }];
+  assert.deepEqual(laneCandidates({ goal: { repo: 'o/r', number: 2 }, tickets: tickets.map((t) => ({ repo: 'o/r', ...t })) }).map((t) => t.number), [1]);
+  assert.deepEqual(laneCandidates({ goal: { repo: 'o/r', number: 9 }, tickets }).map((t) => t.number), [1, 2]);
+  assert.deepEqual(tickets.filter(canStartWhenReady).map((t) => t.number), [1]);
 });
