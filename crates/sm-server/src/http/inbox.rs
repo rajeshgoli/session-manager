@@ -856,14 +856,16 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 })
                 .collect();
             format!(
-                r#"<div class="b me">{quotes}<div class="body">{body}</div><div class="m">You · {when}{to}</div></div>"#,
+                r#"<div class="b me" id="{id}">{quotes}<div class="body">{body}</div><div class="m">You · {when}{to}</div></div>"#,
+                id = escape_html(&reply.id),
                 body = escape_html(reply.body.trim()),
                 when = when(&reply.created_at),
                 to = delivered_to(&reply.delivered_to_session_id),
             )
         }
         Item::Note(note) => format!(
-            r#"<div class="b me"><div class="body">{body}</div><div class="m">You · {when}{to}</div></div>"#,
+            r#"<div class="b me" id="{id}"><div class="body">{body}</div><div class="m">You · {when}{to}</div></div>"#,
+            id = escape_html(&note.id),
             body = escape_html(note.body.trim()),
             when = when(&note.created_at),
             to = delivered_to(&note.delivered_to_session_id),

@@ -81,7 +81,13 @@ export function Thread({ id, controls }) {
   const scrollOnLoad = useRef(true);
   useLayoutEffect(() => {
     if (data && scrollOnLoad.current && items.current) {
-      items.current.scrollTop = items.current.scrollHeight;
+      const at = new URLSearchParams(location.search).get('at');
+      const target = at && [...items.current.querySelectorAll('[id]')].find(node => node.id === at);
+      if (target) {
+        target.scrollIntoView({block:'center'});
+        target.classList.add('thread-highlight');
+        setTimeout(() => target.classList.remove('thread-highlight'), 2000);
+      } else items.current.scrollTop = items.current.scrollHeight;
       scrollOnLoad.current = false;
     }
   }, [data]);

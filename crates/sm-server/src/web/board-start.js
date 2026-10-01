@@ -3,8 +3,23 @@ import { useEffect, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, toast, openPanel } from './ui.js';
 import { EFFORTS } from './start.js';
 
+export const canStartAnyway = (ticket) => ticket.state === 'blocked'
+  && !(ticket.warnings || []).some((warning) => ['stale', 'cycle', 'merged_not_closed'].includes(warning));
+
+export function blockedReasons(ticket) {
+  const blockers = (ticket.waits_on || []).filter((item) => item.state !== 'done').map((item) => `#${item.number}`);
+  const reasons = [];
+  if (blockers.length) reasons.push(`#${ticket.number} waits on ${blockers.join(', ')}, which ${blockers.length === 1 ? 'is' : 'are'} not done.`);
+  if ((ticket.warnings || []).includes('stale')) reasons.push('GitHub data is stale. Refresh the Board to check this ticket.');
+  if ((ticket.warnings || []).includes('cycle')) reasons.push('This ticket is in a dependency cycle. Fix its ticket links before starting.');
+  if ((ticket.warnings || []).includes('merged_not_closed')) reasons.push('A PR has merged. Close this ticket on GitHub.');
+  if (!reasons.length) reasons.push('This ticket is blocked. Refresh the Board to check why.');
+  return reasons;
+}
+
 export function startBody(ticket, form) {
   const body = { repo: ticket.repo, number: ticket.number, provider: form.provider, name: form.name, brief: form.brief };
+  if (canStartAnyway(ticket)) body.start_blocked = true;
   if (form.model) body.model = form.model;
   if (form.reasoning_effort) body.reasoning_effort = form.reasoning_effort;
   return body;
@@ -24,8 +39,10 @@ export function TicketStart({ ticket, onClose, onStarted }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   useEffect(() => {
+    if (ticket.state === 'blocked' && !canStartAnyway(ticket)) return;
     let alive = true;
     const query = new URLSearchParams({ repo: ticket.repo, number: ticket.number });
+    if (ticket.state === 'blocked') query.set('start_blocked', 'true');
     Promise.all([api(`/client/board/start-options?${query}`), api('/client/settings')])
       .then(([options, saved]) => { if (alive) { setForm(options); setSettings(saved); } })
       .catch((e) => alive && setError(e.message));
@@ -52,10 +69,13 @@ export function TicketStart({ ticket, onClose, onStarted }) {
     finally { setBusy(false); }
   };
   const choices = form && form.model && !models.includes(form.model) ? [form.model, ...models] : models;
+  const blocked = ticket.state === 'blocked';
+  const startable = !blocked || canStartAnyway(ticket);
   return html`<${Popover} onClose=${onClose} className="ticket-start">
-    <h2>Start #${ticket.number}</h2>
+    <h2>${startable ? 'Start' : 'Blocked'} #${ticket.number}</h2>
     <p class="sub">${ticket.title}</p>
-    ${form ? html`
+    ${blocked ? blockedReasons(ticket).map((reason) => html`<p>${reason}</p>`) : null}
+    ${startable && form ? html`
       <${Seg} label="Provider" value=${form.provider}
         options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
         onChange=${(provider) => set(providerDefaults(settings, provider))} />
@@ -72,9 +92,9 @@ export function TicketStart({ ticket, onClose, onStarted }) {
         <label class="fld"><span class="l">Name</span><input class="inp" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></label>
         <div class="fld"><span class="l">Workspace</span><span class="mono">${homeRelative(form.working_dir)}</span></div>
         <label class="fld top"><span class="l">First message</span><textarea class="inp" rows="6" value=${form.brief} onInput=${(e) => set({ brief: e.target.value })}></textarea></label>` : null}
-    ` : !error ? html`<p>Loading…</p>` : null}
+    ` : startable && !error ? html`<p>Loading…</p>` : null}
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
-    <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>Cancel</button>
-      <button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button></div>
+    <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable ? 'Cancel' : 'Close'}</button>
+      ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
 }

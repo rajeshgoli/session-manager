@@ -329,6 +329,11 @@ select.inp { padding: 3px 6px; }
 .critical-path { color: var(--ink-3); font-size: .867rem; padding: 0 12px 10px; }
 .board-ticket { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 12px; padding: 10px 14px; border-top: 1px solid var(--line); }
 .board-ticket.compact { flex: 1 1 20rem; border-top: 0; padding: 0; }
+.board-ticket > .links, .board-ticket > .ticket-state { grid-column: 1 / -1; }
+.board-ticket .links { min-width: 0; }
+.ticket-actions { display: flex; align-items: center; gap: 4px; }
+.ticket-state.cyan { color: var(--cyan); }
+.other-tickets > h2 { margin: 0; padding: 10px 14px; font-size: .933rem; color: var(--ink-2); }
 .ticket-clock { grid-column: 1 / -1; border: 0; padding: 0; background: none; text-align: left; cursor: pointer; display: grid; grid-template-columns: minmax(8rem, 30%) minmax(0, 1fr); gap: 12px; align-items: center; font-size: .9rem; }
 .clock-strip { height: 9px; background: var(--panel-2); position: relative; overflow: hidden; border-radius: 2px; }
 .clock-segment { position: absolute; height: 100%; background: var(--ink-3); }
@@ -371,6 +376,14 @@ select.inp { padding: 3px 6px; }
 .inbox-actions span,.reader-title { flex:1; min-width:2.667rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .doc-reader iframe { flex:1; width:100%; border:0; min-height:0; background:var(--panel); }
 .reader-bar select { max-width:6.667rem; background:var(--panel); border:1px solid var(--line); }
+.ticket-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+.ticket-reader > .seg { margin:8px 12px; align-self:flex-start; }
+.ticket-reader-content { flex:1; overflow:auto; padding:12px 18px; overflow-wrap:anywhere; }
+.ticket-reader-content h3 { margin:18px 0 8px; }
+.ticket-reader-content .ticket-markdown pre,.ticket-reader-content .ticket-markdown table { display:block; max-width:100%; overflow:auto; }
+.ticket-reader-content .ticket-markdown img { max-width:100%; height:auto; }
+.ticket-labels { display:flex; gap:6px; flex-wrap:wrap; }
+.ticket-comment { border-top:1px solid var(--line); padding:12px 0; }
 .thread-items { flex:1; overflow:auto; padding:18px; }
 .thread-items .b { border:1px solid var(--line); background:var(--panel); border-radius:10px; padding:12px; margin:10px 0; max-width:90%; overflow-wrap:anywhere; }
 .thread-items .me { margin-left:auto; background:var(--sel); white-space:pre-wrap; }
@@ -378,6 +391,7 @@ select.inp { padding: 3px 6px; }
 .thread-items .turn { border-left:3px solid var(--cyan); }
 .thread-items .turn .lbl { color:var(--cyan); font-size:.9rem; margin-bottom:6px; }
 .inbox-list h2.cyan { color:var(--cyan); }
+.thread-items .thread-highlight { background:color-mix(in srgb, var(--magenta) 18%, var(--panel)); box-shadow:0 0 0 2px var(--magenta); }
 .thread-items .m,.thread-items .ev { color:var(--ink-3); font-size:.9rem; }
 .thread-items .ev { text-align:center; margin:12px; }
 .thread-items img { max-width:100%; }
