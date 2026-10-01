@@ -4,7 +4,7 @@ import { safeThreadHtml } from './inbox.js';
 import {
   html, api, usePoll, useNow, config, age, limitText, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
-  openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
+  openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
 
@@ -192,7 +192,7 @@ const hoverText = (text) => (text.length > 1000 ? `${text.slice(0, 1000)}…` : 
 /** A finished agent is safe to retire immediately only after its current turn is idle. */
 export const canRetireImmediately = (agent) => !!agent.facts?.finished && agent.facts?.agent?.state === 'idle';
 
-/** `onRetired(true)` after a retire; `onRetired(false)` when a busy agent needs the confirmation instead. */
+/** `onRetired(true)` after a retire; `onRetired(false)` when the agent remains live. */
 export function RetireButton({ agent, onRetired, small = false }) {
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -211,7 +211,7 @@ export function RetireButton({ agent, onRetired, small = false }) {
         try {
           await api(`/sessions/${encodeURIComponent(agent.id)}/restore`, { method: 'POST', body: {} });
           toast(`Restored ${agent.name}`);
-          onRetired?.(true);
+          onRetired?.(false);
         } catch (error) { toast(error.message); }
       } } });
       setAsking(false);
@@ -229,15 +229,17 @@ export function RetireButton({ agent, onRetired, small = false }) {
   };
   const click = (event) => {
     event.stopPropagation();
-    if (canRetireImmediately(agent)) retire(true);
+    if (asking) retire();
+    else if (canRetireImmediately(agent)) retire(true);
     else setAsking(true);
   };
-  return asking
-    ? html`<span class="confirm retire-confirm" onClick=${(event) => event.stopPropagation()}>Retire ${agent.name}?
-        <button type="button" class="btn sm danger" disabled=${busy} onClick=${() => retire()}>Retire</button>
-        <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></span>`
-    : html`<button type="button" class=${`btn danger ${small ? 'sm' : ''}`} disabled=${busy}
-        onClick=${click}>Retire</button>`;
+  return html`<span class="retire-action" onClick=${(event) => event.stopPropagation()}>
+    <button type="button" class=${`btn danger ${small ? 'sm' : ''}`} disabled=${busy}
+      onClick=${click}>Retire</button>
+    ${asking ? html`<span class="retire-confirm">Retire ${agent.name}?
+      <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button>
+    </span>` : null}
+  </span>`;
 }
 
 /** The Agent, Jobs and You facts (1782 F), shared by the card and the details band. */
@@ -341,7 +343,8 @@ export function AgentsPage({ openRef }) {
   const card = (agent, depth = 0) => {
     order.push(agent);
     return html`<${AgentCard} key=${agent.id} agent=${agent} depth=${depth} now=${now} showRepo=${view === 'attention'}
-      titles=${titles} selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} onRetired=${reload} />`;
+      titles=${titles} selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload}
+      onRetired=${(done) => { if (done && selected === agent.id) closePanel(); reload(); }} />`;
   };
   const sections = view === 'attention' ? sectionAgents(sessions) : [];
   const groups = view === 'repo' ? groupAgents(sessions) : [];
@@ -523,7 +526,7 @@ export function AgentPanel({ id, controls }) {
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
-    <${AgentActions} agent=${agent} onRetired=${reload} />
+    <${AgentActions} agent=${agent} onRetired=${(done) => { if (done) closePanel(); reload(); }} />
     <${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
       prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
       jobs=${agent.jobs || []} thread=${agent.thread}
