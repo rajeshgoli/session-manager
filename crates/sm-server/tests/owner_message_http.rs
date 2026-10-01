@@ -1506,3 +1506,31 @@ async fn a_missed_turn_start_hook_still_lets_the_answer_through() {
     assert_eq!(replies.len(), 1, "{thread}");
     assert!(replies[0]["html"].as_str().unwrap().contains("All green"));
 }
+
+// ---- Stop hook's final message (sm#1863) -----------------------------------
+
+#[tokio::test]
+async fn the_stop_payloads_final_message_beats_a_stale_transcript_read() {
+    let f = fixture();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(
+            json!({"hook_event_name": "Stop", "session_manager_id": "eng00001",
+                    "last_assistant_message": "Got it. This reply is from memory.",
+                    "sm_last_message": "Previous turn's summary"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, turn) = request(&f.app, "GET", "/sessions/eng00001/last-turn", None).await;
+    assert_eq!(status, StatusCode::OK, "{turn}");
+    assert_eq!(turn["text"], "Got it. This reply is from memory.");
+
+    // Older Claude versions send no final message: the transcript text stands.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    stop_hook(&f, "eng00001", "From the transcript").await;
+    let (_, turn) = request(&f.app, "GET", "/sessions/eng00001/last-turn", None).await;
+    assert_eq!(turn["text"], "From the transcript");
+}
