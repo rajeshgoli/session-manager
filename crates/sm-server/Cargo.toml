@@ -9,11 +9,13 @@ rust-version.workspace = true
 htmd = "=0.5.5"
 markup5ever_rcdom = "0.38"
 anyhow = { workspace = true }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 axum = { workspace = true, features = ["multipart", "ws"] }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
 hmac = { workspace = true }
+instant-acme = { version = "0.8.5", features = ["rcgen"] }
 jsonwebtoken = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "poll", "resource", "signal", "term"] }
@@ -22,6 +24,7 @@ pulldown-cmark = { workspace = true }
 qrcode = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 rusqlite = { workspace = true }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

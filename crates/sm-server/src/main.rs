@@ -16,7 +16,7 @@ use sm_server::{
     queue::{QueueRecoverySummary, RetainedQueueStore},
     queue_authority::{QueueAuthorityServer, QueueAuthorityServiceIdentity},
     sessions::{expand_home, SessionStore},
-    studio_ssh,
+    studio_ssh, terminal_lan,
     usage_identity::IdentityPoller,
 };
 use tokio::net::TcpListener;
@@ -58,6 +58,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The LAN listener and ACME client both use rustls. Their dependency graph
+    // enables more than one crypto backend, so choose one before either runs.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
     let config = AppConfig::load_from_path_with_local_env(&args.config, args.local_env.as_deref())?;
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -205,6 +208,9 @@ async fn main() -> Result<()> {
     let state = AppState::try_new(config)
         .context("failed to initialize server state")?
         .with_listen_port(args.port);
+    if state.config().terminal_direct.lan.enabled {
+        tokio::spawn(terminal_lan::run(Arc::new(state.clone())));
+    }
     // Reparent lifecycle and notification delivery can take the cross-process
     // apply lock, access the retained queue, and talk to tmux.  Keep all of
     // that work on one dedicated worker: watch polling is a snapshot read and
