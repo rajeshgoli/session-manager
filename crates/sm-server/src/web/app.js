@@ -276,10 +276,15 @@ function Rail({ page, layout, updateLayout }) {
 
 // ---- usage dash (sm#1881) ------------------------------------------------------
 
-const CLAUDE_METERS = [
-  { kind: 'session_5h', label: '5-hour', short: '5h', idle: 'Starts on next use' },
-  { kind: 'weekly_all', label: 'This week', short: 'Wk', idle: 'No reading' },
-];
+// Claude always shows its two windows; Codex shows what it reports.
+const ALWAYS = {
+  claude: [
+    { window: 'five_hour', idle: 'Starts on next use' },
+    { window: 'week', idle: 'No reading' },
+  ],
+  codex: [],
+};
+const WINDOW_LABEL = { five_hour: ['5-hour', '5h'], week: ['This week', 'Wk'] };
 
 /** Today: the time; within a week: weekday and time; else the date. */
 function when(iso) {
@@ -302,7 +307,9 @@ function DashMeter({ label, short, total, queue, text, brief = text, lines = [],
   </div>`;
 }
 
-function claudeMeter(spec, meter) {
+function usageMeter(spec, meter) {
+  const [label, short] = spec.scope ? [`${spec.scope} week`, spec.scope.slice(0, 2)] : WINDOW_LABEL[spec.window];
+  spec = { ...spec, label: spec.account ? `${label} · ${spec.account}` : label, short };
   if (!meter) return { ...spec, total: 0, text: '–', lines: [[spec.idle]] };
   const pct = Math.round(meter.percent);
   const lines = [[`Resets ${when(meter.resets_at)}`]];
@@ -311,7 +318,7 @@ function claudeMeter(spec, meter) {
     : meter.pace?.kind === 'on_pace' ? ` · on pace for ${Math.round(meter.pace.percent)}% at reset` : '';
   return {
     ...spec, total: meter.percent, text: `${pct}%`, lines,
-    title: `${spec.label}: ${pct}% used · resets ${when(meter.resets_at)}${pace} · read ${when(meter.observed_at)}`,
+    title: `${spec.label}${meter.label ? ` (${meter.label})` : ''}: ${pct}% used · resets ${when(meter.resets_at)}${pace} · read ${when(meter.observed_at)}`,
   };
 }
 
@@ -321,17 +328,24 @@ function Dash() {
   const mac = host && host.available !== false ? host : null;
   const memTotal = mac && mac.memory_total_bytes;
   const memPct = (bytes) => (memTotal ? (100 * bytes) / memTotal : 0);
-  const meters = usage?.meters || [];
-  const claude = usage ? [
-    ...CLAUDE_METERS.map((spec) => claudeMeter(spec, meters.find((m) => m.kind === spec.kind))),
-    // A model-scoped week (Fable) shows only while Claude reports one.
-    ...meters.filter((m) => m.kind === 'weekly_scoped').map((m) =>
-      claudeMeter({ kind: m.kind, label: `${m.scope || 'Model'} week`, short: (m.scope || 'Md').slice(0, 2) }, m)),
-  ] : [];
+  const sections = usage ? ['claude', 'codex'].map((provider) => {
+    const mine = (usage.meters || []).filter((m) => m.provider === provider);
+    // Several accounts with current windows each name theirs.
+    const several = new Set(mine.map((m) => m.account_key)).size > 1;
+    const rows = ALWAYS[provider]
+      .filter((spec) => !mine.some((m) => m.window === spec.window && !m.scope))
+      .map((spec) => usageMeter(spec));
+    for (const m of mine) {
+      rows.push(usageMeter({ window: m.window, scope: m.scope, account: several ? (m.label || m.account_key).split('@')[0] : '' }, m));
+    }
+    const order = (m) => (m.window === 'five_hour' ? 0 : m.scope ? 2 : 1);
+    rows.sort((a, b) => order(a) - order(b));
+    return { provider, rows: rows.length ? rows : [usageMeter({ window: 'week', idle: 'No reading' })] };
+  }) : [];
   return html`<div class="dash" aria-label="Usage">
-    ${claude.length ? html`<a class="dh" href="/analytics/spend" title="Claude usage · open Analytics"
-        onClick=${(e) => { e.preventDefault(); navigate('/analytics/spend'); }}>Claude</a>
-      ${claude.map((m) => html`<${DashMeter} key=${m.label} ...${m} />`)}` : null}
+    ${sections.map(({ provider, rows }) => html`<a class="dh" href="/analytics/spend" title=${`${provider === 'claude' ? 'Claude' : 'Codex'} usage · open Analytics`}
+        onClick=${(e) => { e.preventDefault(); navigate('/analytics/spend'); }}>${provider === 'claude' ? 'Claude' : 'Codex'}</a>
+      ${rows.map((m) => html`<${DashMeter} key=${`${provider}:${m.label}`} ...${m} />`)}`)}
     ${mac ? html`<span class="dh">Mac</span>
       <${DashMeter} label="Memory" short="Mem" kind="memory" total=${memPct(mac.memory_used_bytes)}
         queue=${typeof mac.queue_memory_bytes === 'number' ? memPct(mac.queue_memory_bytes) : undefined}
