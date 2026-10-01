@@ -47,10 +47,10 @@ export function Reader({ id, controls, onBack = closePanel }) {
       setAskTarget(info);
       if (!targetInitialized.current) { setTarget(info.default); targetInitialized.current = true; }
       else setTarget(previous => previous === 'author' && !info.author?.live ? info.default : previous);
-      const thread = await fetch(`/inbox/thread/${encodeURIComponent(info.thread_key)}?format=json`);
-      if (!thread.ok) throw Error(`Work thread: ${thread.status}`);
+      const thread = await fetch(`/docs/${encodeURIComponent(docId)}/ask-items`);
+      if (!thread.ok) throw Error(`Ask items: ${thread.status}`);
       const data = await thread.json();
-      setItems((data.items || []).filter(item => item.at >= info.first_published_at));
+      setItems(data.items || []);
       setAskError('');
     } catch (e) { setAskError(e.message); }
   };

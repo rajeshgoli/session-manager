@@ -707,6 +707,25 @@ impl ThreadCatalog {
             })
     }
 
+    /// Ask previews a document's portion of a work thread without changing
+    /// read state for messages elsewhere in that thread.
+    pub(crate) fn doc_items(&self, doc_id: &str) -> Option<Vec<Value>> {
+        let (key, first_published_at) = self.doc_key(doc_id)?;
+        let first_published_at = norm(&first_published_at);
+        let now = OffsetDateTime::now_utc();
+        Some(
+            self.entries_for(&key)
+                .into_iter()
+                .filter(|entry| entry.item.at() >= first_published_at)
+                .map(|entry| {
+                    entry
+                        .item
+                        .json(&self.world, entry.sender_id.unwrap_or(""), now)
+                })
+                .collect(),
+        )
+    }
+
     fn reply_options(&self, state: &AppState, entries: &[ThreadEntry<'_>]) -> Vec<Value> {
         let mut latest = BTreeMap::<String, String>::new();
         for entry in entries {
@@ -1061,6 +1080,66 @@ mod tests {
             index.doc_key(&doc(None, "unknown"), &publish("unknown", None, at)),
             "docpath:owner/repo/docs/memo.html"
         );
+    }
+
+    #[test]
+    fn ask_items_start_at_the_docs_first_publication_without_viewing_older_messages() {
+        let first = "2026-09-01T12:00:00Z";
+        let doc = doc(Some(1785), "first");
+        let doc_id = doc.id.clone();
+        let message = |id: &str, at: &str| OwnerMessage {
+            id: id.into(),
+            human: "owner".into(),
+            sender_session_id: "first".into(),
+            sender_session_name: "First".into(),
+            title: id.into(),
+            body_markdown: id.into(),
+            blocking: false,
+            created_at: at.into(),
+            first_viewed_at: None,
+            handled_at: None,
+            handled_via: None,
+        };
+        let catalog = ThreadCatalog {
+            world: World {
+                sessions: BTreeMap::new(),
+                messages: vec![
+                    message("older", "2026-09-01T11:00:00Z"),
+                    message("newer", "2026-09-01T13:00:00Z"),
+                ],
+                replies: Vec::new(),
+                notes: Vec::new(),
+                follows: Vec::new(),
+                finished: Vec::new(),
+                agent_replies: Vec::new(),
+                marks: BTreeMap::new(),
+            },
+            work: index(),
+            docs: vec![DocData {
+                summary: crate::owner_docs::OwnerDocSummary {
+                    doc,
+                    state: crate::owner_docs::OwnerDocState::New,
+                    latest_commit_sha: "abc".into(),
+                    latest_blob_sha: "def".into(),
+                    published_at: first.into(),
+                    publish_count: 1,
+                    review_undelivered: false,
+                },
+                facts: DocInboxFacts::default(),
+                publishes: vec![publish("first", Some(1785), first)],
+                key: "ticket:owner/repo#1782".into(),
+            }],
+            ask_answer_keys: BTreeMap::new(),
+        };
+        let items = catalog.doc_items(&doc_id).unwrap();
+        assert_eq!(items.len(), 2); // The publication and the newer message.
+        assert!(items.iter().any(|item| item["id"] == "newer"));
+        assert!(!items.iter().any(|item| item["id"] == "older"));
+        assert!(catalog
+            .world
+            .messages
+            .iter()
+            .all(|message| message.first_viewed_at.is_none()));
     }
 
     #[tokio::test]
