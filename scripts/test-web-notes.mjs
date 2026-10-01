@@ -69,12 +69,19 @@ function server() {
       const note = notes.find(row => row.id === noteId);
       if (!note) return json({ detail: 'Missing' }, 404);
       if (method === 'PUT') {
+        const hold = handler.holdNextSave;
+        handler.holdNextSave = null;
+        if (hold) { handler.saveStarted?.(); await hold; }
         const input = request.postDataJSON();
         if (input.if_version !== note.version) return json(note, 409);
         note.body = input.body; note.title = input.body.split('\n')[0].replace(/^# /, '') || 'Untitled';
         note.version++; note.updated_at = stamp(); return json(note);
       }
       const snapshot = { ...note };
+      if (handler.nextLoadVersion) {
+        snapshot.version = handler.nextLoadVersion;
+        handler.nextLoadVersion = null;
+      }
       const hold = handler.holdNextLoad;
       handler.holdNextLoad = null;
       if (hold) { handler.holdStarted?.(); await hold; }
@@ -235,29 +242,33 @@ test('page, terminal pane, actions and a version conflict', async () => {
 test('late note loads do not replace edits or a newly selected note', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
-    for (const scenario of ['edit', 'selection']) {
+    for (const scenario of ['edit', 'selection', 'conflict']) {
       const context = await browser.newContext();
       const handler = server();
       await context.route('**/*', handler);
       const page = await context.newPage();
       await page.goto(`${origin}/notes`);
       await page.locator('.note-card').first().waitFor();
-      if (scenario === 'edit') {
+      if (scenario !== 'selection') {
         await page.locator('.note-card-main').first().click();
         await page.locator('.notes-editor textarea').waitFor();
+      }
+      if (scenario === 'conflict') {
+        await page.locator('.notes-editor textarea').fill('Dirty before a slow visibility check');
+        handler.nextLoadVersion = 3;
       }
       let release;
       handler.holdNextLoad = new Promise(resolve => { release = resolve; });
       const loadHeld = new Promise(resolve => { handler.holdStarted = resolve; });
       const delayedRequest = page.waitForRequest(request => request.url().endsWith('/notes/one') && request.method() === 'GET');
-      if (scenario === 'edit') await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+      if (scenario !== 'selection') await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       else await page.locator('.note-card-main').first().click();
       await delayedRequest;
       await loadHeld;
       if (scenario === 'edit') await page.locator('.notes-editor textarea').fill('Typed during a slow refresh');
       else {
         await page.locator('.note-card-main').nth(1).click();
-        await page.locator('.notes-editor textarea').waitFor();
+        await page.waitForFunction(() => document.querySelector('.notes-editor textarea')?.value.includes('Merge checklist'));
         assert.match(await page.locator('.notes-editor textarea').inputValue(), /Merge checklist/);
       }
       const delayedResponse = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'GET');
@@ -265,7 +276,65 @@ test('late note loads do not replace edits or a newly selected note', async () =
       await delayedResponse;
       assert.equal(await page.locator('.notes-editor textarea').inputValue(),
         scenario === 'edit' ? 'Typed during a slow refresh' : initial[1].body);
+      if (scenario === 'conflict') assert.equal(await page.getByRole('dialog').count(), 0);
       await context.close();
     }
+  } finally { await browser.close(); }
+});
+
+test('navigation waits for a pending save conflict', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const handler = server();
+    const firstContext = await browser.newContext();
+    const secondContext = await browser.newContext();
+    await firstContext.route('**/*', handler);
+    await secondContext.route('**/*', handler);
+    const first = await firstContext.newPage();
+    const second = await secondContext.newPage();
+    for (const page of [first, second]) {
+      await page.goto(`${origin}/notes`);
+      await page.locator('.note-card-main').first().click();
+      await page.locator('.notes-editor textarea').waitFor();
+    }
+    const newerSave = second.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await second.locator('.notes-editor textarea').fill('Saved on another device');
+    assert.equal((await newerSave).status(), 200);
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await first.locator('.notes-editor textarea').fill('Draft to preserve');
+    await first.getByText('Board', { exact: true }).first().click();
+    await saveStarted;
+    assert.equal(new URL(first.url()).pathname, '/notes');
+    release();
+    await first.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
+    assert.equal(new URL(first.url()).pathname, '/notes');
+    assert.equal(await first.locator('.notes-editor textarea').inputValue(), 'Draft to preserve');
+    await firstContext.close();
+    await secondContext.close();
+  } finally { await browser.close(); }
+});
+
+test('navigation saves text typed while an earlier save is pending', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext();
+    const handler = server();
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card-main').first().click();
+    let release;
+    handler.holdNextSave = new Promise(resolve => { release = resolve; });
+    const saveStarted = new Promise(resolve => { handler.saveStarted = resolve; });
+    await page.locator('.notes-editor textarea').fill('First edit');
+    await page.getByText('Board', { exact: true }).first().click();
+    await saveStarted;
+    await page.locator('.notes-editor textarea').fill('Second edit during save');
+    release();
+    await page.waitForURL(`${origin}/board`);
+    assert.equal(handler.notes.find(note => note.id === 'one').body, 'Second edit during save');
+    await context.close();
   } finally { await browser.close(); }
 });

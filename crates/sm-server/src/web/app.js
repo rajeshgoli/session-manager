@@ -106,18 +106,21 @@ function App() {
 
   useEffect(() => {
     let committedUrl = location.href;
-    const pop = () => {
-      if (document.querySelector('.notes-dialog')) {
+    const canLeaveNotes = async () => (await Promise.all(bus.request('notes-before-leave'))).every(Boolean);
+    const pop = async () => {
+      const targetUrl = location.href;
+      if (document.querySelector('.notes-view')) {
         history.pushState(null, '', committedUrl);
-        return;
+        if (!(await canLeaveNotes())) return;
+        history.pushState(null, '', targetUrl);
       }
       committedUrl = location.href;
       openOrigin = null; setLoc(readLocation());
     };
     window.addEventListener('popstate', pop);
     const offs = [
-      bus.on('navigate', (path) => {
-        if (document.querySelector('.notes-dialog')) return;
+      bus.on('navigate', async (path) => {
+        if (!(await canLeaveNotes())) return;
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
         if ((target && target.legacy) || build.stale) {
@@ -128,10 +131,10 @@ function App() {
         committedUrl = location.href;
         setLoc(readLocation());
       }),
-      bus.on('open', (ref) => {
+      bus.on('open', async (ref) => {
         const current = readLocation();
-        if (document.querySelector('.notes-dialog') && ref !== current.open) return;
         if (current.open === ref) return;
+        if (!(await canLeaveNotes())) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];
         const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')

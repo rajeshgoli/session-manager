@@ -1,6 +1,6 @@
 // Notes page and pane (1821 B3). The same view renders at both widths.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, toast, navigate, openPanel, stored, store } from './ui.js';
+import { html, api, bus, toast, navigate, openPanel, stored, store } from './ui.js';
 import { EFFORTS } from './start.js';
 
 const notePath = id => `/notes/${encodeURIComponent(id)}`;
@@ -133,6 +133,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const editSerial = useRef(0);
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
+  const saveRef = useRef(null);
   const search = async (q = query) => {
     const serial = ++searchSerial.current;
     try {
@@ -188,9 +189,16 @@ export function NotesView({ pane = false, onClose, onType }) {
     const visible = () => {
       if (document.hidden || !current.current.open) return;
       if (current.current.body === current.current.open.body) load(current.current.open.id);
-      else api(notePath(current.current.open.id)).then(note => {
-        if (note.version !== current.current.open.version) setConflict(note);
-      }).catch(() => {});
+      else {
+        const openAtStart = current.current.open;
+        const serial = loadSerial.current;
+        api(notePath(openAtStart.id)).then(note => {
+          if (serial === loadSerial.current && current.current.open?.id === openAtStart.id
+            && current.current.open.version === openAtStart.version
+            && current.current.body !== current.current.open.body
+            && note.version !== openAtStart.version) setConflict(note);
+        }).catch(() => {});
+      }
     };
     document.addEventListener('visibilitychange', visible);
     return () => document.removeEventListener('visibilitychange', visible);
@@ -216,6 +224,14 @@ export function NotesView({ pane = false, onClose, onType }) {
     }).catch(err => { setStatus('Save failed'); setError(err.message); return false; });
     return saving.current;
   };
+  saveRef.current = save;
+  useEffect(() => bus.on('notes-before-leave', async () => {
+    for (;;) {
+      if (await saveRef.current() === false) return false;
+      const { open: note, body: text } = current.current;
+      if (!note || text === note.body) return true;
+    }
+  }), []);
   const collapse = async () => {
     if (await save() === false) return;
     loadSerial.current++;
@@ -270,7 +286,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   };
   const selection = () => selectedText(editor.current, current.current.body);
   const cardText = id => async () => (await api(notePath(id))).body;
-  const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) { navigate('/notes'); onClose?.(); } else openPanel('notes:view'); };
+  const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) navigate('/notes'); else openPanel('notes:view'); };
   return html`<section class=${`notes-view ${pane ? 'notes-pane' : 'notes-page'}`}>
     <header class="notes-head"><h1>Notes</h1><div class="notes-tools">
       <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => setQuery(e.target.value)} />

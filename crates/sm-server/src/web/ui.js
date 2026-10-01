@@ -26,6 +26,9 @@ export const bus = {
   emit(event, data) {
     (listeners[event] || []).forEach((fn) => fn(data));
   },
+  request(event, data) {
+    return [...(listeners[event] || [])].map((fn) => fn(data));
+  },
 };
 
 /** Client-side navigation to a shell path (`/`, `/queue`, `/terminal/…`). */
