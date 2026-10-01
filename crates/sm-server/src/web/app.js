@@ -117,7 +117,7 @@ function App() {
     window.addEventListener('popstate', pop);
     const offs = [
       bus.on('navigate', (path) => {
-        if (readLocation().open === 'notes:view' && document.querySelector('.notes-dialog')) return;
+        if (document.querySelector('.notes-dialog')) return;
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
         if ((target && target.legacy) || build.stale) {
@@ -130,7 +130,7 @@ function App() {
       }),
       bus.on('open', (ref) => {
         const current = readLocation();
-        if (current.open === 'notes:view' && document.querySelector('.notes-dialog') && ref !== current.open) return;
+        if (document.querySelector('.notes-dialog') && ref !== current.open) return;
         if (current.open === ref) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];

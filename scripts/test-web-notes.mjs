@@ -74,7 +74,11 @@ function server() {
         note.body = input.body; note.title = input.body.split('\n')[0].replace(/^# /, '') || 'Untitled';
         note.version++; note.updated_at = stamp(); return json(note);
       }
-      return json(note);
+      const snapshot = { ...note };
+      const hold = handler.holdNextLoad;
+      handler.holdNextLoad = null;
+      if (hold) { handler.holdStarted?.(); await hold; }
+      return json(snapshot);
     }
     if (url.pathname.endsWith('/revisions')) return json([{ version: 1, at: stamp() }]);
     if (url.pathname === '/client/board') return json({ lanes: [{ tickets: [{ repo: 'rajeshgoli/session-manager' }] }], other: [] });
@@ -215,7 +219,53 @@ test('page, terminal pane, actions and a version conflict', async () => {
     await first.getByRole('button', { name: 'Keep mine' }).click();
     assert.equal((await forcedSave).status(), 200);
     await first.getByRole('dialog').waitFor({ state: 'hidden' });
+    const pageConflict = second.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'PUT');
+    await second.locator('.notes-editor textarea').fill('Full-page unresolved version');
+    assert.equal((await pageConflict).status(), 409);
+    await second.getByRole('dialog', { name: 'Changed on another device' }).waitFor();
+    await second.keyboard.press('g');
+    await second.keyboard.press('b');
+    assert.equal(new URL(second.url()).pathname, '/notes', 'keyboard navigation keeps the full-page conflict');
+    assert.equal(await second.getByRole('dialog').count(), 1);
     await secondContext.close();
     await context.close();
+  } finally { await browser.close(); }
+});
+
+test('late note loads do not replace edits or a newly selected note', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const scenario of ['edit', 'selection']) {
+      const context = await browser.newContext();
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      await page.goto(`${origin}/notes`);
+      await page.locator('.note-card').first().waitFor();
+      if (scenario === 'edit') {
+        await page.locator('.note-card-main').first().click();
+        await page.locator('.notes-editor textarea').waitFor();
+      }
+      let release;
+      handler.holdNextLoad = new Promise(resolve => { release = resolve; });
+      const loadHeld = new Promise(resolve => { handler.holdStarted = resolve; });
+      const delayedRequest = page.waitForRequest(request => request.url().endsWith('/notes/one') && request.method() === 'GET');
+      if (scenario === 'edit') await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+      else await page.locator('.note-card-main').first().click();
+      await delayedRequest;
+      await loadHeld;
+      if (scenario === 'edit') await page.locator('.notes-editor textarea').fill('Typed during a slow refresh');
+      else {
+        await page.locator('.note-card-main').nth(1).click();
+        await page.locator('.notes-editor textarea').waitFor();
+        assert.match(await page.locator('.notes-editor textarea').inputValue(), /Merge checklist/);
+      }
+      const delayedResponse = page.waitForResponse(response => response.url().endsWith('/notes/one') && response.request().method() === 'GET');
+      release();
+      await delayedResponse;
+      assert.equal(await page.locator('.notes-editor textarea').inputValue(),
+        scenario === 'edit' ? 'Typed during a slow refresh' : initial[1].body);
+      await context.close();
+    }
   } finally { await browser.close(); }
 });

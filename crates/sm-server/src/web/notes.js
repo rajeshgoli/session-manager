@@ -129,6 +129,8 @@ export function NotesView({ pane = false, onClose, onType }) {
   const file = useRef(null);
   const saveTimer = useRef(null);
   const searchSerial = useRef(0);
+  const loadSerial = useRef(0);
+  const editSerial = useRef(0);
   const current = useRef({ open, body }); current.current = { open, body };
   const saving = useRef(Promise.resolve(true));
   const search = async (q = query) => {
@@ -168,8 +170,15 @@ export function NotesView({ pane = false, onClose, onType }) {
   }, []);
   const load = async id => {
     if (!id) return;
+    const serial = ++loadSerial.current;
+    const editAtStart = editSerial.current;
+    const before = current.current;
     try {
       const note = await api(notePath(id));
+      if (serial !== loadSerial.current || editAtStart !== editSerial.current
+        || current.current.open?.id !== before.open?.id
+        || current.current.open?.version !== before.open?.version
+        || current.current.body !== before.body) return;
       current.current = { open: note, body: note.body };
       setOpen(note); setBody(note.body); setStatus(`Saved · ${age(note.updated_at)}`);
       setConflict(null); setHistoryRows(null); setPreview(false); setPreviewHtml('');
@@ -209,6 +218,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   };
   const collapse = async () => {
     if (await save() === false) return;
+    loadSerial.current++;
     current.current = { open: null, body: '' };
     store('sm-notes-open', '');
     setOpen(null); setBody('');
@@ -224,6 +234,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     return () => document.removeEventListener('keydown', key);
   }, [pane, conflict, open, body]);
   const edit = text => {
+    editSerial.current++;
     current.current.body = text; setBody(text); setStatus('Unsaved');
     clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => save(), 800);
   };
@@ -252,6 +263,7 @@ export function NotesView({ pane = false, onClose, onType }) {
   const restore = async version => {
     if (await save() === false) return;
     try { const note = await api(`${notePath(open.id)}/restore`, { method: 'POST', body: { version } });
+      loadSerial.current++;
       current.current = { open: note, body: note.body }; setOpen(note); setBody(note.body);
       setHistoryRows(null); setStatus('Saved · now'); search();
     } catch (err) { setError(err.message); }
@@ -285,7 +297,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     ${!pane && !compact ? html`<div class="notes-editor-slot">${open ? editorView() : html`<p class="notes-empty">Choose a note or create one.</p>`}</div>` : null}</div>
     ${conflict ? html`<div class="notes-dialog-backdrop"><div class="notes-dialog" role="dialog" aria-modal="true" aria-label="Changed on another device">
       <h2>Changed on another device</h2><p>Choose which version to keep.</p>
-      <button class="btn" onClick=${() => { current.current = { open: conflict, body: conflict.body }; setOpen(conflict); setBody(conflict.body); setConflict(null); setStatus('Saved · now'); }}>Load theirs</button>
+      <button class="btn" onClick=${() => { loadSerial.current++; current.current = { open: conflict, body: conflict.body }; setOpen(conflict); setBody(conflict.body); setConflict(null); setStatus('Saved · now'); }}>Load theirs</button>
       <button class="btn pri" onClick=${() => { const version = conflict.version; setConflict(null); save(version); }}>Keep mine</button>
     </div></div>` : null}
   </section>`;
