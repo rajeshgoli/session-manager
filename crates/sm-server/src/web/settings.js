@@ -1,11 +1,12 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg, Toggle, age } from './ui.js';
+import { html, api, config, navigate, Seg, Toggle, age } from './ui.js';
 import { tokens, tokensOf } from './handoff.js';
+import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
 
 const SECTIONS = [
-  ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'],
+  ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'], ['reviews', 'Reviews'],
   ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['about', 'About'],
 ];
 const SAMPLE = { repo: 'rajeshgoli/session-manager', number: 1706, title: 'Board Start preselects Fable', url: 'https://github.com/rajeshgoli/session-manager/issues/1706' };
@@ -133,7 +134,8 @@ export function SettingsPage() {
     <div class="settings-body" key=${selected}>
       ${selected === 'appearance' ? html`<${Appearance} />` : selected === 'context-handoff' ? html`<${Handoff} write=${write} />`
         : selected === 'notifications' ? html`<${Notifications} write=${write} />` : selected === 'devices-access' ? html`<${Devices} write=${write} />`
-        : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'queue-limits'
+        : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'reviews'
+          ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
           : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
           : html`<${NewAgents} data=${data.new_agent} write=${write} />`}</${Resource}>`}
@@ -199,9 +201,82 @@ function NewAgents({ data, write }) {
 
 function QueueLimits({ data, write }) {
   return html`<h2>Queue limits</h2><p class="sub">Changes apply without a restart. Lower limits hold new starts; running jobs continue. Reset restores the configured value shown in the field.</p>
-    <div class="settings-grid">${[['max_running', 'Total'], ['tests', 'Tests'], ['perf', 'Performance'], ['background', 'Background'], ['service', 'Service']].map(([key, label]) => html`<${Field}
+    <div class="settings-grid">${[['max_running', 'Total'], ['tests', 'Tests'], ['perf', 'Performance'], ['background', 'Background'], ['service', 'Service'], ['review', 'Review runs']].map(([key, label]) => html`<${Field}
       label=${label} type="number" min="0" max="16" initial=${data[key]} placeholder=${String(config.queue_config_limits?.[key] ?? '')} reset=${true}
       save=${value => write('/client/settings', { queue_limits: { [key]: integerLimit(value) } })} />`)}</div>`;
+}
+
+export function meterPercent(value) {
+  const n = Number(value);
+  if (value === '' || !Number.isInteger(n) || n < 50 || n > 100) throw new Error('Enter a whole number from 50 to 100.');
+  return n;
+}
+
+/** Policy rows for Settings › Reviews: every repo, then stored lane and ticket policies. */
+export function policyRows(listing, repos) {
+  const policies = listing?.policies || [];
+  const repoNames = [...new Set([...(repos || []), ...policies.filter(p => p.scope === 'repo').map(p => p.repo)])].sort();
+  return [
+    ...repoNames.map(repo => ({ scope: 'repo', repo, number: 0, policy: policies.find(p => p.scope === 'repo' && p.repo === repo) || null })),
+    ...policies.filter(p => p.scope !== 'repo').map(policy => ({ scope: policy.scope, repo: policy.repo, number: policy.number, policy })),
+  ];
+}
+
+const meterText = value => typeof value === 'number' ? `${Math.round(value)}%` : '—';
+const timeText = iso => iso ? new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+
+function Reviews({ data, write }) {
+  const [status, reloadStatus] = useResource('/client/reviews/status');
+  const [listing, reloadListing] = useResource('/review-policies');
+  const [board] = useResource('/client/board');
+  const [reviewer, setReviewer] = useState(data.reviews.reviewer);
+  const [saved, setSaved] = useState(''), [checking, setChecking] = useState(false), [editing, setEditing] = useState(null);
+  const choose = async next => {
+    setReviewer(next); setSaved('Saving…');
+    try { await write('/client/settings', { reviews: { reviewer: next } }); setSaved('Saved'); }
+    catch (e) { setSaved(e.message); }
+  };
+  const tryNow = async () => {
+    setChecking(true);
+    try { await write('/client/reviews/github-codex/check', undefined, 'POST'); setSaved('The next review request checks GitHub Codex.'); reloadStatus(); }
+    catch (e) { setSaved(e.message); } finally { setChecking(false); }
+  };
+  const github = status.data?.github_codex;
+  const day = status.data?.last_24h;
+  const rows = policyRows(listing.data, (board.data?.repos || []).map(r => r.repo));
+  const reviewed = day ? day.github_codex + day.codex_runs + day.claude_runs : 0;
+  const total = day ? reviewed + day.no_reviewer : 0;
+  return html`<h2>Reviews</h2><p class="sub">Shared with the phone. Agents run sm request-review; sm picks the reviewer below and moves to its fallback when it can't review.</p>
+    ${github?.state === 'paused' ? html`<div class="review-banner" role="status"><span class="chip amber">Paused</span>
+      <span><b>GitHub Codex is out of code-review quota</b> since ${timeText(github.paused_at)}. Reviews go to local runs.
+        ${github.next_check_at ? ` The next check is after ${timeText(github.next_check_at)}.` : ''}</span>
+      <button class="btn sm" disabled=${checking} onClick=${tryNow}>Try now</button></div>` : null}
+    <h3>Default reviewer <span class="sub">every repo, lane and ticket without its own</span></h3>
+    <${ReviewerEditor} value=${reviewer} onChange=${choose} />
+    <p role="status" class="saved">${saved}</p>
+    <h3>Narrower policies</h3>
+    <${Resource} state=${listing} retry=${reloadListing}>${() => html`<div class="review-policies">${rows.map(row => html`<div class="review-policy-row">
+      <span class="sub">${row.scope === 'repo' ? `Repo · ${row.repo.split('/').pop()}` : row.scope === 'lane' ? `Lane · ${row.repo.split('/').pop()} #${row.number}` : `Ticket ${row.repo.split('/').pop()} #${row.number}`}</span>
+      <span>${row.policy ? html`<b>${reviewerText(row.policy.reviewer)}</b> <span class="sub">${setByText(row.policy)} · falls back to ${fallbackText(row.policy.fallback)}</span>` : html`<span class="sub">Uses the default</span>`}</span>
+      ${row.scope === 'repo' ? html`<span class="anchor"><button class="btn sm" onClick=${() => setEditing(row.repo)}>${row.policy ? 'Change' : 'Set'}</button>
+        ${editing === row.repo ? html`<${PolicyPopover} scope="repo" repo=${row.repo} title=${`Reviews for ${row.repo}`} policy=${row.policy} align="right"
+          onClose=${() => setEditing(null)} onSaved=${reloadListing} />` : null}</span>`
+        : html`<button class="btn sm" onClick=${() => navigate('/board')}>Board</button>`}
+    </div>`)}</div>`}</${Resource}>
+    <h3>Limits and today</h3>
+    <div class="settings-grid">
+      <${Field} label="Review runs at once" type="number" min="0" max="16" initial=${data.queue_limits.review} placeholder="4" reset=${true}
+        hint='Queue type "review"; another run waits for a slot.' save=${value => write('/client/settings', { queue_limits: { review: integerLimit(value) } })} />
+      <${Field} label="Skip a provider at (% of its weekly meter)" type="number" min="50" max="100" initial=${data.reviews.skip_meter_percent}
+        hint=${status.data ? `Codex ${meterText(status.data.meters.codex)} · Claude ${meterText(status.data.meters.claude)} now. 100 never skips.` : '100 never skips.'}
+        save=${value => write('/client/settings', { reviews: { skip_meter_percent: meterPercent(value) } })} />
+    </div>
+    <${Resource} state=${status} retry=${reloadStatus}>${() => html`<div class="review-day">
+      <p><b>Last 24 hours: ${total}</b> <span class="sub">· GitHub Codex ${day.github_codex} · Codex runs ${day.codex_runs} · Claude runs ${day.claude_runs} · ${day.no_reviewer ? html`<span class="magenta">${day.no_reviewer} left unreviewed</span>` : 'none left unreviewed'}</span></p>
+      <div class="review-bar" aria-hidden="true">${[['github_codex', 'cyan'], ['codex_runs', 'green'], ['claude_runs', 'amber'], ['no_reviewer', 'magenta']].map(([key, color]) => day[key]
+        ? html`<i style=${`flex:${day[key]};background:var(--${color})`} title=${`${key.replace('_', ' ')}: ${day[key]}`}></i>` : null)}</div>
+      ${status.data.running.length ? html`<p class="sub">Now: ${status.data.running.map(r => `${r.repo.split('/').pop()} #${r.pr_number} · ${r.reviewer_label || 'starting'}`).join('; ')}</p>` : null}
+    </div>`}</${Resource}>`;
 }
 
 function TerminalLimits({ data, config, write }) {

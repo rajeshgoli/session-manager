@@ -52,6 +52,7 @@ const ASSETS: &[Asset] = &[
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("board.js", JS),
     asset!("board-start.js", JS),
+    asset!("reviews.js", JS),
     asset!("inbox.js", JS),
     asset!("reader.js", JS),
     asset!("history.js", JS),

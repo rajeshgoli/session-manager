@@ -94,9 +94,26 @@ export function agentFact(agent, now = Date.now()) {
 
 /** "▶ 2 running · 2h 56m", "⏸ Waiting 8m · 1st in line", or "No jobs". */
 export function jobsFact(agent) {
+  const paired = pairedText(agent.paired_reviewer);
+  if (paired) return { text: paired.text, tone: paired.active ? 'amber' : 'muted' };
   const jobs = agent.facts && agent.facts.jobs;
   if (!jobs || !jobs.tone) return { text: (jobs && jobs.text) || 'No jobs', tone: 'muted' };
   return { text: `${jobs.running > 0 ? '▶' : '⏸'} ${jobs.text}`, tone: jobs.tone };
+}
+
+/** A paired reviewer's line: reviewing a round, or idle between rounds (1768 I3). */
+export function pairedText(paired) {
+  if (!paired) return null;
+  if (['waiting_reviewer', 'reviewing', 'nudged'].includes(paired.request_state)) {
+    return { active: true, text: `Reviewing PR #${paired.pr_number} for ${paired.author_name || 'its author'} · round ${paired.round}` };
+  }
+  return { active: false, text: `Paired reviewer for #${paired.ticket} · idle` };
+}
+
+/** An author's line while sm finds and runs its review (1768 I3). */
+export function reviewWaitText(waiting, review, now = Date.now()) {
+  if (!waiting) return `Waiting on review of PR #${review.pr_number} · ${age(review.since, now)}`;
+  return `Waiting on review by ${waiting.reviewer_label || 'sm'} · ${age(waiting.since, now)}`;
 }
 
 /** The You line: an open question, else the finished summary, else nothing. */
@@ -525,7 +542,7 @@ function WorkTab({ agent, now, onAnswered }) {
       : null}
     ${reviews.length
       ? html`<section><h3>Reviews</h3><ul>${reviews.map((review) => html`<li>
-          <span class="ball amber">Codex review on PR #${review.pr_number}</span> <span class="sub">requested ${age(review.since, now)} ago</span></li>`)}</ul></section>`
+          <span class="ball amber">${reviewWaitText(agent.waiting_on_review, review, now)}</span> <span class="sub">PR #${review.pr_number} · requested ${age(review.since, now)} ago</span></li>`)}</ul></section>`
       : null}
     ${docs.length
       ? html`<section><h3>Docs</h3><ul>${docs.slice(0, 6).map((doc) => html`<li>

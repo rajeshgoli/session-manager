@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast, typingIn, Links, age } from './ui.js';
+import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age } from './ui.js';
 import { Reader } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -174,6 +174,7 @@ export function Thread({ id, controls, agent }) {
     <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => item.type === 'turn'
       ? html`<div key=${i} class="b turn"><div class="lbl">Last turn · ${new Date(item.at).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}</div><div class="md" dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} /></div>`
       : html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
+    ${(data?.review_asks || []).map(ask => html`<${ReviewAsk} key=${ask.request_id} ask=${ask} onDone=${reload} />`)}
     <div class="thread-compose">
       ${quotes.map((q,i) => html`<blockquote>${q.quote}<button class="icon-btn" disabled=${busy} title="Remove quote" onClick=${() => setQuotes(quotes.filter((_,n) => n !== i))}>×</button></blockquote>`)}
       ${data?.can_send ? html`<textarea aria-label="Reply" placeholder=${`Write to ${data.reply_to}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />
@@ -181,6 +182,24 @@ export function Thread({ id, controls, agent }) {
       ${failure ? html`<p role="alert">${failure}</p>` : null}
     </div>
   </section>`;
+}
+/** "PR #n has no reviewer" (1768 G6): run the policy again, change it, or review it yourself. */
+function ReviewAsk({ ask, onDone }) {
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState('');
+  const act = async (path, text) => {
+    setBusy(true); setFailure('');
+    try {
+      const result = await api(`/client/review-requests/${encodeURIComponent(ask.request_id)}/${path}`, { method: 'POST', body: {} });
+      toast(result.state === 'no_reviewer' ? `Still no reviewer for PR #${ask.pr_number}` : text);
+      onDone();
+    } catch (e) { setFailure(e.message); } finally { setBusy(false); }
+  };
+  return html`<div class="review-ask"><strong class="magenta">PR #${ask.pr_number} has no reviewer</strong>
+    <div class="row"><button class="btn sm pri" disabled=${busy} onClick=${() => act('retry', `Review requested again for PR #${ask.pr_number}`)}>Retry now</button>
+      <button class="btn sm" disabled=${busy} onClick=${() => navigate('/settings#reviews')}>Change policy</button>
+      <button class="btn sm" disabled=${busy} onClick=${() => act('owner', `You review PR #${ask.pr_number}; sm wakes the author when your review lands`)}>Review it myself</button></div>
+    ${failure ? html`<p role="alert" class="err">${failure}</p>` : null}</div>`;
 }
 // In another page's reading pane the thread fetches its own agent.
 function ThreadPanel({ id, controls }) {

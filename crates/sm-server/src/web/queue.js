@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, meterBand } from './ui.js';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion } from './queue-model.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
 const pct = (value) => typeof value === 'number' ? `${value.toFixed(1)}%` : '—';
@@ -15,7 +15,7 @@ export function QueuePage() {
   const now = useNow(5000);
   if (!queue) return html`<div class="content">${errorText(error) || 'Loading queue…'}</div>`;
   return html`<div class="content queue-page">${errorText(error)}
-    <div class="q-tiles">${['tests', 'background', 'perf', 'service'].map((type) => {
+    <div class="q-tiles">${['review', 'tests', 'background', 'perf', 'service'].map((type) => {
       const slot = queue.slots?.by_type?.[type];
       const waiting = queue.queued.filter((job) => job.type === type).length;
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
@@ -91,8 +91,10 @@ export function HeldBack({ stats, insightOnly = false }) {
 
 function JobRow({ job, now }) {
   const deadline = Date.parse(job.wait_deadline_at) - now;
+  const review = reviewJobText(job);
   return html`<button class="q-job" type="button" data-open-ref=${`job:${job.id}`} onClick=${() => openPanel(`job:${job.id}`)}>
-    <span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>
+    ${review ? html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${review.title} <b>${review.reviewer}</b><small>${review.detail}</small>${review.why ? html`<small class="amber">${review.why}</small>` : null}</span>`
+      : html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>`}
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}
       ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : job.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
@@ -154,7 +156,8 @@ function JobPanel({ id, controls }) {
     setRequest(created);
   });
   const sampleMax = Math.max(100, ...(usage?.samples || []).map((s) => s.cpu_percent || 0), ...(usage?.samples || []).map((s) => s.gpu_percent || 0));
-  return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${title(job)}</span>${controls}<span class="s">${job.type} · ${jobAgentLabel(job)}</span></div>
+  const review = reviewJobText(job);
+  return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${review ? `${review.title} · round ${job.review.round}` : title(job)}</span>${controls}<span class="s">${review ? job.review.reviewer_label : `${job.type} · ${jobAgentLabel(job)}`}</span></div>
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
         ${job.state === 'pending' ? html`<button class="btn" disabled=${busy} onClick=${() => perform(async () => setCheck(await api(`/client/queue/jobs/${encoded}/start-check`)))}>Start now</button>` : null}
@@ -168,6 +171,10 @@ function JobPanel({ id, controls }) {
         ${request?.status === 'completed' ? html`<div class="summary">${request.result}</div>` : null}
         ${request && ['failed', 'timed_out'].includes(request.status) ? html`<p class="err">${request.error || 'The question did not finish. Try again.'}</p>` : null}
       </section>` : null}
+      ${job.review ? html`<dl class="q-details q-review"><dt>Reviews</dt><dd><a href=${`https://github.com/${job.review.repo}/pull/${job.review.pr_number}`} target="_blank" rel="noopener">${job.review.repo} PR #${job.review.pr_number}</a> · round ${job.review.round}</dd>
+        <dt>Reviewer</dt><dd>${job.review.reviewer_label || '—'}</dd><dt>For</dt><dd>${job.review.author_name}</dd>
+        <dt>Why</dt><dd>${job.review.policy_source || 'default'} policy${job.review.why !== 'default' ? html` · <span class="amber">${job.review.why}</span>` : ''}</dd>
+        <dt>Checkout</dt><dd>${job.cwd}</dd></dl>` : null}
       <dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
