@@ -138,4 +138,17 @@ class AttentionModelsTest {
         assertEquals("1h 0m", factAge("2026-09-30T18:47:00Z", now))
         assertNull(factAge(null, now))
     }
+
+    @Test
+    fun ticketTitleIsTheTitleOfTheTicketTheRowNumbers() {
+        val claims = listOf(
+            SessionClaim(kind = "pr", repo = "rajeshgoli/session-manager", number = 1901, title = "Ticket titles on agent cards"),
+            SessionClaim(kind = "ticket", repo = "rajeshgoli/session-manager", number = 1900, title = " Show ticket titles next to agent names "),
+        )
+        val titled = agent("s1900", "sm-1900").copy(obligations = SessionObligations("s1900", claims = claims))
+        assertEquals("#1900", ticketLabel(titled))
+        assertEquals("Show ticket titles next to agent names", ticketTitle(titled))
+        assertNull(ticketTitle(agent("iter8", "iter8-run", ticket = 1858)))
+        assertNull(ticketTitle(agent("s1768", "sm-1768")))
+    }
 }

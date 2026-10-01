@@ -16,7 +16,7 @@ function load(path) {
 const agents = load(`${root}/agents.js`);
 await agents.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await agents.evaluate();
-const { sectionAgents, foldIdle, foldText, summaryCounts, agentFact, jobsFact, youFact, edgeTone, groupAgents, canRetireImmediately } = agents.namespace;
+const { sectionAgents, foldIdle, foldText, summaryCounts, agentFact, jobsFact, youFact, edgeTone, groupAgents, canRetireImmediately, ticketTitle } = agents.namespace;
 
 // Spec 1782 appendix B's worked examples, as GET /watch/state draws them at 19:47 UTC.
 const now = Date.parse('2026-09-30T19:47:00Z');
@@ -134,4 +134,15 @@ test('only a finished idle agent retires without confirmation', () => {
   assert.equal(canRetireImmediately({ ...fixtures.far, facts: {
     ...fixtures.far.facts, agent: { state: 'working' },
   } }), false);
+});
+
+test('the card title is the title of the claim the card numbers (sm#1900)', () => {
+  const claim = (kind, number, title) => ({ kind, number, title, repo: 'rajeshgoli/session-manager' });
+  assert.equal(ticketTitle({ claims: [claim('ticket', 1900, 'Show ticket titles next to agent names')] }),
+    'Show ticket titles next to agent names');
+  assert.equal(ticketTitle({ claims: [claim('pr', 1901, 'Ticket titles on agent cards'), claim('ticket', 1900, 'Other')] }),
+    'Ticket titles on agent cards');
+  assert.equal(ticketTitle({ claims: [claim('ticket', 1900, '  ')] }), '');
+  assert.equal(ticketTitle({ claims: [] }), '');
+  assert.equal(ticketTitle({}), '');
 });

@@ -123,7 +123,10 @@ fun SettingsScreen(
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
-        SettingsGroup("Appearance") { TextSizeSetting() }
+        SettingsGroup("Appearance") {
+            TextSizeSetting()
+            AgentTitlesSetting()
+        }
         ConnectionSettings(
             state,
             viewModel,
@@ -180,6 +183,22 @@ private fun TextSizeSetting() {
         valueRange = li.rajeshgo.sm.data.repository.TEXT_SCALE_MIN..li.rajeshgo.sm.data.repository.TEXT_SCALE_MAX,
         steps = 8,
     )
+}
+
+/** Ticket titles under agent names on the Agents tab (sm#1900). */
+@Composable
+private fun AgentTitlesSetting() {
+    val context = LocalContext.current
+    val settings = remember(context) { li.rajeshgo.sm.data.repository.SettingsRepository(context.applicationContext) }
+    val shown by settings.agentTitles.collectAsState(initial = true)
+    val scope = rememberCoroutineScope()
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Ticket titles on agent rows", style = MaterialTheme.typography.bodyLarge)
+            Text("Shows each agent's ticket title under its name", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+        }
+        Switch(checked = shown, onCheckedChange = { enabled -> scope.launch { settings.saveAgentTitles(enabled) } })
+    }
 }
 
 @Composable

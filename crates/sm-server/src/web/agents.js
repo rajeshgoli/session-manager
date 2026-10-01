@@ -160,6 +160,15 @@ function ticketText(agent) {
   return claims.length > 1 ? `${label} +${claims.length - 1}` : label;
 }
 
+/** The title of the claim ticketText names, shown under the agent's name (sm#1900); '' when none. */
+export function ticketTitle(agent) {
+  const first = (agent.claims || [])[0];
+  return (first && first.title && first.title.trim()) || '';
+}
+
+/** Settings › Appearance › Ticket titles; on unless turned off in this browser. */
+export const TITLES_KEY = 'sm-agent-titles';
+
 const claudeLink = (agent) => {
   const url = agent.remote_control && agent.remote_control.url;
   return url && url.startsWith('https://claude.ai/code/') ? url : null;
@@ -327,11 +336,12 @@ export function AgentsPage({ openRef }) {
     return html`<div class="content">${error ? html`<p class="err">${error.message}</p>` : html`<p class="muted">Loading…</p>`}</div>`;
   }
   const sessions = doc.sessions || [];
+  const titles = stored(TITLES_KEY, true) !== false;
   const order = [];
   const card = (agent, depth = 0) => {
     order.push(agent);
     return html`<${AgentCard} key=${agent.id} agent=${agent} depth=${depth} now=${now} showRepo=${view === 'attention'}
-      selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} onRetired=${reload} />`;
+      titles=${titles} selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload} onRetired=${reload} />`;
   };
   const sections = view === 'attention' ? sectionAgents(sessions) : [];
   const groups = view === 'repo' ? groupAgents(sessions) : [];
@@ -451,14 +461,15 @@ export function groupAgents(sessions) {
     .sort((a, b) => Number(b.busy) - Number(a.busy) || basename(a.repo).localeCompare(basename(b.repo)));
 }
 
-function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered, onRetired }) {
+function AgentCard({ agent, depth, now, showRepo, titles, selected, cursor, onAnswered, onRetired }) {
   const codex = (agent.provider || '').startsWith('codex');
   const section = sectionOf(agent);
   const faded = ['idle', 'stopped'].includes(section) && !hasTicket(agent);
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
   const tall = !!youFact(agent, now);
-  const cls = ['card', 'acard', `edge-${edgeTone(agent)}`, tall && 'tall', selected && 'sel', cursor && 'kb',
+  const title = titles ? ticketTitle(agent) : '';
+  const cls = ['card', 'acard', `edge-${edgeTone(agent)}`, tall && 'tall', title && 'titled', selected && 'sel', cursor && 'kb',
     faded && 'faded', depth && 'child'].filter(Boolean).join(' ');
   const iconButton = (title, name, action) => html`<button type="button" class="icon-btn" title=${title} aria-label=${title}
     onClick=${(event) => { event.stopPropagation(); action(); }}><${Icon} name=${name} /></button>`;
@@ -471,6 +482,7 @@ function AgentCard({ agent, depth, now, showRepo, selected, cursor, onAnswered, 
       ${live ? iconButton('Terminal (t)', 'terminal', () => openTerminal(agent)) : null}
       ${linked ? iconButton('Open in Claude (c)', 'external', () => openInClaude(agent)) : null}
     </span>
+    ${title ? html`<span class="ttl" title=${title}>${title}</span>` : null}
     <span class="ln"><span class=${`prov ${codex ? 'codex' : 'claude'}`}>${codex ? 'CODEX' : 'CLAUDE'}</span>
       <span class="tk"> ${ticketText(agent)}</span>
       ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
