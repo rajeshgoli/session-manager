@@ -14,7 +14,9 @@ pub fn resolve_target(
     doc: &OwnerDoc,
     latest_blob: &str,
 ) -> Result<Value, String> {
-    let pr = doc.pr_number.ok_or("This doc has no PR")?;
+    let Some(pr) = doc.pr_number else {
+        return resolve_without_pr(source, doc, latest_blob);
+    };
     let info = source.doc_pr_info(&doc.repo, pr)?;
     if info["state"] == "CLOSED" {
         let branch = info["headRefName"]
@@ -30,11 +32,64 @@ pub fn resolve_target(
     if info["state"] == "OPEN" {
         return Ok(json!({"kind":"reopen","pr":pr}));
     }
-    let mut branch = info["baseRefName"]
+    let branch = info["baseRefName"]
         .as_str()
-        .ok_or("PR has no base branch")?
-        .to_owned();
-    let mut after = info["mergedAt"].as_str().unwrap_or("").to_owned();
+        .ok_or("PR has no base branch")?;
+    follow_merges(
+        source,
+        doc,
+        latest_blob,
+        branch,
+        info["mergedAt"].as_str().unwrap_or(""),
+    )
+}
+
+/// A doc published from a commit (sm#1946): the one open PR that changes its
+/// file takes the review; with none, a new PR opens from the default branch,
+/// as for a merged doc.
+fn resolve_without_pr(
+    source: &dyn OwnerDocSource,
+    doc: &OwnerDoc,
+    latest_blob: &str,
+) -> Result<Value, String> {
+    let found = source.doc_open_prs(&doc.repo, &doc.path)?;
+    let prs: Vec<i64> = found["prs"]
+        .as_array()
+        .ok_or("missing open PR list")?
+        .iter()
+        .filter_map(Value::as_i64)
+        .collect();
+    match prs.as_slice() {
+        [pr] => Ok(json!({"kind":"attach","pr":pr})),
+        [] => {
+            let branch = found["default_branch"]
+                .as_str()
+                .ok_or("repo has no default branch")?;
+            follow_merges(source, doc, latest_blob, branch, "")
+                .map_err(|e| format!("No open PR changes {}, and {e}", doc.path))
+        }
+        _ => Err(format!(
+            "Open PRs {} all change {}. Ask the doc's agent to publish it on one with sm doc publish --pr.",
+            prs.iter()
+                .map(|p| format!("#{p}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            doc.path
+        )),
+    }
+}
+
+/// Follows `branch` through the PRs that merged it after `after` to where the
+/// doc now lives.
+fn follow_merges(
+    source: &dyn OwnerDocSource,
+    doc: &OwnerDoc,
+    latest_blob: &str,
+    branch: &str,
+    after: &str,
+) -> Result<Value, String> {
+    let mut branch = branch.to_owned();
+    let mut after = after.to_owned();
     let mut visited = BTreeSet::new();
     for _ in 0..10 {
         if !visited.insert(branch.clone()) {
@@ -158,6 +213,35 @@ pub(super) fn branch_state(repo: &str, branch: &str) -> Result<Value, String> {
     }
     Ok(json!({"tip":tip,"prs":rows}))
 }
+/// The default branch and the open PRs whose diff changes `path` without
+/// deleting it, reading each PR's first 100 files.
+pub(super) fn open_prs(repo: &str, path: &str) -> Result<Value, String> {
+    let (owner, name) = repo.split_once('/').ok_or("invalid repo")?;
+    let (mut prs, mut cursor) = (Vec::new(), Value::Null);
+    loop {
+        let data = gh_graphql("query($o:String!,$n:String!,$after:String){repository(owner:$o,name:$n){defaultBranchRef{name} pullRequests(states:[OPEN],first:100,after:$after){nodes{number files(first:100){nodes{path changeType}}} pageInfo{hasNextPage endCursor}}}}",json!({"o":owner,"n":name,"after":cursor}),true)?;
+        let repo = &data["repository"];
+        let page = &repo["pullRequests"];
+        prs.extend(
+            page["nodes"]
+                .as_array()
+                .ok_or("missing open PRs")?
+                .iter()
+                .filter(|pr| {
+                    pr["files"]["nodes"].as_array().is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|f| f["path"] == path && f["changeType"] != "DELETED")
+                    })
+                })
+                .map(|pr| pr["number"].clone()),
+        );
+        if page["pageInfo"]["hasNextPage"] != true {
+            return Ok(json!({"default_branch":repo["defaultBranchRef"]["name"],"prs":prs}));
+        }
+        cursor = page["pageInfo"]["endCursor"].clone();
+    }
+}
 pub(super) fn ensure_pr(
     repo: &str,
     path: &str,
@@ -240,6 +324,12 @@ pub(super) fn reopen_pr(repo: &str, pr: i64) -> Result<(), String> {
     }
 }
 
+/// Whether the review goes to a PR other than the one the reviewed revision
+/// was published on, so its comments travel as quotes in the review body.
+pub(super) fn body_only(target: &Value) -> bool {
+    matches!(target["kind"].as_str(), Some("new_pr" | "attach"))
+}
+
 /// Resolve outside the write transaction, then save this value with the submission.
 pub(super) async fn target(state: &Arc<AppState>, doc: &OwnerDoc) -> Result<Value, ApiError> {
     let latest = owner_doc_store(state)
@@ -319,7 +409,7 @@ pub(super) async fn prepare(
         target["held"] = json!(true);
         store.set_review_target(&review.id, &target)?;
     }
-    if target["kind"] == "new_pr" {
+    if body_only(&target) {
         let head = target["head_sha"]
             .as_str()
             .ok_or_else(|| conflict("missing review head"))?
@@ -340,6 +430,10 @@ pub(super) async fn prepare(
             .map_err(|e| github_failure(format!("{e:?}")))?;
             if git_blob_sha(&bytes) != blob {
                 return Err(github_failure("Document blob mismatch".into()));
+            }
+            if target["kind"] == "attach" {
+                target["doc_changed"] = json!(review.blob_sha != blob);
+                store.set_review_target(&review.id, &target)?;
             }
             store.publish_moving(
                 PublishOwnerDoc {
@@ -378,8 +472,12 @@ mod tests {
         info: Value,
         branches: BTreeMap<String, Value>,
         missing: bool,
+        open_prs: Value,
     }
     impl OwnerDocSource for Source {
+        fn doc_open_prs(&self, _: &str, _: &str) -> Result<Value, String> {
+            Ok(json!({"default_branch":"main","prs":self.open_prs}))
+        }
         fn doc_pr_info(&self, _: &str, _: i64) -> Result<Value, String> {
             Ok(self.info.clone())
         }
@@ -425,10 +523,38 @@ mod tests {
             info: json!({"state":"MERGED","baseRefName":"epic","mergedAt":"2026-01-01"}),
             branches: serde_json::from_value(branches).unwrap(),
             missing: false,
+            open_prs: json!([]),
         }
     }
     fn merged(base: &str, at: &str) -> Value {
         json!({"number":2,"state":"MERGED","baseRefName":base,"mergedAt":at,"headRefOid":"tip"})
+    }
+    #[test]
+    fn doc_without_pr_goes_to_the_one_open_pr_changing_it_else_the_default_branch() {
+        let no_pr = OwnerDoc {
+            pr_number: None,
+            ..doc()
+        };
+        let mut s = source(json!({"main":{"tip":"main-tip","prs":[]}}));
+        s.open_prs = json!([1906]);
+        assert_eq!(
+            resolve_target(&s, &no_pr, "blob").unwrap(),
+            json!({"kind":"attach","pr":1906})
+        );
+        s.open_prs = json!([]);
+        assert_eq!(
+            resolve_target(&s, &no_pr, "blob").unwrap(),
+            json!({"kind":"new_pr","base":"main","tip_sha":"main-tip","doc_changed":false})
+        );
+        s.missing = true;
+        assert_eq!(
+            resolve_target(&s, &no_pr, "blob").unwrap_err(),
+            "No open PR changes memo.html, and memo.html is not on main"
+        );
+        s.open_prs = json!([7, 9]);
+        assert!(resolve_target(&s, &no_pr, "blob")
+            .unwrap_err()
+            .starts_with("Open PRs #7, #9 all change memo.html."));
     }
     #[test]
     fn follows_deleted_or_unchanged_merged_branch_but_stops_at_open_or_new_commits() {

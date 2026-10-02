@@ -21963,6 +21963,7 @@ struct StubDocSource {
 struct FakeGitHub {
     reopen_info: Option<Value>,
     branch_state: Option<Value>,
+    open_prs: Option<Value>,
     review_target: Option<(i64, String)>,
     lose_pr_response: bool,
     /// pr number -> (state, head sha)
@@ -22048,6 +22049,14 @@ impl OwnerDocSource for StubDocSource {
             .branch_state
             .clone()
             .ok_or("branch unavailable".into())
+    }
+    fn doc_open_prs(&self, _: &str, _: &str) -> Result<Value, String> {
+        self.github
+            .lock()
+            .unwrap()
+            .open_prs
+            .clone()
+            .ok_or("open PRs unavailable".into())
     }
     fn ensure_doc_review_pr(
         &self,
@@ -24189,6 +24198,66 @@ async fn owner_doc_merged_review_retries_creation_without_duplicate_pr_or_publis
     assert_eq!(publishes.len(), 2);
     assert_eq!(publishes[0].pr_number, Some(12));
     assert_eq!(publishes[1].pr_number, Some(99));
+}
+
+#[tokio::test]
+async fn owner_doc_without_pr_review_goes_to_the_open_pr_changing_it() {
+    let sha = "a".repeat(40);
+    let head = "d".repeat(40);
+    let source = review_memo_source(&sha);
+    let (app, dir) = owner_docs_app(source.clone());
+    let (status, doc) = post_json(
+        app.clone(),
+        "/docs",
+        json!({"repo": "acme/widgets", "path": "specs/memo.html", "commit_sha": sha,
+               "session_id": "author01", "title": "Decision memo"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(doc["pr_number"], Value::Null);
+    let (status, _, page) = get_response(app.clone(), "/docs/widgets/specs/memo.html").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.contains("\"canComment\":true"), "{page}");
+    add_draft(&app, &id, &sha, json!(3), "Buy the dip.", "Why now?").await;
+    source.put("acme/widgets", "specs/memo.html", &head, b"New document");
+    {
+        let mut g = source.github.lock().unwrap();
+        g.set_pr(40, "open", &head);
+        g.open_prs = Some(json!({"default_branch":"main","prs":[40]}));
+    }
+    let (status, t) = get_json(app.clone(), &format!("/docs/{id}/reopen-target")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(t, json!({"kind":"attach","pr":40}));
+    let payload = json!({"submission_id":"no-pr-sub-001","sha":sha,"verdict":"comment"});
+    for _ in 0..2 {
+        let (status, res) =
+            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["file_comment_count"], 1);
+    }
+    let g = source.github.lock().unwrap();
+    assert!(!g
+        .calls
+        .iter()
+        .any(|c| c == "create_review_pr" || c == "reopen_pr"));
+    assert_eq!(g.reviews.len(), 1);
+    assert!(g.reviews[0].threads.is_empty());
+    assert_eq!(g.reviews[0].commit, head);
+    assert!(g.reviews[0].body.contains("written against aaaaaaa"));
+    assert!(g.reviews[0].body.contains("Why now?"));
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(store.get(&id).unwrap().unwrap().pr_number, Some(40));
+    let publishes = store.publishes(&id).unwrap();
+    assert_eq!(
+        publishes.iter().map(|p| p.pr_number).collect::<Vec<_>>(),
+        [None, Some(40)]
+    );
+    assert_eq!(
+        store.review_target("no-pr-sub-001").unwrap().unwrap()["doc_changed"],
+        true
+    );
 }
 
 #[tokio::test]
