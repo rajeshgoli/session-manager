@@ -263,6 +263,7 @@ fun BoardScreen(
     val expanded by viewModel.expanded.collectAsState()
     val resumed = rememberResumed()
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val listState = rememberLazyListState()
     var now by remember { mutableStateOf(OffsetDateTime.now()) }
     var reader by remember { mutableStateOf<ReaderPage?>(null) }
@@ -329,7 +330,8 @@ fun BoardScreen(
         },
         onOpenNeedsYou = { ticket ->
             ticket.needsYou?.let { needs ->
-                reader = ReaderPage(title = needs.text, subtitle = "#${ticket.number} ${ticket.title}", path = needs.url)
+                if (needs.kind == "elsewhere") uriHandler.openUri(needs.url)
+                else reader = ReaderPage(title = needs.text, subtitle = "#${ticket.number} ${ticket.title}", path = needs.url)
             }
         },
         onShowLane = { laneId -> showLane(laneId).takeIf { it >= 0 }?.let { scrollTo = it } },
@@ -1035,7 +1037,7 @@ private fun ticketDetails(
 ): List<Detail> {
     val details = mutableListOf<Detail>()
     ticket.needsYou?.let { needs ->
-        details += Detail(needs.text, Amber) { actions.onOpenNeedsYou(ticket) }
+        details += Detail(if (needs.kind == "elsewhere") "${needs.text} · Open" else needs.text, Amber) { actions.onOpenNeedsYou(ticket) }
         if (head != null && head.repo == ticket.repo && head.number == ticket.number) {
             details += Detail("heads the longest chain", Amber)
         }

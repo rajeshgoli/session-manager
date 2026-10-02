@@ -1923,6 +1923,7 @@ pub fn router(state: AppState) -> Router {
         .route("/merge-holds/release", post(merge_holds::release))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/board", get(board::get_board))
+        .route("/board/waiting", put(board::put_waiting))
         .route("/notes", get(notes::list).post(notes::create))
         .route("/notes/search", get(notes::search))
         .route("/notes/preview", post(notes::preview))
@@ -20185,6 +20186,179 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         // Owner pages such as /bug-reports/{id} answer in HTML.
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[test]
+    fn partner_assertion_is_owner_authority_only_for_auto_start() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.partner_access_audiences = vec!["fr-aud".into()];
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let uri: Uri = "/client/board/auto-start".parse().unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp() as usize;
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:8420".parse().unwrap());
+        for (aud, email, exp, allowed) in [
+            ("fr-aud", "rajeshgoli@gmail.com", now + 600, true),
+            ("sm-browser-aud", "rajeshgoli@gmail.com", now + 600, false),
+            ("fr-aud", "stranger@example.com", now + 600, false),
+            ("fr-aud", "", now + 600, false),
+            ("fr-aud", "rajeshgoli@gmail.com", now - 1, false),
+        ] {
+            headers.insert(
+                "x-sm-partner-assertion",
+                test_browser_access_assertion(aud, email, exp)
+                    .parse()
+                    .unwrap(),
+            );
+            let result = board::auto_start_owner_guard(&state, &headers, peer, &uri);
+            assert_eq!(result.is_ok(), allowed, "{aud} {email} {exp}: {result:?}");
+            if let Err(error) = result {
+                assert!(matches!(
+                    error,
+                    ApiError::Status {
+                        status: StatusCode::FORBIDDEN,
+                        ..
+                    }
+                ));
+            }
+            // The general board owner guard never consumes the partner header.
+            for (method, path) in [
+                ("DELETE", "/client/board/auto-start"),
+                ("PUT", "/client/board/auto-start/lane"),
+                ("POST", "/client/board/start"),
+            ] {
+                assert!(board::owner_write_guard(
+                    &state,
+                    &headers,
+                    peer,
+                    method,
+                    &path.parse().unwrap()
+                )
+                .is_err());
+            }
+        }
+        headers.insert(
+            "x-sm-partner-assertion",
+            test_browser_access_assertion("fr-aud", "rajeshgoli@gmail.com", now + 600)
+                .parse()
+                .unwrap(),
+        );
+        assert!(board::auto_start_owner_guard(
+            &state,
+            &headers,
+            "192.0.2.1:1234".parse().unwrap(),
+            &uri
+        )
+        .is_err());
+        headers.insert("x-forwarded-host", "fr.example.com".parse().unwrap());
+        assert!(board::auto_start_owner_guard(&state, &headers, peer, &uri).is_err());
+        headers.remove("x-forwarded-host");
+        // A correctly signed token from another issuer is not authority.
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("google-test-key".into());
+        let wrong_issuer = encode(
+            &header,
+            &json!({
+                "sub":"owner", "aud":"fr-aud", "iss":"https://other.cloudflareaccess.com",
+                "exp":now + 600, "iat":now, "email":"rajeshgoli@gmail.com"
+            }),
+            &EncodingKey::from_rsa_pem(test_private_key_pem()).unwrap(),
+        )
+        .unwrap();
+        headers.insert("x-sm-partner-assertion", wrong_issuer.parse().unwrap());
+        assert!(board::auto_start_owner_guard(&state, &headers, peer, &uri).is_err());
+        let signed = test_browser_access_assertion("fr-aud", "rajeshgoli@gmail.com", now + 600);
+        let (payload, signature) = signed.rsplit_once('.').unwrap();
+        let bad_signature = format!(
+            "{payload}.{}{}",
+            if signature.starts_with('A') { "B" } else { "A" },
+            &signature[1..]
+        );
+        headers.insert("x-sm-partner-assertion", bad_signature.parse().unwrap());
+        assert!(board::auto_start_owner_guard(&state, &headers, peer, &uri).is_err());
+        headers.insert("x-sm-partner-assertion", "not-a-token".parse().unwrap());
+        assert!(board::auto_start_owner_guard(&state, &headers, peer, &uri).is_err());
+    }
+
+    #[tokio::test]
+    async fn partner_assertion_route_persists_authorization() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.partner_access_audiences = vec!["fr-aud".into()];
+        config.board.repos = vec!["acme/widgets".into()];
+        config.rust_core.fixture_writes_enabled = true;
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let store = board::board_store(&state);
+        let key = ("acme/widgets".to_owned(), 1940);
+        let node = crate::board::sync::RefNode {
+            repo: key.0.clone(),
+            number: key.1,
+            title: "Partner authorization test".into(),
+            url: "https://github.com/acme/widgets/issues/1940".into(),
+            state: "open".into(),
+            state_reason: None,
+            closed_at: None,
+        };
+        store
+            .set_waiting(
+                &key,
+                Some((&node, "Test", "https://fr.example.com")),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        store
+            .set_waiting(&key, None, OffsetDateTime::now_utc())
+            .unwrap();
+        let app = router(state);
+        let token = test_browser_access_assertion("fr-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for (method, uri, payload, expected) in [
+            (
+                "PUT",
+                "/client/board/auto-start",
+                json!({"repo":key.0,"number":key.1,"provider":"claude"}),
+                StatusCode::OK,
+            ),
+            (
+                "DELETE",
+                "/client/board/auto-start?repo=acme/widgets&number=1940",
+                Value::Null,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "PUT",
+                "/client/board/auto-start/lane",
+                json!({"goal_repo":"acme/widgets","goal_number":1,"tickets":[]}),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "localhost:8420")
+                .header("content-type", "application/json")
+                .header("x-sm-partner-assertion", &token)
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "{method} {uri}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let records = store.auto_starts().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "waiting");
     }
 
     fn seed_cloudflare_access_jwks(state: &AppState) {

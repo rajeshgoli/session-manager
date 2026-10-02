@@ -97,3 +97,37 @@ fn standing_bugs_ticket_shows_its_open_bugs() {
     assert!(line.ends_with("2 open bugs"), "{line}");
     assert!(!line.contains("waits on"), "{line}");
 }
+
+#[test]
+fn waiting_cli_requires_complete_mark_or_clear() {
+    for args in [
+        vec!["sm", "board", "waiting", "12", "--clear"],
+        vec![
+            "sm",
+            "board",
+            "waiting",
+            "12",
+            "--text",
+            "Trial",
+            "--url",
+            "https://fr.example.com",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    for args in [
+        vec!["sm", "board", "waiting", "12"],
+        vec!["sm", "board", "waiting", "12", "--text", "Trial"],
+        vec![
+            "sm",
+            "board",
+            "waiting",
+            "12",
+            "--clear",
+            "--url",
+            "https://fr.example.com",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}

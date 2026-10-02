@@ -28,6 +28,16 @@ pub(crate) struct BoardArgs {
 
 #[derive(Subcommand)]
 enum BoardCommand {
+    /// Mark a ticket as waiting for the owner outside sm
+    Waiting {
+        ticket: String,
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        text: Option<String>,
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        url: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Record that TICKET starts after each BLOCKER
     After {
         ticket: String,
@@ -109,6 +119,28 @@ pub(crate) fn run_board(client: &ApiClient, args: BoardArgs) -> Result<()> {
     };
     let session_id = optional_current_session_id();
     match args.command {
+        Some(BoardCommand::Waiting {
+            ticket,
+            text,
+            url,
+            clear,
+        }) => {
+            let (repo, number) = refs.parse(&ticket).unwrap_or_else(|error| usage(&error));
+            let response = client.request(
+                "PUT",
+                "/board/waiting",
+                Some(json!({"repo":repo,"number":number,"text":text,"url":url,"clear":clear})),
+            )?;
+            let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+            if response.status != 200 {
+                refused(response.status, &body);
+            }
+            println!(
+                "#{}: waiting mark {}",
+                number,
+                if clear { "cleared" } else { "set" }
+            );
+        }
         None => {
             let mut path = "/board?format=json".to_owned();
             if let Some(lane) = args.lane.as_deref() {

@@ -107,6 +107,7 @@ pub struct Holder {
 pub enum WaitingKind {
     Message,
     Review,
+    Elsewhere,
 }
 
 /// A waiting-on-you record (D1): an unanswered blocking message, or a doc
@@ -190,6 +191,8 @@ pub struct ModelInput {
     /// `work_links`: `(repo, pr)` to the ticket numbers it is for.
     pub pr_tickets: BTreeMap<(String, i64), BTreeSet<i64>>,
     pub waiting: Vec<WaitingRecord>,
+    /// Durable ticket marks, independent of any agent.
+    pub elsewhere: BTreeMap<Key, WaitingRecord>,
     /// Repos whose reads are failing (C4).
     pub stale: BTreeSet<String>,
     /// `board_members` per lane id.
@@ -529,7 +532,11 @@ fn waiting_by_ticket(input: &ModelInput) -> BTreeMap<Key, &WaitingRecord> {
                 .push(key);
         }
     }
-    let mut result: BTreeMap<Key, &WaitingRecord> = BTreeMap::new();
+    let mut result: BTreeMap<Key, &WaitingRecord> = input
+        .elsewhere
+        .iter()
+        .map(|(key, record)| (key.clone(), record))
+        .collect();
     for record in &input.waiting {
         let mut tickets: BTreeSet<Key> = by_session
             .get(record.session_id.as_str())

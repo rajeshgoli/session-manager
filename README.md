@@ -562,6 +562,36 @@ not commit secrets, Cloudflare tokens, Google client secrets, or device CA keys.
 
 ---
 
+## Waiting outside sm and partner auto-start
+
+```bash
+sm board waiting 1940 --text "Trial 1: 20 cases waiting in fr" --url https://fr.example.com/trials/1
+sm board waiting 1940 --clear
+```
+
+The text is at most 120 characters and the link must use HTTPS. Setting a mark
+replaces the previous mark. It belongs to the ticket, survives agent retirement,
+and clears when sm observes the ticket closing or when explicitly cleared. The
+board shows **Needs you**, the text, and **Open**, with its usual count and state
+precedence. Setting it does not send an alert. Local API callers use
+`PUT /board/waiting` with `{repo, number, text, url}` or `{repo, number, clear: true}`.
+
+To let a partner forward the owner's Cloudflare Access login, configure its
+application audience tag in the installed server config:
+
+```yaml
+partner_access_audiences:
+  - "partner-application-audience-tag"
+```
+
+Only `PUT /client/board/auto-start` accepts `x-sm-partner-assertion`. It requires a
+direct loopback request with a local Host and no proxy forwarding headers. sm
+verifies the RS256 signature against `cloudflare_access.team_domain` certificates,
+issuer, configured audience, expiration, and the owner's email from
+`auth.google.allowlist_emails`. Invalid partner assertions return 403 with a
+reason. Other routes ignore the header and retain their existing authentication.
+The partner forwards the login from the owner's current request without storing it.
+
 ## Testing
 
 Rust server and CLI:
