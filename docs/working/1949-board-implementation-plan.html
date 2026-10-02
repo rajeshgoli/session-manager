@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1949 - Board implementation plan</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<style>
+@page { size: A4; margin: 17mm 17mm 18mm; }
+.memo-page { margin: 0 0 2rem; }
+.memo-page h2 { margin-top: .5rem; }
+.flow { display:grid; grid-template-columns:repeat(3,1fr); gap:.5rem; font-family:system-ui,sans-serif; margin:1rem 0; }
+.flow div { border:1px solid var(--rule); padding:.7rem; background:var(--surface-2); }
+small.ref { color:var(--ink-2); }
+td code { overflow-wrap:anywhere; }
+@media print { .memo-page { break-after:page; margin:0; } .memo-page:last-of-type { break-after:auto; } }
+@media (max-width:600px) { .flow { grid-template-columns:1fr; } table { font-size:.78rem; } }
+</style>
+<section class="memo-page">
+<h1>1949 - A quieter board that still shows the work</h1>
+<p class="meta">Implementation plan for owner review · 2 October 2026<br>Author: Codex <code>99887e19</code> (<code>sm-1949</code>) · Ticket #1949</p>
+<h2>Memo · 1. Recommended decision</h2>
+<p><b>Approve the V3 layout with explicit launch authorization, separate live indicators, and protected bulk updates.</b> A compact row shows the ticket, its agent, each current wait, and its next-launch settings. One shared editor configures selected tickets. Sol / Medium becomes one complete choice.</p>
+<p>A <b>preset</b> is a provider, exact model and reasoning effort chosen together. Effort controls how much reasoning the model is asked to do. A <b>launch preference</b> saves those choices and an optional first message without permission to start. An <b>authorization</b> is the owner's explicit permission for one ticket to start when eligible. The board calls this “Start when ready”; “armed” means that permission exists, not that a job is queued or running.</p>
+<table><thead><tr><th>Decision</th><th>Recommendation and reason</th></tr></thead><tbody>
+<tr><td>What stays visible?</td><td>Ticket state, agent activity, all current queue/review waits and their ages. These answer different operational questions.</td></tr>
+<tr><td>How does a shared edit behave?</td><td>Preview eligible and excluded tickets; save the reviewed change together. If relevant state changes, save nothing and ask for a fresh preview. This prevents stale edits replacing newer work.</td></tr>
+<tr><td>Can a future default launch work?</td><td><b>No.</b> A lane default fills configuration for future choices. It never grants permission to start unseen tickets. Explicit selections grant that permission.</td></tr>
+<tr><td>Does the mockup define new ticket creation?</td><td>Keep existing Add lane and bug reporting. Defer the illustrative “New ticket” and “Add ticket” shortcuts; a general issue-creation workflow is outside this layout change.</td></tr>
+<tr><td>What ships first?</td><td>Land supporting data and update protection, then board/shared setup, then queue confirmation and full verification. Serialize overlapping board files.</td></tr>
+</tbody></table>
+<p>The material authorization-policy departure from the mockup is its “Start new tickets when ready” lane-default switch. This plan excludes that standing authorization. The alternative grants permission to tickets that do not exist yet and needs a separate policy decision.</p>
+<div class="ruling">Approval covers the implementation described here. Until approval, this branch contains documentation only. Publishing this plan neither launches agents nor changes the live board.</div>
+</section>
+<section class="memo-page">
+<h2>2. The board remains an operational instrument</h2>
+<p>A ticket can be in progress while its agent is idle, a test runs, and a review waits. None of those facts replaces another. The server remains the authority for ticket state; the browser presents the facts it receives.</p>
+<table><thead><tr><th>Ticket and links</th><th>Agent</th><th>Work and waits</th><th>Launch</th></tr></thead><tbody>
+<tr><td>#1926 · In progress<br>Issue · PR · Inbox</td><td>sm1926<br>Idle · agent card · terminal</td><td>Tests running 2m<br>Review waiting 8m</td><td>Held<br>More actions</td></tr>
+<tr><td>#1907 · Blocked<br>After #1894</td><td>No agent</td><td>Dependency #1894<br>No queued job</td><td>Sol / Medium<br>Start when ready</td></tr>
+<tr><td>#1908 · In progress</td><td>Working</td><td>Build running 14m<br>Quiet for 5m<br>Review waiting 3m</td><td>Held<br>More actions</td></tr>
+</tbody></table>
+<p><b>Quiet</b> is the server's existing indication that a running job has shown little activity. It is not failure or completion. Show both total runtime and quiet duration. A missing timestamp reads “age unavailable”; the browser must not invent zero minutes.</p>
+<p>Stack lanes vertically with aligned columns and compact headers. Lane rank, progress, stale-data and dependency-cycle warnings remain visible. Move priority controls, review policy, End lane and shared setup into the lane menu; keep a close-ready goal's Close action visible. Critical path remains reachable from the header.</p>
+<p>On a narrow phone, each row wraps into labeled ticket, agent, work/waits and launch blocks. It does not turn the operational indicators into an overflow menu. Long titles wrap. Current waits never disappear because the ticket is in a folded group.</p>
+<p>History moves behind “Time spent” and ticket details, with the existing 3h / 6h / 24h windows. The overview still has Refresh, update age, Add lane and the existing application navigation, search, resource meters and provider meters.</p>
+<p>All work, Needs attention, Armed and Finished are presentation filters. They do not change eligibility. Selection uses the repository and ticket number, so a ticket appearing in two lanes is selected and changed once.</p>
+<div class="callout">The compact view is successful only if an idle agent with a running job and a pending review is immediately distinguishable from an idle agent with nothing moving.</div>
+</section>
+<section class="memo-page">
+<h2>3. One choice sets the complete launch</h2>
+<p>Pin <b>Sol / Medium</b> as Codex, <code>gpt-6-sol</code>, <code>medium</code>. Pin <b>Claude defaults</b> beside it; show the currently saved Claude model and effort, including “provider default” when unset. The chips show full model identifiers as well as friendly labels. A model name must not shorten to an ambiguous “Gpt”.</p>
+<div class="flow"><div><b>1. Select tickets</b><br>Choose rows or visible rows in a lane.</div><div><b>2. Shared setup</b><br>Choose a preset, launch behavior and first message once.</div><div><b>3. Review and save</b><br>See effective choices, exclusions and exceptions for every ticket.</div></div>
+<p>The shared editor has three independently explicit choices: configuration, first message and launch behavior. Each starts at “Keep each ticket's current choice.” A common value replaces only the chosen field. A ticket exception takes precedence over the common value and stays marked in the preview.</p>
+<p>For launch behavior, choose Keep current, Manual, or Start when ready. Manual cancels existing permission to auto-start; it cannot stop an agent that has already started. Start when ready explicitly grants or renews permission and resets failed attempts. Keep current never retries a failed launch.</p>
+<p>For the first message, choose Keep current, Use ticket default, or Custom text. Custom text is the exact same text for every selected ticket unless it has an exception. It is not a template engine. The normal ticket default still renders the ticket's identity at launch time. Preview each ticket's default separately.</p>
+<p>Example: select eight rows. Two are held, one is a lane goal and one has a merged-but-open warning. The editor says “8 selected · 4 eligible · 4 excluded” and lists each reason. Choose Sol / Medium once, Start when ready once, and one message. Give one eligible ticket a Claude exception. The confirmation shows three Sol launches and one Claude launch, with ready and dependency-blocked counts.</p>
+<p>For a single ready ticket, Start opens the same flat configuration fields. One click on Sol / Medium replaces the provider/model/effort sequence; the final Start click submits it. From the board that is at most three clicks: Start, Sol / Medium, Start. No expansion panel is required to see model, effort or first message.</p>
+<p>A preset click only edits a form. “Save preferences” saves configuration without starting work. “Authorize N tickets” submits Start when ready. The button describes the strongest action in a mixed selection; its preview lists cancellations and renewed failed authorizations too.</p>
+</section>
+<section class="memo-page">
+<h2>4. Defaults and existing work have different scope</h2>
+<p>A <b>future lane default</b> is the configuration suggested for tickets first seen in that lane after the default is saved. It includes provider, model, effort and first-message choice. It does not include Start when ready. Existing tickets retain their captured choice; changing defaults does not rewrite them.</p>
+<table><thead><tr><th>Action</th><th>Affects</th><th>Does not affect</th></tr></thead><tbody>
+<tr><td>Apply to selection</td><td>The previewed eligible ticket identities, with exceptions</td><td>Excluded rows, unseen tickets, lane defaults, live agents</td></tr>
+<tr><td>Save future lane default</td><td>Tickets first discovered in that lane after saving</td><td>Existing preferences, existing authorizations, lane order</td></tr>
+<tr><td>Change provider defaults</td><td>The existing Settings → New agents behavior</td><td>Previously captured explicit configurations</td></tr>
+<tr><td>Edit a review policy</td><td>The next review request at its existing scope</td><td>The implementation agent's preset or a running review</td></tr>
+</tbody></table>
+<p><b>Resolution</b> means choosing the effective settings when several sources exist. For an unconfigured ticket, preserve the existing recognized Tier choice (a named agent type written on the ticket) first, then its captured lane default, then the last recognized agent type used, then global provider defaults. Once the owner saves a ticket preference, that explicit choice wins. An existing waiting or failed auto-start authorization always displays its own stored choice until explicitly edited. Saving preferences on an armed ticket updates its future launch configuration, while preserving its current permission and attempt count.</p>
+<p>If a new ticket appears in multiple lanes at once, capture the default from the highest-priority lane that has one. Show the source lane. Later lane moves or rank changes do not silently replace the captured choice. If no lane has a default, the existing source order still applies.</p>
+<p>After installation, existing tickets are marked as already seen before any future lane defaults are applied. There is no automatic conversion into armed tickets and no rewrite of running sessions. Existing agent types remain available; the two quick presets do not rename or replace them.</p>
+<p>A preview protects against concurrent change. For example, if another tab cancels #1907 while this editor is open, Save must not re-arm it using stale data. If an agent claims it, the server rejects the stale selection before saving any selected item. The user sees which rows changed and explicitly accepts a new preview.</p>
+<div class="ruling">No bulk operation writes to an agent record. A launch preference and an authorization belong to the ticket's next launch. Existing agent controls remain separate.</div>
+</section>
+<section class="memo-page">
+<h2>5. Launch rules stay recognizable</h2>
+<p><b>Close-ready</b> means the server has found a container ticket whose parts are complete and which can be closed. The standing Bugs goal is an exception: it stays available as a collection point and offers neither Start nor Close.</p>
+<table><thead><tr><th>Current condition</th><th>Visible action</th><th>Secondary action / rule</th></tr></thead><tbody>
+<tr><td>Ready, unheld, no merged-but-open warning</td><td>Start</td><td>Start when ready can be explicitly authorized in shared setup.</td></tr>
+<tr><td>Dependency-blocked, unheld</td><td>Start when ready</td><td>Start anyway in More; confirmation names every unmet dependency.</td></tr>
+<tr><td>Blocked by stale data or cycle</td><td>Why blocked</td><td>Never Start anyway. Existing single-ticket authorization remains editable; it cannot run until the server finds readiness. New bulk authorization excludes these rows.</td></tr>
+<tr><td>Merged PR, ticket still open</td><td>Reconciliation explanation</td><td>No Start, Start anyway or new bulk authorization.</td></tr>
+<tr><td>Close-ready</td><td>Close</td><td>Start instead in More; bulk setup excludes this row.</td></tr>
+<tr><td>Needs you, held, in progress, or open PR preventing readiness</td><td>Current operational state</td><td>No launch. Idle agent activity never makes the ticket ready.</td></tr>
+<tr><td>Standing Bugs goal</td><td>Standing lane and open bug count</td><td>More actions only. No Start or Close.</td></tr>
+<tr><td>Done</td><td>History and links</td><td>No launch or ticket action menu.</td></tr>
+</tbody></table>
+<p>Goals are excluded from bulk setup even when they would individually be ready. This preserves the existing lane-selection rule; it does not remove an ordinary goal's conditional single-ticket Start.</p>
+<p>Auto-start shows distinct waiting, globally paused and failed states. Pausing does not erase permission. The existing worker tries a launch at most three times, then waits for an explicit retry. Retry shows the saved model and effort, and a renamed agent type cannot silently change them. Cancel removes permission; a historical cancelled record is not displayed as armed.</p>
+<p>Readiness is checked again at launch, including claim reservation. Two tabs or a manual start racing an automatic start produce at most one agent. Cancel and Pause wait for an already-entered launch to finish, as today; they prevent subsequent launches and do not promise to reverse one already underway.</p>
+<p>The server records early starts and adds the unmet-dependency explanation to the first message. The redesign keeps that behavior, owner authorization and the standing Bugs exception.</p>
+</section>
+<section class="memo-page">
+<h2>6. Every operational control still has a home</h2>
+<p>Ticket title opens the existing details panel. Separate Issue and PR anchors open actual GitHub pages. Agent name opens the existing agent card; terminal has its own direct action. Inbox and document links keep their destinations. Details still expose GitHub content, Session Manager history and linked appearances across lanes.</p>
+<table><thead><tr><th>Control family</th><th>Location after the change</th></tr></thead><tbody>
+<tr><td>Review choice and inheritance</td><td>Ticket/lane More → Review policy; repository/default settings remain in Settings. Precedence remains ticket, lane, repository, default. Paired reviewer and computed fallback remain visible.</td></tr>
+<tr><td>Hand off</td><td>Ticket More or agent card. Agent-and-successors versus ticket scope, auto toggle, threshold, defaults and explicit Hand off now confirmation remain.</td></tr>
+<tr><td>Agent operations</td><td>Existing card: terminal, Open in Claude when available, Retire/Restore, Clone, Follow, attach command, notes, messages, work/activity/summary.</td></tr>
+<tr><td>Queue operations</td><td>Direct job link opens the existing job panel: Cancel with note, Follow, Ask agent, agent link, logs, resource history, review detail and Start now.</td></tr>
+<tr><td>History and navigation</td><td>Time spent, ticket details and existing application navigation. Browser deep links, Back, panel layout and terminal return continue to work.</td></tr>
+</tbody></table>
+<p><b>Queue admission</b> is the decision to let a submitted job consume machine resources. Queue “Start now” overrides admission; ticket “Start anyway” overrides unmet ticket dependencies. They are distinct permissions and never share a button or request.</p>
+<div class="flow"><div><b>Read start-check</b><br>Get current job state, warnings and memory estimates.</div><div><b>Show the override</b><br>Explain capacity, ordering, cooldown and memory warnings.</div><div><b>Confirm Start now</b><br>Only for a still-pending job; then send the existing owner-only request.</div></div>
+<p>The queue confirmation displays every warning, available memory, reserved memory, estimated memory and estimate source. Unknown values stay unknown. It explains that forced work still faces runtime limits and can be requeued first under memory pressure. If the check fails, no override request is sent.</p>
+<p>The confirmation names when the check was read and expires after 30 seconds. After expiry, refresh it and confirm again. It is a snapshot, not a capacity reservation: memory can change, and the existing server revalidates job state at the actual override. A job already running or ended is refreshed instead of force-started again.</p>
+</section>
+<section class="memo-page">
+<h2>7. Delivery, evidence and review</h2>
+<p><b>The source baseline is verified for frontend parity.</b> At 20:15 UTC on 2 October, all 32 embedded frontend assets matched the installed app byte for byte. Both produced build hash <code>50dbd490e878</code>. The deployed checkout and this worktree were at <code>66dae398f896bcfef90bfef9e9b6778f65ed93ff</code>. This does not prove the installed backend binary's full commit identity.</p>
+<p>The V3 reference was retrieved from the owner-linked design commit. Its 79,583 bytes match SHA-256 <code>aece2f9a6d5534d415508708cd7256223fdfd3f3099a80ab0b6a3b4356d58c3c</code>. Its sample ages and controls are illustrative. The application will use live records and existing server decisions.</p>
+<table><thead><tr><th>Implementation slice</th><th>Deliverable and proof</th></tr></thead><tbody>
+<tr><td>Saved choices and safe updates</td><td>Preference/default storage, preview and atomic selection update, revision checks and tests for claims, cancellations, pause and stale forms.</td></tr>
+<tr><td>Board and shared launch editor</td><td>Compact responsive lanes, exact presets, selection/exception editor, independent waits and all links. Fixture screenshots and interaction tests.</td></tr>
+<tr><td>Queue confirmation and release</td><td>Start-check flow, full function/state verification, authenticated live checks, deployed asset comparison and spec graduation.</td></tr>
+</tbody></table>
+<p>After plan approval, split these into finishable implementation tickets under #1949 and record dependencies with sm board. The two board slices run in order because their files overlap. This document remains in docs/working until its implementation ships; it then moves to docs/specs with the implementing changes.</p>
+<p>Acceptance includes 390, 768 and 1440-pixel widths in light and dark themes; a ticket with simultaneous running, waiting, quiet and review indicators; all ticket-state exceptions; every link destination; retry/cancel/pause races; defaults versus overrides; multi-lane duplicates; all-or-nothing updates and duplicate-request handling. Tests must exercise actual handlers and rendered interactions, not just matching text in source.</p>
+<h3>FAQ - what changed since the last revision</h3>
+<p><b>Is this a new visual direction?</b> No. It adopts the accepted V3 stacked lanes and aligned columns. The appendices supply the code-backed behavior the illustrative mockup does not implement.</p>
+<p><b>What needs approval beyond appearance?</b> Future defaults prefill only; they never authorize unseen work. Shared saves reject stale selections as a whole. General New ticket/Add ticket shortcuts remain out of scope.</p>
+<p><b>Is anything deployed?</b> No. This is the first implementation-plan revision. Code, live settings and running agents remain unchanged.</p>
+<p><b>When can this ticket close?</b> After the approved implementation passes review, ships, and is verified in the installed app. A documentation-only PR does not close #1949.</p>
+</section>
+<hr class="appendix-divider">
+<h2>Appendices - implementation contract</h2>
+<p>Paths below are relative to the repository. Existing symbols refer to baseline <code>66dae398</code>. Proposed interfaces and tests are explicitly labeled; their names are contract anchors, not a claim that they already exist.</p>
+<h3>A. Scope and evidence</h3>
+<p>Owner reference: <a href="https://github.com/rajeshgoli/session-manager/blob/0e5c5a1cb21f5e31add9234be1dbfb040b8c8f0e/docs/working/1949-session-manager-concept-v3.html">exact V3 source</a>. Evidence: local health returned healthy; every filename in <code>http/web.rs::ASSETS</code> was fetched from installed <code>/assets/</code> and compared byte-for-byte with source; build_id reproduced using filename, zero byte, file bytes, zero byte in manifest order. No live mutations were used. Repeat before implementation and after deploy; reconcile any newer behavior into this plan before changing it.</p>
+<p>The screenshot's “launch queue” wording is not adopted as a new scheduler. Auto-start remains the existing board recomputation worker, not an entry in sm queue. Capacity figures are real queue counts. Do not transplant the mockup's duplicate function declarations, fake ticket IDs, hard-coded ages or simulated controls.</p>
+<h3>B. Complete placement map</h3>
+<p>This inventory covers the Board and every control family reached from it. Existing global pages remain intact; retaining a panel means retaining all its current controls and route behavior, not rebuilding a subset inside the board.</p>
+<table><thead><tr><th>Existing function / state</th><th>Placement and preservation rule</th><th>Code / verification anchor</th></tr></thead><tbody>
+<tr><td>App navigation, search, new agent, dashboard meters, queue/inbox/board badges, bug capture, offline/stale indicators, keyboard shortcuts</td><td>Keep shared application shell and global actions; board layout does not replace them.</td><td><code>web/app.js</code>: Rail, Dash, TopBar, Palette, useKeyboard; <code>web/bug.js</code>; existing agents/bug/terminal-route tests.</td></tr>
+<tr><td>Refresh, last update age, Add lane, empty/error/loading state</td><td>Board toolbar; background refresh still acknowledges a rendered visible snapshot only.</td><td><code>web/board.js</code>: BoardPage, AddLane; <code>http/board.rs</code>; board_http::board_seen_acks_and_withdraws.</td></tr>
+<tr><td>Lane rank, state counts, progress, goal title/link</td><td>Compact lane header. Rank/order server-owned; no client sorting that changes priority.</td><td><code>web/board.js::Lane</code>; <code>board/model.rs</code>; board_http::lane_add_duplicate_409.</td></tr>
+<tr><td>Priority up/down; End lane; conditional goal Close</td><td>Lane More for priority/end; visible Close. Preserve End confirmation and GitHub tickets. Only owner actions change order/end.</td><td>Lane, BoardPage::move/close; <code>/client/board/order</code>, <code>/lanes/{id}</code>, <code>/close</code>.</td></tr>
+<tr><td>Stale lane, cycles, critical path</td><td>Warnings always visible in header; critical path disclosure includes existing linked chain, no invented path.</td><td>Lane; <code>board/model.rs</code>, <code>board/tests.rs</code>.</td></tr>
+<tr><td>Active, blocked, done groups; other tickets and folds</td><td>Keep server row order; newest closed first; needs-you other tickets never lost to row limit. Fold only rows with no current operational activity/wait.</td><td>groupTickets, visibleOther, Fold; <code>tests/web/board.test.mjs</code> grouping cases; proposed rendered fold test.</td></tr>
+<tr><td>Ticket state, needs-you text/link, dependency reasons, sub-issue completion, standing goal, started-early mark, merged-not-closed warning</td><td>Ticket/state block; all informational states remain independently visible.</td><td>TicketRow, standingText, blockedReasons; <code>board/model.rs::TicketFacts</code>; board_http::bugs_lane_lifecycle and start rejection tests.</td></tr>
+<tr><td>Conditional Start / blocked actions / Close / Start instead / no-action done</td><td>Memo page 5 action matrix. Start anyway moves to More. Single-ticket Why blocked retains all reasons.</td><td>rowActions, canStart, canStartWhenReady, canStartAnyway; <code>http/board.rs::validate_start</code>, start; board_http::start_rechecks_readiness_after_github_fetch_before_claiming.</td></tr>
+<tr><td>Auto-start status, edit, retry, cancel, pause notice, saved type and brief</td><td>Launch column and More. Waiting/failed only count as existing authorization; paused overlays waiting, never hides failed.</td><td>WhenReadyChip; chipText, retryBody, TicketStart; <code>board/auto_start.rs</code>; <code>http/board.rs::authorization_current</code>.</td></tr>
+<tr><td>Lane Start when ready, eligible goals excluded, per-ticket configuration</td><td>Lane menu opens the shared editor scoped to that lane, with the same explicit goal exclusion. Expanded exclusions are visible.</td><td>LaneWhenReady, laneCandidates; put_auto_start_lane; board_http::auto_start_routes_store_blocked_choice_and_lane_is_all_or_nothing.</td></tr>
+<tr><td>Provider, model, effort, name, workspace, first-message preview/edit, reviewer on immediate start</td><td>Flat shared Start editor; name editing only for immediate single-ticket Start. Workspace remains server-resolved. Existing reviewer editor retained.</td><td>TicketStart, AgentFields, ReviewerRow; start_options_payload; startBody, autoStartBody.</td></tr>
+<tr><td>Bug report text, screenshot toggle, file-only/file-and-start, retry start after filing failure</td><td>Keep existing bug dialog behavior while sharing preset/field components. A launch retry never files the bug twice.</td><td>TicketStart mode=bug; bugBody, bugStartBody; <code>tests/web/bug.test.mjs</code>; board_http::bug_report_start_failure_keeps_issue.</td></tr>
+<tr><td>Ticket review policy; lane, repository and default inheritance; set-by identity/time; computed fallback</td><td>Existing review editors at same scopes; launch bulk preferences do not write review policies.</td><td><code>web/reviews.js</code>: PolicyPopover, inheritedPolicy, ReviewerEditor, reviewFallback; <code>review/policy.rs</code>; board.test.mjs inheritance/fallback cases.</td></tr>
+<tr><td>Paired reviewer provider/model/effort, next-request scope, fallback reason and reviewer identity</td><td>Ticket-only paired choice retained; agent and job panels keep author/reviewer pairing and fallback detail.</td><td>ReviewerRow; <code>web/agents.js::pairedText</code>; <code>web/queue-model.js::reviewJobText</code>; review backend tests.</td></tr>
+<tr><td>Handoff agent/successors or ticket scope, auto toggle, 1–100 threshold, token display, defaults, no-gauge message, explicit handoff now</td><td>Existing HandoffPopover and agent More. Do not add automated Codex context handoffs.</td><td><code>web/handoff.js</code>; <code>web/agents.js::MoreMenu</code>; board.test.mjs token conversion; existing handoff handler tests.</td></tr>
+<tr><td>Agent card, terminal, activity independent of ticket state</td><td>Direct row controls; holder state and timestamps come from board links. Unknown state stays unknown.</td><td><code>http/board_links.rs</code>; <code>web/ui.js::Links</code>; <code>web/agents.js::AgentPanel</code>; agents/terminal-route tests.</td></tr>
+<tr><td>Open in Claude, Retire/Restore, Clone, Follow/Unfollow, copy attach, notes, MessageBox, Work/Activity/Summary</td><td>Keep AgentPanel, AgentActions, MoreMenu, NoteEditor and tabs intact, including conditional live/stopped actions.</td><td><code>web/agents.js</code>; <code>tests/web/agents.test.mjs</code>; proposed board-to-panel interaction test.</td></tr>
+<tr><td>Issue, PR, review round/verdict/wait, Inbox thread, published docs</td><td>Actual GitHub anchors plus internal details; retain thread query position and published document revision. All concurrent reviews visible.</td><td>Links, threadHref, openItem/openPanel; <code>http/board_links.rs::BoardLinks</code>; <code>web/history.js::Ticket</code>, <code>web/reader.js</code>.</td></tr>
+<tr><td>Ticket GitHub/history tabs, body/comments/checks, related item links, multiple lanes</td><td>Existing ticket panel; add Time spent disclosure there if needed without replacing history. Board appearance links retain lane identities.</td><td><code>web/history.js::Ticket</code>; <code>board/model.rs::Row::also_in</code>; proposed deep-link interaction test.</td></tr>
+<tr><td>Clock strip, ball explanation, 3/6/24 hours, segments/gaps</td><td>Secondary Time spent disclosure. Retain segment meanings and window persistence; never use clock.ball to suppress independent current facts.</td><td>Clock, clockSegments; <code>board/clock.rs</code>, <code>http/board_clock.rs</code>; clock tests and board_http::clocked_tickets_carry_ball_text_and_segments.</td></tr>
+<tr><td>Queue running/waiting/quiet age, job link, excess jobs</td><td>Work/waits column. No noninteractive “+N jobs” hiding active facts: wrap all current jobs with their ages.</td><td>BoardLinks jobs; Links; <code>web/queue-model.js</code>; proposed concurrent job/review fixture.</td></tr>
+<tr><td>Queue slots, machine chart, held-back insight, running/waiting order, ended jobs</td><td>Existing QueuePage. Board counts must not include armed tickets as queued jobs.</td><td><code>web/queue.js</code>: QueuePage, MacChart, HeldBack, JobRow.</td></tr>
+<tr><td>Job Cancel/note, Follow, Ask agent and request state, agent link, review metadata, argv/folder/times/limits/reason, CPU/GPU charts and earlier/latest samples, last 40 log lines</td><td>Existing JobPanel retains all controls and errors.</td><td><code>web/queue.js::JobPanel</code>; <code>http/follows.rs</code>; existing queue handler tests.</td></tr>
+<tr><td>Queue Start now</td><td>Pending-only; new check/confirmation before existing POST, owner-auth retained.</td><td><code>http/follows.rs::queue_job_start_check</code>, force_start_queue_job; <code>queue.rs::QueueStartCheck</code>; proposed queue-start interaction tests.</td></tr>
+<tr><td>Panel location/layout, browser Back, terminal return, route reload, document reader</td><td>Use existing route helpers; do not replace with prototype modals or inert labels.</td><td><code>web/app.js</code>: readLocation, urlFor, Panel; <code>web/terminal-route.js</code>, reader.js; terminal-route.test.mjs.</td></tr>
+</tbody></table>
+<h3>C. Row data and responsive behavior</h3>
+<p>Use <code>state</code>, <code>holder.state</code>, <code>jobs[]</code>, and review records independently. Preserve needs_you and warning fields. Use <code>jobs[].since</code> for total running/wait age and <code>quiet_since</code> for quiet duration. Agent working age uses its provided activity timestamp; do not relabel that timestamp as an exact idle transition without backend evidence. Show Idle without an age when that transition is unavailable.</p>
+<p>Add a board <code>reviews[]</code> collection with stable request identity, repository/PR number, reviewer label, current state, and current-step <code>since</code>. Include every active internal review request and every outstanding owner document review for linked PRs. Deduplicate the same request found through holder and PR association. Keep existing singular <code>review</code> and <code>prs[].review</code> compatibility fields; the new board reads the collection. board_links.rs::choose_review currently picks one owner/Codex summary, and add_review_fields picks one active PR request; neither can be the sole source of simultaneous waits. Test two PRs, owner plus automated review, and a running test together.</p>
+<p>Display a dependency list without age when the baseline lacks a reliable dependency-wait start timestamp. This plan does not add guessed historical ages. Timestamp parsing errors and future timestamps render “age unavailable”. Ages refresh at least every 30 seconds while visible, independent of data fetch; stale/error status stays visible when fetch fails.</p>
+<p>Desktop at 1024 CSS pixels and above uses shared grid columns (ticket flexible, agent, waits, launch); 600–1023 uses two labeled rows; below 600 uses one labeled stack. All widths wrap content, never clip a wait or require page-horizontal scrolling. The 390/768/1440 checks run at default and maximum existing text size. Buttons/links have at least 40px touch targets on touch layouts, visible focus, accessible labels and text state independent of color.</p>
+<p>Keep server ordering within existing active/blocked groups. Never fold a row with a holder, current job, review wait, needs-you indication, active authorization or warning. Other blocked/done folds retain their counts and expand controls. Filters: All work = non-done plus existing completed disclosure; Needs attention = needs_you, any warnings, failed authorization or quiet/stalled indicator; Armed = waiting/failed authorization, including global pause; Finished = done. A lane stays visible if it has matching rows. Search matches repo, number, title or goal title. Selection persists across filters, with an explicit hidden-selection count; Select visible adds only rendered, unfolded matching rows. Clear selection is explicit. Counts deduplicate repo/number; filters never authorize or cancel.</p>
+<h3>D. Saved preferences and future defaults</h3>
+<p>Proposed persisted records live in the board's SQLite database, where claims and auto_starts can be checked transactionally. Version the new record format at 1 within the existing forward-only schema migration scheme. The externally observable shapes are:</p>
+<pre><code>LaunchConfig = {
+  provider: "claude" | "codex-fork",
+  model: string | null,
+  reasoning_effort: string | null,
+  brief: string | null
+}
+TicketPreference = {
+  repo, number, config: LaunchConfig, revision: integer,
+  source: "ticket" | "lane", source_lane_id: integer | null
+}
+LaneDefault = { lane_id, config: LaunchConfig, revision: integer }
+FirstSeen = { repo, number } // unique globally across board appearances
+</code></pre>
+<p>All configuration fields are required in stored records. Null model/effort means provider runtime default, not a pointer to mutable Settings. Null brief means render the current ticket default at launch; a nonempty brief is literal text. Whitespace-only custom text is rejected; the user chooses Use ticket default instead. Preserve nonblank text byte-for-byte. Existing template placeholder validation remains in Settings. There is no reviewer, workspace, agent name or authorization bit in LaunchConfig.</p>
+<p>Create the new tables without changing the existing database schema version backwards. Before enabling default writes, initialize FirstSeen for all current board facts in one transaction; record completion so this initialization is never repeated. On first discovery, use recognized ticket Tier before a lane default. Capture a lane default only if no recognized Tier supplies configuration; select the lowest rank, then lowest lane id among containing lanes with defaults. Capture concrete provider defaults when choosing Claude defaults or global settings; an explicit null remains provider default. Do not backfill a later-created lane default onto FirstSeen tickets. Old rows outside the board receive FirstSeen when first observed; this is discovery time, not GitHub issue creation time. State this in the default editor.</p>
+<p>Without stored preference/authorization, resolve configuration in this order: recognized Tier; last recognized agent type supplied by the browser's existing LAST_TYPE_KEY; current global provider defaults. The captured lane record, when present, is already a stored preference. Only waiting/failed authorization is the authoritative editable configuration over every preference. Cancelled/started rows are history and do not override preferences. Saving config-only on an authorized ticket updates that authorization's fields but preserves state, attempts and error; it does not re-arm, retry or clear pause. Save the same effective config as its ticket preference. A later explicit Start uses the saved preference as form prefill, while still requiring confirmation.</p>
+<p>Preset IDs <code>sol-medium</code> and <code>claude-defaults</code> are stable built-ins, not agent_type names. Sol is the exact triple specified in the memo. Claude resolves Settings at preview. Named agent types retain exact-match validation. A removed/edited type displays Custom while preserving the stored triple; do not silently substitute the new named value. Manage links to existing agent-type/provider settings; custom user-pinned preset CRUD is not added in this change.</p>
+<p>Proposed owner endpoints: <code>GET /client/board/launch-default?lane_id=N</code> returns default or null plus revision; <code>PUT</code> takes <code>{lane_id, expected_revision, config}</code>, with config null clearing the default. Missing expected_revision is 400; changed revision is 409, no write. The UI explicitly labels “Future discoveries in this lane only; does not authorize starts”. No default editor writes a ticket preference or auto_starts row.</p>
+<h3>E. Selection preview and commit contract</h3>
+<p>Add owner-authenticated <code>POST /client/board/launch-preview</code> and <code>PUT /client/board/launch-selection</code>. Include both in existing browser owner read/write route tests. Do not grant partner-agent write authority to these new bulk/default endpoints; preserve the existing single-ticket auto-start guard unchanged. Maximum selection is 100 distinct ticket keys, matching per-ticket exceptions only; duplicate keys or exceptions outside selection are 400. No selection means 400. Custom messages are at most 32,000 UTF-8 bytes. Validate provider/effort with current settings validators.</p>
+<pre><code>// POST launch-preview
+{
+  selection: [{repo, number}, ...],
+  common: {
+    config: {mode:"keep"} | {mode:"set", provider, model, reasoning_effort},
+    message: {mode:"keep"} | {mode:"default"} | {mode:"custom", text},
+    behavior: "keep" | "manual" | "when_ready"
+  },
+  exceptions: [{repo, number, config?, message?, behavior?}],
+  last_agent_type: string | null
+}
+// Response
+{
+  token, expires_at, selected_count, eligible_count, excluded_count,
+  items: [{repo, number, eligible, reasons:[], effective_config,
+           behavior, authorization_state, source, has_exception}],
+  ready_count, blocked_count, renew_failed_count, cancel_count,
+  auto_start_paused
+}
+// PUT launch-selection
+{request_id: UUID, token}
+// Success: same request_id returns this saved result again
+{request_id, applied:[{repo,number}], excluded:[{repo,number,reasons}],
+ authorized_count, cancelled_count, preferences_count}
+</code></pre>
+<p>Exception fields replace common fields only when present. Never merge a half-config that retains another provider's model. The token binds the complete resolved intent and the full selected key set, including excluded items; it expires after five minutes. The client does not get to submit a different plan with that token. Token signing/storage is private implementation detail. Response entries use canonical repository identity, sorted repo then number. Preview never authorizes or writes preferences.</p>
+<p>Eligibility requires an open board ticket in Ready or Blocked, no holder/reservation, no goal membership in any active lane, no open associated PR, and none of stale/cycle/merged_not_closed warnings. Report every applicable exclusion using stable reason codes <code>not_on_board, closed, lane_goal, held, open_pr, state, stale, cycle, merged_not_closed</code> plus human text. Include done/needs_you/in_progress/close_ready/standing state as detail. Dependency blocking alone is eligible. Single-ticket cancel/retry/edit remain available through the existing surface even if bulk excludes the row.</p>
+<p>Acquire the existing auto-start launch lock before the board lock, then use an immediate SQLite transaction that reads current claims/reservations, preferences, authorization records and defaults and commits all selected writes. Check affected configuration/default/settings revisions and the relevant board facts against preview before writing. Relevant facts include existence/open state, holder, associated open PRs, warnings, dependencies, goal membership and auto-start state/attempts/choice. Clock age changes, unrelated board activity and elapsed time alone do not invalidate a preview. Read claims within the write transaction rather than trusting a projection made before it: ordinary claim writes do not all hold board_lock today.</p>
+<p>If any relevant selected fact or resolved value differs, return 409 with <code>code:"selection_changed"</code> and per-key reasons, commit nothing and issue no recompute. The browser retains the draft and shows a new preview only on request; it never retries authorization automatically. Expired tokens return 409 <code>preview_expired</code>. Invalid tokens/body return 400. Authentication failures use existing 401/403 behavior. All excluded rows remain unchanged. A selection with zero eligible rows is previewable, but commit returns 409 <code>no_eligible_tickets</code>.</p>
+<p>For each eligible ticket, apply effective config/message. Behavior keep preserves absent/waiting/failed/cancelled/started permission state and attempts; manual cancels waiting/failed only; when_ready writes fresh waiting authorization with zero attempts and no last_error/session_id. Explicit when_ready can renew failed authorization and is labeled accordingly. No operation edits an existing session, claim, PR, ticket body, review policy, queue job or lane rank. Only a committed new/changed waiting authorization requests recomputation.</p>
+<p>Use monotonically increasing revisions for every authorization mutation, including cancel, failure, success, retry and legacy single/lane writes. This prevents cancel-and-rearm to identical values evading stale detection. In the same database transaction, persist request_id plus token identity and response. Retain these completion records for seven days. Duplicate request_id with the same token returns the stored response even if its preview expired; a different token returns 409. After seven days an old expired token cannot execute anew. After a timeout the browser retries the same request_id/token; it does not create another authorization. Restart tests verify this behavior.</p>
+<p>Launch serialization retains process_auto_starts' per-record recheck and claim-time reservation. Include the authorization revision in that recheck so a cancelled then re-created equal-valued record cannot reuse an old launch plan. Settings pause keeps its existing lock. Bulk transaction either precedes a claim (claim cancels/wins at subsequent launch check) or observes it and refuses; it cannot overwrite an already active holder.</p>
+<h3>F. Queue warning confirmation</h3>
+<p>Implement in <code>web/queue.js::JobPanel</code> with a small testable request controller. GET the existing start-check; it returns job_id, state, warnings[], memory_available_bytes, memory_reserve_bytes, memory_estimate_bytes, memory_estimate_source and past_runs. Render all warnings verbatim as text, never HTML. Jobs ahead is currently conveyed in warning text, not an invented structured count. Source labels distinguish declared budget and past runs; null available/estimate displays Unknown.</p>
+<p>On initial click show loading with confirmation disabled. On successful pending check show “Start now despite these admission limits?” plus warnings and memory. A zero-warning check still requires confirmation. Cancel sends no POST. A check is valid for 30 seconds from successful receipt, measured with the browser monotonic clock. On confirm after expiry, repeat GET, update the displayed facts and require another click. A polled nonpending job invalidates the check immediately. Within that interval, POST existing <code>/client/queue/jobs/{id}/start</code> once. Keep controls disabled in flight. On GET error do not POST; on POST error show it and refresh the job. Closing/reopening the panel or changing job id discards the check. Not-pending state invalidates the confirmation. Client confirmation does not alter the backend owner-only admission override or guarantee capacity remains fixed between requests.</p>
+<h3>G. Meaningful verification and ownership of requirements</h3>
+<table><thead><tr><th>Memo requirement</th><th>Implementation anchors</th><th>Required evidence</th></tr></thead><tbody>
+<tr><td>Independent operational rows, responsive layout, filters, selection</td><td>Appendix C; board.js, app.css, board_links.rs, add_review_fields</td><td>Rendered fixture tests with idle+running+waiting+quiet+two reviews; no hidden waits; 390/768/1440 light/dark and largest text; keyboard selection and focus.</td></tr>
+<tr><td>Exact presets and one shared editor</td><td>D/E; board-start.js; proposed launch selection module</td><td>Actual interaction: Start → Sol → Start ≤3 clicks; shared common fields, exceptions, exact request bodies, no request on preset click.</td></tr>
+<tr><td>Default/selection separation and inheritance</td><td>D; board storage and owner-settings readers</td><td>FirstSeen migration, new discovery, Tier precedence, duplicate lanes, rank changes, cleared defaults, provider nulls, custom text/default rendering, existing auth unchanged.</td></tr>
+<tr><td>Launch exceptions, authorization lifecycle and no overwritten work</td><td>E; auto_start.rs, http/board.rs, claims.rs</td><td>HTTP tests for every exclusion; goal in another lane; paused/failed/retry/cancel; 3 attempts; claim before transaction; claim after preview; cancel/rearm same triple; settings change; all-or-nothing rollback; repeated request after restart.</td></tr>
+<tr><td>Existing reviews, handoff, agent controls and links</td><td>B placement map</td><td>Existing review/handoff/agent tests pass; browser clicks each link/control family using fixture handlers; inherited versus own policy and paired fallback remain visible.</td></tr>
+<tr><td>Queue admission warnings</td><td>F; queue.js, follows.rs, queue.rs</td><td>Start-check error sends no POST; warning/memory rendering; cancellation; expired check needs refresh/reconfirmation; nonpending no override; duplicate-click suppression; owner auth rejection preserved.</td></tr>
+<tr><td>Delivery and installed verification</td><td>Memo page 7; deployment scripts</td><td>Isolated Rust tests, web tests, clippy and fmt; reviewed PRs; installed assets rechecked; owner-auth public board and queue read/confirmation checks without executing unwanted work.</td></tr>
+</tbody></table>
+<p>Use <code>scripts/test-rust-isolated.sh</code> through <code>sm queue run --type tests</code>. Run web tests through the queue too when combined with long checks. Required checks before implementation PRs: <code>cargo clippy -p sm-server --all-targets -- -D warnings</code> and <code>cargo fmt -p sm-server --check</code>. Browser fixture tests should load real Preact modules with intercepted HTTP, not duplicate production decision code. Fixture-only confirmations can exercise writes; live verification is read-only unless the owner has named disposable test tickets/jobs.</p>
+<p>Suggested finishable work boundaries after approval: (1) storage/defaults/preview/commit and backend race tests; (2) operational data plus compact layout and route tests; (3) shared editor/presets/default UI and interaction tests; (4) queue confirmation and release verification. Serialize (2) and (3); both touch board.js and board-start.js. Record every child under #1949 with sm board under and explicit after dependencies. Do not call #1949 complete until all four deliverables ship. A review finding that changes an owner decision returns to the memo.</p>
+<p>Deploy through <code>scripts/restart-rust-server.sh --update</code> in the deployed checkout when required; frontend assets are embedded in the Rust binary. Verify installed hashes and authenticated public-host routes, then clean build outputs with cargo clean while retaining installed binaries. Graduate this HTML to docs/specs in the shipping change, with the completed test/code anchors. The present doc-only PR does not change specs or deploy.</p>
+<h3>H. Source footnotes</h3>
+<p>[1] <code>crates/sm-server/src/web/board.js</code> and <code>board-start.js</code> define existing board actions and launch forms. [2] <code>crates/sm-server/src/http/board.rs</code>, <code>board/auto_start.rs</code> and <code>http/claims.rs</code> own authorization, recomputation and reservation. [3] <code>http/board_links.rs</code>, <code>http/board_clock.rs</code> and <code>board/model.rs</code> project live facts and history. [4] <code>web/reviews.js</code>, <code>web/handoff.js</code>, <code>web/agents.js</code> preserve the retained panels. [5] <code>web/queue.js</code>, <code>http/follows.rs</code>, <code>queue.rs::QueueStartCheck</code> expose queue controls and warnings. [6] <code>owner_settings.rs</code> supplies current agent types, provider defaults and validators. [7] <code>web/app.js</code>, <code>ui.js</code>, <code>history.js</code>, <code>reader.js</code> own navigation, links and details. All are read at the baseline in Appendix A.</p>
+<h3>Z. Implementation FAQ</h3>
+<p><b>Why not reuse the lane PUT repeatedly?</b> It has lane-local all-or-nothing writes but no cross-selection stale-preview contract. Sequential cancellation followed by authorization can partially apply and start work during a later request. The new transaction commits the complete reviewed selection.</p>
+<p><b>Why reject stale/cycle rows in bulk while retaining individual authorization?</b> The existing single-ticket form permits saving an authorization that still cannot execute until readiness returns. The V3 bulk design explicitly excludes unsafe current inputs. Keeping both preserves individual functionality and prevents broad authorization from an unreliable selection.</p>
+<p><b>Does configuration-only editing retry failures?</b> No. It preserves failed state and attempts. Only explicit Retry or Start when ready renews permission. Config-only editing of a waiting authorization can affect a future launch; the preview therefore explicitly says “updates existing authorization” and displays pause state.</p>
+<p><b>Is “Keep current” a hidden write?</b> An all-keep row causes no preference/authorization mutation and no revision bump. It is still counted as eligible in preview but response preferences_count counts changed preference rows only. Excluded rows never write. A fully all-keep selection returns a zero-change success, without recomputation.</p>
+<p><b>Does the new design show every historical job/review?</b> Current jobs and waits remain visible. Historical time and completed work stay in existing details/history surfaces; this work does not introduce a new archive.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
