@@ -213,24 +213,34 @@ pub(super) fn branch_state(repo: &str, branch: &str) -> Result<Value, String> {
     }
     Ok(json!({"tip":tip,"prs":rows}))
 }
-/// The default branch and the open PRs whose diff includes `path`, among the
-/// 100 most recently updated, each read to its first 100 files.
+/// The default branch and the open PRs whose diff changes `path` without
+/// deleting it, reading each PR's first 100 files.
 pub(super) fn open_prs(repo: &str, path: &str) -> Result<Value, String> {
     let (owner, name) = repo.split_once('/').ok_or("invalid repo")?;
-    let data = gh_graphql("query($o:String!,$n:String!){repository(owner:$o,name:$n){defaultBranchRef{name} pullRequests(states:[OPEN],first:100,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number files(first:100){nodes{path}}}}}}",json!({"o":owner,"n":name}),true)?;
-    let repo = &data["repository"];
-    let prs: Vec<Value> = repo["pullRequests"]["nodes"]
-        .as_array()
-        .ok_or("missing open PRs")?
-        .iter()
-        .filter(|pr| {
-            pr["files"]["nodes"]
+    let (mut prs, mut cursor) = (Vec::new(), Value::Null);
+    loop {
+        let data = gh_graphql("query($o:String!,$n:String!,$after:String){repository(owner:$o,name:$n){defaultBranchRef{name} pullRequests(states:[OPEN],first:100,after:$after){nodes{number files(first:100){nodes{path changeType}}} pageInfo{hasNextPage endCursor}}}}",json!({"o":owner,"n":name,"after":cursor}),true)?;
+        let repo = &data["repository"];
+        let page = &repo["pullRequests"];
+        prs.extend(
+            page["nodes"]
                 .as_array()
-                .is_some_and(|files| files.iter().any(|f| f["path"] == path))
-        })
-        .map(|pr| pr["number"].clone())
-        .collect();
-    Ok(json!({"default_branch":repo["defaultBranchRef"]["name"],"prs":prs}))
+                .ok_or("missing open PRs")?
+                .iter()
+                .filter(|pr| {
+                    pr["files"]["nodes"].as_array().is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|f| f["path"] == path && f["changeType"] != "DELETED")
+                    })
+                })
+                .map(|pr| pr["number"].clone()),
+        );
+        if page["pageInfo"]["hasNextPage"] != true {
+            return Ok(json!({"default_branch":repo["defaultBranchRef"]["name"],"prs":prs}));
+        }
+        cursor = page["pageInfo"]["endCursor"].clone();
+    }
 }
 pub(super) fn ensure_pr(
     repo: &str,
