@@ -1937,3 +1937,99 @@ async fn bug_report_refuses_agent_session() {
 }
 
 const BUGS_BODY: &str = "Standing lane for bugs filed from the sm app. sm links every open bug to this ticket so the board shows them in the Bugs lane. Leave it open; closing it makes sm start a new one with the next bug.";
+
+#[tokio::test]
+async fn elsewhere_waiting_lifecycle() {
+    let f = fixture();
+    add_goal(&f).await;
+    // A retired agent's ticket still carries a ticket-owned waiting mark.
+    f.claim(3, "gone0001");
+    let mark = |text: &str| json!({"repo": REPO, "number": 3, "text": text, "url": "https://fr.example.com/trial/1"});
+    let (status, body) = request(
+        &f.app,
+        "PUT",
+        "/board/waiting",
+        Some(mark("Trial 1: 20 cases waiting in fr")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.state.run_board_pass().unwrap();
+    let ticket = f.ticket(3).await;
+    assert_eq!(ticket["state"], "needs_you");
+    assert_eq!(
+        ticket["needs_you"],
+        json!({"kind":"elsewhere", "text":"Trial 1: 20 cases waiting in fr", "url":"https://fr.example.com/trial/1"})
+    );
+    assert_eq!(f.badge().await, 1);
+    assert_eq!(f.board_notices(), 0);
+    // Replacement, idempotent clear, and restoration after clearing.
+    assert_eq!(
+        request(&f.app, "PUT", "/board/waiting", Some(mark("Replacement")))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(f.ticket(3).await["needs_you"]["text"], "Replacement");
+    for _ in 0..2 {
+        assert_eq!(
+            request(
+                &f.app,
+                "PUT",
+                "/board/waiting",
+                Some(json!({"repo": REPO, "number": 3, "clear": true}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(f.ticket(3).await["state"], "ready");
+    }
+    request(&f.app, "PUT", "/board/waiting", Some(mark("Restored"))).await;
+    // Durable storage is readable by a fresh store, independent of sessions.
+    let store = sm_server::board::BoardStore::new(f.dir.join("message_queue.db"));
+    assert_eq!(store.input(&Default::default()).unwrap().elsewhere.len(), 1);
+    f.board.issues.lock().unwrap().get_mut(&3).unwrap().0 = false;
+    f.state.run_board_pass().unwrap();
+    assert!(store
+        .input(&Default::default())
+        .unwrap()
+        .elsewhere
+        .is_empty());
+    f.board.issues.lock().unwrap().get_mut(&3).unwrap().0 = true;
+    f.state.run_board_pass().unwrap();
+    assert_eq!(f.ticket(3).await["state"], "ready");
+}
+
+#[tokio::test]
+async fn elsewhere_waiting_validates_text_and_url() {
+    let f = fixture();
+    add_goal(&f).await;
+    for (text, url) in [
+        ("".to_owned(), "https://fr.example.com"),
+        ("x".repeat(121), "https://fr.example.com"),
+        ("Trial".into(), "http://fr.example.com"),
+        ("Trial".into(), "javascript:alert(1)"),
+    ] {
+        let (status, _) = request(
+            &f.app,
+            "PUT",
+            "/board/waiting",
+            Some(json!({"repo": REPO,"number":3,"text":text,"url":url})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(request(&f.app, "PUT", "/board/waiting", Some(json!({"repo":REPO,"number":3,"text":"é".repeat(120),"url":"https://fr.example.com"}))).await.0, StatusCode::OK);
+    f.board.issues.lock().unwrap().get_mut(&3).unwrap().0 = false;
+    assert_eq!(
+        request(
+            &f.app,
+            "PUT",
+            "/board/waiting",
+            Some(json!({"repo":REPO,"number":3,"text":"Closed","url":"https://fr.example.com"}))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}

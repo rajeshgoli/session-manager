@@ -151,6 +151,10 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             authorized_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
         );
+        CREATE TABLE IF NOT EXISTS board_waiting (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, text TEXT NOT NULL,
+            url TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(repo, number)
+        );
         CREATE TABLE IF NOT EXISTS board_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -386,6 +390,29 @@ impl BoardStore {
 
     pub fn ensure_schema(&self) -> Result<()> {
         self.open_write().map(|_| ())
+    }
+
+    /// Set or clear a durable mark. The route resolves the ticket before setting it.
+    pub fn set_waiting(
+        &self,
+        key: &Key,
+        mark: Option<(&RefNode, &str, &str)>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction()?;
+        if let Some((node, text, url)) = mark {
+            upsert_ref(&tx, node, &format_ts(now))?;
+            tx.execute("INSERT OR REPLACE INTO board_waiting(repo, number, text, url, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![key.0, key.1, text, url, format_ts(now)])?;
+        } else {
+            tx.execute(
+                "DELETE FROM board_waiting WHERE repo = ?1 AND number = ?2",
+                params![key.0, key.1],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The standing Bugs ticket, if sm has made one.
@@ -706,6 +733,10 @@ impl BoardStore {
             }
             let closed = node.as_ref().is_none_or(|node| node.state != "open");
             if closed {
+                tx.execute(
+                    "DELETE FROM board_waiting WHERE repo = ?1 AND number = ?2",
+                    params![repo, number],
+                )?;
                 tx.execute(
                     "DELETE FROM board_edges WHERE waiter_repo = ?1 AND waiter_number = ?2",
                     params![repo, number],
@@ -1192,6 +1223,12 @@ pub fn record_event(
 }
 
 fn upsert_ref(conn: &Connection, node: &RefNode, now: &str) -> Result<()> {
+    if node.state == "closed" {
+        conn.execute(
+            "DELETE FROM board_waiting WHERE repo = ?1 AND number = ?2",
+            params![node.repo, node.number],
+        )?;
+    }
     let closed_at = if node.state == "open" {
         None
     } else {
@@ -1569,6 +1606,26 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
         input.bugs_goal = bugs_goal(conn)?;
     }
     input.waiting = outside.waiting.clone();
+    if table_exists(conn, "board_waiting")? {
+        let mut statement =
+            conn.prepare("SELECT repo, number, text, url, created_at FROM board_waiting")?;
+        for entry in statement.query_map([], |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?),
+                WaitingRecord {
+                    kind: model::WaitingKind::Elsewhere,
+                    session_id: String::new(),
+                    pr: None,
+                    text: row.get(2)?,
+                    url: row.get(3)?,
+                    created_at: row.get(4)?,
+                },
+            ))
+        })? {
+            let (key, record) = entry?;
+            input.elsewhere.insert(key, record);
+        }
+    }
     let syncs = repo_syncs(conn)?;
     input.stale = syncs
         .iter()

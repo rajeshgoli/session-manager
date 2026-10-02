@@ -801,6 +801,77 @@ pub(super) struct PostLinkRequest {
     session_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub(super) struct WaitingRequest {
+    repo: String,
+    number: i64,
+    text: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+pub(super) async fn put_waiting(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<WaitingRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/board/waiting")?;
+    ensure_core_writes_enabled(&state)?;
+    let key = ticket_key(&payload.repo, payload.number)?;
+    let text = payload.text.unwrap_or_default();
+    let url = payload.url.unwrap_or_default();
+    if !payload.clear {
+        if text.trim().is_empty() || text.chars().count() > 120 {
+            return Err(bad_request("text must contain 1 to 120 characters"));
+        }
+        if !url.parse::<Uri>().ok().is_some_and(|u| {
+            u.scheme_str() == Some("https") && u.host().is_some_and(|host| !host.is_empty())
+        }) {
+            return Err(bad_request("url must be an https URL"));
+        }
+    }
+    blocking(&state, move |state| {
+        let node = if payload.clear {
+            None
+        } else {
+            let resolved = state
+                .board_source
+                .resolve(std::slice::from_ref(&key))
+                .map_err(|error| ApiError::Status {
+                    status: StatusCode::BAD_GATEWAY,
+                    detail: error,
+                })?;
+            let issue = resolved
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| ApiError::Status {
+                    status: StatusCode::NOT_FOUND,
+                    detail: "Ticket not found".into(),
+                })?;
+            if issue.node.state != "open" {
+                return Err(bad_request("Ticket is closed"));
+            }
+            Some(issue.node)
+        };
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        board_store(state).set_waiting(
+            &key,
+            node.as_ref().map(|n| (n, text.as_str(), url.as_str())),
+            time::OffsetDateTime::now_utc(),
+        )?;
+        request_recompute(state);
+        Ok(json!({"cleared": payload.clear}))
+    })
+    .await
+    .map(Json)
+}
+
 /// `POST /board/links` (C5).
 pub(super) async fn post_link(
     State(state): State<Arc<AppState>>,
@@ -1456,6 +1527,79 @@ fn validate_auto_choice(
     Ok(key)
 }
 
+pub(super) fn auto_start_owner_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    uri: &Uri,
+) -> Result<(), ApiError> {
+    let Some(value) = headers.get("x-sm-partner-assertion") else {
+        return owner_write_guard(state, headers, peer_addr, "PUT", uri);
+    };
+    let denied = |reason: &str| ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: format!("Partner login: {reason}"),
+    };
+    // The public tunnel also connects over loopback: require a local host
+    // and reject forwarding headers so it cannot widen this exception.
+    if !is_local_bypass_request(headers, Some(peer_addr), &state.config)
+        || [
+            "forwarded",
+            "x-forwarded-host",
+            "x-forwarded-for",
+            "cf-connecting-ip",
+        ]
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(denied("a direct loopback request is required"));
+    }
+    let assertion = value.to_str().map_err(|_| denied("malformed assertion"))?;
+    if state.config.partner_access_audiences.is_empty() {
+        return Err(denied("no partner audiences are configured"));
+    }
+    let issuer = state
+        .config
+        .cloudflare_access
+        .expected_issuer()
+        .ok_or_else(|| denied("Cloudflare team is not configured"))?;
+    let kid =
+        cloudflare_access_assertion_key_id(assertion).map_err(|_| denied("malformed assertion"))?;
+    let had_cached = cloudflare_access_has_cached_jwks(state, &issuer);
+    let mut jwks = cloudflare_access_cached_jwks(state, &issuer, false)
+        .map_err(|_| denied("could not load team certificates"))?;
+    if jwks.find(&kid).is_none()
+        && had_cached
+        && cloudflare_access_mark_unknown_key_refresh_if_allowed(state, &issuer)
+    {
+        jwks = cloudflare_access_cached_jwks(state, &issuer, true)
+            .map_err(|_| denied("could not refresh team certificates"))?;
+    }
+    let claims = state
+        .config
+        .partner_access_audiences
+        .iter()
+        .find_map(|audience| {
+            crate::cloudflare_access::verify_cloudflare_access_assertion_with_jwks(
+                assertion, &issuer, audience, &jwks,
+            )
+            .ok()
+        })
+        .ok_or_else(|| denied("invalid signature, issuer, audience, or token lifetime"))?;
+    // The shared verifier permits clock skew; partner authority must be unexpired.
+    if claims.exp as i128 <= time::OffsetDateTime::now_utc().unix_timestamp() as i128 {
+        return Err(denied("assertion has expired"));
+    }
+    if !claims
+        .email
+        .as_deref()
+        .is_some_and(|email| allowlisted_google_email(&state.config, email))
+    {
+        return Err(denied("owner email is required"));
+    }
+    Ok(())
+}
+
 pub(super) async fn put_auto_start(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1463,7 +1607,10 @@ pub(super) async fn put_auto_start(
     headers: HeaderMap,
     Json(mut choice): Json<board::auto_start::Choice>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_write_guard(&state, &headers, peer_addr, "PUT", &uri)?;
+    blocking(&state, move |state| {
+        auto_start_owner_guard(state, &headers, peer_addr, &uri)
+    })
+    .await?;
     ensure_core_writes_enabled(&state)?;
     let _launch_guard = state.board_auto_start_gate.lock().await;
     blocking(&state, move |state| {

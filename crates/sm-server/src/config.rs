@@ -36,6 +36,7 @@ pub struct AppConfig {
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub cloudflare_access: CloudflareAccessConfig,
+    pub partner_access_audiences: Vec<String>,
     pub public_edge: PublicEdgeConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub terminal_direct: TerminalDirectConfig,
@@ -96,6 +97,7 @@ impl Default for AppConfig {
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
             cloudflare_access: CloudflareAccessConfig::default(),
+            partner_access_audiences: Vec::new(),
             public_edge: PublicEdgeConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
             terminal_direct: TerminalDirectConfig::default(),
@@ -2156,6 +2158,8 @@ struct RawConfig {
     #[serde(default)]
     cloudflare_access: CloudflareAccessConfig,
     #[serde(default)]
+    partner_access_audiences: Vec<String>,
+    #[serde(default)]
     public_edge: PublicEdgeConfig,
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
@@ -2306,6 +2310,7 @@ impl From<RawConfig> for AppConfig {
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             cloudflare_access: raw.cloudflare_access,
+            partner_access_audiences: raw.partner_access_audiences,
             public_edge: raw.public_edge,
             mobile_terminal: raw.mobile_terminal,
             terminal_direct: raw.terminal_direct,

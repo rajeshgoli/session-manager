@@ -111,6 +111,7 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false
           agent=${ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name, provider: ticket.holder.provider, state: ticket.holder.state } : null}
           onClose=${() => setMenu(null)} />` : null}</span>` : null}
     </span>
+    ${ticket.needs_you ? html`<span class="sub ticket-state amber">${ticket.needs_you.text} · <a href=${ticket.needs_you.url} target="_blank" rel="noopener noreferrer">Open</a></span>` : null}
     ${ticket.review_policy || ticket.review ? html`<span class="sub ticket-state ticket-review">
       ${ticket.review_policy ? html`<button class="review-pill" title=${setByText(ticket.review_policy)} onClick=${() => setMenu('policy')}>Review: <b>${reviewerText(ticket.review_policy.reviewer)}</b></button>` : null}
       ${ticket.review ? html`<span class="amber">${ticket.review.reviewer_label || 'Review'}, ${age(ticket.review.since)}</span>` : null}</span>` : null}
