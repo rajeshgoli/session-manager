@@ -10166,6 +10166,10 @@ async fn get_btw_request(
 }
 
 fn recover_btw_requests(state: Arc<AppState>) {
+    // Fixture routers have no agent runtime to resume and share this DB with test setup.
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
     thread::spawn(move || {
         while !state
             .btw_workers
