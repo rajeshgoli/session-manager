@@ -189,7 +189,7 @@
   var STATE_LABELS = { new: 'New', read: 'Read', needs_you: 'Needs you', replied: 'Replied', handled: 'Handled' };
   function stateText() {
     if (MSG) return MODE === 'read' ? ['No agent is left to reply to', 'ro'] : [STATE_LABELS[S.state] || '', S.state === 'needs_you' ? 'ro' : 'muted'];
-    if (!CONFIG.prNumber) return ['Read-only: no PR', 'ro'];
+    if (!CONFIG.prNumber) return ['No PR — commenting sends your review to one', 'muted'];
     if (S.prState === 'open') return [S.canComment ? 'PR open' : 'Read-only', S.canComment ? 'muted' : 'ro'];
     if (S.prState === 'unknown' || !S.prState) return ['Read-only: PR state unknown', 'ro'];
     return [S.prState === 'merged' ? 'PR merged — commenting opens a new PR' : 'PR closed — commenting reopens it', 'muted'];
@@ -688,7 +688,7 @@
     holdCheck.checked = !!S.mergeHold; holdCheck.disabled = !!S.mergeHold;
     var body = el('textarea', { placeholder: 'Overall comment (optional)' });
     if (attempt) { body.value = attempt.body; body.disabled = true; }
-    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : S.reopenTarget && S.reopenTarget.kind === 'new_pr' ? 'Open PR from ' + S.reopenTarget.base + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'reopen' ? 'Reopen PR #' + S.reopenTarget.pr + ' and submit' : 'Submit review', onclick: function () {
+    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : S.reopenTarget && S.reopenTarget.kind === 'new_pr' ? 'Open PR from ' + S.reopenTarget.base + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'reopen' ? 'Reopen PR #' + S.reopenTarget.pr + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'attach' ? 'Submit to PR #' + S.reopenTarget.pr : 'Submit review', onclick: function () {
       var picked = root.querySelector ? root.querySelector('input[name=sm-verdict]:checked') : null;
       submit.disabled = true;
       msg.className = 'muted';

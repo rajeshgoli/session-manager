@@ -43,6 +43,10 @@ pub trait OwnerDocSource: Send + Sync {
     fn doc_branch_state(&self, _repo: &str, _branch: &str) -> Result<Value, String> {
         Err("branch history unavailable".into())
     }
+    /// `{default_branch, prs}`: the open PRs whose diff includes `path`.
+    fn doc_open_prs(&self, _repo: &str, _path: &str) -> Result<Value, String> {
+        Err("open PR lookup unavailable".into())
+    }
     #[allow(clippy::too_many_arguments)] // Explicit GitHub destination and owner attribution.
     fn ensure_doc_review_pr(
         &self,
@@ -302,6 +306,9 @@ impl OwnerDocSource for GhCliDocSource {
     }
     fn doc_branch_state(&self, repo: &str, branch: &str) -> Result<Value, String> {
         reopen::branch_state(repo, branch)
+    }
+    fn doc_open_prs(&self, repo: &str, path: &str) -> Result<Value, String> {
+        reopen::open_prs(repo, path)
     }
     #[allow(clippy::too_many_arguments)] // Explicit GitHub destination and owner attribution.
     fn ensure_doc_review_pr(
@@ -1279,7 +1286,8 @@ async fn view_doc_response(
     let latest_sha = publishes.last().map(|publish| publish.commit_sha.clone());
     let pull_request = doc_pull_request_async(state, doc, false).await;
     let (pr_state, pr_url, can_comment) = match &pull_request {
-        None => (Value::Null, Value::Null, false),
+        // Submitting finds or opens a PR for it (sm#1946).
+        None => (Value::Null, Value::Null, true),
         Some(Ok(pr)) => (
             json!(pr.state),
             json!(pr.url),

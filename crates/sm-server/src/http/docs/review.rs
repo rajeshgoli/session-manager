@@ -299,17 +299,22 @@ pub(super) async fn submit_owner_doc_review(
     if let Some(unfinished) = store.unfinished_review(&doc.id, &sha)? {
         return Err(superseded(Some(unfinished)));
     }
-    let Some(pr_number) = doc.pr_number else {
-        return Err(conflict("This doc has no PR, so it is read-only"));
+    // A doc with no PR (sm#1946) or a closed one goes to the PR the
+    // target names; an open PR takes the review directly.
+    let pr = match doc.pr_number {
+        Some(pr_number) => {
+            let (lookup_state, repo) = (state.clone(), doc.repo.clone());
+            let pr = tokio::task::spawn_blocking(move || {
+                doc_pull_request(&lookup_state, &repo, pr_number, true)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?
+            .map_err(github_failure)?;
+            pr.is_open().then_some((pr_number, pr))
+        }
+        None => None,
     };
-    let (lookup_state, repo) = (state.clone(), doc.repo.clone());
-    let pr = tokio::task::spawn_blocking(move || {
-        doc_pull_request(&lookup_state, &repo, pr_number, true)
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?
-    .map_err(github_failure)?;
-    let mut target = if !pr.is_open() {
+    let mut target = if pr.is_none() {
         Some(super::reopen::target(state, doc).await?)
     } else {
         None
@@ -321,12 +326,12 @@ pub(super) async fn submit_owner_doc_review(
             .unwrap_or("doc");
         target["branch"] = json!(format!("sm-doc/{stem}-{}", &submission_id[..8]));
         target["hold"] = json!(payload.hold);
-    } else if payload.hold {
+    } else if let Some((pr_number, _)) = pr.as_ref().filter(|_| payload.hold) {
         super::super::merge_holds::change(
             state.clone(),
             super::super::merge_holds::HoldRequest {
                 repo: doc.repo.clone(),
-                pr: pr_number,
+                pr: *pr_number,
                 reason: None,
                 requester_session_id: None,
             },
@@ -345,7 +350,7 @@ pub(super) async fn submit_owner_doc_review(
         body.as_deref(),
         target.as_ref(),
     )?;
-    run_blocking(state, review, (inserted && target.is_none()).then_some(pr)).await
+    run_blocking(state, review, pr.filter(|_| inserted).map(|(_, pr)| pr)).await
 }
 
 async fn run_blocking(
@@ -377,7 +382,7 @@ fn run_submission(
     if let Some(pr) = target.as_ref().and_then(|t| t["target_pr"].as_i64()) {
         doc.pr_number = Some(pr);
     }
-    let body_only = target.as_ref().is_some_and(|t| t["kind"] == "new_pr");
+    let body_only = target.as_ref().is_some_and(super::reopen::body_only);
     let pr_number = doc
         .pr_number
         .ok_or_else(|| conflict("This doc has no PR, so it is read-only"))?;
@@ -528,7 +533,7 @@ fn post_and_submit(
     let (mut line_comments, mut file_comments) = (0i64, 0i64);
     let body_only = owner_doc_store(state)
         .review_target(&review.id)?
-        .is_some_and(|t| t["kind"] == "new_pr");
+        .is_some_and(|t| super::reopen::body_only(&t));
     if body_only {
         file_comments = drafts.len() as i64;
     }
@@ -667,7 +672,7 @@ fn finish_from_github(
 ) -> Result<OwnerDocReview, ApiError> {
     let body_only = owner_doc_store(state)
         .review_target(&review.id)?
-        .is_some_and(|t| t["kind"] == "new_pr");
+        .is_some_and(|t| super::reopen::body_only(&t));
     let line_comments = submitted.comments.iter().filter(|(_, line)| *line).count() as i64;
     let file_comments = submitted.comments.len() as i64 - line_comments;
     let (line_comments, file_comments) = if body_only {
@@ -721,8 +726,12 @@ fn finish(
                 line_comments,
                 file_comments,
             );
-            if let Some(t) = target.as_ref().filter(|t|t["kind"] == "new_pr") {
-                text.push_str(&format!("\nOpened PR #{} from {} for this review.",t["target_pr"],t["base"].as_str().unwrap_or("")));
+            if let Some(t) = target.as_ref().filter(|t| super::reopen::body_only(t)) {
+                if t["kind"] == "attach" {
+                    text.push_str(&format!("\nThe doc had no PR, so this review went to PR #{0}, which changes it. Publish its next revision there with sm doc publish --pr {0}.",t["target_pr"]));
+                } else {
+                    text.push_str(&format!("\nOpened PR #{} from {} for this review.",t["target_pr"],t["base"].as_str().unwrap_or("")));
+                }
                 if t["doc_changed"] == true {text.push_str("\nThe document changed since the reviewed revision; comments quote the original text.");}
             }
             if let Some(line) = &hold_line {

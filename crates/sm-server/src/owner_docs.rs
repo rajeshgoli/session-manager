@@ -645,7 +645,6 @@ impl OwnerDocStore {
                     anyhow::ensure!(
                         candidate.repo == request.repo
                             && candidate.path == request.path
-                            && candidate.pr_number.is_some()
                             && request.pr_number.is_some(),
                         "invalid document move"
                     );
