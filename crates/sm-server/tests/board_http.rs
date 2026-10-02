@@ -2363,3 +2363,52 @@ async fn web_lane_default_captures_only_first_board_discovery_and_never_authoriz
     );
     assert!(reopened.auto_starts().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn shared_launch_tier_overrides_lane_default_and_invalidates_old_preview() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, settings) = owner_request(&f,"PUT","/client/settings",Some(json!({"new_agent":{"agent_types":[{"name":"Expert","provider":"codex-fork","model":"gpt-6-astra","effort":"high"}]}}))).await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    let db = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let config = json!({"provider":"claude","model":"opus","reasoning_effort":"high","brief":null});
+    // A captured lane preference is still subordinate to a subsequently added Tier.
+    db.execute("INSERT INTO board_launch_preferences(repo,number,config,source,source_lane_id) VALUES (?1,2,?2,'lane',1)",params![REPO,config.to_string()]).unwrap();
+    let mut body = launch_selection(&[2], "when_ready");
+    body["common"]["config"] = json!({"mode":"keep"});
+    body["common"]["message"] = json!({"mode":"keep"});
+    let old = launch_preview(&f, body.clone()).await;
+    assert_eq!(old["items"][0]["effective_config"]["provider"], "claude");
+    db.execute(
+        "UPDATE board_items SET tier='Expert' WHERE repo=?1 AND number=2",
+        [REPO],
+    )
+    .unwrap();
+    let (status, changed) = launch_commit(&f, &old, "00000000-0000-4000-8000-000000000013").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{changed}");
+    assert!(changed["changed"][0]["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("tier")));
+    assert!(BoardStore::new(f.dir.join("message_queue.db"))
+        .auto_starts()
+        .unwrap()
+        .is_empty());
+    let fresh = launch_preview(&f, body.clone()).await;
+    assert_eq!(
+        fresh["items"][0]["effective_config"]["model"],
+        "gpt-6-astra"
+    );
+    assert_eq!(fresh["items"][0]["source"], "ticket Tier");
+    // An explicit owner preference retains priority over Tier.
+    db.execute(
+        "UPDATE board_launch_preferences SET source='ticket' WHERE repo=?1 AND number=2",
+        [REPO],
+    )
+    .unwrap();
+    let explicit = launch_preview(&f, body).await;
+    assert_eq!(
+        explicit["items"][0]["effective_config"]["provider"],
+        "claude"
+    );
+}

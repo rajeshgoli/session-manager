@@ -159,7 +159,8 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
       .then(([options, saved]) => {
         if (!alive) return;
         let next = { ...options, template: options.brief };
-        const preference = ticket.launch_preference?.config;
+        const tier = (saved.new_agent.agent_types || []).find(t => t.name.toLowerCase() === ticket.tier?.toLowerCase());
+        const preference = ticket.launch_preference?.source === 'lane' && tier ? null : ticket.launch_preference?.config;
         if (preference && !auto) next = { ...next, ...preference, brief: preference.brief ?? options.brief };
         if (later) {
           const kinds = saved.new_agent.agent_types || [];

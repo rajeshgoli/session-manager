@@ -182,7 +182,7 @@ fn resolve(
         ));
     }
     let pref = preference(conn, key)?;
-    if !pref.is_null() {
+    if !pref.is_null() && pref["source"] != "lane" {
         return Ok((
             serde_json::from_value(pref["config"].clone())?,
             pref["source"].as_str().unwrap_or("ticket").into(),
@@ -197,6 +197,12 @@ fn resolve(
         .optional()?
         .flatten();
     for (name, source) in [(tier.as_deref(), "ticket Tier"), (last, "last used")] {
+        if source == "last used" && !pref.is_null() {
+            return Ok((
+                serde_json::from_value(pref["config"].clone())?,
+                "lane".into(),
+            ));
+        }
         if let Some(t) = name.and_then(|n| {
             settings
                 .agent_types
@@ -264,6 +270,14 @@ fn snapshot(conn: &Connection, board: &Board, req: &Preview, settings: &Value) -
         let key = t.key();
         let claims=conn.prepare("SELECT id,session_id,reserved_at FROM work_claims WHERE repo=?1 AND number=?2 AND kind='ticket' AND ended_at IS NULL ORDER BY id")?
             .query_map(params![key.0,key.1],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let tier: Option<String> = conn
+            .query_row(
+                "SELECT tier FROM board_items WHERE repo=?1 AND number=?2",
+                params![key.0, key.1],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         let facts=board.facts.get(&key).map(|f|json!({"state":f.state.as_str(),"open":f.item.is_open(),"warnings":f.warnings,"waits_on":f.waits_on,"prs":f.prs,"holder":f.holder.as_ref().map(|h|(&h.session_id,h.state.as_str()))}));
         let goals: Vec<_> = board
             .lanes
@@ -271,7 +285,7 @@ fn snapshot(conn: &Connection, board: &Board, req: &Preview, settings: &Value) -
             .filter(|l| l.lane.goal == key)
             .map(|l| l.lane.id)
             .collect();
-        rows.push(json!({"key":key,"facts":facts,"claims":claims,"attributed_prs":attributed_prs(conn,&key)?,"goals":goals,"preference":preference(conn,&key)?,"auto":auto(conn,&key)?}));
+        rows.push(json!({"key":key,"facts":facts,"tier":tier,"claims":claims,"attributed_prs":attributed_prs(conn,&key)?,"goals":goals,"preference":preference(conn,&key)?,"auto":auto(conn,&key)?}));
     }
     Ok(json!({"rows":rows,"settings":settings}))
 }
@@ -621,6 +635,7 @@ impl BoardStore {
                 .filter_map(|(i, t)| {
                     let reasons: Vec<_> = [
                         "facts",
+                        "tier",
                         "claims",
                         "goals",
                         "preference",
