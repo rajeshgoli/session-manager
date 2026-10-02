@@ -29,6 +29,16 @@ const DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS: f64 = 15.0;
 // its historical name.
 const DEFAULT_SEND_KEYS_MAX_CHUNK_BYTES: usize = 512;
 const DEFAULT_SEND_KEYS_CHUNK_GAP_MS: f64 = 20.0;
+// A Claude still starting up can read the typed text and its Enter as one
+// paste. It then keeps the Enter as an invisible character, and the next
+// Enter only strips it ("review and press Enter to send"). sm waits up to
+// the echo window for Claude to show the typed text before pressing Enter.
+// After each Enter, sm waits the check window for the composer to let go of
+// the text, and presses Enter again at most this many times.
+const CLAUDE_TEXT_ECHO_WINDOW: Duration = Duration::from_millis(3000);
+const CLAUDE_SUBMIT_CHECK_WINDOW: Duration = Duration::from_millis(1000);
+const CLAUDE_SUBMIT_CHECK_POLL: Duration = Duration::from_millis(50);
+const CLAUDE_SUBMIT_MAX_RETRIES: usize = 3;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1048,8 +1058,58 @@ impl TmuxRuntime {
 
     fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.send_text(tmux_session, text)?;
+        self.wait_for_claude_text_echo(tmux_session, text);
         thread::sleep(self.compute_settle_delay(text));
-        self.send_key(tmux_session, "Enter")
+        self.send_key(tmux_session, "Enter")?;
+        for _ in 0..CLAUDE_SUBMIT_MAX_RETRIES {
+            if !self.claude_composer_keeps_text(tmux_session, text) {
+                break;
+            }
+            self.send_key(tmux_session, "Enter")?;
+        }
+        Ok(())
+    }
+
+    /// On a Claude composer, wait until it shows `text`: Claude has then read
+    /// the text, so the Enter that follows arrives as its own keypress. Any
+    /// other pane, including Codex, returns at once.
+    fn wait_for_claude_text_echo(&self, tmux_session: &str, text: &str) {
+        let deadline = Instant::now() + CLAUDE_TEXT_ECHO_WINDOW;
+        loop {
+            let Some((pane, (_, cursor_y))) = self
+                .capture_pane_text(tmux_session)
+                .zip(self.pane_cursor_position(tmux_session))
+            else {
+                return;
+            };
+            let echoed = claude_live_composer(&pane, cursor_y)
+                .is_none_or(|composer| composer_holds_text(&composer, text));
+            if echoed || Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(CLAUDE_SUBMIT_CHECK_POLL);
+        }
+    }
+
+    /// True when Claude's live composer still ends with `text` once the
+    /// check window has passed. Any other pane, including Codex, is false.
+    fn claude_composer_keeps_text(&self, tmux_session: &str, text: &str) -> bool {
+        let deadline = Instant::now() + CLAUDE_SUBMIT_CHECK_WINDOW;
+        loop {
+            let kept = self
+                .capture_pane_text(tmux_session)
+                .zip(self.pane_cursor_position(tmux_session))
+                .is_some_and(|(pane, (_, cursor_y))| {
+                    claude_composer_holds_text(&pane, cursor_y, text)
+                });
+            if !kept {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                return true;
+            }
+            thread::sleep(CLAUDE_SUBMIT_CHECK_POLL);
+        }
     }
 
     fn send_text(&self, tmux_session: &str, text: &str) -> Result<()> {
@@ -2339,6 +2399,51 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
     claude_composer_line_is_candidate(composer.trim()) && cursor_x == leading + prefix_width
 }
 
+/// Claude's live composer: the last prompt row through the divider below it,
+/// with the cursor inside, whitespace removed because Claude wraps and
+/// indents the draft. `None` when the pane shows no such composer.
+fn claude_live_composer(pane: &str, cursor_y: usize) -> Option<String> {
+    let lines = pane.lines().collect::<Vec<_>>();
+    let start = lines.iter().rposition(|line| {
+        let line = line.trim_start();
+        line.starts_with('❯') || line.starts_with('>')
+    })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| claude_composer_footer_divider(line))
+        .map(|offset| start + 1 + offset)?;
+    (start..end).contains(&cursor_y).then(|| {
+        lines[start..end]
+            .concat()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    })
+}
+
+/// Whether Claude's live composer still holds `text` or a collapsed paste.
+fn claude_composer_holds_text(pane: &str, cursor_y: usize, text: &str) -> bool {
+    claude_live_composer(pane, cursor_y)
+        .is_some_and(|composer| composer_holds_text(&composer, text))
+}
+
+fn composer_holds_text(composer: &str, text: &str) -> bool {
+    if composer.contains("[Pastedtext#") {
+        return true;
+    }
+    let wanted = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return false;
+    }
+    let tail = wanted[wanted.len().saturating_sub(40)..]
+        .iter()
+        .collect::<String>();
+    composer.ends_with(&tail)
+}
+
 fn claude_composer_footer_divider(line: &str) -> bool {
     let non_whitespace = line
         .chars()
@@ -2908,7 +3013,145 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
             vec![512, 512, 376]
         );
         assert_eq!(chunks.concat(), text);
-        assert!(log.trim_end().ends_with("send-keys -t sm-test Enter"));
+        assert_eq!(
+            log.lines().rfind(|line| line.starts_with("send-keys")),
+            Some("send-keys -t sm-test Enter")
+        );
+    }
+
+    const HELD_HANDOFF_PANE: &str = "\
+ Claude Code v2.1.285
+                                Removed 1 invisible character · review and press Enter to send
+──────────────────────────────────────────────────────────── sympathy-h4 ─
+❯ [sm handoff] You are taking over from sympathy-h3 (3c9eb923).
+  Read the handoff note first, then continue the
+  work.
+────────────────────────────────────────────────────────────────────────
+  Opus 5.5 (1M context)
+";
+    const HANDOFF_TEXT: &str = "[sm handoff] You are taking over from sympathy-h3 (3c9eb923).\nRead the handoff note first, then continue the work.";
+
+    #[test]
+    fn claude_composer_holds_text_matches_a_wrapped_unsubmitted_draft() {
+        assert!(claude_composer_holds_text(
+            HELD_HANDOFF_PANE,
+            5,
+            HANDOFF_TEXT
+        ));
+        // The cursor must be inside the live composer.
+        assert!(!claude_composer_holds_text(
+            HELD_HANDOFF_PANE,
+            1,
+            HANDOFF_TEXT
+        ));
+        // Other text, or no Claude divider under the prompt, is not held.
+        assert!(!claude_composer_holds_text(
+            HELD_HANDOFF_PANE,
+            5,
+            "other text"
+        ));
+        assert!(!claude_composer_holds_text(
+            "› [sm handoff] continue the work.\n",
+            0,
+            "continue the work."
+        ));
+    }
+
+    #[test]
+    fn claude_composer_holds_text_ignores_a_submitted_message_above_an_empty_composer() {
+        let pane = "\
+❯ [sm handoff] You are taking over from sympathy-h3 (3c9eb923).
+  Read the handoff note first, then continue the work.
+✽ Mulling… (3s · thinking with high effort)
+──────────────────────────────────────────────────────────── sympathy-h4 ─
+❯
+────────────────────────────────────────────────────────────────────────
+";
+        assert!(!claude_composer_holds_text(pane, 4, HANDOFF_TEXT));
+        let collapsed = "❯ [Pasted text #1 +12 lines]\n──────────\n";
+        assert!(claude_composer_holds_text(collapsed, 0, HANDOFF_TEXT));
+    }
+
+    /// A runtime on a fake tmux whose `capture-pane` runs `capture` with
+    /// `$held` (the handoff draft in the composer) and `$empty` (an empty
+    /// composer) on the cursor row, and whose log is `$log`.
+    #[cfg(unix)]
+    fn fake_claude_composer_runtime(capture: &str) -> (TmuxRuntime, PathBuf, PathBuf) {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        let held_pane = temp_dir.join("held.txt");
+        let empty_pane = temp_dir.join("empty.txt");
+        fs::write(&held_pane, HELD_HANDOFF_PANE).unwrap();
+        fs::write(&empty_pane, "\n\n\n\n\n❯ \n──────────\n").unwrap();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+log="{log}"; held="{held}"; empty="{empty}"
+printf '%s\n' "$*" >> "$log"
+case "$1" in
+  has-session) exit 0 ;;
+  display-message) echo 0,5; exit 0 ;;
+  capture-pane) {capture}; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                log = log_path.display(),
+                held = held_pane.display(),
+                empty = empty_pane.display(),
+            ),
+        )
+        .unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        runtime.send_keys_settle_ms = 0.0;
+        (runtime, log_path, temp_dir)
+    }
+
+    fn enter_count(log_path: &Path) -> usize {
+        fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "send-keys -t sm-test Enter")
+            .count()
+    }
+
+    /// Claude keeps the draft until the second Enter, as it does after
+    /// reading text and Enter as one paste.
+    #[cfg(unix)]
+    #[test]
+    fn send_input_presses_enter_again_while_claude_holds_the_draft() {
+        let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
+            r#"if [ "$(grep -c ' Enter$' "$log")" -ge 2 ]; then cat "$empty"; else cat "$held"; fi"#,
+        );
+
+        assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
+
+        assert_eq!(enter_count(&log_path), 2);
+    }
+
+    /// Claude shows the draft only from its fourth capture; Enter waits for
+    /// it, and one Enter submits.
+    #[cfg(unix)]
+    #[test]
+    fn send_input_presses_enter_only_once_claude_shows_the_draft() {
+        let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
+            r#"if [ "$(grep -c ' Enter$' "$log")" -ge 1 ] || [ "$(grep -c '^capture-pane' "$log")" -lt 4 ]; then cat "$empty"; else cat "$held"; fi"#,
+        );
+
+        assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let enter = position_after(&lines, " Enter", 0);
+        assert!(
+            lines[..enter]
+                .iter()
+                .filter(|line| line.starts_with("capture-pane"))
+                .count()
+                >= 4,
+            "{log}"
+        );
+        assert_eq!(enter_count(&log_path), 1);
     }
 
     #[test]
