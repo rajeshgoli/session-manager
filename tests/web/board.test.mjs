@@ -206,3 +206,21 @@ test('lane form and row entry offer only open tickets nobody holds', () => {
   assert.deepEqual(laneCandidates({ goal: { repo: 'o/r', number: 9 }, tickets }).map((t) => t.number), [1, 2]);
   assert.deepEqual(tickets.filter(canStartWhenReady).map((t) => t.number), [1]);
 });
+
+test('compact board keeps concurrent waits independent and labels unknown ages honestly', () => {
+  const {currentReviews,operationalAge,hasOperations,matchesFilter}=board.namespace;
+  const ticket={repo:'a/b',number:1,title:'Simultaneous work',state:'in_progress',holder:{state:'idle'},jobs:[{state:'running',quiet_since:'2026-10-02T00:00:00Z'},{state:'waiting'}],reviews:[{reviewer_label:'Your review'},{reviewer_label:'Codex review'}]};
+  assert.equal(currentReviews(ticket).length,2);assert.equal(hasOperations(ticket),true);assert.equal(matchesFilter(ticket,'attention'),true);
+  assert.equal(operationalAge(null),'age unavailable');assert.equal(operationalAge('2099-01-01'),'age unavailable');
+  assert.equal(matchesFilter(ticket,'finished'),false);
+});
+
+test('selection identity deduplicates lane appearances and bulk excludes goals and live work', () => {
+  const {distinctTickets,bulkReasons,keepEdit}=modules.get(`${root}/launch-setup.js`).namespace;
+  const t={repo:'a/b',number:1,state:'ready'};
+  assert.equal(distinctTickets([t,{...t}]).length,1);
+  assert.deepEqual(bulkReasons(t,new Set(['a/b#1'])),['lane goal']);
+  assert.deepEqual(bulkReasons({...t,holder:{state:'idle'}}),['held']);
+  assert.ok(bulkReasons({...t,state:'blocked',warnings:['cycle']}).includes('cycle'));
+  assert.equal(keepEdit().behavior,'keep');
+});

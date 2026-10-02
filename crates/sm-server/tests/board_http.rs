@@ -16,6 +16,7 @@ use sm_server::{
             BoardSource, IssueConnection, IssueNode, IssuesPage, LinkMutation, RefNode,
             ResolvedIssue, WriteError,
         },
+        BoardStore,
     },
     config::{AppConfig, EmailConfig, PathsConfig, QueueRunnerConfig, SmSendConfig},
     http::{router, AppState, DocFetchError, DocPullRequest, OwnerDocSource},
@@ -34,6 +35,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+use time::OffsetDateTime;
 use tower::ServiceExt;
 
 const REPO: &str = "acme/widgets";
@@ -2031,5 +2033,382 @@ async fn elsewhere_waiting_validates_text_and_url() {
         .await
         .0,
         StatusCode::BAD_REQUEST
+    );
+}
+
+fn launch_selection(numbers: &[i64], behavior: &str) -> Value {
+    json!({"selection":numbers.iter().map(|n|json!({"repo":REPO,"number":n})).collect::<Vec<_>>(),
+      "common":{"config":{"mode":"set","provider":"codex-fork","model":"gpt-6-sol","reasoning_effort":"medium"},"message":{"mode":"custom","text":"Read this ticket; preserve existing work."},"behavior":behavior},"exceptions":[]})
+}
+async fn launch_preview(f: &Fixture, body: Value) -> Value {
+    let (status, value) =
+        owner_request(f, "POST", "/client/board/launch-preview", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    value
+}
+async fn launch_commit(f: &Fixture, preview: &Value, id: &str) -> (StatusCode, Value) {
+    owner_request(
+        f,
+        "PUT",
+        "/client/board/launch-selection",
+        Some(json!({"request_id":id,"token":preview["token"]})),
+    )
+    .await
+}
+#[tokio::test]
+async fn shared_launch_excludes_goals_and_rejects_claim_race_atomically() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let preview = launch_preview(&f, launch_selection(&[1, 2, 3], "when_ready")).await;
+    assert_eq!(preview["eligible_count"], 2);
+    assert_eq!(preview["excluded_count"], 1);
+    assert!(preview["items"][0]["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("lane_goal")));
+    f.claim(3, "eng00001");
+    let (status, body) = launch_commit(&f, &preview, "00000000-0000-4000-8000-000000000001").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "selection_changed");
+    assert!(f.ticket(2).await["auto_start"].is_null());
+    let fresh = launch_preview(&f, launch_selection(&[1, 2, 3], "when_ready")).await;
+    assert_eq!(fresh["eligible_count"], 1);
+    let (status, saved) = launch_commit(&f, &fresh, "00000000-0000-4000-8000-000000000002").await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["authorized_count"], 1);
+    assert_eq!(f.ticket(2).await["auto_start"]["model"], "gpt-6-sol");
+    assert!(f.ticket(3).await["auto_start"].is_null());
+    let (status, duplicate) =
+        launch_commit(&f, &fresh, "00000000-0000-4000-8000-000000000002").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(duplicate, saved);
+}
+#[tokio::test]
+async fn shared_launch_preserves_failed_state_and_requires_explicit_retry() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000003")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let store = BoardStore::new(f.dir.join("message_queue.db"));
+    for _ in 0..3 {
+        store
+            .auto_start_result(
+                &(REPO.into(), 2),
+                Err("launch unavailable"),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+    }
+    let mut edit = launch_selection(&[2], "keep");
+    edit["common"]["config"]["model"] = json!("gpt-6-astra");
+    let p = launch_preview(&f, edit).await;
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000004")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let row = store.auto_starts().unwrap().remove(0);
+    assert_eq!(row.state, "failed");
+    assert_eq!(row.attempts, 3);
+    assert_eq!(row.model.as_deref(), Some("gpt-6-astra"));
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    assert_eq!(p["renew_failed_count"], 1);
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000005")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let row = store.auto_starts().unwrap().remove(0);
+    assert_eq!(row.state, "waiting");
+    assert_eq!(row.attempts, 0);
+    let p = launch_preview(&f, launch_selection(&[2], "manual")).await;
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000006")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(store.auto_starts().unwrap()[0].state, "cancelled");
+}
+#[tokio::test]
+async fn shared_launch_detects_cancel_rearm_and_settings_changes() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let choice = json!({"repo":REPO,"number":2,"provider":"codex-fork","model":"gpt-6-sol","reasoning_effort":"medium"});
+    owner_request(&f, "PUT", "/client/board/auto-start", Some(choice.clone())).await;
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    owner_request(
+        &f,
+        "DELETE",
+        "/client/board/auto-start?repo=acme/widgets&number=2",
+        None,
+    )
+    .await;
+    owner_request(&f, "PUT", "/client/board/auto-start", Some(choice)).await;
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000007")
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    let (status, body) = owner_request(
+        &f,
+        "PUT",
+        "/client/settings",
+        Some(json!({"new_agent":{"auto_start_paused":true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000008")
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    assert_eq!(p["auto_start_paused"], true);
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000009")
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+#[tokio::test]
+async fn shared_launch_exceptions_and_web_preferences_do_not_change_phone_options() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (_, before) = owner_request(
+        &f,
+        "GET",
+        "/client/board/start-options?repo=acme/widgets&number=2",
+        None,
+    )
+    .await;
+    let mut body = launch_selection(&[2, 3], "keep");
+    body["exceptions"] = json!([{"repo":REPO,"number":3,"config":{"mode":"set","provider":"claude","model":null,"reasoning_effort":null},"message":{"mode":"default"}}]);
+    let p = launch_preview(&f, body).await;
+    let (status, saved) = launch_commit(&f, &p, "00000000-0000-4000-8000-000000000010").await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["authorized_count"], 0);
+    let (_, web) = owner_request(&f, "GET", "/client/board", None).await;
+    let rows = web["lanes"][0]["tickets"].as_array().unwrap();
+    let two = rows.iter().find(|t| t["number"] == 2).unwrap();
+    let three = rows.iter().find(|t| t["number"] == 3).unwrap();
+    assert_eq!(two["launch_preference"]["config"]["model"], "gpt-6-sol");
+    assert_eq!(three["launch_preference"]["config"]["provider"], "claude");
+    assert!(three["launch_preference"]["config"]["brief"].is_null());
+    assert!(two["auto_start"].is_null());
+    let (_, after) = owner_request(
+        &f,
+        "GET",
+        "/client/board/start-options?repo=acme/widgets&number=2",
+        None,
+    )
+    .await;
+    assert_eq!(before, after);
+}
+#[tokio::test]
+async fn shared_launch_rejects_duplicates_and_excludes_unsafe_states() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, _) = owner_request(
+        &f,
+        "POST",
+        "/client/board/launch-preview",
+        Some(launch_selection(&[2, 2], "when_ready")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/client/board/launch-preview",
+        Some(launch_selection(&[2], "when_ready")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    f.board.prs.lock().unwrap().insert(
+        2,
+        vec![PrRef {
+            repo: REPO.into(),
+            number: 77,
+            state: "OPEN".into(),
+            url: format!("https://github.com/{REPO}/pull/77"),
+        }],
+    );
+    pass(&f).await;
+    let p = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    assert!(p["items"][0]["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("open_pr")));
+    assert_eq!(p["eligible_count"], 0);
+    assert_eq!(
+        launch_commit(&f, &p, "00000000-0000-4000-8000-000000000011")
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn shared_launch_detects_pr_claim_after_preview_even_after_holder_ends() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let preview = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    f.claim(2, "eng00001");
+    claim_pr_77(&f, "eng00001", "OPEN");
+    Connection::open(f.dir.join("message_queue.db"))
+        .unwrap()
+        .execute("UPDATE work_claims SET ended_at='2026-09-30T00:00:00Z'", [])
+        .unwrap();
+    assert_eq!(
+        launch_commit(&f, &preview, "00000000-0000-4000-8000-000000000012")
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let fresh = launch_preview(&f, launch_selection(&[2], "when_ready")).await;
+    assert_eq!(fresh["eligible_count"], 0);
+    assert!(fresh["items"][0]["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("open_pr")));
+}
+
+#[tokio::test]
+async fn web_lane_default_captures_only_first_board_discovery_and_never_authorizes() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (_, board) = owner_request(&f, "GET", "/client/board", None).await;
+    let lane = board["lanes"][0]["id"].as_i64().unwrap();
+    let config = json!({"provider":"codex-fork","model":"gpt-6-sol","reasoning_effort":"medium","brief":null});
+    let write = json!({"lane_id":lane,"expected_revision":0,"config":config});
+    let (status, first) = owner_request(
+        &f,
+        "PUT",
+        "/client/board/launch-default",
+        Some(write.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["revision"], 1);
+    assert_eq!(
+        owner_request(&f, "PUT", "/client/board/launch-default", Some(write))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let store = BoardStore::new(f.dir.join("message_queue.db"));
+    assert!(store
+        .launch_preference(&(REPO.into(), 2))
+        .unwrap()
+        .is_null());
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .insert(5, (true, Vec::new(), Some(1)));
+    pass(&f).await;
+    let (_, _) = owner_request(&f, "GET", "/client/board", None).await;
+    assert_eq!(
+        store.launch_preference(&(REPO.into(), 5)).unwrap()["config"],
+        config
+    );
+    assert!(store.auto_starts().unwrap().is_empty());
+    let cleared = json!({"lane_id":lane,"expected_revision":1,"config":null});
+    assert_eq!(
+        owner_request(&f, "PUT", "/client/board/launch-default", Some(cleared))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .insert(6, (true, Vec::new(), Some(1)));
+    pass(&f).await;
+    owner_request(&f, "GET", "/client/board", None).await;
+    assert!(store
+        .launch_preference(&(REPO.into(), 6))
+        .unwrap()
+        .is_null());
+    let reset = json!({"lane_id":lane,"expected_revision":2,"config":config});
+    assert_eq!(
+        owner_request(&f, "PUT", "/client/board/launch-default", Some(reset))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    pass(&f).await;
+    owner_request(&f, "GET", "/client/board", None).await;
+    assert!(store
+        .launch_preference(&(REPO.into(), 6))
+        .unwrap()
+        .is_null());
+    let reopened = BoardStore::new(f.dir.join("message_queue.db"));
+    assert_eq!(
+        reopened.launch_preference(&(REPO.into(), 5)).unwrap()["config"],
+        config
+    );
+    assert!(reopened.auto_starts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn shared_launch_tier_overrides_lane_default_and_invalidates_old_preview() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, settings) = owner_request(&f,"PUT","/client/settings",Some(json!({"new_agent":{"agent_types":[{"name":"Expert","provider":"codex-fork","model":"gpt-6-astra","effort":"high"}]}}))).await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    let db = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let config = json!({"provider":"claude","model":"opus","reasoning_effort":"high","brief":null});
+    // A captured lane preference is still subordinate to a subsequently added Tier.
+    db.execute("INSERT INTO board_launch_preferences(repo,number,config,source,source_lane_id) VALUES (?1,2,?2,'lane',1)",params![REPO,config.to_string()]).unwrap();
+    let mut body = launch_selection(&[2], "when_ready");
+    body["common"]["config"] = json!({"mode":"keep"});
+    body["common"]["message"] = json!({"mode":"keep"});
+    let old = launch_preview(&f, body.clone()).await;
+    assert_eq!(old["items"][0]["effective_config"]["provider"], "claude");
+    db.execute(
+        "UPDATE board_items SET tier='Expert' WHERE repo=?1 AND number=2",
+        [REPO],
+    )
+    .unwrap();
+    let (status, changed) = launch_commit(&f, &old, "00000000-0000-4000-8000-000000000013").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{changed}");
+    assert!(changed["changed"][0]["reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("tier")));
+    assert!(BoardStore::new(f.dir.join("message_queue.db"))
+        .auto_starts()
+        .unwrap()
+        .is_empty());
+    let fresh = launch_preview(&f, body.clone()).await;
+    assert_eq!(
+        fresh["items"][0]["effective_config"]["model"],
+        "gpt-6-astra"
+    );
+    assert_eq!(fresh["items"][0]["source"], "ticket Tier");
+    // An explicit owner preference retains priority over Tier.
+    db.execute(
+        "UPDATE board_launch_preferences SET source='ticket' WHERE repo=?1 AND number=2",
+        [REPO],
+    )
+    .unwrap();
+    let explicit = launch_preview(&f, body).await;
+    assert_eq!(
+        explicit["items"][0]["effective_config"]["provider"],
+        "claude"
     );
 }

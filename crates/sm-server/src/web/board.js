@@ -1,8 +1,10 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
 import { createContext } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age } from './ui.js';
+import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
 import { TicketStart, LaneWhenReady, blockedReasons, canStartAnyway, chipText, retryBody, laneCandidates } from './board-start.js';
+import { SharedLaunchSetup, LaneLaunchDefault, distinctTickets } from './launch-setup.js';
+import { Presets, exactConfig } from './launch-fields.js';
 import { HandoffPopover } from './handoff.js';
 import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
@@ -22,8 +24,8 @@ export function groupTickets(tickets) {
   };
 }
 export function visibleOther(tickets) {
-  const urgent = tickets.filter((t) => t.state === 'needs_you');
-  const rest = tickets.filter((t) => t.state !== 'needs_you');
+  const urgent = tickets.filter((t) => t.state === 'needs_you' || hasOperations(t));
+  const rest = tickets.filter((t) => t.state !== 'needs_you' && !hasOperations(t));
   return [...urgent, ...rest.slice(0, Math.max(0, OTHER_ROW_LIMIT - urgent.length))];
 }
 export const openBlockers = (ticket) => (ticket.waits_on || []).filter((item) => item.state !== 'done');
@@ -85,44 +87,72 @@ function WhenReadyChip({ ticket, onStart }) {
     onClick=${() => onStart(ticket, 'when_ready')}>${chipText(auto, paused)}</button>
     ${failed ? html`<button class="btn sm" disabled=${retrying} onClick=${retry}>Retry</button>` : null}`;
 }
-function TicketRow({ ticket, end, hours, onStart, onClose, busy, compact = false, slim = false, lanePolicy = null }) {
+export function operationalAge(since, now = Date.now()) {
+  const time = Date.parse(since);
+  return Number.isFinite(time) && time <= now ? age(since, now) : 'age unavailable';
+}
+export function currentReviews(ticket) {
+  if (ticket.reviews) return ticket.reviews;
+  const list = (ticket.prs || []).flatMap(pr => (pr.reviews || [pr.review]).filter(r=>r?.waiting_since).map(r=>({...r,since:r.waiting_since,reviewer_label:r.by==='you'?'Your review':'Codex review',number:pr.number})));
+  if (ticket.review && !list.some(r=>r.by!=='you')) list.push(ticket.review);
+  return list;
+}
+export const hasOperations = t => !!(t.holder || t.needs_you || t.auto_start || t.jobs?.length || currentReviews(t).length || t.warnings?.length);
+export function matchesFilter(ticket, filter, query = '', goalTitle = '') {
+  const match = filter==='all' || filter==='finished' && ticket.state==='done' || filter==='armed' && !!ticket.auto_start || filter==='attention' && (ticket.needs_you || ticket.warnings?.length || ticket.auto_start?.state==='failed' || ticket.jobs?.some(j=>j.quiet_since) || ['stalled','no_agent'].includes(ticket.clock?.ball));
+  return !!match && `${ticket.repo} #${ticket.number} ${ticket.title} ${goalTitle}`.toLowerCase().includes(query.toLowerCase());
+}
+const BoardSelection = createContext({selected:new Set(),toggle:()=>{}});
+function TicketRow({ ticket, end, hours, onStart, onClose, busy, lanePolicy = null }) {
   const [menu, setMenu] = useState(null);
-  const parts = ticket.sub_issues;
-  const can = rowActions(ticket);
-  const agent = ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name,
-    provider: ticket.holder.provider, fact: `${ticket.holder.state === 'working' ? '● Working' : '○ Idle'}${ticket.holder.since ? ` ${age(ticket.holder.since)}` : ''}` } : null;
-  return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
-    <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
-    <span class="ticket-actions">
-      ${ticket.auto_start ? html`<${WhenReadyChip} ticket=${ticket} onStart=${onStart} />`
-        : can.whenReady ? html`<button class="link-btn when-ready-link" onClick=${() => onStart(ticket, 'when_ready')}>Start when ready…</button>` : null}
-      ${can.start ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
-      ${can.startBlocked ? html`<button class="btn sm" onClick=${() => onStart(ticket)}>${canStartAnyway(ticket) ? 'Start anyway' : 'Why blocked'}</button>` : null}
-      ${can.close ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(ticket)}>Close</button>` : null}
-      ${can.menu ? html`<span class="anchor"><button class="icon-btn" data-pop-anchor title="More ticket actions" onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
-        ${menu === 'more' ? html`<${Popover} onClose=${() => setMenu(null)} align="right" className="menu">
-          ${ticket.state === 'close_ready' ? html`<button onClick=${() => { setMenu(null); onStart(ticket); }}>Start instead</button>` : null}
-          ${canStartWhenReady(ticket) ? html`<button onClick=${() => { setMenu(null); onStart(ticket, 'when_ready'); }}>Start when ready…</button>` : null}
-          <button onClick=${() => setMenu('handoff')}>Hand off…</button>
-          <button onClick=${() => setMenu('policy')}>Review policy…</button><//>` : null}
-        ${menu === 'policy' ? html`<${PolicyPopover} scope="ticket" repo=${ticket.repo} number=${ticket.number} title=${`Reviews for #${ticket.number}`}
-          policy=${ticket.review_policy} lanePolicy=${lanePolicy} align="right" onClose=${() => setMenu(null)} onSaved=${boardChanged} />` : null}
-        ${menu === 'handoff' ? html`<${HandoffPopover} scope="ticket" align="right" ticket=${{ repo: ticket.repo, number: ticket.number }}
-          agent=${ticket.holder ? { id: ticket.holder.session_id, name: ticket.holder.name, provider: ticket.holder.provider, state: ticket.holder.state } : null}
-          onClose=${() => setMenu(null)} />` : null}</span>` : null}
-    </span>
-    ${ticket.needs_you ? html`<span class="sub ticket-state amber">${ticket.needs_you.text} · <a href=${ticket.needs_you.url} target="_blank" rel="noopener noreferrer">Open</a></span>` : null}
-    ${ticket.review_policy || ticket.review ? html`<span class="sub ticket-state ticket-review">
-      ${ticket.review_policy ? html`<button class="review-pill" title=${setByText(ticket.review_policy)} onClick=${() => setMenu('policy')}>Review: <b>${reviewerText(ticket.review_policy.reviewer)}</b></button>` : null}
-      ${ticket.review ? html`<span class="amber">${ticket.review.reviewer_label || 'Review'}, ${age(ticket.review.since)}</span>` : null}</span>` : null}
-    ${ticket.state !== 'blocked' && (ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
-    ${ticket.state === 'blocked' ? html`<span class="sub ticket-state">${blockedReasons(ticket).join(' ')}</span>` : null}
-    ${ticket.state === 'close_ready' ? html`<span class="sub ticket-state cyan">${parts?.done || 0} of ${parts?.total || 0} parts done · All parts done</span>` : null}
-    ${ticket.state === 'standing' ? html`<span class="sub ticket-state cyan">${standingText(ticket)}</span>` : null}
-    ${ticket.started_early ? html`<span class="sub ticket-state">started early</span>` : null}
-    ${!slim ? html`<${Clock} ticket=${ticket} end=${end} hours=${hours} />` : null}
-    ${!slim && !ticket.clock && !['ready', 'blocked', 'close_ready', 'standing'].includes(ticket.state) ? html`<span class="sub ticket-state">${ticket.state.replaceAll('_', ' ')}${ticket.holder ? ` · ${ticket.holder.name}` : ''}</span>` : null}
-    <${Links} ticket=${ticket} prs=${ticket.prs || []} agent=${agent} jobs=${ticket.jobs || []} thread=${ticket.thread} docs=${ticket.docs || []} />
+  const selection = useContext(BoardSelection);
+  const now = useNow();
+  const parts = ticket.sub_issues, can = rowActions(ticket), holder = ticket.holder;
+  const config = ticket.auto_start ? { ...ticket.auto_start, reasoning_effort:ticket.auto_start.effort } : ticket.launch_preference?.config;
+  const reviews = currentReviews(ticket);
+  return html`<div class="board-ticket" data-ticket=${ticketKey(ticket)}>
+    <div class="board-ticket-main">
+      <div class="ticket-title-line"><input type="checkbox" aria-label=${`Select ${ticket.repo}#${ticket.number}`} checked=${selection.selected.has(ticketKey(ticket))} onChange=${()=>selection.toggle(ticketKey(ticket))} />
+        <button class="ticket-title" onClick=${()=>ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button></div>
+      <span class=${`ticket-state-label ${ticket.state==='needs_you'?'magenta':''}`}>${ticket.state.replaceAll('_',' ')}</span>
+      <div class="ticket-direct-links"><a href=${ticket.url||`https://github.com/${ticket.repo}/issues/${ticket.number}`} target="_blank" rel="noopener noreferrer">Issue #${ticket.number} ↗</a>
+        ${(ticket.prs||[]).map(pr=>html`<span><button class="link-btn" onClick=${()=>openPanel(`ticket:${pr.repo||ticket.repo}#${pr.number}`)}>PR #${pr.number} · ${(pr.state||'open').toLowerCase()}</button> <a aria-label=${`Open PR ${pr.number} on GitHub`} href=${pr.url||`https://github.com/${pr.repo||ticket.repo}/pull/${pr.number}`} target="_blank" rel="noopener noreferrer">↗</a></span>`)}</div>
+      ${ticket.needs_you?html`<span class="sub magenta">${ticket.needs_you.text} · <a href=${ticket.needs_you.url} target="_blank" rel="noopener noreferrer">Open</a></span>`:null}
+      ${ticket.state==='blocked'?html`<span class="sub">${blockedReasons(ticket).join(' ')}</span>`:null}
+      ${(ticket.warnings||[]).includes('merged_not_closed')?html`<span class="sub amber">PR merged · close this ticket on GitHub.</span>`:null}
+      ${ticket.state==='close_ready'?html`<span class="sub cyan">${parts?.done||0} of ${parts?.total||0} parts done</span>`:null}
+      ${ticket.state==='standing'?html`<span class="sub cyan">${standingText(ticket)}</span>`:null}
+      ${ticket.started_early?html`<span class="sub amber">Started early</span>`:null}
+      <${Links} thread=${ticket.thread} docs=${ticket.docs||[]} />
+      ${ticket.clock?html`<details class="board-time"><summary>Time spent · last ${hours}h</summary><${Clock} ticket=${ticket} end=${end} hours=${hours} /></details>`:null}
+    </div>
+    <div class="board-agent"><span class="board-column-label">Agent / terminal</span>${holder?html`
+      <div class="ticket-agent-links"><button class="link-btn" onClick=${()=>openPanel(`agent:${holder.session_id}`)}>${holder.name}</button><button class="btn sm" aria-label=${`Terminal for ${holder.name}`} onClick=${()=>navigate(`/terminal/${encodeURIComponent(holder.session_id)}`)}>⌨</button></div>
+      <span class=${`sub ${holder.state==='working'?'green':''}`}>${holder.state==='working'?'● Working':holder.state==='idle'?'○ Idle':holder.state==='stopped'||holder.state==='retired'?'Stopped':holder.state||'Activity unknown'}${holder.state==='working'?` · ${operationalAge(holder.since,now)}`:''}</span>
+      <span class="sub">${holder.provider?.startsWith('codex')?'Codex':holder.provider==='claude'?'Claude':holder.provider||''}</span>`:html`<span class="sub">No agent assigned</span>`}</div>
+    <div class="board-waits"><span class="board-column-label">Work / waits</span>
+      ${(ticket.jobs||[]).map(job=>html`<button class=${`board-job ${job.quiet_since?'red':job.state==='running'?'green':'amber'}`} onClick=${()=>{navigate('/queue');openPanel(`job:${job.id}`);}}>
+        <b>${job.label||job.id}</b><span>${job.state==='running'?'Running':'Waiting'} · ${operationalAge(job.since||job.started_at||job.queued_at,now)}</span>${job.quiet_since?html`<span>Quiet for ${operationalAge(job.quiet_since,now)}</span>`:null}</button>`)}
+      ${reviews.map(r=>html`<span class=${`board-review ${r.by==='you'?'magenta':'amber'}`}>${r.reviewer_label||'Review'}${r.number?` · PR #${r.number}`:''}<span>Waiting ${operationalAge(r.since||r.waiting_since,now)}</span></span>`)}
+      ${!ticket.jobs?.length&&!reviews.length?html`<span class="sub">${ticket.state==='blocked'?`Dependencies: ${blockedText(ticket)||'see ticket warnings'}`:holder?.state==='working'?'Agent working':holder?'No current job or review wait':'No current job'}</span>`:null}
+    </div>
+    <div class="board-launch"><span class="board-column-label">Launch</span>${config?html`<span class="sub launch-exact">${exactConfig(config)}</span>`:null}
+      <div class="ticket-actions">
+        ${ticket.auto_start?html`<${WhenReadyChip} ticket=${ticket} onStart=${onStart} />`:can.whenReady&&!['stale','cycle'].some(w=>ticket.warnings?.includes(w))?html`<button class="btn sm" onClick=${()=>onStart(ticket,'when_ready')}>Start when ready</button>`:null}
+        ${can.start?html`<button class="btn sm pri" onClick=${()=>onStart(ticket)}>Start</button>`:null}
+        ${can.startBlocked&&!canStartAnyway(ticket)?html`<button class="btn sm" onClick=${()=>onStart(ticket)}>Why blocked</button>`:null}
+        ${can.close?html`<button class="btn sm pri" disabled=${busy} onClick=${()=>onClose(ticket)}>Close</button>`:null}
+        ${can.menu?html`<span class="anchor"><button class="icon-btn" data-pop-anchor aria-label=${`More actions for #${ticket.number}`} onClick=${()=>setMenu(menu?null:'more')}>⋯</button>
+          ${menu==='more'?html`<${Popover} onClose=${()=>setMenu(null)} align="right" className="menu">
+            ${canStartAnyway(ticket)?html`<button onClick=${()=>{setMenu(null);onStart(ticket);}}>Start anyway…</button>`:null}
+            ${can.close?html`<button onClick=${()=>{setMenu(null);onStart(ticket);}}>Start instead</button>`:null}
+            ${canStartWhenReady(ticket)||ticket.auto_start?html`<button onClick=${()=>{setMenu(null);onStart(ticket,'when_ready');}}>${ticket.auto_start?'Edit / cancel auto-start':'Start when ready…'}</button>`:null}
+            <button onClick=${()=>setMenu('handoff')}>Hand off…</button><button onClick=${()=>setMenu('policy')}>Review policy…</button><//>`:null}
+          ${menu==='policy'?html`<${PolicyPopover} scope="ticket" repo=${ticket.repo} number=${ticket.number} title=${`Reviews for #${ticket.number}`} policy=${ticket.review_policy} lanePolicy=${lanePolicy} align="right" onClose=${()=>setMenu(null)} onSaved=${boardChanged} />`:null}
+          ${menu==='handoff'?html`<${HandoffPopover} scope="ticket" align="right" ticket=${{repo:ticket.repo,number:ticket.number}} agent=${holder?{id:holder.session_id,name:holder.name,provider:holder.provider,state:holder.state}:null} onClose=${()=>setMenu(null)} />`:null}</span>`:null}
+      </div>
+      ${ticket.review_policy?html`<button class="review-pill" title=${setByText(ticket.review_policy)} onClick=${()=>setMenu('policy')}>Review: ${reviewerText(ticket.review_policy.reviewer)}</button>`:null}
+    </div>
   </div>`;
 }
 function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy = null }) {
@@ -137,11 +167,13 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
   const [ending, setEnding] = useState(false);
   const [reviews, setReviews] = useState(false);
   const [lining, setLining] = useState(false);
+  const [defaults, setDefaults] = useState(false);
+  const [laneMenu, setLaneMenu] = useState(false);
   const policy = lane.review_policy;
   const groups = groupTickets(lane.tickets || []);
   const counts = lane.counts;
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
-  const short = groups.active.length === 1;
+  const short = false;
   const goalRow = (lane.tickets || []).find((t) => t.repo === lane.goal.repo && t.number === lane.goal.number);
   const showBlocked = groups.active.length + groups.blocked.length <= BLOCKED_ROW_LIMIT;
   return html`<section class="board-lane">
@@ -159,24 +191,28 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
         ${reviews ? html`<${PolicyPopover} scope="lane" repo=${lane.goal.repo} number=${lane.goal.number} title=${`Reviews for lane ${lane.rank} · ${lane.goal.title}`}
           policy=${policy} align="right" onClose=${() => setReviews(false)} onSaved=${boardChanged} />` : null}</span>
       <div class="lane-actions">${lane.goal.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(lane.goal)}>Close</button>` : null}
-        ${laneCandidates(lane).length ? html`<button class="btn sm" onClick=${() => setLining(true)}>Start lane when ready…</button>` : null}
-        <button class="icon-btn" title="Move lane up" disabled=${busy || index === 0} onClick=${() => move(index, -1)}>↑</button>
-        <button class="icon-btn" title="Move lane down" disabled=${busy || index === count - 1} onClick=${() => move(index, 1)}>↓</button>
-        <button class="btn sm" disabled=${busy} onClick=${() => setEnding(!ending)}>End</button></div>
+        <span class="anchor"><button class="btn sm" data-pop-anchor onClick=${()=>setLaneMenu(!laneMenu)}>Lane actions ⋯</button>
+        ${laneMenu?html`<${Popover} onClose=${()=>setLaneMenu(false)} align="right" className="menu">
+          <button onClick=${()=>{setLaneMenu(false);setLining(true);}}>Shared launch setup…</button>
+          <button onClick=${()=>{setLaneMenu(false);setDefaults(true);}}>Future launch default…</button>
+          <button disabled=${busy||index===0} onClick=${()=>{setLaneMenu(false);move(index,-1);}}>Move lane up</button>
+          <button disabled=${busy||index===count-1} onClick=${()=>{setLaneMenu(false);move(index,1);}}>Move lane down</button>
+          <button onClick=${()=>{setLaneMenu(false);setEnding(true);}}>End lane…</button><//>`:null}</span></div>
       ${short ? html`<${TicketRow} ticket=${groups.active[0]} compact end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
     </header>
-    ${lining ? html`<div class="board-start-overlay"><${LaneWhenReady} lane=${lane} onClose=${() => setLining(false)} onSaved=${boardChanged} /></div>` : null}
+    ${lining ? html`<div class="board-start-overlay"><${SharedLaunchSetup} tickets=${lane.tickets||[]} goals=${new Set([ticketKey(lane.goal)])} onClose=${()=>setLining(false)} onSaved=${boardChanged} /></div>` : null}
+    ${defaults ? html`<div class="board-start-overlay"><${LaneLaunchDefault} lane=${lane} onClose=${()=>setDefaults(false)} onSaved=${boardChanged} /></div>` : null}
     ${ending ? html`<div class="lane-confirm">End this lane? Its tickets stay on GitHub.
       <button class="btn sm" onClick=${() => setEnding(false)}>Cancel</button>
       <button class="btn sm danger" disabled=${busy} onClick=${() => mutate(`/client/board/lanes/${lane.id}`, 'DELETE')}>End lane</button></div>` : null}
     ${lane.stale ? html`<p class="err">GitHub data is stale. Refresh to try again.</p>` : null}
     ${(lane.cycles || []).length ? html`<p class="err">Dependency cycle: ${lane.cycles.map((chain) => chain.map((t) => `#${t.number}`).join(' → ')).join('; ')}</p>` : null}
-    ${(lane.longest_chain || []).length ? html`<div class="critical-path">Critical path: ${lane.longest_chain.map((t, i) => html`${i ? ' → ' : ''}<button class="link-btn" onClick=${() => ticketLink(t)}>#${t.number}</button>`)}</div>` : null}
+    ${(lane.longest_chain || []).length ? html`<details class="critical-path"><summary>Critical path</summary> ${lane.longest_chain.map((t, i) => html`${i ? ' → ' : ''}<button class="link-btn" onClick=${() => ticketLink(t)}>#${t.number}</button>`)}</details>` : null}
     ${!short ? groups.active.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />`) : null}
-    ${showBlocked ? groups.blocked.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`) : null}
-    <div class="lane-folds">${!showBlocked ? html`<${Fold} tickets=${groups.blocked} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
-      ${groups.done.slice(0, DONE_ROW_LIMIT).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
-      <${Fold} tickets=${groups.done.slice(DONE_ROW_LIMIT)} label="More done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
+    ${(showBlocked ? groups.blocked : groups.blocked.filter(hasOperations)).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
+    <div class="lane-folds">${!showBlocked ? html`<${Fold} tickets=${groups.blocked.filter(t=>!hasOperations(t))} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
+      ${groups.done.filter((t,i)=>i<DONE_ROW_LIMIT || hasOperations(t)).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
+      <${Fold} tickets=${groups.done.filter((t,i)=>i>=DONE_ROW_LIMIT && !hasOperations(t))} label="More done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
   </section>`;
 }
 function AddLane({ repos, mutate, busy, onClose }) {
@@ -197,6 +233,18 @@ export function BoardPage() {
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [starting, setStarting] = useState(null);
+  const [selected, setSelected] = useState(new Set());
+  const [batch, setBatch] = useState(null);
+  const [filter, setFilter] = useState('all');
+  const [query, setQuery] = useState('');
+  const [settings, setSettings] = useState(null);
+  useEffect(()=>{api('/client/settings').then(setSettings).catch(()=>{});},[]);
+  const toggle = key => setSelected(prev=>{const next=new Set(prev);next.has(key)?next.delete(key):next.add(key);return next;});
+  const allTickets = data ? distinctTickets([...data.lanes.flatMap(l=>l.tickets||[]),...(data.other||[]).flatMap(g=>g.tickets)]) : [];
+  const goals = new Set(data?.lanes.map(l=>ticketKey(l.goal))||[]);
+  const visibleLanes = data?.lanes.map(l=>({...l,tickets:(l.tickets||[]).filter(t=>matchesFilter(t,filter,query,l.goal.title))})).filter(l=>l.tickets.length)||[];
+  const visibleOthers = (data?.other||[]).map(g=>({...g,tickets:g.tickets.filter(t=>matchesFilter(t,filter,query))})).filter(g=>g.tickets.length);
+  const openBatch = preset => {const tickets=allTickets.filter(t=>selected.has(ticketKey(t)));if(!tickets.length){toast('Select tickets first');return;}setBatch({tickets,initialPreset:preset});};
   const refreshTimer = useRef(null);
   useEffect(() => () => clearTimeout(refreshTimer.current), []);
   useEffect(() => bus.on('board-changed', reload), [reload]);
@@ -235,22 +283,29 @@ export function BoardPage() {
   };
   const close = (ticket) => mutate('/client/board/close', 'POST', { repo: ticket.repo, number: ticket.number });
   const startTicket = (ticket, mode = 'start') => setStarting({ ticket, mode });
-  return html`<${AutoStartPaused.Provider} value=${!!(data && data.auto_start_paused)}><div class="content board-content">
+  return html`<${AutoStartPaused.Provider} value=${!!(data && data.auto_start_paused)}><${BoardSelection.Provider} value=${{selected,toggle}}><div class="content board-content">
     <div class="board-toolbar"><span class="sub">${data ? `${data.lanes.length} lanes · updated ${age(data.generated_at)} ago` : 'Loading board…'}</span>
       <${Seg} label="Clock window" value=${hours} options=${[3, 6, 24].map((n) => ({ value: n, label: `${n} h` }))} onChange=${(n) => { store('sm-board-clock-hours', n); setHours(n); }} />
       <button class="btn" disabled=${busy} onClick=${() => mutate('/client/board/refresh', 'POST')}>Refresh</button>
       <span class="anchor"><button class="btn" data-pop-anchor onClick=${() => setAdding(!adding)}>Add lane</button>
         ${adding ? html`<${AddLane} repos=${data ? data.repos : []} mutate=${mutate} busy=${busy} onClose=${() => setAdding(false)} />` : null}</span>
     </div>
+    <div class="board-filterbar"><${Seg} label="Board filter" value=${filter} onChange=${setFilter} options=${[{value:'all',label:'All work'},{value:'attention',label:'Needs attention'},{value:'armed',label:'Armed'},{value:'finished',label:'Finished'}]} />
+      <input class="inp" aria-label="Find a ticket or goal" placeholder="Find a ticket or goal…" value=${query} onInput=${e=>setQuery(e.target.value)} /></div>
+    <div class="board-presetbar"><span class="sub">QUICK PRESETS</span><${Presets} settings=${settings} onPick=${c=>openBatch(c.provider==='claude'?'claude':'sol')} /><button class="link-btn" onClick=${()=>navigate('/settings')}>Manage</button></div>
+    <div class="board-selectionbar"><button class="btn sm" onClick=${()=>{const boxes=[...document.querySelectorAll('.board-ticket input[type=checkbox]')].filter(el=>el.getClientRects().length);setSelected(prev=>new Set([...prev,...boxes.map(el=>el.closest('[data-ticket]').dataset.ticket)]));}}>Select visible</button>
+      <span>${selected.size} selected${selected.size ? ` · ${allTickets.filter(t=>selected.has(ticketKey(t))&&!matchesFilter(t,filter,query)).length} outside current filter` : ''}</span>
+      <button class="btn sm pri" disabled=${!selected.size} onClick=${()=>openBatch(null)}>Shared setup</button>${selected.size?html`<button class="link-btn" onClick=${()=>setSelected(new Set())}>Clear selection</button>`:null}</div>
     ${error || actionError ? html`<p class="err" role="alert">${actionError || error.message}</p>` : null}
     ${data ? html`
-      ${data.lanes.length ? data.lanes.map((lane, index) => html`<${Lane} key=${lane.id} lane=${lane} index=${index} count=${data.lanes.length}
+      ${data.lanes.length ? visibleLanes.map((lane) => html`<${Lane} key=${lane.id} lane=${lane} index=${data.lanes.findIndex(l=>l.id===lane.id)} count=${data.lanes.length}
         end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />`) : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
-      ${(data.other || []).map((group) => html`<section class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
+      ${visibleOthers.map((group) => html`<section class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
         ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />`)}
         ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />` : null}</section>`)}
       <div class="clock-legend"><span class="ball green">agent working</span><span class="ball green">queue job running (hatched)</span><span class="ball amber">queue or review</span><span class="ball magenta">waiting on you</span><span class="ball red">nothing moving</span></div>` : null}
+    ${batch?html`<div class="board-start-overlay"><${SharedLaunchSetup} tickets=${batch.tickets} goals=${goals} initialPreset=${batch.initialPreset} onClose=${()=>setBatch(null)} onSaved=${()=>{setSelected(new Set());reload();}} /></div>`:null}
     ${starting ? html`<div class="board-start-overlay"><${TicketStart} key=${`${ticketKey(starting.ticket)} ${starting.mode}`} ticket=${starting.ticket}
       mode=${starting.mode} onClose=${() => setStarting(null)} onStarted=${reload} /></div>` : null}
-  </div><//>`;
+  </div><//><//>`;
 }
