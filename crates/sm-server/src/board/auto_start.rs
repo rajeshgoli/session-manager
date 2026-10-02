@@ -32,6 +32,7 @@ pub struct Record {
     pub brief: Option<String>,
     pub state: String,
     pub attempts: i64,
+    pub revision: i64,
     pub last_error: Option<String>,
     pub session_id: Option<String>,
 }
@@ -118,7 +119,7 @@ impl BoardStore {
         };
         let mut stmt = conn.prepare(
             "SELECT repo, number, agent_type, provider, model, effort,
-            brief, state, attempts, last_error, session_id FROM auto_starts",
+            brief, state, attempts, last_error, session_id, revision FROM auto_starts",
         )?;
         let records = stmt
             .query_map([], |row| {
@@ -134,6 +135,7 @@ impl BoardStore {
                     attempts: row.get(8)?,
                     last_error: row.get(9)?,
                     session_id: row.get(10)?,
+                    revision: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

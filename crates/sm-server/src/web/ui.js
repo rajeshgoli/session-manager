@@ -77,9 +77,10 @@ export function openItem(kind, id, href) {
 // ---- fetch ------------------------------------------------------------------
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, body = null) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -148,7 +149,7 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
   }
   if (!response.ok) {
     const detail = value && (typeof value.detail === 'string' ? value.detail : value.error);
-    throw new ApiError(detail || `HTTP ${response.status}`, response.status);
+    throw new ApiError(detail || `HTTP ${response.status}`, response.status, value);
   }
   if (method === 'GET' && value !== null) pageData.put(path, value);
   return value;

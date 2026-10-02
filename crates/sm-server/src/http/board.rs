@@ -301,6 +301,11 @@ pub(super) fn init_board(state: Arc<AppState>) {
             .await;
             match result {
                 Ok(Ok(Some(recomputed))) => {
+                    if let Err(error) = new_agent_settings(&state).and_then(|settings| {
+                        board_store(&state).sync_launch_preferences(&recomputed.board, &settings)
+                    }) {
+                        eprintln!("launch preference capture failed: {error:#}");
+                    }
                     let started = process_auto_starts(&state, &recomputed).await;
                     send_alerts_excluding(&state, &recomputed, &started);
                 }
@@ -1094,7 +1099,9 @@ pub(super) async fn client_board(
     owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let hours = super::board_clock::clock_hours(query.clock_hours)?;
     let payload = blocking(&state, move |state| {
-        Ok(board_payload(state, None, Some(hours))?)
+        let mut payload = board_payload(state, None, Some(hours))?;
+        super::board_launch::decorate(state, &mut payload)?;
+        Ok(payload)
     })
     .await?;
     Ok(Json(payload))

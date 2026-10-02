@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
 import { EFFORTS } from './start.js';
+import { Presets } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
 export const REVIEWER_KINDS = [{ value: '', label: 'Lane default' }, { value: 'github_codex', label: 'GitHub' },
@@ -43,6 +44,7 @@ export const LAST_TYPE_KEY = 'sm-auto-start-type';
 /** "opus[1m]" → "Opus", "claude-sonnet-4-5" → "Sonnet"; null is the provider default. */
 export function modelShort(model) {
   if (!model) return 'default';
+  if (model.startsWith('gpt-')) return model;
   const word = model.replace(/\[.*\]$/, '').replace(/^claude-/, '').split(/[-_\s]/)[0] || model;
   return word[0].toUpperCase() + word.slice(1);
 }
@@ -157,14 +159,16 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
       .then(([options, saved]) => {
         if (!alive) return;
         let next = { ...options, template: options.brief };
+        const preference = ticket.launch_preference?.config;
+        if (preference && !auto) next = { ...next, ...preference, brief: preference.brief ?? options.brief };
         if (later) {
           const kinds = saved.new_agent.agent_types || [];
           const name = defaultType(ticket, kinds, stored(LAST_TYPE_KEY, ''));
           const type = kinds.find((t) => t.name === name);
           if (auto) next = { ...next, ...choiceOf(auto), brief: auto.brief ?? options.brief };
-          else if (type) next = { ...next, provider: type.provider, model: type.model, reasoning_effort: type.effort };
-          setTypeName(name || CUSTOM);
-          setEdited(!!auto && auto.brief != null);
+          else if (type && !preference) next = { ...next, provider: type.provider, model: type.model, reasoning_effort: type.effort };
+          setTypeName(preference && !auto ? matchType(kinds, preference) || CUSTOM : name || CUSTOM);
+          setEdited(auto ? auto.brief != null : !!preference && preference.brief != null);
         }
         setForm(next); setSettings(saved);
       })
@@ -288,19 +292,20 @@ function BugText({ value, disabled, onInput }) {
  */
 export function AgentFields({ form, set, settings, models, expanded, setExpanded, efforts = EFFORTS, reviewer = true, named = null, extra = null }) {
   return html`
+    <${Presets} settings=${settings} onPick=${set} />
     <${Seg} label="Provider" value=${form.provider}
       options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
       onChange=${(provider) => set(providerDefaults(settings, provider))} />
     <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span>
-      <button class="link-btn" onClick=${() => setExpanded(!expanded)}>${expanded ? 'Less' : 'Change'}</button></div>
+      </div>
     ${named}
-    ${expanded ? html`
+    ${html`
       <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
         <option value="">Provider default</option>${models.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
       <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
         options=${[{ value: '', label: 'default' }, ...(efforts[form.provider] || []).map((e) => ({ value: e, label: e }))]}
         onChange=${(value) => set({ reasoning_effort: value || null })} /></div>
-      ${extra}` : null}
+      ${extra}`}
     ${reviewer ? html`<${ReviewerRow} form=${form} set=${set} />` : null}`;
 }
 

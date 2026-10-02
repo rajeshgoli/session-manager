@@ -349,6 +349,7 @@ mod ask;
 mod auto_retire;
 mod board;
 mod board_clock;
+mod board_launch;
 mod board_links;
 mod browser_terminal;
 mod bugs;
@@ -1942,6 +1943,12 @@ pub fn router(state: AppState) -> Router {
         .route("/board/links", post(board::post_link))
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
+        .route("/client/board/launch-preview", post(board_launch::preview))
+        .route("/client/board/launch-selection", put(board_launch::commit))
+        .route(
+            "/client/board/launch-default",
+            get(board_launch::get_default).put(board_launch::put_default),
+        )
         .route("/client/board/start", post(board::client_start))
         .route(
             "/client/board/auto-start",
@@ -21286,9 +21293,10 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 22] = [
+    const OWNER_WEB_READS: [&str; 23] = [
         "/client/queue",
         "/client/queue/stats",
+        "/client/board/launch-default?lane_id=1",
         "/client/queue/jobs/job-missing/start-check",
         "/client/queue/jobs/job-missing/usage",
         "/client/utilization/series",
@@ -21319,6 +21327,21 @@ mod tests {
                 json!({}),
             ),
             (Method::POST, "/queue-jobs/job-missing/cancel", json!({})),
+            (
+                Method::POST,
+                "/client/board/launch-preview",
+                json!({"selection":[],"common":{"config":{"mode":"keep"},"message":{"mode":"keep"},"behavior":"keep"},"exceptions":[]}),
+            ),
+            (
+                Method::PUT,
+                "/client/board/launch-selection",
+                json!({"request_id":"missing","token":"missing"}),
+            ),
+            (
+                Method::PUT,
+                "/client/board/launch-default",
+                json!({"lane_id":1,"expected_revision":0,"config":null}),
+            ),
             (
                 Method::POST,
                 "/sessions/fork1001/what",

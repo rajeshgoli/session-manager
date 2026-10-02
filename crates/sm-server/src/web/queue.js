@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useState, useMemo } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
+
+import { startNowController } from './queue-start.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
 const pct = (value) => typeof value === 'number' ? `${value.toFixed(1)}%` : '—';
@@ -93,7 +95,11 @@ const QUESTION_DONE = ['completed', 'failed', 'timed_out'];
 
 function JobPanel({ id, controls }) {
   const encoded = encodeURIComponent(id);
+  const startController = useMemo(()=>startNowController(api,id),[id]);
+  const [startCheck,setStartCheck] = useState(null);
+  const [startBusy,setStartBusy] = useState(false);
   const [job, error, reload] = usePoll(() => api(`/queue-jobs/${encoded}`), 5000, [id]);
+  useEffect(()=>{setStartCheck(null);startController.cancel();},[id,job?.state]);
   const [log, logError] = usePoll(async () => {
     try { return await api(`/queue-jobs/${encoded}/log?lines=40`); }
     catch (error) {
@@ -146,10 +152,18 @@ function JobPanel({ id, controls }) {
   return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${review ? `${review.title} · round ${job.review.round}` : title(job)}</span>${controls}<span class="s">${review ? job.review.reviewer_label : `${job.type} · ${jobAgentLabel(job)}`}</span></div>
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
-        ${job.state === 'pending' ? html`<button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/start`, { method: 'POST', body: {} }); bus.emit('queue-changed'); })}>${busy ? 'Starting…' : 'Start now'}</button>` : null}
+        ${job.state === 'pending' ? html`<button class="btn" disabled=${busy||startBusy} onClick=${async()=>{setStartBusy(true);setFailure('');try{setStartCheck(await startController.inspect());}catch(e){setFailure(e.message);}finally{setStartBusy(false);}}}>${startBusy?'Checking…':'Start now'}</button>` : null}
         ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>Cancel</button><button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>` : null}
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
+      ${startCheck && job.state==='pending' ? html`<section class="q-card" aria-label="Start now confirmation"><h3>Start now despite admission limits?</h3><p class="sub">Checked at ${new Date(startCheck.checked_at).toLocaleTimeString()}</p>
+        <p>This overrides admission slots, queue order, performance cooldown and memory admission. Runtime limits still apply; forced jobs can be requeued first under memory pressure.</p>
+        ${startCheck.warnings.length?html`<ul>${startCheck.warnings.map(w=>html`<li>${w}</li>`)}</ul>`:html`<p>No admission warnings in this snapshot.</p>`}
+        <dl class="q-details"><dt>Available memory</dt><dd>${startCheck.memory_available_bytes==null?'Unknown':gb(startCheck.memory_available_bytes)}</dd><dt>Memory reserve</dt><dd>${gb(startCheck.memory_reserve_bytes)}</dd><dt>Estimated memory</dt><dd>${startCheck.memory_estimate_bytes==null?'Unknown':gb(startCheck.memory_estimate_bytes)} · ${startCheck.memory_estimate_source||'unknown source'}${startCheck.past_runs?` · ${startCheck.past_runs} past runs`:''}</dd></dl>
+        <p class="sub">Snapshot expires after 30 seconds. If it expires, confirmation refreshes the check and asks again. Memory is not reserved.</p>
+        <button class="btn" disabled=${startBusy} onClick=${()=>{startController.cancel();setStartCheck(null);}}>Keep waiting</button>
+        <button class="btn danger" disabled=${startBusy||busy} onClick=${async()=>{setStartBusy(true);setFailure('');try{const r=await startController.confirm(job.state);if(r.submitted){setStartCheck(null);bus.emit('queue-changed');reload();}else if(r.check){setStartCheck(r.check);setFailure('Check refreshed. Review these values and confirm again.');}}catch(e){setFailure(e.message);setStartCheck(null);reload();}finally{setStartBusy(false);}}}>${startBusy?'Starting…':'Confirm Start now'}</button>
+      </section>`:null}
       ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>Cancel job</button></section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}

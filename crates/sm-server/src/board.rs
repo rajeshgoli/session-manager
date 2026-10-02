@@ -23,6 +23,7 @@ use crate::work_claims::{canonical_repo, HolderState, SessionDirectory};
 
 pub mod auto_start;
 pub mod clock;
+pub mod launch;
 pub mod model;
 pub mod pushes;
 pub mod sync;
@@ -167,6 +168,7 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
     {
         conn.execute("ALTER TABLE board_items ADD COLUMN tier TEXT", [])?;
     }
+    launch::schema(conn)?;
     Ok(())
 }
 
