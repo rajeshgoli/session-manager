@@ -425,6 +425,7 @@ fn await_stable_serving_for(
 ) -> Result<()> {
     await_serving(stream).context("waiting for replacement serving reply")?;
     let deadline = std::time::Instant::now() + duration;
+    let mut consecutive_timeouts = 0;
     while std::time::Instant::now() < deadline {
         let mut byte = [0];
         let check_deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -435,7 +436,32 @@ fn await_stable_serving_for(
                 Err(error) => return Err(error).context("reading replacement handover connection"),
             }
         }
-        probe_health(address).context("probing replacement health")?;
+        match probe_health(address) {
+            Ok(()) => consecutive_timeouts = 0,
+            Err(error) => {
+                // SO_RCVTIMEO reports WouldBlock on macOS and TimedOut on
+                // other platforms. A busy replacement may miss one probe.
+                let timed_out = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    )
+                });
+                consecutive_timeouts += 1;
+                if !timed_out || consecutive_timeouts >= 3 || std::time::Instant::now() >= deadline
+                {
+                    return Err(error).context("probing replacement health");
+                }
+                eprintln!(
+                    "replacement health probe timed out ({consecutive_timeouts}/3); \
+                     retrying within stability window: {error:#}"
+                );
+            }
+        }
+    }
+    // The deadline can expire between iterations after a tolerated timeout.
+    if consecutive_timeouts != 0 {
+        bail!("replacement health did not recover before stability window ended");
     }
     Ok(())
 }
@@ -749,6 +775,101 @@ mod tests {
         assert!(waiting.ends_with("new"), "{waiting}");
         old.await.unwrap();
         new.abort();
+    }
+
+    #[test]
+    fn slow_health_probe_recovers_without_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[true, true, false, true, true, false],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_secs(12),
+        );
+        result.unwrap();
+        assert!(
+            probes >= 6,
+            "successful probes must reset the timeout count"
+        );
+    }
+
+    #[test]
+    fn three_consecutive_health_timeouts_request_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[true, true, true],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_secs(15),
+        );
+        assert!(result.is_err());
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn health_timeout_at_window_end_requests_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[true],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_millis(10),
+        );
+        assert!(result.is_err());
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn unhealthy_response_requests_immediate_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[],
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_secs(15),
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("health check failed"));
+        assert_eq!(probes, 1);
+    }
+
+    // Exercise real socket timeouts, including macOS's WouldBlock result.
+    // Entries mark responses delayed beyond the production one-second timeout.
+    fn check_health_sequence(
+        slow: &[bool],
+        response: &'static [u8],
+        duration: Duration,
+    ) -> (Result<()>, usize) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Shutdown::default();
+        let stopped = stop.clone();
+        let slow = slow.to_vec();
+        let server = thread::spawn(move || {
+            let mut probes = 0;
+            while !stopped.is_stopped() {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = [0; 1];
+                        socket.read_exact(&mut request).unwrap();
+                        if slow.get(probes).copied().unwrap_or(false) {
+                            thread::sleep(Duration::from_millis(1300));
+                        }
+                        // The client may already have timed out and closed.
+                        let _ = socket.write_all(response);
+                        probes += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accepting health probe: {error}"),
+                }
+            }
+            probes
+        });
+        let (mut old, mut new) = UnixStream::pair().unwrap();
+        send_serving(&mut new).unwrap();
+        let result = await_stable_serving_for(&mut old, address, duration);
+        stop.stop();
+        (result, server.join().unwrap())
     }
 
     #[test]
