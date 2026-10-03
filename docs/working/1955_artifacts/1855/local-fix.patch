@@ -1,0 +1,86 @@
+From 19dad75078286997f29fc8f4314ffaaab501abe6 Mon Sep 17 00:00:00 2001
+From: Rajesh <rajesh@studio.local>
+Date: Sat, 3 Oct 2026 09:59:47 -0700
+Subject: [PATCH] Accept retired sm request-codex-review as a hidden alias of
+ request-review
+
+Agents launched from stale instruction files (checkouts lagging origin/main,
+or sessions started before the rename deploy) still call the old
+'sm request-codex-review', which the renamed CLI rejected. They then fell
+back to posting '@codex review' by hand, which sm does not track, so the web
+board showed the agent as stalled instead of 'review on PR #N'.
+
+Make request-codex-review a hidden clap alias of request-review and drop the
+run() pre-parse rejection that printed 'unrecognized subcommand'. The alias
+forwards the create path and the list/status/cancel subcommands, so a stale
+agent registers its review instead of falling back.
+
+Add a parse test that fails without the alias and passes with it.
+---
+ crates/sm-server/src/bin/sm.rs | 36 ++++++++++++++++++++++++++++------
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/crates/sm-server/src/bin/sm.rs b/crates/sm-server/src/bin/sm.rs
+index f1b3fd76..e3422625 100644
+--- a/crates/sm-server/src/bin/sm.rs
++++ b/crates/sm-server/src/bin/sm.rs
+@@ -87,7 +87,7 @@ enum Command {
+     ListDevices(ListDevicesArgs),
+     #[command(name = "remove-device")]
+     RemoveDevice(RemoveDeviceArgs),
+-    #[command(name = "request-review")]
++    #[command(name = "request-review", alias = "request-codex-review")]
+     RequestReview(RequestReviewArgs),
+     /// Paired reviewers: return your review to sm
+     Review(ReviewArgs),
+@@ -853,11 +853,6 @@ fn main() {
+ }
+ 
+ fn run() -> Result<()> {
+-    let removed_command = concat!("request-codex-", "review");
+-    if std::env::args().nth(1).as_deref() == Some(removed_command) {
+-        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
+-        process::exit(2);
+-    }
+     let cli = Cli::parse();
+     let command = cli.command;
+     let command = match command {
+@@ -7408,6 +7403,35 @@ mod tests {
+         assert_eq!(request_id.as_deref(), Some("req456"));
+     }
+ 
++    #[test]
++    fn request_codex_review_is_a_hidden_alias_of_request_review() {
++        let create_cli = Cli::try_parse_from([
++            "sm",
++            "request-codex-review",
++            "1808",
++            "--steer",
++            "focus on auth",
++        ])
++        .expect("request-codex-review should parse as a hidden alias of request-review");
++        let Command::RequestReview(create_args) = create_cli.command else {
++            panic!("expected request-codex-review to map to RequestReview");
++        };
++        assert_eq!(create_args.action_or_pr.as_deref(), Some("1808"));
++        assert_eq!(create_args.steer.as_deref(), Some("focus on auth"));
++        assert!(create_args.command.is_none());
++
++        let list_cli = Cli::try_parse_from(["sm", "request-codex-review", "list", "--json"])
++            .expect("request-codex-review subcommands should resolve through the alias");
++        let Command::RequestReview(list_args) = list_cli.command else {
++            panic!("expected request-codex-review list to map to RequestReview");
++        };
++        assert!(list_args.json);
++        assert!(matches!(
++            list_args.command,
++            Some(RequestReviewCommand::List)
++        ));
++    }
++
+     #[test]
+     fn codex_review_request_list_path_preserves_python_filters() {
+         let _guard = ENV_LOCK.lock().unwrap();
+-- 
+2.54.0 (Apple Git-157)
+

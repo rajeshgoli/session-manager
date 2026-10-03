@@ -1,0 +1,25 @@
+   Compiling sm-server v0.1.0 (/Users/rajesh/worktrees/sm-1955-opencode-1855/crates/sm-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.64s
+     Running tests/retired_review_name.rs (target/debug/deps/retired_review_name-27186cda4fb9e072)
+
+running 1 test
+test retired_request_codex_review_name_posts_a_review_request ... FAILED
+
+failures:
+
+---- retired_request_codex_review_name_posts_a_review_request stdout ----
+
+thread 'retired_request_codex_review_name_posts_a_review_request' (192765351) panicked at crates/sm-server/tests/retired_review_name.rs:62:5:
+sm failed: error: unrecognized subcommand 'request-codex-review'
+
+tip: use 'sm request-review' instead
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    retired_request_codex_review_name_posts_a_review_request
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+error: test failed, to rerun pass `-p sm-server --test retired_review_name`

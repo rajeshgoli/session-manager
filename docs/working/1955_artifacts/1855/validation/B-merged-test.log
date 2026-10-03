@@ -1,0 +1,9 @@
+   Compiling sm-server v0.1.0 (/Users/rajesh/worktrees/sm-1955-opencode-1855/crates/sm-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.55s
+     Running tests/retired_review_name.rs (target/debug/deps/retired_review_name-27186cda4fb9e072)
+
+running 1 test
+test retired_request_codex_review_name_posts_a_review_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+

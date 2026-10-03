@@ -1,0 +1,9 @@
+   Compiling sm-server v0.1.0 (/Users/rajesh/worktrees/sm-1955-opencode-1913/crates/sm-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.73s
+     Running unittests src/lib.rs (target/debug/deps/sm_server-4cece1a226abaa8e)
+
+running 1 test
+test queue::tests::queue_job_does_not_inherit_handed_over_listeners ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1183 filtered out; finished in 0.05s
+

@@ -1,0 +1,154 @@
+commit 14ea14c93602af0b6c8064589c41533604364ca7
+Author: Rajesh Goli <rajeshgoli@gmail.com>
+Date:   Thu Oct 1 07:53:56 2026 -0700
+
+    fix: prevent inherited handover listeners in queue jobs (#1918)
+    
+    Co-authored-by: Rajesh <rajesh@studio.local>
+
+diff --git a/crates/sm-server/src/handover.rs b/crates/sm-server/src/handover.rs
+index 9102ba97..05960e40 100644
+--- a/crates/sm-server/src/handover.rs
++++ b/crates/sm-server/src/handover.rs
+@@ -473,6 +473,9 @@ pub fn send_listeners(stream: &UnixStream, fds: &[RawFd], lan_listener: bool) ->
+     Ok(())
+ }
+ 
++/// Receive listeners before starting workers that can spawn child processes.
++/// macOS has no atomic close-on-exec receive flag, so startup ordering keeps
++/// children from racing the descriptor receipt and the fcntl below.
+ pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
+     if !readable_before(stream, std::time::Instant::now() + Duration::from_secs(15))? {
+         bail!("timed out waiting for handover listeners");
+@@ -480,11 +483,15 @@ pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
+     let mut body = [0_u8; 1024];
+     let mut iov = [IoSliceMut::new(&mut body)];
+     let mut control = cmsg_space!([RawFd; 4]);
++    #[cfg(target_os = "linux")]
++    let receive_flags = MsgFlags::MSG_CMSG_CLOEXEC;
++    #[cfg(not(target_os = "linux"))]
++    let receive_flags = MsgFlags::empty();
+     let message = recvmsg::<()>(
+         stream.as_raw_fd(),
+         &mut iov,
+         Some(&mut control),
+-        MsgFlags::empty(),
++        receive_flags,
+     )
+     .context("failed to receive handover listeners")?;
+     if message.flags.contains(MsgFlags::MSG_CTRUNC) {
+@@ -503,6 +510,15 @@ pub fn receive_listeners(stream: &UnixStream) -> Result<(Vec<OwnedFd>, bool)> {
+             }
+         }
+     }
++    // SCM_RIGHTS transfers the socket, not its descriptor flags. Own every
++    // received descriptor before a fallible operation so errors close them all.
++    for fd in &fds {
++        nix::fcntl::fcntl(
++            fd.as_raw_fd(),
++            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
++        )
++        .context("failed to mark handover listener close-on-exec")?;
++    }
+     let reply: Reply = serde_json::from_slice(&body[..length])?;
+     if !reply.handed_over || fds.len() != 3 + usize::from(reply.lan_listener) {
+         bail!("invalid handover listener reply");
+@@ -598,6 +614,14 @@ mod tests {
+         let (fds, lan) = receive_listeners(&new).unwrap();
+         assert_eq!(fds.len(), 3);
+         assert!(!lan);
++        for fd in &fds {
++            let flags = nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
++            assert_ne!(
++                flags & nix::libc::FD_CLOEXEC,
++                0,
++                "handed-over listener is inheritable"
++            );
++        }
+         assert!(send_listeners(&old, &[tcp.as_raw_fd()], false).is_err());
+     }
+ 
+diff --git a/crates/sm-server/src/queue.rs b/crates/sm-server/src/queue.rs
+index 1d54052b..16ecabea 100644
+--- a/crates/sm-server/src/queue.rs
++++ b/crates/sm-server/src/queue.rs
+@@ -10167,6 +10167,79 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn queue_job_does_not_inherit_handed_over_listeners() {
++        use std::os::{
++            fd::AsRawFd,
++            unix::net::{UnixListener, UnixStream},
++        };
++
++        let state_dir = unique_temp_path("handover-inheritance");
++        let job = create_test_job(&state_dir, "tests", "handover-inheritance");
++        let conn = Connection::open(state_dir.join("queue_runner.db")).unwrap();
++        let job = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
++        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let lan = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        // macOS Unix socket paths have a small length limit.
++        let socket_dir = PathBuf::from(format!("/tmp/sm-1913-{}", job.id));
++        fs::create_dir_all(&socket_dir).unwrap();
++        let authority_path = socket_dir.join("authority.sock");
++        let handover_path = socket_dir.join("handover.sock");
++        let authority = UnixListener::bind(&authority_path).unwrap();
++        let handover = UnixListener::bind(&handover_path).unwrap();
++        let (old, new) = UnixStream::pair().unwrap();
++        let listeners = [
++            http.as_raw_fd(),
++            authority.as_raw_fd(),
++            handover.as_raw_fd(),
++            lan.as_raw_fd(),
++        ];
++        let markers = [
++            format!("127.0.0.1:{}", http.local_addr().unwrap().port()),
++            format!("127.0.0.1:{}", lan.local_addr().unwrap().port()),
++            authority_path.display().to_string(),
++            handover_path.display().to_string(),
++        ];
++        for has_lan in [false, true] {
++            crate::handover::send_listeners(&old, &listeners[..3 + usize::from(has_lan)], has_lan)
++                .unwrap();
++            let (received, received_lan) = crate::handover::receive_listeners(&new).unwrap();
++            assert_eq!(received_lan, has_lan);
++            write_queue_job_wrapper(
++                Path::new(job.wrapper_path.as_ref().unwrap()),
++                "/tmp",
++                Some(&[
++                    "/bin/zsh".into(),
++                    "-c".into(),
++                    // Inspect both the queue wrapper and its descendant command.
++                    "/usr/sbin/lsof -nP -a -p $$,$PPID -Fn; print stdout-ok; print -u2 stderr-ok"
++                        .into(),
++                ]),
++                None,
++                &BTreeMap::new(),
++                Path::new(job.exit_code_path.as_ref().unwrap()),
++            )
++            .unwrap();
++            let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
++            let log = fs::read_to_string(job.log_path.as_ref().unwrap()).unwrap();
++            assert!(status.success(), "{log}");
++            assert!(log.contains("n/dev/null"), "stdin missing: {log}");
++            assert!(
++                log.contains("stdout-ok") && log.contains("stderr-ok"),
++                "{log}"
++            );
++            for marker in &markers {
++                assert!(!log.contains(marker), "inherited {marker}: {log}");
++            }
++            // Keep the received listeners open until after the child exits.
++            drop(received);
++        }
++        drop(conn);
++        fs::remove_dir_all(state_dir).unwrap();
++        fs::remove_dir_all(socket_dir).unwrap();
++    }
++
+     #[test]
+     fn queue_job_starts_under_the_process_ceiling() {
+         let job_dir = unique_temp_path("process-ceiling-spawn");

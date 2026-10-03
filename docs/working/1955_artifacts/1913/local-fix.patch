@@ -1,0 +1,162 @@
+From c8b1d623cd0785450897d214d0709bd14f2685bb Mon Sep 17 00:00:00 2001
+From: Rajesh <rajesh@studio.local>
+Date: Sat, 3 Oct 2026 09:54:31 -0700
+Subject: [PATCH] Close inherited listener descriptors before a queue job execs
+
+Queue jobs were launched with whatever descriptors the queue runner
+already held. Descriptors that arrive without close-on-exec - listeners
+and accepted sockets passed over a handover, for example - therefore
+survived into the job child, which kept the live HTTP listener, handover
+socket and authority socket alive across a server restart and exposed
+them to whatever the job ran.
+
+Reuse the tmux spawn helper in spawn_queue_job_process so the job child
+starts with only stdin, stdout and stderr. The new test hands the job a
+readable descriptor and fails while the child can still see it.
+---
+ crates/sm-server/src/queue.rs   | 94 +++++++++++++++++++++++++++++++++
+ crates/sm-server/src/runtime.rs | 14 +++--
+ 2 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/crates/sm-server/src/queue.rs b/crates/sm-server/src/queue.rs
+index 1d54052b..970f77dd 100644
+--- a/crates/sm-server/src/queue.rs
++++ b/crates/sm-server/src/queue.rs
+@@ -5390,6 +5390,10 @@ fn spawn_queue_job_process(
+     #[cfg(unix)]
+     {
+         command.process_group(0);
++        // The job needs its three standard descriptors and nothing else: the
++        // live server's listeners and authority socket reach the child whenever
++        // they arrive without close-on-exec (sm#1955).
++        crate::runtime::close_inherited_descriptors_before_exec(&mut command);
+         if let Some(ceiling) = process_ceiling {
+             // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
+             // state. Lowering a limit cannot fail for a value at or below the
+@@ -10743,6 +10747,96 @@ mod tests {
+         fs::remove_dir_all(job_dir).unwrap();
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn queue_job_child_inherits_nothing_above_standard_descriptors() {
++        // The job child must start with only stdin, stdout and stderr. A
++        // listener or accepted socket can arrive without close-on-exec — a
++        // handover passes descriptors that way — and then every queue job keeps
++        // the live HTTP listener, handover socket and authority socket alive and
++        // hands them to whatever it runs. The duplicated descriptor below stands
++        // in for those, and the wrapper proves with its own log whether the
++        // child could still read it.
++        let job_dir = unique_temp_path("inherited-descriptors");
++        fs::create_dir_all(&job_dir).unwrap();
++        let inherited_path = job_dir.join("inherited-listener");
++        fs::write(&inherited_path, "production-listener\n").unwrap();
++        let inherited = fs::File::open(&inherited_path).unwrap();
++        let inherited_fd = nix::fcntl::fcntl(
++            std::os::fd::AsRawFd::as_raw_fd(&inherited),
++            nix::fcntl::FcntlArg::F_DUPFD(200),
++        )
++        .unwrap();
++        assert_eq!(
++            nix::fcntl::fcntl(inherited_fd, nix::fcntl::FcntlArg::F_GETFD).unwrap()
++                & nix::libc::FD_CLOEXEC,
++            0,
++            "the probe descriptor must start inheritable"
++        );
++
++        let wrapper_path = job_dir.join("run.zsh");
++        let exit_code_path = job_dir.join("exit.code");
++        let log_path = job_dir.join("job.log");
++        let probe = format!(
++            r#"if read -r marker <&{inherited_fd} 2>/dev/null; then echo "inherited: $marker"; else echo 'inherited: none'; fi"#
++        );
++        write_queue_job_wrapper(
++            &wrapper_path,
++            "/tmp",
++            Some(&["/bin/zsh".to_owned(), "-c".to_owned(), probe]),
++            None,
++            &BTreeMap::new(),
++            &exit_code_path,
++        )
++        .unwrap();
++        let job = QueueJobRuntimeRecord {
++            owner: None,
++            label: "descriptor-probe".into(),
++            id: "job-inherited-descriptors".to_owned(),
++            job_type: "tests".to_owned(),
++            state: "pending".to_owned(),
++            notify_session_id: None,
++            queued_at: now_rfc3339(),
++            started_at: None,
++            finished_at: None,
++            holding_reason: None,
++            wrapper_path: Some(wrapper_path.display().to_string()),
++            log_path: Some(log_path.display().to_string()),
++            exit_code_path: Some(exit_code_path.display().to_string()),
++            timeout_seconds: 60,
++            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
++            cpu_percent: None,
++            gpu_percent: None,
++            memory_bytes: None,
++            pid: None,
++            process_group_id: None,
++            exit_code: None,
++            completion_notified_at: None,
++            termination_detail_json: None,
++            revived_at: None,
++            process_limit: None,
++            peak_process_count: None,
++            owner_forced_at: None,
++            lane_rank: i64::MAX,
++            rank_tickets: None,
++        };
++
++        let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
++        let _ = nix::unistd::close(inherited_fd);
++        let log = fs::read_to_string(&log_path).unwrap();
++        assert!(status.success(), "job log: {log}");
++        assert!(
++            !log.contains("production-listener"),
++            "queue job child inherited descriptor {inherited_fd}:\n{log}"
++        );
++        assert!(
++            log.contains("inherited: none"),
++            "job child could not report its descriptors, so the probe proved nothing:\n{log}"
++        );
++
++        fs::remove_dir_all(job_dir).unwrap();
++    }
++
+     #[test]
+     fn zero_timeout_never_expires() {
+         let mut job = QueueJobRuntimeRecord {
+diff --git a/crates/sm-server/src/runtime.rs b/crates/sm-server/src/runtime.rs
+index fef4b83c..f1d630e7 100644
+--- a/crates/sm-server/src/runtime.rs
++++ b/crates/sm-server/src/runtime.rs
+@@ -199,13 +199,17 @@ impl std::fmt::Display for CodexModelValidationError {
+ 
+ impl std::error::Error for CodexModelValidationError {}
+ 
+-/// A tmux client that starts a server daemonizes into that long-lived server.
+-/// macOS has no `pipe2`, so a pipe another thread is creating can be inherited
+-/// before it is marked close-on-exec; the server would then hold its write end
+-/// forever and that thread would wait for EOF indefinitely (sm#1432). Close
++/// A spawned child must not carry the launcher's descriptors beyond stdio. Two
++/// shapes leak without this: a pipe another thread is creating is not yet
++/// marked close-on-exec on macOS, which has no `pipe2`, so a tmux client that
++/// daemonizes into the server keeps its write end and that thread waits for EOF
++/// forever (sm#1432); and a listener or accepted socket that arrived through a
++/// handover or `accept` starts without close-on-exec, so a queue job would keep
++/// the live HTTP listener, handover socket and authority socket open across a
++/// restart and hand them to every tool and test the job runs (sm#1955). Close
+ /// every inherited non-close-on-exec descriptor above stdio in the child.
+ /// Close-on-exec descriptors, including std's exec-error pipe, stay open.
+-fn close_inherited_descriptors_before_exec(command: &mut Command) {
++pub(crate) fn close_inherited_descriptors_before_exec(command: &mut Command) {
+     const MAX_SCANNED_DESCRIPTORS: u64 = 65_536;
+     let scan_limit = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+         .map(|(soft, _)| soft)
+-- 
+2.54.0 (Apple Git-157)
+
