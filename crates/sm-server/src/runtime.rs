@@ -199,13 +199,22 @@ impl std::fmt::Display for CodexModelValidationError {
 
 impl std::error::Error for CodexModelValidationError {}
 
-/// A tmux client that starts a server daemonizes into that long-lived server.
-/// macOS has no `pipe2`, so a pipe another thread is creating can be inherited
-/// before it is marked close-on-exec; the server would then hold its write end
-/// forever and that thread would wait for EOF indefinitely (sm#1432). Close
-/// every inherited non-close-on-exec descriptor above stdio in the child.
+/// Close every inherited non-close-on-exec descriptor above stdio in the child.
 /// Close-on-exec descriptors, including std's exec-error pipe, stay open.
-fn close_inherited_descriptors_before_exec(command: &mut Command) {
+///
+/// macOS leaves `pipe`, `dup` and descriptors received over `SCM_RIGHTS`
+/// without close-on-exec, so a plain spawn hands the child whatever the parent
+/// already holds. Two spawns need this guard:
+///
+/// - A tmux client that starts a server daemonizes into that long-lived
+///   server, and a pipe another thread is creating can be inherited before it
+///   is marked close-on-exec; the server would then hold its write end forever
+///   and that thread would wait for EOF indefinitely (sm#1432).
+/// - A queue job started by `sm queue run` takes the server's HTTP listener and
+///   control sockets with it, which is how a job kept the retired server's
+///   `127.0.0.1:8420` listener and `handover.sock` open after a blue-green
+///   restart (sm#1913).
+pub(crate) fn close_inherited_descriptors_before_exec(command: &mut Command) {
     const MAX_SCANNED_DESCRIPTORS: u64 = 65_536;
     let scan_limit = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
         .map(|(soft, _)| soft)

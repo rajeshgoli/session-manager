@@ -5389,6 +5389,12 @@ fn spawn_queue_job_process(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(unix)]
     {
+        // The job needs stdin, stdout and stderr and nothing else. Without this
+        // it also inherits whatever listeners and control sockets the server
+        // holds without close-on-exec, which keeps a retired server's port
+        // bound and hands a job child a live descriptor for a production
+        // socket (sm#1913).
+        crate::runtime::close_inherited_descriptors_before_exec(&mut command);
         command.process_group(0);
         if let Some(ceiling) = process_ceiling {
             // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
@@ -10740,6 +10746,138 @@ mod tests {
         assert!(log.contains("[sm queue] effective PATH: /queue-test/script-bin"));
         assert_eq!(fs::read_to_string(exit_code_path).unwrap().trim(), "127");
 
+        fs::remove_dir_all(job_dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_job_child_does_not_inherit_the_servers_listeners() {
+        // Same guard as the tmux descriptor test: without lsof there is no way
+        // to read another process's descriptor table here.
+        if !Command::new("lsof")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success() || !output.stderr.is_empty())
+        {
+            return;
+        }
+
+        let job_dir = unique_temp_path("inherited-listeners");
+        fs::create_dir_all(&job_dir).unwrap();
+        let wrapper_path = job_dir.join("run.zsh");
+        let exit_code_path = job_dir.join("exit.code");
+        let log_path = job_dir.join("job.log");
+        write_queue_job_wrapper(
+            &wrapper_path,
+            "/tmp",
+            Some(&["/bin/sleep".to_owned(), "30".to_owned()]),
+            None,
+            &BTreeMap::new(),
+            &exit_code_path,
+        )
+        .unwrap();
+
+        // The two descriptors a job must never take with it: an HTTP listener
+        // and a control socket, the shapes the live server holds. Each is
+        // duplicated above descriptor 200, a number no shell allocates for its
+        // own files, so anything lsof reports there arrived with the spawn.
+        // The copy is deliberately left without close-on-exec: that is how
+        // `dup`, `pipe` and a listener received over `SCM_RIGHTS` arrive on
+        // macOS, and a plain spawn hands every such descriptor to the child.
+        let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority =
+            std::os::unix::net::UnixListener::bind(job_dir.join("authority.sock")).unwrap();
+        let mut held_descriptors = Vec::new();
+        for listener in [
+            std::os::fd::AsRawFd::as_raw_fd(&http_listener),
+            std::os::fd::AsRawFd::as_raw_fd(&authority),
+        ] {
+            // A very low open-file limit leaves no room above 200; that is an
+            // environment limit, not a leak.
+            let Ok(copy) = nix::fcntl::fcntl(listener, nix::fcntl::FcntlArg::F_DUPFD(200)) else {
+                return;
+            };
+            assert_eq!(
+                nix::fcntl::fcntl(copy, nix::fcntl::FcntlArg::F_GETFD).unwrap()
+                    & nix::libc::FD_CLOEXEC,
+                0,
+                "descriptor {copy} is already close-on-exec, so this test would prove nothing"
+            );
+            held_descriptors.push(copy);
+        }
+
+        let job = QueueJobRuntimeRecord {
+            owner: None,
+            label: "inherited-listeners".into(),
+            id: "job-inherited-listeners".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "pending".to_owned(),
+            notify_session_id: None,
+            queued_at: now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: Some(wrapper_path.display().to_string()),
+            log_path: Some(log_path.display().to_string()),
+            exit_code_path: Some(exit_code_path.display().to_string()),
+            timeout_seconds: 60,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+            termination_detail_json: None,
+            revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
+            owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
+        };
+
+        let mut child = spawn_queue_job_process(&job, None).unwrap();
+        // Pause inside the wrapper so the child is still alive, and already
+        // past exec, when its descriptors are read.
+        thread::sleep(StdDuration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the job child ended before it could be inspected: {}",
+            fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        let inspected = Command::new("lsof")
+            .args(["-a", "-p", &child.id().to_string()])
+            .arg("-d")
+            .arg(
+                held_descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&inspected.stdout).into_owned();
+        let sockets: Vec<_> = report
+            .lines()
+            .filter(|line| {
+                matches!(
+                    line.split_whitespace().nth(4),
+                    Some("unix") | Some("IPv4") | Some("IPv6")
+                )
+            })
+            .collect();
+        terminate_process_group(i64::from(child.id()), true);
+        let _ = child.wait();
+        assert!(
+            sockets.is_empty(),
+            "the job child kept the server's listener descriptors:\n{report}"
+        );
+        for descriptor in held_descriptors {
+            let _ = nix::unistd::close(descriptor);
+        }
         fs::remove_dir_all(job_dir).unwrap();
     }
 

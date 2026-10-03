@@ -17360,6 +17360,51 @@ mod tests {
         }
     }
 
+    /// True when an lsof line names something a test child must not hold. A
+    /// regular file or directory below the production root is state the child
+    /// read; a `unix` line below it is the live authority or handover socket;
+    /// a listening descriptor is a server port, which lsof prints with no path
+    /// to anchor on. A test child opens no socket of its own, so a socket line
+    /// means the descriptor arrived with the spawn (sm#1913).
+    fn names_leaked_server_state(line: &str, production_root: &str) -> bool {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.get(4).copied() {
+            Some("REG" | "DIR" | "unix") => line.contains(production_root),
+            Some("IPv4" | "IPv6") => line.contains("(LISTEN)"),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn lsof_scan_flags_inherited_listeners_and_production_state() {
+        let production_root = "/Users/dev/.local/share/claude-sessions";
+        // The shapes reported from a live queue run: the retired server's HTTP
+        // listener, the handover socket, and a production database.
+        for line in [
+            "sm_server 100 rajesh  7u  IPv4 0xaaa      0t0  TCP localhost:8420 (LISTEN)",
+            "sm_server 100 rajesh  8u  IPv6 0xbbb      0t0  TCP *:8443 (LISTEN)",
+            "sm_server 100 rajesh  9u  unix 0xccc      0t0      /Users/dev/.local/share/claude-sessions/handover.sock",
+            "sm_server 100 rajesh  3u  REG 0xddd      4096   12 /Users/dev/.local/share/claude-sessions/queue_runner.db",
+        ] {
+            assert!(
+                names_leaked_server_state(line, production_root),
+                "missed: {line}"
+            );
+        }
+        // The child's own state, its stdio pipes, and the header row.
+        for line in [
+            "sm_server 100 rajesh  4u  REG 0xeee      4096   21 /private/tmp/sm-rust-test-abc/queue_runner.db",
+            "sm_server 100 rajesh  5u  PIPE 0xfff    16384      ->0x111",
+            "sm_server 100 rajesh  6w  REG 0x112         0   33 /private/tmp/sm-rust-test-abc/job.log",
+            "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME",
+        ] {
+            assert!(
+                !names_leaked_server_state(line, production_root),
+                "false positive: {line}"
+            );
+        }
+    }
+
     #[test]
     fn test_isolation_direct_harness_without_wrapper_cannot_open_production_state_paths() {
         if let Some(probe_path) = env::var_os(DIRECT_HARNESS_PROBE_ENV) {
@@ -17460,23 +17505,19 @@ mod tests {
                     first_probe.pid
                 );
                 let open_files = String::from_utf8_lossy(&lsof.stdout);
-                // Queue children may inherit the live authority and handover
-                // sockets. Only regular files and directories can leak state.
-                let production_files: Vec<_> = open_files
+                let production_text = production_root.to_string_lossy().into_owned();
+                let leaked: Vec<_> = open_files
                     .lines()
                     .skip(1)
-                    .filter(|line| {
-                        line.contains(production_root.to_string_lossy().as_ref())
-                            && matches!(line.split_whitespace().nth(4), Some("REG" | "DIR"))
-                    })
+                    .filter(|line| names_leaked_server_state(line, &production_text))
                     .collect();
                 assert!(
-                    production_files.is_empty(),
-                    "unwrapped test child opened production state path:\n{}",
-                    production_files.join("\n")
+                    leaked.is_empty(),
+                    "unwrapped test child held a production state path or listener:\n{}",
+                    leaked.join("\n")
                 );
                 println!(
-                    "direct-harness lsof proof: child pid {} has no open path below {}",
+                    "direct-harness lsof proof: child pid {} has no open path below {} and no inherited listener",
                     first_probe.pid,
                     production_root.display()
                 );
