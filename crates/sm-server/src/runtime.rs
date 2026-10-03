@@ -175,7 +175,7 @@ impl std::fmt::Display for InitialBriefDeliveryError {
             ),
             Self::ProviderDraftNotAccepted { provider } => write!(
                 formatter,
-                "timed out waiting for {provider} to show the initial spawn brief in its composer; the typed brief never reached the input line, so it was not submitted"
+                "timed out waiting for the initial spawn brief to appear in {provider}'s composer; it was not submitted because sm could not confirm the typed brief reached the input line"
             ),
             Self::ProviderAcceptanceTimedOut { provider } => write!(
                 formatter,
@@ -1438,9 +1438,10 @@ impl TmuxRuntime {
     /// usable composer, and only report success after provider-side evidence.
     ///
     /// For Claude the brief is typed first and submitted only once the pane
-    /// shows it as the live composer draft, so a paste that never reached
-    /// Claude's input line fails as `ProviderDraftNotAccepted` instead of
-    /// burning the acknowledgement window on a submission that never happened.
+    /// shows the typed text somewhere it was not before, so a paste sm cannot
+    /// prove reached Claude's input line fails as `ProviderDraftNotAccepted`
+    /// instead of burning the acknowledgement window on a submission that never
+    /// happened.
     ///
     /// This deliberately does not retry after submission: a missing event can
     /// mean the first submission was accepted, so another paste could run the
@@ -1582,13 +1583,20 @@ impl TmuxRuntime {
         self.send_key(tmux_session, "Enter")
     }
 
-    /// True once the pane differs from the pre-submission snapshot and still
-    /// shows the tail of the brief, which is how a held draft looks.
+    /// True once the pane shows the tail of the brief somewhere it did not
+    /// appear before the brief was typed.
     ///
-    /// The tail is matched with all whitespace removed because Claude wraps a
-    /// long draft across pane rows. A draft Claude collapses into a
-    /// `[Pasted text]` placeholder does not match, which is intended: that
-    /// placeholder is dropped when submitted on an idle session.
+    /// Being newly present is the whole content of the proof. Claude's idle pane
+    /// already carries model, path and footer text, so a brief short enough to
+    /// collide with it -- one letter, or a word from `auto mode on (shift+tab to
+    /// cycle)` -- would otherwise match chrome that has nothing to do with the
+    /// draft, and an unrelated repaint would supply the "the pane changed" half.
+    /// A draft Claude collapses into a `[Pasted text]` placeholder does not
+    /// match either, which is intended: that placeholder is dropped when
+    /// submitted on an idle session.
+    ///
+    /// Whitespace is removed from both sides because Claude wraps a long draft
+    /// across pane rows and pads the composer.
     fn wait_for_claude_brief_draft(
         &self,
         tmux_session: &str,
@@ -1596,14 +1604,16 @@ impl TmuxRuntime {
         prompt: &str,
     ) -> bool {
         let probe = claude_brief_draft_probe(prompt);
+        let ready_compact = claude_compact_pane_text(ready_pane);
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         loop {
             if !self.session_exists(tmux_session).unwrap_or(false) {
                 return false;
             }
-            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
-                pane != ready_pane && claude_pane_shows_brief_draft(&pane, &probe)
-            }) {
+            if self
+                .capture_pane_text(tmux_session)
+                .is_some_and(|pane| claude_brief_draft_newly_visible(&pane, &ready_compact, &probe))
+            {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -2148,11 +2158,12 @@ fn claude_compact_pane_text(text: &str) -> String {
         .collect()
 }
 
-/// True when the pane still renders `probe`, which is what a draft waiting in
-/// the composer looks like. Whitespace is removed from both sides because
-/// Claude wraps a long draft across pane rows and pads the composer.
-fn claude_pane_shows_brief_draft(pane: &str, probe: &str) -> bool {
-    !probe.is_empty() && claude_compact_pane_text(pane).contains(probe)
+/// True when `probe` appears in the pane but did not appear in the composer
+/// snapshot taken before the brief was typed.
+fn claude_brief_draft_newly_visible(pane: &str, ready_compact: &str, probe: &str) -> bool {
+    !probe.is_empty()
+        && !ready_compact.contains(probe)
+        && claude_compact_pane_text(pane).contains(probe)
 }
 
 /// Claude renders a status/footer block below its live composer. Looking only
@@ -3587,6 +3598,44 @@ exit 0
         assert!(
             !log.contains("send-keys -t sm-test Enter"),
             "an unsubmitted draft must not be resubmitted blind:\n{log}"
+        );
+    }
+
+    /// A brief this short is already on screen before anything is typed: `a`
+    /// appears in Claude's footer chrome, so seeing it proves nothing, and a
+    /// repaint of that chrome is not a landed draft.
+    #[test]
+    fn claude_spawn_brief_is_not_submitted_on_a_repaint_that_only_repeats_chrome() {
+        let idle = claude_idle_pane();
+        // The model line changed and nothing else: no draft, no composer change.
+        let repainted = idle.replace("Sonnet 5.5", "Sonnet 4.5");
+        assert_ne!(idle, repainted);
+        assert!(claude_compact_pane_text(&idle).contains("a"));
+        let (tmux_binary, log_path, _temp_dir) =
+            fake_claude_pane_tmux_binary(&idle, &repainted, None);
+        let working_dir = tempfile_path("claude-draft-repaint-work");
+        fs::create_dir_all(&working_dir).unwrap();
+        let transcript_root = tempfile_path("claude-draft-repaint-root");
+        fs::create_dir_all(&transcript_root).unwrap();
+        let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
+        let spec = claude_brief_spec(&working_dir);
+
+        let error = runtime
+            .deliver_verified_initial_brief(&spec, "a")
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error.downcast_ref::<InitialBriefDeliveryError>(),
+                Some(InitialBriefDeliveryError::ProviderDraftNotAccepted { .. })
+            ),
+            "unexpected delivery failure: {error:#}"
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- a"));
+        assert!(
+            !log.contains("send-keys -t sm-test Enter"),
+            "a repaint of chrome text must not be read as a landed draft:\n{log}"
         );
     }
 
