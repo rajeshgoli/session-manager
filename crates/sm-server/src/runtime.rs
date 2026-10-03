@@ -32,6 +32,13 @@ const DEFAULT_SEND_KEYS_CHUNK_GAP_MS: f64 = 20.0;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum separation between the last brief keystroke and the Enter that
+/// submits it. See `submit_claude_initial_brief`.
+const DEFAULT_INITIAL_BRIEF_SUBMIT_GAP: Duration = Duration::from_millis(1500);
+/// Tail of the brief that must be visible in the pane before Enter is sent.
+/// Matching a tail rather than the head proves the whole paste landed, not just
+/// its first line.
+const CLAUDE_BRIEF_DRAFT_PROBE_CHARS: usize = 32;
 const SERVER_ANCHOR_SESSION: &str = "__sm_server_anchor";
 const DEFAULT_TMUX_BINARY: &str = "tmux";
 const SERVER_ANCHOR_COMMAND: &str = "sleep 315360000";
@@ -79,6 +86,7 @@ pub struct TmuxRuntime {
     start_settle_ms: u64,
     initial_brief_ready_timeout: Duration,
     initial_brief_ack_timeout: Duration,
+    initial_brief_submit_gap: Duration,
     send_keys_settle_ms: f64,
     send_keys_settle_max_ms: f64,
     send_keys_settle_per_ki_ms: f64,
@@ -149,6 +157,7 @@ pub enum CodexModelValidationError {
 pub enum InitialBriefDeliveryError {
     ProviderAcknowledgementUnavailable { provider: String },
     ProviderReadinessTimedOut { provider: String },
+    ProviderDraftNotAccepted { provider: String },
     ProviderAcceptanceTimedOut { provider: String },
     SessionExited { provider: String },
 }
@@ -163,6 +172,10 @@ impl std::fmt::Display for InitialBriefDeliveryError {
             Self::ProviderReadinessTimedOut { provider } => write!(
                 formatter,
                 "timed out waiting for {provider} to become ready for the initial spawn brief"
+            ),
+            Self::ProviderDraftNotAccepted { provider } => write!(
+                formatter,
+                "timed out waiting for {provider} to show the initial spawn brief in its composer; the typed brief never reached the input line, so it was not submitted"
             ),
             Self::ProviderAcceptanceTimedOut { provider } => write!(
                 formatter,
@@ -298,6 +311,10 @@ impl TmuxRuntime {
                 .runtime_initial_brief_ack_timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT),
+            initial_brief_submit_gap: config
+                .runtime_initial_brief_submit_gap_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_INITIAL_BRIEF_SUBMIT_GAP),
             send_keys_settle_ms: finite_nonnegative_or_default(
                 config.send_keys_settle_ms,
                 DEFAULT_SEND_KEYS_SETTLE_MS,
@@ -1420,6 +1437,11 @@ impl TmuxRuntime {
     /// Deliver an immutable spawn brief only after the provider exposes a
     /// usable composer, and only report success after provider-side evidence.
     ///
+    /// For Claude the brief is typed first and submitted only once the pane
+    /// shows it as the live composer draft, so a paste that never reached
+    /// Claude's input line fails as `ProviderDraftNotAccepted` instead of
+    /// burning the acknowledgement window on a submission that never happened.
+    ///
     /// This deliberately does not retry after submission: a missing event can
     /// mean the first submission was accepted, so another paste could run the
     /// brief twice.
@@ -1466,7 +1488,7 @@ impl TmuxRuntime {
                         .into(),
                     );
                 }
-                self.wait_for_claude_initial_brief_composer(&spec.tmux_session)?;
+                let ready_pane = self.wait_for_claude_initial_brief_composer(&spec.tmux_session)?;
                 // Claude 2.1.280 creates its transcript only when the first
                 // user turn is submitted, so the transcript cannot gate
                 // readiness. Record any transcript an older Claude already
@@ -1483,7 +1505,7 @@ impl TmuxRuntime {
                 if self.session_has_attached_clients(&spec.tmux_session)? {
                     bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
                 }
-                self.send_text_then_enter(&spec.tmux_session, prompt)?;
+                self.submit_claude_initial_brief(&spec.tmux_session, &ready_pane, prompt)?;
                 self.wait_for_claude_initial_brief_acceptance(
                     &spec.tmux_session,
                     &transcript,
@@ -1501,7 +1523,10 @@ impl TmuxRuntime {
 
     /// Wait until Claude exposes an empty composer at the live cursor. Startup
     /// and onboarding screens precede the interactive UI.
-    fn wait_for_claude_initial_brief_composer(&self, tmux_session: &str) -> Result<()> {
+    ///
+    /// The confirmed pane snapshot is returned so the caller can tell an
+    /// untouched composer from one holding the typed brief.
+    fn wait_for_claude_initial_brief_composer(&self, tmux_session: &str) -> Result<String> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         loop {
             if !self.session_exists(tmux_session)? {
@@ -1510,8 +1535,8 @@ impl TmuxRuntime {
                 }
                 .into());
             }
-            if self.claude_initial_brief_composer_ready(tmux_session) {
-                return Ok(());
+            if let Some(pane) = self.claude_empty_composer_pane(tmux_session) {
+                return Ok(pane);
             }
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
@@ -1523,12 +1548,73 @@ impl TmuxRuntime {
         }
     }
 
-    /// Claude's empty composer must be at the active cursor, not merely occur
-    /// in scrollback or resemble a typed prompt in a startup frame.
-    fn claude_initial_brief_composer_ready(&self, tmux_session: &str) -> bool {
-        self.claude_empty_composer_pane(tmux_session).is_some()
+    /// Type the brief, wait until Claude's pane shows it as the live composer
+    /// draft, and only then submit it.
+    ///
+    /// Both conditions below were measured against Claude Code 2.1.285 in
+    /// detached tmux while diagnosing the September 30 spawn failures: typing on
+    /// the first frame that looks like an empty composer and submitting 330 ms
+    /// later left the brief sitting in the composer with no transcript turn,
+    /// while the same keystrokes accepted 8 times out of 8 once sm waited for
+    /// the draft and then held at least 1.5 s before Enter.
+    ///
+    /// The read-merge explanation for the separation is inferred, not proven --
+    /// the harness had no reachable model, so a stalled provider connection may
+    /// have contributed. It is also the same failure class that makes the
+    /// 512-byte chunking in `split_send_text_chunks` necessary. What is proven
+    /// is the shape of the fix: an Enter sent into a composer that still reads
+    /// as untouched cannot produce a submission, so the wait both spaces the
+    /// keystrokes and turns a 30-second stall into an honest failure.
+    fn submit_claude_initial_brief(
+        &self,
+        tmux_session: &str,
+        ready_pane: &str,
+        prompt: &str,
+    ) -> Result<()> {
+        self.send_text(tmux_session, prompt)?;
+        if !self.wait_for_claude_brief_draft(tmux_session, ready_pane, prompt) {
+            return Err(InitialBriefDeliveryError::ProviderDraftNotAccepted {
+                provider: "claude".to_owned(),
+            }
+            .into());
+        }
+        thread::sleep(self.initial_brief_submit_gap);
+        self.send_key(tmux_session, "Enter")
     }
 
+    /// True once the pane differs from the pre-submission snapshot and still
+    /// shows the tail of the brief, which is how a held draft looks.
+    ///
+    /// The tail is matched with all whitespace removed because Claude wraps a
+    /// long draft across pane rows. A draft Claude collapses into a
+    /// `[Pasted text]` placeholder does not match, which is intended: that
+    /// placeholder is dropped when submitted on an idle session.
+    fn wait_for_claude_brief_draft(
+        &self,
+        tmux_session: &str,
+        ready_pane: &str,
+        prompt: &str,
+    ) -> bool {
+        let probe = claude_brief_draft_probe(prompt);
+        let deadline = Instant::now() + self.initial_brief_ready_timeout;
+        loop {
+            if !self.session_exists(tmux_session).unwrap_or(false) {
+                return false;
+            }
+            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
+                pane != ready_pane && claude_pane_shows_brief_draft(&pane, &probe)
+            }) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Claude's empty composer must be at the active cursor, not merely occur
+    /// in scrollback or resemble a typed prompt in a startup frame.
     fn claude_empty_composer_pane(&self, tmux_session: &str) -> Option<String> {
         let pane = self.capture_pane_text(tmux_session)?;
         if !claude_composer_layout_is_candidate(&pane) {
@@ -2040,6 +2126,33 @@ fn claude_transcript_has_matching_user_turn(
                         content == prompt || (!prompt.trim().is_empty() && content == prompt.trim())
                     })
         })
+}
+
+/// The tail of a brief that has to be visible in the pane before the brief is
+/// submitted. Short briefs use their whole text.
+fn claude_brief_draft_probe(prompt: &str) -> String {
+    let compact = claude_compact_pane_text(prompt);
+    let chars = compact.chars().collect::<Vec<_>>();
+    if chars.len() <= CLAUDE_BRIEF_DRAFT_PROBE_CHARS {
+        return compact;
+    }
+    chars[chars.len() - CLAUDE_BRIEF_DRAFT_PROBE_CHARS..]
+        .iter()
+        .collect()
+}
+
+fn claude_compact_pane_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+/// True when the pane still renders `probe`, which is what a draft waiting in
+/// the composer looks like. Whitespace is removed from both sides because
+/// Claude wraps a long draft across pane rows and pads the composer.
+fn claude_pane_shows_brief_draft(pane: &str, probe: &str) -> bool {
+    !probe.is_empty() && claude_compact_pane_text(pane).contains(probe)
 }
 
 /// Claude renders a status/footer block below its live composer. Looking only
@@ -3342,6 +3455,180 @@ esac
             plain.lines().nth(20).unwrap(),
             styled.lines().nth(20).unwrap()
         ));
+    }
+
+    /// A tmux stand-in that reports `idle_pane` until the brief has been typed
+    /// and `typed_pane` afterwards, which is how a test controls whether Claude
+    /// received the keystrokes. `transcript` is the provider transcript the fake
+    /// appends a user turn to when it is asked to press Enter; without it the
+    /// submission is never acknowledged.
+    fn fake_claude_pane_tmux_binary(
+        idle_pane: &str,
+        typed_pane: &str,
+        transcript: Option<&Path>,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        fs::write(temp_dir.join("idle-pane"), idle_pane).unwrap();
+        fs::write(temp_dir.join("typed-pane"), typed_pane).unwrap();
+        let acknowledged_turn = transcript.map_or_else(String::new, |path| {
+            format!(
+                "  case \"$*\" in *' -t sm-test Enter'*) printf '%s\\n' '{}' >> \"{}\" ;; esac\n",
+                CLAUDE_ACCEPTED_BRIEF_TURN,
+                path.display()
+            )
+        });
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+if [ "$1" = "capture-pane" ]; then
+  if grep -q -- '-l --' "{log}"; then
+    cat "{temp}/typed-pane"
+  else
+    cat "{temp}/idle-pane"
+  fi
+  exit 0
+fi
+if [ "$1" = "display-message" ]; then
+  echo 1,2
+  exit 0
+fi
+if [ "$1" = "send-keys" ]; then
+{acknowledged_turn}  exit 0
+fi
+exit 0
+"#,
+                log = log_path.display(),
+                temp = temp_dir.display(),
+                acknowledged_turn = acknowledged_turn,
+            ),
+        )
+        .unwrap();
+        (tmux_binary, log_path, temp_dir)
+    }
+
+    const CLAUDE_ACCEPTED_BRIEF_TURN: &str = r#"{"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","message":{"content":"Probe: reply ok, then run sm task-complete."}}"#;
+
+    /// An idle Claude Code composer captured at the live cursor: an empty
+    /// prompt row above the chrome divider and the model/footer block.
+    fn claude_idle_pane() -> String {
+        let divider = "─".repeat(40);
+        format!(
+            "\n{divider}\n❯\n{divider}\n  Sonnet 5.5\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
+        )
+    }
+
+    fn claude_draft_pane(draft: &str) -> String {
+        let divider = "─".repeat(40);
+        format!(
+            "\n❯ {draft}\n\n{divider}\n  Sonnet 5.5\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
+        )
+    }
+
+    fn claude_brief_delivery_runtime(tmux_binary: PathBuf, transcript_root: &Path) -> TmuxRuntime {
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        runtime.claude_projects_roots = vec![transcript_root.to_path_buf()];
+        // Short enough to keep the test quick; the production defaults are
+        // 10s and 30s.
+        runtime.initial_brief_ready_timeout = Duration::from_millis(500);
+        runtime.initial_brief_ack_timeout = Duration::from_millis(500);
+        runtime.initial_brief_submit_gap = Duration::ZERO;
+        runtime
+    }
+
+    fn claude_brief_spec(working_dir: &Path) -> TmuxSessionSpec {
+        TmuxSessionSpec {
+            session_id: "sm-test".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: working_dir.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            force_initial_prompt_stdin: true,
+            claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_owned()),
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn claude_spawn_brief_is_not_submitted_while_the_composer_stays_untouched() {
+        let pane = claude_idle_pane();
+        let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(&pane, &pane, None);
+        let working_dir = tempfile_path("claude-draft-gate-work");
+        fs::create_dir_all(&working_dir).unwrap();
+        let transcript_root = tempfile_path("claude-draft-gate-root");
+        fs::create_dir_all(&transcript_root).unwrap();
+        let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
+        let spec = claude_brief_spec(&working_dir);
+
+        let error = runtime
+            .deliver_verified_initial_brief(&spec, "Probe: reply ok, then run sm task-complete.")
+            .unwrap_err();
+
+        // The pane never changed after the paste, so the brief never reached
+        // Claude's input line. Submitting there could not produce a turn, and
+        // pretending otherwise spends the whole acknowledgement window.
+        assert!(
+            matches!(
+                error.downcast_ref::<InitialBriefDeliveryError>(),
+                Some(InitialBriefDeliveryError::ProviderDraftNotAccepted { .. })
+            ),
+            "unexpected delivery failure: {error:#}"
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- Probe"));
+        assert!(
+            !log.contains("send-keys -t sm-test Enter"),
+            "an unsubmitted draft must not be resubmitted blind:\n{log}"
+        );
+    }
+
+    #[test]
+    fn claude_spawn_brief_is_submitted_once_the_composer_shows_the_draft() {
+        let draft = "Probe: reply ok, then run sm task-complete.";
+        let working_dir = tempfile_path("claude-draft-submit-work");
+        fs::create_dir_all(&working_dir).unwrap();
+        let transcript_root = tempfile_path("claude-draft-submit-root");
+        fs::create_dir_all(&transcript_root).unwrap();
+        let transcript = claude_transcript_candidates(
+            std::slice::from_ref(&transcript_root),
+            working_dir.to_str().unwrap(),
+            "11111111-1111-4111-8111-111111111111",
+        )[0]
+        .clone();
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(
+            &claude_idle_pane(),
+            &claude_draft_pane(draft),
+            Some(&transcript),
+        );
+        let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
+        let spec = claude_brief_spec(&working_dir);
+
+        runtime
+            .deliver_verified_initial_brief(&spec, draft)
+            .unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let typed = position_after(&lines, "send-keys -t sm-test -l -- Probe", 0);
+        // The draft is read back from the pane before the submit keystroke, so
+        // sm can prove the brief landed instead of hoping the Enter took.
+        let draft_checked = position_after(&lines, "capture-pane -p -t sm-test", typed + 1);
+        let submitted = position_after(&lines, "send-keys -t sm-test Enter", draft_checked + 1);
+        assert!(typed < draft_checked);
+        assert!(draft_checked < submitted);
+        assert!(
+            log.trim_end().ends_with("send-keys -t sm-test Enter"),
+            "the brief should be submitted once and only once:\n{log}"
+        );
     }
 
     #[test]

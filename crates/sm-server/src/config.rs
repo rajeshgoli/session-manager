@@ -2127,6 +2127,10 @@ pub struct RustCoreConfig {
     pub runtime_initial_brief_ready_timeout_ms: Option<u64>,
     #[serde(default)]
     pub runtime_initial_brief_ack_timeout_ms: Option<u64>,
+    /// Separation Claude Code needs between the pasted brief and the Enter that
+    /// submits it. Lower it only to reproduce a delivery failure.
+    #[serde(default)]
+    pub runtime_initial_brief_submit_gap_ms: Option<u64>,
     #[serde(default)]
     pub send_keys_settle_ms: Option<f64>,
     #[serde(default)]
