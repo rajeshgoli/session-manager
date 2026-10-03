@@ -34,12 +34,18 @@ pub const SOCKET_FILE: &str = "handover.sock";
 const MAX_REQUEST_BYTES: usize = 1024;
 
 fn readable_before(stream: &UnixStream, deadline: std::time::Instant) -> Result<bool> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Ok(false);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let mut descriptors = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut descriptors, PollTimeout::try_from(remaining)?) {
+            Ok(ready) => return Ok(ready > 0),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    let mut descriptors = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
-    Ok(poll(&mut descriptors, PollTimeout::try_from(remaining)?)? > 0)
 }
 
 fn read_exact_before(
@@ -426,7 +432,10 @@ fn await_stable_serving_for(
     await_serving(stream).context("waiting for replacement serving reply")?;
     let deadline = std::time::Instant::now() + duration;
     let mut consecutive_timeouts = 0;
-    while std::time::Instant::now() < deadline {
+    // Scheduling delays must not let an unchecked replacement pass the window.
+    let mut first_probe = true;
+    while first_probe || std::time::Instant::now() < deadline {
+        first_probe = false;
         let mut byte = [0];
         let check_deadline = std::time::Instant::now() + Duration::from_secs(1);
         if readable_before(stream, check_deadline.min(deadline))? {
@@ -839,22 +848,27 @@ mod tests {
         let slow = slow.to_vec();
         let server = thread::spawn(move || {
             let mut probes = 0;
+            let mut responses = Vec::new();
             while !stopped.is_stopped() {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
-                        socket
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .unwrap();
-                        socket
-                            .set_write_timeout(Some(Duration::from_secs(2)))
-                            .unwrap();
-                        let mut request = [0; 1];
-                        socket.read_exact(&mut request).unwrap();
-                        if slow.get(probes).copied().unwrap_or(false) {
-                            thread::sleep(Duration::from_millis(1300));
-                        }
-                        // The client may already have timed out and closed.
-                        let _ = socket.write_all(response);
+                        let delayed = slow.get(probes).copied().unwrap_or(false);
+                        // A timed-out response must not delay accepting the next probe.
+                        responses.push(thread::spawn(move || {
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            socket
+                                .set_write_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0; 1];
+                            socket.read_exact(&mut request).unwrap();
+                            if delayed {
+                                thread::sleep(Duration::from_millis(1300));
+                            }
+                            // The client may already have timed out and closed.
+                            let _ = socket.write_all(response);
+                        }));
                         probes += 1;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -862,6 +876,9 @@ mod tests {
                     }
                     Err(error) => panic!("accepting health probe: {error}"),
                 }
+            }
+            for response in responses {
+                response.join().unwrap();
             }
             probes
         });
