@@ -1,0 +1,32 @@
+PASS  ok  write in checkout
+PASS  ok  write in temp folder
+PASS  ok  write ~/.cargo
+PASS  ok  Claude Code cwd file
+PASS  blocked  write /tmp root
+PASS  blocked  write home
+PASS  blocked  write main repo
+PASS  blocked  write sm state
+PASS  blocked  read ~/.ssh
+PASS  blocked  read ~/.claude
+PASS  blocked  read ~/.claude.json
+PASS  blocked  read sm config
+PASS  blocked  read keychains
+PASS  ok  read sm logs
+PASS  ok  read gh config
+PASS  blocked  live sm 8420
+PASS  blocked  model server direct 8000
+PASS  blocked  live sm LAN listener 8443
+PASS  blocked  another agent proxy 1236
+PASS  blocked  example.com direct
+PASS  blocked  example.com via proxy
+PASS  blocked  1.1.1.1 direct
+PASS  blocked  DNS lookup
+PASS  ok  github via proxy
+PASS  ok  gh api via proxy
+PASS  ok  git ls-remote via proxy
+PASS  blocked  sm tmux socket
+PASS  blocked  default tmux socket
+PASS  blocked  driver tmux socket
+PASS  ok  private tmux socket
+PASS  ok  loopback listen on 18441
+31 passed, 0 failed
