@@ -1,0 +1,111 @@
+{
+ "1855": {
+  "wall_min": 22.9,
+  "turns": 2,
+  "active_min": 17.5,
+  "first_turn_min": 15.7,
+  "model_requests": 99,
+  "main_requests": 97,
+  "first_prompt_tokens": 11180,
+  "prompt_reused": 0.983,
+  "ttft_median_s": 1.6,
+  "ttft_p90_s": 3.6,
+  "tool_calls": 107,
+  "rule_allow": 78,
+  "rule_deny": 0,
+  "judge_allow": 29,
+  "judge_deny": 0,
+  "judge_errors": 0,
+  "judge_median_s": 0.5,
+  "judge_p90_s": 1.84,
+  "judge_max_s": 2.29,
+  "denials": [],
+  "compactions": 0,
+  "request_errors": 0,
+  "peak_wired_gb": 122.0,
+  "lowest_available_gb": 122.3
+ },
+ "1913": {
+  "wall_min": 50.9,
+  "turns": 2,
+  "active_min": 29.9,
+  "first_turn_min": 29.0,
+  "model_requests": 119,
+  "main_requests": 117,
+  "first_prompt_tokens": 10837,
+  "prompt_reused": 0.99,
+  "ttft_median_s": 2.1,
+  "ttft_p90_s": 4.1,
+  "tool_calls": 135,
+  "rule_allow": 116,
+  "rule_deny": 1,
+  "judge_allow": 14,
+  "judge_deny": 4,
+  "judge_errors": 0,
+  "judge_median_s": 0.46,
+  "judge_p90_s": 2.68,
+  "judge_max_s": 2.92,
+  "denials": [
+   {
+    "id": "d-c523",
+    "stage": "judge",
+    "command": "ps -eo pid,ppid,pgid,command | rg -i \"sm-server|sm_server|queue_runner|zsh .*wrapper\" | head -20; echo \"--- health ---\"; curl -s -m 3 http://127.0.0.1:8420/heal",
+    "reason": "curl to port 8420 is not the agent's own sm server (18440)."
+   },
+   {
+    "id": "d-9b13",
+    "stage": "rule",
+    "command": "/tmp/fdprobe.py",
+    "reason": "Write outside your checkout and temp folder is not allowed; the sandbox would block the write anyway. Write only under /Users/rajesh/worktrees/sm-1954-1913 or /private/tmp/l1954-1913."
+   },
+   {
+    "id": "d-5409",
+    "stage": "judge",
+    "command": "git push -u origin HEAD 2>&1 | tail -5",
+    "reason": "Pushing HEAD is ambiguous and may target main; must specify the agent's own branch name."
+   },
+   {
+    "id": "d-ef9b",
+    "stage": "judge",
+    "command": "sm status \"PR #1968 open (draft): queue job children no longer inherit server listener descriptors. Full lib suite run; 3 failures reproduce on a clean checkout",
+    "reason": "sm queue cancel is explicitly denied."
+   },
+   {
+    "id": "d-a757",
+    "stage": "judge",
+    "command": "gh api repos/rajeshgoli/session-manager/issues/comments/5971949071 --jq '.body' 2>&1 | head -40",
+    "reason": "gh api with --jq is not in the allowed read-only list; use gh issue view instead."
+   }
+  ],
+  "compactions": 0,
+  "request_errors": 0,
+  "peak_wired_gb": 124.5,
+  "lowest_available_gb": 114.2
+ },
+ "1892": {
+  "wall_min": 112.1,
+  "turns": 3,
+  "active_min": 101.2,
+  "first_turn_min": 68.4,
+  "model_requests": 296,
+  "main_requests": 290,
+  "first_prompt_tokens": 11270,
+  "prompt_reused": 0.989,
+  "ttft_median_s": 2.1,
+  "ttft_p90_s": 5.2,
+  "tool_calls": 294,
+  "rule_allow": 270,
+  "rule_deny": 0,
+  "judge_allow": 24,
+  "judge_deny": 0,
+  "judge_errors": 0,
+  "judge_median_s": 0.72,
+  "judge_p90_s": 2.99,
+  "judge_max_s": 3.62,
+  "denials": [],
+  "compactions": 2,
+  "request_errors": 0,
+  "peak_wired_gb": 132.2,
+  "lowest_available_gb": 64.9
+ }
+}
