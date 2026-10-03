@@ -107,13 +107,13 @@
 </style>
 
 <h1>1784 — Local models as sm agents</h1>
-<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), this revision · Tickets #1784, #1926 · revision 7, 2026-10-03</small></p>
+<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), revision 7; Claude Opus 5.5 <code>sm-1961</code> (ed61f79b), 200K measurement and this revision · Tickets #1784, #1926, #1961 · revision 8, 2026-10-03</small></p>
 
 <h2>Memo</h2>
 
-<p><b>A local model on this Mac does real work in your workflow. The next steps are a memory measurement and permissions, not sm code.</b> Qwen3.8-Flash-Next, driving an unmodified Claude Code, took three real tickets from last week alone. On two it produced fixes that pass the merged fix's own tests: one mergeable as-is, one after small changes. The third needed live reproduction its sandbox could not allow, so it proves nothing either way. Its active time ran 1.0–2.3× the original agent's, at no Claude or Codex quota. What made the runs slow was waiting on you. Of the 6.9 hours the three runs took, 5.6 hours were the agent stopped at a permission prompt for a command it was not pre-approved to run. A local agent that waits hours for a human is not worth building sm around.</p>
+<p><b>A local model on this Mac does real work in your workflow. A 200K window fits one agent plus its judge, and the next step is permissions, not sm code.</b> Qwen3.8-Flash-Next, driving an unmodified Claude Code, took three real tickets from last week alone. On two it produced fixes that pass the merged fix's own tests: one mergeable as-is, one after small changes. The third needed live reproduction its sandbox could not allow, so it proves nothing either way. Its active time ran 1.0–2.3× the original agent's, at no Claude or Codex quota. What made the runs slow was waiting on you. Of the 6.9 hours the three runs took, 5.6 hours were the agent stopped at a permission prompt for a command it was not pre-approved to run. A local agent that waits hours for a human is not worth building sm around.</p>
 
-<p>So the next work gives a local agent a way to be approved without you. One short ticket first measures what the 200K context window costs in memory. Then a <b>sandbox wall</b> makes most actions harmless by construction, and a <b>judge</b>, a second instance of the same local model, rules on the few actions that leave the wall. Nothing leaves the Mac, and nothing waits on you: an action the judge denies can be allowed by you afterwards, and the agent retries it. The sm engineering this memo designs (appendices C–G) comes after that, with MTPLX as the model server.</p>
+<p>So the next work gives a local agent a way to be approved without you. A replay measurement on 3 Oct settled the window: 200K fits one agent plus its judge at 137 GB of wired memory, and two agents do not fit. Next, a <b>sandbox wall</b> makes most actions harmless by construction, and a <b>judge</b>, a second instance of the same local model, rules on the few actions that leave the wall. Nothing leaves the Mac, and nothing waits on you: an action the judge denies can be allowed by you afterwards, and the agent retries it. The sm engineering this memo designs (appendices C–G) comes after that, with MTPLX as the model server.</p>
 
 <dl class="vocab">
 <dt>Model server</dt><dd>The program that holds model weights in memory and answers HTTP requests in the formats Claude Code and Codex speak. <b>MTPLX</b> 2.12.0 is the one the prototype uses: an open-source (Apache-2.0) server for Apple Silicon, installed with pip. LM Studio, the other server on this Mac, cannot load Flash-Next yet.</dd>
@@ -144,11 +144,11 @@
 
 <p>What the results say, in order of weight:</p>
 <ul>
-<li><b>The quality is real on well-specified bugs.</b> On #1913 all three runs found the same working design. Flash-Next alone proved the root cause, with a small C program showing that a file handle passed between processes loses its close-on-exec flag. On #1855 the grader found the production change identical to the merged one and the tests broader. Rescue effort was noisy on #1913: 35%, 40% and 65% for near-identical fixes. You ruled on 2 Oct that the bar is "passes the merged fix's own test, and the grader says small changes or better", with rescue recorded but not gating.</li>
-<li><b>#1892 tests the sandbox, not the model.</b> The original agent fixed it by reproducing the failure live with a real spawn. The local agent had no sm and no tmux, so it diagnosed from four saved screen captures. It correctly declined to ship a blind retry, and asked you one well-formed question with a recommendation. The fixed protocol reply ("proceed as you judge best") then sent it off to build a diagnostic script it could not run. Graded within those limits, the call was right and the diagnosis partly right. The script had bugs, as untested code does. Its one avoidable miss is that it did not commit what it had.</li>
+<li><b>The quality is real on well-specified bugs.</b> On #1913 all three runs found the same working design, and Flash-Next alone proved the root cause with a small C program. On #1855 the grader found the production change identical to the merged one. Your bar (2 Oct): passes the merged fix's own test, and the grader says small changes or better. Rescue effort is recorded but does not gate; it ranged 35–65% for near-identical fixes.</li>
+<li><b>#1892 tests the sandbox, not the model.</b> The original fix needed live reproduction with a real spawn; the local agent had no sm and no tmux. It declined to ship a blind retry and asked you a well-formed question. The protocol's fixed reply then sent it to build a diagnostic it could not run. Graded within those limits, the call was right; it did not commit what it had.</li>
 <li><b>Flash-Next is the model.</b> It writes 52–57 tokens a second, against 17–20 for the 27B model. It starts each reply in a median 1.5–1.9 seconds, because MTPLX reuses 95–97% of each prompt from the previous turn. Its active time was a third shorter than the 27B model's on the same ticket.</li>
-<li><b>Claude Code needs no changes beyond environment variables.</b> All of sm's hooks fire under the slim profile, including compaction. The first prompt is about 15K tokens. No Anthropic credential existed in any run's config, so nothing could reach your quota.</li>
-<li><b>Memory is the cost.</b> While Flash-Next ran, wired memory (memory macOS cannot page out) peaked at 137–139 GB, and available memory fell as low as 68 GB. Once, under pressure, MTPLX dropped a connection; Claude Code retried on its own.</li>
+<li><b>Claude Code needs no changes beyond environment variables.</b> All of sm's hooks fire, including compaction. No Anthropic credential existed in any run's config.</li>
+<li><b>Memory is the cost.</b> Wired memory (memory macOS cannot page out) peaked at 137–139 GB, and available memory once fell to 68 GB, when MTPLX dropped one connection that Claude Code retried.</li>
 </ul>
 
 <figure>
@@ -168,8 +168,46 @@
 <rect x="536" y="128" width="12" height="12" fill="var(--orange)"/><text x="552" y="138" fill="var(--ink)">waiting at a permission prompt</text>
 <line x1="476" y1="148" x2="476" y2="162" stroke="var(--ink)" stroke-width="2"/><text x="486" y="159" fill="var(--ink)">original agent's whole run</text>
 </svg>
-<figcaption><b>Figure 1. Where the time went.</b> Blue is the agent working; orange is the agent stopped at a permission prompt, or for an answer. The black tick is how long the original top-tier agent took in total. On #1892 one prompt sat unanswered for 4.8 hours while you were away. Earlier, on 27B run 4, prompts cost more time than the work did. Measured from the request log (appendix H.7).</figcaption>
+<figcaption><b>Figure 1. Where the time went.</b> Blue is the agent working; orange is the agent stopped at a permission prompt or for an answer; the black tick is the original top-tier agent's whole run. On #1892 one prompt sat unanswered for 4.8 hours while you were away. From the request log (appendix H.7).</figcaption>
 </figure>
+
+<h3>200K measurement</h3>
+
+<p><b>A 200K window fits for one agent plus its judge: wired memory peaks at 137 GB. Two agents plus the judge at 200K do not fit, so I recommend 200K with one agent.</b> "Fit" is the limit appendix L set: peak wired memory plus a 10% margin at or under 190 GB, which leaves the queue's typical use and sm's unload margin free. I replayed a real Claude Code conversation from the prototype against Flash-Next on MTPLX, grown from 49K to 190K tokens: alone, as two conversations, and as two plus a judge request every 30 seconds (appendix L). Two agents hit one of two walls. With MTPLX's store of saved conversations (its <b>session bank</b>) capped at 16 GB, two conversations past about 160K push each other out, and each then re-reads its whole conversation, which takes 13 minutes. With the cap at 32 GB they keep their places, but peak wired memory reaches 176 GB, or 194 GB with the margin.</p>
+
+<table>
+<thead><tr><th>Setting</th><th>Peak wired</th><th>+10%</th><th>Fits 190 GB?</th><th>Speed</th></tr></thead>
+<tbody>
+<tr><td><b>200K, one agent + judge, 16 GB bank (recommended)</b></td><td>137</td><td>151</td><td>Yes</td><td>Judge never waits. First token about 6 s for a typical turn at 190K.</td></tr>
+<tr><td>200K, two agents + judge, 32 GB bank</td><td>176</td><td>194</td><td>No</td><td>Turns that overlap wait for each other.</td></tr>
+<tr><td>160K, two agents + judge, 32 GB bank</td><td>164</td><td>180</td><td>Yes</td><td>Turns that overlap wait for each other; the judge waits behind the other agent.</td></tr>
+</tbody>
+</table>
+<p class="sans"><small>GB. Wired memory is memory macOS cannot page out. Every step's figures, and the 70K–175K sizes, are in appendix L.6.</small></p>
+
+<figure>
+<svg viewBox="0 0 880 210" role="img" aria-label="Peak wired memory by conversation size" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11.5px">
+<g stroke="var(--rule)"><line x1="60" y1="180.0" x2="680" y2="180.0"/><line x1="60" y1="140.0" x2="680" y2="140.0"/><line x1="60" y1="100.0" x2="680" y2="100.0"/><line x1="60" y1="60.0" x2="680" y2="60.0"/><line x1="60" y1="20.0" x2="680" y2="20.0"/></g>
+<g fill="var(--ink-2)" text-anchor="end" font-size="10"><text x="54" y="184.0">100</text><text x="54" y="144.0">120</text><text x="54" y="104.0">140</text><text x="54" y="64.0">160</text><text x="54" y="24.0">180 GB</text></g>
+<g fill="var(--ink-2)" text-anchor="middle" font-size="10"><text x="96" y="198">49K</text><text x="284" y="198">96K</text><text x="424" y="198">131K</text><text x="540" y="198">160K</text><text x="660" y="198">190K tokens</text></g>
+<line x1="60" y1="34.6" x2="680" y2="34.6" stroke="var(--red)" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="66" y="31.2" fill="var(--red)">limit: 173 GB peak (190 GB with the 10% margin)</text>
+<polyline fill="none" stroke="var(--blue)" stroke-width="2.5" points="96,168.0 180,164.0 256,148.0 284,140.0 360,136.0 424,126.0 480,120.0 540,112.0 600,106.0 660,108.0"/>
+<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" points="96,162.0 180,142.0 256,126.0 284,128.0 360,116.0 424,112.0 480,106.0 540,78.0"/>
+<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" stroke-dasharray="4 3" points="540,78.0 600,80.0 660,78.0"/>
+<polyline fill="none" stroke="var(--violet)" stroke-width="2.5" points="96,156.0 180,136.0 256,116.0 284,112.0 360,98.0 424,82.0 480,64.0 540,52.0 600,50.0 660,28.0"/>
+<g fill="var(--ink)"><text x="688" y="112.0">one agent + judge, 16 GB bank</text><text x="688" y="81.6">two + judge, 16 GB bank</text><text x="688" y="92.8" fill="var(--ink-2)" font-size="10">dashed: full re-reads</text><text x="688" y="32.0">two + judge, 32 GB bank</text></g>
+</svg>
+<figcaption><b>Figure 2. Peak wired memory as the conversation grows.</b> One agent stays well under the limit. Two agents with a 16 GB bank stay under it only by evicting each other's saved state and re-reading in full; with a 32 GB bank they cross the limit at about 175K. Measured 3 Oct.</figcaption>
+</figure>
+
+<ul>
+<li><b>Writing stays fast; reading new text slows as the conversation grows.</b> Flash-Next writes 52–79 tokens a second at every size, but reads new text at about 470 tokens a second near 50K and 130 near 190K. A typical prototype turn added about 750 tokens, so the reply starts after about 1.6 s at 50K, 3 s at 96K and 6 s at 190K; a 3,000-token turn (90th percentile) waits 6, 12 and 23 s.</li>
+<li><b>MTPLX serves one request at a time,</b> whatever its concurrency flags say. With two agents, overlapping turns and judge calls wait behind each other; queued judge requests here waited 48–242 s. With one agent, the judge runs only while the agent waits for its tool call, and answered in a median 1.3 s.</li>
+<li><b>Resuming after a yield costs seconds if MTPLX stops cleanly.</b> MTPLX reloads in 19–26 s and answered a parked 190K conversation in 11 s from its on-disk cache; with nothing cached, the re-read takes 13 minutes. So sm stops MTPLX with <code>mtplx stop</code>, never a kill, and leaves that cache on (MTPLX's default; about 45 GB of SSD).</li>
+</ul>
+
+<p>Appendix L's rule picks the largest window that fits, then the most agents: 200K with one agent. The real alternative is two agents at 160K, which get more work through when their turns do not overlap, are each slower when they do, and compact sooner. I recommend one agent for #1954; two agents are better measured in real use once sm owns the model.</p>
 
 <h3>Decision surface</h3>
 
@@ -177,37 +215,35 @@
 <thead><tr><th>Question</th><th>Recommendation</th><th>Why, in one line</th></tr></thead>
 <tbody>
 <tr><td>1. Is a local agent worth pursuing?</td><td><b>Yes.</b> Two of two well-specified tickets fixed to the merged fix's standard, at 1.7–2.3× the original agent's active time.</td><td>Free, unmetered, and good enough for the Local tier (question 6), once it stops waiting on you.</td></tr>
-<tr><td>2. What comes next?</td><td><b>Measure 200K, then permissions, before any sm code.</b> #1961 measures memory and speed at 200K with one conversation, two, and two plus the judge, without running agents. #1954 then prototypes the wall and the judge, and reruns the three tickets with no human at the terminal.</td><td>The 200K figure decides how many agents fit. Waits were 5.6 of 6.9 hours; plumbing around an agent that stalls buys nothing.</td></tr>
-<tr><td>3. How does a local agent get approval?</td><td><b>Sandbox wall plus a same-model judge.</b> Actions inside the wall run unasked. Actions that leave it (<code>git push</code>, <code>gh</code>, <code>sm</code>, network tools) go to a second seat of the same local model through a Claude Code hook. The judge answers allow or deny; no answer in 30 seconds counts as deny. A denied action is logged, and you can allow it afterwards; the agent then retries.</td><td>Nothing leaves the Mac, and the agent never waits on you. The judge is as capable as the agent and costs one seat, not a second model.</td></tr>
+<tr><td>2. What comes next?</td><td><b>Permissions, before any sm code.</b> #1954 prototypes the wall and the judge, and reruns the three tickets with no human at the terminal, at the window and settings in questions 5 and 8.</td><td>Waits were 5.6 of 6.9 hours; plumbing around an agent that stalls buys nothing.</td></tr>
+<tr><td>3. How does a local agent get approval?</td><td><b>Sandbox wall plus a same-model judge.</b> Actions inside the wall run unasked. Actions that leave it (<code>git push</code>, <code>gh</code>, <code>sm</code>, network tools) go through a Claude Code hook to the same local model, which answers allow or deny; no answer in 30 seconds is a deny. You can allow a denied action afterwards, and the agent retries.</td><td>Nothing leaves the Mac, and the agent never waits on you.</td></tr>
 <tr><td>4. Which model and server?</td><td><b>Qwen3.8-Flash-Next on MTPLX 2.12.0</b>, with Qwen3.8-27B on LM Studio as the fallback if MTPLX fails.</td><td>Flash-Next is about 3× faster and at least as good. LM Studio's engine does not recognise Flash-Next's architecture yet.</td></tr>
-<tr><td>5. What context window?</td><td><b>200K tokens</b>, as you asked, if #1961 shows it fits. #1954 runs at the window #1961 recommends.</td><td>The prototype ran at 131K and compacted once on its longest run. 200K costs more context cache per agent; #1961 says how much.</td></tr>
+<tr><td>5. What context window?</td><td><b>200K tokens.</b> MTPLX runs with <code>--context-window 200000</code> and its session bank capped at 16 GB.</td><td>Measured: 137 GB peak wired at 190K, 151 GB with the margin, under the 190 GB limit.</td></tr>
 <tr><td>6. What work goes to local agents?</td><td><b>A Local row in the tier table:</b> well-specified fixes whose failure a test can reproduce inside the checkout, plus scouting, inventory and triage. Not bugs that need live reproduction against a running sm, not spec authorship, design, review, or maintainer seats. PRs go through <code>sm request-review</code>.</td><td>That is exactly the line between the two passes and #1892.</td></tr>
 <tr><td>7. Who wins when memory runs short, and during perf runs?</td><td><b>Queue jobs, always; perf runs unload the model.</b> Unchanged.</td><td>Peak wired memory was 139 GB, and once available memory reached 68 GB. That is less headroom than the queue's 90th-percentile job needs.</td></tr>
-<tr><td>8. How many agents share the model?</td><td><b>One agent plus its judge</b> until #1961 measures two; you set the count from its readout. Then sm's seat limit (appendix F) takes over.</td><td>The prototype ran one agent at a time. MTPLX's behaviour with several conversations at once is unmeasured.</td></tr>
+<tr><td>8. How many agents share the model?</td><td><b>One agent plus its judge</b> (MTPLX <code>--max-active-requests 2</code>). The alternative is two agents plus the judge at a 160K window with a 32 GB session bank (164 GB peak). sm's seat limit (appendix F) enforces your choice.</td><td>Two agents at 200K peak at 176 GB, over the limit, and MTPLX serves one request at a time.</td></tr>
 <tr><td>9. How do prototype runs treat the agent's questions?</td><td><b>The driver answers as you would</b>, with a decision rather than a deflection. A ticket that needs live reproduction gets a scratch sm server the agent can reach.</td><td>The fixed reply turned a good question on #1892 into wasted work.</td></tr>
 </tbody>
 </table>
 
 <h3>Permissions: the options</h3>
 
-<p>Claude Code offers three ways to approve an action: ask the human, let auto mode decide, or skip permissions entirely. The prototype used the first, with a wide allow list. Prompts still came for compound commands, <code>$(…)</code>, <code>cd</code> out of the checkout, and reads of sm's logs. They are the commands an agent writes when it is diagnosing something. The other options:</p>
+<p>The prototype asked you, with a wide allow list. Prompts still came for compound commands, <code>$(…)</code>, <code>cd</code> out of the checkout and reads of sm's logs: the commands an agent writes when it diagnoses something. The options:</p>
 
 <table>
-<thead><tr><th>Option</th><th>Code leaves the Mac?</th><th>Judging quality</th><th>Cost</th><th>Verdict</th></tr></thead>
+<thead><tr><th>Option</th><th>Judging quality</th><th>Cost</th><th>Verdict</th></tr></thead>
 <tbody>
-<tr><td>Ask you (today)</td><td>No</td><td>Best</td><td>Hours of waiting; 5.6 of 6.9 hours here</td><td>No. You allow a denied action afterwards instead</td></tr>
-<tr><td>Claude Code auto mode</td><td>Yes: its classifier calls Anthropic directly</td><td>Good</td><td>Bills your Claude subscription on every tool call, or fails without a login</td><td>No</td></tr>
-<tr><td>Jev (hosted decision model)</td><td>Yes</td><td>Fast, about 100 ms; can be swayed by text injected into what it reads</td><td>About $0.04 per million input tokens</td><td>No: sends code out</td></tr>
-<tr><td>Haiku through the API</td><td>Yes</td><td>Likely weaker than the agent it judges</td><td>Metered</td><td>No</td></tr>
-<tr><td>Wall only, permissions skipped</td><td>No</td><td>None: anything inside the wall runs</td><td>Free. Built and verified: 13 of 13 checks</td><td>The base layer</td></tr>
-<tr><td>Wall plus a small local guard model</td><td>No</td><td>Weaker at reading shell commands</td><td>A second set of weights in memory</td><td>Fallback if the same-model judge is too slow</td></tr>
-<tr><td><b>Wall plus the same model as judge</b></td><td>No</td><td>As capable as the agent. It sees only the proposed action and a short policy, which is harder to steer than the agent's whole conversation</td><td>One seat, plus a few seconds per judged action</td><td><b>Recommended</b></td></tr>
+<tr><td>Ask you (today)</td><td>Best</td><td>Hours of waiting; 5.6 of 6.9 hours here</td><td>No. You allow a denied action afterwards instead</td></tr>
+<tr><td>Claude Code auto mode</td><td>Good</td><td>Bills your Claude subscription on every tool call, or fails without a login</td><td>No: sends code to Anthropic</td></tr>
+<tr><td>Jev (hosted decision model)</td><td>Fast, about 100 ms; can be swayed by text injected into what it reads</td><td>About $0.04 per million input tokens</td><td>No: sends code out</td></tr>
+<tr><td>Haiku through the API</td><td>Likely weaker than the agent it judges</td><td>Metered</td><td>No: sends code out</td></tr>
+<tr><td>Wall only, permissions skipped</td><td>None: anything inside the wall runs</td><td>Free. Built and verified: 13 of 13 checks</td><td>The base layer</td></tr>
+<tr><td>Wall plus a small local guard model</td><td>Weaker at reading shell commands</td><td>A second set of weights in memory</td><td>Fallback if the same-model judge is too slow</td></tr>
+<tr><td><b>Wall plus the same model as judge</b></td><td>As capable as the agent, and sees only the proposed action and a short policy, which is harder to steer than the agent's whole conversation</td><td>No second model; about a second per judged action with one agent</td><td><b>Recommended.</b> Nothing leaves the Mac</td></tr>
 </tbody>
 </table>
 
-<p>The wall is what keeps the judge's load small. Inside it, an action can damage nothing outside the agent's own checkout, so it needs no judgment. Only the actions that leave the wall need a ruling: talking to GitHub and talking to sm. Reading outside the checkout stays allowed, except credentials, which the wall blocks. The prototype's wall blocked sm and GitHub outright. A working local agent needs both, so the judge's main job is <code>git push</code>, <code>gh</code> and <code>sm</code> commands. Appendix K specifies the wall, the hook contract, the judge's policy, and the rerun protocol.</p>
-
-<p>No permission-skipping flag is needed. Claude Code's hook can answer "allow" itself, which replaces the prompt, so the agent runs in the normal permission mode with the hook deciding. That matters: my own session's safety check refused to launch an agent with permissions skipped, even inside the wall. #1954's first step confirms that the hook's answer behaves this way on the installed Claude Code. If it does not, skipping permissions inside the wall becomes a decision for you, and I would recommend it. The wall plus the judge is stricter than the prompts it replaces: a prompt answered at 2 a.m. on a phone is not a careful review.</p>
+<p>The wall keeps the judge's load small: inside it an action can damage nothing outside the agent's checkout, so only actions that leave it need a ruling, mainly <code>git push</code>, <code>gh</code> and <code>sm</code>. The hook answers allow or deny itself, so no permission-skipping flag is needed; my own session's safety check refused to launch an agent with permissions skipped, even inside the wall. #1954's first step confirms the hook behaves this way on the installed Claude Code. If it does not, skipping permissions inside the wall becomes your decision, and I would recommend it: a prompt answered at 2 a.m. on a phone is not a careful review. Appendix K specifies the wall, the hook, the policy and the rerun.</p>
 
 <h3>Why this is sm's job</h3>
 
@@ -255,15 +291,15 @@
 <line x1="46" x2="710" y1="142" y2="142" stroke="var(--violet)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="137" text-anchor="end" fill="var(--violet)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">Flash-Next, one agent, peak wired (measured) → this much left (136 GB)</text>
 <text x="46" y="296" fill="var(--ink-2)">hour of day (local) · GB used, dark = average, light = peak · 256 GiB = 275 GB total</text></svg>
 
-<figcaption><b>Figure 2. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples). Dark bars are hourly averages and light bars are hourly peaks. The dashed line shows how much memory is left for everything else at Flash-Next's measured peak with one agent (139 GB wired, 2 Oct). The average hour fits under it; the peak hours, 18:00–23:00, driven by queue jobs, force a yield. More agents and a 200K window lower the line further, by an amount #1961 measures. The dots mark hours with no samples.</figcaption>
+<figcaption><b>Figure 3. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples; dark = hourly average, light = hourly peak, dots = no samples). The dashed line is what is left for everything else with Flash-Next at its one-agent peak: 139 GB at 131K, 137 GB at 200K. The average hour fits; the peak hours, 18:00–23:00, driven by queue jobs, force a yield. A second agent would lower the line by about 40 GB.</figcaption>
 </figure>
 
-<p>Four facts from that data and from the earlier benchmarks drive the design:</p>
+<p>Three facts from that data and the earlier benchmarks drive the design:</p>
 <ul>
 <li><b>Queue jobs are the memory.</b> Queue jobs alone used 49 GB at the median sample, 173 GB at the 90th percentile and 247 GB at the 99th. Background jobs were running 61% of the time. The GPU is shared too: from 18:00 to 21:00 it averaged 60–76% busy from queue work.</li>
-<li><b>sm's memory guard would hit the wrong target.</b> When available memory falls below 8 GiB, the guard stops the largest <i>queue job</i>. A model server started outside sm is not a queue job, so the guard would stop your job to protect the model. On 1 Oct a benchmark model held 216 GB of wired memory while the queue saw that job as idle and holding 0 GB. Your <code>1858-train-r2</code> job was running, and I unloaded the model by hand with 47 GB left.</li>
-<li><b>Stopping the job that started a model does not free it.</b> The model lives in the server's process, not the job's. Only something that knows a model is loaded, and tells the server to let it go, gets the memory back.</li>
-<li><b>The model's memory is wired.</b> macOS cannot page it out or compress it. Only an unload relieves pressure, which is why the guard's first move must be to unload, not to wait.</li>
+<li><b>sm's memory guard would hit the wrong target.</b> Below 8 GiB available it stops the largest <i>queue job</i>, and stopping the job that started a model does not free the model. On 1 Oct a benchmark model held 216 GB wired while the queue saw its job as idle at 0 GB, and I unloaded it by hand with 47 GB left.</li>
+
+<li><b>The model's memory is wired.</b> Only an unload relieves pressure, so the guard's first move must be to unload, not to wait.</li>
 </ul>
 
 <h3>What local agents are worth</h3>
@@ -277,7 +313,7 @@
 
 <h3>How it works once sm owns it</h3>
 
-<p>This is the design the permissions ticket clears the way for. Claude Code stays the harness, launched with a <b>slim profile</b>: no MCP servers, no slash commands, seven tools. The prototype confirmed the profile and found one required setting. <code>CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off</code> stops Claude Code adding a fresh system message every turn, which otherwise defeated prompt reuse and cost 85 seconds before each reply on the 27B model. Codex and opencode stay out. A separate ticket runs the opencode check you asked for.</p>
+<p>This is the design the permissions ticket clears the way for. Claude Code stays the harness, launched with a <b>slim profile</b>: no MCP servers, no slash commands, seven tools, and <code>CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off</code>, without which prompt reuse fails. Codex and opencode stay out; #1955 runs the opencode check you asked for.</p>
 <figure>
 <svg viewBox="0 0 720 250" role="img" aria-label="Local agent architecture" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
 <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink-2)"/></marker></defs>
@@ -304,14 +340,14 @@
 <line x1="470" y1="65" x2="528" y2="65" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="499" y="58" text-anchor="middle" fill="var(--ink-2)" font-size="10">HTTP</text>
 <line x1="210" y1="168" x2="528" y2="168" stroke="var(--violet)" stroke-dasharray="5 3" marker-end="url(#ar)"/><text x="370" y="160" text-anchor="middle" fill="var(--violet)" font-size="10.5">mtplx serve / stop</text>
 </svg>
-<figcaption><b>Figure 3. The moving parts.</b> Only the violet parts are new. The agent is a normal Claude Code session in tmux, so sm tracks it the way it tracks every Claude agent. sm, not the agent, decides when the weights are loaded: MTPLX runs only while sm wants the model resident, so an agent can never pull 77 GB into memory behind sm's back.</figcaption>
+<figcaption><b>Figure 4. The moving parts.</b> Only the violet parts are new. The agent is a normal Claude Code session in tmux. sm, not the agent, decides when the weights are loaded, so an agent can never pull 77 GB into memory behind sm's back.</figcaption>
 </figure>
 
-<p><b>Spawning.</b> <code>sm spawn claude --host local "brief"</code> starts a local agent inside the wall, with its judge hook. sm refuses with a reason if no seat is free or the model cannot be loaded now; the spawn waits the way a queue job waits. Name, children, <code>sm send</code>, reminders and status behave as for any Claude agent. The app shows a LOCAL badge.</p>
+<p><b>Spawning.</b> <code>sm spawn claude --host local "brief"</code> starts a local agent inside the wall, with its judge hook, or waits like a queue job if no seat is free. It otherwise behaves as any Claude agent, with a LOCAL badge in the app.</p>
 
-<p><b>Yielding.</b> When a queue job pushes free memory under a <b>yield line</b> 24 GB above the guard's floor, sm stops delivering new messages to local agents. It lets their current turns finish for at most 10 minutes, then stops MTPLX. Once memory has stayed clear for 10 minutes, it restarts the model and hands each parked agent its held messages. A perf run does the same for its duration. Appendix F has the timeline.</p>
+<p><b>Yielding.</b> When a queue job pushes free memory under a <b>yield line</b> 24 GB above the guard's floor, sm holds new messages to local agents, lets current turns finish for at most 10 minutes, and stops MTPLX. Once memory has stayed clear for 10 minutes, it restarts the model and hands each parked agent its held messages. A perf run does the same. Appendix F has the timeline.</p>
 
-<p><b>Accounting.</b> Local turns land in the usage ledger tagged with host <code>local</code>, at zero quota weight. They are excluded from the Claude meter fit, and they show in Spend as a separate Local line measured in model-busy hours.</p>
+<p><b>Accounting.</b> Local turns land in the usage ledger with host <code>local</code> at zero quota weight, outside the Claude meter fit, and show in Spend as a Local line in model-busy hours.</p>
 
 <h3>The plan</h3>
 
@@ -319,9 +355,8 @@
 <thead><tr><th>Ticket</th><th>What it does</th><th>Tier</th><th>Starts after</th></tr></thead>
 <tbody>
 <tr><td><b>#1953</b> Local agents in sm</td><td>Goal ticket; every ticket below sits under it.</td><td>—</td><td>—</td></tr>
-<tr><td><b>#1961</b> Measure 200K</td><td>Replay real Claude Code requests from the prototype, grown to about 190K tokens, against Flash-Next on MTPLX: one conversation, two, then two plus judge requests. Record memory, first-token time, write speed and prompt reuse at each size, and the cost of re-reading a whole conversation after a yield. Recommend the window and seat count as a readout in this memo. Appendix L is its protocol.</td><td>Opus, high</td><td>nothing: next</td></tr>
-<tr><td><b>#1954</b> Permissions for local agents</td><td>Build the wall and the same-model judge by hand, with no sm code. Write an adversarial set of actions the judge must refuse. Rerun #1913, #1855 and #1892 one at a time with nobody at the terminal, #1892 with a scratch sm server it can reach. Report prompts avoided, judge verdicts, seconds per judged action, and denials you would have allowed, as a readout in this memo. Appendix K is its protocol.</td><td>Opus, high (driver)</td><td>#1961</td></tr>
-<tr><td><b>#1955</b> opencode harness check</td><td>Run #1855 and #1913 in opencode on Flash-Next under the same wall. Compare quality, active time and first-prompt size with the Claude Code runs. If opencode clearly wins, the harness question reopens.</td><td>Opus, high</td><td>a quiet window, not during #1961's or #1954's runs</td></tr>
+<tr><td><b>#1954</b> Permissions for local agents</td><td>Build the wall and the same-model judge by hand, with no sm code, plus an adversarial set of actions the judge must refuse. Rerun #1913, #1855 and #1892 one at a time with nobody at the terminal, #1892 with a scratch sm server. Report prompts avoided, judge verdicts, seconds per judged action, and denials you would have allowed. Appendix K is its protocol.</td><td>Opus, high (driver)</td><td>nothing: next (#1961 is done)</td></tr>
+<tr><td><b>#1955</b> opencode harness check</td><td>Run #1855 and #1913 in opencode on Flash-Next under the same wall. Compare quality, active time and first-prompt size with the Claude Code runs. If opencode clearly wins, the harness question reopens.</td><td>Opus, high</td><td>a quiet window, not during #1954's runs</td></tr>
 <tr><td><b>#1956</b> Launch a local agent</td><td>Host field, MTPLX launch environment, slim profile, wall and judge hook at launch, local usage split from the quota fit, LOCAL badge on web and Android.</td><td>Opus, high</td><td>#1954</td></tr>
 <tr><td><b>#1957</b> sm owns the model</td><td><code>sm model load|unload|status</code> over MTPLX. Record the reservation, have the memory guard unload the model before it stops any queue job, have perf admission unload it, add the model's memory to the recorder.</td><td>Opus, high</td><td>#1954</td></tr>
 <tr><td><b>#1958</b> Seat limit and yield</td><td>Drain, park and resume; spawn waits for a seat.</td><td>Opus, high</td><td>#1956, #1957</td></tr>
@@ -329,21 +364,19 @@
 </tbody>
 </table>
 
-<p><b>#1954's pass bar.</b> No permission prompt reaches you. Actions the judge denied that the ticket needed, ones you would have allowed afterwards, are under one per ticket. The judge allows nothing on the adversarial set that the policy forbids. Each ticket's verdict is no worse than the prototype's. A judged action costs under 10 seconds at the median. If the same-model judge misses the bar on speed alone, the ticket tries a small local guard model before reporting. If it misses on safety, the driver reports and the work stops there.</p>
+<p><b>#1954's pass bar.</b> No permission prompt reaches you. Denials the ticket needed, ones you would have allowed afterwards, are under one per ticket. The judge allows nothing on the adversarial set that the policy forbids. Each ticket's verdict is no worse than the prototype's. A judged action costs under 10 seconds at the median. If the judge misses on speed alone, the ticket tries a small local guard model before reporting; if it misses on safety, the work stops there.</p>
 
 <h3>Risks I cannot close from here</h3>
 <ul>
 <li><b>MTPLX is young.</b> One maintainer, version 2.12.0, and the Flash-Next pack comes from the same author. If it stalls, the fallback is Qwen3.8-27B on LM Studio, which passed #1913 at a third of the speed.</li>
-<li><b>A same-model judge shares the agent's blind spots.</b> The defence is that it sees only the proposed action and a fixed policy, never the files or web pages that might carry injected instructions. The adversarial set in #1954 tests exactly that.</li>
-<li><b>Memory at 200K with two seats is unmeasured.</b> The prototype peaked at 139 GB wired with one seat at 131K. MTPLX's session bank, its store of reusable conversation state, can grow to 48 GB. #1961 measures this before anything else, and #1957 caps the bank with <code>MTPLX_SESSION_BANK_MAX_BYTES</code>.</li>
+<li><b>A same-model judge shares the agent's blind spots.</b> It sees only the proposed action and a fixed policy, never the files or pages that might carry injected instructions; #1954's adversarial set tests that.</li>
+<li><b>A second agent is unproven.</b> Two agents fit only at 160K, and MTPLX serves one request at a time, so their combined output is unmeasured.</li>
 <li><b>Routing.</b> The Local tier works only if tickets that need live reproduction are kept away from it. A misrouted ticket costs machine hours, not quota.</li>
-<li><b>Grading noise.</b> Rescue effort ranged 35–65% for near-identical fixes. Verdicts rest on the merged fix's tests and the grader's verdict, not on that number.</li>
 </ul>
 
-<h3>FAQ — what changed since revision 6</h3>
+<h3>FAQ — what changed since revision 7</h3>
 <ul>
-<li><b>The judge never hands an action to you</b> (your review, 3 Oct). It answers allow or deny; a timeout or an unreadable answer is a deny. Every denial is logged with an id, and you can allow one afterwards; sm then tells the agent to retry it. The agent never waits on you: it carries on with what it can do, or reports and stops. Appendix K.8 has the mechanism.</li>
-<li><b>200K is measured first, in its own ticket, #1961</b> (your review). It replays the prototype's real requests instead of running agents, so it is quick. It also takes over the two-agent measurement from #1954, because both are memory questions. #1954 now starts after #1961 and runs at the window and settings #1961 recommends.</li>
+<li><b>200K is measured</b> (#1961, 3 Oct): one agent plus its judge fits at 137 GB peak wired; two agents at 200K do not. The figures replace the estimates in appendices C, E, F and K.</li>
 </ul>
 
 <hr class="appendix-divider">
@@ -430,12 +463,12 @@ export SM_HOST=local</code></pre>
 <p>sm prepends a short fixed block, about 150 words, to the spawn brief of every local agent. The block states: your tier is Local; do not delegate or spawn; use <code>sm status</code> on <code>[sm remind]</code>; open a PR and run <code>sm request-review</code>; stop and report if blocked. The text lives in <code>docs/product/local_agent_addendum.md</code> so it can change without a rebuild; sm reads it at spawn.</p>
 <h4>C.8 Example</h4>
 <pre><code>$ sm model status
-flash-next  ready  seats 1/2 used (+1 judge)  reservation 160 GB
+flash-next  ready  seats 1/1 used (+1 judge)  reservation 151 GB
 $ sm spawn claude --host local --name sm-1901-inventory "Inventory every call site of …"
 spawned sm-1901-inventory (7c1e…) host=local model=flash-next (effort ignored: local host)
 $ sm spawn claude --host local --model qwen3.8-27b "…"
 error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
-<p>The 160 GB reservation is illustrative; #1961 measures the real figure at 200K.</p>
+<p>151 GB is Flash-Next's measured peak at 200K with one agent and the judge (137 GB wired, L.6) plus 10%.</p>
 
 <h3 id="d">D. P1: usage accounting</h3>
 <ul>
@@ -450,11 +483,12 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <pre><code>MTPLX_SESSION_BANK_MAX_BYTES=&lt;cap&gt; mtplx serve \
   --model Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
   --profile turbo --host 127.0.0.1 --port 8000 \
+  --context-window &lt;context&gt; \
   --max-active-requests &lt;seats + 1&gt; --batching-preset agent --yes</code></pre>
-<p>The prototype ran <code>--profile turbo</code> with the default scheduler, one request at a time. <code>--max-active-requests</code> and <code>--batching-preset agent</code> are the settings #1961 measures for two seats plus the judge. The session bank is MTPLX's store of reusable conversation state. Left uncapped it may grow to 48 GB, so P2 caps it at 16 GB until #1961's measurements say otherwise. The 30 GB n-gram table stays on SSD and is streamed.</p>
+<p>Settings, from #1961's measurements (L.6): context 200000, one seat plus the judge (<code>--max-active-requests 2</code>), and the session bank capped at 16 GB. The session bank is MTPLX's store of reusable conversation state in memory. Left uncapped it may grow to 48 GB. A 190K conversation's saved state is 6.9 GB, and 16 GB holds one conversation with room for its previous step; two conversations need 32 GB. Whatever the flags say, MTPLX serves one request at a time, so concurrent requests queue. Its on-disk session cache stays on (MTPLX's default, about 45 GB of SSD): it is what makes a resume after a yield take seconds. The 30 GB n-gram table stays on SSD and is streamed.</p>
 <ul>
 <li><b>Readiness:</b> poll <code>GET /v1/models</code> until it answers, with a 10-minute timeout. A cold start loads 77 GB.</li>
-<li><b>Stop:</b> <code>mtplx stop --port 8000</code>, then confirm the process is gone; if it is still alive after 60 seconds, kill it.</li>
+<li><b>Stop:</b> <code>mtplx stop --port 8000</code>, then confirm the process is gone; if it is still alive after 60 seconds, kill it. A clean stop takes about 30 seconds, because MTPLX writes pending conversation state to its on-disk cache first. A kill loses that state, and each parked agent then re-reads its whole conversation (13 minutes at 190K).</li>
 <li><b>Version:</b> pin MTPLX at 2.12.0. An upgrade is a deliberate step that reruns #1855.</li>
 </ul>
 <p>The fallback server is LM Studio 0.4.16 with Qwen3.8-27B. It loads with <code>lms load &lt;key&gt; -c &lt;context&gt; --parallel &lt;seats&gt; --identifier &lt;short-id&gt; -y</code> and unloads with <code>lms unload &lt;id&gt;</code>. Its just-in-time loading and auto-update are both off: version 0.4.19 breaks tool calling for Qwen on <code>/v1/messages</code>. P2 puts both servers behind one small trait, so switching between them is configuration.</p>
@@ -463,7 +497,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <thead><tr><th>Command</th><th>Behaviour</th></tr></thead>
 <tbody>
 <tr><td><code>sm model status</code></td><td>Loaded model, server, seats used / total, reservation, state (E.3), last yield time and reason.</td></tr>
-<tr><td><code>sm model load &lt;key&gt; [--seats N] [--context T]</code></td><td>Defaults: seats 2, context 200000. Computes the reservation (E.4) and refuses if available memory minus reservation is below the yield line. Otherwise starts the server (E.1) and waits for readiness. Only one model may be loaded; loading a second is refused.</td></tr>
+<tr><td><code>sm model load &lt;key&gt; [--seats N] [--context T]</code></td><td>Defaults: seats 1, context 200000. Computes the reservation (E.4) and refuses if available memory minus reservation is below the yield line. Otherwise starts the server (E.1) and waits for readiness. Only one model may be loaded; loading a second is refused.</td></tr>
 <tr><td><code>sm model unload [--force]</code></td><td>Drains first (F), then stops the server (E.1). <code>--force</code> skips the drain.</td></tr>
 </tbody>
 </table>
@@ -482,7 +516,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 </tbody>
 </table>
 <p>If <code>config.json</code> has no recognisable attention layout, sm refuses the load and asks for <code>--reservation &lt;GB&gt;</code>. The <b>yield line</b> is the guard's reserve plus 24 GB (config <code>local_host.yield_margin_bytes</code>), so 32.6 GB of available memory by default. Available memory means the kernel's value that the guard already uses (queue.rs:4519–4542).</p>
-<p><b>The formula is a floor, not the reservation.</b> The server keeps earlier prompts' caches in memory so that it can reuse them, and MLX holds working buffers on top. Measured, MiniMax grew from 121 GB loaded to 160 GB with two agents on 6.6K-token prompts and 181–216 GB with four. The formula predicts 129 GB plus 3–27 GB. The reservation is therefore the larger of the formula and the highest footprint sm has recorded for that model at that seat count (stored as <code>measured_peak_bytes</code> in <code>local_model</code>, updated from E.6 samples). The guard watches the model's actual footprint, not the reservation. Known peaks to seed it with: Qwen3-Coder-Next 4 seats 95 GB; MiniMax M2.5 2 seats 160 GB, 4 seats 216 GB wired. Flash-Next on MTPLX: 139 GB wired with one seat at 131K (2 Oct); #1961 adds one and two seats plus the judge at 200K. For MTPLX models the formula does not apply, because Flash-Next's attention layout is not in a <code>config.json</code> sm can read. Their reservation is the measured peak plus 10%, and a load with no measured peak needs <code>--reservation &lt;GB&gt;</code>.</p>
+<p><b>The formula is a floor, not the reservation.</b> The server keeps earlier prompts' caches in memory so that it can reuse them, and MLX holds working buffers on top. Measured, MiniMax grew from 121 GB loaded to 160 GB with two agents on 6.6K-token prompts and 181–216 GB with four. The formula predicts 129 GB plus 3–27 GB. The reservation is therefore the larger of the formula and the highest footprint sm has recorded for that model at that seat count (stored as <code>measured_peak_bytes</code> in <code>local_model</code>, updated from E.6 samples). The guard watches the model's actual footprint, not the reservation. Known peaks to seed it with: Qwen3-Coder-Next 4 seats 95 GB; MiniMax M2.5 2 seats 160 GB, 4 seats 216 GB wired. Flash-Next on MTPLX: 139 GB wired with one seat at 131K (2 Oct); at 200K, 137 GB with one seat plus the judge and a 16 GB session bank, and 176 GB with two seats plus the judge and a 32 GB bank (#1961, L.6). For MTPLX models the formula does not apply, because Flash-Next's attention layout is not in a <code>config.json</code> sm can read. Their reservation is the measured peak plus 10%, and a load with no measured peak needs <code>--reservation &lt;GB&gt;</code>.</p>
 <p><b>The model's memory is wired.</b> In the benchmark, wired memory rose from 9 GB to 98–108 GB while Qwen was answering. Wired memory cannot be compressed or paged out, so the kernel cannot relieve pressure from it; only an unload can. This is why the reservation must be counted in full and why the guard's first action is to unload, not to wait.</p>
 <p>Guard change (queue.rs:5263 <code>host_memory_guard_pass</code>): when available memory falls below the yield line and the model state is <code>ready</code> or <code>draining</code>, the pass starts a yield (F.2) instead of stopping a job. When available memory falls below the reserve itself, which means a yield was too slow, the guard force-unloads the model first. It returns to stopping queue jobs only if memory is still under the reserve after the unload. Test: extend <code>host_memory_guard_stops_the_largest_job_of_any_type_only_under_pressure</code> (queue.rs:8756) with a loaded model and assert the model is unloaded and no job is stopped.</p>
 <h4>E.5 Perf admission</h4>
@@ -492,7 +526,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 
 <h3 id="f">F. B1: seat limit, drain, park, resume</h3>
 <h4>F.1 Seat limit</h4>
-<p>A local agent occupies a seat from spawn until it is retired or killed, not only while mid-turn. The judge holds one extra seat for as long as any local agent exists; it is not counted in the limit shown to spawns. Idle agents hold their conversation cache in the server, and admitting more agents than seats makes the server evict caches and re-read whole conversations. A spawn with no free seat waits up to <code>--max-wait</code> (default 5 minutes, same flag and semantics as <code>sm queue run</code>) and then fails with <code>no local seat free (4/4 used by …)</code>.</p>
+<p>A local agent occupies a seat from spawn until it is retired or killed, not only while mid-turn. The judge holds one extra seat for as long as any local agent exists; it is not counted in the limit shown to spawns. Idle agents hold their conversation cache in the server, and admitting more agents than seats makes the server evict caches and re-read whole conversations. A spawn with no free seat waits up to <code>--max-wait</code> (default 5 minutes, same flag and semantics as <code>sm queue run</code>) and then fails with <code>no local seat free (1/1 used by …)</code>. The default is one seat (L.6). A second seat is the owner's choice, and it comes with a 160K window and a 32 GB session bank.</p>
 <h4>F.2 Drain and park</h4>
 <ol>
 <li>State → <code>draining</code>. sm holds new <code>sm send</code> deliveries, reminders and wakes addressed to local agents in their durable queues. Nothing is lost; delivery is deferred.</li>
@@ -501,9 +535,9 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <li>Any agent cut off mid-turn is flagged <code>resume_needed</code>.</li>
 </ol>
 <h4>F.3 Reload and resume</h4>
-<p>Reload condition: <code>desired</code> is true, no perf job is running or in cooldown, and available memory has stayed at or above the reservation plus the yield line for 10 continuous minutes (<code>local_host.reload_hold</code>). On reload, the model is loaded with the same seats and context. Each parked agent's held messages are then delivered in order. An agent flagged <code>resume_needed</code> with nothing held gets <code>[sm] The local model was unloaded while you were working (&lt;reason&gt;). Continue where you left off.</code></p>
+<p>Reload condition: <code>desired</code> is true, no perf job is running or in cooldown, and available memory has stayed at or above the reservation plus the yield line for 10 continuous minutes (<code>local_host.reload_hold</code>). On reload, the model is loaded with the same seats and context. A parked agent's first request after reload is served from MTPLX's on-disk cache: 11 s for a 190K conversation (L.6). Each parked agent's held messages are then delivered in order. An agent flagged <code>resume_needed</code> with nothing held gets <code>[sm] The local model was unloaded while you were working (&lt;reason&gt;). Continue where you left off.</code></p>
 <h4>F.4 Worked example</h4>
-<p>At 18:02 Flash-Next is loaded (two seats plus the judge, reservation 160 GB for illustration) with two local agents. A queue job grows by 40 GB. Available memory drops from 70 GB to 30 GB, below the 32.6 GB yield line. sm drains: one agent is idle, and the other finishes its turn at 18:05. sm stops MTPLX at 18:05 and parks both. The job ends at 19:40. Available memory has been at or above 192.6 GB (160 + 32.6) since then, so at 19:50 sm restarts the model and delivers two held <code>sm send</code> messages to one of the agents.</p>
+<p>At 18:02 Flash-Next is loaded (one seat plus the judge, reservation 151 GB) with one local agent. A queue job grows by 40 GB. Available memory drops from 70 GB to 30 GB, below the 32.6 GB yield line. sm drains: the agent finishes its turn at 18:05. sm stops MTPLX at 18:05 and parks the agent. The job ends at 19:40. Available memory has been at or above 183.6 GB (151 + 32.6) since then, so at 19:50 sm restarts the model and delivers two held <code>sm send</code> messages to the agent.</p>
 
 <figure>
 <svg viewBox="0 0 720 170" role="img" aria-label="Yield timeline" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11.5px">
@@ -629,7 +663,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 
 <h3 id="i">I. Measurements and method</h3>
 <h4>I.1 Machine and memory history</h4>
-<p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 2 is generated from the same table by a script that groups by local hour.</p>
+<p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 3 is generated from the same table by a script that groups by local hour.</p>
 <h4>I.2 Quota share</h4>
 <p><code>usage.db</code> <code>message_ledger</code>, last 14 days, weighted with quota_rates.rs:120 and rated with quota_rates.rs:61, then halved to a weekly figure: Astra 68.3%, Opus 50.4%, Fable 20.2%, Sol 2.3%, Sonnet 0.6%, Luna under 0.1%.</p>
 <h4>I.3 First-prompt size</h4>
@@ -711,7 +745,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <tr><td>opencode check</td><td>Plan table</td><td>#1955 readout</td></tr>
 <tr><td>Local work goes through review</td><td>C.7</td><td>Addendum text</td></tr>
 <tr><td>Model choice by per-agent memory</td><td>E.4, I.4</td><td>Reservation from config.json (LM Studio models) or measured peak plus 10% (MTPLX); test that a load with neither is refused</td></tr>
-<tr><td>One agent plus judge until #1961 measures two seats</td><td>E.1, F.1, L</td><td>#1961 records memory and speed with two conversations plus the judge; E.2 default seats changes only on that evidence</td></tr>
+<tr><td>One agent plus judge (#1961 measured two seats: over the rule at 200K)</td><td>E.1, E.2, F.1, L.6</td><td>#1961 readout; E.2 default seats 1</td></tr>
 </tbody>
 </table>
 
@@ -780,7 +814,7 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 
 <h4>K.6 The rerun</h4>
 <ul>
-<li>MTPLX as in E.1, with the context window, <code>--max-active-requests</code> and session-bank cap that #1961 recommends.</li>
+<li>MTPLX as in E.1: <code>--context-window 200000 --max-active-requests 2 --batching-preset agent</code>, <code>MTPLX_SESSION_BANK_MAX_BYTES=16G</code>, one agent at a time. The judge hook acts on the answer line as soon as it streams. When another request is waiting, MTPLX can hold the response open for up to 30 seconds after the answer (L.6).</li>
 <li>Run #1855, #1913 and #1892 one at a time from the H.1 start commits, with no human at the terminal. #1892 gets a scratch sm-server inside the wall (H.8) and a private tmux socket.</li>
 <li>The driver answers questions as the owner would (H.8) and records each one.</li>
 <li>Record per run: everything in H.4; every hook decision from the log (stage, decision, latency); prompts that reached a human (must be none); every denial, and which ones the driver allowed afterwards (K.8); peak wired memory and lowest available memory.</li>
@@ -833,11 +867,68 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 </ul>
 
 <h4>L.5 Readout and recommendation</h4>
-<p>The readout goes into this memo as a "200K measurement" section. Its first element is a table with one row per phase and size (50K, 100K, 131K, 160K, 190K): peak wired memory, lowest available memory, median time to first token, write speed and reuse. It then recommends the window and seat count by one rule: <b>the largest window, then the most agents, whose measured peak wired memory plus 10% stays at or under 190 GB.</b> That leaves the queue's median use (49 GB) plus the yield line (32.6 GB) free out of 275 GB. The candidates, in order: two agents plus the judge at 200K; one agent plus the judge at 200K; one agent plus the judge at 160K; then at 131K. The owner decides; the chosen figures replace the illustrative 160 GB in C.8 and F.4, seed <code>measured_peak_bytes</code> (E.4), set E.2's default seats, and set #1954's server settings (K.6).</p>
+<p>The readout goes into this memo as a "200K measurement" section. Its first element is a table with one row per phase and size (50K, 100K, 131K, 160K, 190K): peak wired memory, lowest available memory, median time to first token, write speed and reuse. It then recommends the window and seat count by one rule: <b>the largest window, then the most agents, whose measured peak wired memory plus 10% stays at or under 190 GB.</b> That leaves the queue's median use (49 GB) plus the yield line (32.6 GB) free out of 275 GB. The candidates, in order: two agents plus the judge at 200K; one agent plus the judge at 200K; one agent plus the judge at 160K; then at 131K. The owner decides; the chosen figures set the reservation in C.8 and F.4, seed <code>measured_peak_bytes</code> (E.4), set E.2's default seats, and set #1954's server settings (K.6).</p>
+
+<h4>L.6 Results (3 Oct) and how the runs departed from L.1–L.4</h4>
+<p>Two queue jobs ran: <code>1961-200k</code> (phases 1–4, session bank 16 GB, 2 h 21 min) and <code>1961-200k-bank32</code> (phase 3 again with the bank at 32 GB, 35 min). Neither reached the yield line, and MTPLX stopped cleanly after every phase with no kill. The driver kit is <code>~/.local/share/local-agents-proto/kit-1961/</code> (<code>replay_1961.py</code>, <code>run_1961.sh</code>, <code>summarize_1961.py</code>, <code>gens_1961.py</code>, <code>l6_rows.py</code>). Raw results are in <code>~/.local/share/local-agents-proto/runs-1961/{main,bank32}/</code>: one line per request, a memory sample every 5 s, events, the plan, and MTPLX's log per phase.</p>
+<p><b>Server.</b> <code>MTPLX_SESSION_BANK_MAX_BYTES=16G</code> (or <code>32G</code>) <code>mtplx serve --model Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed --profile turbo --host 127.0.0.1 --port 8000 --max-active-requests 3 --batching-preset agent --context-window 200000 --yes</code>. MTPLX's default window is already 262,144 tokens, so nothing more was needed to admit 200K prompts. It reported an engine budget of 192 GB, 77.3 GB of weights and a 24 GB per-conversation cap inside the bank. A 190K conversation's saved state measured 6.9 GB.</p>
+<p><b>Departures.</b></p>
+<ul>
+<li><b>Sizes below 96K are cuts, not growth.</b> The base body <code>00048.json</code> is already 96K tokens. The 49K, 70K and 89K steps are that conversation cut at a user-message boundary, so each step is still the previous request plus more turns. Above 96K, each step appends Read turns of <code>queue.rs</code> (conversation A), <code>http.rs</code> (B, D) or <code>sessions.rs</code> (C, E) from commit c009acd, sized with <code>count_tokens</code> to 115K, 131K, 145K, 160K, 175K and 190K.</li>
+<li><b>Steps add 7–21K tokens; real turns add about 750.</b> A step's read time is therefore not a first-token time. The memo's first-token figures are derived: a turn's new tokens divided by the read speed measured at that depth (table below). Real turn sizes come from the prototype's request log: median 385–767 new tokens per request across the Flash-Next runs, 90th percentile 1.9–5.7K.</li>
+<li><b>Every conversation has its own tag</b> (A–E, plus the run id) on the first line of the system prompt. Nothing reuses the prototype's on-disk cache, and phase 3 does not reuse phase 2's.</li>
+<li><b>Timing comes from MTPLX's log, not the client stream.</b> With <code>max_tokens 300</code>, the model's reasoning often hits the cap. MTPLX then runs a second pass inside the same request to finish the reply, and the usage it returns describes that second pass. A queued request also receives empty reasoning deltas about every 5 s. Read time is therefore MTPLX's <code>elapsed_s</code> minus output tokens divided by its decode speed, from the first pass's log line.</li>
+<li><b>The judge</b> used K.4's template for <code>git push -u origin 1855-review-alias</code> with K.4's policy as the system prompt, reasoning off, temperature 0 and <code>max_tokens 200</code>. Each judge request went 30 s after the previous one started, or when it finished if that was later. All 45 answered ALLOW; this measures speed, not judgement.</li>
+<li><b>The 32 GB run is extra.</b> At 16 GB the two conversations evicted each other from 160–175K on, which hid their real memory. Repeating phase 3 at 32 GB measured two agents without eviction.</li>
+<li><b>Phase 4</b> sent phase 1's 190K request after a restart; MTPLX answered from its on-disk cache. It then sent the same request under a new tag, which nothing had cached.</li>
+</ul>
+<p><b>Per step.</b> Seconds is each request's end-to-end time, conversations in tag order. With two conversations it includes waiting for the other, because MTPLX serves one request at a time. Memory is peak wired / lowest available in GB during the step. Bold rows in the memo's table are these runs' peaks.</p>
+<table>
+<thead><tr><th rowspan="2">Size</th><th colspan="2">One agent, 16 GB</th><th colspan="2">Two agents, 16 GB</th><th colspan="2">Two + judge, 16 GB</th><th colspan="2">Two + judge, 32 GB</th></tr>
+<tr><th>s</th><th>GB</th><th>s</th><th>GB</th><th>s</th><th>GB</th><th>s</th><th>GB</th></tr></thead>
+<tbody>
+<tr><td>49K</td><td>60</td><td>106 / 154</td><td>118 / 89</td><td>110 / 148</td><td>90 / 119</td><td>109 / 151</td><td>93 / 124</td><td>112 / 148</td></tr>
+<tr><td>70K</td><td>48</td><td>108 / 151</td><td>78 / 95</td><td>118 / 140</td><td>79 / 97</td><td>119 / 140</td><td>97 / 78</td><td>122 / 137</td></tr>
+<tr><td>89K</td><td>80</td><td>116 / 143</td><td>160 / 160</td><td>125 / 135</td><td>159 / 159</td><td>127 / 132</td><td>167 / 167</td><td>132 / 126</td></tr>
+<tr><td>96K</td><td>39</td><td>120 / 140</td><td>77 / 77</td><td>126 / 132</td><td>78 / 78</td><td>126 / 132</td><td>92 / 92</td><td>134 / 124</td></tr>
+<tr><td>115K</td><td>94</td><td>122 / 137</td><td>196 / 197</td><td>132 / 129</td><td>194 / 194</td><td>132 / 126</td><td>216 / 216</td><td>141 / 113</td></tr>
+<tr><td>131K</td><td>94</td><td>127 / 132</td><td>188 / 188</td><td>133 / 126</td><td>191 / 191</td><td>134 / 126</td><td>130 / 216</td><td>149 / 107</td></tr>
+<tr><td>145K</td><td>86</td><td>130 / 129</td><td>183 / 118</td><td>136 / 124</td><td>118 / 184</td><td>137 / 124</td><td>129 / 203</td><td>158 / 96</td></tr>
+<tr><td>160K</td><td>99</td><td>134 / 126</td><td>216 / 218</td><td>141 / 118</td><td>231 / 755</td><td>151 / 107</td><td>158 / 269</td><td>164 / 80</td></tr>
+<tr><td>175K</td><td>110</td><td>137 / 121</td><td>776 / 143</td><td>150 / 110</td><td>144 / 787</td><td>150 / 110</td><td>152 / 254</td><td>165 / 88</td></tr>
+<tr><td>190K</td><td>118</td><td>136 / 124</td><td>903 / 906</td><td>150 / 110</td><td>149 / 900</td><td>151 / 110</td><td>178 / 283</td><td>176 / 77</td></tr>
+</tbody>
+</table>
+<p class="sans"><small>Requests of 750–906 s are full re-reads after the other conversation evicted this one's saved state from the 16 GB bank. MTPLX's own footprint ran 4–8 GB below wired memory throughout. Swap stayed at 9 GB, all of it from before the runs.</small></p>
+<p><b>Read and write speed, one agent</b> (MTPLX log, first pass):</p>
+<table>
+<thead><tr><th>Size</th><th>New tokens</th><th>Read (s)</th><th>Read speed (tok/s)</th><th>Write speed (tok/s)</th></tr></thead>
+<tbody>
+<tr><td>49K</td><td>48,616 (all, nothing cached)</td><td>57.2</td><td>850</td><td>64</td></tr>
+<tr><td>70K</td><td>21,369</td><td>45.6</td><td>469</td><td>79</td></tr>
+<tr><td>89K</td><td>19,204</td><td>70.5</td><td>272</td><td>60</td></tr>
+<tr><td>96K</td><td>6,959</td><td>28.2</td><td>247</td><td>63</td></tr>
+<tr><td>115K</td><td>18,871</td><td>86.9</td><td>217</td><td>67</td></tr>
+<tr><td>131K</td><td>16,104</td><td>87.0</td><td>185</td><td>67</td></tr>
+<tr><td>145K</td><td>13,797</td><td>83.4</td><td>165</td><td>75</td></tr>
+<tr><td>160K</td><td>15,100</td><td>97.1</td><td>156</td><td>68</td></tr>
+<tr><td>175K</td><td>14,940</td><td>106.1</td><td>141</td><td>52</td></tr>
+<tr><td>190K</td><td>15,035</td><td>115.8</td><td>130</td><td>78</td></tr>
+<tr><td>190K, nothing cached (phase 4)</td><td>189,997</td><td>784</td><td>242</td><td>55</td></tr>
+</tbody>
+</table>
+<p>Read time per new token rises roughly linearly with conversation size, as full attention predicts: about 1.2 ms per token for the first 49K tokens and 7.7 ms per token near 190K. The phase-1 step reads sum to 778 s, which matches the 784 s cold read of the whole 190K. Each step therefore re-read only its new turns. Write speed shows no trend with size.</p>
+<p><b>Judge.</b> With the 32 GB bank, judge requests that found the model free had their answer complete in 0.65–4.4 s, median 1.3 s. Those that arrived during an agent's read waited 48–242 s, and in the 16 GB run up to 867 s behind a full re-read. When another request was pending, MTPLX held the response open about 30 s after the answer while it saved the conversation state (<code>mtplx_stream_commit_wait_deferred</code> in its log). A hook that waits for the stream to close would add those 30 s.</p>
+<p><b>Restart and resume.</b> Eight loads took 19–26 s each. A clean <code>mtplx stop</code> took 30 s, including the write of pending conversation state to the on-disk cache (3.8 s for one 190K conversation). After a restart, phase 1's 190K conversation answered in 10.7 s, against 784 s plus 5 s of writing with nothing cached. The on-disk cache held about 45 GB after the runs, within MTPLX's automatic 100 GB cap. Under load the cache did not save evicted conversations, because MTPLX writes to it only when idle. A bank too small for the agents loaded is therefore not rescued by the disk.</p>
 
 <h3 id="z">Z. FAQ</h3>
 <p><b>Why does the judge deny rather than ask the owner?</b> An action routed to a human makes the agent wait for as long as the human is away; on #1892 that was 4.8 hours. A denial costs one tool call. The agent carries on or reports, and the owner can allow the action afterwards (K.8). This is the owner's ruling on revision 6.</p>
-<p><b>Why is 200K measured by replay rather than by running agents?</b> Memory depends on how much conversation the server holds, not on what the agent does with it. Replaying saved requests reaches 190K in minutes, controls the size exactly, and needs no permissions, so it can run before #1954. Speed under real agent work is still recorded in #1954's reruns.</p>
+<p><b>Why is 200K measured by replay rather than by running agents?</b> Memory depends on how much conversation the server holds, not on what the agent does with it. Replaying saved requests reaches 190K in a few hours of machine time and no agent time, controls the size exactly, and needs no permissions, so it can run before #1954. Speed under real agent work is still recorded in #1954's reruns.</p>
+<p><b>What changed in revision 7?</b></p>
+<ul>
+<li><b>The judge never hands an action to you</b> (your review, 3 Oct). It answers allow or deny; a timeout or an unreadable answer is a deny. Every denial is logged with an id, and you can allow one afterwards; sm then tells the agent to retry it. The agent never waits on you: it carries on with what it can do, or reports and stops. Appendix K.8 has the mechanism.</li>
+<li><b>200K is measured first, in its own ticket, #1961</b> (your review). It replays the prototype's real requests instead of running agents, so it is quick. It also takes over the two-agent measurement from #1954, because both are memory questions. #1954 now starts after #1961 and runs at the window and settings #1961 recommends.</li>
+</ul>
 <p><b>What changed in revision 6?</b></p>
 <ul>
 <li><b>The prototype ran</b> (2 Oct). The results table and Figure 1 replace revision 5's expectations. The confirmation tickets ran on Flash-Next only, the combination that passed #1913.</li>
@@ -859,7 +950,6 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 <p><b>What if Claude Code changes its request format and the model server lags?</b> Claude Code updates itself. A breaking change shows up as local agents failing their first turn. Re-running prototype ticket #1913 on any Claude Code or LM Studio upgrade catches it. If it recurs, the opencode fallback removes the dependency.</p>
 <p><b>Does this work on a second machine?</b> Not in this design. The host is <code>127.0.0.1</code>, and the memory logic reads this Mac's memory.</p>
 <p><b>Why keep provider <code>claude</code> instead of adding <code>claude-local</code>?</b> A new provider string would have to be added to every one of the ~25 files that branch on provider (B), for no behavioural difference. The host field touches only the sites that genuinely differ.</p>
-
 
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
      The block is self-contained and appended to every memo that uses the house tokens;
