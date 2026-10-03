@@ -1549,71 +1549,85 @@ impl TmuxRuntime {
         }
     }
 
-    /// Type the brief, wait until Claude's pane shows it as the live composer
-    /// draft, and only then submit it.
+    /// Type the brief, wait until its text appears in Claude's composer, hold a
+    /// separation, then confirm the composer still holds it and submit.
     ///
-    /// Both conditions below were measured against Claude Code 2.1.285 in
-    /// detached tmux while diagnosing the September 30 spawn failures: typing on
-    /// the first frame that looks like an empty composer and submitting 330 ms
-    /// later left the brief sitting in the composer with no transcript turn,
-    /// while the same keystrokes accepted 8 times out of 8 once sm waited for
-    /// the draft and then held at least 1.5 s before Enter.
+    /// Measured against Claude Code 2.1.280 and 2.1.285 in detached tmux:
+    /// typing on the first frame that looks like an empty composer and
+    /// submitting 330 ms later left the brief sitting in the composer with no
+    /// transcript turn, while waiting for the draft and holding at least 1.5 s
+    /// before Enter submitted 12 times out of 12.
     ///
-    /// The read-merge explanation for the separation is inferred, not proven --
-    /// the harness had no reachable model, so a stalled provider connection may
-    /// have contributed. It is also the same failure class that makes the
-    /// 512-byte chunking in `split_send_text_chunks` necessary. What is proven
-    /// is the shape of the fix: an Enter sent into a composer that still reads
-    /// as untouched cannot produce a submission, so the wait both spaces the
-    /// keystrokes and turns a 30-second stall into an honest failure.
+    /// The confirmation after the separation is not decoration. That gap is
+    /// long enough for someone to attach to the pane and clear or retype the
+    /// composer, and an Enter sent into whatever replaced the brief runs the
+    /// wrong thing. The read-merge explanation for the separation itself stays
+    /// inferred: the harness had no reachable model, so a stalled provider
+    /// connection may have contributed. What is proven is only that an Enter
+    /// sent into a composer that still reads as untouched cannot produce a
+    /// submission, and that this shape turns a 30-second stall into an honest
+    /// failure.
     fn submit_claude_initial_brief(
         &self,
         tmux_session: &str,
         ready_pane: &str,
         prompt: &str,
     ) -> Result<()> {
+        let probe = claude_brief_draft_probe(prompt);
+        // The composer is read before the keystrokes so that text already on
+        // the screen cannot be mistaken for the drafted brief.
+        let ready_block = claude_composer_block(ready_pane);
         self.send_text(tmux_session, prompt)?;
-        if !self.wait_for_claude_brief_draft(tmux_session, ready_pane, prompt) {
+        if !self.wait_for_claude_brief_draft(tmux_session, &probe, ready_block.as_deref()) {
             return Err(InitialBriefDeliveryError::ProviderDraftNotAccepted {
                 provider: "claude".to_owned(),
             }
             .into());
         }
         thread::sleep(self.initial_brief_submit_gap);
+        // That separation is long enough for someone to attach and clear or
+        // retype the composer, so both halves of the proof are taken again
+        // here. Submitting on a stale proof could run whatever replaced the
+        // brief, which is the outcome the probe exists to prevent.
+        if self.session_has_attached_clients(tmux_session)? {
+            bail!(
+                "refusing to submit the initial Claude spawn brief while a tmux client is attached"
+            );
+        }
+        if !self.claude_brief_draft_is_current(tmux_session, &probe, ready_block.as_deref()) {
+            return Err(InitialBriefDeliveryError::ProviderDraftNotAccepted {
+                provider: "claude".to_owned(),
+            }
+            .into());
+        }
         self.send_key(tmux_session, "Enter")
     }
 
-    /// True once the pane shows the tail of the brief somewhere it did not
-    /// appear before the brief was typed.
-    ///
-    /// Being newly present is the whole content of the proof. Claude's idle pane
-    /// already carries model, path and footer text, so a brief short enough to
-    /// collide with it -- one letter, or a word from `auto mode on (shift+tab to
-    /// cycle)` -- would otherwise match chrome that has nothing to do with the
-    /// draft, and an unrelated repaint would supply the "the pane changed" half.
-    /// A draft Claude collapses into a `[Pasted text]` placeholder does not
-    /// match either, which is intended: that placeholder is dropped when
-    /// submitted on an idle session.
-    ///
-    /// Whitespace is removed from both sides because Claude wraps a long draft
-    /// across pane rows and pads the composer.
+    /// True while the composer holds the brief: it was not there before the
+    /// keystrokes and it is there now. See `claude_brief_draft_in_composer`.
+    fn claude_brief_draft_is_current(
+        &self,
+        tmux_session: &str,
+        probe: &str,
+        ready_block: Option<&str>,
+    ) -> bool {
+        self.capture_pane_text(tmux_session)
+            .is_some_and(|pane| claude_brief_draft_in_composer(&pane, ready_block, probe))
+    }
+
+    /// Wait for the composer to hold the brief, up to the readiness window.
     fn wait_for_claude_brief_draft(
         &self,
         tmux_session: &str,
-        ready_pane: &str,
-        prompt: &str,
+        probe: &str,
+        ready_block: Option<&str>,
     ) -> bool {
-        let probe = claude_brief_draft_probe(prompt);
-        let ready_compact = claude_compact_pane_text(ready_pane);
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         loop {
             if !self.session_exists(tmux_session).unwrap_or(false) {
                 return false;
             }
-            if self
-                .capture_pane_text(tmux_session)
-                .is_some_and(|pane| claude_brief_draft_newly_visible(&pane, &ready_compact, &probe))
-            {
+            if self.claude_brief_draft_is_current(tmux_session, probe, ready_block) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -2158,12 +2172,47 @@ fn claude_compact_pane_text(text: &str) -> String {
         .collect()
 }
 
-/// True when `probe` appears in the pane but did not appear in the composer
-/// snapshot taken before the brief was typed.
-fn claude_brief_draft_newly_visible(pane: &str, ready_compact: &str, probe: &str) -> bool {
-    !probe.is_empty()
-        && !ready_compact.contains(probe)
-        && claude_compact_pane_text(pane).contains(probe)
+/// The rows Claude reserves for its live input line: everything between the
+/// last two chrome dividers.
+///
+/// Captured panes from Claude Code 2.1.280 and 2.1.285 draw one divider above
+/// the composer and one below it, and a draft that wraps keeps the prompt glyph
+/// on the first row only, so the whole block has to be read rather than one
+/// row. `None` means the pane has no divider pair to locate the composer in.
+fn claude_composer_block(pane: &str) -> Option<String> {
+    let lines = pane.lines().collect::<Vec<_>>();
+    let dividers = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| claude_composer_footer_divider(line.trim()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let above = *dividers.get(dividers.len().checked_sub(2)?)?;
+    let below = *dividers.last()?;
+    Some(claude_compact_pane_text(&lines[above + 1..below].join("")))
+}
+
+/// True when the composer block holds `probe` now and did not hold it before
+/// the brief was typed.
+///
+/// Both halves matter. Only "not there before" separates a drafted brief from
+/// Claude's own chrome text, which a short brief collides with -- `a` and
+/// `auto` are already on an idle screen. Only "inside the composer" separates
+/// it from a footer or header repaint, which is the other half of what a
+/// submission-eager read can mistake for a draft.
+///
+/// A pane whose composer cannot be located falls back to the previous
+/// behaviour of submitting after the separation. That is deliberate: a layout
+/// this code has never seen gives no evidence either way, and refusing to act
+/// on it would stop every Claude spawn rather than just the unreadable one.
+fn claude_brief_draft_in_composer(pane: &str, ready_block: Option<&str>, probe: &str) -> bool {
+    if probe.is_empty() {
+        return false;
+    }
+    match (claude_composer_block(pane), ready_block) {
+        (None, _) | (Some(_), None) => true,
+        (Some(block), Some(ready)) => block != ready && block.contains(probe),
+    }
 }
 
 /// Claude renders a status/footer block below its live composer. Looking only
@@ -3470,24 +3519,41 @@ esac
 
     /// A tmux stand-in that reports `idle_pane` until the brief has been typed
     /// and `typed_pane` afterwards, which is how a test controls whether Claude
-    /// received the keystrokes. `transcript` is the provider transcript the fake
-    /// appends a user turn to when it is asked to press Enter; without it the
-    /// submission is never acknowledged.
+    /// received the keystrokes. `transcript` is a place to append an accepted
+    /// user turn when it is asked to press Enter, and the brief that turn
+    /// carries; without it the submission is never acknowledged.
+    /// `attach_after_typing` makes the pane report a watching client from the
+    /// moment the brief has been typed, which is how a test covers the wait a
+    /// human could interfere with.
     fn fake_claude_pane_tmux_binary(
         idle_pane: &str,
         typed_pane: &str,
-        transcript: Option<&Path>,
+        transcript: Option<(&Path, &str)>,
+        attach_after_typing: bool,
     ) -> (PathBuf, PathBuf, PathBuf) {
         let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
         fs::write(temp_dir.join("idle-pane"), idle_pane).unwrap();
         fs::write(temp_dir.join("typed-pane"), typed_pane).unwrap();
-        let acknowledged_turn = transcript.map_or_else(String::new, |path| {
+        let acknowledged_turn = transcript.map_or_else(String::new, |(path, brief)| {
+            let turn = serde_json::json!({
+                "type": "user",
+                "sessionId": CLAUDE_TEST_PROVIDER_SESSION_ID,
+                "message": {"content": brief},
+            })
+            .to_string();
             format!(
-                "  case \"$*\" in *' -t sm-test Enter'*) printf '%s\\n' '{}' >> \"{}\" ;; esac\n",
-                CLAUDE_ACCEPTED_BRIEF_TURN,
+                "  case \"$*\" in *' -t sm-test Enter'*) printf '%s\\n' '{turn}' >> \"{}\" ;; esac\n",
                 path.display()
             )
         });
+        let watched = if attach_after_typing {
+            format!(
+                "  if grep -q -- '-l --' \"{}\"; then echo observer; fi\n",
+                log_path.display()
+            )
+        } else {
+            String::new()
+        };
         fs::write(
             &tmux_binary,
             format!(
@@ -3495,6 +3561,9 @@ esac
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "-L" ]; then
   shift 2
+fi
+if [ "$1" = "list-clients" ]; then
+{watched}  exit 0
 fi
 if [ "$1" = "capture-pane" ]; then
   if grep -q -- '-l --' "{log}"; then
@@ -3515,6 +3584,7 @@ exit 0
 "#,
                 log = log_path.display(),
                 temp = temp_dir.display(),
+                watched = watched,
                 acknowledged_turn = acknowledged_turn,
             ),
         )
@@ -3522,22 +3592,36 @@ exit 0
         (tmux_binary, log_path, temp_dir)
     }
 
-    const CLAUDE_ACCEPTED_BRIEF_TURN: &str = r#"{"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","message":{"content":"Probe: reply ok, then run sm task-complete."}}"#;
+    const CLAUDE_TEST_PROVIDER_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
-    /// An idle Claude Code composer captured at the live cursor: an empty
-    /// prompt row above the chrome divider and the model/footer block.
-    fn claude_idle_pane() -> String {
+    /// The composer block as Claude Code draws it: one divider above the prompt
+    /// rows and one below them, then the model and mode footer. Taken from
+    /// captured 2.1.280 and 2.1.285 panes, where a wrapped draft keeps the
+    /// prompt glyph on its first row only.
+    fn claude_pane_with_composer(composer: &str) -> String {
         let divider = "─".repeat(40);
         format!(
-            "\n{divider}\n❯\n{divider}\n  Sonnet 5.5\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
+            "\n{divider}\n{composer}\n{divider}\n  Sonnet 5.5\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
         )
     }
 
+    fn claude_idle_pane() -> String {
+        claude_pane_with_composer("❯")
+    }
+
     fn claude_draft_pane(draft: &str) -> String {
-        let divider = "─".repeat(40);
-        format!(
-            "\n❯ {draft}\n\n{divider}\n  Sonnet 5.5\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n"
-        )
+        claude_pane_with_composer(&format!("❯ {draft}"))
+    }
+
+    /// Where Claude would keep this session's transcript, so a test can put a
+    /// fake one exactly where the runtime looks for it.
+    fn claude_brief_transcript_path(transcript_root: &PathBuf, working_dir: &Path) -> PathBuf {
+        claude_transcript_candidates(
+            std::slice::from_ref(transcript_root),
+            working_dir.to_str().unwrap(),
+            CLAUDE_TEST_PROVIDER_SESSION_ID,
+        )[0]
+        .clone()
     }
 
     fn claude_brief_delivery_runtime(tmux_binary: PathBuf, transcript_root: &Path) -> TmuxRuntime {
@@ -3562,7 +3646,7 @@ exit 0
             provider: "claude".to_owned(),
             initial_message: None,
             force_initial_prompt_stdin: true,
-            claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_owned()),
+            claude_session_id: Some(CLAUDE_TEST_PROVIDER_SESSION_ID.to_owned()),
             model: None,
             reasoning_effort: None,
         }
@@ -3571,7 +3655,8 @@ exit 0
     #[test]
     fn claude_spawn_brief_is_not_submitted_while_the_composer_stays_untouched() {
         let pane = claude_idle_pane();
-        let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(&pane, &pane, None);
+        let (tmux_binary, log_path, _temp_dir) =
+            fake_claude_pane_tmux_binary(&pane, &pane, None, false);
         let working_dir = tempfile_path("claude-draft-gate-work");
         fs::create_dir_all(&working_dir).unwrap();
         let transcript_root = tempfile_path("claude-draft-gate-root");
@@ -3601,18 +3686,20 @@ exit 0
         );
     }
 
-    /// A brief this short is already on screen before anything is typed: `a`
-    /// appears in Claude's footer chrome, so seeing it proves nothing, and a
-    /// repaint of that chrome is not a landed draft.
+    /// A chrome repaint must not read as a landed draft. The prompt row is
+    /// untouched here, so there is nothing for Enter to submit.
     #[test]
-    fn claude_spawn_brief_is_not_submitted_on_a_repaint_that_only_repeats_chrome() {
+    fn claude_spawn_brief_is_not_submitted_on_a_repaint_outside_the_composer() {
         let idle = claude_idle_pane();
-        // The model line changed and nothing else: no draft, no composer change.
         let repainted = idle.replace("Sonnet 5.5", "Sonnet 4.5");
         assert_ne!(idle, repainted);
-        assert!(claude_compact_pane_text(&idle).contains("a"));
+        assert_eq!(
+            claude_composer_block(&idle),
+            claude_composer_block(&repainted),
+            "the fixture must repaint chrome, not the composer"
+        );
         let (tmux_binary, log_path, _temp_dir) =
-            fake_claude_pane_tmux_binary(&idle, &repainted, None);
+            fake_claude_pane_tmux_binary(&idle, &repainted, None, false);
         let working_dir = tempfile_path("claude-draft-repaint-work");
         fs::create_dir_all(&working_dir).unwrap();
         let transcript_root = tempfile_path("claude-draft-repaint-root");
@@ -3621,7 +3708,7 @@ exit 0
         let spec = claude_brief_spec(&working_dir);
 
         let error = runtime
-            .deliver_verified_initial_brief(&spec, "a")
+            .deliver_verified_initial_brief(&spec, "Probe: reply ok, then run sm task-complete.")
             .unwrap_err();
 
         assert!(
@@ -3632,31 +3719,95 @@ exit 0
             "unexpected delivery failure: {error:#}"
         );
         let log = fs::read_to_string(log_path).unwrap();
-        assert!(log.contains("send-keys -t sm-test -l -- a"));
         assert!(
             !log.contains("send-keys -t sm-test Enter"),
-            "a repaint of chrome text must not be read as a landed draft:\n{log}"
+            "a repaint outside the composer is not a landed draft:\n{log}"
         );
     }
 
+    /// The brief does not have to be long to be provable: one character typed
+    /// into the prompt row changes that row, which is what the proof reads.
     #[test]
-    fn claude_spawn_brief_is_submitted_once_the_composer_shows_the_draft() {
+    fn claude_spawn_brief_shorter_than_its_footer_text_is_still_submitted() {
+        let draft = "a";
+        let working_dir = tempfile_path("claude-draft-short-work");
+        fs::create_dir_all(&working_dir).unwrap();
+        let transcript_root = tempfile_path("claude-draft-short-root");
+        fs::create_dir_all(&transcript_root).unwrap();
+        let transcript = claude_brief_transcript_path(&transcript_root, &working_dir);
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(
+            &claude_idle_pane(),
+            &claude_draft_pane(draft),
+            Some((&transcript, draft)),
+            false,
+        );
+        let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
+        let spec = claude_brief_spec(&working_dir);
+
+        runtime
+            .deliver_verified_initial_brief(&spec, draft)
+            .unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(
+            log.trim_end().ends_with("send-keys -t sm-test Enter"),
+            "a brief the composer is holding should still be submitted:\n{log}"
+        );
+    }
+
+    /// The separation after the draft is long enough for someone to attach and
+    /// clear or retype the composer, so both the watcher and the draft are
+    /// confirmed again immediately before Enter.
+    #[test]
+    fn claude_spawn_brief_is_not_submitted_once_a_client_starts_watching() {
+        let brief = "Probe: reply ok, then run sm task-complete.";
+        let working_dir = tempfile_path("claude-draft-attach-work");
+        fs::create_dir_all(&working_dir).unwrap();
+        let transcript_root = tempfile_path("claude-draft-attach-root");
+        fs::create_dir_all(&transcript_root).unwrap();
+        let transcript = claude_brief_transcript_path(&transcript_root, &working_dir);
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(
+            &claude_idle_pane(),
+            &claude_draft_pane(brief),
+            Some((&transcript, brief)),
+            true,
+        );
+        let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
+        let spec = claude_brief_spec(&working_dir);
+
+        let error = runtime
+            .deliver_verified_initial_brief(&spec, brief)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("a tmux client is attached"),
+            "unexpected delivery failure: {error:#}"
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(
+            !log.contains("send-keys -t sm-test Enter"),
+            "an observed pane must not be submitted into:\n{log}"
+        );
+    }
+
+    /// The full submit path: type, prove the draft, read the composer back one
+    /// more time, then press Enter exactly once.
+    #[test]
+    fn claude_initial_brief_is_submitted_once_after_the_draft_is_read_back() {
         let draft = "Probe: reply ok, then run sm task-complete.";
         let working_dir = tempfile_path("claude-draft-submit-work");
         fs::create_dir_all(&working_dir).unwrap();
         let transcript_root = tempfile_path("claude-draft-submit-root");
         fs::create_dir_all(&transcript_root).unwrap();
-        let transcript = claude_transcript_candidates(
-            std::slice::from_ref(&transcript_root),
-            working_dir.to_str().unwrap(),
-            "11111111-1111-4111-8111-111111111111",
-        )[0]
-        .clone();
+        let transcript = claude_brief_transcript_path(&transcript_root, &working_dir);
         fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         let (tmux_binary, log_path, _temp_dir) = fake_claude_pane_tmux_binary(
             &claude_idle_pane(),
             &claude_draft_pane(draft),
-            Some(&transcript),
+            Some((&transcript, draft)),
+            false,
         );
         let runtime = claude_brief_delivery_runtime(tmux_binary, &transcript_root);
         let spec = claude_brief_spec(&working_dir);
