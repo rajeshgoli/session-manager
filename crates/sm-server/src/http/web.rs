@@ -254,13 +254,22 @@ mod tests {
 
     #[test]
     fn own_javascript_stays_under_the_size_budget() {
-        let own: usize = ASSETS
+        let assets: Vec<_> = ASSETS
             .iter()
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
-            .map(|asset| asset.body.len())
-            .sum();
-        // The separate source assets include the work-thread Ask column and Notes editor.
-        assert!(own <= 320 * 1024, "own JS is {own} bytes");
+            .collect();
+        let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
+        // Raw source bytes, excluding vendors. Board operations and shared launch
+        // setup (#1949) bring the app to 336,872 bytes; 336 KiB leaves ~2% headroom.
+        const BUDGET: usize = 336 * 1024;
+        assert!(
+            own <= BUDGET,
+            "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",
+            assets
+                .iter()
+                .map(|asset| (asset.name, asset.body.len()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
