@@ -1,0 +1,65 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (target/debug/deps/sm_server-4cece1a226abaa8e)
+
+running 1 test
+test queue::tests::queue_job_does_not_inherit_handed_over_listeners ... FAILED
+
+failures:
+
+---- queue::tests::queue_job_does_not_inherit_handed_over_listeners stdout ----
+
+thread 'queue::tests::queue_job_does_not_inherit_handed_over_listeners' (192762255) panicked at crates/sm-server/src/queue.rs:10236:17:
+inherited 127.0.0.1:50257: p83394
+fcwd
+n/private/tmp
+ftxt
+n/bin/zsh
+ftxt
+n/usr/lib/dyld
+f0
+n/dev/null
+f1
+n/private/var/folders/qg/3bf6xx9s211_ltp6n_ht47780000gn/T/sm-rust-queue-handover-inheritance-83393-0/logs/job_04c324f5424f.log
+f2
+n/private/var/folders/qg/3bf6xx9s211_ltp6n_ht47780000gn/T/sm-rust-queue-handover-inheritance-83393-0/logs/job_04c324f5424f.log
+f10
+n/private/var/folders/qg/3bf6xx9s211_ltp6n_ht47780000gn/T/sm-rust-queue-handover-inheritance-83393-0/job_04c324f5424f/run.zsh
+f12
+n127.0.0.1:50257
+f13
+n/tmp/sm-1913-job_04c324f5424f/authority.sock
+f14
+n/tmp/sm-1913-job_04c324f5424f/handover.sock
+p83395
+fcwd
+n/private/tmp
+ftxt
+n/bin/zsh
+ftxt
+n/usr/lib/dyld
+f0
+n/dev/null
+f1
+n/private/var/folders/qg/3bf6xx9s211_ltp6n_ht47780000gn/T/sm-rust-queue-handover-inheritance-83393-0/logs/job_04c324f5424f.log
+f2
+n/private/var/folders/qg/3bf6xx9s211_ltp6n_ht47780000gn/T/sm-rust-queue-handover-inheritance-83393-0/logs/job_04c324f5424f.log
+f10
+n/dev/null
+f12
+n127.0.0.1:50257
+f13
+n/tmp/sm-1913-job_04c324f5424f/authority.sock
+f14
+n/tmp/sm-1913-job_04c324f5424f/handover.sock
+stdout-ok
+stderr-ok
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    queue::tests::queue_job_does_not_inherit_handed_over_listeners
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1183 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p sm-server --lib`

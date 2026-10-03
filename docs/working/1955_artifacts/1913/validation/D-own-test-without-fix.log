@@ -1,0 +1,24 @@
+   Compiling sm-server v0.1.0 (/Users/rajesh/worktrees/sm-1955-opencode-1913/crates/sm-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.26s
+     Running unittests src/lib.rs (target/debug/deps/sm_server-4cece1a226abaa8e)
+
+running 1 test
+test queue::tests::queue_job_child_inherits_nothing_above_standard_descriptors ... FAILED
+
+failures:
+
+---- queue::tests::queue_job_child_inherits_nothing_above_standard_descriptors stdout ----
+
+thread 'queue::tests::queue_job_child_inherits_nothing_above_standard_descriptors' (192762214) panicked at crates/sm-server/src/queue.rs:10900:9:
+queue job child inherited descriptor 200:
+inherited: production-listener
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    queue::tests::queue_job_child_inherits_nothing_above_standard_descriptors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1183 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p sm-server --lib`

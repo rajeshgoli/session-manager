@@ -1,0 +1,22 @@
+   Compiling sm-server v0.1.0 (/Users/rajesh/worktrees/sm-1955-opencode-1855/crates/sm-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.87s
+     Running unittests src/bin/sm.rs (target/debug/deps/sm-ff671c28c22b6815)
+
+running 1 test
+test tests::request_codex_review_is_a_hidden_alias_of_request_review ... FAILED
+
+failures:
+
+---- tests::request_codex_review_is_a_hidden_alias_of_request_review stdout ----
+
+thread 'tests::request_codex_review_is_a_hidden_alias_of_request_review' (192764895) panicked at crates/sm-server/src/bin/sm.rs:7420:10:
+request-codex-review should parse as a hidden alias of request-review: ErrorInner { kind: InvalidSubcommand, context: FlatMap { keys: [InvalidSubcommand, SuggestedSubcommand, Suggested, Usage], values: [String("request-codex-review"), Strings(["roster", "request-review"]), StyledStrs([]), StyledStr(StyledStr("\u{1b}[1m\u{1b}[4mUsage:\u{1b}[0m \u{1b}[1msm\u{1b}[0m [OPTIONS] <COMMAND>"))] }, message: None, source: None, help_flag: Some("--help"), styles: Styles { header: Style { fg: None, bg: None, underline: None, effects: Effects(BOLD | UNDERLINE) }, error: Style { fg: Some(Ansi(Red)), bg: None, underline: None, effects: Effects(BOLD) }, usage: Style { fg: None, bg: None, underline: None, effects: Effects(BOLD | UNDERLINE) }, literal: Style { fg: None, bg: None, underline: None, effects: Effects(BOLD) }, placeholder: Style { fg: None, bg: None, underline: None, effects: Effects() }, valid: Style { fg: Some(Ansi(Green)), bg: None, underline: None, effects: Effects() }, invalid: Style { fg: Some(Ansi(Yellow)), bg: None, underline: None, effects: Effects() }, context: Style { fg: None, bg: None, underline: None, effects: Effects() }, context_value: None }, color_when: Auto, color_help_when: Auto, backtrace: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::request_codex_review_is_a_hidden_alias_of_request_review
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 176 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p sm-server --bin sm`
