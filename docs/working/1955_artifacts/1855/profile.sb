@@ -1,0 +1,26 @@
+(version 1)
+(allow default)
+
+(deny file-write*)
+(allow file-write*
+  (subpath "/Users/rajesh/worktrees/sm-1955-opencode-1855")
+  (subpath "/Users/rajesh/.local/share/local-agents-proto/kit/runs/flash-opencode-1855")
+  (subpath "/private/tmp/sm-1955/1855/runtime")
+  (subpath "/private/private/tmp/sm-1955/1855/runtime")
+  (subpath "/private/tmp/claude-501/-Users-rajesh-worktrees-sm-1784-proto-flash-opencode-1855")
+  (subpath "/Users/rajesh/.cargo")
+  (subpath "/Users/rajesh/.local/share/opencode") (subpath "/Users/rajesh/.cache/opencode") (subpath "/Users/rajesh/.config/opencode")
+  (subpath "/dev"))
+
+(deny file-read*
+  (subpath "/Users/rajesh/.ssh") (subpath "/Users/rajesh/.claude") (subpath "/Users/rajesh/.codex") (subpath "/Users/rajesh/.config/gh")
+  (subpath "/Users/rajesh/.config/session-manager") (subpath "/Users/rajesh/Library/Keychains") (subpath "/Users/rajesh/.aws")
+  (literal "/Users/rajesh/.claude.json") (literal "/Users/rajesh/.netrc"))
+
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*") (remote unix-socket))
+(deny network-outbound (remote ip "localhost:8420"))
+(deny network-outbound
+  (remote unix-socket (path-literal "/private/tmp/tmux-501/session-manager"))
+  (remote unix-socket (path-literal "/private/tmp/tmux-501/default"))
+  (remote unix-socket (subpath "/Users/rajesh/.local/share/claude-sessions")))

@@ -1,0 +1,36 @@
+[
+  {
+    "ticket": 1855,
+    "merged_commit": "2100e916ec4df495c8c31a9c216a9692e64bf4db",
+    "start_commit": "4a3a060d6c37b1ae03a7969c73098c811050f54a",
+    "checkout": "/Users/rajesh/worktrees/sm-1955-opencode-1855",
+    "baseline_brief_sha256": "5f8a659b7c3a086a1a849e8567607d5aeaf03e537e1c4f988a5a0e6ab1c424cc",
+    "claude_active_minutes": 12,
+    "claude_verdict": "mergeable as-is",
+    "run_state": "completed and independently graded",
+    "local_commit": "19dad75078286997f29fc8f4314ffaaab501abe6",
+    "result": {
+      "ticket": 1855,
+      "start": 1791046479.4783092,
+      "end": 1791046794.4232068,
+      "exit_code": 0
+    }
+  },
+  {
+    "ticket": 1913,
+    "merged_commit": "14ea14c93602af0b6c8064589c41533604364ca7",
+    "start_commit": "0d3211e3fdb18bff2aa26ea04fe3297c1b8c8428",
+    "checkout": "/Users/rajesh/worktrees/sm-1955-opencode-1913",
+    "baseline_brief_sha256": "a36bb094419176070bb4e947b8281f0a222b8a6b65e86b4611643b325ebf4d55",
+    "claude_active_minutes": 32,
+    "claude_verdict": "small changes",
+    "run_state": "completed and independently graded",
+    "local_commit": "c8b1d623cd0785450897d214d0709bd14f2685bb",
+    "result": {
+      "ticket": 1913,
+      "start": 1791045574.741471,
+      "end": 1791046478.3077419,
+      "exit_code": 0
+    }
+  }
+]

@@ -1,0 +1,14 @@
+{
+  "source": "sm-1961 (ed61f79b), PR #1963, memo revision 8 appendix L.6",
+  "owner_decision": "pending",
+  "environment": {"MTPLX_SESSION_BANK_MAX_BYTES": "16G"},
+  "serve_arguments": ["serve", "--model", "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed", "--profile", "turbo", "--host", "127.0.0.1", "--port", "8000", "--context-window", "200000", "--max-active-requests", "2", "--batching-preset", "agent", "--yes"],
+  "agents_at_once": 1,
+  "stop_arguments": ["stop", "--port", "8000"],
+  "shutdown_rule": "Graceful stop only; never kill MTPLX. Stop takes about 30 seconds and saves conversation state.",
+  "queue_type": "background",
+  "memory_precheck_available_gb": 180,
+  "memory_abort_available_gb": 32.6,
+  "scheduling_note": "MTPLX serves one request at a time; judge calls wait behind an agent request.",
+  "remaining_prerequisite": "#1954 shared sandbox and a quiet window outside its runs"
+}
