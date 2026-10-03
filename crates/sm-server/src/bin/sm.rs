@@ -87,7 +87,8 @@ enum Command {
     ListDevices(ListDevicesArgs),
     #[command(name = "remove-device")]
     RemoveDevice(RemoveDeviceArgs),
-    #[command(name = "request-review")]
+    // Hidden alias for stale agent prompts. deprecated_command_message warns when it is used.
+    #[command(name = "request-review", alias = "request-codex-review")]
     RequestReview(RequestReviewArgs),
     /// Paired reviewers: return your review to sm
     Review(ReviewArgs),
@@ -853,10 +854,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let removed_command = concat!("request-codex-", "review");
-    if std::env::args().nth(1).as_deref() == Some(removed_command) {
-        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
-        process::exit(2);
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if let Some(notice) = deprecated_command_message(&command_tokens_after_globals(&args)) {
+        eprintln!("{notice}");
     }
     let cli = Cli::parse();
     let command = cli.command;
@@ -5607,6 +5607,16 @@ fn retired_command_message(command: &[&str]) -> Option<&'static str> {
     }
 }
 
+fn deprecated_command_message(command: &[&str]) -> Option<&'static str> {
+    match command {
+        ["request-codex-review", ..] => Some(
+            "deprecated: 'sm request-codex-review' is a hidden alias of 'sm request-review' \
+             and will be removed; use 'sm request-review <PR>' instead.",
+        ),
+        _ => None,
+    }
+}
+
 fn command_tokens_after_globals(args: &[String]) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -7406,6 +7416,53 @@ mod tests {
             panic!("expected cancel subcommand");
         };
         assert_eq!(request_id.as_deref(), Some("req456"));
+    }
+
+    #[test]
+    fn request_codex_review_name_is_a_hidden_deprecated_alias() {
+        use clap::CommandFactory;
+
+        // Stale agent instructions still say `sm request-codex-review`. The name has to
+        // register the review rather than die as an unrecognized subcommand, and say so.
+        let create_cli =
+            Cli::try_parse_from(["sm", "request-codex-review", "967", "--notify", "notify123"])
+                .expect("the deprecated name must still parse");
+        let Command::RequestReview(create_args) = create_cli.command else {
+            panic!("expected request-review command from the deprecated name");
+        };
+        assert_eq!(create_args.action_or_pr.as_deref(), Some("967"));
+        assert_eq!(create_args.notify.as_deref(), Some("notify123"));
+        assert!(create_args.command.is_none());
+
+        let list_cli =
+            Cli::try_parse_from(["sm", "request-codex-review", "list", "--json"]).unwrap();
+        let Command::RequestReview(list_args) = list_cli.command else {
+            panic!("expected request-review command from the deprecated name");
+        };
+        assert!(matches!(
+            list_args.command,
+            Some(RequestReviewCommand::List)
+        ));
+        assert!(list_args.json);
+
+        let notice = deprecated_command_message(&["request-codex-review", "967"]).unwrap();
+        assert!(notice.starts_with("deprecated:"));
+        assert!(notice.contains("sm request-review"));
+        assert_eq!(deprecated_command_message(&["request-review", "967"]), None);
+
+        // --api-url is global, so it must not hide the deprecated name from the notice.
+        let global_args = [
+            "--api-url".to_owned(),
+            "http://127.0.0.1:8420".to_owned(),
+            "request-codex-review".to_owned(),
+            "list".to_owned(),
+        ];
+        let global_command = command_tokens_after_globals(&global_args);
+        assert!(deprecated_command_message(&global_command).is_some());
+
+        // Hidden: the alias works but is not advertised in help.
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("request-codex-review"), "{help}");
     }
 
     #[test]
