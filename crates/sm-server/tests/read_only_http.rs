@@ -16748,16 +16748,27 @@ async fn runtime_core_spawn_brief_ack_timeout_is_recoverable_and_never_retries()
         false,
     );
 
-    let (status, payload) = post_json(
+    let (status, parent) = post_json(
         app.clone(),
         "/sessions",
+        json!({"id": "briefparent", "name": "brief-parent",
+            "working_dir": working_dir.display().to_string(), "provider": "codex-fork"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{parent}");
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
         json!({
             "id": "briefnoack",
             "name": "brief-no-ack",
             "working_dir": working_dir.display().to_string(),
             "provider": "codex-fork",
-            "initial_message": "ACK_TIMEOUT_SENTINEL",
-            "spawn_prompt_source": {"kind": "stdin"}
+            "parent_session_id": "briefparent",
+            "prompt": "ACK_TIMEOUT_SENTINEL",
+            "prompt_source": {"kind": "stdin"},
+            "ticket": 1964,
+            "ticket_repo": "acme/widgets"
         }),
     )
     .await;
@@ -16771,10 +16782,19 @@ async fn runtime_core_spawn_brief_ack_timeout_is_recoverable_and_never_retries()
     assert_eq!(payload["session_id"], "briefnoack");
     assert_eq!(payload["provider_session_id"], "initial-brief-thread");
     assert_eq!(payload["retry_safe"], false);
+    assert_eq!(payload["ticket_claim"]["claim"]["session_id"], "briefnoack");
+    let claims =
+        sm_server::work_claims::WorkClaimStore::new(queue_db_path_for_state_file(&state_file))
+            .claims_for_item("acme/widgets", 1964)
+            .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].session_id, "briefnoack");
+    assert!(claims[0].reserved_at.is_none());
+    assert!(claims[0].ended_at.is_none());
     let (status, session) = get_json(app.clone(), "/sessions/briefnoack").await;
     assert_eq!(status, StatusCode::OK, "{session}");
     // The original runtime remains reachable after the observation timeout.
-    wait_for_output_contains(app, "briefnoack", "received:ACK_TIMEOUT_SENTINEL").await;
+    wait_for_output_contains(app.clone(), "briefnoack", "received:ACK_TIMEOUT_SENTINEL").await;
 
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert!(state["sessions"]
@@ -16787,11 +16807,11 @@ async fn runtime_core_spawn_brief_ack_timeout_is_recoverable_and_never_retries()
         fs::read_to_string(intent["artifact"]["path"].as_str().unwrap()).unwrap(),
         "ACK_TIMEOUT_SENTINEL"
     );
-    let launch = &state["session_runtime_launches"][0];
+    let launch = &state["session_runtime_launches"][1];
     assert_eq!(launch["status"], "applied");
     assert_eq!(payload["brief_sha256"], intent["artifact"]["sha256"]);
     let logs = fs::read_to_string(
-        state["session_runtime_launches"][0]["log_file"]
+        state["session_runtime_launches"][1]["log_file"]
             .as_str()
             .unwrap(),
     )
@@ -21397,6 +21417,39 @@ PYTHON
     }))
 }
 
+struct InitialBriefTicketSource;
+
+impl sm_server::work_claims::WorkItemSource for InitialBriefTicketSource {
+    fn fetch(
+        &self,
+        repo: &str,
+        numbers: &[i64],
+    ) -> Result<sm_server::work_claims::BatchFetch, String> {
+        use sm_server::work_claims::{GhItem, ItemFetch, WorkKind};
+        Ok(numbers
+            .iter()
+            .map(|number| {
+                (
+                    *number,
+                    ItemFetch::Found(Box::new(GhItem {
+                        is_draft: false,
+                        kind: WorkKind::Ticket,
+                        title: format!("Ticket {number}"),
+                        state: "open".to_owned(),
+                        state_reason: None,
+                        url: format!("https://github.com/{repo}/issues/{number}"),
+                        head_ref: None,
+                        head_sha: None,
+                        closed_at: None,
+                        merged_at: None,
+                        closing_refs: None,
+                    })),
+                )
+            })
+            .collect())
+    }
+}
+
 fn runtime_app_with_codex_fork_initial_brief_provider(
     state_file: &Path,
     log_dir: &PathBuf,
@@ -21440,39 +21493,42 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
         fs::set_permissions(&provider, permissions).unwrap();
     }
     let runtime_command = r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; done' runtime-sh"#;
-    router(AppState::new(AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-            ..PathsConfig::default()
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db_path_for_state_file(state_file)
-                .display()
-                .to_string(),
-        },
-        codex_fork: CodexForkLaunchConfig {
-            command: provider.display().to_string(),
-            args: Vec::new(),
-            default_model: None,
-            event_schema_version: 2,
-            control_tmux_fallback_enabled: true,
-            create_startup_timeout_seconds: 60,
-        },
-        rust_core: RustCoreConfig {
-            runtime_enabled: true,
-            log_dir: Some(log_dir.display().to_string()),
-            tmux_socket_name: Some(tmux_socket.to_owned()),
-            runtime_command: Some(runtime_command.to_owned()),
-            runtime_prompt_mode: Some("stdin".to_owned()),
-            runtime_initial_brief_ready_timeout_ms: Some(2_000),
-            runtime_initial_brief_ack_timeout_ms: Some(300),
-            send_keys_settle_ms: Some(10.0),
-            send_keys_settle_max_ms: Some(50.0),
-            send_keys_max_chunk_chars: Some(128),
-            ..RustCoreConfig::default()
-        },
-        ..AppConfig::default()
-    }))
+    router(
+        AppState::new(AppConfig {
+            paths: PathsConfig {
+                state_file: state_file.display().to_string(),
+                ..PathsConfig::default()
+            },
+            sm_send: SmSendConfig {
+                db_path: queue_db_path_for_state_file(state_file)
+                    .display()
+                    .to_string(),
+            },
+            codex_fork: CodexForkLaunchConfig {
+                command: provider.display().to_string(),
+                args: Vec::new(),
+                default_model: None,
+                event_schema_version: 2,
+                control_tmux_fallback_enabled: true,
+                create_startup_timeout_seconds: 60,
+            },
+            rust_core: RustCoreConfig {
+                runtime_enabled: true,
+                log_dir: Some(log_dir.display().to_string()),
+                tmux_socket_name: Some(tmux_socket.to_owned()),
+                runtime_command: Some(runtime_command.to_owned()),
+                runtime_prompt_mode: Some("stdin".to_owned()),
+                runtime_initial_brief_ready_timeout_ms: Some(2_000),
+                runtime_initial_brief_ack_timeout_ms: Some(300),
+                send_keys_settle_ms: Some(10.0),
+                send_keys_settle_max_ms: Some(50.0),
+                send_keys_max_chunk_chars: Some(128),
+                ..RustCoreConfig::default()
+            },
+            ..AppConfig::default()
+        })
+        .with_work_item_source(std::sync::Arc::new(InitialBriefTicketSource)),
+    )
 }
 
 fn runtime_app_with_codex_composer(

@@ -4658,6 +4658,28 @@ async fn spawn_session(
         .await
     }
     .await;
+    // An unconfirmed initial turn still committed a live child. Complete
+    // its claim and notifications exactly as for a confirmed spawn, then
+    // return the observation warning to the caller.
+    let (created, mut acceptance_warning) = match created {
+        Err(error @ ApiError::StatusBody { .. }) => {
+            let retained_id = match &error {
+                ApiError::StatusBody { body, .. } if body["code"] == "spawn_acceptance_unknown" => {
+                    body["session_id"].as_str()
+                }
+                _ => None,
+            };
+            let retained = retained_id
+                .map(|id| state.session_store.get_session(id))
+                .transpose()?
+                .flatten();
+            match retained {
+                Some(child) => (Ok(child), Some(error)),
+                None => (Err(error), None),
+            }
+        }
+        result => (result, None),
+    };
     let ticket_claim = ticket_reservation
         .as_ref()
         .and_then(|reservation| claims::finish_spawn_ticket(&state, reservation, created.is_ok()));
@@ -4674,6 +4696,14 @@ async fn spawn_session(
     }
     if let Some(wait_seconds) = payload.wait {
         spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
+    }
+    if let Some(mut warning) = acceptance_warning.take() {
+        if let (ApiError::StatusBody { body, .. }, Some(ticket_claim)) =
+            (&mut warning, ticket_claim)
+        {
+            body["ticket_claim"] = ticket_claim;
+        }
+        return Err(warning);
     }
     let mut response = serde_json::to_value(SpawnSessionResponse::from(child))?;
     if let Some(ticket_claim) = ticket_claim {
