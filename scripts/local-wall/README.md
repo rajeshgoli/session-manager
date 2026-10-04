@@ -46,6 +46,12 @@ and credential files are unreadable. Do not allow writes to shared caches:
 poisoned dependency source could execute during a later host build. This replaces
 the prototype's writable `~/.cargo` grant to preserve the process boundary.
 
+Set `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` in the cleared launch
+environment. Host `.gitconfig` and `.config/git` are unreadable because they may
+hold credentials or authentication settings. Install the agent's Git identity
+in its checkout config and pass the proxy's credential helper through the
+host-controlled Git environment, rather than relying on host configuration.
+
 Generate the profile with host-owned values, for example:
 
 ```sh
@@ -90,7 +96,7 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Host Cargo home | No write; config and credentials unreadable |
 | Other agents' state, including future siblings | No read or write |
 | Own config, judge plugin, profile, launch files, server secret | Read; no write |
-| GitHub config, git credential store, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
+| GitHub config, both standard Git credential stores, host global Git config, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
 | Judge/proxy service-secret directories | No read or write |
 | sm logs outside protected state directories | Read |
 | Direct internet and DNS | No outbound connection |

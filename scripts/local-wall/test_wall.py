@@ -214,7 +214,8 @@ class WallTests(unittest.TestCase):
         for path in [self.state / p for p in ("server.secret", "launch-serve.sh", "xdg/config/sm_judge.js")]:
             path.write_text("fixture-immutable")
         for name in (".ssh/key", ".claude/settings.json", ".codex/auth.json", ".aws/credentials",
-                     ".config/session-manager/config.yaml", ".config/gh/hosts.yml", "Library/Keychains/key",
+                     ".config/session-manager/config.yaml", ".config/gh/hosts.yml", ".config/git/credentials",
+                     ".gitconfig", "Library/Keychains/key",
                      ".claude.json", ".netrc", ".git-credentials", ".cargo/credentials",
                      ".cargo/credentials.toml", ".cargo/config", ".cargo/config.toml"):
             target = self.home / name
@@ -231,6 +232,13 @@ class WallTests(unittest.TestCase):
         for target in [self.checkout, private_cargo, *[self.state / p for p in
                        ("xdg/data", "xdg/cache", "xdg/state")], Path(self.tmp)]:
             self.sandbox(f"open({str(target / 'write-test')!r}, 'w').write('ok')", True, f"write {target}")
+        self.sandbox("import os, subprocess; env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', "
+                     "GIT_CONFIG_NOSYSTEM='1'); "
+                     f"subprocess.run(['git', '-C', {str(self.checkout)!r}, 'init', '-q'], env=env, check=True); "
+                     f"subprocess.run(['git', '-C', {str(self.checkout)!r}, '-c', 'user.name=wall-fixture', "
+                     "'-c', 'user.email=wall-fixture@localhost', '-c', 'commit.gpgsign=false', "
+                     "'commit', '--allow-empty', '-qm', 'fixture'], env=env, check=True)", True,
+                     "Git work with host global config excluded")
         for target in (self.home / "bad", self.root / "bad", other / "bad", self.service / "bad"):
             self.sandbox(f"open({str(target)!r}, 'w').write('bad')", False, f"write {target}")
         host_cargo_binary = self.home / ".cargo/bin/cargo"

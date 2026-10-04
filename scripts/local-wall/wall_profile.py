@@ -162,7 +162,7 @@ def generate(args, listeners, minimum_tmp_length):
     lines.append("(allow file-write* " + " ".join(
         f"(subpath {quoted(p)})" for p in writable) + ")")
     denied_reads = [(home / p).resolve() for p in (
-        ".ssh", ".claude", ".codex", ".config/session-manager", ".config/gh",
+        ".ssh", ".claude", ".codex", ".config/session-manager", ".config/gh", ".config/git", ".gitconfig",
         "Library/Keychains", ".aws", ".claude.json", ".netrc", ".git-credentials",
         ".cargo/credentials", ".cargo/credentials.toml", ".cargo/config", ".cargo/config.toml",
     )] + services
