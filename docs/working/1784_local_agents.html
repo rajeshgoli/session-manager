@@ -107,7 +107,7 @@
 </style>
 
 <h1>1784 — Local models as sm agents</h1>
-<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), revision 7; Claude Opus 5.5 <code>sm-1961</code> (ed61f79b), 200K measurement; Codex <code>sm-1955</code> (d97b5130), opencode comparison; Claude Opus 5.5 <code>sm-1954</code> (d07c4e36), permissions readout and this revision · Tickets #1784, #1926, #1961, #1955, #1954 · revision 10, 2026-10-03</small></p>
+<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), revision 7; Claude Opus 5.5 <code>sm-1961</code> (ed61f79b), 200K measurement; Codex <code>sm-1955</code> (d97b5130), opencode comparison; Claude Opus 5.5 <code>sm-1954</code> (d07c4e36), permissions readout; Claude Opus 5.5 <code>sm-1971</code> (dc463a4b), blind re-grade and this revision · Tickets #1784, #1926, #1961, #1955, #1954, #1971 · revision 11, 2026-10-03</small></p>
 
 <h2>Memo</h2>
 
@@ -254,7 +254,17 @@
 </tbody>
 </table>
 
-<p><b>Why quality dropped, as far as one run per ticket shows.</b> The judge did not cause it: #1855 and #1892 had no denial. #1855 added a deprecation warning nobody asked for. #1913 fixed the same symptom the prototype fixed, but its new test fails outside the wall: the wall gave it a short temporary path, so a socket path macOS rejects elsewhere passed inside; #1956 gives agents a temporary path of normal length. #1892 reproduced the bug live this time, against a Claude Code with no model behind it, and fixed the wrong mechanism. The prototype’s grades were single runs too, by a different grader. One sample cannot separate these causes from run-to-run variance, which is why #1966 runs each ticket twice.</p>
+<p><b>Why quality dropped: the work got worse, not the grading.</b> Four fresh graders each saw the prototype’s and #1954’s diffs for one ticket side by side, unlabelled, with the same test evidence (#1971, appendix K.11). All four preferred the prototype’s diff, by 15 to 30 points of rescue effort. On #1855 they matched the original grades. On #1913 they were kinder to both runs, but the gap held.</p>
+<table>
+<thead><tr><th>Ticket, run</th><th>Original grade</th><th>Blind grader 1</th><th>Blind grader 2</th></tr></thead>
+<tbody>
+<tr><td>#1855 prototype</td><td>mergeable as-is, 0%</td><td>mergeable as-is, 5%</td><td>mergeable as-is, 0%</td></tr>
+<tr><td>#1855 #1954</td><td>small changes, 35%</td><td>small changes, 35%</td><td>small changes, 20%</td></tr>
+<tr><td>#1913 prototype</td><td>small changes, 65%</td><td>mergeable as-is, 35%</td><td>small changes, 40%</td></tr>
+<tr><td>#1913 #1954</td><td>large changes, 75%</td><td>small changes, 50%</td><td>large changes, 70%</td></tr>
+</tbody>
+</table>
+<p>Each cell is verdict, then rescue effort. What got worse is the same in every grade. On #1855, #1954 added a deprecation warning nobody asked for and tested parsing only; the prototype tested the real binary. On #1913 both runs made the same production fix, but #1954’s new test fails outside the wall: the wall gave it a short temporary path, so a socket path macOS rejects elsewhere passed inside. #1956 gives agents a temporary path of normal length. #1892 had no comparable prototype run; it reproduced the bug against a Claude Code with no model behind it and fixed the wrong mechanism. The judge did not cause the drop: #1855 and #1892 had no denial. The re-grade cannot say which remaining difference did: the wall, the brief, the 200K window, or run-to-run variance. #1966 runs each ticket twice inside the wall, which separates variance from the rest.</p>
 
 <h3>Why this is sm's job</h3>
 
@@ -389,6 +399,7 @@
 <h3>FAQ — what changed since revision 9</h3>
 <ul>
 <li><b>Permissions are measured</b> (#1954, 3 Oct): no prompts, no denial needing reversal, the adversarial set passed, half a second per judged action; quality graded worse on all three tickets. Questions 1–3 and 10 change; 11 and 12 are new; #1966 now runs inside this wall, twice per ticket.</li>
+<li><b>The quality drop is real</b> (#1971, revision 11): a blind re-grade preferred the prototype’s diff on both comparable tickets in all four grades, so the drop came from the work, not the grader. “Why quality dropped” changes; appendix K.11 is new.</li>
 </ul>
 
 <hr class="appendix-divider">
@@ -900,7 +911,7 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 <tr><td>#1892</td><td>wrong, 90%</td><td>3 of 11 spawn tests fail</td><td>The bug is Claude ignoring a named Enter after the brief is visible; the agent waits until the brief is visible and sends the same Enter. The merged fix sends a bracketed paste and a literal carriage return. Each review finding was handled correctly; the mechanism was never tested.</td></tr>
 </tbody>
 </table>
-<p>Evidence per run in <code>evidence/grade_evidence_&lt;ticket&gt;.log</code>: the agent’s tests, the module’s tests, the merged fix’s test on the agent’s change, fmt and clippy (clean on all three). The zsh step that copies the merged test file first failed on a <code>$M:c</code> modifier and was rerun; both results are in the log.</p>
+<p>Evidence per run in <code>evidence/grade_evidence_&lt;ticket&gt;.log</code>: the agent’s tests, the module’s tests, the merged fix’s test on the agent’s change, fmt and clippy (clean on all three). The zsh step that copies the merged test file first failed on a <code>$M:c</code> modifier and was rerun; both results are in the log. K.11 re-grades #1855 and #1913 blind, side by side with the prototype’s diffs.</p>
 
 <h4>K.9.5 Launch requirements for #1956</h4>
 <p>These are the observable behaviours #1956 builds and tests; each comes from a K.9.1 departure or a finding above.</p>
@@ -933,6 +944,34 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 </table>
 
 <p>The wall keeps the judge's load small: inside it an action can damage nothing outside the agent's checkout, so only actions that leave it need a ruling, mainly <code>git push</code>, <code>gh</code> and <code>sm</code>. The hook answers allow or deny itself, so no permission-skipping flag is needed; my own session's safety check refused to launch an agent with permissions skipped, even inside the wall. On Claude Code 2.1.285 a hook answer of allow skips the prompt for every tool, including compound commands, <code>$(…)</code>, <code>cd</code> out of the checkout and writes outside it (K.9.1), so the permission-skipping fallback is not needed.</p>
+
+<h4 id="k11">K.11 Blind re-grade (#1971, 3 Oct)</h4>
+<p><b>Conclusion: the work got worse.</b> One grader sees both runs' diffs for a ticket, unlabelled, with the same evidence. If the drop had come from grading, the blind grades would not separate the runs. They do: every grader preferred the prototype's diff, and every grader named the same defects in #1954's diffs that K.9.4 named.</p>
+<h4>K.11.1 Method</h4>
+<ul>
+<li><b>Tickets.</b> #1855 and #1913. #1892's two runs had different reproduction setups and are not comparable.</li>
+<li><b>Blind checkouts.</b> For each ticket and each run, a fresh <code>git clone --shared</code> at the start commit (<code>4a3a060d6c</code> for #1855, <code>0d3211e3fd</code> for #1913), with the run's diff applied and squashed into one commit by a neutral author (<code>author &lt;author@example.invalid&gt;</code>), one fixed date, the message “Change for #&lt;ticket&gt;”, on a branch named <code>work</code>. The origin remote, every other branch, every tag and the reflog are removed. The prototype side uses <code>grades/sm-1784-proto-flash-claude-&lt;ticket&gt;/local_fix.diff</code>; the #1954 side uses <code>git diff &lt;start&gt; HEAD</code> from <code>~/worktrees/sm-1954-&lt;ticket&gt;</code>, which had no uncommitted changes. Script: <code>1971_artifacts/setup.sh</code>.</li>
+<li><b>Coin flip.</b> <code>$RANDOM % 2</code> per ticket assigned the runs to <code>/private/tmp/regrade-&lt;ticket&gt;-A</code> and <code>-B</code>, recorded in <code>evidence/assignment.txt</code>, which no grader was pointed at. Both flips came out A = #1954, B = prototype.</li>
+<li><b>Evidence.</b> One <code>sm queue run --type tests</code> job ran <code>kit/grade_evidence.sh</code>'s steps A–D on all four checkouts: the change's own new tests, the changed module's tests (<code>--bin sm</code> for #1855, <code>queue::tests</code> for #1913), the merged fix's own test applied onto the change, then fmt and clippy. Script: <code>1971_artifacts/evidence.sh</code>; logs: <code>evidence/test_evidence_&lt;ticket&gt;_&lt;A|B&gt;.log</code>.</li>
+<li><b>Graders.</b> Four Codex graders (<code>gpt-5.6-terra</code>, high), spawned with <code>sm spawn codex-fork --working-dir /Users/rajesh/projects/session-manager --prompt-file &lt;brief&gt;</code>. Each answered H.5's questions 1–6 for A and for B, then “Which is closer to mergeable, and by how much?” The second grader per ticket saw the labels swapped: its packet's <code>checkout-A</code> is a symlink to the <code>-B</code> checkout, and its diffs and evidence logs are relabelled to match. The brief forbids reading <code>docs/working/</code>, <code>~/.local/share/local-agents-proto/</code>, other pull requests or issues, and other <code>/private/tmp</code> directories, and says not to build or run tests. No grader saw either run's PR or review history. Script: <code>1971_artifacts/briefs.sh</code>; one brief per ticket in <code>evidence/brief_&lt;ticket&gt;_g1.md</code>. Each grader replied with <code>sm send</code> and was retired.</li>
+</ul>
+<h4>K.11.2 Results</h4>
+<table>
+<thead><tr><th>Ticket, grader</th><th>Prototype</th><th>#1954</th><th>Which is closer</th><th>Grader's main points</th></tr></thead>
+<tbody>
+<tr><td>#1855, grader 1</td><td>mergeable as-is, 5%</td><td>small changes, 35%</td><td>prototype, by 30 points</td><td>Both remove the early rejection and add the alias. #1954 adds an unrequested deprecation warning and tests parsing only. The prototype's test runs the real binary for both names against a stub server.</td></tr>
+<tr><td>#1855, grader 2 (swapped)</td><td>mergeable as-is, 0%</td><td>small changes, 20%</td><td>prototype, by 20 points</td><td>The same, plus: #1954's warning promises a removal nobody decided and scans the arguments a second time.</td></tr>
+<tr><td>#1913, grader 1</td><td>mergeable as-is, 35%</td><td>small changes, 50%</td><td>prototype, by 15 points</td><td>Both close inherited descriptors before each queue job runs; the merged fix marks them close-on-exec when the handover receives them. #1954's queue test fails at the socket bind on a path longer than macOS allows. The prototype's test with inheritable pipes passes.</td></tr>
+<tr><td>#1913, grader 2 (swapped)</td><td>small changes, 40%</td><td>large changes, 70%</td><td>prototype, by 30 points</td><td>The same production design on both. #1954's module suite is red, it changes an HTTP test the ticket did not need, and its test waits a fixed 300 ms and leaks cleanup on panic.</td></tr>
+</tbody>
+</table>
+<p>The merged fix's test passed on all four changes; fmt and clippy were clean on all four. #1954's own #1913 queue test failed in both of its evidence runs, the original and this one. Absolute grades moved between graders by up to one verdict step and 30 points (the prototype's #1913 diff: small changes, 65% originally; mergeable or small changes, 35–40% blind), but the order never did.</p>
+<h4>K.11.3 Departures</h4>
+<ul>
+<li><b>One redaction left in place.</b> The prototype's #1913 diff cites <code>sm#1784</code> in two code comments. Both runs are #1784 local-agent work, so the tag does not say which run wrote it. Removing it would have changed the graded code, so the diffs stay byte-identical, and the brief forbids the memo and the grade folders instead.</li>
+<li><b>First evidence job discarded.</b> It shared one cargo target directory across the four checkouts. Cargo tracks a workspace member's source by absolute path and modification time, so checkout B's tests ran checkout A's binaries. The rerun builds each checkout in its own <code>target/</code>; only the rerun's logs were given to graders.</li>
+<li><b>Evidence ran on the blind copies</b>, not on <code>~/worktrees/sm-1954-*</code>, so the log paths and headers reveal nothing.</li>
+</ul>
 
 <h3 id="l">L. #1961: 200K measurement protocol</h3>
 <p>#1961 measures what a 200K-token context window costs on Flash-Next before any agent runs at it. It runs no agents and writes no sm code. It replays real Claude Code requests saved by the prototype, grown to about 190K tokens, so the server sees exactly the request shape an agent sends: each request is the previous one plus one more turn.</p>
