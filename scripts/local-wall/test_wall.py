@@ -148,6 +148,21 @@ class WallTests(unittest.TestCase):
         self.assertNotEqual(denied.returncode, 0)
         self.assertNotIn(secret, denied.stdout + denied.stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "host service fixture requires macOS")
+    def test_application_launch_broker_lookup_is_denied(self):
+        script = ("import ctypes, sys; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
+                  "port=ctypes.c_uint.in_dll(lib,'bootstrap_port').value; out=ctypes.c_uint(); "
+                  "rc=lib.bootstrap_look_up(port,b'com.apple.coreservices.launchservicesd',ctypes.byref(out)); "
+                  "print(rc); sys.exit(0 if rc == 0 else 1)")
+        control = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=15)
+        self.assertEqual(control.returncode, 0, f"host LaunchServices control failed: {control.stdout} {control.stderr}")
+        profile = self.state / "broker-wall.sb"
+        profile.write_text(wall.generate(self.args, set(), 65))
+        denied = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-c", script],
+                                capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertNotEqual(denied.stdout.strip(), "0")
+
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_actual_wall_files_network_and_future_successor(self):
         # Use ephemeral, unprivileged ports to avoid colliding with live services.

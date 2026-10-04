@@ -168,11 +168,10 @@ def generate(args, listeners, minimum_tmp_length):
     )] + services
     lines.append("(deny file-read* " + " ".join(
         f"(subpath {quoted(p)})" for p in denied_reads) + ")")
-    # File restrictions do not stop Security.framework from asking securityd
-    # to read an unlocked keychain on its behalf. Block both legacy and modern
-    # credential-service endpoints, including their per-function variants.
-    lines.append('(deny mach-lookup (global-name-regex '
-                 '#"^com[.]apple[.](SecurityServer|securityd)([.].*)?$"))')
+    # Host services run outside this process's wall. Do not let tools delegate
+    # keychain access, application launching or other privileged operations to
+    # them. IPC needed by local tools uses private Unix sockets or admitted TCP.
+    lines.extend(["(deny mach-lookup)", "(deny mach-register)", "(deny appleevent-send)"])
     # Negative filter protects siblings created AFTER this snapshot. An allow
     # for our directory alone would not override a denial of the entire root.
     # realpath() needs metadata on the root to resolve our own state. Listing

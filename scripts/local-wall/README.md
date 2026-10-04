@@ -103,7 +103,8 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Own sm gateway, egress proxy, model and judge | Loopback connection |
 | Private Unix sockets in own `tmp/` | Connection |
 | Every Unix socket outside own `tmp/`, including Docker, default tmux and sm-state sockets | No connection |
-| macOS SecurityServer/securityd service family | No Mach lookup (keychain queries denied) |
+| Host Mach services, including keychain and application-launch brokers | No lookup or registration |
+| Apple-event delegation | No send |
 
 The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement
