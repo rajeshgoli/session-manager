@@ -491,6 +491,7 @@ tmp/                                   the agent's TMPDIR and TMUX_TMPDIR</pre>
 <tr><td><code>session.compacted</code></td><td><code>apply_compaction_event</code> (sessions.rs:6434) with <code>compaction_complete</code>.</td></tr>
 <tr><td><code>session.updated</code> with a title</td><td>Native title for display (F.4).</td></tr>
 <tr><td><code>session.error</code></td><td>Stores the error text on the session as <code>last_provider_error</code>, shown in <code>sm show</code>; no status change (opencode reports idle after it).</td></tr>
+<tr><td><code>message.updated</code>, role user, an id sm did not generate, first time seen</td><td>Owner prompt (D.5), whatever the status: marks the outstanding owner message answered and wakes what waits on it, as Claude’s <code>UserPromptSubmit</code> does for owner input. If this message also starts a turn, the status row above applies the turn start once, not twice. Test: owner input typed while a turn is running is recorded as owner input.</td></tr>
 <tr><td>Anything else</td><td>Updates <code>last_activity</code> only.</td></tr>
 </tbody>
 </table>
