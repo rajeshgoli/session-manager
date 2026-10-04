@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
 import { EFFORTS } from './start.js';
-import { Presets } from './launch-fields.js';
+import { TypePicker, OTHER_TYPE, agentTypes, typeConfig, matchType } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
 export const REVIEWER_KINDS = [{ value: '', label: 'Lane default' }, { value: 'github_codex', label: 'GitHub' },
@@ -38,7 +38,7 @@ export function providerDefaults(settings, provider) {
 
 // Start when ready (1821 F4). Efforts match the server's agent-type check.
 export const AUTO_EFFORTS = { claude: ['low', 'medium', 'high', 'xhigh', 'max'], 'codex-fork': ['medium', 'high', 'xhigh'] };
-export const CUSTOM = '__custom__';
+export const CUSTOM = OTHER_TYPE;
 export const LAST_TYPE_KEY = 'sm-auto-start-type';
 
 /** "opus[1m]" → "Opus", "claude-sonnet-4-5" → "Sonnet"; null is the provider default. */
@@ -51,12 +51,7 @@ export function modelShort(model) {
 
 export const typeText = (type) => `${modelShort(type.model)} ${type.effort || 'default'}`;
 
-/** The agent type whose provider, model and effort equal the choice, else ''. */
-export function matchType(types, choice) {
-  const type = (types || []).find((t) => t.provider === choice.provider && t.model === (choice.model || null)
-    && t.effort === (choice.reasoning_effort || null));
-  return type ? type.name : '';
-}
+export { matchType };
 
 export function chipText(auto, paused) {
   const head = auto.state === 'failed' ? '⏵ failed' : paused ? '⏵ paused' : '⏵ when ready';
@@ -128,15 +123,14 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
   const [form, setForm] = useState(null);
   const [settings, setSettings] = useState(null);
   const [models, setModels] = useState([]);
-  const [expanded, setExpanded] = useState(false);
   const [preview, setPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [typeName, setTypeName] = useState(CUSTOM);
   const [edited, setEdited] = useState(false);
   const [report, setReport] = useState({ text: '', screenshot: !!(bug && bug.screenshot), startAgent: false });
   const [filed, setFiled] = useState(null);
-  const types = (settings && settings.new_agent.agent_types) || [];
+  const types = agentTypes(settings);
+  const typeName = (form && matchType(types, form)) || CUSTOM;
   useEffect(() => {
     if (!reporting) return;
     let alive = true;
@@ -168,7 +162,6 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
           const type = kinds.find((t) => t.name === name);
           if (auto) next = { ...next, ...choiceOf(auto), brief: auto.brief ?? options.brief };
           else if (type && !preference) next = { ...next, provider: type.provider, model: type.model, reasoning_effort: type.effort };
-          setTypeName(preference && !auto ? matchType(kinds, preference) || CUSTOM : name || CUSTOM);
           setEdited(auto ? auto.brief != null : !!preference && preference.brief != null);
         }
         setForm(next); setSettings(saved);
@@ -187,17 +180,8 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [wantModels, form && form.provider, form && form.working_dir]);
-  const set = (patch) => {
-    const next = { ...form, ...patch };
-    setForm(next);
-    if (later) setTypeName(matchType(types, next) || CUSTOM);
-  };
-  const pick = (name) => {
-    const type = types.find((t) => t.name === name);
-    if (!type) { setTypeName(CUSTOM); setExpanded(true); return; }
-    store(LAST_TYPE_KEY, name);
-    set({ provider: type.provider, model: type.model, reasoning_effort: type.effort });
-  };
+  const set = (patch) => setForm({ ...form, ...patch });
+  const onType = (type) => store(LAST_TYPE_KEY, type.name);
   const run = async (method, path, body, done) => {
     if (busy) return;
     setBusy(true); setError(null);
@@ -241,7 +225,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
         <${Toggle} label="Screenshot" checked=${report.screenshot} disabled=${locked || !bug.screenshot} onChange=${(screenshot) => setReport({ ...report, screenshot })} /></div>
       <div class="line"><span>Start an agent</span>
         <${Toggle} label="Start an agent" checked=${report.startAgent} disabled=${locked} onChange=${(startAgent) => setReport({ ...report, startAgent })} /></div>
-      ${report.startAgent ? form ? html`<${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} expanded=${expanded} setExpanded=${setExpanded}
+      ${report.startAgent ? form ? html`<${AgentFields} form=${form} set=${set} settings=${settings} models=${choices}
         named=${html`<div class="line"><span>Named from the new ticket, as Start does</span></div>`} />` : !error ? html`<p>Loading…</p>` : null : null}
       ${filed ? html`<p>Filed <a href=${filed.issue.url} target="_blank" rel="noopener">#${filed.issue.number}</a>; the agent did not start.</p>` : null}
       ${error ? html`<p class="err" role="alert">${error}</p>` : null}
@@ -257,9 +241,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
       ${settings && settings.new_agent.auto_start_paused ? html`<p class="amber">Auto-start is paused (Settings › New agents).</p>` : null}`
       : blocked ? blockedReasons(ticket).map((reason) => html`<p>${reason}</p>`) : null}
     ${startable && form ? html`
-      ${later ? html`<div class="fld"><span class="l">Agent type</span><${Seg} label="Agent type" value=${typeName} onChange=${pick}
-        options=${[...types.map((t) => ({ value: t.name, label: t.name })), { value: CUSTOM, label: 'Custom' }]} /></div>` : null}
-      <${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} expanded=${expanded} setExpanded=${setExpanded}
+      <${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} onType=${onType}
         efforts=${later ? AUTO_EFFORTS : EFFORTS} reviewer=${!later}
         named=${html`<div class="line"><span>Named ${form.name}${later ? ` · first message ${edited ? 'edited' : 'default'}` : ''}</span><span>
           ${later && edited ? html`<button class="link-btn" onClick=${() => { setEdited(false); set({ brief: form.template }); }}>Use default</button> ` : null}
@@ -287,41 +269,58 @@ function BugText({ value, disabled, onInput }) {
 }
 
 /**
- * The agent section Start and Report a bug share (1859 B4): provider, the model · effort ·
- * workspace line with Change, its Model and Effort fields, and the Reviewer row.
- * `named` follows the line; `extra` follows Effort while expanded.
+ * The agent section Start, Start when ready and Report a bug share (1859 B4, sm#1981):
+ * one click on a configured agent type, or Other for the Provider, Model and Effort
+ * fields; then the model · effort · workspace line, `named`, `extra`, and the Reviewer row.
  */
-export function AgentFields({ form, set, settings, models, expanded, setExpanded, efforts = EFFORTS, reviewer = true, named = null, extra = null }) {
+export function AgentFields({ form, set, settings, models, efforts = EFFORTS, reviewer = true, named = null, extra = null, onType = null }) {
+  const matched = matchType(agentTypes(settings), form);
+  const [other, setOther] = useState(!matched);
+  const chosen = other || !matched ? CUSTOM : matched;
+  const pick = (type) => {
+    setOther(!type);
+    if (!type) return;
+    set(typeConfig(type));
+    if (onType) onType(type);
+  };
   return html`
-    <${Presets} settings=${settings} onPick=${set} />
-    <${Seg} label="Provider" value=${form.provider}
-      options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
-      onChange=${(provider) => set(providerDefaults(settings, provider))} />
-    <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span>
-      </div>
-    ${named}
-    ${html`
+    <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
+    ${chosen === CUSTOM ? html`
+      <${Seg} label="Provider" value=${form.provider}
+        options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
+        onChange=${(provider) => set(providerDefaults(settings, provider))} />
       <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
         <option value="">Provider default</option>${models.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
       <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
         options=${[{ value: '', label: 'default' }, ...(efforts[form.provider] || []).map((e) => ({ value: e, label: e }))]}
-        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>
-      ${extra}`}
+        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>` : null}
+    <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span></div>
+    ${named}
+    ${extra}
     ${reviewer ? html`<${ReviewerRow} form=${form} set=${set} />` : null}`;
 }
 
-/** The reviewer for this ticket (1768 I3): the policy it would use, or a ticket policy stored at Start. */
+/**
+ * The reviewer for this ticket (1768 I3): one line naming the policy it would use,
+ * opening to the editor on Change (sm#1981), or open while a ticket policy is chosen.
+ */
 function ReviewerRow({ form, set }) {
+  const [open, setOpen] = useState(!!form.reviewer);
   const resolved = form.review_policy;
   const own = resolved && resolved.source && resolved.source.startsWith('ticket');
   const kinds = REVIEWER_KINDS.map((k) => (k.value === '' && own ? { ...k, label: 'Ticket\'s own' } : k));
   const kind = form.reviewer ? form.reviewer.kind : '';
   const choose = (value) => set({ reviewer: value ? switchKind(form.reviewer || resolved?.resolved, value) : null });
+  const current = resolved ? `${reviewerText(resolved.resolved)} · from ${resolved.source}` : 'The policy a review request would use';
+  if (!open) {
+    return html`<div class="line reviewer-line"><span>Reviewer · ${current}</span>
+      <button type="button" class="link-btn" onClick=${() => setOpen(true)}>Change</button></div>`;
+  }
   return html`<div class="fld top"><span class="l">Reviewer</span><div class="review-editor">
     <${Seg} label="Reviewer for this ticket" value=${kind} options=${kinds} onChange=${choose} />
     ${form.reviewer ? html`<${ReviewerEditor} value=${form.reviewer} kinds=${null} onChange=${(reviewer) => set({ reviewer })}
       note=${form.reviewer.kind === 'paired' ? `Starts at the first review request, in ${form.name ? `${form.name}'s checkout, as ${form.name}-reviewer` : 'the new agent\'s checkout, as its reviewer'}. It may build and run tests, never edit.` : null} />`
-      : html`<p class="sub">${resolved ? `${reviewerText(resolved.resolved)} · from ${resolved.source}` : 'The policy a review request would use.'}</p>`}
+      : html`<p class="sub">${current}.</p>`}
   </div></div>`;
 }
 

@@ -224,3 +224,21 @@ test('selection identity deduplicates lane appearances and bulk excludes goals a
   assert.ok(bulkReasons({...t,state:'blocked',warnings:['cycle']}).includes('cycle'));
   assert.equal(keepEdit().behavior,'keep');
 });
+
+// sm#1981: Done and Archive open the row below, else above; agent types match by value.
+test('inbox advances to the next shown row and agent types match exactly', async () => {
+  const { shownRows, nextRow } = modules.get(`${root}/inbox.js`).namespace;
+  const r = (thread_key, group) => ({ thread_key, group });
+  const rows = [r('a', 'earlier'), r('b', 'needs_you'), r('c', 'folded'), r('d', 'finished')];
+  assert.deepEqual(shownRows(rows, 'open', false).map(x => x.thread_key), ['b', 'd', 'a']);
+  assert.deepEqual(shownRows(rows, 'open', true).map(x => x.thread_key), ['b', 'd', 'a', 'c']);
+  assert.deepEqual(shownRows(rows, 'done', false), rows);
+  const shown = shownRows(rows, 'open', false);
+  assert.equal(nextRow(shown, 'b').thread_key, 'd');
+  assert.equal(nextRow(shown, 'a').thread_key, 'd');
+  assert.equal(nextRow([r('a', 'new')], 'a'), null);
+  assert.equal(nextRow(shown, 'gone'), null);
+  const types = [{ name: 'Sol/Med', provider: 'codex-fork', model: 'gpt-6.1-sol', effort: 'medium' }];
+  assert.equal(matchType(types, { provider: 'codex-fork', model: 'gpt-6.1-sol', reasoning_effort: 'medium' }), 'Sol/Med');
+  assert.equal(matchType(types, { provider: 'codex-fork', model: 'gpt-6.1-sol', reasoning_effort: 'high' }), '');
+});
