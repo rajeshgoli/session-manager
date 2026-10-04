@@ -195,6 +195,9 @@ async fn main() -> Result<()> {
         let handover_acceptor =
             handover::spawn_acceptor(&handover_listener, shutdown.clone(), handover_tx)?;
 
+        if config.rust_core.runtime_enabled {
+            sm_server::local_model::register_live(&config)?;
+        }
         // Only the live queue server records: scratch servers run with the
         // runtime off so they stay clear of live queue state (sm#1609).
         if config.rust_core.runtime_enabled && config.utilization.enabled {

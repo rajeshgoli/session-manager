@@ -26,6 +26,7 @@ mod doc;
 mod git_repo;
 mod history;
 mod merge_holds;
+mod model;
 mod watch;
 
 #[derive(Parser)]
@@ -81,6 +82,7 @@ enum Command {
     Lookup(LookupArgs),
     Roster(EmptyArgs),
     Queue(QueueArgs),
+    Model(model::ModelArgs),
     #[command(name = "enroll-device")]
     EnrollDevice(EnrollDeviceArgs),
     Device(device::DeviceArgs),
@@ -1320,6 +1322,7 @@ fn run() -> Result<()> {
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
+        Command::Model(args) => model::run(&client, args)?,
         Command::RequestReview(args) => run_request_codex_review(&client, args)?,
         Command::Review(args) => run_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,

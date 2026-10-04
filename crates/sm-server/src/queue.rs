@@ -1680,6 +1680,18 @@ impl RetainedQueueStore {
         if job.state != "pending" {
             return get_queue_job_conn(&conn, job_id);
         }
+        // Includes owner-forced starts: a perf run never shares the model.
+        if job.job_type == "perf" && crate::local_model::hold_perf(state_dir, &job.label)? {
+            mark_pending_queue_jobs_holding_conn(&conn, Some(job_id), "local_model")?;
+            schedule_queue_admission_retry(
+                state_dir.to_path_buf(),
+                message_queue_db_path.to_path_buf(),
+                cancel_grace_seconds,
+                admission_policy,
+                admission_policy.resource_retry_interval_seconds,
+            );
+            return get_queue_job_conn(&conn, job_id);
+        }
         let process_ceiling = queue_job_process_ceiling(admission_policy.process_reserve);
         let child = match spawn_queue_job_process(&job, process_ceiling) {
             Ok(child) => child,
@@ -1763,7 +1775,10 @@ impl RetainedQueueStore {
             cancel_grace_seconds,
             admission_policy,
         )?
-        .map(|job| (job, true)))
+        .map(|job| {
+            let started = job.state == "running";
+            (job, started)
+        }))
     }
 
     pub fn admit_queue_jobs_in_state_dir(
@@ -4232,6 +4247,28 @@ struct QueueAdmissionSummary {
     retry_after_seconds: Option<u64>,
 }
 
+pub(crate) fn with_model_load_admission<T>(
+    state_dir: &Path,
+    captured: QueueAdmissionPolicy,
+    load: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _lock = QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let path = state_dir.join("queue_runner.db");
+    if path.exists() {
+        let conn = open_queue_jobs_connection(&path)?;
+        init_queue_jobs_schema(&conn)?;
+        let jobs = list_queue_job_runtime_records_conn(&conn)?;
+        if running_queue_job_count(&jobs, Some("perf")) > 0
+            || perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured))
+        {
+            bail!("local model load is blocked by a performance run or its cooldown");
+        }
+    }
+    load()
+}
+
 fn admit_pending_queue_jobs_conn(
     conn: &Connection,
     state_dir: &Path,
@@ -4299,6 +4336,22 @@ fn admit_pending_queue_jobs_conn(
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "memory_pressure")?;
             summary.retry_after_seconds = Some(admission_policy.resource_retry_interval_seconds);
             break;
+        }
+        if let Some(perf) = oldest_pending_queue_job(&jobs, "perf") {
+            if perf.timeout_seconds > 0
+                && perf.cpu_percent.is_some_and(|v| (1..=100).contains(&v))
+                && perf.gpu_percent.unwrap_or(0) <= 100
+                && perf.memory_bytes.is_some_and(|v| v > 0)
+                && !perf_has_finite_blockers(&jobs)
+                && !perf_cooldown_active(&jobs, admission_policy)
+                && !perf_blocked_by_tests_after_perf(&jobs)
+                && crate::local_model::hold_perf(state_dir, &perf.label)?
+            {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "local_model")?;
+                summary.retry_after_seconds =
+                    Some(admission_policy.resource_retry_interval_seconds);
+                break;
+            }
         }
         let ready_perf = jobs.iter().find(|job| {
             job.state == "pending"
@@ -5031,7 +5084,7 @@ thread_local! {
     static TEST_HOST_MEMORY: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
 }
 
-fn host_memory_capacity() -> Option<(i64, i64)> {
+pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
     #[cfg(test)]
     if let Some(capacity) = TEST_HOST_MEMORY.with(std::cell::Cell::get) {
         return Some(capacity);
@@ -5072,7 +5125,7 @@ fn perf_memory_headroom_is_safe(
         .is_some_and(|required| available >= required)
 }
 
-fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
+pub(crate) fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
     #[cfg(target_os = "macos")]
     {
         configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES)
@@ -5785,13 +5838,18 @@ fn host_pressure_victim<'a>(
 /// records the chosen job as `memory_terminating` with cause
 /// `host_memory_pressure` and returns it with its process group to stop.
 /// The job's own watcher then finishes it as `memory_exceeded`.
-fn host_memory_guard_pass(
+pub(crate) fn host_memory_guard_pass(
     conn: &Connection,
     host: Option<(i64, i64)>,
     configured_reserve: i64,
     rss_by_pgid: &HashMap<i64, i64>,
 ) -> Result<Option<(String, i64)>> {
     let reserve = effective_memory_reserve_bytes(configured_reserve);
+    if let Some(dir) = conn.path().and_then(|p| Path::new(p).parent()) {
+        if crate::local_model::guard_model(dir, host, reserve)? {
+            return Ok(None);
+        }
+    }
     let Some(available) = host
         .map(|(_, available)| available)
         .filter(|available| *available < reserve)
@@ -5838,6 +5896,16 @@ pub fn spawn_host_memory_guard(
                 continue;
             }
             let host = host_memory_capacity();
+            // The model yields above the job-kill reserve. Failed unloads keep
+            // this guard from selecting a queue victim until the model is gone.
+            match crate::local_model::guard_model(&state_dir, host, reserve) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("local model memory guard: {error:#}");
+                    continue;
+                }
+            }
             if host.is_none_or(|(_, available)| available >= reserve) {
                 continue;
             }
@@ -7243,6 +7311,10 @@ pub fn queue_hold_explanation(
             };
             ("waiting for the performance run to finish".into(), detail)
         }
+        "local_model" => (
+            "waiting for the local model to unload".into(),
+            "Performance runs wait until the local model has stopped. A failed unload keeps admission blocked.".into(),
+        ),
         "perf_cooldown" => (
             "waiting for performance cooldown".into(),
             format!("The scheduler is enforcing the {}-second performance cooldown between runs. Admission retries automatically when the cooldown ends.", policy.perf_cooldown_seconds),
