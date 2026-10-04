@@ -1,0 +1,5 @@
+{"t": 1791070949.200313, "line": "status idle"}
+{"t": 1791070950.281155, "line": "status busy"}
+{"t": 1791071520.312482, "line": "delivered msg_1042e862d001OsUrHoPend4aOQ (286 chars, sent): [sm context management] Your context is at 35%. Stop at a lo", "key": "pane-750a3739874d", "messageID": "msg_1042e862d001OsUrHoPend4aOQ"}
+{"t": 1791071847.396641, "line": "status idle"}
+{"t": 1791072074.0635579, "line": "status unreachable"}

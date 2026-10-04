@@ -1,0 +1,90 @@
+From 92da92c794ab8edeff5c968b40a4f95c5622c6a4 Mon Sep 17 00:00:00 2001
+From: "sm-1966-oc (local agent)" <sm-1966-oc@local.invalid>
+Date: Sat, 3 Oct 2026 16:38:24 -0700
+Subject: [PATCH] Accept sm request-codex-review as hidden alias of sm
+ request-review
+
+Agents launched from checkouts still carrying the pre-#1786 instructions ran
+'sm request-codex-review <PR>', which the renamed command rejected; they then
+fell back to posting '@codex review' by hand, so sm never registered the
+review. A hidden clap alias routes the stale name to the same handler instead
+of erroring.
+---
+ crates/sm-server/src/bin/sm.rs | 40 +++++++++++++++++++++++++++++-----
+ 1 file changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/crates/sm-server/src/bin/sm.rs b/crates/sm-server/src/bin/sm.rs
+index f1b3fd76..1542e041 100644
+--- a/crates/sm-server/src/bin/sm.rs
++++ b/crates/sm-server/src/bin/sm.rs
+@@ -87,7 +87,7 @@ enum Command {
+     ListDevices(ListDevicesArgs),
+     #[command(name = "remove-device")]
+     RemoveDevice(RemoveDeviceArgs),
+-    #[command(name = "request-review")]
++    #[command(name = "request-review", alias = "request-codex-review")]
+     RequestReview(RequestReviewArgs),
+     /// Paired reviewers: return your review to sm
+     Review(ReviewArgs),
+@@ -853,11 +853,6 @@ fn main() {
+ }
+ 
+ fn run() -> Result<()> {
+-    let removed_command = concat!("request-codex-", "review");
+-    if std::env::args().nth(1).as_deref() == Some(removed_command) {
+-        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
+-        process::exit(2);
+-    }
+     let cli = Cli::parse();
+     let command = cli.command;
+     let command = match command {
+@@ -5629,6 +5624,7 @@ fn command_tokens_after_globals(args: &[String]) -> Vec<&str> {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use clap::CommandFactory;
+     use std::{
+         ffi::OsString,
+         io::{BufRead, BufReader},
+@@ -7408,6 +7404,38 @@ mod tests {
+         assert_eq!(request_id.as_deref(), Some("req456"));
+     }
+ 
++    #[test]
++    fn request_codex_review_parses_as_hidden_alias_of_request_review() {
++        let create_cli = Cli::try_parse_from([
++            "sm",
++            "request-codex-review",
++            "1808",
++            "--notify",
++            "notify123",
++        ])
++        .unwrap();
++        let Command::RequestReview(create_args) = create_cli.command else {
++            panic!("expected request-review command");
++        };
++        assert_eq!(create_args.action_or_pr.as_deref(), Some("1808"));
++        assert_eq!(create_args.notify.as_deref(), Some("notify123"));
++
++        let list_cli = Cli::try_parse_from(["sm", "request-codex-review", "list"]).unwrap();
++        let Command::RequestReview(list_args) = list_cli.command else {
++            panic!("expected request-review command");
++        };
++        assert!(matches!(
++            list_args.command,
++            Some(RequestReviewCommand::List)
++        ));
++
++        let help = Cli::command().render_help().to_string();
++        assert!(
++            !help.contains("request-codex-review"),
++            "alias should stay hidden from help output"
++        );
++    }
++
+     #[test]
+     fn codex_review_request_list_path_preserves_python_filters() {
+         let _guard = ENV_LOCK.lock().unwrap();
+-- 
+2.54.0 (Apple Git-157)
+
