@@ -78,10 +78,25 @@ disjoint. The caller reserves these entire ranges for their respective services.
 Every server port, including the agent's own server, is blocked outbound. Only
 the current agent's gateway and egress ports are reachable in those ranges. The
 model/judge ports must be distinct, outside these ranges and outside sm's
-8420/8443. The generator also blocks every other TCP listener observed at launch,
+8420/8443. Raw TCP connections reach only these four admitted service ports;
+other host services remain unreachable even when launched after the profile.
+The generator also blocks every other TCP listener observed at launch,
 plus sm and LM Studio's fixed ports; admitted services override the fixed
 8000/1234–1236 denials. `lsof` errors, diagnostics or malformed socket records
-fail the generation. New test listeners outside reserved ranges remain usable.
+fail the generation. The wall denies every new IP listener, including loopback
+and wildcard binds. macOS cannot express an inbound rule restricted to loopback:
+its `localhost` filter also accepts wildcard binds. The trusted host must create,
+bind to exactly `127.0.0.1` or `::1`, and listen on each socket before passing it
+into the wall. The agent may accept and reply on those prebound descriptors.
+Ordinary bind/listen APIs need an immutable host-supplied adapter backed by the
+trusted listener broker; creating that broker is a separate #1974 prerequisite.
+Test-client connections to broker-allocated test listeners likewise use trusted
+connected descriptors. The broker may connect only to that agent's registered
+test listeners; it must refuse provider control ports, privileged service ports,
+other agents' listeners and arbitrary destinations.
+Do not relax the profile when it or the adapter is absent. Outbound connections
+to admitted services need no inbound-listener grant. Private Unix listeners
+remain usable without a TCP broker.
 
 Gateway/egress port reservations protect agents launched later: a wall generated
 before a successor launches still cannot reach that successor's agent, gateway
@@ -100,6 +115,8 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Judge/proxy service-secret directories | No read or write |
 | sm logs outside protected state directories | Read |
 | Direct internet and DNS | No outbound connection |
+| New TCP/UDP listeners on loopback, wildcard or LAN addresses | No bind/listen |
+| Trusted prebound IPv4/IPv6 loopback listener descriptors | Accept and reply |
 | Own sm gateway, egress proxy, model and judge | Loopback connection |
 | Private Unix sockets in own `tmp/` | Connection |
 | Every Unix socket outside own `tmp/`, including Docker, default tmux and sm-state sockets | No connection |

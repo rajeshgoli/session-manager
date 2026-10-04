@@ -181,8 +181,12 @@ def generate(args, listeners, minimum_tmp_length):
                  f"(require-not (literal {quoted(state_root)}))))")
     lines.append(f"(deny file-read-data (literal {quoted(state_root)}))")
     lines.extend([
+        # Seatbelt's localhost inbound filter also matches wildcard/LAN binds.
+        # New IP listeners must be allocated outside the wall and passed in.
+        "(deny network-inbound (local ip))",
         "(deny network-outbound)",
-        f'(allow network-outbound (remote ip "localhost:*") '
+        '(allow network-outbound ' + ' '.join(
+            f'(remote ip "localhost:{number}")' for number in sorted(admitted)) + ' '
         f'(remote unix-socket (subpath {quoted(state / "tmp")})))',
     ])
     for number in sorted(forbidden):

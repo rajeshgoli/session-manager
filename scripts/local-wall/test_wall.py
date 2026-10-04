@@ -44,6 +44,7 @@ class WallTests(unittest.TestCase):
             self.assertIn(f'(deny network-outbound (remote ip "localhost:{number}"))', profile)
         for number in (8000, 8441, 18600, 18700):
             self.assertNotIn(f'(deny network-outbound (remote ip "localhost:{number}"))', profile)
+        self.assertNotIn('(remote ip "localhost:*")', profile)
 
     def test_profile_validation(self):
         invalid = [("model_port", "8420"), ("judge_port", "18550"),
@@ -107,6 +108,26 @@ class WallTests(unittest.TestCase):
         if not expected and permission_denial:
             self.assertIn("PermissionError", result.stderr,
                           f"{label} failed for a reason other than sandbox permission: {result.stderr}")
+
+    def inherited_listener(self, listener):
+        # Only a trusted host creates/binds/listens. The wall permits using
+        # this loopback-only capability while refusing any new IP listeners.
+        fd = listener.fileno()
+        script = (f"import socket; s=socket.socket(fileno={fd}); s.settimeout(5); "
+                  "c,_=s.accept(); c.sendall(b'fixture-loopback'); c.close()")
+        child = subprocess.Popen(["/usr/bin/sandbox-exec", "-f", str(self.profile), sys.executable, "-c", script],
+                                 pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "TMPDIR": self.tmp})
+        try:
+            with socket.create_connection(listener.getsockname()[:2], timeout=5) as client:
+                client.settimeout(6)
+                self.assertEqual(client.recv(128), b"fixture-loopback")
+            out, err = child.communicate(timeout=8)
+            self.assertEqual(child.returncode, 0, out + err)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
 
     @unittest.skipUnless(sys.platform == "darwin", "keychain fixture requires macOS")
     def test_keychain_service_cannot_return_a_readable_fixture_secret(self):
@@ -304,12 +325,25 @@ class WallTests(unittest.TestCase):
                                 (gateway, True), (proxy, True), (model, True), (judge, True)]:
             self.sandbox(f"import socket; socket.create_connection(('127.0.0.1', {number}), timeout=2)",
                          allowed, f"connect {number}")
+        with socket.socket() as late_service:
+            late_service.bind(("127.0.0.1", 0))
+            late_service.listen()
+            late_port = late_service.getsockname()[1]
+            self.sandbox(f"import socket; socket.create_connection(('127.0.0.1',{late_port}),timeout=2)",
+                         False, "unadmitted host service launched after the profile")
         # Direct connections do not depend on outside network reachability: the
         # sandbox must reject at connect(), before any packet can leave the host.
         self.sandbox("import socket; socket.create_connection(('1.1.1.1',443),timeout=2)", False, "internet")
         self.sandbox("import socket; socket.getaddrinfo('example.com',443)", False, "DNS", permission_denial=False)
-        self.sandbox("import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); "
-                     "socket.create_connection(s.getsockname(),timeout=2)", True, "new test loopback listener")
+        for address, family in [("0.0.0.0", "AF_INET"), ("127.0.0.1", "AF_INET"),
+                                ("::", "AF_INET6"), ("::1", "AF_INET6")]:
+            self.sandbox(f"import socket; s=socket.socket(socket.{family}); s.bind(({address!r},0)); s.listen()",
+                         False, f"new IP listener {address}")
+        self.inherited_listener(pair[0])
+        with socket.socket(socket.AF_INET6) as ipv6:
+            ipv6.bind(("::1", 0))
+            ipv6.listen()
+            self.inherited_listener(ipv6)
         self.sandbox(f"import socket; s=socket.socket(socket.AF_UNIX); s.bind({str(Path(self.tmp) / 'private.sock')!r}); "
                      f"s.listen(); socket.socket(socket.AF_UNIX).connect({str(Path(self.tmp) / 'private.sock')!r})",
                      True, "private Unix socket")
