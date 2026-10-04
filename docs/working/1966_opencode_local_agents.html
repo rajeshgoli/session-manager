@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1966 — Local agents on opencode</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<h1>1966 — Local agents on opencode: how sm runs them</h1>
+<p class="sans"><small>Authors: Claude Opus 5.5 sm-1966-h2 <code>691a9d70</code>, contract; Claude Opus 5.5 sm-1966 <code>f3018f36</code>, lifecycle proof · Tickets #1966, #1956 · revision 1, 2026-10-04</small></p>
+
+<h2>Memo</h2>
+
+<p><b>sm gains a fourth kind of agent, <code>opencode</code>, and it is how every local agent runs.</b> You start one with <code>sm spawn local "brief"</code>. sm launches the agent’s own opencode server inside the sandbox wall. Everything that today depends on typing into a terminal — the brief, <code>sm send</code>, reminders, queue wakes, status, token counts — sm does over that server’s HTTP interface instead. A tmux session stays, only so you can watch the agent and type to it, as you do today. This memo asks for eight rulings, all with recommendations. The appendices are the build contract for #1956 and the two tickets I propose splitting off it.</p>
+
+<p><b>What you have already ruled</b> (4 Oct): opencode is the local harness; the model stays Qwen3.8-Flash-Next, with no more model trials; and the local-agents memo (#1784) takes no new information, so this contract is its own document. Where #1784’s appendices still bind, appendix A names them.</p>
+
+<h3>Terms</h3>
+<dl class="vocab">
+<dt>Provider</dt><dd>sm’s name for the program an agent runs in. Today: <code>claude</code> (Claude Code), <code>codex</code> (stock Codex), <code>codex-fork</code> (your patched Codex). This memo adds <code>opencode</code>.</dd>
+<dt>opencode server</dt><dd><code>opencode serve</code>: opencode running with no screen, answering HTTP on a local port. It holds the conversation, calls the model, and runs the agent’s tools. One per agent.</dd>
+<dt>Attach view</dt><dd><code>opencode attach</code>: opencode’s own terminal screen, connected to a running server. It shows the live conversation and accepts typing.</dd>
+<dt>Sandbox wall</dt><dd>The macOS sandbox from #1954 that confines a local agent to its checkout and a few local ports. The <b>judge</b> is a second conversation with the same model that allows or denies each action leaving the wall.</dd>
+<dt>Event stream</dt><dd>A long-lived HTTP response on which the opencode server reports what happens: busy, idle, each tool call, each model request with its token counts.</dd>
+<dt>Outbox</dt><dd>sm’s existing durable message queue, used so that a message counts as delivered only when opencode confirms it has it.</dd>
+<dt>MTPLX</dt><dd>The program that holds the model in memory and answers requests, on port 8000.</dd>
+</dl>
+
+<h3>Why opencode: the proof in one table</h3>
+<p>sm-1966 drove opencode from an unmodified scratch sm, inside #1954’s wall and judge, and checked the six things sm depends on. All six held. It then fixed two past tickets hands-off, in a third to a half of Claude Code’s time under the same wall and judge. Appendix P has the detail and evidence.</p>
+
+<table>
+<thead><tr><th style="width:34%">What sm needs from the harness</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>1. Submit the brief exactly once and know it arrived</td><td><b>Proved.</b> Confirmed in 1 s; a resend after a simulated crash was recognised and dropped.</td></tr>
+<tr><td>2. Show working/idle, last tool and context in sm</td><td><b>Proved.</b> sm tracked the agent live, about a second behind.</td></tr>
+<tr><td>3. Deliver <code>sm send</code>, reminders and queue wakes, never twice</td><td><b>Proved:</b> one turn per message, idle or busy.</td></tr>
+<tr><td>4. Same conversation after restarts</td><td><b>Proved</b> after opencode, model and full restarts, and through a 12-minute model outage.</td></tr>
+<tr><td>5. Judge every action with no prompt to you</td><td><b>Proved.</b> No prompt in 97 real tool calls; allow-once behaves as in #1954.</td></tr>
+<tr><td>6. Local usage at zero quota weight</td><td><b>Exact token counts reach sm.</b> Zero weight needs the local account in this contract.</td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>Ticket</th><th>Claude Code, wall + judge</th><th>opencode, wall + judge + sm</th></tr></thead>
+<tbody>
+<tr><td>#1855 retired review-command alias</td><td>15.7 min, small changes</td><td><b>4.4 min, mergeable as-is</b></td></tr>
+<tr><td>#1913 server sockets inherited by jobs</td><td>29.0 min, large changes</td><td><b>15.0 min, small changes</b></td></tr>
+</tbody>
+</table>
+<p class="sans"><small>Active minutes from brief to the end of the first turn. Both opencode fixes pass the merged fix’s own test, which fails without them. Grades for opencode are the driver’s and match the independent Codex grades of the same designs in #1955. Two tickets is a small sample; after launch every local PR goes through <code>sm request-review</code>, and its grades are the ongoing measure.</small></p>
+
+<h3>How sm drives an opencode agent</h3>
+
+<figure>
+<svg viewBox="0 0 760 300" role="img" aria-label="How sm drives an opencode agent" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<rect x="12" y="20" width="178" height="200" rx="6" fill="none" stroke="var(--ink-2)"/>
+<text x="26" y="42" fill="var(--ink)" font-weight="600">sm server</text>
+<text x="26" y="64" fill="var(--ink-2)">outbox (message queue)</text>
+<text x="26" y="82" fill="var(--ink-2)">event reader, one per agent</text>
+<text x="26" y="100" fill="var(--ink-2)">session record: status,</text>
+<text x="26" y="116" fill="var(--ink-2)">last tool, context %</text>
+<text x="26" y="134" fill="var(--ink-2)">usage ledger (local, 0%)</text>
+<text x="26" y="152" fill="var(--ink-2)">handoff at 75%</text>
+<text x="26" y="196" fill="var(--violet)">new for opencode: delivery</text>
+<text x="26" y="212" fill="var(--violet)">and event reader</text>
+<rect x="250" y="20" width="250" height="200" rx="6" fill="none" stroke="var(--ink-3)"/>
+<text x="262" y="38" fill="var(--ink-2)">tmux session (as for every agent)</text>
+<rect x="266" y="50" width="218" height="44" rx="5" fill="none" stroke="var(--ink-2)"/>
+<text x="278" y="68" fill="var(--ink)">agent window: attach view</text>
+<text x="278" y="84" fill="var(--ink-2)">what you see on sm attach</text>
+<rect x="266" y="110" width="218" height="98" rx="5" fill="none" stroke="var(--violet)" stroke-dasharray="5 3"/>
+<text x="278" y="126" fill="var(--violet)">serve window, inside the wall</text>
+<rect x="280" y="134" width="190" height="30" rx="4" fill="none" stroke="var(--ink-2)"/>
+<text x="292" y="153" fill="var(--ink)">opencode serve :185xx</text>
+<rect x="280" y="170" width="190" height="30" rx="4" fill="none" stroke="var(--ink-2)"/>
+<text x="292" y="189" fill="var(--ink)">judge plugin, every tool</text>
+<rect x="560" y="20" width="188" height="56" rx="6" fill="none" stroke="var(--ink-2)"/>
+<text x="574" y="42" fill="var(--ink)">MTPLX :8000</text><text x="574" y="60" fill="var(--ink-2)">Flash-Next: agent + judge</text>
+<rect x="560" y="150" width="188" height="56" rx="6" fill="none" stroke="var(--ink-2)"/>
+<text x="574" y="172" fill="var(--ink)">judge service</text><text x="574" y="190" fill="var(--ink-2)">#1954, unchanged</text>
+<line x1="190" y1="140" x2="280" y2="140" stroke="var(--blue)" stroke-width="1.5"/>
+<text x="196" y="118" fill="var(--blue)">brief,</text><text x="196" y="132" fill="var(--blue)">messages</text>
+<line x1="280" y1="158" x2="190" y2="158" stroke="var(--blue)" stroke-width="1.5"/>
+<text x="200" y="174" fill="var(--blue)">events</text>
+<line x1="380" y1="94" x2="380" y2="134" stroke="var(--ink-3)" stroke-dasharray="3 2"/>
+<line x1="470" y1="148" x2="560" y2="56" stroke="var(--ink-2)"/>
+<line x1="470" y1="185" x2="560" y2="180" stroke="var(--ink-2)"/>
+<line x1="654" y1="150" x2="654" y2="76" stroke="var(--ink-2)"/>
+<text x="12" y="250" fill="var(--ink-2)">Blue: HTTP from sm, with a password sm passes only to the attach view. Dashed grey: the attach view is a client of the same server.</text>
+<text x="12" y="268" fill="var(--ink-2)">Nothing is typed into a terminal by sm. If you type in the attach view, sm sees it on the event stream as your message.</text>
+</svg>
+<figcaption><b>Figure 1. One local agent.</b> The tmux session keeps every existing way of watching an agent working (<code>sm attach</code>, the web and phone terminals) without sm having to read a screen.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th style="width:22%">What sm does</th><th style="width:36%">Claude Code agents today</th><th>opencode agents</th></tr></thead>
+<tbody>
+<tr><td>Start the agent, send the brief</td><td>Types the brief into the terminal; watches the transcript file to confirm it.</td><td>Starts the server in the wall, creates a conversation, sends the brief over HTTP, confirms it by asking for it back.</td></tr>
+<tr><td><code>sm send</code>, reminders, queue wakes</td><td>Typed; waits for an empty prompt box first.</td><td>Sent over HTTP at once. If the agent is busy, opencode reads it at its next step, as Claude Code does with a queued prompt.</td></tr>
+<tr><td>When is a message “delivered”?</td><td>Once typed.</td><td>Once opencode confirms it holds it. Until then it stays in the outbox, across restarts.</td></tr>
+<tr><td>Urgent message</td><td>Moves the running command to the background, interrupts, types.</td><td>Same as any message: queued for the next step. It never interrupts (decision 4).</td></tr>
+<tr><td>Working / idle, last tool, context %</td><td>Claude Code hooks call sm.</td><td>sm reads the event stream.</td></tr>
+<tr><td>Token usage</td><td>Read from the transcript file; counted against your Claude account.</td><td>Read from the event stream; counted against a <b>local</b> account at zero quota weight.</td></tr>
+<tr><td>Restart, restore</td><td><code>claude --resume</code>.</td><td>Restart the server on the agent’s own data folder; same conversation id.</td></tr>
+<tr><td>Rename, clear</td><td>Types <code>/rename</code>, <code>/clear</code>.</td><td>Sets the conversation title; starts a fresh conversation.</td></tr>
+<tr><td>Retire</td><td>Kills the tmux session.</td><td>Same; sm then confirms the server has exited.</td></tr>
+</tbody>
+</table>
+
+<p><b>Why a message is confirmed by asking for it back.</b> sm picks the message’s id before sending and records it. Before every send, it asks opencode for that id; if opencode has it, sm marks it delivered and sends nothing. The proof found that opencode does not refuse a repeated id: resending one appended the text a second time. So the check before sending, not the id alone, is what prevents a message arriving twice. Figure 2 shows a delivery while opencode is down.</p>
+
+<figure>
+<svg viewBox="0 0 760 150" role="img" aria-label="Delivery while opencode restarts" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<line x1="40" y1="60" x2="740" y2="60" stroke="var(--ink-3)"/>
+<rect x="210" y="52" width="210" height="16" fill="var(--red)" opacity="0.25"/><text x="238" y="48" fill="var(--red)">opencode server down (restarting)</text>
+<circle cx="120" cy="60" r="5" fill="var(--blue)"/><text x="62" y="88" fill="var(--ink)">① sm send: id recorded,</text><text x="62" y="104" fill="var(--ink)">sent, confirmed. Delivered.</text>
+<circle cx="260" cy="60" r="5" fill="var(--orange)"/><text x="214" y="88" fill="var(--ink)">② reminder due: id recorded,</text><text x="214" y="104" fill="var(--ink)">send fails. Stays pending.</text>
+<circle cx="470" cy="60" r="5" fill="var(--blue)"/><text x="430" y="88" fill="var(--ink)">③ server back; ask for the id:</text><text x="430" y="104" fill="var(--ink)">absent, so send. Delivered.</text>
+<circle cx="680" cy="60" r="5" fill="var(--ink-3)"/><text x="622" y="88" fill="var(--ink)">④ after a lost reply:</text><text x="622" y="104" fill="var(--ink)">id present, no send.</text>
+<text x="40" y="136" fill="var(--ink-2)">sm retries pending messages every 5 seconds, in order; a later message waits until the earlier one is confirmed.</text>
+</svg>
+<figcaption><b>Figure 2. Exactly-once delivery.</b> The proof lost an <code>sm send</code> during an outage until delivery counted only confirmed messages; with that rule the message arrived once, 9 s after the restart.</figcaption>
+</figure>
+
+<h3>A local agent from your side</h3>
+<p><b>On the phone and web app, a local agent looks and acts like any other agent, with three differences: a LOCAL badge, no interrupt, and no spawning of its own.</b> What changes, surface by surface:</p>
+<table>
+<thead><tr><th style="width:22%">Surface</th><th>What you see with a local agent</th><th style="width:20%">Ships in</th></tr></thead>
+<tbody>
+<tr><td>Agent list, Board, Watch</td><td>The agent with a violet <b>LOCAL</b> badge, its status (working / idle), last tool and context use, updated about a second behind the agent.</td><td>Local usage ticket</td></tr>
+<tr><td>Start an agent (start sheets, Board start)</td><td>A <b>“Local (Flash-Next)”</b> choice, shown only while the model is loaded. With the one seat taken, it is greyed out with “1/1 in use by &lt;name&gt;”.</td><td>Local usage ticket (moved forward from #1959)</td></tr>
+<tr><td>Terminal view</td><td>opencode’s own screen instead of Claude Code’s. Anything you type there reaches the agent as your message; Esc there interrupts it.</td><td>The provider (#1956)</td></tr>
+<tr><td>Send, and urgent send</td><td>Messages arrive as for any agent. Urgent does not interrupt: the agent reads it at its next step (decision 4).</td><td>#1956</td></tr>
+<tr><td>“What is it doing?” summary</td><td>Not available for a local agent (decision 5); the status line and terminal show the same information.</td><td>#1956</td></tr>
+<tr><td>Settings › Handoff</td><td>A fourth row, “Local (opencode)”, at 75%.</td><td>Local usage ticket</td></tr>
+<tr><td>Spend</td><td>No Claude or Codex meter moves. A Local line appears with #1959.</td><td>#1959</td></tr>
+</tbody>
+</table>
+<p>Until the local usage ticket ships, the only way to start a local agent is the command your agents use, <code>sm spawn local "brief"</code>. A refusal there reads, for example, <code>error: no local seat free (1/1 used by sm-2001-fix)</code>.</p>
+
+<h3>Decision surface</h3>
+<table>
+<thead><tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. How does sm represent a local agent?</td><td><b>A new provider, <code>opencode</code>; every opencode agent is local.</b> #1784’s plan of a <code>host = local</code> field on Claude agents is dropped.</td><td>Claude Code and Codex never run on the local model now; a second field would only describe one combination.</td></tr>
+<tr><td>2. Keep a tmux session, or run with no terminal?</td><td><b>Keep tmux, for watching only.</b> The attach view runs there; the server runs in a second window inside the wall.</td><td><code>sm attach</code>, the web and phone terminals, output capture and kill all keep working unchanged. Your patched Codex follows the same pattern.</td></tr>
+<tr><td>3. What do you type to start one?</td><td><b><code>sm spawn local "brief"</code></b>, with <code>sm spawn opencode</code> as an alias. It uses whatever model sm has loaded; <code>--effort</code> is ignored.</td><td>You choose the tier, not the program; the command survives a later harness change.</td></tr>
+<tr><td>4. What does an urgent message do?</td><td><b>Nothing different: it is queued and read at the next step.</b> No sm path interrupts a local agent. You can still press Esc in the attach view.</td><td>opencode cannot move a running command to the background, so an interrupt kills it; the proof lost a 20-second command this way.</td></tr>
+<tr><td>5. What can a local agent not do at launch?</td><td><b>It cannot spawn agents, and <code>sm what</code> does not work on it.</b> sm refuses a spawn from a local agent; handoff successors are started by sm, so handoff still works.</td><td>One model seat; a child would wait for its own parent’s seat. <code>sm what</code> types a Claude or Codex side command opencode does not have.</td></tr>
+<tr><td>6. When does sm ask a local agent to hand off?</td><td><b>At 75% of its 200K window</b> (150K tokens), editable in handoff settings like the other providers.</td><td>sm’s 35% is set for Claude’s 1M window; at 35% of 200K a local agent was stopped mid-fix at 70K tokens. 75% leaves 50K before opencode compacts on its own.</td></tr>
+<tr><td>7. How is the opencode version controlled?</td><td><b>Pinned (1.17.9 today); sm refuses to spawn on any other version.</b> Updates are off. An upgrade is a deliberate change that reruns the proof’s checks.</td><td>opencode releases often and its plugin interface is young; the judge plugin depends on it.</td></tr>
+<tr><td>8. How is #1956 split?</td><td><b>Three tickets:</b> the opencode provider (#1956); local usage, handoff and badge (new); and the wall in production (new), which is harness-independent. Table below.</td><td>As scoped, #1956 does not fit one agent without compaction, and the wall work touches different files.</td></tr>
+</tbody>
+</table>
+
+<h3>The plan</h3>
+<table>
+<thead><tr><th style="width:26%">Ticket</th><th>What it does</th><th style="width:12%">Tier</th><th style="width:18%">Starts after</th></tr></thead>
+<tbody>
+<tr><td><b>#1966</b> Qualify opencode</td><td>Proof done; this contract. Closes when you approve it.</td><td>Opus, high</td><td>—</td></tr>
+<tr><td><b>New: local agent wall in production</b></td><td>The judge service run by sm; the wall profile generated at launch; queue jobs from a local agent run inside its wall; GitHub credentials held by the egress proxy; the proxy names the agent; an sm gateway through which sm knows every request from a local agent is that agent’s; a normal-length temporary path. Appendix I.2 lists each with its test. No opencode code.</td><td>Opus, high</td><td>this memo</td></tr>
+<tr><td><b>#1956</b> opencode provider</td><td>Launch in the wall with the judge plugin, HTTP delivery and the outbox, the event reader, restore, retire, clear, rename, attach, <code>sm spawn local</code>, the one-agent limit. Appendices B–F, I.1.</td><td>Opus, high</td><td>the wall ticket</td></tr>
+<tr><td><b>New: local usage, handoff, badge</b></td><td>The local account at zero weight, usage rows, the 75% handoff threshold, the LOCAL badge on web and Android, and “Local” in the app’s start sheets. Appendices G, H, K.</td><td>Opus, high</td><td>#1956</td></tr>
+<tr><td><b>#1957</b> sm owns the model</td><td>Unchanged from #1784 appendix E.</td><td>Opus, high</td><td>—</td></tr>
+<tr><td><b>#1958</b> Seat limit and yield</td><td>#1784 appendix F, with two substitutions (appendix J).</td><td>Opus, high</td><td>#1956, #1957</td></tr>
+<tr><td><b>#1959</b> Spend and tier table</td><td>#1784 appendix G’s Spend line and tier row; the row names <code>sm spawn local</code>.</td><td>Sonnet, high</td><td>#1958</td></tr>
+</tbody>
+</table>
+
+<h3>Risks I cannot close from here</h3>
+<ul>
+<li><b>Compaction near 200K is untested.</b> The largest prompt in the proof was 80K tokens. opencode compacts on its own and tells sm; how well it summarises is unknown. Handoff at 75% means it should rarely matter. #1956 measures where compaction triggers and records it.</li>
+<li><b>opencode moves fast.</b> Pinning protects a running system; each upgrade costs a rerun of the proof’s checks (about an hour of model time).</li>
+<li><b>First spawn needs the network once.</b> opencode installs its plugin library from npm, and the wall has no network, so sm prepares it outside the wall, once per opencode version. If npm is unreachable then, the spawn fails with a message saying so.</li>
+<li><b>The quality evidence is two tickets.</b> Local PRs go through review like any other; if they keep coming back as “large changes” or “wrong”, narrow the Local tier.</li>
+</ul>
+
+<h3>FAQ — what changed since the local-agents memo</h3>
+<ul>
+<li><b>The app can start a local agent</b> as soon as the local usage ticket ships, not only after #1959; #1784 had put the start-sheet choice in #1959.</li>
+<li><b>This is the first revision of this memo.</b> It replaces #1784’s appendices B, C, D and G, which specified Claude Code as the local harness; #1784’s appendices E, F (with appendix J’s two substitutions), K and L still bind.</li>
+<li><b><code>sm spawn claude --host local</code> is gone</b>; the command is <code>sm spawn local</code>.</li>
+<li><b>#1784’s launch requirement for a Claude Code judge hook is replaced</b> by an opencode plugin that calls the same judge service.</li>
+<li><b>A local agent reaches sm only through its own gateway</b>, which tells sm which agent sent each request. #1784 let local agents call sm directly; sm does not check who is calling, so a local agent could have started agents or queued jobs outside its sandbox by leaving out its name. The gateway is part of the wall ticket.</li>
+</ul>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3 id="a">A. Conventions and what still binds from #1784</h3>
+<p>Paths are relative to <code>crates/sm-server/src/</code> unless they start with <code>docs/</code>, <code>scripts/</code>, <code>web/</code> or <code>android-app/</code>. Line numbers are at origin/main <code>4c58e52c</code>; treat them as starting points. “#1784” means <code>docs/working/1784_local_agents.html</code> at that commit. “Local agent” means a session whose <code>provider</code> is <code>opencode</code>. “The model server” means MTPLX 2.12.0 serving Qwen3.8-Flash-Next with an OpenAI-compatible API at <code>http://127.0.0.1:8000/v1</code>. “The server” alone means the agent’s opencode server. GB means 10<sup>9</sup> bytes.</p>
+<table>
+<thead><tr><th>#1784 appendix</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>B. Where sm hard-codes provider</td><td>Replaced by appendix B here.</td></tr>
+<tr><td>C. Host field and launch profile</td><td>Replaced by appendices B–F here. C.7 (the brief addendum) carries over as F.6; C.9 (the handoff threshold) as H.</td></tr>
+<tr><td>D. Usage accounting</td><td>Replaced by appendix G.</td></tr>
+<tr><td>E. sm owns the model</td><td>Binds unchanged (#1957).</td></tr>
+<tr><td>F. Seat limit, drain, park, resume</td><td>Binds, with appendix J’s two substitutions (#1958).</td></tr>
+<tr><td>G. Spend line, tier table, UI</td><td>The badge moves to appendix K here; Spend and the tier row bind (#1959), with the row naming <code>sm spawn local</code>.</td></tr>
+<tr><td>K. Permissions: wall, proxy, judge</td><td>Binds. K.9.5’s requirements 2 and 5 (Claude Code hook and settings) are replaced by I.1; the rest are the wall ticket’s (I.2).</td></tr>
+<tr><td>L. 200K measurement</td><td>Binds: one agent plus the judge, 200K window, 16 GB session bank.</td></tr>
+</tbody>
+</table>
+
+<h3 id="b">B. Provider sites</h3>
+<p>Providers are bare strings: there is no enum, trait or registry, and about 40 sites match on <code>"claude" | "codex" | "codex-fork"</code>. #1956 adds <code>opencode</code> at each site below. Sites not listed must reject <code>opencode</code> the way they reject an unknown provider today; a site that silently falls through to Claude behaviour for an unknown provider (for example <code>session_input_ready</code>, runtime.rs:1229) must gain an explicit <code>opencode</code> arm or an early return, never the Claude arm.</p>
+<table>
+<thead><tr><th style="width:30%">Concern and site</th><th>Behaviour for <code>opencode</code></th><th style="width:12%">Spec</th></tr></thead>
+<tbody>
+<tr><td>CLI aliases, bin/sm.rs:3942 <code>launch_provider_for_alias</code>; clap commands bin/sm.rs:103–110, 1065–1100</td><td><code>local</code> and <code>opencode</code> map to <code>opencode</code>; <code>sm local</code> starts one directly like <code>sm claude</code>.</td><td>C.1</td></tr>
+<tr><td>Create gate, http.rs:15506 <code>ensure_core_runtime_provider_supported</code>; runtime.rs:1369 <code>launch_command</code></td><td>Accepted.</td><td>C</td></tr>
+<tr><td>Spawn, http.rs:4543 <code>spawn_session</code>, 4688 <code>spawn_child_session</code></td><td>Refused when the parent’s provider is <code>opencode</code>; limit check; model check.</td><td>C.1, C.2</td></tr>
+<tr><td>Model catalog, runtime.rs:415 <code>session_models</code>; http.rs:3084 <code>client_session_models</code></td><td>One entry, the loaded model, or empty with reason <code>no local model loaded</code>.</td><td>C.2</td></tr>
+<tr><td>Session record, sessions.rs:16066–16081</td><td>New <code>opencode</code> object; <code>provider_resume_id</code> holds opencode’s conversation id.</td><td>B.1</td></tr>
+<tr><td>Launch record, sessions.rs:15926 <code>SessionRuntimeLaunchRecord</code></td><td>Records the brief’s message and part ids.</td><td>B.1, D.4</td></tr>
+<tr><td>Initial brief, runtime.rs:1496–1575 <code>deliver_verified_initial_brief</code></td><td>New arm: delivery by D.2, confirmation by D.2’s check.</td><td>D.4</td></tr>
+<tr><td>Readiness, runtime.rs:1229 <code>session_input_ready</code>; 1678 <code>wait_for_initial_brief_readiness</code> (also used by handoff, http/handoff.rs:394)</td><td>Ready = health check answers and conversation status is known. Never reads the pane.</td><td>C.5</td></tr>
+<tr><td>Delivery, sessions.rs:10890 <code>should_persist_runtime_send</code>, 11124–11276, 11715 <code>drain_pending_runtime_messages_raw</code>, 11036 <code>runtime_session_accepts_background_delivery_raw</code>, 12117 <code>deliver_urgent_runtime_message_raw</code></td><td>All modes persist to the queue and go through D.2; no keystrokes, no ready fence, no urgent sequence.</td><td>D</td></tr>
+<tr><td>Native rename, sessions.rs:7101 <code>queue_provider_native_rename</code>, 11278 <code>deliver_runtime_native_rename_to_session_raw</code></td><td>HTTP title update.</td><td>F.4</td></tr>
+<tr><td>Display name, sessions.rs:16357 <code>cached_display_name</code>; 13617 <code>generated_session_name</code></td><td>opencode honoured for native titles; generated names from <code>STAR_NAMES</code>.</td><td>F.4</td></tr>
+<tr><td>Status, http.rs:12806 <code>live_activity_state</code></td><td>From the event reader’s stored state.</td><td>E.3</td></tr>
+<tr><td>Context gauge, sessions.rs:16971 <code>provider_has_measured_context_gauge</code></td><td>True.</td><td>E.2</td></tr>
+<tr><td>Restore, sessions.rs:5728 <code>restore_core_session_with_runtime</code>, 970 <code>reconcile_missing_session_runtimes</code>, 1031 <code>recover_session_runtime_launches</code>, 12751 <code>provider_resume_id_for_restore</code>; runtime.rs:630 <code>restore_session</code>; http/agent_history.rs:132; http/auto_retire.rs:16 <code>RESTORABLE_PROVIDERS</code>; http/ask.rs:119</td><td>Restorable; F.1.</td><td>F.1</td></tr>
+<tr><td>Retire, sessions.rs:7432</td><td>Kill tmux, then confirm the server exited.</td><td>F.2</td></tr>
+<tr><td>Clear, sessions.rs:~5300–5560 <code>clear_core_session_with_runtime</code>; runtime.rs:737 <code>clear_session</code></td><td>New conversation over HTTP.</td><td>F.3</td></tr>
+<tr><td><code>sm what</code>, http.rs:10222–10309 <code>run_btw_request</code></td><td>400 <code>provider opencode does not support sm what</code> (the existing unsupported path).</td><td>F.5</td></tr>
+<tr><td>Attach, http.rs:12674 <code>attach_descriptor_payload</code>; bin/sm.rs:4760; http/browser_terminal.rs</td><td>Unchanged: tmux attach.</td><td>F.7</td></tr>
+<tr><td>Usage, sessions.rs:495; usage_ledger.rs:1060–1090 <code>scan_artifact</code>; usage_identity.rs:27; quota_rates.rs:61–117; activity_ledger.rs:205; usage_report.rs, usage_meters.rs, analytics_spend.rs</td><td>Local account, zero rate.</td><td>G</td></tr>
+<tr><td>Handoff, handoff/policy.rs:77–120; handoff/store.rs:112</td><td>Enabled by default at 75 / 85 / 50, window 200,000.</td><td>H</td></tr>
+<tr><td>UI labels: web/ui.js:340 <code>providerLabel</code>, web/agents.js:468–489, web/settings.js:315 (handoff list), web/handoff.js:52; Android WatchScreen.kt:1221, 2035, HandoffControls.kt:170–207</td><td>LOCAL badge; handoff row.</td><td>K</td></tr>
+<tr><td>Start pickers: web/start.js, web/board-start.js, web/launch-fields.js, Android CreateSessionSheet.kt; validators owner_settings.rs:319, board/launch.rs:17, http/board.rs:1476</td><td>Unchanged in #1956: local is not offered there until #1959.</td><td>K</td></tr>
+</tbody>
+</table>
+
+<h4>B.1 Persisted shapes</h4>
+<p><b>Session record</b> (sessions.rs:16066 and the sibling structs that carry <code>provider</code>). For <code>provider = "opencode"</code>:</p>
+<pre>"provider": "opencode",
+"provider_resume_id": "ses_efbf952ffffeGHJl3LNU4jXFIL",   // opencode conversation id
+"model": "qwen3.8-flash-next",
+"tmux_session": "sm-rust-opencode-5b7e12aa-…",            // core_tmux_session_name, unchanged
+"opencode": {
+  "port": 18503,
+  "state_dir": "/Users/rajesh/.local/share/claude-sessions/opencode/5b7e12aa",
+  "version": "1.17.9",
+  "model_base_url": "http://127.0.0.1:8000/v1"
+}</pre>
+<p><code>opencode</code> is <code>Option&lt;…&gt;</code> with <code>#[serde(default, skip_serializing_if = "Option::is_none")]</code>, so existing records are unchanged on disk. It is required when the provider is <code>opencode</code>; a record with the provider and no object loads as stopped with error <code>opencode session missing its runtime binding</code>. <code>reasoning_effort</code> is always null.</p>
+<p><b>Message queue</b> (queue.rs:3597, <code>message_queue</code>): three new nullable columns, <code>provider_message_id TEXT</code>, <code>provider_part_id TEXT</code> and <code>provider_conversation_id TEXT</code> (the conversation the ids were issued for), added by the existing migration pattern. Null for every other provider.</p>
+<p><b>Sessions:</b> one new nullable column, <code>provider_event_cursor TEXT</code> (E.1’s backfill cursor), by the existing migration pattern; null for other providers and reset to null by <code>sm clear</code>.</p>
+<p><b>Launch record</b> (sessions.rs:15926): two new optional fields, <code>brief_message_id</code> and <code>brief_part_id</code>, written before the brief is first sent (D.4).</p>
+<p><b>Per-agent state folder</b>, <code>&lt;opencode.state_root&gt;/&lt;sm id&gt;/</code>, created at spawn and never deleted by sm (it holds the conversation, which restore needs):</p>
+<pre>xdg/config/opencode/opencode.json     config (C.3)
+xdg/config/opencode/plugins/sm_judge.js
+xdg/config/opencode/node_modules/…     plugin library, copied from the prepared copy (C.4)
+xdg/data/  xdg/cache/  xdg/state/      opencode's own; xdg/data holds the conversation database
+server.secret                          server password, mode 0600
+wall.sb                                the wall profile generated at launch
+launch-serve.sh  launch-attach.sh      the two window scripts (C.5)
+serve.pid  serve.log                   server process id and its log
+usage.jsonl                            usage lines (E.2), the usage ledger's artifact
+tmp/                                   the agent's TMPDIR and TMUX_TMPDIR</pre>
+<p>Inside the wall only <code>xdg/data</code>, <code>xdg/cache</code>, <code>xdg/state</code> and <code>tmp/</code> are writable. Everything else here — config, judge plugin, plugin library, <code>server.secret</code>, <code>wall.sb</code>, the window scripts, <code>serve.pid</code>, <code>serve.log</code>, <code>usage.jsonl</code> — is written only by sm or by <code>launch-serve.sh</code>, which runs outside the wall. The judge plugin’s decision log is therefore <code>xdg/state/plugin.jsonl</code>; it is the agent’s own record, and the authoritative decision log is the judge service’s, outside the wall. So an agent cannot edit its profile, its judge or its scripts and then kill its server to be restarted with them. Test: from inside the wall, writes to <code>wall.sb</code>, <code>sm_judge.js</code> and <code>launch-serve.sh</code> fail, while an allowed tool call under these write rules succeeds and logs to <code>xdg/state/plugin.jsonl</code>; after killing the server, the restarted one runs the original profile (a denied <code>curl</code> is still denied). If opencode itself needs to write under <code>xdg/config</code> at run time, #1956 reports it rather than widening the rule.</p>
+<p><b>Configuration</b>, a new block in sm’s config with these defaults:</p>
+<pre>opencode:
+  binary: /opt/homebrew/bin/opencode
+  version: "1.17.9"
+  state_root: ~/.local/share/claude-sessions/opencode
+  port_range: [18500, 18599]
+  model_base_url: http://127.0.0.1:8000/v1
+  model_id: qwen3.8-flash-next
+  context_window: 200000
+  output_limit: 32000
+  max_agents: 1
+  judge_url: http://127.0.0.1:8441
+  health_timeout_secs: 60
+  confirm_timeout_secs: 10</pre>
+
+<h3 id="c">C. Launch</h3>
+
+<h4>C.1 Entry points</h4>
+<ul>
+<li>CLI: <code>sm spawn local [--name N] [--model M] "brief"</code>, <code>sm spawn opencode …</code> (alias) and <code>sm local</code>. <code>--effort</code> is accepted and ignored; the spawn result adds <code>(effort ignored: local)</code>.</li>
+<li>HTTP: <code>POST /sessions/spawn</code> and <code>POST /client/sessions</code> accept <code>"provider": "opencode"</code>.</li>
+<li>Every session-creation route (<code>sm spawn</code>, <code>sm local</code>/<code>POST /sessions</code>, and any other that creates a session) refuses a request from a local agent with 403 <code>local agents cannot spawn agents</code>. The caller is identified by the wall’s sm gateway (I.2 item 8), never by anything in the request: a local agent reaches sm only through its own gateway port, which stamps every request with the agent’s id. A request so stamped is refused on every session-creation route, whatever <code>parent_session_id</code> it claims or omits. Tests: through the gateway, 403 for <code>sm spawn</code> and for a direct <code>POST /sessions</code> with no parent field and with a forged one; a script the agent writes and runs gets the same 403, because the check is on the connection, not the command text. Handoff successors are created by sm itself (handoff/transfer.rs) and are not refused; they inherit <code>provider = "opencode"</code> as successors already inherit provider.</li>
+<li>Board start, owner settings’ <code>new_agent.provider</code> and the web and Android start sheets do not offer <code>opencode</code> until #1959.</li>
+</ul>
+
+<h4>C.2 Checks before launch, in order</h4>
+<ol>
+<li><b>Seats.</b> If the number of non-stopped <code>opencode</code> sessions is at least <code>max_agents</code>, refuse with 409 <code>no local seat free (1/1 used by &lt;name&gt;)</code>. #1958 later replaces this with waiting. <b>A handoff successor skips this check</b>: it takes its predecessor’s seat, which <code>complete_handoff</code> frees moments later by retiring the predecessor. Counting the predecessor would refuse every local handoff at <code>max_agents = 1</code> (or, under #1958, wait forever for a seat only the successor’s start can free). Example: <code>sm-2001-fix</code> holds the one seat and hands off; its successor starts with 2/1 seats briefly in use; the predecessor retires and the count is 1/1 again. The overlap costs under 1 GB (two opencode servers on one model). Test: at <code>max_agents = 1</code> a local handoff completes, while an ordinary second launch is still refused.</li>
+<li><b>Model.</b> Until #1957 ships: <code>GET &lt;model_base_url&gt;/models</code> must answer 200 within 5 s, else 409 <code>no local model loaded</code>. After #1957: the <code>local_model</code> state must be <code>ready</code>. An explicit <code>--model</code> that differs from <code>model_id</code> (or the loaded identifier) is refused with 409 <code>model &lt;m&gt; is not loaded; loaded: &lt;id&gt;</code>.</li>
+<li><b>Version.</b> <code>&lt;binary&gt; --version</code> must print exactly <code>version</code>, else 409 <code>opencode &lt;found&gt; is installed; sm is pinned to &lt;version&gt;</code>.</li>
+<li><b>Plugin library</b> (C.4) is prepared, or preparing it succeeds.</li>
+<li><b>Wall prerequisites</b> from the wall ticket: the judge service answers, the egress proxy is up.</li>
+<li><b>Port.</b> The lowest port in <code>port_range</code> not held by another non-stopped opencode session and not accepting connections. None free: 409 <code>no local port free</code>.</li>
+</ol>
+
+<h4>C.3 The opencode config file</h4>
+<p>Written to <code>xdg/config/opencode/opencode.json</code> at every launch and restore (so a config change in sm takes effect on restore):</p>
+<pre>{"$schema": "https://opencode.ai/config.json",
+ "autoupdate": false, "share": "disabled", "snapshot": false, "lsp": false, "formatter": false,
+ "provider": {"local": {"npm": "@ai-sdk/openai-compatible", "name": "Local model",
+   "options": {"baseURL": "&lt;model_base_url&gt;", "apiKey": "local", "timeout": 3000000},
+   "models": {"&lt;model_id&gt;": {"name": "&lt;model_id&gt;",
+     "limit": {"context": &lt;context_window&gt;, "output": &lt;output_limit&gt;}}}}},
+ "model": "local/&lt;model_id&gt;", "small_model": "local/&lt;model_id&gt;", "enabled_providers": ["local"],
+ "compaction": {"auto": true},
+ "permission": {"*": "allow", "question": "deny", "task": "deny", "webfetch": "deny",
+   "websearch": "deny", "doom_loop": "allow", "external_directory": "allow"}}</pre>
+<p>No permission is <code>ask</code>, so nothing can wait on a human; the judge plugin (I.1) runs before opencode’s own check and decides. <code>question</code> is denied so the agent cannot block on a question to a person; <code>task</code> is denied so it cannot start sub-agents. Test: a unit test renders the file for a fixed config and compares it byte for byte.</p>
+
+<h4>C.4 The plugin library</h4>
+<p>opencode installs <code>@opencode-ai/plugin</code> into its config folder from npm when it first starts with a plugin present. Inside the wall there is no network, so sm prepares it outside: if <code>&lt;state_root&gt;/plugin-sdk/&lt;version&gt;/node_modules/@opencode-ai</code> does not exist, sm writes a minimal config there and runs <code>opencode debug config</code> with <code>XDG_CONFIG_HOME</code> pointing at it, outside the wall, with a 120-second timeout. At each launch sm copies that folder’s <code>node_modules</code>, <code>package.json</code> and lock file into the agent’s config folder. Failure: 409 <code>opencode plugin library could not be prepared: &lt;last 400 bytes of output&gt;</code>. Never pass <code>--pure</code>: it skips local plugins and with them the judge.</p>
+
+<h4>C.5 Process layout and start</h4>
+<p>The tmux session keeps sm’s existing name and socket. It has two windows:</p>
+<table>
+<thead><tr><th>Window</th><th>Runs</th><th>Inside the wall?</th></tr></thead>
+<tbody>
+<tr><td><code>serve</code></td><td><code>launch-serve.sh</code>: loop — <code>sandbox-exec -f wall.sb opencode serve --port &lt;port&gt; --hostname 127.0.0.1 --print-logs --log-level INFO</code> in the background, write its pid to <code>serve.pid</code>, wait; on exit, wait 5 s and start again, at most 5 starts in 10 minutes, then exit.</td><td>The server, yes</td></tr>
+<tr><td><code>agent</code> (selected)</td><td><code>launch-attach.sh</code>: loop — <code>opencode attach http://127.0.0.1:&lt;port&gt; --session &lt;ses id&gt;</code>; on exit, wait 2 s and start again.</td><td>No: it is a viewer and holds nothing the agent can reach</td></tr>
+</tbody>
+</table>
+<p>The server’s environment, set with <code>env -i</code> plus: <code>HOME</code>, <code>USER</code>, <code>LOGNAME</code>, <code>SHELL</code>, <code>LANG</code>, <code>TERM</code>, a fixed <code>PATH</code> (sm’s client folder first); <code>XDG_CONFIG_HOME</code>, <code>XDG_DATA_HOME</code>, <code>XDG_CACHE_HOME</code>, <code>XDG_STATE_HOME</code> → the state folder’s <code>xdg/…</code>; <code>OPENCODE_DISABLE_AUTOUPDATE=1</code>, <code>OPENCODE_DISABLE_MODELS_FETCH=1</code>, <code>OPENCODE_DISABLE_LSP_DOWNLOAD=1</code>; <code>OPENCODE_SERVER_USERNAME=opencode</code>, <code>OPENCODE_SERVER_PASSWORD=&lt;server.secret&gt;</code>; sm’s session variables as <code>managed_session_command</code> exports them (<code>SESSION_MANAGER_ID</code>, <code>CLAUDE_SESSION_MANAGER_ID</code>, <code>SM_SESSION_CREDENTIAL</code>); the judge variables <code>LOCAL_AGENT_ID=&lt;sm id&gt;</code>, <code>LOCAL_JUDGE_URL=&lt;judge_url&gt;</code>, <code>SM_JUDGE_PLUGIN_LOG=&lt;state&gt;/xdg/state/plugin.jsonl</code> (inside a folder the wall lets it write); <code>PWD</code> and the working folder = the agent’s checkout; plus the wall ticket’s variables (<code>SM_API_URL</code> → the agent’s sm gateway, proxy, <code>NO_PROXY</code> for loopback, <code>TMPDIR</code>, <code>TMUX_TMPDIR</code>, git identity). No <code>ANTHROPIC_*</code> or <code>OPENAI_*</code> variable is set. The attach window gets only the password variables and <code>TERM</code>.</p>
+<p><code>server.secret</code> is 32 random bytes, hex-encoded, created once per state folder. Every HTTP call sm makes to the server sends basic authentication with it. Another local agent cannot reach this server, even one launched earlier whose wall predates this port: every wall denies the whole <code>port_range</code>, its own agent’s port included (sm and the attach view connect from outside), and denies reading every other agent’s state folder, so it can neither connect nor read this password (wall ticket, I.2 item 2).</p>
+<p><b>Start sequence.</b></p>
+<ol>
+<li>Write the launch record (<code>status: launching</code>), as today.</li>
+<li>Create the state folder, config (C.3), plugin (I.1), library (C.4), <code>wall.sb</code> (wall ticket), the two scripts.</li>
+<li><code>tmux new-session</code> with the <code>serve</code> window; <code>pipe-pane</code> it into <code>serve.log</code>.</li>
+<li>Poll <code>GET /global/health</code> every 250 ms until 200, up to <code>health_timeout_secs</code>. Timeout: kill the tmux session, fail the launch with <code>opencode server did not start: &lt;last 20 lines of serve.log&gt;</code>.</li>
+<li><code>POST /session</code> with <code>{"title": "&lt;friendly name&gt;"}</code>; store the returned id as <code>provider_resume_id</code>.</li>
+<li>Start the event reader (E).</li>
+<li>Create the <code>agent</code> window running <code>launch-attach.sh</code>, select it, and <code>pipe-pane</code> it into the session’s existing <code>log_file</code> (so <code>sm output</code> keeps its meaning: what you would see).</li>
+<li>Deliver the brief (D.4). On confirmation, mark the launch applied and the session running, as today.</li>
+</ol>
+<p><b>Readiness</b>, wherever sm asks whether a session can take input (<code>session_input_ready</code>, <code>wait_for_initial_brief_readiness</code>, handoff’s successor wait): the health call answers 200 and <code>GET /session/status</code> answers. Busy or idle does not matter, because opencode queues input.</p>
+<p>Tests: a launch against a stub opencode HTTP server (C.7) produces the two windows, the files above with modes, the environment (asserting no <code>ANTHROPIC_</code> variable), and the three HTTP calls in order.</p>
+
+<h4>C.6 Failure handling</h4>
+<p>Any failure before step 8 removes the provisional session as today and keeps the state folder (named in the error) for diagnosis. A crash of sm between steps is recovered at boot by <code>recover_session_runtime_launches</code>: with a launch record in <code>launching</code> and a conversation id present, sm resumes at step 6; without one, it fails the launch.</p>
+
+<h4>C.7 Test double</h4>
+<p>#1956 adds a stub opencode server for tests (Rust, in the test module, on an ephemeral port) implementing: health; create session; status; message get by id (200 after a stored message, 404 otherwise); <code>prompt_async</code> (stores, and with a test switch appends text on a repeated id, as real opencode does); <code>PATCH /session/{id}</code>; abort (records the call; tests assert it is made only by <code>sm clear</code>); and an event stream the test can write to. The proof’s <code>kit/fake_oai.py</code> and <code>kit/oc_bridge.py</code> in <code>docs/working/1966_artifacts/</code> show the real request and event shapes.</p>
+
+<h3 id="d">D. Delivery</h3>
+
+<h4>D.1 Modes</h4>
+<p>Every message to an opencode session — <code>sm send</code> in any mode, reminders, queue completions, parent wakes, stop notices, handoff notices, context-monitor messages, rename requests — is persisted to the message queue and delivered in queue order by D.2. A rename row takes D.2’s rename branch (a title change, not a prompt); every other row is sent as a prompt. The text is exactly what sm types for Claude today (<code>format_send_input_text_raw</code>, <code>PendingMessage::delivery_text</code>). Differences from tmux providers:</p>
+<ul>
+<li><b>No ready fence.</b> A message is sent whether the agent is busy or idle; opencode stores it and the model reads it at its next step. Background categories (<code>BACKGROUND_RETRY_MESSAGE_CATEGORIES</code>) need no idle check.</li>
+<li><b>Urgent is ordinary.</b> No Ctrl-B, no Escape, no abort. <code>POST /session/{id}/abort</code> is called by sm only in <code>sm clear</code> (F), never for a message.</li>
+<li><b>Control predecessors</b> (sessions.rs:11715: after an urgent or rename message the drain stops until the next pass) do not apply; the drain continues in queue order.</li>
+<li><b>Gone runtime.</b> A connection failure is not a reason to mark the session stopped. Only an absent tmux session is (unchanged rule).</li>
+</ul>
+
+<h4>D.2 One delivery attempt</h4>
+<p>For the oldest pending row for the session (rows are strictly ordered; a later row is not attempted until every earlier row is delivered). <b>Rename branch:</b> if the row is a rename request, sm sends <code>PATCH /session/{ses}</code> with <code>{"title": "&lt;name&gt;"}</code> instead of steps 1–4. A 2xx marks the row delivered (step 5); anything else, or no connection, leaves it pending and stops this pass. Resending is safe because setting the same title twice changes nothing, so no message id and no GET are needed. Example: rows 50 (rename to <code>sm-2001-fix</code>) and 51 (<code>sm send</code>) are pending; row 50’s PATCH times out, both stay pending; next pass the PATCH succeeds, then row 51 goes through steps 1–5. Every other row:</p>
+<ol>
+<li>If <code>provider_message_id</code> is null, generate a message id and a part id (D.3) and store both, with the current <code>provider_resume_id</code> as <code>provider_conversation_id</code>, on the row in one write. From then on the row keeps them, and steps 2–4 address that conversation.</li>
+<li><code>GET /session/{ses}/message/{message id}</code>. 200: go to step 5. 404: continue. Anything else, or no connection: leave the row pending; stop this pass.</li>
+<li><code>POST /session/{ses}/prompt_async</code> with <code>{"messageID": id, "parts": [{"id": part id, "type": "text", "text": text}]}</code>.</li>
+<li>Poll the GET of step 2 every 250 ms for up to <code>confirm_timeout_secs</code>. 200: continue. Otherwise leave the row pending; stop this pass.</li>
+<li>Mark the row delivered through <code>complete_runtime_message_delivery_raw</code>, which applies the existing side effects (delivery acknowledgements, stop-notify, reminder registration, parent wake) in one transaction.</li>
+</ol>
+<p><b>When attempts run.</b> Immediately when a row is queued (the same call sites that drain today), on every event-reader (re)connection, and in the 5-second background retry sweep (main.rs:335), which for opencode sessions covers every pending row, not only the background categories. Attempts for one session are serialised by the existing per-session input lock.</p>
+<p><b>Once a handoff starts</b> (the successor’s creation begins), no row is attempted to the predecessor: new rows stay pending and move to the successor with the others, so nothing lands in a conversation that is about to retire. Example: <code>sm send</code> arrives while the successor is starting; it stays pending, moves, and the successor receives it first. Test: a send arriving between handoff start and the predecessor’s retirement reaches the successor exactly once and the predecessor never.</p>
+<p><b>Before the conversation changes.</b> <code>sm clear</code> (F) and a handoff that moves pending rows to a successor first run step 2 for every pending row of the session that holds ids, against the row’s stored conversation on the current server: 200 marks it delivered; 404 clears its three ids, so it is sent fresh to the new conversation. If the server does not answer, <code>sm clear</code> is refused with 409 <code>opencode server unreachable; pending messages unresolved</code>; a handoff is deferred: the predecessor is not retired and no row moves until every such row is resolved, retried on each 5-second sweep. If the server still does not answer after 10 minutes, the handoff fails with <code>handoff blocked: unresolved deliveries to an unreachable conversation</code> on the predecessor, rows stay with it, and nothing is sent twice. Restoring the predecessor (C.5) lets the next attempt resolve them. Example: row 60 was posted, then sm crashed before marking it; on restart the owner runs <code>sm clear</code>. The GET answers 200, so row 60 is marked delivered and is not posted again into the new conversation. Test: the same sequence against the stub; one prompt total.</p>
+<p><b>Why step 2 before step 3, every time.</b> opencode does not refuse a repeated message id: reposting one appended the text to the stored message (proof finding P.4 item 1). The GET is what makes a resend after a lost reply, an sm crash or an opencode restart deliver nothing twice.</p>
+<p><b>Example.</b> Row 41 (<code>sm send</code>) is queued while the server restarts. Pass 1: ids <code>msg_10a2…</code>/<code>prt_10a2…</code> stored; GET fails to connect; row stays pending. Five seconds later the server is up. Pass 2: GET → 404; POST; GET → 200 at 0.3 s; delivered; the sender’s <code>--notify-on-delivery</code> acknowledgement fires. If sm had crashed after the POST and before marking, pass 3 (after restart) would GET → 200 and mark it delivered without posting.</p>
+<p>Tests (against C.7’s stub): a row is delivered once across a forced failure between POST and marking; with the stub’s repeat-append switch on, the stored text is never doubled; urgent and background rows to a busy session are delivered without waiting; abort is never called; a later row is not posted while an earlier one is pending.</p>
+
+<h4>D.3 Ids</h4>
+<p>opencode orders a conversation by id, so ids are generated at the first attempt, never earlier. Format, as opencode generates them: the prefix (<code>msg</code> or <code>prt</code>), an underscore, 12 lower-case hex digits of <code>(unix milliseconds × 4096 + counter) mod 2<sup>48</sup></code>, where the counter starts at 1 each new millisecond and increments within one, then 14 random characters from <code>0-9A-Za-z</code>. Example: <code>msg_1041e3ac0001WxqUWbXtu5JPXu</code>. Test: ids generated in sequence sort ascending as strings. Consequence, accepted: a row that first failed long ago keeps its earlier id, so if you typed in the attach view meanwhile, opencode places the late row before your message in the conversation. The model still reads both.</p>
+
+<h4>D.4 The brief</h4>
+<p>The spawn brief uses D.2 with the ids stored on the launch record (<code>brief_message_id</code>, <code>brief_part_id</code>) instead of a queue row, so that recovery after a crash runs the same check. It differs from D.2 in timing only: the spawn waits for confirmation up to <code>initial_brief_ack_timeout</code> (the existing setting) and retries a failed attempt every second within it. On timeout the launch fails as <code>ProviderAcceptanceTimedOut</code> today, and the brief stays retained as today. Unlike the Claude path (runtime.rs:1568, “no retry after submission”), a retry is safe here because of the check. The brief text is the stored brief artifact with F.6’s addendum prepended.</p>
+
+<h4>D.5 What you type in the attach view</h4>
+<p>A user message that reaches the event stream with an id sm did not generate is yours. sm treats it as Claude’s <code>UserPromptSubmit</code> for an owner-typed prompt (E.1), so owner-answer tracking works as it does when you type into a Claude agent.</p>
+
+<h3 id="e">E. The event reader</h3>
+<p>One thread per running opencode session, in the style of the codex-fork event monitor (<code>monitor_codex_fork_event_stream</code>, sessions.rs:8174), started at launch step 6, at restore and at boot for every non-stopped opencode session. It opens <code>GET /event</code> (server-sent events, basic authentication) with the blocking <code>ureq</code> client already in the workspace, reads it line by line, and acts only on events whose <code>sessionID</code> is the session’s current conversation id, read from <code>provider_resume_id</code> on each event, never captured once at start, so it follows <code>sm clear</code> (F) without a restart. Events for an earlier conversation id are ignored. On disconnect it reconnects after 1 s, then 2, 4, up to 5 s. It exits when the session is stopped.</p>
+
+<h4>E.1 Mapping</h4>
+<table>
+<thead><tr><th style="width:30%">opencode event</th><th>sm effect (the store transition named is the one the Claude hook uses today; #1956 makes it callable without the HTTP hook)</th></tr></thead>
+<tbody>
+<tr><td>Connection opened or reopened</td><td><code>GET /session/status</code>, compared with sm’s stored status. Only a difference is applied, as the rows below (busy or retry while sm shows idle → turn start; idle while sm shows working → turn stop). A match applies nothing, so a reconnect never clears a recorded completion or fabricates a stop that would kick handoff. Before comparing, sm backfills: <code>GET /session/{id}/message</code>, and every message from <code>provider_event_cursor</code> onward (a new nullable session column: the id of the last message whose events sm applied; that message itself is replayed again, with part-id deduplication, until it is complete) is replayed through the rows below in order — its user message as a turn start, tool parts, <code>step-finish</code> parts (deduplicated by part id), and, if it ended and the status is now idle, a turn stop. The cursor advances past a message only once it is complete (its <code>time.completed</code> is set); an incomplete message stays the cursor and is revisited on the next reconnect, with parts already seen skipped. So a turn that started and finished while disconnected is recorded once, with its tools, usage, completion and handoff check. Then run a delivery pass (D.2). Tests: a whole turn emitted while the reader is down is applied once on reconnect; two disconnects during one assistant message lose no tool or usage part and duplicate none; reconnect while busy and sm shows working, and while idle and sm shows idle with a completion recorded: no hook runs, the completion survives, no handoff ask; reconnect after a missed idle: one turn stop.</td></tr>
+<tr><td><code>session.status</code> <code>busy</code> or <code>retry</code>, from idle</td><td>Turn start: <code>apply_claude_user_prompt_submit_hook</code> (sessions.rs:2203) with the last user message’s text; owner-typed when D.5 says so.</td></tr>
+<tr><td><code>session.status</code> <code>idle</code>, from busy or retry</td><td>Turn stop: <code>apply_claude_stop_hook</code> (sessions.rs:1983) with <code>last_assistant_message</code> = the text of the last assistant message (<code>GET /session/{id}/message</code>, last entry with role assistant). The returned <code>stop_applied</code> kicks handoff as today.</td></tr>
+<tr><td><code>message.part.updated</code>, tool part entering <code>running</code></td><td><code>apply_claude_pre_tool_use_hook</code> (sessions.rs:2158) with the tool name; one row in the tool-usage log.</td></tr>
+<tr><td><code>message.part.updated</code>, <code>step-finish</code> part, first time this part id is seen</td><td>One usage line (E.2), then a context update (E.2).</td></tr>
+<tr><td><code>session.compacted</code></td><td><code>apply_compaction_event</code> (sessions.rs:6434) with <code>compaction_complete</code>.</td></tr>
+<tr><td><code>session.updated</code> with a title</td><td>Native title for display (F.4).</td></tr>
+<tr><td><code>session.error</code></td><td>Stores the error text on the session as <code>last_provider_error</code>, shown in <code>sm show</code>; no status change (opencode reports idle after it).</td></tr>
+<tr><td><code>message.updated</code>, role user, an id sm did not generate, first time seen</td><td>Owner prompt (D.5), whatever the status: marks the outstanding owner message answered and wakes what waits on it, as Claude’s <code>UserPromptSubmit</code> does for owner input. If this message also starts a turn, the status row above applies the turn start once, not twice. Test: owner input typed while a turn is running is recorded as owner input.</td></tr>
+<tr><td>Anything else</td><td>Updates <code>last_activity</code> only.</td></tr>
+</tbody>
+</table>
+<p>Example from the proof’s probe run: brief sent at 23:09:10; <code>busy</code> → sm shows working; a <code>bash</code> tool part → last tool <code>bash</code>; a <code>step-finish</code> with 120 input, 7 output, 900 cache-read tokens → context 0.5%; <code>idle</code> → sm shows idle with the agent’s last reply. sm lagged opencode by about one second throughout.</p>
+
+<h4>E.2 Usage lines and the context gauge</h4>
+<p>For each new <code>step-finish</code> part, sm appends one compact JSON line to <code>usage.jsonl</code> in the state folder. The shape is Claude’s, so the existing line parser reads it:</p>
+<pre>{"type":"assistant","timestamp":"2026-10-03T23:09:11.565Z","sessionId":"&lt;ses id&gt;","cwd":"&lt;checkout&gt;",
+ "requestId":"&lt;part id&gt;","message":{"id":"&lt;part id&gt;","model":"local/&lt;model_id&gt;","role":"assistant","content":[],
+ "usage":{"input_tokens":120,"output_tokens":7,"cache_read_input_tokens":900,"cache_creation_input_tokens":0}}}</pre>
+<p>Fields from the part’s <code>tokens</code>: input → <code>input_tokens</code>; output plus reasoning → <code>output_tokens</code>; <code>cache.read</code> → cache read; <code>cache.write</code> → cache creation. The line must contain the exact bytes <code>"usage":{</code> (the parser skips lines without them). Part ids already seen are remembered per session (in memory, and rebuilt at reader start by reading <code>usage.jsonl</code>), so a reconnection that replays a part writes nothing twice.</p>
+<p>Context: <code>apply_context_usage_event</code> (sessions.rs:6365) with total input = input + cache read + cache write, window = <code>context_window</code>, used percentage = total ÷ window × 100, model id = <code>model_id</code>. Example: 150,000 of 200,000 → 75%.</p>
+
+<h4>E.3 Status shown</h4>
+<p><code>live_activity_state</code> for opencode returns <code>working</code> while the last applied status is busy or retry, <code>idle</code> when idle, and <code>None</code> (the existing fallback) when the reader has not connected for more than 60 s. It never reads the pane. There is no <code>waiting_permission</code>: nothing in the config asks.</p>
+
+<h3 id="f">F. Restore, retire, clear, rename, <code>sm what</code>, attach</h3>
+
+<h4>F.1 Restore and boot</h4>
+<ul>
+<li><b>Restorable.</b> <code>opencode</code> joins <code>RESTORABLE_PROVIDERS</code> and every restorable list (B). <code>provider_resume_id_for_restore</code> returns the stored conversation id; none stored → <code>MissingProviderResumeId</code>.</li>
+<li><b>Restore</b> = C.5’s start sequence with the existing state folder and conversation id: skip step 5 and step 8 (no new conversation, no brief), pick a port by C.2 step 6 (it may differ; the record is updated), rewrite the config and scripts. Then run a delivery pass, so messages held while it was down arrive in order. The model reads its whole earlier conversation from the server’s database: proved after process, full and model restarts (P.2 row 4).</li>
+<li><b>Boot.</b> Unchanged rule: a non-stopped session whose tmux session is absent is marked stopped with the existing “use sm restore” error. A session whose tmux is alive gets its event reader restarted.</li>
+<li><b>Server crash</b> while tmux is alive: <code>launch-serve.sh</code> restarts it (C.5); the reader reconnects; pending rows deliver. After 5 restarts in 10 minutes the script exits; sm sees the <code>serve</code> window’s process gone at the next reconcile and marks the session stopped with <code>opencode server keeps exiting; see &lt;state&gt;/serve.log</code>.</li>
+<li>Test: stop and restore a stub-backed session; assert the same conversation id, a new or same port, the config rewritten, no brief re-sent, held rows delivered once.</li>
+</ul>
+
+<h4>F.2 Retire</h4>
+<p>Unchanged up to <code>tmux kill-session</code>. Then sm waits up to 10 s for the port to stop accepting connections; if it still does, sends SIGTERM to the pid in <code>serve.pid</code> (only if that process’s command line contains <code>opencode serve</code> and the state folder), waits 5 s, and records <code>opencode server did not exit</code> on the session if it still runs. The state folder is kept. Test: retire with a stub that ignores SIGHUP; assert the SIGTERM.</p>
+
+<h4>F.3 Clear</h4>
+<p><code>sm clear</code> on an opencode session: if the current conversation is busy or retrying, <code>POST /session/{old}/abort</code>, then wait up to 10 s for <code>GET /session/status</code> to show it idle; if it does not, refuse with 409 <code>opencode conversation did not stop; clear not applied</code> and change nothing, so no old turn keeps editing the checkout unseen. Then <code>POST /session</code> with the session’s title; the new conversation id becomes <code>provider_resume_id</code> and is appended to <code>seat_sessions</code> (G) before any prompt goes to it, so its usage lines resolve to the seat (the old id’s row stays, keeping its usage); the event reader switches to the new id (E); <code>tmux respawn-window -k</code> on the <code>agent</code> window with the new id; <code>reset_session_after_clear</code> and context-alert cancellation as today; an optional prompt is delivered by D.2. Nothing is typed. Test: a clear during a running tool aborts the old conversation, sees it idle, then switches; a stub that never goes idle gets the 409 and the old id stays current. Test: after a clear, the stub emits busy, a tool call, usage and idle for the new id and sm applies each, while the same events for the old id are ignored; usage written under the new id lands on the agent’s seat.</p>
+
+<h4>F.4 Rename and display name</h4>
+<p>A rename row delivers through D.2’s rename branch (<code>PATCH /session/{id}</code> with <code>{"title": "&lt;name&gt;"}</code>, in queue order, retried until a 2xx). Test: a rename row queued ahead of a send reaches the stub as a PATCH, never as a prompt, and the send is not attempted until the PATCH succeeds. <code>cached_display_name</code> accepts native titles from <code>opencode</code>, fed by E.1’s <code>session.updated</code>. Generated names come from <code>STAR_NAMES</code>.</p>
+
+<h4>F.5 <code>sm what</code></h4>
+<p>Returns 400 <code>provider opencode does not support sm what</code>, through the existing unsupported-provider path (http.rs:10302).</p>
+
+<h4>F.6 Brief addendum</h4>
+<p>As #1784 C.7: sm prepends a fixed block of about 150 words, read at spawn from <code>docs/product/local_agent_addendum.md</code>, to every local agent’s brief. It says: your tier is Local; you cannot spawn or delegate; run <code>sm status</code> on <code>[sm remind]</code>; open a PR and run <code>sm request-review</code>; if blocked, report to your parent with <code>sm send</code> and stop. #1956 writes the file.</p>
+
+<h4>F.7 Attach and output</h4>
+<p><code>sm attach</code>, the attach descriptor, the web and phone terminals: unchanged; they attach the tmux session, whose selected window is the attach view. Typing there reaches the agent as your message (D.5). <code>sm output</code> tails <code>log_file</code>, which the <code>agent</code> window feeds. Claude Remote Control does not apply.</p>
+
+<h3 id="g">G. Usage accounting</h3>
+<ul>
+<li><b>Artifact.</b> At launch, restore and clear, sm appends a <code>seat_sessions</code> row <code>(seat, provider = "opencode", provider_session_id = &lt;ses id&gt;, artifact_path = &lt;state&gt;/usage.jsonl)</code> through <code>append_seat_session</code>.</li>
+<li><b>Parse.</b> <code>scan_artifact</code> (usage_ledger.rs:1060–1090) parses <code>opencode</code> artifacts with <code>parse_claude_line</code>. <code>scan_usage_ledger</code> (sessions.rs:495) maps <code>opencode</code> to a new <code>UsageProvider::Local</code>.</li>
+<li><b>Account.</b> Local rows are booked to account key <code>local</code> (one row in <code>accounts</code>: <code>account_key = local, provider = local</code>), never to a Claude or Codex identity; <code>usage_identity</code> gains <code>Provider::Local</code> with that fixed key and no timeline lookup. Every quota consumer keys on account, so local rows leave Claude’s and Codex’s numbers untouched.</li>
+<li><b>Price.</b> <code>quota_rates::pricing</code> returns rate 0 with <code>needs_note = false</code> for provider <code>opencode</code> (and <code>local</code>), never the “unknown model priced as Opus” fallback that the proof hit.</li>
+<li><b>Other readers.</b> <code>activity_ledger.rs:205</code> accepts <code>opencode</code>; usage_report, usage_meters and analytics_spend skip <code>local</code> until #1959 adds the Spend line.</li>
+<li>Test: a ledger fixture with one opencode artifact and one Claude artifact over the same hour leaves the Claude weekly percentage identical to the Claude-only fixture, and books the opencode tokens exactly to <code>local</code>.</li>
+</ul>
+
+<h3 id="h">H. Handoff</h3>
+<p>In <code>HandoffDefaults::default()</code> (handoff/policy.rs:77): <code>providers.opencode = true</code>; <code>provider_thresholds.opencode</code> = threshold 75, reminder 85, review floor 50; <code>window_tokens.opencode = 200000</code>. <code>provider_has_measured_context_gauge</code> is true for <code>opencode</code>. The settings screens list opencode as a fourth row (K). Everything else about the ask (wording, reminders, successor creation, moving pending messages and claims) is unchanged; the successor is an opencode agent because successors inherit provider. Example: at 140K tokens (70%) no ask; at 150K the standard <code>[sm context management]</code> notice; at 170K the reminder. Test: an opencode session reporting 74% gets no ask, 75% gets one, while a Claude session at 35% still gets one.</p>
+<p><b>Compaction.</b> opencode compacts on its own when the conversation nears the window (<code>compaction.auto</code>). #1956 measures, with the stub-free real model, the token count at which it compacts under C.3’s config, records it in the PR, and confirms it is above 85% (the reminder). If it is not, the PR sets <code>compaction.reserved</code> so that it is.</p>
+
+<h3 id="i">I. The judge and the wall</h3>
+
+<h4>I.1 The judge plugin (#1956)</h4>
+<p>The plugin is <code>scripts/opencode/sm_judge.js</code> in the repo, a copy of the proof’s fixed <code>kit/sm_judge.js</code> with the judge URL read from <code>LOCAL_JUDGE_URL</code>. sm copies it to <code>xdg/config/opencode/plugins/</code> at every launch and restore. It hooks <code>tool.execute.before</code>, translates the call to #1954’s judge request shape, and throws on anything but allow:</p>
+<table>
+<thead><tr><th>opencode tool, arguments</th><th>Sent to the judge service as</th></tr></thead>
+<tbody>
+<tr><td><code>bash {command, workdir}</code></td><td><code>Bash {command}</code>, cwd = workdir or the checkout</td></tr>
+<tr><td><code>read {filePath}</code>; <code>glob</code>/<code>list</code>/<code>grep {path}</code>; <code>todowrite</code></td><td><code>Read {file_path}</code>; <code>Glob</code>/<code>Grep {path}</code>; <code>TodoWrite</code></td></tr>
+<tr><td><code>edit {filePath}</code>, <code>write {filePath}</code></td><td><code>Edit</code>/<code>Write {file_path}</code></td></tr>
+<tr><td><code>apply_patch {patchText}</code></td><td>One <code>Edit {file_path}</code> per file the patch adds, updates, deletes or moves to; any deny blocks the patch</td></tr>
+<tr><td>anything else</td><td>Its own name and arguments</td></tr>
+</tbody>
+</table>
+<p>Every path is made absolute against the checkout before sending (the proof’s one false denial came from a relative path). A deny, an unreachable judge service or an unreadable answer throws <code>Permission denied by the local judge: &lt;reason&gt;</code>; opencode records the tool as failed and shows the model that text. Each decision is logged to <code>plugin.jsonl</code> (time, call id, tool, allow, reason, milliseconds). Tests: the proof’s check that a relative edit inside the checkout is allowed while <code>../escape.txt</code> and an absolute path outside are denied, run against the judge service in rules-only mode; and #1954’s adversarial set run through the plugin rather than the Claude hook, 35/35 denied, 18/18 allowed, 5/5 look-alikes allowed.</p>
+<p>This replaces #1784 K.9.5’s requirement 2 (the Claude Code hook) and requirement 5 (Claude settings). The judge service itself, its answer shape, its log and its allow-once file (#1784 K.3, K.8) are unchanged.</p>
+
+<h4>I.2 The wall in production (new ticket)</h4>
+<p>Harness-independent; each item is #1784 K.9.5’s, restated with its test:</p>
+<ol>
+<li>The judge service runs as an sm-managed service, started by sm when the first local agent launches and kept running while any exists, with its decision log and allow file under <code>~/.local/share/claude-sessions/local-judge/</code>. sm registers each agent with it before launch (the fields of #1784 K.4: name, ticket, title, branch, checkout, temporary folder, parent, sm URL). Test: two launches register two agents; the service survives an sm restart.</li>
+<li>The wall profile is <code>kit/wall_profile.sh</code>’s (#1954), moved to <code>scripts/local-wall/</code>, generated at launch with the listening-port deny list taken then, admitting the agent’s sm gateway port (item 8; sm’s own ports 8420 and 8443 stay denied), the model server’s and the judge service’s. The agent’s own server port is denied for outbound connections too: the server only accepts connections, from sm and the attach view, both outside the wall, so nothing inside needs to call it, and a tool cannot use the inherited password to open untracked conversations (bypassing the no-spawn rule and <code>max_agents</code>). Test: from inside the wall, <code>POST /session</code> to the agent’s own port fails to connect, while a normal turn with tools still completes; if opencode turns out to call itself, #1956 reports it. It also denies every port of <code>opencode.port_range</code> except the agent’s own, whether or not it is listening at launch, and denies reading <code>&lt;state_root&gt;</code> except the agent’s own state folder, so an agent cannot reach a local agent launched after it (a handoff successor, say) or read its password. Test: with a predecessor running, launch a successor; from inside the predecessor’s wall, a connection to the successor’s port and a read of its <code>server.secret</code> both fail. Admitted ports are exempt from the profile’s fixed deny list too (which names 8000, the model’s default port, so the kit script now skips admitted ports there). Tests: <code>kit/wall_check.sh</code>’s 31 checks pass against a launched local session; with <code>model_base_url</code> at its default <code>http://127.0.0.1:8000/v1</code>, a model call from inside the wall succeeds while LM Studio’s 1234 stays denied.</li>
+<li>The agent’s environment carries <code>NO_PROXY</code> for loopback, the gh-only credential helper, <code>TMUX_TMPDIR</code> in its temporary folder, and a <code>TMPDIR</code> at least as long as the macOS per-user temporary path, so a socket-path bug fails inside the wall as it does outside. Its checkout carries a git identity naming the agent.</li>
+<li>A queue job submitted by a local session runs inside that session’s wall profile. The submitter is the gateway’s stamp (item 8), not <code>requester_session_id</code>: a stamped job runs in that agent’s wall even if the request omits or forges the requester or sets <code>--notify</code> elsewhere. Tests: a queued <code>curl https://example.com</code> from a local session fails; so does one submitted with session variables unset and <code>--notify rajesh</code>.</li>
+<li>GitHub credentials are held by the egress proxy and are not readable inside the wall. Test: <code>cat ~/.config/gh/hosts.yml</code> inside the wall fails while <code>git push</code> and <code>gh pr view</code> through the proxy succeed. If the proxy cannot hold them for gh, the ticket reports that rather than shipping a partial design.</li>
+<li>The proxy names the agent on every connection, git’s included (a port per agent or an authentication challenge).</li>
+<li><code>sm queue cancel</code> by a local session succeeds only for its own jobs (identified by the gateway’s stamp).</li>
+<li><b>sm gateway.</b> Each local agent gets a loopback gateway port, run by the egress proxy service outside the wall, and its environment’s <code>SM_API_URL</code> points there. The gateway forwards to sm, drops any client-supplied <code>X-SM-Local-Agent</code> header and adds <code>X-SM-Local-Agent: &lt;sm id&gt;</code> plus a gateway secret sm checks (stored where no wall can read it). sm treats a request carrying a valid stamp as from that local agent on every route and ignores the header without the secret. The wall admits only this port of sm’s, so a local agent has no unstamped path to sm. Example: agent <code>a1966oc0</code> runs <code>env -u SM_SESSION_CREDENTIAL sm queue run … --notify rajesh</code>; the request still arrives stamped <code>a1966oc0</code>, so the job runs in its wall. Tests: a request to 8420 from inside the wall fails to connect; a forged <code>X-SM-Local-Agent</code> sent through the gateway is replaced by the true id; a stamp without the secret is ignored.</li>
+</ol>
+
+<h3 id="j">J. Changes to #1784’s model-ownership appendices</h3>
+<ul>
+<li><b>#1784 F.2 step 2</b> (drain waits until every local agent’s Claude hook state is <code>TurnStopped</code>): becomes “until every opencode session’s last applied status is idle (E.1)”, with the same 10-minute limit.</li>
+<li><b>#1784 F.2 step 1</b> (hold deliveries): the hold applies to D.2 — rows stay pending and are not attempted while the model is draining or yielded. A yield therefore loses no message; rows deliver in order after reload.</li>
+<li><b>#1784 Figure F1, ②</b> (“a running turn gets a connection error, which Claude Code retries and then gives up on”): opencode instead retries an unreachable model indefinitely, every ~30 s, reporting <code>retry</code>, which sm shows as working; the turn continues when the model returns (P.4 item 6). sm sends no “continue” to a turn cut off this way; it sends one only if the session is idle after reload with <code>resume_needed</code> set.</li>
+<li><b>#1784 E.4’s reservation</b> (one agent plus the judge, 151 GB) is unchanged: opencode’s server and attach view use under 1 GB together.</li>
+</ul>
+
+<h3 id="k">K. User interface</h3>
+<ul>
+<li><b>Badge</b> (new usage ticket): <code>providerLabel</code> (web/ui.js:340) returns “Local” for <code>opencode</code>, shown as a LOCAL badge in <code>--violet</code> on web/agents.js:468–489; Android WatchScreen.kt:1221 label “LOCAL” and <code>providerTint</code> (WatchScreen.kt:2035) violet; WatchModels.kt where provider is summarised.</li>
+<li><b>Handoff settings</b> (same ticket): a fourth provider row “Local (opencode)” in web/settings.js:315 and Android HandoffControls.kt:170; web/handoff.js:52 window 200K for opencode.</li>
+<li><b>Start sheets and Board start</b> (same ticket, moved forward from #1784 appendix G, which assigned it to #1959): web and Android offer “Local (&lt;loaded model&gt;)” only while the model is loaded (the C.1 model check answers), creating the agent through the same route as <code>sm spawn local</code>. While no seat is free the choice is disabled with C.1’s refusal text. #1959 keeps the Spend line and the tier table only. Tests: the choice is absent with no model loaded, disabled with the seat taken, and starts an opencode agent otherwise.</li>
+</ul>
+
+<h3 id="l">L. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Code site or test</th></tr></thead>
+<tbody>
+<tr><td>Decision 1: provider <code>opencode</code>, no host field</td><td>B, B.1</td><td>Sites in B; record round-trip test; old records unchanged on disk</td></tr>
+<tr><td>Decision 2: tmux kept for watching</td><td>C.5, F.7</td><td>Launch test asserts two windows, agent window selected</td></tr>
+<tr><td>Decision 3: <code>sm spawn local</code>, loaded model, effort ignored</td><td>C.1, C.2</td><td>CLI alias test; model-mismatch and no-model refusals</td></tr>
+<tr><td>Decision 4: urgent never interrupts</td><td>D.1</td><td>Stub asserts abort never called; urgent row to busy session delivered</td></tr>
+<tr><td>Decision 5: no spawn from a local agent; no <code>sm what</code></td><td>C.1, F.5</td><td>403 test; 400 test; handoff successor still created</td></tr>
+<tr><td>Decision 6: handoff at 75%</td><td>H</td><td>74/75% test; compaction point measured</td></tr>
+<tr><td>Decision 7: version pinned</td><td>C.2 step 3, C.3</td><td>Version-mismatch refusal test; config has autoupdate off</td></tr>
+<tr><td>Decision 8: three tickets</td><td>Plan; I.2</td><td>Tickets filed with <code>sm board after</code>/<code>under</code></td></tr>
+<tr><td>Exactly-once delivery; delivered = confirmed</td><td>D.2–D.4</td><td>Crash-between-POST-and-mark test; repeat-append test</td></tr>
+<tr><td>Status, last tool, context in sm</td><td>E</td><td>Stub event-stream tests per row of E.1</td></tr>
+<tr><td>Same conversation after restart</td><td>F.1</td><td>Restore test; server-crash loop test</td></tr>
+<tr><td>Judge on every tool, no prompt</td><td>C.3, I.1</td><td>Config test; adversarial set through the plugin</td></tr>
+<tr><td>Zero quota weight</td><td>G</td><td>Ledger fixture test</td></tr>
+<tr><td>Server not drivable by others</td><td>C.5</td><td>Live check M item 1: an unauthenticated call to the server returns 401</td></tr>
+<tr><td>Live acceptance</td><td>M</td><td>The live check, recorded in the #1956 PR</td></tr>
+</tbody>
+</table>
+
+<h3 id="m">M. Live acceptance for #1956</h3>
+<p>Before merge, on this Mac, with the model server loaded through <code>sm queue</code> and the wall ticket shipped, #1956 runs and records in its PR:</p>
+<ol>
+<li><code>sm spawn local</code> with the probe brief (<code>docs/working/1966_artifacts/briefs/probe.txt</code>); the brief confirmed once; sm shows working then idle with last tool and context; a call to the server without the password returns 401.</li>
+<li>Idle and busy deliveries of an <code>sm send</code>, an <code>sm remind</code> and a queue completion: three messages, three arrivals, no duplicate, and a 20-second command not interrupted by the urgent one.</li>
+<li>Kill the opencode server process: it restarts, a message sent meanwhile arrives once.</li>
+<li><code>sm retire</code> then <code>sm restore</code>: same conversation; the agent answers a question about its earlier work.</li>
+<li>One past ticket hands-off (#1855 from start commit <code>4a3a060d6c37</code>), through PR and <code>sm request-review</code>: the merged fix’s test passes on the agent’s change.</li>
+<li>The usage ledger shows the run’s tokens under <code>local</code>, and the Claude weekly percentage does not move.</li>
+</ol>
+
+<h3 id="p">P. The lifecycle proof (#1966, 3 Oct)</h3>
+<p>Driver <code>sm-1966</code> (f3018f36), 3 Oct 16:02–17:01 PDT. No production sm code changed and nothing touched live sm state. The kit and the evidence named below are in <code>docs/working/1966_artifacts/</code> (its <code>README.txt</code> lists every file); raw opencode databases, request and event logs and the scratch sm's state are kept in <code>~/.local/share/local-agents-proto/runs-1966/</code>.</p>
+
+<h4>P.1 What ran</h4>
+<table>
+<thead><tr><th>Piece</th><th>What it is</th><th>Where it runs</th></tr></thead>
+<tbody>
+<tr><td>Scratch sm</td><td>The installed <code>sm-server</code>, unchanged, on fresh state at port 18450 (<code>kit/scratch_sm.sh</code>). Runtime on, so it delivers messages, fires reminders and runs its own queue jobs. Own state folder, queue folder, usage database and tmux socket (<code>l1966-scratch</code>); <code>SM_TEST_ISOLATION_ROOT</code> isolates every default path and drops the push key. Seeded with two sessions: parent <code>sm-1966</code> (<code>p1966000</code>) and agent <code>sm-1966-oc</code> (<code>a1966oc0</code>), both <code>provider = "claude"</code>, so sm's existing hook routes and pane delivery apply unchanged.</td><td>Outside the wall</td></tr>
+<tr><td>opencode</td><td><code>opencode serve</code> 1.17.9 on 127.0.0.1:18451, one per agent, inside #1954's wall (<code>kit/wall_profile.sh</code>, with the agent's own service ports passed as a fifth argument). Its config, data, cache and state folders are the run directory's <code>xdg/</code>.</td><td>Inside the wall</td></tr>
+<tr><td>Judge plugin</td><td><code>kit/sm_judge.js</code>: opencode's <code>tool.execute.before</code> hook, posting #1954's PreToolUse JSON to the judge service and throwing on anything but allow (P.3.3).</td><td>Inside opencode</td></tr>
+<tr><td>Judge service</td><td>#1954's <code>judge_service.py</code>, unchanged, on 8441; its decision log and allow file in the run directory, not in live sm state. Judge calls go to MTPLX on 8000 in the real-model runs and are denied outright (<code>--no-model</code>) in the stand-in runs.</td><td>Outside the wall</td></tr>
+<tr><td>Bridge</td><td><code>kit/oc_bridge.py</code>: submits briefs once (P.3.1), follows opencode's event stream and posts sm's existing hook routes (P.3.2).</td><td>Outside the wall</td></tr>
+<tr><td>Pane</td><td><code>kit/oc_pane.py</code>: the tmux pane sm types into. Stands in for an HTTP delivery path inside sm (P.3.4).</td><td>Outside the wall</td></tr>
+<tr><td>Model</td><td>Stand-in: <code>kit/fake_oai.py</code>, a scripted OpenAI-format server on 18452 that issues fixed tool calls. Real: MTPLX 2.12.0 serving Flash-Next at 200K with #1954's settings (<code>kit/mtplx_job.sh</code>), behind #1954's logging proxy on 18456.</td><td>Outside the wall</td></tr>
+</tbody>
+</table>
+<p>Every long-running piece ran through <code>sm queue</code> (<code>kit/services.sh</code> holds the scratch sm, judge service and model proxy in one service job). One agent ran at a time. The stand-in model proved the mechanics deterministically; the real model then repeated the judge and restore checks and ran two benchmark tickets.</p>
+
+<h4>P.2 The six behaviours</h4>
+<table>
+<thead><tr><th>Behaviour</th><th>Mechanism</th><th>Check and result</th></tr></thead>
+<tbody>
+<tr><td>1. Brief submitted and acknowledged exactly once</td><td><code>POST /session/{id}/prompt_async</code> with a message id and part id the bridge chose and wrote to its outbox first; acknowledged when <code>GET /session/{id}/message/{messageID}</code> returns the user message.</td><td><b>Proved.</b> Acknowledged in 1.0 s (four briefs: 0.96–1.03 s). Resubmitting the same brief returned <code>already-accepted</code> in 1 ms and sent nothing; the conversation holds one brief turn (<code>evidence/p1_*.json</code>).</td></tr>
+<tr><td>2. Working/idle and tokens projected into sm</td><td>Event stream: <code>session.status</code> busy or retry → sm's <code>UserPromptSubmit</code> hook; idle → <code>Stop</code>; a tool part entering <code>running</code> → sm's tool-use hook; each <code>step-finish</code> part (one per model request) → sm's context-usage hook and one usage line.</td><td><b>Proved.</b> sm showed idle → working (last tool <code>bash</code>, 0.6% context, 1,120 tokens) → idle, about a second behind opencode, and tracked the real runs live (peaks of 17% on #1855 and 40% on #1913). After any reconnection the bridge re-sends the current state.</td></tr>
+<tr><td>3. <code>sm send</code>, reminders and queue wakes, no duplicate turns</td><td>sm's own delivery, unchanged, into the pane; the pane submits each Enter once through the bridge's outbox.</td><td><b>Proved, with one mapping change</b> (P.4 finding 2). Idle: a reminder, a queue completion and an <code>sm send</code> became three turns, one each. Busy (20-second command running): the same three arrived mid-turn as three stored messages, the command ran to completion, and opencode read all three at its next step, as Claude Code reads prompts queued during a turn (<code>evidence/p3-*-messages.json</code>, <code>p3-*-view.jsonl</code>).</td></tr>
+<tr><td>4. Same conversation and provider after restarts</td><td>The opencode session id is sm's <code>provider_resume_id</code>; the conversation lives in opencode's database under the run's data folder. Restart = start <code>opencode serve</code> on the same folder.</td><td><b>Proved.</b> opencode killed and restarted: same session, same 31 messages, the next request carried the whole history (42 messages vs 40). Bridge and pane killed too, as after a reboot: same. Stand-in model down 30 s and 12 minutes: opencode retried every ~30 s (28 attempts) and finished the turn once when the model returned. Real model: <code>mtplx stop</code>, a question sent while it was down, MTPLX restarted; the agent answered from its own earlier work (“92da92c7, one file: crates/sm-server/src/bin/sm.rs”), 63 s after the model was back.</td></tr>
+<tr><td>5. Judge allows and denies with no human prompt</td><td>Judge plugin → #1954's judge service; opencode's own permission table never says “ask”.</td><td><b>Proved.</b> Stand-in: rule allow, rule deny (write outside the checkout), judge-stage deny (<code>git push</code>), and the wall stopping the one write the rules let through. #1954's allow-once: the owner allowed <code>d-5691</code>, the identical push passed once (stage <code>owner</code>), the next identical call was denied again (<code>d-abdb</code>). Real runs: P.5. Every denial reached the model as the tool's error text.</td></tr>
+<tr><td>6. Local usage at zero hosted-quota weight</td><td>Exact tokens from each <code>step-finish</code> part, written as Claude-format usage lines that sm's unchanged ledger scanner reads.</td><td><b>Tokens proved; zero weight is not sm's behaviour today, for either harness.</b> All 19 stand-in requests reached <code>message_ledger</code> with exact counts (6,360 input, 133 output, 17,100 cache read). sm filed them under the Claude account active at the time, and priced the unknown model name at the Opus rate: 0.0013% of the weekly Claude meter for these rows. appendix G’s local account is what makes it zero; it is harness-independent.</td></tr>
+</tbody>
+</table>
+
+<h4>P.3 Adapters and persisted shapes</h4>
+<p><b>P.3.1 Exactly-once submission.</b> Every submission has a key: <code>brief-</code> plus the first 16 hex characters of the brief's SHA-256, or one fresh key per delivery. Before the first attempt the bridge appends to <code>ledger.jsonl</code>:</p>
+<pre><code>{"key": "brief-ccc62b9be4aca887", "messageID": "msg_1041e3ac0001WxqUWbXtu5JPXu",
+ "partID": "prt_1041e3ac0002TY2acF6ctX9NM4", "source": "brief", "chars": 2975, "text": "…", "t": 1791070452.416628}
+{"key": "brief-ccc62b9be4aca887", "accepted": 1791070452.431535, "result": "sent"}</code></pre>
+<p>Each attempt first asks <code>GET /session/{id}/message/{messageID}</code>; 200 means already accepted, and nothing is posted. Otherwise it posts <code>{"messageID", "parts": [{"id": partID, "type": "text", "text"}]}</code> and records <code>accepted</code>. Attempts repeat every second until accepted; on restart, entries without <code>accepted</code> are replayed. Ids follow opencode's ascending format: <code>msg_</code> or <code>prt_</code>, 12 hex characters of (milliseconds × 4096 + counter) mod 2<sup>48</sup>, then 14 base-62 characters. They must be generated at submission time, because opencode orders a conversation by id.</p>
+<p><b>P.3.2 Event projection.</b> The bridge reads <code>GET /event</code> (server-sent events) and acts only on its own session id:</p>
+<table>
+<thead><tr><th>opencode event</th><th>sm route and body</th></tr></thead>
+<tbody>
+<tr><td><code>session.status</code> <code>busy</code> or <code>retry</code>, from idle</td><td><code>POST /hooks/claude</code> <code>{hook_event_name: "UserPromptSubmit", session_manager_id, session_id: &lt;opencode id&gt;, prompt: &lt;last user text&gt;, transcript_path, sm_hook_emitted_at}</code></td></tr>
+<tr><td><code>session.status</code> <code>idle</code></td><td><code>POST /hooks/claude</code> <code>{hook_event_name: "Stop", …, last_assistant_message}</code></td></tr>
+<tr><td><code>message.part.updated</code>, tool part, state <code>running</code></td><td><code>POST /hooks/tool-use</code> <code>{hook_event_name: "PreToolUse", session_manager_id, tool_name, tool_input, tool_use_id: callID, cwd}</code></td></tr>
+<tr><td><code>message.part.updated</code>, <code>step-finish</code> part, first time seen</td><td>One usage line appended to <code>transcript/&lt;opencode id&gt;.jsonl</code> (below), then <code>POST /hooks/context-usage</code> <code>{session_id: &lt;sm id&gt;, used_percentage, total_input_tokens: input + cache read + cache write, context_window_tokens: 200000, model_id}</code></td></tr>
+<tr><td><code>session.compacted</code></td><td><code>POST /hooks/context-usage</code> <code>{event: "compaction_complete"}</code> (not exercised: no run compacted)</td></tr>
+<tr><td>Connection opened or reopened</td><td>Read <code>GET /session/status</code> and re-send the current state as <code>Stop</code> or <code>UserPromptSubmit</code></td></tr>
+</tbody>
+</table>
+<pre><code>{"type":"assistant","timestamp":"2026-10-03T23:09:11.565863Z","sessionId":"ses_efbf952ffffeGHJl3LNU4jXFIL",
+ "cwd":"/Users/rajesh/worktrees/sm-1966-oc-probe","requestId":"prt_104075407001jAKdrI1l2FKhRG",
+ "message":{"id":"prt_104075407001jAKdrI1l2FKhRG","model":"local/flash-next","role":"assistant","content":[],
+ "usage":{"input_tokens":120,"output_tokens":7,"cache_read_input_tokens":900,"cache_creation_input_tokens":0}}}</code></pre>
+<p>Output tokens include opencode's separate reasoning count. The line must be compact JSON: sm's parser skips any line without the exact bytes <code>"usage":{</code>.</p>
+<p><b>P.3.3 Judge plugin.</b> opencode loads plugins from <code>&lt;config&gt;/opencode/plugins/</code> only when started without <code>--pure</code>; the config folder is the agent's own, so no other plugin loads. Tool translation to #1954's PreToolUse shape:</p>
+<table>
+<thead><tr><th>opencode tool, arguments</th><th>Sent to the judge service as</th></tr></thead>
+<tbody>
+<tr><td><code>bash {command, workdir}</code></td><td><code>Bash {command}</code>, cwd = workdir or the checkout</td></tr>
+<tr><td><code>read {filePath}</code>; <code>glob</code>/<code>list</code>/<code>grep {path}</code>; <code>todowrite</code></td><td><code>Read {file_path}</code>; <code>Glob</code>/<code>Grep {path}</code>; <code>TodoWrite</code></td></tr>
+<tr><td><code>edit {filePath}</code>, <code>write {filePath}</code></td><td><code>Edit</code>/<code>Write {file_path}</code></td></tr>
+<tr><td><code>apply_patch {patchText}</code></td><td>One <code>Edit {file_path}</code> per file the patch adds, updates, deletes or moves to; any deny blocks the patch</td></tr>
+<tr><td>anything else</td><td>Its own name and arguments, which the service sends to the judge</td></tr>
+</tbody>
+</table>
+<p>A deny, an unreachable service or an unreadable answer throws <code>Permission denied by the local judge: &lt;reason&gt;</code>; opencode records the tool as failed and shows the model that text. Each decision is also logged to <code>plugin.jsonl</code> (time, call id, tool, allow, reason, milliseconds). opencode's own table: <code>{"*": "allow", "question": "deny", "task": "deny", "webfetch": "deny", "websearch": "deny", "doom_loop": "allow", "external_directory": "allow"}</code>. Nothing is <code>ask</code>, so no call can wait on a human; the plugin runs before opencode's own check, so the table cannot override a denial.</p>
+<p><b>P.3.4 The pane.</b> sm delivers by typing into the session's tmux pane, and gates background wakes on the pane showing an empty Claude composer (a last line <code>&gt;</code> with the cursor just after it). The pane draws that line only while opencode reports the session idle (<code>GET /session/status</code>, every 250 ms) and no submission is in flight. Typed text is buffered; carriage return submits it once through P.3.1; line feed stays a newline. Escape aborts the turn (<code>POST /session/{id}/abort</code>), except within 2 s of Ctrl-B, which is sm's urgent sequence (P.4 finding 2). Its log is <code>pane.jsonl</code>. In an sm provider arm this pane disappears: delivery is P.3.1 directly, readiness is the status above, and the pane becomes <code>opencode attach http://127.0.0.1:&lt;port&gt; --session &lt;id&gt;</code>, opencode's own terminal view of the same session (checked: it shows the live run, thoughts, tools and context use).</p>
+<p><b>P.3.5 Launch.</b> <code>kit/run_oc.sh</code>: clone the checkout; register the agent with the judge service; write <code>opencode.json</code> (one provider, <code>@ai-sdk/openai-compatible</code> at the model URL, model <code>local/flash</code>, 200,000 context, 32,000 output; autoupdate, sharing, snapshots, LSP and formatters off); copy the plugin; <b>run opencode once outside the wall</b> so it installs its plugin SDK into the config folder from npm (inside the wall there is no network); generate the wall profile; start <code>sandbox-exec -f profile.sb opencode serve --port &lt;port&gt;</code> with <code>XDG_*</code> set to the run folder, <code>OPENCODE_DISABLE_AUTOUPDATE=1</code>, <code>OPENCODE_DISABLE_MODELS_FETCH=1</code>, the judge variables and sm's session variables; create the session (<code>POST /session</code>); start the bridge and pane.</p>
+
+<h4>P.4 Findings that shape an opencode contract</h4>
+<ol>
+<li><b>opencode does not de-duplicate a reposted message id.</b> Reposting the same <code>messageID</code> appended the text to the existing message (“brief one brief one”); with a fixed part id it overwrote the part instead. Exactly-once therefore needs the existence check and outbox of P.3.1, not the id alone.</li>
+<li><b>Urgent delivery must not abort.</b> sm's urgent path (reminders, urgent <code>sm send</code>) sends Ctrl-B, which in Claude Code moves the running command to the background, then Escape. opencode cannot background a running tool, so mapping Escape to abort killed a 20-second command mid-run. Contract: urgent delivery to opencode is a queued prompt, read at the next step boundary; abort is only for an explicit interrupt.</li>
+<li><b>A delivery must be held until opencode accepts it.</b> sm counts a message delivered once it has typed it. With opencode down, the first pane gave up and lost an <code>sm send</code>. After the fix, the message sent during the outage arrived once, 9 s after restart. Contract: sm marks a delivery done only when opencode has accepted it, and the outbox survives restarts of the adapter.</li>
+<li><b>Usage is mis-attributed today.</b> sm filed local tokens under the active Claude account and priced the unknown model at the Opus rate (P.2 row 6). appendix G’s local account is required for either harness.</li>
+<li><b>Launch must prepare opencode's config folder outside the wall</b> (plugin SDK from npm) and must not pass <code>--pure</code>, which skips local plugins and with them the judge.</li>
+<li><b>Model outages are absorbed.</b> opencode retries an unreachable model indefinitely, backing off to about 30 s, and reports <code>retry</code>, which sm shows as working. A yield (1784 appendix F) loses no turn; a resumed turn waits up to 30 s after the model returns.</li>
+</ol>
+
+<h4>P.5 Benchmark runs inside the wall, judge and scratch sm</h4>
+<p>Real model, hands-off, briefs as #1954's with one change: nothing outside the Mac is reachable, so instead of pushing, opening a draft PR and requesting review, the agent commits, runs <code>sm status</code>, reports to its parent with <code>sm send</code> and stops. The first #1855 attempt is excluded: the launcher cloned current main, where #1855 is already fixed; it was aborted after one minute with no file changed, and the launcher now verifies the start commit.</p>
+<table>
+<thead><tr><th>Run</th><th>Start commit</th><th>Local commit</th><th>Active min</th><th>Model requests</th><th>Tool calls: rules / judge allowed / denied</th><th>Judge median (max)</th><th>First prompt</th><th>Prompt reused</th><th>Largest prompt</th></tr></thead>
+<tbody>
+<tr><td>#1855</td><td><code>4a3a060d6c37</code></td><td><code>92da92c794ab</code></td><td>4.43</td><td>32</td><td>35: 22 / 13 / 0</td><td>0.71 s (3.5 s)</td><td>8,292</td><td>96.9%</td><td>33,067</td></tr>
+<tr><td>#1913</td><td><code>0d3211e3fdb1</code></td><td><code>65d6fa8d…</code></td><td>14.95</td><td>61</td><td>62: 57 / 4 / 1</td><td>2.1 s (2.9 s)</td><td>8,004</td><td>98.6%</td><td>79,712</td></tr>
+</tbody>
+</table>
+<p>Active time runs from the brief's submission to the session going idle after the report to the parent. Tokens are opencode's per-request counts. No human prompt and no question in either run. The one denial (<code>d-36c4</code>, #1913) was false and mine: opencode passed a relative path for an edit, the plugin forwarded it, and the judge service resolved it against its own folder. The agent edited the file in its next call. The plugin now sends absolute paths (<code>evidence/p5_relative_path_fix.txt</code>: the same relative edit is allowed; <code>../escape.txt</code> and an absolute path outside are still denied). Mid-run, at 35% of its window, the scratch sm sent the #1913 agent its standard handoff notice (decision 6); the agent finished its fix and reported. In both runs each agent's report reached the parent's pane through the scratch sm.</p>
+<p><b>Validation.</b> As #1955 did (1784 appendix M.3), on a separate clone of each agent commit:</p>
+<table>
+<thead><tr><th>Run</th><th>At the local commit</th><th>Fix removed, tests kept</th><th>fmt, clippy</th></tr></thead>
+<tbody>
+<tr><td>#1855</td><td>Own test (alias parses, stays hidden from help) and the merged real-binary test <code>retired_review_name</code> pass</td><td>Both fail</td><td>Clean</td></tr>
+<tr><td>#1913</td><td>The merged fix’s test <code>queue_job_does_not_inherit_handed_over_listeners</code> passes. The agent’s own test fails here: its socket path exceeds macOS’s limit outside the wall (below); the queue module has the same single failure</td><td>Merged test fails; own test fails</td><td>Clean</td></tr>
+</tbody>
+</table>
+<p><b>Grades, by the driver.</b> #1855 <b>mergeable as-is</b>, rescue 0%: the same production change as the merged fix (a hidden clap alias and removal of the pre-parse rejection), with a parse-level test where the merged fix runs the real binary; #1955’s Codex grader graded that same change mergeable as-is. #1913 <b>small changes</b>, rescue about half, as for #1955’s change: it closes inherited descriptors in the queue child, the design #1955’s grader graded small changes, where the merged fix marks the received listeners close-on-exec at the source. Two further corrections: its new test needs a shorter socket path, and its edit to an existing <code>http.rs</code> test (flag any listening socket in a test child) widens scope. It cites “sm#1966” in comments because my brief named it <code>sm-1966-oc</code>. The short temporary path is a driver error: <code>run_oc.sh</code> kept #1954’s short <code>TMPDIR</code>, which 1784 appendix K.9.5 item 4 removes. No independent grader ran; Codex quota was not spent on it.</p>
+
+<h4>P.6 Not proved here</h4>
+<ul>
+<li><b>Spawn through <code>sm spawn</code>.</b> The scratch sm was seeded with the agent's record, as in #1954; sm's spawn path for a new provider is implementation, not something opencode can show.</li>
+<li><b>Compaction near 200K.</b> The largest prompt was 79,712 tokens. opencode compacts on its own and emits <code>session.compacted</code>; its behaviour near the limit and the summary's quality are unmeasured.</li>
+<li><b><code>/clear</code>, <code>/rename</code> and <code>sm btw</code>.</b> sm types these into Claude Code. opencode equivalents exist (new session, <code>PATCH /session/{id}</code> title, a forked session) but none was exercised.</li>
+<li><b>Owner typing in the attached view.</b> A prompt typed in <code>opencode attach</code> is a user message that did not come from the outbox; the bridge would report it as owner-typed. Not exercised.</li>
+<li><b>Version drift.</b> opencode releases often. The proof pins 1.17.9 with updates off; an upgrade needs P.2's checks again.</li>
+</ul>
+
+<h4>P.7 Reproduce</h4>
+<pre><code>K=docs/working/1966_artifacts/kit
+sm queue run --type service --label 1966-services -- zsh $K/services.sh ~/worktrees/sm-1966-oc-probe fake
+R=~/.local/share/local-agents-proto/runs-1966                      # or $L1966_RUNS
+zsh $K/run_oc.sh http://127.0.0.1:18452/v1 start                    # probe run "a", stand-in model
+python3 $K/oc_bridge.py brief $R/a/bridge.json --file docs/working/1966_artifacts/briefs/probe.txt   # proof 1, run twice
+$K/prove_p3.sh i1 idle;  $K/prove_p3.sh b2 busy                     # proof 3
+$K/prove_p4.sh r2 process;  $K/prove_p4.sh r3 all                   # proof 4
+STOP_MODEL=… START_MODEL=… $K/prove_p4.sh m1 model
+# real model: sm queue run --type background -- zsh $K/mtplx_job.sh, then services.sh … mtplx,
+# then RUN=c TICKET=1855 COMMIT=4a3a060d6c37 BRANCH=1966-oc-1855 run_oc.sh http://127.0.0.1:18456/v1 start,
+# brief briefs/1855.md, and validate_1855.sh &lt;agent commit&gt; &lt;log dir&gt; (likewise d / #1913)</code></pre>
+
+
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not run opencode with no tmux at all?</b> Every live-agent path in sm assumes a tmux session: delivery, readiness, kill, restore, clear, output capture, attach, the web and phone terminals, and boot reconciliation. Your retired Codex app-server provider ran headless and needed parallel versions of most of these; keeping tmux for viewing removes that work and keeps <code>sm attach</code> meaning what it means for every other agent. sm never reads the opencode screen, so the usual cost of tmux — scraping a pane — does not come back.</p>
+<p><b>Why does the brief retry, when the Claude path forbids it?</b> The Claude path cannot tell whether a lost submission landed, so a retry risks running the brief twice. Here the existence check answers exactly that question before every attempt.</p>
+<p><b>Why is the server password needed if the wall already limits ports?</b> The wall stops other local agents. The password stops anything on this machine that can open a loopback connection but cannot read your files — a web page in your browser, or a stray scan — from driving a local agent. It is not a boundary against your Claude and Codex agents: they run unwalled as you, can read <code>server.secret</code>, and can already type into any agent’s tmux pane. Those agents are trusted to that degree today, and this design does not change it. It costs one environment variable.</p>
+<p><b>Why does sm write usage lines in Claude’s format?</b> sm’s ledger already parses that format exactly, de-duplicates by message id, and the proof showed every token arriving. A separate parser would add code without changing a number.</p>
+<p><b>What happened to the proof’s pane and bridge?</b> They were stand-ins so that the proof needed no sm code: the bridge followed the event stream and called sm’s hook routes, and the pane imitated a Claude prompt box so sm could type. In #1956 both disappear into sm itself (D and E); the pane becomes the attach view.</p>
+<p><b>What does the proof not cover?</b> Spawn through <code>sm spawn</code> (the proof seeded the session), compaction near 200K, clear, rename and typing in the attach view. #1956’s tests and live check (M) cover the first four; compaction is measured (H).</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
