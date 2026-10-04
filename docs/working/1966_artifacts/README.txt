@@ -1,4 +1,4 @@
-Evidence for #1966; read appendix N of ../1784_local_agents.html.
+Evidence for #1966; read appendix P of ../1966_opencode_local_agents.html.
 
 kit/      The executed scripts. Run output goes to $L1966_RUNS (default ~/.local/share/local-agents-proto/runs-1966).
           judge_service.py, judge_policy.md and proto_proxy.py are #1954's, used unchanged from ../1954_artifacts/kit.
