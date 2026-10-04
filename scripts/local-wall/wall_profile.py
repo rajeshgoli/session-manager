@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -176,20 +175,11 @@ def generate(args, listeners, minimum_tmp_length):
     lines.append(f"(deny file-read-data (literal {quoted(state_root)}))")
     lines.extend([
         "(deny network-outbound)",
-        '(allow network-outbound (remote ip "localhost:*") (remote unix-socket))',
+        f'(allow network-outbound (remote ip "localhost:*") '
+        f'(remote unix-socket (subpath {quoted(state / "tmp")})))',
     ])
     for number in sorted(forbidden):
         lines.append(f'(deny network-outbound (remote ip "localhost:{number}"))')
-    uid = os.getuid()
-    socket_denials = [
-        '(remote unix-socket (path-literal "/private/var/run/mDNSResponder"))',
-        f'(remote unix-socket (subpath "/private/tmp/tmux-{uid}"))',
-        f'(remote unix-socket (require-all (subpath {quoted(home / ".local/share/claude-sessions")}) '
-        f'(require-not (subpath {quoted(state / "tmp")}))))',
-        f'(remote unix-socket (require-all (subpath {quoted(state_root)}) '
-        f'(require-not (subpath {quoted(state)}))))',
-    ]
-    lines.append("(deny network-outbound " + " ".join(socket_denials) + ")")
     return "\n".join(lines) + "\n"
 
 

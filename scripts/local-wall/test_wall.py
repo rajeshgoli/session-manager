@@ -210,6 +210,21 @@ class WallTests(unittest.TestCase):
         self.addCleanup(host_socket.close)
         self.sandbox(f"import socket; socket.socket(socket.AF_UNIX).connect({str(blocked_socket)!r})",
                      False, "sm-state Unix socket")
+        daemon_socket = self.home / ".docker/run/docker.sock"
+        daemon_socket.parent.mkdir(parents=True)
+        daemon = socket.socket(socket.AF_UNIX)
+        daemon.bind(str(daemon_socket))
+        daemon.listen()
+        self.addCleanup(daemon.close)
+        self.sandbox(f"import socket; socket.socket(socket.AF_UNIX).connect({str(daemon_socket)!r})",
+                     False, "host daemon outside private tmp")
+        daemon_alias = Path(self.tmp) / "daemon-alias.sock"
+        daemon_alias.symlink_to(daemon_socket)
+        self.sandbox(f"import socket; socket.socket(socket.AF_UNIX).connect({str(daemon_alias)!r})",
+                     False, "private tmp symlink to host daemon")
+        daemon.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            daemon.accept()
         for number, allowed in [(own, False), (successor, False), (future_gateway, False),
                                 (gateway, True), (proxy, True), (model, True), (judge, True)]:
             self.sandbox(f"import socket; socket.create_connection(('127.0.0.1', {number}), timeout=2)",

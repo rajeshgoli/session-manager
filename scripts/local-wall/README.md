@@ -87,7 +87,7 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Direct internet and DNS | No outbound connection |
 | Own sm gateway, egress proxy, model and judge | Loopback connection |
 | Private Unix sockets in own `tmp/` | Connection |
-| Default tmux and sm-state Unix sockets | No connection |
+| Every Unix socket outside own `tmp/`, including Docker, default tmux and sm-state sockets | No connection |
 
 The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement
