@@ -34,7 +34,8 @@ use crate::{
     btw::BtwStore,
     config::{path_is_under_home, test_isolation_root_from_environment, ContextMonitorConfig},
     runtime::{
-        RestoreTmuxLivenessOutcome, RestoreTmuxTeardownOutcome, TmuxRuntime, TmuxSessionSpec,
+        InitialBriefDeliveryError, RestoreTmuxLivenessOutcome, RestoreTmuxTeardownOutcome,
+        TmuxRuntime, TmuxSessionSpec,
     },
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
@@ -54,6 +55,22 @@ use handoff_store::{handoff_session_ref, handoff_view_for_record};
 pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};
 use handoff_transfer::handoff_fences_delivery_raw;
 pub use handoff_transfer::{HandoffAcceptOutcome, HandoffFacts, HandoffWork, SuccessorPlan};
+
+/// The provider is live, but acceptance of its submitted initial turn is unknown.
+#[derive(Debug)]
+pub struct SpawnAcceptanceUnknown {
+    pub session_id: String,
+    pub provider_session_id: Option<String>,
+    pub brief_sha256: Option<String>,
+}
+
+impl std::fmt::Display for SpawnAcceptanceUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "initial brief was submitted but its acceptance could not be confirmed; live session {} retained (provider session {}); it was not resent to avoid duplicate work. Inspect this session before retrying spawn",
+            self.session_id, self.provider_session_id.as_deref().unwrap_or("unknown"))
+    }
+}
+impl std::error::Error for SpawnAcceptanceUnknown {}
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
@@ -4689,15 +4706,23 @@ impl SessionStore {
         let named_runtime = launch_name
             .as_deref()
             .map(|name| runtime.with_claude_display_name(name));
+        let mut acceptance_unknown = false;
         if let Err(error) = named_runtime
             .as_ref()
             .unwrap_or(runtime)
             .create_session(&spec)
         {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let error_message = format!("{error:#}");
-            let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
+            acceptance_unknown = error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<InitialBriefDeliveryError>(),
+                    Some(InitialBriefDeliveryError::ProviderAcceptanceTimedOut { .. })
+                )
+            });
+            if !acceptance_unknown {
+                let _guard = self.write_guard()?;
+                let mut state = self.load_raw_json_value()?;
+                let error_message = format!("{error:#}");
+                let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
                 state
                     .get("spawn_launch_intents")
                     .and_then(Value::as_array)
@@ -4718,28 +4743,29 @@ impl SessionStore {
                         ))
                     })
             });
-            let failure_reason = recovery_detail
-                .as_deref()
-                .map(|detail| format!("{error_message}; {detail}"))
-                .unwrap_or_else(|| error_message.clone());
-            eprintln!(
-                "session runtime launch failed: session={} provider={}: {failure_reason}",
-                record.id, record.provider
-            );
-            let remove_provisional_session =
-                remove_failed_provisional_runtime_session(&state, &record.id);
-            mark_runtime_launch_failed(
-                &mut state,
-                &launch_id,
-                &record.id,
-                remove_provisional_session,
-                &failure_reason,
-            )?;
-            self.write_raw_json_value(&state)?;
-            return Err(match recovery_detail {
-                Some(detail) => error.context(format!("{error_message}; {detail}")),
-                None => error,
-            });
+                let failure_reason = recovery_detail
+                    .as_deref()
+                    .map(|detail| format!("{error_message}; {detail}"))
+                    .unwrap_or_else(|| error_message.clone());
+                eprintln!(
+                    "session runtime launch failed: session={} provider={}: {failure_reason}",
+                    record.id, record.provider
+                );
+                let remove_provisional_session =
+                    remove_failed_provisional_runtime_session(&state, &record.id);
+                mark_runtime_launch_failed(
+                    &mut state,
+                    &launch_id,
+                    &record.id,
+                    remove_provisional_session,
+                    &failure_reason,
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Err(match recovery_detail {
+                    Some(detail) => error.context(format!("{error_message}; {detail}")),
+                    None => error,
+                });
+            }
         }
         if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
@@ -4885,6 +4911,17 @@ impl SessionStore {
         }
         if launch_name.is_none() {
             self.queue_initial_native_rename(&record);
+        }
+        if acceptance_unknown {
+            return Err(SpawnAcceptanceUnknown {
+                session_id: record.id.clone(),
+                provider_session_id: record.provider_resume_id.clone(),
+                brief_sha256: request
+                    .spawn_brief
+                    .as_ref()
+                    .map(|brief| brief.sha256.clone()),
+            }
+            .into());
         }
         Ok(record)
     }

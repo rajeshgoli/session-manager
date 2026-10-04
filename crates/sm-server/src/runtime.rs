@@ -604,7 +604,15 @@ impl TmuxRuntime {
                             })
                             .is_ok()
                     });
-            let _ = self.kill_session(&spec.tmux_session);
+            let acceptance_unknown = error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<InitialBriefDeliveryError>(),
+                    Some(InitialBriefDeliveryError::ProviderAcceptanceTimedOut { .. })
+                )
+            });
+            if !acceptance_unknown {
+                let _ = self.kill_session(&spec.tmux_session);
+            }
             return Err(if snapshot_saved {
                 error.context(format!(
                     "initial brief launch failed; provider pane retained at {}",
@@ -1511,7 +1519,25 @@ impl TmuxRuntime {
                     }
                     .into());
                 }
-                self.send_text_then_enter(&spec.tmux_session, prompt)?;
+                // tmux parses a trailing semicolon in an argument as a command
+                // separator even with send-keys -l. Hex input preserves every
+                // byte, including semicolons at a chunk boundary.
+                for chunk in prompt
+                    .as_bytes()
+                    .chunks(self.send_keys_max_chunk_bytes.max(1))
+                {
+                    let mut args = vec![
+                        "send-keys".to_owned(),
+                        "-t".to_owned(),
+                        spec.tmux_session.clone(),
+                        "-H".to_owned(),
+                    ];
+                    args.extend(chunk.iter().map(|byte| format!("{byte:02x}")));
+                    self.run_tmux(args.iter().map(String::as_str))?;
+                    thread::sleep(duration_from_millis(self.send_keys_chunk_gap_ms));
+                }
+                thread::sleep(self.compute_settle_delay(prompt));
+                self.send_key(&spec.tmux_session, "Enter")?;
                 self.wait_for_codex_fork_initial_brief_acceptance(
                     &spec.tmux_session,
                     &artifacts.event_stream_path,

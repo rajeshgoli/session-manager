@@ -4658,6 +4658,28 @@ async fn spawn_session(
         .await
     }
     .await;
+    // An unconfirmed initial turn still committed a live child. Complete
+    // its claim and notifications exactly as for a confirmed spawn, then
+    // return the observation warning to the caller.
+    let (created, mut acceptance_warning) = match created {
+        Err(error @ ApiError::StatusBody { .. }) => {
+            let retained_id = match &error {
+                ApiError::StatusBody { body, .. } if body["code"] == "spawn_acceptance_unknown" => {
+                    body["session_id"].as_str()
+                }
+                _ => None,
+            };
+            let retained = retained_id
+                .map(|id| state.session_store.get_session(id))
+                .transpose()?
+                .flatten();
+            match retained {
+                Some(child) => (Ok(child), Some(error)),
+                None => (Err(error), None),
+            }
+        }
+        result => (result, None),
+    };
     let ticket_claim = ticket_reservation
         .as_ref()
         .and_then(|reservation| claims::finish_spawn_ticket(&state, reservation, created.is_ok()));
@@ -4674,6 +4696,14 @@ async fn spawn_session(
     }
     if let Some(wait_seconds) = payload.wait {
         spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
+    }
+    if let Some(mut warning) = acceptance_warning.take() {
+        if let (ApiError::StatusBody { body, .. }, Some(ticket_claim)) =
+            (&mut warning, ticket_claim)
+        {
+            body["ticket_claim"] = ticket_claim;
+        }
+        return Err(warning);
     }
     let mut response = serde_json::to_value(SpawnSessionResponse::from(child))?;
     if let Some(ticket_claim) = ticket_claim {
@@ -15430,6 +15460,19 @@ enum ApiError {
 }
 
 fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
+    if let Some(unknown) = error.downcast_ref::<crate::sessions::SpawnAcceptanceUnknown>() {
+        return ApiError::StatusBody {
+            status: StatusCode::CONFLICT,
+            body: json!({
+                "detail": unknown.to_string(),
+                "code": "spawn_acceptance_unknown",
+                "session_id": unknown.session_id,
+                "provider_session_id": unknown.provider_session_id,
+                "brief_sha256": unknown.brief_sha256,
+                "retry_safe": false,
+            }),
+        };
+    }
     if let Some(validation) = error.downcast_ref::<CodexModelValidationError>() {
         let status = match validation {
             CodexModelValidationError::Unsupported { .. } => StatusCode::BAD_REQUEST,
