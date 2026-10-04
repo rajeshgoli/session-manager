@@ -443,13 +443,12 @@ impl ThreadCatalog {
                         )
                     }
                     Item::Turn(row) => {
-                        unread_finished |= row.read_at.is_none();
+                        // A Finished row matters only while its agent is live
+                        // (sm#1981); a retired agent's work folds as ended.
+                        let unread = row.read_at.is_none() && self.world.live(&row.session_id);
+                        unread_finished |= unread;
                         (
-                            if row.read_at.is_none() {
-                                "finished"
-                            } else {
-                                "earlier"
-                            },
+                            if unread { "finished" } else { "earlier" },
                             first_line(row.text.as_deref().unwrap_or(""), 140),
                         )
                     }

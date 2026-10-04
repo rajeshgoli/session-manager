@@ -1,8 +1,9 @@
-// The New agent popover (spec 1710 D6.5): pick Claude or Codex and press
-// Start; the owner's saved defaults fill in model, effort and workspace, and
-// "Change" opens every field in the same panel.
+// The New agent popover (spec 1710 D6.5, sm#1981): pick a configured agent
+// type and press Start, or Other for provider, model and effort; "Change"
+// opens the workspace, name and first message in the same panel.
 import { useEffect, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, openPanel, toast } from './ui.js';
+import { TypePicker, OTHER_TYPE, agentTypes, matchType } from './launch-fields.js';
 
 export const EFFORTS = {
   claude: ['low', 'medium', 'high', 'max'],
@@ -42,6 +43,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   const [form, setForm] = useState(null);
   const [models, setModels] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [other, setOther] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -119,10 +121,17 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     if (form.workspace && form.workspace !== OTHER && !choices.includes(form.workspace)) choices.unshift(form.workspace);
     const summary = [form.model || providerDefaultModel(form.provider), form.effort || 'default effort', homeRelative(folder) || 'no workspace'];
     const modelOptions = models.includes(form.model) || !form.model ? models : [form.model, ...models];
+    const matched = matchType(agentTypes(settings), { ...form, reasoning_effort: form.effort });
+    const chosen = other || !matched ? OTHER_TYPE : matched;
+    const pick = (type) => {
+      setOther(!type);
+      if (type) set({ provider: type.provider, model: type.model, effort: type.effort });
+    };
     content = html`
-      <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${PROVIDERS} />
-      ${expanded
+      <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
+      ${chosen === OTHER_TYPE
         ? html`
+          <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${PROVIDERS} />
           <div class="fld"><span class="l">Model</span>
             <select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
               <option value="">Provider default</option>
@@ -130,7 +139,10 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
             </select></div>
           <div class="fld"><span class="l">Effort</span>
             <${Seg} label="Effort" value=${form.effort || ''} onChange=${(value) => set({ effort: value || null })}
-              options=${[{ value: '', label: 'default' }, ...EFFORTS[form.provider].map((e) => ({ value: e, label: e }))]} /></div>
+              options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>`
+        : null}
+      ${expanded
+        ? html`
           <div class="fld"><span class="l">Workspace</span>
             <select class="inp" value=${form.workspace} onChange=${(e) => set({ workspace: e.target.value })}>
               ${choices.map((path) => html`<option value=${path}>${homeRelative(path)}</option>`)}

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { html, api, Popover, toast, stored } from './ui.js';
-import { Presets, ConfigFields, claudeDefaults, exactConfig, SOL } from './launch-fields.js';
+import { TypePicker, ConfigFields, claudeDefaults, exactConfig, typeConfig } from './launch-fields.js';
 
 export const keyOf = t => `${t.repo}#${t.number}`;
 export const keepEdit = () => ({config:{mode:'keep'},message:{mode:'keep'},behavior:'keep'});
@@ -16,7 +16,7 @@ const reasonsText = reasons => reasons.map(r => ({lane_goal:'lane goal',not_on_b
 function EditFields({ value, onChange, settings }) {
   const set = patch => onChange({...value,...patch});
   const config = value.config.mode === 'set' ? value.config : claudeDefaults(settings);
-  return html`<${Presets} settings=${settings} onPick=${c => set({config:{mode:'set',...c}})} />
+  return html`<${TypePicker} settings=${settings} other=${false} onPick=${t => set({config:{mode:'set',...typeConfig(t)}})} />
     <label class="fld"><span class="l">Launch configuration</span><select class="inp" value=${value.config.mode} onChange=${e => set({config:e.target.value === 'keep' ? {mode:'keep'} : {mode:'set',...claudeDefaults(settings)}})}><option value="keep">Keep each ticket's current choice</option><option value="set">Set provider, model and effort</option></select></label>
     ${value.config.mode === 'set' ? html`<${ConfigFields} value=${config} onChange=${c => set({config:{mode:'set',...c}})} />` : null}
     <label class="fld"><span class="l">Start behavior</span><select class="inp" value=${value.behavior} onChange=${e => set({behavior:e.target.value})}>
@@ -35,7 +35,7 @@ export function SharedLaunchSetup({ tickets, goals, initialPreset, onClose, onSa
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState(null);
   const [messages,setMessages] = useState({});
-  useEffect(() => { let live=true;api('/client/settings').then(s => {if(!live)return;setSettings(s);if(initialPreset)setCommon({...keepEdit(),config:{mode:'set',...(initialPreset==='sol'?SOL:claudeDefaults(s))}});}).catch(e => live&&setError(e.message));return()=>{live=false;};},[]);
+  useEffect(() => { let live=true;api('/client/settings').then(s => {if(!live)return;setSettings(s);if(initialPreset)setCommon({...keepEdit(),config:{mode:'set',...initialPreset}});}).catch(e => live&&setError(e.message));return()=>{live=false;};},[]);
   const change = fn => {fn();setPreview(null);setRequestId(null);setError(null);};
   const draft = () => ({selection:defaultSelection(chosen),common,exceptions:Object.entries(exceptions).map(([key,edit]) => ({...defaultSelection(chosen.filter(t=>keyOf(t)===key))[0],...edit})),last_agent_type:stored('sm-auto-start-type','') || null});
   const review = async () => {setBusy(true);setError(null);try {const p=await api('/client/board/launch-preview',{method:'POST',body:draft()});setPreview(p);setRequestId(crypto.randomUUID());}catch(e){setError(e.message);}finally{setBusy(false);}};
@@ -65,7 +65,7 @@ export function LaneLaunchDefault({ lane, onClose, onSaved }) {
   useEffect(()=>{Promise.all([api('/client/settings'),api(`/client/board/launch-default?lane_id=${lane.id}`)]).then(([s,d])=>{setSettings(s);setSaved(d);setConfig(d.config||{...claudeDefaults(s),brief:null});}).catch(e=>setError(e.message));},[]);
   const save=async clear=>{setBusy(true);setError(null);try{await api('/client/board/launch-default',{method:'PUT',body:{lane_id:lane.id,expected_revision:saved.revision,config:clear?null:config}});onSaved();onClose();}catch(e){setError(e.message);}finally{setBusy(false);}};
   return html`<${Popover} onClose=${onClose} className="ticket-start shared-launch"><h2>Future lane default</h2><p>${lane.goal.title}</p><p>Only tickets new to the entire board and initially in this lane capture this configuration. Moving an existing ticket here keeps its settings. This never authorizes a start.</p>
-    ${config?html`<fieldset disabled=${busy}><${Presets} settings=${settings} onPick=${c=>setConfig({...config,...c})} /><${ConfigFields} value=${config} onChange=${c=>setConfig({...config,...c})} />
+    ${config?html`<fieldset disabled=${busy}><${TypePicker} settings=${settings} other=${false} onPick=${t=>setConfig({...config,...typeConfig(t)})} /><${ConfigFields} value=${config} onChange=${c=>setConfig({...config,...c})} />
       <label class="fld"><span class="l">First message</span><select class="inp" value=${config.brief===null?'default':'custom'} onChange=${e=>setConfig({...config,brief:e.target.value==='default'?null:''})}><option value="default">Use each ticket's default</option><option value="custom">Use this exact text</option></select></label>
       ${config.brief!==null?html`<textarea class="inp" rows="4" value=${config.brief} onInput=${e=>setConfig({...config,brief:e.target.value})} />`:null}</fieldset>`:null}
     ${error?html`<p class="err" role="alert">${error}</p>`:null}<div class="row"><button class="btn" onClick=${onClose}>Cancel</button><button class="btn" disabled=${busy||!saved} onClick=${()=>save(true)}>Clear default</button><button class="btn pri" disabled=${busy||!saved} onClick=${()=>save(false)}>Save future default</button></div><//>`;

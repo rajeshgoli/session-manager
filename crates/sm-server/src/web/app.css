@@ -698,6 +698,7 @@ button.sw-sec { cursor: pointer; }
 .launch-presets { display:flex;gap:8px;flex-wrap:wrap; }
 .preset { background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:8px 12px;color:var(--ink);text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:3px; }
 .preset:hover { border-color:var(--accent); }
+.preset.on { border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent); }
 .preset span { color:var(--ink-2);font-size:.8rem;overflow-wrap:anywhere; }
 .board-ticket { grid-template-columns:minmax(0,2.5fr) minmax(0,1fr) minmax(0,1.35fr) minmax(0,1.25fr);gap:16px;padding:16px;align-items:start; }
 .board-ticket > div { min-width:0;display:flex;flex-direction:column;gap:6px;overflow-wrap:anywhere; }
@@ -736,5 +737,6 @@ button.sw-sec { cursor: pointer; }
  .board-content button,.board-content a,.shared-launch button,.shared-launch select { min-height:40px; }
  .ticket-direct-links a { display:inline-flex;align-items:center; }
  .board-start-overlay .pop.ticket-start { max-height:calc(100dvh - 16px); }
- .board-presetbar .launch-presets,.preset { width:100%; }
+ .board-presetbar .launch-presets { width:100%; }
+ .launch-presets { display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); }
 }

@@ -981,36 +981,28 @@ async fn doc_waits_for_archive_and_a_revision_unfolds_it() {
 }
 
 #[tokio::test]
-async fn an_unread_finished_retired_agent_stays_out_of_the_fold() {
+async fn an_unread_finished_retired_agent_folds_as_ended() {
+    // sm#1981: Finished work matters only while its agent is live.
     let f = fixture();
     let turns = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"));
     let at = time::OffsetDateTime::now_utc();
-    turns.record_finished("child001", at).unwrap();
-    turns
-        .record_turn(
-            "child001",
-            "claude",
-            at,
-            sm_server::turn_messages::ReplyTiming::AtMessage,
-            "Finished work",
-        )
-        .unwrap();
-    assert_eq!(
-        row(&inbox(&f, "open").await, "agent:child001")["group"],
-        "finished"
-    );
-    let (status, _) = request(
-        &f.app,
-        "POST",
-        "/inbox/done",
-        Some(json!({"thread_key": "agent:child001"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        row(&inbox(&f, "open").await, "agent:child001")["folded_by"],
-        "ended"
-    );
+    for id in ["child001", "eng00001"] {
+        turns.record_finished(id, at).unwrap();
+        turns
+            .record_turn(
+                id,
+                "claude",
+                at,
+                sm_server::turn_messages::ReplyTiming::AtMessage,
+                "Finished work",
+            )
+            .unwrap();
+    }
+    let listing = inbox(&f, "open").await;
+    let retired = row(&listing, "agent:child001");
+    assert_eq!(retired["group"], "folded");
+    assert_eq!(retired["folded_by"], "ended");
+    assert_eq!(row(&listing, "agent:eng00001")["group"], "finished");
 }
 
 #[tokio::test]

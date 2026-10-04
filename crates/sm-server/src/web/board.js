@@ -4,7 +4,7 @@ import { useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
 import { TicketStart, LaneWhenReady, blockedReasons, canStartAnyway, chipText, retryBody, laneCandidates } from './board-start.js';
 import { SharedLaunchSetup, LaneLaunchDefault, distinctTickets } from './launch-setup.js';
-import { Presets, exactConfig } from './launch-fields.js';
+import { TypePicker, exactConfig, typeConfig } from './launch-fields.js';
 import { HandoffPopover } from './handoff.js';
 import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
@@ -292,7 +292,7 @@ export function BoardPage() {
     </div>
     <div class="board-filterbar"><${Seg} label="Board filter" value=${filter} onChange=${setFilter} options=${[{value:'all',label:'All work'},{value:'attention',label:'Needs attention'},{value:'armed',label:'Armed'},{value:'finished',label:'Finished'}]} />
       <input class="inp" aria-label="Find a ticket or goal" placeholder="Find a ticket or goal…" value=${query} onInput=${e=>setQuery(e.target.value)} /></div>
-    <div class="board-presetbar"><span class="sub">QUICK PRESETS</span><${Presets} settings=${settings} onPick=${c=>openBatch(c.provider==='claude'?'claude':'sol')} /><button class="link-btn" onClick=${()=>navigate('/settings')}>Manage</button></div>
+    <div class="board-presetbar"><span class="sub">QUICK PRESETS</span><${TypePicker} settings=${settings} other=${false} onPick=${t=>openBatch(typeConfig(t))} /><button class="link-btn" onClick=${()=>navigate('/settings')}>Manage</button></div>
     <div class="board-selectionbar"><button class="btn sm" onClick=${()=>{const boxes=[...document.querySelectorAll('.board-ticket input[type=checkbox]')].filter(el=>el.getClientRects().length);setSelected(prev=>new Set([...prev,...boxes.map(el=>el.closest('[data-ticket]').dataset.ticket)]));}}>Select visible</button>
       <span>${selected.size} selected${selected.size ? ` · ${allTickets.filter(t=>selected.has(ticketKey(t))&&!matchesFilter(t,filter,query)).length} outside current filter` : ''}</span>
       <button class="btn sm pri" disabled=${!selected.size} onClick=${()=>openBatch(null)}>Shared setup</button>${selected.size?html`<button class="link-btn" onClick=${()=>setSelected(new Set())}>Clear selection</button>`:null}</div>

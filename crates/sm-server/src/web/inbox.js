@@ -31,6 +31,17 @@ const docRevision = item => {
   const link = new DOMParser().parseFromString(item.html, 'text/html').querySelector('a[href]');
   return link ? { path: readerPath(link.getAttribute('href')), title: link.textContent.trim() } : null;
 };
+/** Rows in the order the list shows them; Folded rows only while the fold is open. */
+export function shownRows(rows, filter, foldOpen) {
+  if (filter !== 'open') return rows;
+  return [...['needs_you','finished','new','earlier'].flatMap(group => rows.filter(r => r.group === group)),
+    ...(foldOpen ? rows.filter(r => r.group === 'folded') : [])];
+}
+/** After Done or Archive (sm#1981): the row below, else the row above, else none. */
+export function nextRow(rows, key) {
+  const i = rows.findIndex(r => r.thread_key === key);
+  return i < 0 ? null : rows[i + 1] || rows[i - 1] || null;
+}
 const replyTime = value => value ? new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'its last turn';
 
 export function InboxPage({ openRef }) {
@@ -59,10 +70,14 @@ export function InboxPage({ openRef }) {
     catch (e) { toast(e.message); }
     finally { setBusy(false); }
   };
+  const advance = key => {
+    const next = nextRow(shownRows(data?.rows || [], filter, foldOpen), key);
+    if (next) openPanel(rowRef(next)); else closePanel();
+  };
   const done = async () => {
     if (!selected || busy) return;
     setBusy(true);
-    try { await write('/inbox/done', { thread_key: selected.thread_key }); closePanel(); reload(); }
+    try { await write('/inbox/done', { thread_key: selected.thread_key }); advance(selected.thread_key); reload(); }
     catch (e) { toast(e.message); }
     finally { setBusy(false); }
   };
@@ -72,7 +87,7 @@ export function InboxPage({ openRef }) {
     try {
       const unarchive = row.folded_by === 'archived';
       await write(`/inbox/${unarchive ? 'unarchive' : 'archive'}`, { thread_key: row.thread_key });
-      if (row.thread_key === workKey) closePanel();
+      if (row.thread_key === workKey) advance(row.thread_key);
       reload();
     } catch (e) { toast(e.message); }
     finally { setBusy(false); }
@@ -85,7 +100,7 @@ export function InboxPage({ openRef }) {
     document.addEventListener('keydown', key);
     const off = bus.on('inbox-done', done);
     return () => { document.removeEventListener('keydown', key); off(); };
-  }, [selected, busy]);
+  }, [selected, busy, data, filter, foldOpen]);
   const row = item => html`<div class="inbox-entry" key=${item.thread_key}>
     <button class=${`inbox-row ${rowRef(item) === openRef ? 'selected' : ''}`} onClick=${() => openPanel(rowRef(item))}>
       <strong>${item.title}</strong><span>${item.preview}</span>

@@ -9,7 +9,7 @@ rows[3].jobs=[{id:'job-1',label:'Required repository checks',state:'running',sin
 rows[3].reviews=[{id:'review1',by:'agent',number:1950,reviewer_label:'Codex review',since:ago(10)},{id:'owner1',by:'you',number:1950,reviewer_label:'Rajesh review',since:ago(12)}];
 rows[2].waits_on=[rows[1]];
 const board={generated_at:new Date().toISOString(),lanes:[{id:1,rank:1,goal:rows[0],tickets:rows,counts:{ready:1,blocked:2,in_progress:1,done:0}}],other:[],repos:[]};
-const settings={new_agent:{provider:'claude',claude:{model:'opus',effort:'high'},codex:{model:'gpt-6-sol',effort:'medium'},agent_types:[]}};
+const settings={new_agent:{provider:'claude',claude:{model:'opus',effort:'high'},codex:{model:'gpt-6-sol',effort:'medium'},agent_types:[{name:'Sol/Med',provider:'codex-fork',model:'gpt-6-sol',effort:'medium'}]}};
 const html=`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/app.css"><script type="importmap">{"imports":{"preact":"/vendor/preact.module.js","preact/hooks":"/vendor/hooks.module.js","htm":"/vendor/htm.module.js"}}</script></head><body><div id="app"></div><script type="module">import{render,h}from'preact';import{BoardPage}from'/board.js';render(h(BoardPage),document.getElementById('app'));</script></body></html>`;
 (async()=>{const browser=await chromium.launch({executablePath:process.env.SM_CHROME_PATH,headless:true});try{
 const page=await browser.newPage();const errors=[],writes=[];page.on('pageerror',e=>errors.push(e.message));
