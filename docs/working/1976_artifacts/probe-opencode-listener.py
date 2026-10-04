@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import tempfile
 import time
@@ -22,6 +23,8 @@ with tempfile.TemporaryDirectory(prefix="sm-oc-fd-", dir="/private/tmp") as root
         directory.mkdir(parents=True, exist_ok=True)
     (state / "xdg/config/opencode/opencode.json").write_text(json.dumps({"autoupdate": False, "share": "disabled"}))
     private_tmp = wall.temporary_directory(state, len(wall.user_temp()))
+    shim = state / "probe-listener-shim.dylib"
+    shutil.copyfile("/tmp/sm-1974/probe-listener-shim.dylib", shim)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -43,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="sm-oc-fd-", dir="/private/tmp") as root
         log = open(state / "serve.log", "w+")
         child = subprocess.Popen([
             "/usr/bin/sandbox-exec", "-f", str(profile), "/usr/bin/env",
-            "DYLD_INSERT_LIBRARIES=/tmp/sm-1974/probe-listener-shim.dylib",
+            f"DYLD_INSERT_LIBRARIES={shim}",
             f"SM_LOOPBACK_LISTENER_FD={listener.fileno()}", "/opt/homebrew/bin/opencode",
             "serve", "--pure", "--hostname", "127.0.0.1", "--port", str(port),
         ], cwd=checkout, env=env, pass_fds=(listener.fileno(),), stdout=log, stderr=log)

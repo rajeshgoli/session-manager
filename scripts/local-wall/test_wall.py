@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
+PYTHON = str(Path(sys._base_executable).resolve())
 MODULE = importlib.util.spec_from_file_location("wall_profile", Path(__file__).with_name("wall_profile.py"))
 wall = importlib.util.module_from_spec(MODULE)
 MODULE.loader.exec_module(wall)
@@ -26,7 +27,9 @@ class WallTests(unittest.TestCase):
         self.root = self.home / ".local/share/claude-sessions/opencode"
         self.state = self.root / "agent-a"
         self.service = self.home / ".local/share/claude-sessions/local-egress"
-        for path in [self.checkout, self.service, self.home / ".cargo", self.state / "xdg/config",
+        self.logs = self.root.parent / "logs"
+        for path in [self.checkout, self.service, self.home / ".cargo/bin", self.state / "xdg/config",
+                     self.logs,
                      *[self.state / p for p in ("xdg/data", "xdg/cache", "xdg/state", "tmp")]]:
             path.mkdir(parents=True, exist_ok=True)
         self.tmp = wall.temporary_directory(self.state, 65)
@@ -36,6 +39,8 @@ class WallTests(unittest.TestCase):
             "--tmp-dir", self.tmp, "--agent-port", "18500", "--gateway-port", "18600",
             "--egress-port", "18700", "--model-port", "8000", "--judge-port", "8441",
             "--service-state-dir", str(self.service),
+            "--read-only-dir", str(self.logs),
+            "--read-only-dir", str(self.home / ".cargo/bin"),
         ])
 
     def test_profile_reserves_future_ports_and_exempts_admitted_services(self):
@@ -82,6 +87,12 @@ class WallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             wall.generate(self.args, set(), 65)
 
+    def test_read_only_directories_cannot_expose_protected_trees(self):
+        for path in (self.home, self.home.parent, self.root, self.service, self.state):
+            self.args.read_only_dir = [str(path)]
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                wall.generate(self.args, set(), 65)
+
     def test_lsof_failure_and_malformed_records_fail_closed(self):
         for code, out, err in [(2, "", ""), (1, "n*:1234\n", ""),
                                (0, "", "permission denied"), (0, "nunknown\n", "")]:
@@ -98,11 +109,13 @@ class WallTests(unittest.TestCase):
 
     def sandbox(self, script, expected, label, permission_denial=True):
         result = subprocess.run(
-            ["/usr/bin/sandbox-exec", "-f", str(self.profile), sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=15,
+            ["/usr/bin/sandbox-exec", "-f", str(self.profile), PYTHON, "-c",
+             "print('fixture-started', flush=True); " + script],
+            capture_output=True, text=True, timeout=15, cwd=self.checkout,
             env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(self.home),
                  "TMPDIR": self.tmp, "TMUX_TMPDIR": self.tmp, "PYTHONDONTWRITEBYTECODE": "1"},
         )
+        self.assertIn("fixture-started", result.stdout, f"{label}: interpreter did not start: {result.stderr}")
         self.assertEqual(result.returncode == 0, expected,
                          f"{label}: rc={result.returncode}, stderr={result.stderr[-1500:]}")
         if not expected and permission_denial:
@@ -115,7 +128,7 @@ class WallTests(unittest.TestCase):
         fd = listener.fileno()
         script = (f"import socket; s=socket.socket(fileno={fd}); s.settimeout(5); "
                   "c,_=s.accept(); c.sendall(b'fixture-loopback'); c.close()")
-        child = subprocess.Popen(["/usr/bin/sandbox-exec", "-f", str(self.profile), sys.executable, "-c", script],
+        child = subprocess.Popen(["/usr/bin/sandbox-exec", "-f", str(self.profile), PYTHON, "-c", script],
                                  pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "TMPDIR": self.tmp})
         try:
@@ -179,10 +192,28 @@ class WallTests(unittest.TestCase):
         self.assertEqual(control.returncode, 0, f"host LaunchServices control failed: {control.stdout} {control.stderr}")
         profile = self.state / "broker-wall.sb"
         profile.write_text(wall.generate(self.args, set(), 65))
-        denied = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(profile), sys.executable, "-c", script],
+        denied = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(profile), PYTHON, "-c", script],
                                 capture_output=True, text=True, timeout=15)
         self.assertNotEqual(denied.returncode, 0)
         self.assertNotEqual(denied.stdout.strip(), "0")
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
+    def test_rust_toolchain_builds_from_explicit_read_access(self):
+        # Resolve the host's installed compiler outside the wall, then admit
+        # only that immutable toolchain. No host rustup config or cache grant.
+        resolved = subprocess.run(["rustup", "which", "rustc"], capture_output=True,
+                                  text=True, timeout=15, check=True)
+        compiler = Path(resolved.stdout.strip()).resolve(strict=True)
+        self.args.read_only_dir.append(str(compiler.parent.parent))
+        self.profile = self.state / "rust-wall.sb"
+        self.profile.write_text(wall.generate(self.args, set(), 65))
+        source = self.checkout / "hello.rs"
+        binary = self.checkout / "hello"
+        source.write_text('fn main() { println!("fixture-rust"); }')
+        self.sandbox("import subprocess; "
+                     f"subprocess.run([{str(compiler)!r}, {str(source)!r}, '-o', {str(binary)!r}], check=True); "
+                     f"assert subprocess.check_output([{str(binary)!r}], text=True).strip() == 'fixture-rust'",
+                     True, "Rust compile and run with explicit toolchain access")
 
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_actual_wall_files_network_and_future_successor(self):
@@ -251,7 +282,10 @@ class WallTests(unittest.TestCase):
             path.write_text("fixture-immutable")
         for name in (".ssh/key", ".claude/settings.json", ".codex/auth.json", ".aws/credentials",
                      ".config/session-manager/config.yaml", ".config/gh/hosts.yml", ".config/git/credentials",
-                     ".gitconfig", "Library/Keychains/key",
+                     ".gitconfig", "Library/Keychains/key", ".npmrc", ".pypirc",
+                     "Library/Application Support/Firefox/Profiles/default/cookies.sqlite",
+                     "Library/Application Support/Google/Chrome/Default/Cookies",
+                     "private-unrecognized/credentials", ".config/future-client/session.json",
                      ".claude.json", ".netrc", ".git-credentials", ".cargo/credentials",
                      ".cargo/credentials.toml", ".cargo/config", ".cargo/config.toml"):
             target = self.home / name
@@ -278,8 +312,9 @@ class WallTests(unittest.TestCase):
         for target in (self.home / "bad", self.root / "bad", other / "bad", self.service / "bad"):
             self.sandbox(f"open({str(target)!r}, 'w').write('bad')", False, f"write {target}")
         host_cargo_binary = self.home / ".cargo/bin/cargo"
-        host_cargo_binary.parent.mkdir()
+        host_cargo_binary.parent.mkdir(exist_ok=True)
         host_cargo_binary.write_text("fixture-host-binary")
+        self.sandbox(f"open({str(host_cargo_binary)!r}).read()", True, "read admitted host tool")
         for target in (host_cargo_binary, self.home / ".cargo/config.toml", self.home / ".cargo/poison-cache"):
             original = target.read_text() if target.exists() else None
             self.sandbox(f"open({str(target)!r}, 'w').write('modified')", False, f"modify host cargo {target}")
@@ -295,7 +330,13 @@ class WallTests(unittest.TestCase):
         self.sandbox(f"open({str(link / 'server.secret')!r}).read()", False, "symlink into successor")
         self.sandbox(f"open({str(self.profile)!r}).read()", True, "read own profile")
         self.sandbox(f"import os; os.listdir({str(self.root)!r})", False, "list other agents' state")
-        self.sandbox(f"import os; os.listdir({str(self.root.parent)!r})", True, "read sm log directory")
+        self.sandbox(f"import os; os.listdir({str(self.root.parent)!r})", False, "list host state")
+        log = self.logs / "fixture.log"
+        log.write_text("fixture-log")
+        self.sandbox(f"open({str(log)!r}).read()", True, "read explicitly admitted sm log")
+        credential_alias = self.checkout / "credential-alias"
+        credential_alias.symlink_to(self.home / ".npmrc")
+        self.sandbox(f"open({str(credential_alias)!r}).read()", False, "symlink to npm credential")
         credential = self.service / "gateway.secret"
         credential.write_text("fixture-service-secret")
         self.sandbox(f"open({str(credential)!r}).read()", False, "read service secret")

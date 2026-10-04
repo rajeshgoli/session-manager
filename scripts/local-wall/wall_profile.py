@@ -155,7 +155,39 @@ def generate(args, listeners, minimum_tmp_length):
         if path == cargo or below(path, cargo) or below(cargo, path):
             raise ValueError("service secrets and cargo must not overlap")
 
-    lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
+    read_only = [physical(value) for value in args.read_only_dir]
+    for path in read_only:
+        if not path.is_dir():
+            raise ValueError(f"read-only tool/log path is not a directory: {path}")
+        # Never turn a broad host tree, agent root or secret tree into an
+        # exception. The caller must supply credential-free immutable tooling
+        # or a dedicated log directory, not arbitrary user data or caches.
+        protected = [home, state_root, *services]
+        if any(path == p or below(p, path) for p in protected):
+            raise ValueError("read-only directory contains a protected host tree")
+        if any(below(path, p) for p in [state_root, *services]):
+            raise ValueError("read-only directory overlaps agent or service state")
+    lines = ["(version 1)", "(allow default)", "(deny file-write*)",
+             "(deny file-read-data)",
+             # dyld opens the filesystem root before resolving its OS cache.
+             # This permits only the root directory, never its descendants.
+             '(allow file-read-data (literal "/"))']
+    # Metadata is needed to resolve physical paths; file contents and directory
+    # listings are denied everywhere unless explicitly admitted here. Do not
+    # admit all of /Library, /etc, /usr/local, /opt or the user's home.
+    runtime = [Path(p) for p in (
+        "/System", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib",
+        "/usr/libexec", "/usr/share", "/dev", "/Library/Apple",
+        "/Library/Developer/CommandLineTools", "/Applications/Xcode.app/Contents/Developer",
+        "/opt/homebrew/Cellar", "/opt/homebrew/bin", "/opt/homebrew/lib",
+        "/opt/homebrew/share", "/opt/homebrew/opt", "/usr/local/bin",
+        "/usr/local/lib", "/usr/local/share",
+        "/private/var/db/timezone", "/private/etc/ssl/cert.pem",
+        "/private/etc/passwd", "/private/etc/group", "/private/etc/hosts",
+        "/private/etc/localtime", "/private/etc/services", "/private/etc/protocols",
+    )]
+    lines.append("(allow file-read-data " + " ".join(
+        f"(subpath {quoted(p)})" for p in [checkout, state, *runtime, *read_only]) + ")")
     # Do not allow the whole Darwin temp directory or the entire state folder.
     # Profile, plugin, launch scripts, password and usage ledger are host-owned.
     writable = [checkout, *mutable, Path("/dev")]
@@ -205,6 +237,8 @@ def parser():
     result.add_argument("--egress-port-range", default="18700-18799")
     result.add_argument("--service-state-dir", action="append", required=True,
                         help="host-owned judge/proxy secret directory; repeat for each")
+    result.add_argument("--read-only-dir", action="append", default=[],
+                        help="host-approved credential-free toolchain or dedicated log directory")
     return result
 
 

@@ -38,13 +38,33 @@ so a Unix socket path which fails outside the sandbox also fails inside it. This
 does not grant write access to the general macOS temporary directory. Fail the
 launch if this command fails.
 
+File contents and directory listings are denied by default. The profile admits
+the checkout, own state and system runtime/tool directories; it does not admit
+the user's home, browser profiles, package-manager configuration or arbitrary
+host data. Metadata remains available for path resolution; the filesystem root
+directory itself is readable because the macOS program loader opens it before
+loading the system library cache. This grants no access to its descendants. Repeat
+`--read-only-dir` for each additional host-approved, credential-free toolchain
+or dedicated log directory. Supply physical narrow directories, never a home,
+state root, service-secret tree or their ancestors. The host must verify these
+directories contain only immutable trusted tools or sanitized logs; do not
+admit mutable shared dependency caches or directories containing credentials.
+Missing tools must fail the launch or be staged into immutable own state;
+never respond by admitting a broad host tree. The old credential-path denials
+remain as extra protection, not an exhaustive credential inventory.
+
 Set `CARGO_HOME` to `<state_dir>/xdg/cache/cargo`, a private mutable directory.
 Prepare any required dependency caches there outside the wall before launch;
 copy cache data without host configuration or credentials. Host Cargo binaries
-remain readable, but the entire host Cargo home stays unwritable. Its config
+are readable only when their physical tool directories are explicitly admitted
+(typically the selected directory under `~/.rustup/toolchains`); the entire host Cargo home
+stays unwritable. Its config
 and credential files are unreadable. Do not allow writes to shared caches:
 poisoned dependency source could execute during a later host build. This replaces
 the prototype's writable `~/.cargo` grant to preserve the process boundary.
+Put the selected toolchain's `bin` on `PATH` and invoke its Cargo/rustc directly,
+so rustup does not need to read the host's settings. If the runtime uses rustup,
+it must prepare a private `RUSTUP_HOME` with credential-free settings/toolchains.
 
 Set `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` in the cleared launch
 environment. Host `.gitconfig` and `.config/git` are unreadable because they may
@@ -108,12 +128,13 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Resource | Agent access |
 | --- | --- |
 | Own checkout, private Cargo home, mutable state, `/dev` | Write |
-| Host Cargo home | No write; config and credentials unreadable |
+| Host Cargo home | No write; read only explicitly admitted tool directories |
 | Other agents' state, including future siblings | No read or write |
 | Own config, judge plugin, profile, launch files, server secret | Read; no write |
 | GitHub config, both standard Git credential stores, host global Git config, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
 | Judge/proxy service-secret directories | No read or write |
-| sm logs outside protected state directories | Read |
+| Dedicated credential-free sm log directories | Read only when explicitly admitted |
+| All other host file contents, including npm tokens and browser cookies | No read |
 | Direct internet and DNS | No outbound connection |
 | New TCP/UDP listeners on loopback, wildcard or LAN addresses | No bind/listen |
 | Trusted prebound IPv4/IPv6 loopback listener descriptors | Accept and reply |
