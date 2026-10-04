@@ -41,7 +41,7 @@ OWN=" ${5:-18236 8431 8432} $SMPORT "
 lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {n=split($9,a,":"); print a[n]}' | sort -un | while read p; do
   [[ $OWN == *" $p "* ]] || print "(deny network-outbound (remote ip \"localhost:$p\"))"
 done
-for p in 8420 8443 8000 1234 1235 1236; do print "(deny network-outbound (remote ip \"localhost:$p\"))"; done
+for p in 8420 8443 8000 1234 1235 1236; do [[ $OWN == *" $p "* ]] || print "(deny network-outbound (remote ip \"localhost:$p\"))"; done
 cat <<P
 (deny network-outbound
   (remote unix-socket (path-literal "/private/var/run/mDNSResponder"))
