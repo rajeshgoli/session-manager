@@ -38,6 +38,14 @@ so a Unix socket path which fails outside the sandbox also fails inside it. This
 does not grant write access to the general macOS temporary directory. Fail the
 launch if this command fails.
 
+Set `CARGO_HOME` to `<state_dir>/xdg/cache/cargo`, a private mutable directory.
+Prepare any required dependency caches there outside the wall before launch;
+copy cache data without host configuration or credentials. Host Cargo binaries
+remain readable, but the entire host Cargo home stays unwritable. Its config
+and credential files are unreadable. Do not allow writes to shared caches:
+poisoned dependency source could execute during a later host build. This replaces
+the prototype's writable `~/.cargo` grant to preserve the process boundary.
+
 Generate the profile with host-owned values, for example:
 
 ```sh
@@ -78,7 +86,8 @@ paths for the lifetime of every launched wall, including across sm restarts.
 
 | Resource | Agent access |
 | --- | --- |
-| Own checkout, cargo directory, mutable state, `/dev` | Write |
+| Own checkout, private Cargo home, mutable state, `/dev` | Write |
+| Host Cargo home | No write; config and credentials unreadable |
 | Other agents' state, including future siblings | No read or write |
 | Own config, judge plugin, profile, launch files, server secret | Read; no write |
 | GitHub config, git credential store, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
@@ -88,6 +97,7 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Own sm gateway, egress proxy, model and judge | Loopback connection |
 | Private Unix sockets in own `tmp/` | Connection |
 | Every Unix socket outside own `tmp/`, including Docker, default tmux and sm-state sockets | No connection |
+| macOS SecurityServer/securityd service family | No Mach lookup (keychain queries denied) |
 
 The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement

@@ -51,6 +51,7 @@ class WallTests(unittest.TestCase):
                    ("agent_port_range", "18599-18500"), ("model_port", "65536"),
                    ("gateway_port_range", "18500-18699"), ("tmp_dir", str(self.checkout)),
                    ("state_dir", str(self.checkout)), ("checkout", str(self.home)),
+                   ("checkout", str(self.home / ".cargo")),
                    ("judge_port", "8000")]
         for name, value in invalid:
             old = getattr(self.args, name)
@@ -106,6 +107,46 @@ class WallTests(unittest.TestCase):
         if not expected and permission_denial:
             self.assertIn("PermissionError", result.stderr,
                           f"{label} failed for a reason other than sandbox permission: {result.stderr}")
+
+    @unittest.skipUnless(sys.platform == "darwin", "keychain fixture requires macOS")
+    def test_keychain_service_cannot_return_a_readable_fixture_secret(self):
+        # Explicit fixture keychain on EVERY command: never query, modify or
+        # change the default keychain. Delete the created keychain before the
+        # temporary directory is removed, also on test failure.
+        keychain = self.state / "xdg/state/fixture.keychain-db"
+        secret = "local-wall-fixture-secret"
+        security = "/usr/bin/security"
+
+        def host(*args):
+            result = subprocess.run([security, *args], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result
+
+        host("create-keychain", "-p", "fixture-password", str(keychain))
+        self.addCleanup(subprocess.run, [security, "delete-keychain", str(keychain)],
+                        capture_output=True, timeout=15)
+        host("unlock-keychain", "-p", "fixture-password", str(keychain))
+        host("add-generic-password", "-a", "wall-fixture", "-s", "wall-test", "-w", secret,
+             "-A", str(keychain))
+        query = [security, "find-generic-password", "-a", "wall-fixture", "-s", "wall-test", "-w", str(keychain)]
+        self.assertEqual(host(*query[1:]).stdout.strip(), secret)
+        profile = wall.generate(self.args, set(), 65)
+        wall_path = self.state / "keychain-wall.sb"
+        wall_path.write_text(profile)
+        control_path = self.state / "keychain-control.sb"
+        control_path.write_text("\n".join(line for line in profile.splitlines()
+                                          if not line.startswith("(deny mach-lookup")) + "\n")
+        # The keychain file is under readable mutable state. Prove the file and
+        # other sandbox rules alone do not protect the secret, then test the
+        # identical command with the credential-service denial enabled.
+        control = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(control_path), *query],
+                                 capture_output=True, text=True, timeout=15)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout.strip(), secret)
+        denied = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(wall_path), *query],
+                                capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertNotIn(secret, denied.stdout + denied.stderr)
 
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_actual_wall_files_network_and_future_successor(self):
@@ -174,7 +215,8 @@ class WallTests(unittest.TestCase):
             path.write_text("fixture-immutable")
         for name in (".ssh/key", ".claude/settings.json", ".codex/auth.json", ".aws/credentials",
                      ".config/session-manager/config.yaml", ".config/gh/hosts.yml", "Library/Keychains/key",
-                     ".claude.json", ".netrc", ".git-credentials"):
+                     ".claude.json", ".netrc", ".git-credentials", ".cargo/credentials",
+                     ".cargo/credentials.toml", ".cargo/config", ".cargo/config.toml"):
             target = self.home / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("fixture-credential")
@@ -184,11 +226,21 @@ class WallTests(unittest.TestCase):
             original = target.read_text()
             self.sandbox(f"open({str(target)!r}, 'w').write('modified')", False, f"immutable {name}")
             self.assertEqual(target.read_text(), original)
-        for target in [self.checkout, self.home / ".cargo", *[self.state / p for p in
+        private_cargo = self.state / "xdg/cache/cargo"
+        private_cargo.mkdir()
+        for target in [self.checkout, private_cargo, *[self.state / p for p in
                        ("xdg/data", "xdg/cache", "xdg/state")], Path(self.tmp)]:
             self.sandbox(f"open({str(target / 'write-test')!r}, 'w').write('ok')", True, f"write {target}")
         for target in (self.home / "bad", self.root / "bad", other / "bad", self.service / "bad"):
             self.sandbox(f"open({str(target)!r}, 'w').write('bad')", False, f"write {target}")
+        host_cargo_binary = self.home / ".cargo/bin/cargo"
+        host_cargo_binary.parent.mkdir()
+        host_cargo_binary.write_text("fixture-host-binary")
+        for target in (host_cargo_binary, self.home / ".cargo/config.toml", self.home / ".cargo/poison-cache"):
+            original = target.read_text() if target.exists() else None
+            self.sandbox(f"open({str(target)!r}, 'w').write('modified')", False, f"modify host cargo {target}")
+            if original is not None:
+                self.assertEqual(target.read_text(), original)
         for root in (Path("/private/tmp"), Path(wall.user_temp()).resolve()):
             target = root / ("wall-denied-" + self.state.parent.parent.parent.name + str(os.getpid()))
             self.addCleanup(target.unlink, missing_ok=True)
