@@ -361,6 +361,7 @@ mod guestbook_page;
 mod handoff;
 mod history;
 mod inbox;
+mod local_model;
 mod merge_holds;
 mod messages;
 mod notes;
@@ -1782,6 +1783,9 @@ pub fn router(state: AppState) -> Router {
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/session-models", get(client_session_models))
         .route("/client/host-status", get(client_host_status))
+        .route("/client/model", get(local_model::status))
+        .route("/client/model/load", post(local_model::load))
+        .route("/client/model/unload", post(local_model::unload))
         .route("/client/queue", get(client_queue))
         .route("/client/queue/stats", get(client_queue_stats))
         .route(
@@ -21336,7 +21340,8 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 23] = [
+    const OWNER_WEB_READS: [&str; 24] = [
+        "/client/model",
         "/client/queue",
         "/client/queue/stats",
         "/client/board/launch-default?lane_id=1",
@@ -21364,6 +21369,8 @@ mod tests {
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
         vec![
+            (Method::POST, "/client/model/load", json!({"key":"fixture"})),
+            (Method::POST, "/client/model/unload", json!({})),
             (
                 Method::POST,
                 "/client/queue/jobs/job-missing/start",

@@ -61,6 +61,7 @@ pub struct AppConfig {
     pub web_watch: WebWatchConfig,
     pub push: PushConfig,
     pub utilization: UtilizationConfig,
+    pub local_host: crate::local_model::LocalHostConfig,
     pub activity: ActivityConfig,
     /// How sm names the owner in text it writes to agents (sm#1580): the
     /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
@@ -134,6 +135,7 @@ impl Default for AppConfig {
             web_watch: WebWatchConfig::default(),
             push: PushConfig::default(),
             utilization: UtilizationConfig::default(),
+            local_host: crate::local_model::LocalHostConfig::default(),
             activity: ActivityConfig::default(),
             owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
@@ -2214,6 +2216,8 @@ struct RawConfig {
     #[serde(default)]
     utilization: UtilizationConfig,
     #[serde(default)]
+    local_host: crate::local_model::LocalHostConfig,
+    #[serde(default)]
     activity: ActivityConfig,
     #[serde(default)]
     owner_name: Option<String>,
@@ -2335,6 +2339,7 @@ impl From<RawConfig> for AppConfig {
             web_watch: raw.web_watch,
             push: raw.push,
             utilization: raw.utilization,
+            local_host: raw.local_host,
             activity: raw.activity,
             owner_name: normalize_owner_name(raw.owner_name.as_deref())
                 .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),

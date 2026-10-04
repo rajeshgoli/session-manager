@@ -67,6 +67,8 @@ pub struct HostSample {
     /// physical footprint, and CPU and GPU busy percent of the whole machine
     /// over the last interval. Never above the host's own figure.
     pub queue_mem_bytes: Option<i64>,
+    /// Physical footprint of the managed model server and its descendants.
+    pub local_model_bytes: Option<i64>,
     pub queue_cpu_pct: Option<f64>,
     pub queue_gpu_pct: Option<f64>,
     /// App memory counting compressed pages at full size, the scale process
@@ -158,6 +160,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Columns added after the first release (sm#1714).
     for (table, column, kind) in [
         ("host_samples", "queue_mem_bytes", "INTEGER"),
+        ("host_samples", "local_model_bytes", "INTEGER"),
         ("host_samples", "queue_cpu_pct", "REAL"),
         ("host_samples", "queue_gpu_pct", "REAL"),
         ("job_samples", "footprint_bytes", "INTEGER"),
@@ -231,9 +234,9 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             mem_compressed_bytes, pressure_level, load_1m,
             running_perf, running_tests, running_background, running_service,
             pending_perf, pending_tests, pending_background, pending_service,
-            queue_mem_bytes, queue_cpu_pct, queue_gpu_pct
+            queue_mem_bytes, queue_cpu_pct, queue_gpu_pct, local_model_bytes
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         "#,
         params![
             host.sampled_at_ms,
@@ -262,6 +265,7 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             host.queue_mem_bytes,
             host.queue_cpu_pct,
             host.queue_gpu_pct,
+            host.local_model_bytes,
         ],
     )?;
     {
@@ -602,7 +606,7 @@ fn count_jobs(sample: &mut HostSample, jobs: &[ActiveQueueJob]) {
 }
 
 #[cfg(target_os = "macos")]
-mod mac {
+pub(crate) mod mac {
     use super::{CpuTicks, VmPages};
     use std::ffi::CString;
     use std::sync::OnceLock;
@@ -821,6 +825,14 @@ impl Recorder {
         let (mut host, gpu_by_pid) = self.measure_host(now_ms);
         let jobs = active_queue_jobs_for_sampling(&self.settings.queue_db_path)?;
         count_jobs(&mut host, &jobs);
+        host.local_model_bytes =
+            match crate::local_model::sample_model(&self.settings.message_queue_db_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("local model sampling failed: {error:#}");
+                    None
+                }
+            };
         let any_running = jobs.iter().any(|job| job.state == "running");
         let mut groups = if any_running {
             run("/bin/ps", &["-axo", "pid=,pgid=,rss=,time="])
@@ -975,7 +987,9 @@ const WEIGHTED_HOSTS: &str = r#"
 fn hold_group(reason: Option<&str>) -> &'static str {
     match reason {
         Some("concurrency_cap") => "limits",
-        Some("perf_running" | "awaiting_tests" | "perf_cooldown" | "displacing") => "perf_rules",
+        Some(
+            "perf_running" | "awaiting_tests" | "perf_cooldown" | "displacing" | "local_model",
+        ) => "perf_rules",
         Some("memory_pressure" | "resource_budget_missing") => "memory",
         _ => "other",
     }
@@ -1220,7 +1234,7 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
                       AVG(running_tests), AVG(running_perf), AVG(running_background),
                       AVG(running_service),
                       MAX(pending_tests + pending_perf + pending_background + pending_service),
-                      AVG(queue_mem_bytes), AVG(queue_cpu_pct), AVG(queue_gpu_pct)
+                      AVG(queue_mem_bytes), AVG(queue_cpu_pct), AVG(queue_gpu_pct), AVG(local_model_bytes), MAX(local_model_bytes)
                FROM host_samples
                WHERE sampled_at_ms >= ?1 AND sampled_at_ms < ?2
                GROUP BY bucket"#,
@@ -1255,6 +1269,8 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
             };
             put_i("mem_used_avg", row.get(6)?);
             put_i("queue_memory_avg", row.get(15)?);
+            put_i("local_model_memory_avg", row.get(18)?);
+            put_i("local_model_memory_max", row.get(19)?);
             put_i(
                 "mem_used_max",
                 row.get::<_, Option<i64>>(7)?.map(|v| v as f64),
@@ -1701,6 +1717,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "ALTER TABLE host_samples DROP COLUMN queue_mem_bytes;
+                 ALTER TABLE host_samples DROP COLUMN local_model_bytes;
                  ALTER TABLE job_samples DROP COLUMN footprint_bytes;",
             )
             .unwrap();
@@ -1708,6 +1725,7 @@ mod tests {
         let mut conn = open_for_write(&path).unwrap();
         let mut host = host(1_000, Some(10.0), 10 * GIB, 1);
         host.queue_mem_bytes = Some(GIB);
+        host.local_model_bytes = Some(20 * GIB);
         let job = JobSample {
             job_id: "a".into(),
             job_type: "tests".into(),
@@ -1724,6 +1742,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (GIB, 7));
+        let model: Vec<Option<i64>> = conn
+            .prepare("SELECT local_model_bytes FROM host_samples ORDER BY sampled_at_ms")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(model, vec![None, Some(20 * GIB)]);
         let used: Vec<Option<i64>> = conn
             .prepare("SELECT mem_used_bytes FROM host_samples ORDER BY sampled_at_ms")
             .unwrap()
