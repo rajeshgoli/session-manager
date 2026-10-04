@@ -362,6 +362,22 @@ HTTPServer(('127.0.0.1',port),Handler).serve_forever()
         let i = args.iter().position(|v| v == flag).unwrap();
         assert_eq!(args[i + 1], value);
     }
+    // Simulate a restart after launch but before the launch worker saved PID.
+    let pid = m.pid;
+    m.state = "loading".into();
+    m.pid = None;
+    host.save(&m).unwrap();
+    host.recover().unwrap();
+    let recovered = host.record().unwrap().unwrap();
+    assert_eq!(recovered.state, "draining");
+    assert_eq!(recovered.pid, pid);
+    assert_eq!(
+        recovered.last_error.as_deref(),
+        Some("sm restarted during loading; unload before reloading")
+    );
+    // Persisted recovery remains unloadable after another controller restart.
+    host.recover().unwrap();
+    assert_eq!(host.record().unwrap().unwrap().pid, pid);
     // The fixture's stop returns before the process necessarily exits. The
     // backend must wait for the owned pane to die, not trust command success.
     host.unload(true, None).unwrap();

@@ -110,6 +110,10 @@ trait ModelServer: Send + Sync {
     fn running(&self, model: &ModelRecord) -> Result<bool> {
         self.ready(model)
     }
+    /// PID recovered only from the backend's private ownership boundary.
+    fn owned_pid(&self, model: &ModelRecord) -> Result<Option<i32>> {
+        Ok(model.pid)
+    }
     fn footprint(&self, model: &ModelRecord) -> Result<Option<i64>>;
 }
 
@@ -448,6 +452,26 @@ impl ModelHost {
             });
         }
         Ok(true)
+    }
+    fn recover(&self) -> Result<()> {
+        if let Some(mut m) = self.record()?.filter(ModelRecord::resident) {
+            if !self.backend.running(&m)? {
+                m.pid = None;
+                let state = if m.desired { "yielded" } else { "unloaded" };
+                self.transition(&mut m, state)?;
+            } else if m.state == "loading" {
+                if m.pid.is_none() {
+                    // Startup may have persisted loading before the tmux launch
+                    // returned its PID. Recover only from our private pane.
+                    m.pid = self.backend.owned_pid(&m)?;
+                }
+                // A server restart interrupted a load worker. Keep admission shut
+                // until a deliberate unload cleans up this still-resident model.
+                m.last_error = Some("sm restarted during loading; unload before reloading".into());
+                self.transition(&mut m, "draining")?;
+            }
+        }
+        Ok(())
     }
     fn sample(&self) -> Result<Option<i64>> {
         let Some(m) = self.record()?.filter(ModelRecord::resident) else {
@@ -799,6 +823,13 @@ impl ModelServer for CliServer {
             Ok(self.pane()?.is_some())
         }
     }
+    fn owned_pid(&self, m: &ModelRecord) -> Result<Option<i32>> {
+        if m.server == "mtplx" {
+            self.pane()
+        } else {
+            Ok(None)
+        }
+    }
     fn footprint(&self, m: &ModelRecord) -> Result<Option<i64>> {
         let mut cmd = Command::new("/bin/ps");
         cmd.args(["-axo", "pid=,ppid=,command="]);
@@ -955,18 +986,7 @@ pub fn register_live(config: &AppConfig) -> Result<Arc<ModelHost>> {
             bail!("unload the persisted local model before changing server configuration");
         }
     }
-    if let Some(mut m) = host.record()?.filter(ModelRecord::resident) {
-        if !host.backend.running(&m)? {
-            m.pid = None;
-            let state = if m.desired { "yielded" } else { "unloaded" };
-            host.transition(&mut m, state)?;
-        } else if m.state == "loading" {
-            // A server restart interrupted a load worker. Keep admission shut
-            // until a deliberate unload cleans up this still-resident model.
-            m.last_error = Some("sm restarted during loading; unload before reloading".into());
-            host.transition(&mut m, "draining")?;
-        }
-    }
+    host.recover()?;
     hosts.insert(queue_dir, host.clone());
     hosts.insert(fs::canonicalize(db_path)?, host.clone());
     Ok(host)
