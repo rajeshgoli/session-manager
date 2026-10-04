@@ -15430,6 +15430,19 @@ enum ApiError {
 }
 
 fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
+    if let Some(unknown) = error.downcast_ref::<crate::sessions::SpawnAcceptanceUnknown>() {
+        return ApiError::StatusBody {
+            status: StatusCode::CONFLICT,
+            body: json!({
+                "detail": unknown.to_string(),
+                "code": "spawn_acceptance_unknown",
+                "session_id": unknown.session_id,
+                "provider_session_id": unknown.provider_session_id,
+                "brief_sha256": unknown.brief_sha256,
+                "retry_safe": false,
+            }),
+        };
+    }
     if let Some(validation) = error.downcast_ref::<CodexModelValidationError>() {
         let status = match validation {
             CodexModelValidationError::Unsupported { .. } => StatusCode::BAD_REQUEST,
