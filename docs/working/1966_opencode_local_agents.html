@@ -223,15 +223,20 @@
 </figure>
 
 <h3>A local agent from your side</h3>
-<pre>$ sm spawn local --name sm-2001-fix "Fix #2001: …"
-spawned sm-2001-fix (5b7e…) provider=opencode model=qwen3.8-flash-next
-$ sm spawn local "…"
-error: no local seat free (1/1 used by sm-2001-fix)
-$ sm attach sm-2001-fix     # opencode's own screen; Esc there interrupts
-$ sm send sm-2001-fix "Also cover the restart path."
-$ sm what sm-2001-fix
-error: provider opencode does not support sm what</pre>
-<p>The app shows the agent with a LOCAL badge, its status, last tool and context use, exactly as for other agents. Its tokens appear in no Claude or Codex meter.</p>
+<p><b>On the phone and web app, a local agent looks and acts like any other agent, with three differences: a LOCAL badge, no interrupt, and no spawning of its own.</b> What changes, surface by surface:</p>
+<table>
+<thead><tr><th style="width:22%">Surface</th><th>What you see with a local agent</th><th style="width:20%">Ships in</th></tr></thead>
+<tbody>
+<tr><td>Agent list, Board, Watch</td><td>The agent with a violet <b>LOCAL</b> badge, its status (working / idle), last tool and context use, updated about a second behind the agent.</td><td>Local usage ticket</td></tr>
+<tr><td>Start an agent (start sheets, Board start)</td><td>A <b>“Local (Flash-Next)”</b> choice, shown only while the model is loaded. With the one seat taken, it is greyed out with “1/1 in use by &lt;name&gt;”.</td><td>Local usage ticket (moved forward from #1959)</td></tr>
+<tr><td>Terminal view</td><td>opencode’s own screen instead of Claude Code’s. Anything you type there reaches the agent as your message; Esc there interrupts it.</td><td>The provider (#1956)</td></tr>
+<tr><td>Send, and urgent send</td><td>Messages arrive as for any agent. Urgent does not interrupt: the agent reads it at its next step (decision 4).</td><td>#1956</td></tr>
+<tr><td>“What is it doing?” summary</td><td>Not available for a local agent (decision 5); the status line and terminal show the same information.</td><td>#1956</td></tr>
+<tr><td>Settings › Handoff</td><td>A fourth row, “Local (opencode)”, at 75%.</td><td>Local usage ticket</td></tr>
+<tr><td>Spend</td><td>No Claude or Codex meter moves. A Local line appears with #1959.</td><td>#1959</td></tr>
+</tbody>
+</table>
+<p>Until the local usage ticket ships, the only way to start a local agent is the command your agents use, <code>sm spawn local "brief"</code>. A refusal there reads, for example, <code>error: no local seat free (1/1 used by sm-2001-fix)</code>.</p>
 
 <h3>Decision surface</h3>
 <table>
@@ -255,7 +260,7 @@ error: provider opencode does not support sm what</pre>
 <tr><td><b>#1966</b> Qualify opencode</td><td>Proof done; this contract. Closes when you approve it.</td><td>Opus, high</td><td>—</td></tr>
 <tr><td><b>New: local agent wall in production</b></td><td>The judge service run by sm; the wall profile generated at launch; queue jobs from a local agent run inside its wall; GitHub credentials held by the egress proxy; the proxy names the agent; an sm gateway through which sm knows every request from a local agent is that agent’s; a normal-length temporary path. Appendix I.2 lists each with its test. No opencode code.</td><td>Opus, high</td><td>this memo</td></tr>
 <tr><td><b>#1956</b> opencode provider</td><td>Launch in the wall with the judge plugin, HTTP delivery and the outbox, the event reader, restore, retire, clear, rename, attach, <code>sm spawn local</code>, the one-agent limit. Appendices B–F, I.1.</td><td>Opus, high</td><td>the wall ticket</td></tr>
-<tr><td><b>New: local usage, handoff, badge</b></td><td>The local account at zero weight, usage rows, the 75% handoff threshold, the LOCAL badge on web and Android. Appendices G, H, K.</td><td>Opus, high</td><td>#1956</td></tr>
+<tr><td><b>New: local usage, handoff, badge</b></td><td>The local account at zero weight, usage rows, the 75% handoff threshold, the LOCAL badge on web and Android, and “Local” in the app’s start sheets. Appendices G, H, K.</td><td>Opus, high</td><td>#1956</td></tr>
 <tr><td><b>#1957</b> sm owns the model</td><td>Unchanged from #1784 appendix E.</td><td>Opus, high</td><td>—</td></tr>
 <tr><td><b>#1958</b> Seat limit and yield</td><td>#1784 appendix F, with two substitutions (appendix J).</td><td>Opus, high</td><td>#1956, #1957</td></tr>
 <tr><td><b>#1959</b> Spend and tier table</td><td>#1784 appendix G’s Spend line and tier row; the row names <code>sm spawn local</code>.</td><td>Sonnet, high</td><td>#1958</td></tr>
@@ -272,6 +277,7 @@ error: provider opencode does not support sm what</pre>
 
 <h3>FAQ — what changed since the local-agents memo</h3>
 <ul>
+<li><b>The app can start a local agent</b> as soon as the local usage ticket ships, not only after #1959; #1784 had put the start-sheet choice in #1959.</li>
 <li><b>This is the first revision of this memo.</b> It replaces #1784’s appendices B, C, D and G, which specified Claude Code as the local harness; #1784’s appendices E, F (with appendix J’s two substitutions), K and L still bind.</li>
 <li><b><code>sm spawn claude --host local</code> is gone</b>; the command is <code>sm spawn local</code>.</li>
 <li><b>#1784’s launch requirement for a Claude Code judge hook is replaced</b> by an opencode plugin that calls the same judge service.</li>
@@ -593,7 +599,7 @@ tmp/                                   the agent's TMPDIR and TMUX_TMPDIR</pre>
 <ul>
 <li><b>Badge</b> (new usage ticket): <code>providerLabel</code> (web/ui.js:340) returns “Local” for <code>opencode</code>, shown as a LOCAL badge in <code>--violet</code> on web/agents.js:468–489; Android WatchScreen.kt:1221 label “LOCAL” and <code>providerTint</code> (WatchScreen.kt:2035) violet; WatchModels.kt where provider is summarised.</li>
 <li><b>Handoff settings</b> (same ticket): a fourth provider row “Local (opencode)” in web/settings.js:315 and Android HandoffControls.kt:170; web/handoff.js:52 window 200K for opencode.</li>
-<li><b>Start sheets, Board start, owner settings:</b> no change until #1959, which offers “Local (&lt;loaded model&gt;)” only while a model is loaded.</li>
+<li><b>Start sheets and Board start</b> (same ticket, moved forward from #1784 appendix G, which assigned it to #1959): web and Android offer “Local (&lt;loaded model&gt;)” only while the model is loaded (the C.1 model check answers), creating the agent through the same route as <code>sm spawn local</code>. While no seat is free the choice is disabled with C.1’s refusal text. #1959 keeps the Spend line and the tier table only. Tests: the choice is absent with no model loaded, disabled with the seat taken, and starts an opencode agent otherwise.</li>
 </ul>
 
 <h3 id="l">L. Requirement trace</h3>
