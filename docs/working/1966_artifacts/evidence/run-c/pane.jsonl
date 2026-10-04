@@ -1,0 +1,10 @@
+{"t": 1791070448.243289, "line": "status idle"}
+{"t": 1791070453.38648, "line": "status busy"}
+{"t": 1791070718.8801541, "line": "status idle"}
+{"t": 1791070778.735667, "line": "delivered msg_10423355f001htaFoYXoHg8gNV (149 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nRESTORE-CHECK: ", "key": "pane-bd2e7ecb06a1", "messageID": "msg_10423355f001htaFoYXoHg8gNV"}
+{"t": 1791070778.9070961, "line": "status busy"}
+{"t": 1791070783.152031, "line": "status retry"}
+{"t": 1791070845.0560389, "line": "status busy"}
+{"t": 1791070882.3952909, "line": "status idle"}
+{"t": 1791070948.508308, "line": "status unreachable"}
+{"t": 1791070949.087647, "line": "status idle"}

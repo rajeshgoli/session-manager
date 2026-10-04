@@ -1,0 +1,10 @@
+{
+ "oc_url": "http://127.0.0.1:18451",
+ "oc_session": "ses_efbe1d623ffeC1f2PL2vE0tMPV",
+ "sm_url": "http://127.0.0.1:18450",
+ "sm_id": "a1966oc0",
+ "state_dir": "/private/tmp/claude-501/-Users-rajesh-projects-session-manager/19dda79e-d611-4ddf-9f27-61037aeffe84/scratchpad/runs/c",
+ "model_label": "local/flash-next",
+ "context_window": 200000,
+ "cwd": "/Users/rajesh/worktrees/sm-1966-oc-c"
+}

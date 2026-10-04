@@ -107,11 +107,11 @@
 </style>
 
 <h1>1784 — Local models as sm agents</h1>
-<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), revision 7; Claude Opus 5.5 <code>sm-1961</code> (ed61f79b), 200K measurement; Codex <code>sm-1955</code> (d97b5130), opencode comparison; Claude Opus 5.5 <code>sm-1954</code> (d07c4e36), permissions readout and this revision · Tickets #1784, #1926, #1961, #1955, #1954 · revision 10, 2026-10-03</small></p>
+<p class="sans"><small>Authors: Claude Opus 5.5 <code>sm-1784</code> (2aac7357), design; Claude Opus 5.5 <code>sm-1926-h2</code> (048af9b5), prototype results; Claude Opus 5.5 <code>sm-1926-h3</code> (06720612), revision 7; Claude Opus 5.5 <code>sm-1961</code> (ed61f79b), 200K measurement; Codex <code>sm-1955</code> (d97b5130), opencode comparison; Claude Opus 5.5 <code>sm-1954</code> (d07c4e36), permissions readout; Claude Opus 5.5 <code>sm-1966</code> (f3018f36), opencode lifecycle proof and this revision · Tickets #1784, #1926, #1961, #1955, #1954, #1966 · revision 11, 2026-10-03</small></p>
 
 <h2>Memo</h2>
 
-<p><b>Local agents no longer wait on you, but their quality is not settled. Inside a sandbox wall, with a judge on the same local model ruling on every action that leaves it, three agents worked 2.5 hours with no permission prompt reaching you and no denial you needed to reverse. The same three tickets graded worse than in the prototype. I recommend you approve #1966: it qualifies opencode inside this wall and runs each ticket twice, so the local tier is decided on more than one sample.</b></p>
+<p><b>opencode passes every check sm needs to run it as an agent, and under the same sandbox wall and judge it finished the same two tickets in a third to a half of Claude Code’s time. I recommend you select opencode as the local harness (option A under “Harness” below); that ruling is the one decision this revision needs. Quality still rests on few samples: opencode’s four runs on two tickets all met your bar, while Claude Code’s hands-off reruns graded worse than the prototype.</b></p>
 <p>A <b>harness</b> turns a model’s replies into file reads, edits and shell commands; Claude Code and opencode are the two candidates. Both run Qwen3.8-Flash-Next on this Mac and consume no Claude or Codex quota. A <b>sandbox wall</b> confines the agent; the <b>judge</b>, a second conversation with the same model, allows or denies each action that leaves it. Earlier runs spent 5.6 of 6.9 hours waiting on you; these spent none, and the permission design is ready for sm (appendix K.9).</p>
 
 <dl class="vocab">
@@ -123,51 +123,81 @@
 <dt>Sandbox wall</dt><dd>A macOS sandbox profile (<code>sandbox-exec</code>) around the whole agent process: it may write only inside its checkout, its temp folder and the Rust caches, may not read credentials, and reaches the network only through a proxy that admits GitHub and nothing else.</dd>
 <dt>Judge</dt><dd>A model that sees one proposed action and answers allow or deny. It never hands the action to you. Claude Code's <b>hook</b> mechanism (a script it runs before every tool call, which sm already uses) can consult it.</dd>
 <dt>Active time</dt><dd>Wall time minus time spent waiting at permission prompts or for an answer from a human.</dd>
-<dt>Rescue effort</dt><dd>The grader's estimate of how much of the original agent's work is still needed to bring the local change up to the merged fix.</dd>
 <dt>Host, yield</dt><dd>As in the sm design below: <b>host</b> is a new per-session field saying where the model runs (<code>local</code> for these agents); a <b>yield</b> is sm unloading the model because a queue job needs the memory, after letting local agents finish their turn.</dd>
 </dl>
 
-<h3>Prototype results</h3>
+<h3>Harness: opencode passes the sm lifecycle proof</h3>
+<p><b>opencode works as an sm agent. I recommend you select it as the local harness.</b> I drove it from an unmodified scratch sm, inside #1954’s wall and judge, and it passed the six checks sm depends on. It then fixed #1855 and #1913 hands-off in 4.4 and 15.0 minutes: 28% and 52% of Claude Code’s time under the same wall and judge. Choosing it costs one piece of sm work Claude Code does not need: a new provider in sm that talks to opencode over HTTP instead of typing into a terminal.</p>
 
 <table>
-<thead><tr><th>Model, server</th><th>Ticket</th><th>Verdict (Codex grader)</th><th>Rescue effort</th><th>Active time vs original agent</th><th>Wall time</th><th>Turns</th></tr></thead>
+<thead><tr><th>What sm needs from the harness</th><th>Result</th><th>What sm builds for opencode</th></tr></thead>
 <tbody>
-
-
-<tr><td><b>Qwen3.8-Flash-Next, MTPLX</b></td><td>#1913</td><td><b>small changes</b></td><td>65%</td><td><b>32 vs 14 min (2.3×)</b></td><td>51 min</td><td>70</td></tr>
-<tr><td><b>Flash-Next, MTPLX</b></td><td>#1855 retired review command alias</td><td><b>mergeable as-is</b></td><td><b>0%</b></td><td><b>12 vs 7 min (1.7×)</b></td><td>31 min</td><td>43</td></tr>
-<tr><td>Flash-Next, MTPLX</td><td>#1892 spawn briefs left unsubmitted</td><td>inconclusive: right call, no fix possible in its sandbox</td><td>95%</td><td>29 vs 29 min (1.0×)</td><td>329 min</td><td>95</td></tr>
+<tr><td>1. Submit the brief exactly once and know it arrived</td><td><b>Proved.</b> Acknowledged in 1 s; a resend after a simulated crash was recognised and dropped.</td><td>Send it over HTTP under an id sm chooses, and check that id before any resend.</td></tr>
+<tr><td>2. Show working/idle, last tool and context in sm</td><td><b>Proved.</b> sm tracked the agent live, about a second behind.</td><td>An event-stream reader, like the one sm already runs for Codex.</td></tr>
+<tr><td>3. Deliver <code>sm send</code>, reminders and queue wakes, never twice</td><td><b>Proved:</b> one turn per message, idle or busy.</td><td>Deliver over HTTP; an urgent message queues instead of interrupting (finding 2 below).</td></tr>
+<tr><td>4. Same conversation after restarts</td><td><b>Proved</b> after opencode, model and full restarts, and through a 12-minute model outage.</td><td>Keep opencode’s data folder; its session id is sm’s resume id.</td></tr>
+<tr><td>5. Judge every action with no prompt to you</td><td><b>Proved.</b> No prompt in 97 real tool calls; deny, allow and allow-once behave as in #1954.</td><td>A plugin file in place of Claude Code’s hook, calling #1954’s judge service unchanged.</td></tr>
+<tr><td>6. Local usage at zero quota weight</td><td><b>Exact token counts reach sm’s ledger.</b> Zero weight needs appendix D’s host-local attribution, for either harness.</td><td>Ledger rows from opencode’s per-request counts.</td></tr>
 </tbody>
 </table>
-<p class="sans"><small>Original agents: Astra high on #1913, an Opus session on #1855, Astra medium on #1892. Validation and the earlier 27B runs are in H.7; the opencode comparison is in M.</small></p>
 
-<p>Your bar is a passing merged regression test and a grader verdict of small changes or better; rescue effort is recorded, not gating.</p>
-
-<h3>opencode comparison</h3>
 <table>
-<thead><tr><th>Ticket</th><th>Claude Code → opencode verdict</th><th>Active minutes</th><th>First-prompt tokens</th></tr></thead>
+<thead><tr><th>Ticket</th><th>Claude Code, wall + judge (#1954)</th><th>opencode, prototype wall (#1955)</th><th>opencode, wall + judge + sm (#1966)</th></tr></thead>
 <tbody>
-<tr><td>#1913 server sockets inherited by jobs</td><td>small changes → small changes</td><td>32 → <b>15.1</b> (53% less)</td><td>15,106 → <b>7,689</b> (49% less)</td></tr>
-<tr><td>#1855 retired review-command alias</td><td>mergeable as-is → <b>mergeable as-is</b></td><td>12 → <b>5.2</b> (56% less)</td><td>15,651 → <b>8,052</b> (49% less)</td></tr>
+<tr><td>#1855 retired review-command alias</td><td>15.7 min, small changes</td><td>5.2 min, mergeable as-is</td><td><b>4.4 min, mergeable as-is</b></td></tr>
+<tr><td>#1913 server sockets inherited by jobs</td><td>29.0 min, large changes</td><td>15.1 min, small changes</td><td><b>15.0 min, small changes</b></td></tr>
+<tr><td>First prompt (tokens)</td><td>11,180 and 10,837</td><td>8,052 and 7,689</td><td>8,292 and 8,004</td></tr>
 </tbody>
 </table>
-<p><b>The harness choice is open. I recommend qualifying opencode for sm integration before committing to Claude Code.</b> Both fixes pass their own and the merged regression tests, and both tests fail when the fixes are removed. These are one run per bug, with a different wall and a 200K window versus Claude Code’s 131K; the numbers establish a promising configuration, not a controlled measure of the harness alone. #1954’s Claude Code reruns provide the comparison at 200K with automatic approvals.</p>
-<p>The options are: keep Claude Code, whose sm hooks already work; switch directly to opencode; or <b>prefer opencode subject to a lifecycle proof</b>—the recommended option. That proof must cover sm status, messages, spawn acknowledgement, restore, accounting and judge decisions. None of those was exercised by these standalone opencode runs. Until the proof and your harness ruling, appendices B–G describe the Claude Code fallback, and launch implementation does not start. Appendix M contains the evidence and exact limits.</p>
+<p class="sans"><small>Active minutes from brief to the end of the first turn. Claude Code’s include pushing, opening a draft PR and requesting review; opencode’s include committing and reporting to the parent. All four opencode fixes pass the merged fix’s own test, which fails without them. #1966’s grades are mine, not an independent grader’s; each matches the Codex grade of #1955’s change, whose design it repeats. The #1913 agent’s own new test fails outside the wall, because my launcher gave it a short temporary path, the trap #1954’s launch requirement 4 removes.</small></p>
 
 <figure>
-<svg viewBox="0 0 760 134" role="img" aria-label="Active minutes: Claude Code versus opencode" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
-<text x="16" y="32" fill="var(--ink)">#1913</text><rect x="86" y="17" width="512" height="16" fill="var(--blue)"/><text x="606" y="30" fill="var(--ink)">32 min</text>
-<rect x="86" y="38" width="241" height="16" fill="var(--violet)"/><text x="335" y="51" fill="var(--ink)">15.1 min</text>
-<text x="16" y="86" fill="var(--ink)">#1855</text><rect x="86" y="71" width="192" height="16" fill="var(--blue)"/><text x="286" y="84" fill="var(--ink)">12 min</text>
-<rect x="86" y="92" width="84" height="16" fill="var(--violet)"/><text x="178" y="105" fill="var(--ink)">5.2 min</text>
-<rect x="420" y="105" width="12" height="12" fill="var(--blue)"/><text x="440" y="116" fill="var(--ink-2)">Claude Code</text><rect x="570" y="105" width="12" height="12" fill="var(--violet)"/><text x="590" y="116" fill="var(--ink-2)">opencode</text>
+<svg viewBox="0 0 760 150" role="img" aria-label="Active minutes by harness" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<text x="16" y="32" fill="var(--ink)">#1913</text>
+<rect x="86" y="12" width="512" height="14" fill="var(--blue)"/><text x="606" y="24" fill="var(--ink)">29.0 min</text>
+<rect x="86" y="29" width="266" height="14" fill="var(--violet)" opacity="0.55"/><text x="360" y="41" fill="var(--ink)">15.1</text>
+<rect x="86" y="46" width="264" height="14" fill="var(--violet)"/><text x="358" y="58" fill="var(--ink)">15.0</text>
+<text x="16" y="96" fill="var(--ink)">#1855</text>
+<rect x="86" y="76" width="277" height="14" fill="var(--blue)"/><text x="371" y="88" fill="var(--ink)">15.7 min</text>
+<rect x="86" y="93" width="93" height="14" fill="var(--violet)" opacity="0.55"/><text x="187" y="105" fill="var(--ink)">5.2</text>
+<rect x="86" y="110" width="78" height="14" fill="var(--violet)"/><text x="172" y="122" fill="var(--ink)">4.4</text>
+<rect x="86" y="134" width="12" height="12" fill="var(--blue)"/><text x="104" y="145" fill="var(--ink-2)">Claude Code, wall + judge</text>
+<rect x="282" y="134" width="12" height="12" fill="var(--violet)" opacity="0.55"/><text x="300" y="145" fill="var(--ink-2)">opencode, prototype wall</text>
+<rect x="470" y="134" width="12" height="12" fill="var(--violet)"/><text x="488" y="145" fill="var(--ink-2)">opencode, wall + judge + sm</text>
 </svg>
-<figcaption><b>Figure 1. Time spent working.</b> The Claude Code values exclude 19 minutes of permission waits per run; opencode has no human waits. Model loading, driver setup, grading and shutdown are excluded from both. Different sandbox and context settings limit causal attribution.</figcaption>
+<figcaption><b>Figure 1. Time spent working on the same two tickets.</b> Adding the wall, the judge and sm’s lifecycle did not slow opencode. Model loading and grading are excluded throughout.</figcaption>
 </figure>
+
+<figure>
+<svg viewBox="0 0 760 170" role="img" aria-label="How sm drives an opencode agent" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<rect x="16" y="20" width="150" height="122" rx="6" fill="none" stroke="var(--ink-2)"/><text x="30" y="42" fill="var(--ink)" font-weight="600">sm</text><text x="30" y="62" fill="var(--ink-2)">sessions, messages,</text><text x="30" y="78" fill="var(--ink-2)">reminders, queue,</text><text x="30" y="94" fill="var(--ink-2)">usage ledger</text>
+<rect x="290" y="20" width="230" height="122" rx="6" fill="none" stroke="var(--violet)" stroke-dasharray="5 3"/><text x="302" y="38" fill="var(--violet)">sandbox wall</text>
+<rect x="306" y="48" width="200" height="40" rx="5" fill="none" stroke="var(--ink-2)"/><text x="318" y="72" fill="var(--ink)">opencode serve (HTTP)</text>
+<rect x="306" y="96" width="200" height="34" rx="5" fill="none" stroke="var(--ink-2)"/><text x="318" y="117" fill="var(--ink)">judge plugin, every tool</text>
+<rect x="560" y="20" width="184" height="50" rx="6" fill="none" stroke="var(--ink-2)"/><text x="574" y="42" fill="var(--ink)">MTPLX, Flash-Next</text><text x="574" y="60" fill="var(--ink-2)">agent and judge</text>
+<rect x="560" y="92" width="184" height="50" rx="6" fill="none" stroke="var(--ink-2)"/><text x="574" y="114" fill="var(--ink)">judge service</text><text x="574" y="132" fill="var(--ink-2)">#1954, unchanged</text>
+<line x1="166" y1="56" x2="306" y2="56" stroke="var(--blue)"/><text x="172" y="50" fill="var(--blue)">brief, messages</text>
+<line x1="306" y1="80" x2="166" y2="80" stroke="var(--blue)"/><text x="172" y="96" fill="var(--blue)">events: busy, idle,</text><text x="172" y="110" fill="var(--blue)">tools, tokens</text>
+<line x1="506" y1="62" x2="560" y2="45" stroke="var(--ink-2)"/><line x1="506" y1="113" x2="560" y2="117" stroke="var(--ink-2)"/><line x1="652" y1="92" x2="652" y2="70" stroke="var(--ink-2)"/>
+<text x="16" y="164" fill="var(--ink-2)">Your view: opencode attach, the same live session in a terminal.</text>
+</svg>
+<figcaption><b>Figure 2. How sm drives an opencode agent.</b> sm sends over HTTP and reads opencode’s event stream; nothing is typed into a terminal. In the proof, a small adapter played sm’s side so that sm itself stayed unchanged (appendix N).</figcaption>
+</figure>
+
+<p><b>What the proof changed in the design.</b> Two behaviours need an explicit rule in sm’s opencode provider. (1) <b>A message is delivered when opencode accepts it, not when sm sends it:</b> with opencode down, a message was otherwise lost; held until accepted, it arrived once after the restart. (2) <b>An urgent message must not abort the running command.</b> sm’s urgent delivery tells Claude Code to move a running command to the background and then interrupts; opencode cannot do the first, so the interrupt killed a 20-second command. Queued instead, the message is read as soon as the command ends. A third finding is not about the harness: sm filed local tokens under your Claude account at the Opus rate, which appendix D’s host-local attribution fixes for either harness.</p>
+
+<table>
+<thead><tr><th>Option</th><th>What follows</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><b>A. Select opencode (recommended)</b></td><td>I converge an opencode contract in place of appendices B–G for your review; #1956 builds it.</td><td>A new sm provider: launch, HTTP delivery and readiness, event reader, restore, usage rows. Comparable to sm’s Codex event-stream provider.</td></tr>
+<tr><td>B. Keep Claude Code</td><td>B–G stand as written; #1956 starts now.</td><td>Local agents take two to three times as long on the one model seat, and delivery keeps typing into a terminal, the source of #1892’s unsubmitted briefs.</td></tr>
+<tr><td>C. More runs first</td><td>A third run per ticket in each harness, about two hours of model time.</td><td>Delays launch. Four opencode runs on two tickets already agree on speed; I do not expect a third to change the choice.</td></tr>
+</tbody>
+</table>
 
 <h3>200K measurement</h3>
 
-<p><b>A 200K window fits for one agent plus its judge: wired memory peaks at 137 GB. Two agents plus the judge at 200K do not fit, so I recommend 200K with one agent.</b> "Fit" is the limit appendix L set: peak wired memory plus a 10% margin at or under 190 GB, which leaves the queue's typical use and sm's unload margin free. I replayed a real Claude Code conversation from the prototype against Flash-Next on MTPLX, grown from 49K to 190K tokens: alone, as two conversations, and as two plus a judge request every 30 seconds (appendix L). Two agents hit one of two walls. With MTPLX's store of saved conversations (its <b>session bank</b>) capped at 16 GB, two conversations past about 160K push each other out, and each then re-reads its whole conversation, which takes 13 minutes. With the cap at 32 GB they keep their places, but peak wired memory reaches 176 GB, or 194 GB with the margin.</p>
+<p><b>A 200K window fits for one agent plus its judge: wired memory peaks at 137 GB. Two agents plus the judge at 200K do not fit, so I recommend 200K with one agent.</b> "Fit" means peak wired memory plus a 10% margin at or under 190 GB, which leaves the queue's typical use and sm's unload margin free. Two agents at 200K either push each other's saved conversations out of MTPLX's store (its <b>session bank</b>), each then re-reading its whole conversation for 13 minutes, or, with a 32 GB bank, peak at 194 GB with the margin. I measured this by replaying a real prototype conversation grown to 190K tokens (appendix L).</p>
 
 <table>
 <thead><tr><th>Setting</th><th>Peak wired</th><th>+10%</th><th>Fits 190 GB?</th><th>Speed</th></tr></thead>
@@ -179,34 +209,13 @@
 </table>
 <p class="sans"><small>GB. Wired memory is memory macOS cannot page out. Every step's figures, and the 70K–175K sizes, are in appendix L.6.</small></p>
 
-<figure>
-<svg viewBox="0 0 880 210" role="img" aria-label="Peak wired memory by conversation size" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11.5px">
-<g stroke="var(--rule)"><line x1="60" y1="180.0" x2="680" y2="180.0"/><line x1="60" y1="140.0" x2="680" y2="140.0"/><line x1="60" y1="100.0" x2="680" y2="100.0"/><line x1="60" y1="60.0" x2="680" y2="60.0"/><line x1="60" y1="20.0" x2="680" y2="20.0"/></g>
-<g fill="var(--ink-2)" text-anchor="end" font-size="10"><text x="54" y="184.0">100</text><text x="54" y="144.0">120</text><text x="54" y="104.0">140</text><text x="54" y="64.0">160</text><text x="54" y="24.0">180 GB</text></g>
-<g fill="var(--ink-2)" text-anchor="middle" font-size="10"><text x="96" y="198">49K</text><text x="284" y="198">96K</text><text x="424" y="198">131K</text><text x="540" y="198">160K</text><text x="660" y="198">190K tokens</text></g>
-<line x1="60" y1="34.6" x2="680" y2="34.6" stroke="var(--red)" stroke-width="1.5" stroke-dasharray="6 4"/>
-<text x="66" y="31.2" fill="var(--red)">limit: 173 GB peak (190 GB with the 10% margin)</text>
-<polyline fill="none" stroke="var(--blue)" stroke-width="2.5" points="96,168.0 180,164.0 256,148.0 284,140.0 360,136.0 424,126.0 480,120.0 540,112.0 600,106.0 660,108.0"/>
-<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" points="96,162.0 180,142.0 256,126.0 284,128.0 360,116.0 424,112.0 480,106.0 540,78.0"/>
-<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" stroke-dasharray="4 3" points="540,78.0 600,80.0 660,78.0"/>
-<polyline fill="none" stroke="var(--violet)" stroke-width="2.5" points="96,156.0 180,136.0 256,116.0 284,112.0 360,98.0 424,82.0 480,64.0 540,52.0 600,50.0 660,28.0"/>
-<g fill="var(--ink)"><text x="688" y="112.0">one agent + judge, 16 GB bank</text><text x="688" y="81.6">two + judge, 16 GB bank</text><text x="688" y="92.8" fill="var(--ink-2)" font-size="10">dashed: full re-reads</text><text x="688" y="32.0">two + judge, 32 GB bank</text></g>
-</svg>
-<figcaption><b>Figure 2. Peak wired memory as the conversation grows.</b> One agent stays well under the limit. Two agents with a 16 GB bank stay under it only by evicting each other's saved state and re-reading in full; with a 32 GB bank they cross the limit at about 175K. Measured 3 Oct.</figcaption>
-</figure>
-
-<ul>
-<li><b>MTPLX serves one request at a time,</b> whatever its concurrency flags say. With two agents, overlapping turns and judge calls wait behind each other; queued judge requests here waited 48–242 s. With one agent, the judge runs only while the agent waits for its tool call, and answered in a median 1.3 s.</li>
-<li><b>Resuming after a yield costs seconds if MTPLX stops cleanly.</b> MTPLX reloads in 19–26 s and answered a parked 190K conversation in 11 s from its on-disk cache; with nothing cached, the re-read takes 13 minutes. So sm stops MTPLX with <code>mtplx stop</code>, never a kill, and leaves that cache on (MTPLX's default; about 45 GB of SSD).</li>
-</ul>
-
 <h3>Decision surface</h3>
 
 <table>
 <thead><tr><th>Question</th><th>Recommendation</th></tr></thead>
 <tbody>
-<tr><td>1. Is a local agent worth pursuing?</td><td><b>Yes, if quality holds over more runs.</b> Your bar is a passing merged regression test and a grade of small changes or better. The prototype met it on 2 of 2 well-specified tickets, opencode on 2 of 2, #1954’s hands-off reruns on 1 of 2. #1966 runs each ticket twice before the Local tier ships.</td></tr>
-<tr><td>2. What comes next?</td><td><b>Approve #1966, then launch.</b> Permissions are settled. #1966 qualifies opencode inside #1954’s wall and judge; #1956 then launches the harness you choose.</td></tr>
+<tr><td>1. Is a local agent worth pursuing?</td><td><b>Yes, if quality holds over more runs.</b> Your bar is a passing merged regression test and a grade of small changes or better. The prototype met it on 2 of 2 well-specified tickets, #1954’s hands-off Claude Code reruns on 1 of 2, and opencode on 4 of 4: #1855 and #1913, twice each.</td></tr>
+<tr><td>2. What comes next?</td><td><b>Rule on the harness, then launch.</b> Permissions and the opencode lifecycle are proved. With opencode, I converge its contract in this memo for your review and #1956 builds it; with Claude Code, #1956 starts now.</td></tr>
 <tr><td>3. How does a local agent get approval?</td><td><b>Sandbox wall plus a same-model judge, now measured.</b> Actions inside the wall run unasked. Actions that leave it (<code>git push</code>, <code>gh</code>, <code>sm</code>, network tools) go through a hook to the same local model, which answers allow or deny; no answer in 30 seconds is a deny. You can allow a denied action afterwards, and the agent retries. No prompt in 536 tool calls; a judged action takes 0.5 s at the median.</td></tr>
 <tr><td>4. Which model and server?</td><td><b>Qwen3.8-Flash-Next on MTPLX 2.12.0</b>, with Qwen3.8-27B on LM Studio as the fallback if MTPLX fails.</td></tr>
 <tr><td>5. What context window?</td><td><b>200K tokens.</b> MTPLX runs with <code>--context-window 200000</code> and its session bank capped at 16 GB.</td></tr>
@@ -215,9 +224,10 @@
 <tr><td>8. How many agents share the model?</td><td><b>One agent plus its judge</b> (MTPLX <code>--max-active-requests 2</code>). The alternative is two agents plus the judge at a 160K window with a 32 GB session bank (164 GB peak). sm's seat limit (appendix F) enforces your choice.</td></tr>
 
 <tr><td>9. How do prototype runs treat the agent's questions?</td><td><b>The driver answers as you would</b>, with a decision rather than a deflection. A ticket that needs live reproduction gets a scratch sm server the agent can reach.</td></tr>
-<tr><td>10. Which harness?</td><td><b>Qualify opencode (#1966), inside this wall and judge.</b> It took a third to a half of the hands-off Claude Code runs’ active time on the same tickets, at grades as good or better. Claude Code stays the fallback: every sm hook already works in it.</td></tr>
-<tr><td>11. May a local agent’s queue job run outside the wall?</td><td><b>No: #1956 runs a local agent’s queue jobs inside the same wall.</b> <code>sm queue run</code> executes with your full permissions, and the judge sees only that it is a test job, so today a queued command is a way out of the wall. No run used it: the scratch sm never ran jobs.</td></tr>
+<tr><td>10. Which harness?</td><td><b>opencode (option A under “Harness”).</b> It passed sm’s six lifecycle checks inside this wall and judge, and took a third to a half of the hands-off Claude Code runs’ active time on the same tickets, at grades as good or better. Claude Code stays the fallback: every sm hook already works in it.</td></tr>
+<tr><td>11. May a local agent’s queue job run outside the wall?</td><td><b>No: #1956 runs a local agent’s queue jobs inside the same wall.</b> <code>sm queue run</code> executes with your full permissions, and the judge sees only that it is a test job, so today a queued command is a way out of the wall. No agent used it; #1966’s scratch sm ran a job submitted under the agent’s identity with sm’s own permissions, not the wall’s.</td></tr>
 <tr><td>12. Where do GitHub credentials live?</td><td><b>In the egress proxy, not inside the wall (#1956).</b> git and gh need your token, so the wall leaves it readable, and any code the agent runs (a test, a build script) could read it and use it through the proxy; the judge sees command text only. With the proxy holding the token, nothing inside the wall can.</td></tr>
+<tr><td>13. When does sm ask a local agent to hand off?</td><td><b>At 75% of its 200K window, not at sm’s 35%.</b> sm’s handoff threshold is set for Claude’s 1M window; on #1913 it asked the local agent to stop mid-fix at 70K tokens. 75% leaves 50K tokens before the harness compacts on its own. #1956 adds the local threshold, for either harness.</td></tr>
 </tbody>
 </table>
 
@@ -233,15 +243,7 @@
 </table>
 <p><small>Active time is the agent’s turns, excluding waits for review. Each agent also pushed a branch, opened a draft PR and answered one or two real Codex reviews; nothing was merged and the PRs are closed. Grades by a Codex grader (terra, high), as in the prototype.</small></p>
 
-<figure>
-<svg viewBox="0 0 760 118" role="img" aria-label="Where each run's tool calls went" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
-<text x="16" y="27" fill="var(--ink)">#1855</text><rect x="86" y="14" width="156" height="18" fill="var(--blue)"/><rect x="242" y="14" width="58" height="18" fill="var(--violet)"/><text x="308" y="28" fill="var(--ink)">107</text>
-<text x="16" y="55" fill="var(--ink)">#1913</text><rect x="86" y="42" width="232" height="18" fill="var(--blue)"/><rect x="318" y="42" width="28" height="18" fill="var(--violet)"/><rect x="346" y="42" width="10" height="18" fill="var(--orange)"/><text x="364" y="56" fill="var(--ink)">135</text>
-<text x="16" y="83" fill="var(--ink)">#1892</text><rect x="86" y="70" width="540" height="18" fill="var(--blue)"/><rect x="626" y="70" width="48" height="18" fill="var(--violet)"/><text x="682" y="84" fill="var(--ink)">294</text>
-<rect x="86" y="100" width="12" height="12" fill="var(--blue)"/><text x="104" y="111" fill="var(--ink-2)">allowed by the rules</text><rect x="250" y="100" width="12" height="12" fill="var(--violet)"/><text x="268" y="111" fill="var(--ink-2)">allowed by the judge</text><rect x="414" y="100" width="12" height="12" fill="var(--orange)"/><text x="432" y="111" fill="var(--ink-2)">denied (none needed)</text>
-</svg>
-<figcaption><b>Figure 3. Where the tool calls went.</b> 87% of actions run on fixed rules with no model call; the judge rules on the rest in about half a second. Decision log, appendix K.9.</figcaption>
-</figure>
+
 
 <table>
 <thead><tr><th>#1954’s pass bar</th><th>Result</th></tr></thead>
@@ -254,7 +256,7 @@
 </tbody>
 </table>
 
-<p><b>Why quality dropped, as far as one run per ticket shows.</b> The judge did not cause it: #1855 and #1892 had no denial. #1855 added a deprecation warning nobody asked for. #1913 fixed the same symptom the prototype fixed, but its new test fails outside the wall: the wall gave it a short temporary path, so a socket path macOS rejects elsewhere passed inside; #1956 gives agents a temporary path of normal length. #1892 reproduced the bug live this time, against a Claude Code with no model behind it, and fixed the wrong mechanism. The prototype’s grades were single runs too, by a different grader. One sample cannot separate these causes from run-to-run variance, which is why #1966 runs each ticket twice.</p>
+<p><b>Why quality dropped, as far as one run per ticket shows.</b> The judge did not cause it: #1855 and #1892 had no denial. #1855 added a deprecation warning nobody asked for. #1913 fixed the same symptom the prototype fixed, but its new test fails outside the wall: the wall gave it a short temporary path, so a socket path macOS rejects elsewhere passed inside; #1956 gives agents a temporary path of normal length. #1892 reproduced the bug live this time, against a Claude Code with no model behind it, and fixed the wrong mechanism. The prototype’s grades were single runs too, by a different grader. One sample cannot separate these causes from run-to-run variance. opencode’s two runs per ticket agree with each other (appendix N.5); Claude Code has one hands-off run per ticket.</p>
 
 <h3>Why this is sm's job</h3>
 
@@ -302,7 +304,7 @@
 <line x1="46" x2="710" y1="142" y2="142" stroke="var(--violet)" stroke-width="2" stroke-dasharray="6 4"/><text x="708" y="137" text-anchor="end" fill="var(--violet)" font-weight="600" paint-order="stroke" stroke="var(--surface)" stroke-width="4">Flash-Next, one agent, peak wired (measured) → this much left (136 GB)</text>
 <text x="46" y="296" fill="var(--ink-2)">hour of day (local) · GB used, dark = average, light = peak · 256 GiB = 275 GB total</text></svg>
 
-<figcaption><b>Figure 4. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples; dark = hourly average, light = hourly peak, dots = no samples). The dashed line is what is left for everything else with Flash-Next at its one-agent peak: 139 GB at 131K, 137 GB at 200K. The average hour fits; the peak hours, 18:00–23:00, driven by queue jobs, force a yield. A second agent would lower the line by about 40 GB.</figcaption>
+<figcaption><b>Figure 3. Memory in use by hour of day, 29–30 Sep</b> (sm's utilization recorder, 13,705 samples; dark = hourly average, light = hourly peak, dots = no samples). The dashed line is what is left for everything else with Flash-Next at its one-agent peak: 139 GB at 131K, 137 GB at 200K. The average hour fits; the peak hours, 18:00–23:00, driven by queue jobs, force a yield. A second agent would lower the line by about 40 GB.</figcaption>
 </figure>
 
 <p>Three facts from that data and the earlier benchmarks drive the design:</p>
@@ -324,7 +326,7 @@
 
 <h3>How it works once sm owns it</h3>
 
-<p>This is the design the permissions ticket clears the way for. The Claude Code fallback uses a <b>slim profile</b>: no MCP servers, no slash commands, seven tools, and <code>CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off</code>, without which prompt reuse fails. The architecture below and appendices B–G specify that fallback; an opencode choice requires the lifecycle proof and a converged launch contract before implementation.</p>
+<p>This is the design the permissions ticket clears the way for. The Claude Code fallback uses a <b>slim profile</b>: no MCP servers, no slash commands, seven tools, and <code>CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off</code>, without which prompt reuse fails. The architecture below and appendices B–G specify that fallback. If you select opencode, Figure 2’s HTTP connection replaces the tmux half of Figure 4, and an opencode contract built from appendix N’s proven mechanisms replaces B–G before implementation.</p>
 <figure>
 <svg viewBox="0 0 720 250" role="img" aria-label="Local agent architecture" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
 <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink-2)"/></marker></defs>
@@ -351,7 +353,7 @@
 <line x1="470" y1="65" x2="528" y2="65" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="499" y="58" text-anchor="middle" fill="var(--ink-2)" font-size="10">HTTP</text>
 <line x1="210" y1="168" x2="528" y2="168" stroke="var(--violet)" stroke-dasharray="5 3" marker-end="url(#ar)"/><text x="370" y="160" text-anchor="middle" fill="var(--violet)" font-size="10.5">mtplx serve / stop</text>
 </svg>
-<figcaption><b>Figure 5. The Claude Code fallback.</b> Only the violet parts are new. The agent is a normal Claude Code session in tmux. sm, not the agent, decides when the weights are loaded, so an agent can never pull 77 GB into memory behind sm's back.</figcaption>
+<figcaption><b>Figure 4. The Claude Code fallback.</b> Only the violet parts are new. The agent is a normal Claude Code session in tmux. sm, not the agent, decides when the weights are loaded, so an agent can never pull 77 GB into memory behind sm's back.</figcaption>
 </figure>
 
 <p><b>Spawning.</b> <code>sm spawn claude --host local "brief"</code> starts a local agent inside the wall, with its judge hook, or waits like a queue job if no seat is free. It otherwise behaves as any Claude agent, with a LOCAL badge in the app.</p>
@@ -368,15 +370,15 @@
 <tr><td><b>#1953</b> Local agents in sm</td><td>Goal ticket; every ticket below sits under it.</td><td>—</td><td>—</td></tr>
 <tr><td><b>#1954</b> Permissions for local agents</td><td>Done. Wall, judge, adversarial set and three hands-off reruns; readout above. Appendix K.9 holds the results, the launch requirements and the kit.</td><td>Opus, high (driver)</td><td>done</td></tr>
 <tr><td><b>#1955</b> opencode harness check</td><td>Readout complete: historical fixes and first-prompt measurements reopen the harness choice. Appendix M records the prototype-wall substitution, quality grades and setup failures.</td><td>Opus, high</td><td>runs complete before #1954, as ruled</td></tr>
-<tr><td><b>#1966</b> Qualify opencode</td><td>Prove sm lifecycle and judge integration in a scratch system, inside #1954’s wall and judge, with two runs per ticket in each harness; compare with #1954’s hands-off timings and converge the selected harness contract. Appendix M.7 is the proof surface.</td><td>Astra, high</td><td>your approval to pursue it</td></tr>
-<tr><td><b>#1956</b> Launch a local agent</td><td>Host field, MTPLX launch environment, slim profile, wall and judge at launch as appendix K.9 requires (queue jobs inside the wall, credentials in the proxy), local usage split from the quota fit, LOCAL badge on web and Android.</td><td>Opus, high</td><td>#1954, #1966</td></tr>
+<tr><td><b>#1966</b> Qualify opencode</td><td>Proof done: six lifecycle checks in a scratch sm inside #1954’s wall and judge, plus #1855 and #1913 run hands-off (appendix N). Remaining: your harness ruling, then, for opencode, the converged contract replacing B–G.</td><td>Opus, high (driver)</td><td>done; awaits your ruling</td></tr>
+<tr><td><b>#1956</b> Launch a local agent</td><td>Host field, MTPLX launch environment, slim profile, wall and judge at launch as appendix K.9 requires (queue jobs inside the wall, credentials in the proxy), local usage split from the quota fit, a local handoff threshold (decision 13), LOCAL badge on web and Android. With opencode, also the opencode provider (option A).</td><td>Opus, high</td><td>#1954, #1966’s ruling and contract</td></tr>
 <tr><td><b>#1957</b> sm owns the model</td><td><code>sm model load|unload|status</code> over MTPLX. Record the reservation, have the memory guard unload the model before it stops any queue job, have perf admission unload it, add the model's memory to the recorder.</td><td>Opus, high</td><td>#1954</td></tr>
 <tr><td><b>#1958</b> Seat limit and yield</td><td>Drain, park and resume; spawn waits for a seat.</td><td>Opus, high</td><td>#1956, #1957</td></tr>
 <tr><td><b>#1959</b> Spend and tier table</td><td>Local line in Spend (web and Android), Local row in CLAUDE.md's tier table.</td><td>Sonnet, high</td><td>#1958</td></tr>
 </tbody>
 </table>
 
-<p><b>#1954’s pass bar</b> is met on prompts, denials, the adversarial set and speed, and missed on quality (permissions readout). The miss is not on safety or speed, so no fallback judge was needed.</p>
+
 
 <h3>Risks I cannot close from here</h3>
 <ul>
@@ -384,11 +386,12 @@
 <li><b>A same-model judge shares the agent's blind spots.</b> It sees only the proposed action and a fixed policy, never the files or pages that might carry injected instructions. The adversarial set found no hole, but code the agent runs (a test, a build script) is bounded by the wall and proxy alone, not by the judge.</li>
 <li><b>A second agent is unproven.</b> Two agents fit only at 160K, and MTPLX serves one request at a time, so their combined output is unmeasured.</li>
 <li><b>Routing.</b> The Local tier works only if tickets that need live reproduction are kept away from it. A misrouted ticket costs machine hours, not quota.</li>
+<li><b>opencode moves fast.</b> It releases often and its plugin interface is young. The proof pins 1.17.9 with updates off; any upgrade reruns appendix N’s checks before agents use it.</li>
 </ul>
 
-<h3>FAQ — what changed since revision 9</h3>
+<h3>FAQ — what changed since revision 10</h3>
 <ul>
-<li><b>Permissions are measured</b> (#1954, 3 Oct): no prompts, no denial needing reversal, the adversarial set passed, half a second per judged action; quality graded worse on all three tickets. Questions 1–3 and 10 change; 11 and 12 are new; #1966 now runs inside this wall, twice per ticket.</li>
+<li><b>opencode’s lifecycle is proved</b> (#1966, 3 Oct): six checks in a scratch sm inside #1954’s wall and judge, and #1855 and #1913 hands-off in 4.4 and 15.0 minutes. The harness section replaces the earlier opencode comparison and asks for your ruling; questions 1, 2 and 10 change, 13 is new; appendix N holds the proof. Claude Code was not rerun: #1954’s hands-off runs serve (option C if you want more).</li>
 </ul>
 
 <hr class="appendix-divider">
@@ -407,6 +410,7 @@
 <div><a href="#k">K. #1954: permissions protocol</a></div>
 <div><a href="#l">L. #1961: 200K measurement protocol</a></div>
 <div><a href="#m">M. #1955: opencode readout</a></div>
+<div><a href="#n">N. #1966: opencode lifecycle proof</a></div>
 <div><a href="#z">Z. FAQ</a></div>
 </div>
 
@@ -414,7 +418,7 @@
 <p>Paths are relative to <code>crates/sm-server/src/</code> unless they start with <code>docs/</code>, <code>specs/</code>, <code>web/</code>, <code>android-app/</code>, <code>hooks/</code> or <code>scripts/</code>. Line numbers are at origin/main <code>2a5e74f3</code>; treat them as starting points. "Local agent" means a session whose <code>host</code> is <code>local</code>. "The model server" means MTPLX 2.12.0 serving Qwen3.8-Flash-Next on <code>127.0.0.1:8000</code>; <code>mtplx</code> is its CLI at <code>~/.local/share/mtplx-venv/bin/mtplx</code>. LM Studio (<code>127.0.0.1:1234</code>, CLI <code>~/.lmstudio/bin/lms</code>) is the fallback server for Qwen3.8-27B. The plan's tickets: #1953 is the goal, #1961 the 200K measurement, #1954 the permissions prototype, #1955 the opencode check. Appendix headings use short labels for the rest: P1 is #1956, P2 #1957, B1 #1958, B2 #1959. P0 is the finished prototype, #1926. GB means 10<sup>9</sup> bytes throughout. 256 GiB is 275 GB, and sm's memory reserve of 8 GiB is 8.6 GB.</p>
 
 <h3 id="b">B. Where sm hard-codes provider today</h3>
-<p>Provider is a free string on the session record (<code>SessionRecord.provider</code>, sessions.rs:15687, default <code>claude</code>). Its values are <code>claude</code>, <code>codex</code> (stock), <code>codex-fork</code> and the retired <code>codex-app</code>. There is no extension point: about 25 production files branch on the literal strings. The Claude Code fallback keeps <code>provider = "claude"</code> for local agents so that none of those branches change. The opencode candidate must prove these same concerns before a provider contract is selected (M.7). The new <code>host</code> field is consulted only at the sites listed in C–G. The sites that matter:</p>
+<p>Provider is a free string on the session record (<code>SessionRecord.provider</code>, sessions.rs:15687, default <code>claude</code>). Its values are <code>claude</code>, <code>codex</code> (stock), <code>codex-fork</code> and the retired <code>codex-app</code>. There is no extension point: about 25 production files branch on the literal strings. The Claude Code fallback keeps <code>provider = "claude"</code> for local agents so that none of those branches change. The opencode candidate proves these same concerns in appendix N; its provider contract replaces this one if you select it. The new <code>host</code> field is consulted only at the sites listed in C–G. The sites that matter:</p>
 <table>
 <thead><tr><th>Concern</th><th>Site</th><th>Local-agent impact</th></tr></thead>
 <tbody>
@@ -435,7 +439,7 @@
 </table>
 
 <h3 id="c">C. P1: host field and launch profile</h3>
-<p><b>Conditional contract:</b> this section and D–G specify the Claude Code fallback. They are executable requirements only if that harness is retained; an opencode selection requires a revised, converged contract after M.7’s proof. No launch implementation proceeds while that choice remains open.</p>
+<p><b>Conditional contract:</b> this section and D–G specify the Claude Code fallback. They are executable requirements only if that harness is retained; an opencode selection requires a revised, converged contract built on appendix N’s proof. No launch implementation proceeds while that choice remains open.</p>
 <h4>C.1 Persisted shape</h4>
 <p>Add <code>host: Option&lt;String&gt;</code> to <code>SessionRecord</code> (sessions.rs:15687 and the two sibling structs at 15727 and 15830 that carry <code>provider</code>). <code>None</code> means the provider's native host. The only other accepted value in this design is <code>"local"</code>. The field is serialised in <code>sessions.json</code> with <code>#[serde(default, skip_serializing_if = "Option::is_none")]</code>, so existing records are unchanged on disk. Any other value is rejected at create with 400 <code>unsupported host &lt;x&gt;</code>. <code>host = "local"</code> with a provider other than <code>claude</code> is rejected with 400 <code>host local requires provider claude</code>.</p>
 <h4>C.2 Entry points</h4>
@@ -484,6 +488,8 @@ $ sm spawn claude --host local --model qwen3.8-27b "…"
 error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <p>151 GB is Flash-Next's measured peak at 200K with one agent and the judge (137 GB wired, L.6) plus 10%.</p>
 
+<h4>C.9 Handoff threshold for host local</h4>
+<p>Applies to either harness. sm’s handoff policy (<code>handoff/policy.rs</code>) asks an agent to hand off when its context reaches its provider’s threshold: 35% for Claude, set for a 1M window. A session whose host is <code>local</code> uses a separate threshold instead, whatever its provider: default 75% of its 200K window (150K tokens), editable in the same handoff settings as the provider thresholds. Every other part of the ask (wording, reminders, claims moved) is unchanged. Example: a local agent at 140K tokens (70%) gets no ask; at 150K it gets the standard <code>[sm context management]</code> notice. Test: a host-local session reporting 74% gets no ask and one reporting 75% gets one, while a hosted Claude session at 35% still gets one.</p>
 <h3 id="d">D. P1: usage accounting</h3>
 <ul>
 <li><b>Account.</b> In <code>scan_usage_ledger</code> (sessions.rs:416), a record with <code>host = local</code> records account key <code>local</code> instead of the Claude OAuth identity. The <code>accounts</code> table gets one row <code>account_key = local, provider = local</code>. Every quota consumer (burn windows, meter fit, <code>sm usage</code>, Spend) is keyed by account, so local rows fall out of Claude's numbers with no further change. Test: a ledger fixture with one local seat and one Claude seat shows the Claude weekly percent unchanged by the local rows.</li>
@@ -677,7 +683,7 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 
 <h3 id="i">I. Measurements and method</h3>
 <h4>I.1 Machine and memory history</h4>
-<p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 4 is generated from the same table by a script that groups by local hour.</p>
+<p>Mac Studio, M3 Ultra (24 performance + 8 efficiency cores), 256 GiB unified memory, LM Studio 0.4.16, Claude Code 2.1.285, Codex CLI 0.157.0, opencode 1.17.9. Memory history: <code>utilization.db</code> <code>host_samples</code>, 2026-09-29 01:59 UTC to 2026-09-30 19:59 UTC. 13,705 samples have memory readings. Used memory (sm's Activity-Monitor definition): median 81 GB, 90th percentile 196 GB, 99th 268 GB. Queue-job share: median 49 GB, 90th percentile 173 GB, 99th 247 GB. Background jobs were running in 61% of samples and tests in 33%; no perf job ran in the window. Figure 3 is generated from the same table by a script that groups by local hour.</p>
 <h4>I.2 Quota share</h4>
 <p><code>usage.db</code> <code>message_ledger</code>, last 14 days, weighted with quota_rates.rs:120 and rated with quota_rates.rs:61, then halved to a weekly figure: Astra 68.3%, Opus 50.4%, Fable 20.2%, Sol 2.3%, Sonnet 0.6%, Luna under 0.1%.</p>
 <h4>I.3 First-prompt size</h4>
@@ -755,12 +761,14 @@ error: model qwen3.8-27b is not loaded; loaded: flash-next</code></pre>
 <tr><td>Permissions readout: no prompts, no needed denials, adversarial set, judge under 10 s</td><td>K.9.2–K.9.3</td><td><code>evidence/decisions.jsonl</code>, <code>evidence/adversarial_judge.jsonl</code>, <code>evidence/metrics.json</code></td></tr>
 <tr><td>A local agent’s queue jobs run inside its wall</td><td>K.9.5 item 6</td><td>#1956 test: queued egress from a local session fails</td></tr>
 <tr><td>GitHub credentials held by the proxy, not readable inside the wall</td><td>K.9.5 item 7</td><td>#1956 test: credential read fails, push and PR view succeed</td></tr>
-<tr><td>Quality judged on two runs per ticket before the Local tier ships</td><td>Memo question 1; #1966</td><td>#1966 readout</td></tr>
+<tr><td>Quality judged on two runs per ticket before the Local tier ships</td><td>Memo question 1; M.1, N.5</td><td>opencode: #1855 and #1913 twice each (M.3 and N.5 validation); Claude Code: one hands-off run per ticket (K.9.4)</td></tr>
 <tr><td>No auto mode</td><td>C.4</td><td>Launch-argument test: local command never carries <code>--permission-mode auto</code></td></tr>
 <tr><td>200K context, measured before permissions</td><td>C.3, E.2, L</td><td>Launch-environment test; #1961 readout</td></tr>
 <tr><td>Local tier: reproducible-in-checkout fixes only</td><td>G (tier row)</td><td>CLAUDE.md row text, B2</td></tr>
 <tr><td>Driver answers questions as the owner would; live-reproduction tickets get a scratch sm</td><td>H.8</td><td>#1954 protocol</td></tr>
-<tr><td>opencode comparison and harness qualification before launch implementation</td><td>Memo harness decision; M</td><td>M.3 tests and M.7 lifecycle proof; archived driver kit</td></tr>
+<tr><td>opencode comparison and harness qualification before launch implementation</td><td>Memo harness decision; M</td><td>M.3 tests; archived #1955 driver kit</td></tr>
+<tr><td>opencode lifecycle proof: six checks, two benchmark tickets</td><td>Memo harness section; N</td><td><code>1966_artifacts/kit</code>: <code>oc_bridge.py brief</code> (check 1), <code>prove_p3.sh</code> (3), <code>prove_p4.sh</code> (4), <code>validate_1855.sh</code>, <code>validate_1913.sh</code>; evidence in <code>1966_artifacts/evidence</code></td></tr>
+<tr><td>Local handoff threshold (decision 13)</td><td>C.9</td><td>#1956: a host-local session at 74% gets no handoff ask, at 75% gets one</td></tr>
 <tr><td>Local work goes through review</td><td>C.7</td><td>Addendum text</td></tr>
 <tr><td>Model choice by per-agent memory</td><td>E.4, I.4</td><td>Reservation from config.json (LM Studio models) or measured peak plus 10% (MTPLX); test that a load with neither is refused</td></tr>
 <tr><td>One agent plus judge (#1961 measured two seats: over the rule at 200K)</td><td>E.1, E.2, F.1, L.6</td><td>#1961 readout; E.2 default seats 1</td></tr>
@@ -878,6 +886,15 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 </table>
 <p>Wall time runs from the brief to the last turn; the gap is the wait for Codex reviews (4–7 minutes each). #1892 compacted twice (168,641 → 8,200 tokens the first time); sm’s compaction hooks fired both times and the agent carried on. Lowest available memory, 65 GB, came while #1892 built sm and ran Claude Code for its reproduction. No model request failed. Egress through the proxy: <code>api.github.com</code> 5, 4 and 11 connections; <code>github.com</code> 67 (git, unattributed); <code>downloads.claude.ai</code> refused 1, 1 and 58 times (Claude Code checking for updates, mostly from #1892’s reproduction instances); nothing else.</p>
 
+<figure>
+<svg viewBox="0 0 760 118" role="img" aria-label="Where each run's tool calls went" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:12px">
+<text x="16" y="27" fill="var(--ink)">#1855</text><rect x="86" y="14" width="156" height="18" fill="var(--blue)"/><rect x="242" y="14" width="58" height="18" fill="var(--violet)"/><text x="308" y="28" fill="var(--ink)">107</text>
+<text x="16" y="55" fill="var(--ink)">#1913</text><rect x="86" y="42" width="232" height="18" fill="var(--blue)"/><rect x="318" y="42" width="28" height="18" fill="var(--violet)"/><rect x="346" y="42" width="10" height="18" fill="var(--orange)"/><text x="364" y="56" fill="var(--ink)">135</text>
+<text x="16" y="83" fill="var(--ink)">#1892</text><rect x="86" y="70" width="540" height="18" fill="var(--blue)"/><rect x="626" y="70" width="48" height="18" fill="var(--violet)"/><text x="682" y="84" fill="var(--ink)">294</text>
+<rect x="86" y="100" width="12" height="12" fill="var(--blue)"/><text x="104" y="111" fill="var(--ink-2)">allowed by the rules</text><rect x="250" y="100" width="12" height="12" fill="var(--violet)"/><text x="268" y="111" fill="var(--ink-2)">allowed by the judge</text><rect x="414" y="100" width="12" height="12" fill="var(--orange)"/><text x="432" y="111" fill="var(--ink-2)">denied (none needed)</text>
+</svg>
+<figcaption><b>Figure K.1. Where the tool calls went.</b> 87% of actions run on fixed rules with no model call; the judge rules on the rest in about half a second. Decision log, appendix K.9.</figcaption>
+</figure>
 <h4>K.9.3 Every denial</h4>
 <table>
 <thead><tr><th>Id</th><th>Run</th><th>Stage</th><th>Action</th><th>Ruling</th><th>Would you allow it?</th></tr></thead>
@@ -1025,6 +1042,28 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 <p><b>Speed by conversation size.</b> Flash-Next writes 52–79 tokens a second at every size, but reads new text at about 470 tokens a second near 50K and 130 near 190K. A typical prototype turn added about 750 tokens, so the reply starts after about 1.6 s at 50K, 3 s at 96K and 6 s at 190K; a 3,000-token turn (90th percentile) waits 6, 12 and 23 s.</p>
 <p><b>One agent at 200K or two at 160K.</b> Appendix L's rule picks the largest window that fits, then the most agents: 200K with one agent. The real alternative is two agents at 160K, which get more work through when their turns do not overlap, are each slower when they do, and compact sooner. I recommend one agent for #1954; two agents are better measured in real use once sm owns the model.</p>
 
+<figure>
+<svg viewBox="0 0 880 210" role="img" aria-label="Peak wired memory by conversation size" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11.5px">
+<g stroke="var(--rule)"><line x1="60" y1="180.0" x2="680" y2="180.0"/><line x1="60" y1="140.0" x2="680" y2="140.0"/><line x1="60" y1="100.0" x2="680" y2="100.0"/><line x1="60" y1="60.0" x2="680" y2="60.0"/><line x1="60" y1="20.0" x2="680" y2="20.0"/></g>
+<g fill="var(--ink-2)" text-anchor="end" font-size="10"><text x="54" y="184.0">100</text><text x="54" y="144.0">120</text><text x="54" y="104.0">140</text><text x="54" y="64.0">160</text><text x="54" y="24.0">180 GB</text></g>
+<g fill="var(--ink-2)" text-anchor="middle" font-size="10"><text x="96" y="198">49K</text><text x="284" y="198">96K</text><text x="424" y="198">131K</text><text x="540" y="198">160K</text><text x="660" y="198">190K tokens</text></g>
+<line x1="60" y1="34.6" x2="680" y2="34.6" stroke="var(--red)" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="66" y="31.2" fill="var(--red)">limit: 173 GB peak (190 GB with the 10% margin)</text>
+<polyline fill="none" stroke="var(--blue)" stroke-width="2.5" points="96,168.0 180,164.0 256,148.0 284,140.0 360,136.0 424,126.0 480,120.0 540,112.0 600,106.0 660,108.0"/>
+<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" points="96,162.0 180,142.0 256,126.0 284,128.0 360,116.0 424,112.0 480,106.0 540,78.0"/>
+<polyline fill="none" stroke="var(--orange)" stroke-width="2.5" stroke-dasharray="4 3" points="540,78.0 600,80.0 660,78.0"/>
+<polyline fill="none" stroke="var(--violet)" stroke-width="2.5" points="96,156.0 180,136.0 256,116.0 284,112.0 360,98.0 424,82.0 480,64.0 540,52.0 600,50.0 660,28.0"/>
+<g fill="var(--ink)"><text x="688" y="112.0">one agent + judge, 16 GB bank</text><text x="688" y="81.6">two + judge, 16 GB bank</text><text x="688" y="92.8" fill="var(--ink-2)" font-size="10">dashed: full re-reads</text><text x="688" y="32.0">two + judge, 32 GB bank</text></g>
+</svg>
+<figcaption><b>Figure L.1. Peak wired memory as the conversation grows.</b> One agent stays well under the limit. Two agents with a 16 GB bank stay under it only by evicting each other's saved state and re-reading in full; with a 32 GB bank they cross the limit at about 175K. Measured 3 Oct.</figcaption>
+</figure>
+
+<ul>
+<li><b>MTPLX serves one request at a time,</b> whatever its concurrency flags say. With two agents, overlapping turns and judge calls wait behind each other; queued judge requests here waited 48–242 s. With one agent, the judge runs only while the agent waits for its tool call, and answered in a median 1.3 s.</li>
+<li><b>Resuming after a yield costs seconds if MTPLX stops cleanly.</b> MTPLX reloads in 19–26 s and answered a parked 190K conversation in 11 s from its on-disk cache; with nothing cached, the re-read takes 13 minutes. So sm stops MTPLX with <code>mtplx stop</code>, never a kill, and leaves that cache on (MTPLX's default; about 45 GB of SSD).</li>
+</ul>
+
+
 <h3 id="m">M. #1955: opencode readout (3 Oct)</h3>
 <p>Driver <code>sm-1955</code> (d97b5130) ran Qwen3.8-Flash-Next on MTPLX 2.12.0 with opencode 1.17.9. The comparison is with H.7’s Flash-Next/Claude Code runs. The two corrected runs satisfy the regression-test part of the owner’s pass bar; the independent six-point grades below decide the quality part.</p>
 <h4>M.1 Results</h4>
@@ -1084,12 +1123,136 @@ Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.</code
 <h4>M.6 Evidence</h4>
 <p>Versioned summaries, local/merged diffs, exact briefs, profiles/configs, validation logs, grades and driver scripts are in <code>docs/working/1955_artifacts/</code>. Raw request bodies, tool-event streams, memory samples, MTPLX logs and the excluded attempt are retained in <code>~/.local/share/local-agents-proto/runs-1955/</code>. The manifest records full commits and brief hashes. The raw archive preserves the runs even if scratch files or benchmark clones are removed.</p>
 <h4>M.7 Harness decision and implementation boundary</h4>
-<p>The observed opencode configuration earns qualification: it materially reduces active time and first prompt on both benchmark tickets. The runs do not isolate the harness from permissions, context settings, build-cache conditions or the two request formats. #1954 supplies hands-off Claude Code runs at 200K for the next comparison. The decision surface therefore recommends qualification before selecting a production harness, with Claude Code as the specified fallback. Ticket #1966 carries that qualification and starts after #1954 and the owner’s approval; #1956’s launch implementation also waits for #1966’s harness ruling and converged contract.</p>
-<p>An opencode lifecycle proof must demonstrate, without production writes: (1) submitting and acknowledging one brief exactly once; (2) projecting working/idle state and token usage into a scratch sm; (3) delivering <code>sm send</code>, reminders and queue wakes while idle, without duplicating user turns; (4) restoring the same conversation and local provider after process/model restart; (5) allowing and denying tools through the local judge without a human prompt; and (6) attributing usage to local at zero hosted-quota weight. The proof records concrete adapters, events, persisted shapes and reproducible checks for each. These become a converged replacement for B–G if the owner selects opencode. Until that decision and proof, no engineer may treat the conditional Claude Code contract as authorisation to settle the reopened harness choice.</p>
+<p>The observed opencode configuration earned qualification: it materially reduced active time and first prompt on both benchmark tickets, but these runs did not isolate the harness from permissions, context settings, build-cache conditions or the two request formats, and exercised no sm lifecycle. Appendix N supplies both: the six lifecycle checks in a scratch sm inside #1954’s wall and judge, and the same two tickets run there. The harness ruling rests on N; #1956’s launch implementation waits for it and, if opencode is selected, for a converged contract replacing B–G.</p>
+
+<h3 id="n">N. #1966: opencode lifecycle proof (3 Oct)</h3>
+<p>Driver <code>sm-1966</code> (f3018f36), 3 Oct 16:02–17:01 PDT. No production sm code changed and nothing touched live sm state. The kit and the evidence named below are in <code>docs/working/1966_artifacts/</code> (its <code>README.txt</code> lists every file); raw opencode databases, request and event logs and the scratch sm's state are kept in <code>~/.local/share/local-agents-proto/runs-1966/</code>.</p>
+
+<h4>N.1 What ran</h4>
+<table>
+<thead><tr><th>Piece</th><th>What it is</th><th>Where it runs</th></tr></thead>
+<tbody>
+<tr><td>Scratch sm</td><td>The installed <code>sm-server</code>, unchanged, on fresh state at port 18450 (<code>kit/scratch_sm.sh</code>). Runtime on, so it delivers messages, fires reminders and runs its own queue jobs. Own state folder, queue folder, usage database and tmux socket (<code>l1966-scratch</code>); <code>SM_TEST_ISOLATION_ROOT</code> isolates every default path and drops the push key. Seeded with two sessions: parent <code>sm-1966</code> (<code>p1966000</code>) and agent <code>sm-1966-oc</code> (<code>a1966oc0</code>), both <code>provider = "claude"</code>, so sm's existing hook routes and pane delivery apply unchanged.</td><td>Outside the wall</td></tr>
+<tr><td>opencode</td><td><code>opencode serve</code> 1.17.9 on 127.0.0.1:18451, one per agent, inside #1954's wall (<code>kit/wall_profile.sh</code>, with the agent's own service ports passed as a fifth argument). Its config, data, cache and state folders are the run directory's <code>xdg/</code>.</td><td>Inside the wall</td></tr>
+<tr><td>Judge plugin</td><td><code>kit/sm_judge.js</code>: opencode's <code>tool.execute.before</code> hook, posting #1954's PreToolUse JSON to the judge service and throwing on anything but allow (N.3.3).</td><td>Inside opencode</td></tr>
+<tr><td>Judge service</td><td>#1954's <code>judge_service.py</code>, unchanged, on 8441; its decision log and allow file in the run directory, not in live sm state. Judge calls go to MTPLX on 8000 in the real-model runs and are denied outright (<code>--no-model</code>) in the stand-in runs.</td><td>Outside the wall</td></tr>
+<tr><td>Bridge</td><td><code>kit/oc_bridge.py</code>: submits briefs once (N.3.1), follows opencode's event stream and posts sm's existing hook routes (N.3.2).</td><td>Outside the wall</td></tr>
+<tr><td>Pane</td><td><code>kit/oc_pane.py</code>: the tmux pane sm types into. Stands in for an HTTP delivery path inside sm (N.3.4).</td><td>Outside the wall</td></tr>
+<tr><td>Model</td><td>Stand-in: <code>kit/fake_oai.py</code>, a scripted OpenAI-format server on 18452 that issues fixed tool calls. Real: MTPLX 2.12.0 serving Flash-Next at 200K with #1954's settings (<code>kit/mtplx_job.sh</code>), behind #1954's logging proxy on 18456.</td><td>Outside the wall</td></tr>
+</tbody>
+</table>
+<p>Every long-running piece ran through <code>sm queue</code> (<code>kit/services.sh</code> holds the scratch sm, judge service and model proxy in one service job). One agent ran at a time. The stand-in model proved the mechanics deterministically; the real model then repeated the judge and restore checks and ran two benchmark tickets.</p>
+
+<h4>N.2 The six behaviours</h4>
+<table>
+<thead><tr><th>Behaviour</th><th>Mechanism</th><th>Check and result</th></tr></thead>
+<tbody>
+<tr><td>1. Brief submitted and acknowledged exactly once</td><td><code>POST /session/{id}/prompt_async</code> with a message id and part id the bridge chose and wrote to its outbox first; acknowledged when <code>GET /session/{id}/message/{messageID}</code> returns the user message.</td><td><b>Proved.</b> Acknowledged in 1.0 s (four briefs: 0.96–1.03 s). Resubmitting the same brief returned <code>already-accepted</code> in 1 ms and sent nothing; the conversation holds one brief turn (<code>evidence/p1_*.json</code>).</td></tr>
+<tr><td>2. Working/idle and tokens projected into sm</td><td>Event stream: <code>session.status</code> busy or retry → sm's <code>UserPromptSubmit</code> hook; idle → <code>Stop</code>; a tool part entering <code>running</code> → sm's tool-use hook; each <code>step-finish</code> part (one per model request) → sm's context-usage hook and one usage line.</td><td><b>Proved.</b> sm showed idle → working (last tool <code>bash</code>, 0.6% context, 1,120 tokens) → idle, about a second behind opencode, and tracked the real runs live (peaks of 17% on #1855 and 40% on #1913). After any reconnection the bridge re-sends the current state.</td></tr>
+<tr><td>3. <code>sm send</code>, reminders and queue wakes, no duplicate turns</td><td>sm's own delivery, unchanged, into the pane; the pane submits each Enter once through the bridge's outbox.</td><td><b>Proved, with one mapping change</b> (N.4 finding 2). Idle: a reminder, a queue completion and an <code>sm send</code> became three turns, one each. Busy (20-second command running): the same three arrived mid-turn as three stored messages, the command ran to completion, and opencode read all three at its next step, as Claude Code reads prompts queued during a turn (<code>evidence/p3-*-messages.json</code>, <code>p3-*-view.jsonl</code>).</td></tr>
+<tr><td>4. Same conversation and provider after restarts</td><td>The opencode session id is sm's <code>provider_resume_id</code>; the conversation lives in opencode's database under the run's data folder. Restart = start <code>opencode serve</code> on the same folder.</td><td><b>Proved.</b> opencode killed and restarted: same session, same 31 messages, the next request carried the whole history (42 messages vs 40). Bridge and pane killed too, as after a reboot: same. Stand-in model down 30 s and 12 minutes: opencode retried every ~30 s (28 attempts) and finished the turn once when the model returned. Real model: <code>mtplx stop</code>, a question sent while it was down, MTPLX restarted; the agent answered from its own earlier work (“92da92c7, one file: crates/sm-server/src/bin/sm.rs”), 63 s after the model was back.</td></tr>
+<tr><td>5. Judge allows and denies with no human prompt</td><td>Judge plugin → #1954's judge service; opencode's own permission table never says “ask”.</td><td><b>Proved.</b> Stand-in: rule allow, rule deny (write outside the checkout), judge-stage deny (<code>git push</code>), and the wall stopping the one write the rules let through. #1954's allow-once: the owner allowed <code>d-5691</code>, the identical push passed once (stage <code>owner</code>), the next identical call was denied again (<code>d-abdb</code>). Real runs: N.5. Every denial reached the model as the tool's error text.</td></tr>
+<tr><td>6. Local usage at zero hosted-quota weight</td><td>Exact tokens from each <code>step-finish</code> part, written as Claude-format usage lines that sm's unchanged ledger scanner reads.</td><td><b>Tokens proved; zero weight is not sm's behaviour today, for either harness.</b> All 19 stand-in requests reached <code>message_ledger</code> with exact counts (6,360 input, 133 output, 17,100 cache read). sm filed them under the Claude account active at the time, and priced the unknown model name at the Opus rate: 0.0013% of the weekly Claude meter for these rows. Appendix D's host-local attribution is what makes it zero; it is harness-independent.</td></tr>
+</tbody>
+</table>
+
+<h4>N.3 Adapters and persisted shapes</h4>
+<p><b>N.3.1 Exactly-once submission.</b> Every submission has a key: <code>brief-</code> plus the first 16 hex characters of the brief's SHA-256, or one fresh key per delivery. Before the first attempt the bridge appends to <code>ledger.jsonl</code>:</p>
+<pre><code>{"key": "brief-ccc62b9be4aca887", "messageID": "msg_1041e3ac0001WxqUWbXtu5JPXu",
+ "partID": "prt_1041e3ac0002TY2acF6ctX9NM4", "source": "brief", "chars": 2975, "text": "…", "t": 1791070452.416628}
+{"key": "brief-ccc62b9be4aca887", "accepted": 1791070452.431535, "result": "sent"}</code></pre>
+<p>Each attempt first asks <code>GET /session/{id}/message/{messageID}</code>; 200 means already accepted, and nothing is posted. Otherwise it posts <code>{"messageID", "parts": [{"id": partID, "type": "text", "text"}]}</code> and records <code>accepted</code>. Attempts repeat every second until accepted; on restart, entries without <code>accepted</code> are replayed. Ids follow opencode's ascending format: <code>msg_</code> or <code>prt_</code>, 12 hex characters of (milliseconds × 4096 + counter) mod 2<sup>48</sup>, then 14 base-62 characters. They must be generated at submission time, because opencode orders a conversation by id.</p>
+<p><b>N.3.2 Event projection.</b> The bridge reads <code>GET /event</code> (server-sent events) and acts only on its own session id:</p>
+<table>
+<thead><tr><th>opencode event</th><th>sm route and body</th></tr></thead>
+<tbody>
+<tr><td><code>session.status</code> <code>busy</code> or <code>retry</code>, from idle</td><td><code>POST /hooks/claude</code> <code>{hook_event_name: "UserPromptSubmit", session_manager_id, session_id: &lt;opencode id&gt;, prompt: &lt;last user text&gt;, transcript_path, sm_hook_emitted_at}</code></td></tr>
+<tr><td><code>session.status</code> <code>idle</code></td><td><code>POST /hooks/claude</code> <code>{hook_event_name: "Stop", …, last_assistant_message}</code></td></tr>
+<tr><td><code>message.part.updated</code>, tool part, state <code>running</code></td><td><code>POST /hooks/tool-use</code> <code>{hook_event_name: "PreToolUse", session_manager_id, tool_name, tool_input, tool_use_id: callID, cwd}</code></td></tr>
+<tr><td><code>message.part.updated</code>, <code>step-finish</code> part, first time seen</td><td>One usage line appended to <code>transcript/&lt;opencode id&gt;.jsonl</code> (below), then <code>POST /hooks/context-usage</code> <code>{session_id: &lt;sm id&gt;, used_percentage, total_input_tokens: input + cache read + cache write, context_window_tokens: 200000, model_id}</code></td></tr>
+<tr><td><code>session.compacted</code></td><td><code>POST /hooks/context-usage</code> <code>{event: "compaction_complete"}</code> (not exercised: no run compacted)</td></tr>
+<tr><td>Connection opened or reopened</td><td>Read <code>GET /session/status</code> and re-send the current state as <code>Stop</code> or <code>UserPromptSubmit</code></td></tr>
+</tbody>
+</table>
+<pre><code>{"type":"assistant","timestamp":"2026-10-03T23:09:11.565863Z","sessionId":"ses_efbf952ffffeGHJl3LNU4jXFIL",
+ "cwd":"/Users/rajesh/worktrees/sm-1966-oc-probe","requestId":"prt_104075407001jAKdrI1l2FKhRG",
+ "message":{"id":"prt_104075407001jAKdrI1l2FKhRG","model":"local/flash-next","role":"assistant","content":[],
+ "usage":{"input_tokens":120,"output_tokens":7,"cache_read_input_tokens":900,"cache_creation_input_tokens":0}}}</code></pre>
+<p>Output tokens include opencode's separate reasoning count. The line must be compact JSON: sm's parser skips any line without the exact bytes <code>"usage":{</code>.</p>
+<p><b>N.3.3 Judge plugin.</b> opencode loads plugins from <code>&lt;config&gt;/opencode/plugins/</code> only when started without <code>--pure</code>; the config folder is the agent's own, so no other plugin loads. Tool translation to #1954's PreToolUse shape:</p>
+<table>
+<thead><tr><th>opencode tool, arguments</th><th>Sent to the judge service as</th></tr></thead>
+<tbody>
+<tr><td><code>bash {command, workdir}</code></td><td><code>Bash {command}</code>, cwd = workdir or the checkout</td></tr>
+<tr><td><code>read {filePath}</code>; <code>glob</code>/<code>list</code>/<code>grep {path}</code>; <code>todowrite</code></td><td><code>Read {file_path}</code>; <code>Glob</code>/<code>Grep {path}</code>; <code>TodoWrite</code></td></tr>
+<tr><td><code>edit {filePath}</code>, <code>write {filePath}</code></td><td><code>Edit</code>/<code>Write {file_path}</code></td></tr>
+<tr><td><code>apply_patch {patchText}</code></td><td>One <code>Edit {file_path}</code> per file the patch adds, updates, deletes or moves to; any deny blocks the patch</td></tr>
+<tr><td>anything else</td><td>Its own name and arguments, which the service sends to the judge</td></tr>
+</tbody>
+</table>
+<p>A deny, an unreachable service or an unreadable answer throws <code>Permission denied by the local judge: &lt;reason&gt;</code>; opencode records the tool as failed and shows the model that text. Each decision is also logged to <code>plugin.jsonl</code> (time, call id, tool, allow, reason, milliseconds). opencode's own table: <code>{"*": "allow", "question": "deny", "task": "deny", "webfetch": "deny", "websearch": "deny", "doom_loop": "allow", "external_directory": "allow"}</code>. Nothing is <code>ask</code>, so no call can wait on a human; the plugin runs before opencode's own check, so the table cannot override a denial.</p>
+<p><b>N.3.4 The pane.</b> sm delivers by typing into the session's tmux pane, and gates background wakes on the pane showing an empty Claude composer (a last line <code>&gt;</code> with the cursor just after it). The pane draws that line only while opencode reports the session idle (<code>GET /session/status</code>, every 250 ms) and no submission is in flight. Typed text is buffered; carriage return submits it once through N.3.1; line feed stays a newline. Escape aborts the turn (<code>POST /session/{id}/abort</code>), except within 2 s of Ctrl-B, which is sm's urgent sequence (N.4 finding 2). Its log is <code>pane.jsonl</code>. In an sm provider arm this pane disappears: delivery is N.3.1 directly, readiness is the status above, and the pane becomes <code>opencode attach http://127.0.0.1:&lt;port&gt; --session &lt;id&gt;</code>, opencode's own terminal view of the same session (checked: it shows the live run, thoughts, tools and context use).</p>
+<p><b>N.3.5 Launch.</b> <code>kit/run_oc.sh</code>: clone the checkout; register the agent with the judge service; write <code>opencode.json</code> (one provider, <code>@ai-sdk/openai-compatible</code> at the model URL, model <code>local/flash</code>, 200,000 context, 32,000 output; autoupdate, sharing, snapshots, LSP and formatters off); copy the plugin; <b>run opencode once outside the wall</b> so it installs its plugin SDK into the config folder from npm (inside the wall there is no network); generate the wall profile; start <code>sandbox-exec -f profile.sb opencode serve --port &lt;port&gt;</code> with <code>XDG_*</code> set to the run folder, <code>OPENCODE_DISABLE_AUTOUPDATE=1</code>, <code>OPENCODE_DISABLE_MODELS_FETCH=1</code>, the judge variables and sm's session variables; create the session (<code>POST /session</code>); start the bridge and pane.</p>
+
+<h4>N.4 Findings that shape an opencode contract</h4>
+<ol>
+<li><b>opencode does not de-duplicate a reposted message id.</b> Reposting the same <code>messageID</code> appended the text to the existing message (“brief one brief one”); with a fixed part id it overwrote the part instead. Exactly-once therefore needs the existence check and outbox of N.3.1, not the id alone.</li>
+<li><b>Urgent delivery must not abort.</b> sm's urgent path (reminders, urgent <code>sm send</code>) sends Ctrl-B, which in Claude Code moves the running command to the background, then Escape. opencode cannot background a running tool, so mapping Escape to abort killed a 20-second command mid-run. Contract: urgent delivery to opencode is a queued prompt, read at the next step boundary; abort is only for an explicit interrupt.</li>
+<li><b>A delivery must be held until opencode accepts it.</b> sm counts a message delivered once it has typed it. With opencode down, the first pane gave up and lost an <code>sm send</code>. After the fix, the message sent during the outage arrived once, 9 s after restart. Contract: sm marks a delivery done only when opencode has accepted it, and the outbox survives restarts of the adapter.</li>
+<li><b>Usage is mis-attributed today.</b> sm filed local tokens under the active Claude account and priced the unknown model at the Opus rate (N.2 row 6). Appendix D's host-local attribution is required for either harness.</li>
+<li><b>Launch must prepare opencode's config folder outside the wall</b> (plugin SDK from npm) and must not pass <code>--pure</code>, which skips local plugins and with them the judge.</li>
+<li><b>Model outages are absorbed.</b> opencode retries an unreachable model indefinitely, backing off to about 30 s, and reports <code>retry</code>, which sm shows as working. A yield (appendix F) loses no turn; a resumed turn waits up to 30 s after the model returns.</li>
+</ol>
+
+<h4>N.5 Benchmark runs inside the wall, judge and scratch sm</h4>
+<p>Real model, hands-off, briefs as #1954's with one change: nothing outside the Mac is reachable, so instead of pushing, opening a draft PR and requesting review, the agent commits, runs <code>sm status</code>, reports to its parent with <code>sm send</code> and stops. The first #1855 attempt is excluded: the launcher cloned current main, where #1855 is already fixed; it was aborted after one minute with no file changed, and the launcher now verifies the start commit.</p>
+<table>
+<thead><tr><th>Run</th><th>Start commit</th><th>Local commit</th><th>Active min</th><th>Model requests</th><th>Tool calls: rules / judge allowed / denied</th><th>Judge median (max)</th><th>First prompt</th><th>Prompt reused</th><th>Largest prompt</th></tr></thead>
+<tbody>
+<tr><td>#1855</td><td><code>4a3a060d6c37</code></td><td><code>92da92c794ab</code></td><td>4.43</td><td>32</td><td>35: 22 / 13 / 0</td><td>0.71 s (3.5 s)</td><td>8,292</td><td>96.9%</td><td>33,067</td></tr>
+<tr><td>#1913</td><td><code>0d3211e3fdb1</code></td><td><code>65d6fa8d…</code></td><td>14.95</td><td>61</td><td>62: 57 / 4 / 1</td><td>2.1 s (2.9 s)</td><td>8,004</td><td>98.6%</td><td>79,712</td></tr>
+</tbody>
+</table>
+<p>Active time runs from the brief's submission to the session going idle after the report to the parent. Tokens are opencode's per-request counts. No human prompt and no question in either run. The one denial (<code>d-36c4</code>, #1913) was false and mine: opencode passed a relative path for an edit, the plugin forwarded it, and the judge service resolved it against its own folder. The agent edited the file in its next call. The plugin now sends absolute paths (<code>evidence/p5_relative_path_fix.txt</code>: the same relative edit is allowed; <code>../escape.txt</code> and an absolute path outside are still denied). Mid-run, at 35% of its window, the scratch sm sent the #1913 agent its standard handoff notice (decision 13); the agent finished its fix and reported. In both runs each agent's report reached the parent's pane through the scratch sm.</p>
+<p><b>Validation.</b> As #1955 did (M.3), on a separate clone of each agent commit:</p>
+<table>
+<thead><tr><th>Run</th><th>At the local commit</th><th>Fix removed, tests kept</th><th>fmt, clippy</th></tr></thead>
+<tbody>
+<tr><td>#1855</td><td>Own test (alias parses, stays hidden from help) and the merged real-binary test <code>retired_review_name</code> pass</td><td>Both fail</td><td>Clean</td></tr>
+<tr><td>#1913</td><td>The merged fix’s test <code>queue_job_does_not_inherit_handed_over_listeners</code> passes. The agent’s own test fails here: its socket path exceeds macOS’s limit outside the wall (below); the queue module has the same single failure</td><td>Merged test fails; own test fails</td><td>Clean</td></tr>
+</tbody>
+</table>
+<p><b>Grades, by the driver.</b> #1855 <b>mergeable as-is</b>, rescue 0%: the same production change as the merged fix (a hidden clap alias and removal of the pre-parse rejection), with a parse-level test where the merged fix runs the real binary; #1955’s Codex grader graded that same change mergeable as-is. #1913 <b>small changes</b>, rescue about half, as for #1955’s change: it closes inherited descriptors in the queue child, the design #1955’s grader graded small changes, where the merged fix marks the received listeners close-on-exec at the source. Two further corrections: its new test needs a shorter socket path, and its edit to an existing <code>http.rs</code> test (flag any listening socket in a test child) widens scope. It cites “sm#1966” in comments because my brief named it <code>sm-1966-oc</code>. The short temporary path is a driver error: <code>run_oc.sh</code> kept #1954’s short <code>TMPDIR</code>, which #1954’s launch requirement 4 removes. No independent grader ran; Codex quota was not spent on it.</p>
+
+<h4>N.6 Not proved here</h4>
+<ul>
+<li><b>Spawn through <code>sm spawn</code>.</b> The scratch sm was seeded with the agent's record, as in #1954; sm's spawn path for a new provider is implementation, not something opencode can show.</li>
+<li><b>Compaction near 200K.</b> The largest prompt was 79,712 tokens. opencode compacts on its own and emits <code>session.compacted</code>; its behaviour near the limit and the summary's quality are unmeasured.</li>
+<li><b><code>/clear</code>, <code>/rename</code> and <code>sm btw</code>.</b> sm types these into Claude Code. opencode equivalents exist (new session, <code>PATCH /session/{id}</code> title, a forked session) but none was exercised.</li>
+<li><b>Owner typing in the attached view.</b> A prompt typed in <code>opencode attach</code> is a user message that did not come from the outbox; the bridge would report it as owner-typed. Not exercised.</li>
+<li><b>Version drift.</b> opencode releases often. The proof pins 1.17.9 with updates off; an upgrade needs N.2's checks again.</li>
+</ul>
+
+<h4>N.7 Reproduce</h4>
+<pre><code>K=docs/working/1966_artifacts/kit
+sm queue run --type service --label 1966-services -- zsh $K/services.sh ~/worktrees/sm-1966-oc-probe fake
+R=~/.local/share/local-agents-proto/runs-1966                      # or $L1966_RUNS
+zsh $K/run_oc.sh http://127.0.0.1:18452/v1 start                    # probe run "a", stand-in model
+python3 $K/oc_bridge.py brief $R/a/bridge.json --file docs/working/1966_artifacts/briefs/probe.txt   # proof 1, run twice
+$K/prove_p3.sh i1 idle;  $K/prove_p3.sh b2 busy                     # proof 3
+$K/prove_p4.sh r2 process;  $K/prove_p4.sh r3 all                   # proof 4
+STOP_MODEL=… START_MODEL=… $K/prove_p4.sh m1 model
+# real model: sm queue run --type background -- zsh $K/mtplx_job.sh, then services.sh … mtplx,
+# then RUN=c TICKET=1855 COMMIT=4a3a060d6c37 BRANCH=1966-oc-1855 run_oc.sh http://127.0.0.1:18456/v1 start,
+# brief briefs/1855.md, and validate_1855.sh &lt;agent commit&gt; &lt;log dir&gt; (likewise d / #1913)</code></pre>
 
 <h3 id="z">Z. FAQ</h3>
 <p><b>Why does the judge deny rather than ask the owner?</b> An action routed to a human makes the agent wait for as long as the human is away; on #1892 that was 4.8 hours. A denial costs one tool call. The agent carries on or reports, and the owner can allow the action afterwards (K.8). This is the owner's ruling on revision 6.</p>
 <p><b>Why is 200K measured by replay rather than by running agents?</b> Memory depends on how much conversation the server holds, not on what the agent does with it. Replaying saved requests reaches 190K in a few hours of machine time and no agent time, controls the size exactly, and needs no permissions, so it can run before #1954. Speed under real agent work is still recorded in #1954's reruns.</p>
+<p><b>What changed in revision 10?</b></p>
+<ul>
+<li><b>Permissions are measured</b> (#1954, 3 Oct): no prompts, no denial needing reversal, the adversarial set passed, half a second per judged action; quality graded worse on all three tickets. Questions 1–3 and 10 change; 11 and 12 are new; #1966 now runs inside this wall, twice per ticket.</li>
+</ul>
 <p><b>What changed in revision 9?</b></p>
 <ul>
 <li><b>opencode ran before #1954</b>, using the prototype wall, as you ruled. Its completed runs took about half Claude Code’s active time and first prompt. The harness choice reopened, with a lifecycle proof (#1966) recommended before sm launch implementation. The original setup attempt is excluded, and the corrected job’s failure is a cleanup timeout after both agents committed.</li>

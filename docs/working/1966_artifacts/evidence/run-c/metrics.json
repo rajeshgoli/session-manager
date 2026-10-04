@@ -1,0 +1,21 @@
+{
+ "user_turns": 1,
+ "active_min": 4.43,
+ "model_requests": 32,
+ "tool_calls": 35,
+ "tool_errors": 0,
+ "first_prompt": 8292,
+ "input": 24572,
+ "cache_read": 777451,
+ "output_incl_reasoning": 8664,
+ "reuse": 0.969,
+ "largest_prompt": 33067,
+ "decisions": {
+  "rule/allow": 22,
+  "judge/allow": 13
+ },
+ "judge_median_ms": 709,
+ "judge_max_ms": 3489,
+ "sm_context_percent_max": 39.9,
+ "denials": []
+}

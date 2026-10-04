@@ -1,0 +1,4 @@
+{"t": 1791068950.49, "status": "idle", "activity_state": "idle", "last_tool_name": null, "last_action_summary": null, "context_percent": null, "tokens_used": 0, "provider_resume_id": "ses_efbf952ffffeGHJl3LNU4jXFIL"}
+{"t": 1791068951.55, "status": "running", "activity_state": "working", "last_tool_name": "bash", "last_action_summary": null, "context_percent": null, "tokens_used": 0, "provider_resume_id": "ses_efbf952ffffeGHJl3LNU4jXFIL"}
+{"t": 1791068951.94, "status": "running", "activity_state": "working", "last_tool_name": "bash", "last_action_summary": null, "context_percent": 0.6, "tokens_used": 1120, "provider_resume_id": "ses_efbf952ffffeGHJl3LNU4jXFIL"}
+{"t": 1791068952.23, "status": "idle", "activity_state": "idle", "last_tool_name": "bash", "last_action_summary": null, "context_percent": 0.6, "tokens_used": 1120, "provider_resume_id": "ses_efbf952ffffeGHJl3LNU4jXFIL"}

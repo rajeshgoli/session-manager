@@ -1,0 +1,1 @@
+PROBE-TOOLS You are sm-1966-oc, a local agent probing the opencode lifecycle. Run the scripted tools, then stop.

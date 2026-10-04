@@ -1,0 +1,12 @@
+{
+ "a1966oc0": {
+  "name": "sm-1966-oc",
+  "ticket": 1913,
+  "title": "Queue jobs inherit live server listener file descriptors",
+  "branch": "1966-oc-1913",
+  "checkout": "/Users/rajesh/worktrees/sm-1966-oc-d",
+  "tmp": "/private/tmp/l1966-d",
+  "parent": "sm-1966",
+  "sm_url": "http://127.0.0.1:18450"
+ }
+}

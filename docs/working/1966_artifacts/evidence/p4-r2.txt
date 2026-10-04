@@ -1,0 +1,5 @@
+before: session ses_efbf952ffffeGHJl3LNU4jXFIL, messages/user turns 31 14
+delivered
+{"healthy":true,"version":"1.17.9"}opencode session ses_efbf952ffffeGHJl3LNU4jXFIL
+pane: tmux -L l1966-scratch attach -t l1966-a1966oc0;  opencode: tmux -L l1966 attach -t oc
+after: session ses_efbf952ffffeGHJl3LNU4jXFIL, messages/user turns 33 15
