@@ -1,0 +1,9 @@
+{"t":1791068951.426,"ms":3,"callID":"call_1791068951416","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791068951.573,"ms":2,"callID":"call_1791068951571","opencode_tool":"write","tool":"Write","allow":true,"reason":"Write inside the checkout or temp folder"}
+{"t":1791068951.59,"ms":1,"callID":"call_1791068951587","opencode_tool":"write","tool":"Write","allow":false,"reason":"Write outside your checkout and temp folder is not allowed; the sandbox would block the write anyway. Write only under /Users/rajesh/worktrees/sm-1966-oc-probe or /private/tmp/l1966-a. Denied (d-a641); write it there instead."}
+{"t":1791068951.603,"ms":1,"callID":"call_1791068951601","opencode_tool":"bash","tool":"Bash","allow":false,"reason":"judge unavailable; retry this command in a minute. Denied (d-5691). Do not retry this in another form. If the work needs it, tell your parent with sm send, then continue with what you can do, or stop."}
+{"t":1791068951.615,"ms":1,"callID":"call_1791068951613","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791068987.544,"ms":1,"callID":"call_1791068987540","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"allowed once by the owner after denial d-5691"}
+{"t":1791068996.13,"ms":1,"callID":"call_1791068996126","opencode_tool":"bash","tool":"Bash","allow":false,"reason":"judge unavailable; retry this command in a minute. Denied (d-abdb). Do not retry this in another form. If the work needs it, tell your parent with sm send, then continue with what you can do, or stop."}
+{"t":1791069023.401,"ms":1,"callID":"call_1791069023397","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791069145.196,"ms":1,"callID":"call_1791069145193","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}

@@ -1,0 +1,36 @@
+{"t":1791070464.052,"ms":3,"callID":"call_6cf3b04381f44541b675739e","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070464.372,"ms":7,"callID":"call_45cc1f24f3934dfc802fcb6f","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070472.067,"ms":1,"callID":"call_e674f571","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070477.307,"ms":2,"callID":"call_6a85e42e","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070482.195,"ms":18,"callID":"call_2b234c57","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070482.212,"ms":1,"callID":"call_5d00f23b","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070485.341,"ms":1,"callID":"call_b7368ed2","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070495.782,"ms":2,"callID":"call_360b8b5d","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070500.07,"ms":2,"callID":"call_9a7f8da0","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070503.891,"ms":1,"callID":"call_7056e7d7","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070506.941,"ms":3,"callID":"call_add732bc1c2e44719c6bf8fa","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070509.068,"ms":2,"callID":"call_a12903f3766141fda32cc158","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070516.622,"ms":2,"callID":"call_ae3c2f66","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070519.105,"ms":1,"callID":"call_165f6b55","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070522.177,"ms":1,"callID":"call_3951a5d4","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070527.863,"ms":33,"callID":"call_9cab0fd2","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070527.894,"ms":2,"callID":"call_090e8e9f","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070532.779,"ms":1,"callID":"call_f2776064","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070539.26,"ms":3490,"callID":"call_a9c6c9d4","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution; \"request_codex_review\" is a test name, not a review trigger."}
+{"t":1791070582.975,"ms":759,"callID":"call_9c2d3db9579e4893837cf574","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution with git stash/pop; no network or sandbox escape."}
+{"t":1791070592.686,"ms":4,"callID":"call_f7afe94dfff7478ebaa9aba9","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070596.102,"ms":857,"callID":"call_e1861b55","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution; \"request-codex-review\" is a test name, not a network call."}
+{"t":1791070602.017,"ms":3,"callID":"call_bbc575ba6c874ffeac7cb031","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791070606.265,"ms":648,"callID":"call_7d8d9d35","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution; no network or sandbox escape."}
+{"t":1791070615.379,"ms":648,"callID":"call_17a58d8d","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution; no network or sandbox escape."}
+{"t":1791070622.935,"ms":671,"callID":"call_832c1e2daf7f4ab18fd05d9f","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution and git stash operations do not leave the sandbox."}
+{"t":1791070631.772,"ms":609,"callID":"call_d4c29a96","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution only; no network or sandbox escape."}
+{"t":1791070641.719,"ms":710,"callID":"call_df8fa14522f44ce58be0b910","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution and git stash operations; no network or sandbox escape."}
+{"t":1791070650.962,"ms":3,"callID":"call_463aef1a965c45298cdbbbfe","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791070675.671,"ms":2,"callID":"call_e1068500","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791070682.793,"ms":836,"callID":"call_44025f6344344392b6616eb3","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local test execution; \"request_codex_review\" is a test name, no external calls or credential access."}
+{"t":1791070694.305,"ms":565,"callID":"call_797c64206b044301b3e6d189","opencode_tool":"bash","tool":"Bash","allow":true,"reason":""}
+{"t":1791070703.931,"ms":897,"callID":"call_391be30ef76b401b9f018092","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local git commit only; no network or sandbox escape."}
+{"t":1791070710.75,"ms":771,"callID":"call_3866b26a","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"sm status and sm send to parent are allowed read/status commands."}
+{"t":1791070714.964,"ms":552,"callID":"call_3bf0e967","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"sm me is a read-only status command."}
+{"t":1791070782.77,"ms":2,"callID":"call_3dc27fc8","opencode_tool":"bash","tool":"Bash","allow":false,"reason":"judge unavailable; retry this command in a minute. Denied (d-534a). Do not retry this in another form. If the work needs it, tell your parent with sm send, then continue with what you can do, or stop."}

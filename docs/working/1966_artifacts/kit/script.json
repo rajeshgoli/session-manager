@@ -1,0 +1,14 @@
+{"default": [],
+ "PROBE-TOOLS": [
+  {"tool": "bash", "args": {"command": "git status --short | head -3; echo rule-allowed", "description": "status"}},
+  {"tool": "write", "args": {"filePath": "/private/tmp/l1966-a/tmp/note.txt", "content": "inside temp\n"}},
+  {"tool": "write", "args": {"filePath": "/Users/rajesh/l1966-outside.txt", "content": "outside\n"}},
+  {"tool": "bash", "args": {"command": "git push origin HEAD", "description": "push"}},
+  {"tool": "bash", "args": {"command": "touch /Users/rajesh/l1966-wall-probe.txt", "description": "wall probe"}}
+ ],
+ "PROBE-RETRY": [
+  {"tool": "bash", "args": {"command": "git push origin HEAD", "description": "push"}}
+ ],
+ "PROBE-SLOW": [
+  {"tool": "bash", "args": {"command": "sleep 20; echo slow-done", "description": "slow"}}
+ ]}

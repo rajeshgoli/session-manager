@@ -1,0 +1,45 @@
+{"t": 1791068908.9559941, "line": "status idle"}
+{"t": 1791068951.612888, "line": "status busy"}
+{"t": 1791068951.938207, "line": "status idle"}
+{"t": 1791068987.529886, "line": "delivered msg_10407e07b001GpXJH8ao89spUo (136 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nPROBE-RETRY [sm", "key": "pane-418985363420", "messageID": "msg_10407e07b001GpXJH8ao89spUo"}
+{"t": 1791068996.115183, "line": "delivered msg_104080206001wbXSPiga5OGwjV (103 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nPROBE-RETRY sec", "key": "pane-d846f8031bbe", "messageID": "msg_104080206001wbXSPiga5OGwjV"}
+{"t": 1791069023.3855171, "line": "delivered msg_104086c89001reG5sZ4wUCvcR0 (77 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nPROBE-SLOW run ", "key": "pane-393442018277", "messageID": "msg_104086c89001reG5sZ4wUCvcR0"}
+{"t": 1791069023.5963788, "line": "status busy"}
+{"t": 1791069029.56851, "line": "delivered msg_1040884ae001Vvs9Mcv3FFO5Id (169 chars, sent): [sm queue] 1966-wake-probe completed: succeeded exit=0 peak_", "key": "pane-8c619bec3322", "messageID": "msg_1040884ae001Vvs9Mcv3FFO5Id"}
+{"t": 1791069030.0710971, "line": "delivered msg_1040886a8001VEWgDNPWQT60ej (84 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nBUSY-SEND sent ", "key": "pane-ea946051c7ee", "messageID": "msg_1040886a8001VEWgDNPWQT60ej"}
+{"t": 1791069030.4990022, "line": "escape: aborted the current turn"}
+{"t": 1791069030.697331, "line": "status idle"}
+{"t": 1791069031.170246, "line": "delivered msg_104088aef001OmxoFFg2EXsRpZ (74 chars, sent): [sm] Scheduled reminder: (f48ef8823904)\nREMINDER-PROBE check", "key": "pane-8a5ec3000654", "messageID": "msg_104088aef001OmxoFFg2EXsRpZ"}
+{"t": 1791069127.800724, "line": "status idle"}
+{"t": 1791069145.180964, "line": "delivered msg_1040a4850001kN8Q9idaCgaFNG (80 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nPROBE-SLOW b2 r", "key": "pane-070e63d36a67", "messageID": "msg_1040a4850001kN8Q9idaCgaFNG"}
+{"t": 1791069145.45787, "line": "status busy"}
+{"t": 1791069151.0200388, "line": "delivered msg_1040a5f1d001nU7YJhi3gZo1IB (166 chars, sent): [sm queue] 1966-wake-b2 completed: succeeded exit=0 peak_pro", "key": "pane-6f26545b3723", "messageID": "msg_1040a5f1d001nU7YJhi3gZo1IB"}
+{"t": 1791069151.506489, "line": "delivered msg_1040a6100001CRRWHBAvd7kC5J (73 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nSEND-PROBE b2 p", "key": "pane-52683af7521b", "messageID": "msg_1040a6100001CRRWHBAvd7kC5J"}
+{"t": 1791069152.070338, "line": "C-b + escape (urgent delivery): not aborting; the text is queued"}
+{"t": 1791069153.0784209, "line": "delivered msg_1040a67260012mPyqsNRC9kvgv (77 chars, sent): [sm] Scheduled reminder: (14fd6019c0ed)\nREMINDER-PROBE b2 ch", "key": "pane-627ab8f12ce7", "messageID": "msg_1040a67260012mPyqsNRC9kvgv"}
+{"t": 1791069165.6353018, "line": "status idle"}
+{"t": 1791069205.168596, "line": "C-b + escape (urgent delivery): not aborting; the text is queued"}
+{"t": 1791069205.6725929, "line": "delivered msg_1040b3498001Tq4rlXfmAhI3xM (77 chars, sent): [sm] Scheduled reminder: (b565da944f10)\nREMINDER-PROBE i1 ch", "key": "pane-3069cac65e0b", "messageID": "msg_1040b3498001Tq4rlXfmAhI3xM"}
+{"t": 1791069206.170609, "line": "delivered msg_1040b3691001WZgIwGgA7y2S3a (166 chars, sent): [sm queue] 1966-wake-i1 completed: succeeded exit=0 peak_pro", "key": "pane-137e44ecf496", "messageID": "msg_1040b3691001WZgIwGgA7y2S3a"}
+{"t": 1791069206.6698549, "line": "delivered msg_1040b3880001tPH1ipOVjvSOmn (73 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nSEND-PROBE i1 p", "key": "pane-fa806e11da98", "messageID": "msg_1040b3880001tPH1ipOVjvSOmn"}
+{"t": 1791069206.67381, "line": "status busy"}
+{"t": 1791069206.973828, "line": "status idle"}
+{"t": 1791069288.007473, "line": "status unreachable"}
+{"t": 1791069290.618217, "line": "DELIVERY FAILED pane-eda49e6e8f50: <urlopen error [Errno 61] Connection refused>", "key": "pane-eda49e6e8f50"}
+{"t": 1791069296.566596, "line": "status idle"}
+{"t": 1791069347.836318, "line": "status idle"}
+{"t": 1791069354.104019, "line": "status unreachable"}
+{"t": 1791069362.487116, "line": "status idle"}
+{"t": 1791069362.977818, "line": "delivered msg_1040d81f50010iKJ2zbxBBsCI4 (90 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nRESTORE-PROBE r", "key": "pane-d381bf9673fa", "messageID": "msg_1040d81f50010iKJ2zbxBBsCI4"}
+{"t": 1791069409.364801, "line": "status idle"}
+{"t": 1791069412.9875572, "line": "delivered msg_1040e5e6c001zLpqdTV3VgRrxe (81 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nRESTORE-PROBE r", "key": "pane-4b29db3d538b", "messageID": "msg_1040e5e6c001zLpqdTV3VgRrxe"}
+{"t": 1791069450.878908, "line": "delivered msg_1040ef268001UXJ2Bx4HskxAUB (91 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nRESTORE-PROBE m", "key": "pane-ebd3cc78127e", "messageID": "msg_1040ef268001UXJ2Bx4HskxAUB"}
+{"t": 1791069451.0660129, "line": "status retry"}
+{"t": 1791069481.0334918, "line": "status idle"}
+{"t": 1791069522.5618198, "line": "delivered msg_104100a78001JPXMVxT46KLKXd (92 chars, sent): [Input from: sm-1966 (p1966000) via sm send]\nLONG-OUTAGE pro", "key": "pane-21833e4a3563", "messageID": "msg_104100a78001JPXMVxT46KLKXd"}
+{"t": 1791069522.717432, "line": "status retry"}
+{"t": 1791070183.026117, "line": "status busy"}
+{"t": 1791070183.316332, "line": "status retry"}
+{"t": 1791070273.1282492, "line": "status idle"}
+{"t": 1791070373.224033, "line": "status unreachable"}
+{"t": 1791070391.036245, "line": "status idle"}

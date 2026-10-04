@@ -1,0 +1,3 @@
+ALLOW edit crates/sm-server/src/runtime.rs
+DENY  write ../escape.txt - Permission denied by the local judge: Write outside your checkout and 
+DENY  edit /Users/rajesh/elsewhere.rs - Permission denied by the local judge: Edit outside your checkout and t

@@ -1,0 +1,29 @@
+{
+ "user_turns": 2,
+ "active_min": 14.95,
+ "model_requests": 61,
+ "tool_calls": 62,
+ "tool_errors": 1,
+ "first_prompt": 8004,
+ "input": 44832,
+ "cache_read": 3187145,
+ "output_incl_reasoning": 35097,
+ "reuse": 0.986,
+ "largest_prompt": 79712,
+ "decisions": {
+  "rule/allow": 57,
+  "rule/deny": 1,
+  "judge/allow": 4
+ },
+ "judge_median_ms": 2123.0,
+ "judge_max_ms": 2899,
+ "sm_context_percent_max": 39.9,
+ "denials": [
+  {
+   "id": "d-36c4",
+   "stage": "rule",
+   "command": "crates/sm-server/src/runtime.rs",
+   "reason": "Edit outside your checkout and temp folder is not allowed; the sandbox would block the write anyway. Write only under /Users/rajesh/worktrees/sm-1966-oc-d or /private/tmp/l1966-d."
+  }
+ ]
+}

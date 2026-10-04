@@ -1,0 +1,62 @@
+{"t":1791070964.252,"ms":2,"callID":"call_7af15d9ef6bc4de68ebb9474","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791070964.787,"ms":2,"callID":"call_141999b712424d5eaecde632","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070969.287,"ms":1,"callID":"call_24597ade","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070978.501,"ms":1,"callID":"call_1fe077c1","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791070981.233,"ms":1,"callID":"call_78b569b2","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791070989.92,"ms":25,"callID":"call_a48caaf4","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791070989.944,"ms":1,"callID":"call_1f11c619","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791070995.725,"ms":2,"callID":"call_f60648ae","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071008.209,"ms":2,"callID":"call_54f3c53b","opencode_tool":"grep","tool":"Grep","allow":true,"reason":"Grep is always allowed"}
+{"t":1791071010.154,"ms":1,"callID":"call_0a870cd0","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071014.643,"ms":26,"callID":"call_55501dd9","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071030.846,"ms":2,"callID":"call_a103437a","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071040.067,"ms":1,"callID":"call_08d6787d","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071054.297,"ms":2,"callID":"call_b04550bc","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071060.414,"ms":1,"callID":"call_5515aada","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071086.431,"ms":1,"callID":"call_62cdb852","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071103.248,"ms":6,"callID":"call_1985e253","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071105.917,"ms":2,"callID":"call_8501d1d4","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071111.651,"ms":2,"callID":"call_5699a7f5","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071147.437,"ms":1,"callID":"call_bcd67db0","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071151.845,"ms":1,"callID":"call_e43f4af9","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071161.213,"ms":1,"callID":"call_50906396","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071164.329,"ms":1,"callID":"call_408fae01","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071188.526,"ms":7,"callID":"call_ea473bc8","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071233.4,"ms":5,"callID":"call_fb94287a","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071235.786,"ms":1,"callID":"call_b030fc7e","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071283.99,"ms":2,"callID":"call_999f7e88","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071294.076,"ms":98,"callID":"call_260658ba","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071299.833,"ms":1,"callID":"call_090a09f9","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071309.462,"ms":3,"callID":"call_ca17c12f","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071352.863,"ms":6,"callID":"call_e11b62ab","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071360.443,"ms":2,"callID":"call_d0802680","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071365.992,"ms":3,"callID":"call_39880287","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071375.587,"ms":1,"callID":"call_f4ff7ea9","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071391.294,"ms":1,"callID":"call_1dcab648","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071394.571,"ms":1,"callID":"call_d415adac","opencode_tool":"read","tool":"Read","allow":true,"reason":"Read is always allowed"}
+{"t":1791071403.453,"ms":2,"callID":"call_4df8b8df","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071406.179,"ms":1,"callID":"call_51a49c58","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071458.322,"ms":4,"callID":"call_b005365c79c74500818a4402","opencode_tool":"edit","tool":"Edit","allow":false,"reason":"Edit outside your checkout and temp folder is not allowed; the sandbox would block the write anyway. Write only under /Users/rajesh/worktrees/sm-1966-oc-d or /private/tmp/l1966-d. Denied (d-36c4); write it there instead."}
+{"t":1791071464.676,"ms":2,"callID":"call_6094d42f","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071468.522,"ms":1,"callID":"call_a61de593","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071494.087,"ms":49,"callID":"call_5f49d89e","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071512.044,"ms":2,"callID":"call_66d29477","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071519.757,"ms":2,"callID":"call_39ae201f","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071521.985,"ms":1,"callID":"call_7c3d1592","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071527.303,"ms":2,"callID":"call_b6a26d4c","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071606.002,"ms":2,"callID":"call_23fb0416","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071611.596,"ms":1,"callID":"call_ace0d314","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071615.222,"ms":2,"callID":"call_b428e371","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071643.608,"ms":2,"callID":"call_4e127eb2","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071657.4,"ms":1,"callID":"call_3c313cad","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071664.71,"ms":3,"callID":"call_3d2cd0fe","opencode_tool":"edit","tool":"Edit","allow":true,"reason":"Edit inside the checkout or temp folder"}
+{"t":1791071668.833,"ms":2,"callID":"call_6ee459a2","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071692.603,"ms":1,"callID":"call_510bfd16","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071716.687,"ms":1,"callID":"call_ead3acbc","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071739.364,"ms":3,"callID":"call_1ea96247","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071779.269,"ms":2,"callID":"call_f9f806fa","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"no egress word in the command"}
+{"t":1791071804.715,"ms":2900,"callID":"call_48532821","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"Local git add and commit only; no network or sandbox escape."}
+{"t":1791071819.152,"ms":2202,"callID":"call_a4e2b6b5","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"sm status and sm send to parent are allowed read/report commands."}
+{"t":1791071827.732,"ms":6,"callID":"call_6ff12f1a","opencode_tool":"write","tool":"Write","allow":true,"reason":"Write inside the checkout or temp folder"}
+{"t":1791071831.018,"ms":2046,"callID":"call_165911ca","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"sm send to parent is allowed; file content is internal message, not credential leak."}
+{"t":1791071838.899,"ms":1964,"callID":"call_bd055b03","opencode_tool":"bash","tool":"Bash","allow":true,"reason":"sm send to parent is allowed; message content is local file."}
