@@ -198,6 +198,54 @@ class WallTests(unittest.TestCase):
         self.assertNotEqual(denied.stdout.strip(), "0")
 
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
+    def test_hardlinks_cannot_cross_read_or_write_boundaries(self):
+        self.profile = self.state / "link-wall.sb"
+        self.profile.write_text(wall.generate(self.args, set(), 65))
+        for name in ("server.secret", "wall.sb", "launch-serve.sh"):
+            original = self.state / name
+            original.write_text("fixture-immutable")
+            for target in (self.state / "xdg/data" / name, Path(self.tmp) / name):
+                self.sandbox(f"import os; os.link({str(original)!r}, {str(target)!r})",
+                             False, f"hardlink immutable {name}")
+                self.assertFalse(target.exists())
+                self.assertEqual(original.read_text(), "fixture-immutable")
+        credential = self.home / ".npmrc"
+        credential.write_text("fixture-host-token")
+        target = self.checkout / "host-token-alias"
+        self.sandbox(f"import os; os.link({str(credential)!r}, {str(target)!r}); open({str(target)!r}).read()",
+                     False, "hardlink host credential")
+        self.assertFalse(target.exists())
+        source = self.checkout / "mutable-source"
+        source.write_text("fixture-mutable")
+        private_alias = self.state / "xdg/data/mutable-alias"
+        self.sandbox(f"import os; os.link({str(source)!r}, {str(private_alias)!r}); "
+                     f"assert open({str(private_alias)!r}).read() == 'fixture-mutable'",
+                     True, "hardlink wholly within mutable boundaries")
+        forbidden = self.state / "immutable-alias"
+        self.sandbox(f"import os; os.link({str(source)!r}, {str(forbidden)!r})",
+                     False, "hardlink mutable source into immutable state")
+        self.assertFalse(forbidden.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
+    def test_signals_stay_inside_inherited_sandbox(self):
+        self.profile = self.state / "signal-wall.sb"
+        self.profile.write_text(wall.generate(self.args, set(), 65))
+        outsider = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            # Only this disposable fixture PID is targeted; never send a
+            # broadcast signal or touch live server/agent processes.
+            for number in (0, 15, 19, 9):
+                self.sandbox(f"import os; os.kill({outsider.pid}, {number})",
+                             False, f"signal outside sandbox: {number}")
+                self.assertIsNone(outsider.poll())
+            self.sandbox("import subprocess, signal; child=subprocess.Popen(['/bin/sleep', '30']); "
+                         "child.terminate(); assert child.wait(timeout=5) == -signal.SIGTERM",
+                         True, "terminate own sandbox child")
+        finally:
+            outsider.terminate()
+            outsider.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_rust_toolchain_builds_from_explicit_read_access(self):
         # Resolve the host's installed compiler outside the wall, then admit
         # only that immutable toolchain. No host rustup config or cache grant.

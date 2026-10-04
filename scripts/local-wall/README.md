@@ -92,6 +92,12 @@ exit status. `--home` defaults to the current user's home; tests override it wit
 a fixture. Secret directories must exist before generation. Include every
 directory containing judge registrations, allow records, gateway secrets,
 proxy private keys and GitHub credentials.
+The host must prepare the checkout/state without hard links to protected host
+files or immutable state. File aliases already created outside the wall retain
+their inode identity; the launch check must reject such shared inodes. Inside
+the wall, hard links are allowed only from mutable files into writable paths.
+Signals reach only processes inheriting that same sandbox, so commands can
+manage their children without stopping the host services or other agents.
 
 The server, gateway and egress ranges default to the values above and must be
 disjoint. The caller reserves these entire ranges for their respective services.
@@ -143,6 +149,8 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Every Unix socket outside own `tmp/`, including Docker, default tmux and sm-state sockets | No connection |
 | Host Mach services, including keychain and application-launch brokers | No lookup or registration |
 | Apple-event delegation | No send |
+| Hard links from immutable state or host files into mutable paths | No link |
+| Signals to host services or other sandboxes | Denied; own children permitted |
 
 The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement
