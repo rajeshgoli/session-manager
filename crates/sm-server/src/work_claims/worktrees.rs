@@ -4,9 +4,13 @@
 //! Deletion is durable by derivation. A retired session's candidates are
 //! every `worktree_path` on its claims, plus its working directory when that
 //! is on the branch of a merged PR it claimed. A candidate stays pending
-//! until a `worktree.removed` event, or a `worktree.left` event with a final
-//! reason, is written for its path after the session retired. Every pass
-//! processes every pending candidate, so a crash only delays the work.
+//! until a `worktree.removed` event, or a `worktree.left` event saying the
+//! path is absent, is written for its path after the session retired. A
+//! candidate left for a passing reason (a keep, a live session or process)
+//! is checked on every pass; one left for its content (commits not on any
+//! remote, uncommitted changes, a failed removal) is checked again every
+//! `RECHECK_INTERVAL`, so a later merge or push frees it (sm#1987). A crash
+//! only delays the work.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -19,7 +23,7 @@ use std::{
 };
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -33,10 +37,79 @@ use super::{
 /// process still inside its worktree counts as a reason to keep it.
 pub const RETIRE_PROCESS_GRACE: Duration = Duration::from_secs(5);
 
+/// How often a worktree left for its content is checked again.
+pub const RECHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Ignored directories that are build output: rebuilt by the next build, so
+/// deleting them never loses work. Matched by name at any depth.
+const BUILD_DIRS: [&str; 6] = [
+    "target",
+    "node_modules",
+    "build",
+    "dist",
+    ".gradle",
+    ".next",
+];
+
 const REMOVED: &str = "worktree.removed";
 const LEFT: &str = "worktree.left";
 const REBUILT: &str = "worktree.rebuilt";
+const KEEP_EXPIRED: &str = "worktree.keep_expired";
 const ABSENT: &str = "absent";
+/// Never deleted and never listed as left over: not a worktree sm made.
+const MAIN_CHECKOUT: &str = "a main checkout";
+const INSIDE_CHECKOUT: &str = "inside another checkout";
+const NOT_A_WORKTREE: &str = "not a git worktree";
+/// The path now holds a checkout of a repository the claims never named.
+const OTHER_REPO: &str = "another repository's checkout";
+/// The path now holds a worktree made after the agent retired.
+const NEWER_WORKTREE: &str = "a newer worktree at this path";
+/// How much later than the retire a worktree must be made to count as a
+/// newer one: retire times are recorded to the second.
+const REUSE_SLACK: Duration = Duration::from_secs(60);
+
+/// Reasons that settle a candidate for good.
+fn settles(reason: &str) -> bool {
+    matches!(
+        reason,
+        ABSENT | MAIN_CHECKOUT | INSIDE_CHECKOUT | OTHER_REPO | NEWER_WORKTREE
+    )
+}
+
+/// Whether the worktree at `path` was made after the candidate's sessions
+/// retired, judged by when git made its admin directory: the path was
+/// reused, so it is not the retired agent's worktree.
+fn made_after_retire(path: &Path, candidate: &Candidate) -> bool {
+    let Some(retired) = candidate.retired_at else {
+        return false;
+    };
+    git(path, &["rev-parse", "--path-format=absolute", "--git-dir"])
+        .and_then(|git_dir| fs::metadata(git_dir).ok()?.created().ok())
+        .is_some_and(|made| OffsetDateTime::from(made) > retired + REUSE_SLACK)
+}
+
+/// Whether a GitHub remote of the repository at `common_dir` is one of the
+/// candidate's recorded repos: a path reused by another repository's
+/// worktree is never the retired agent's to delete. `None` when it has no
+/// GitHub remote to tell by.
+fn is_candidates_repo(common_dir: &str, candidate: &Candidate) -> Option<bool> {
+    let urls = git_in(
+        common_dir,
+        &["config", "--get-regexp", r"^remote\..*\.url$"],
+    )
+    .unwrap_or_default();
+    let repos = urls
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(crate::work_attribution::github_repo_from_remote_url)
+        .map(|repo| super::canonical_repo(&repo))
+        .collect::<Vec<_>>();
+    (!repos.is_empty()).then(|| {
+        repos
+            .iter()
+            .any(|repo| candidate.sources.iter().any(|source| source.repo == *repo))
+    })
+}
 
 impl WorkClaimStore {
     /// `POST /claims/worktree`: records the managed worktree on the caller's
@@ -132,6 +205,9 @@ pub struct CleanupRequest<'a> {
     /// get `RETIRE_PROCESS_GRACE` to exit.
     pub first: Option<&'a str>,
     pub progress: Option<&'a Mutex<CleanupProgress>>,
+    /// How long a worktree left for its content waits before it is checked
+    /// again; `None` is `RECHECK_INTERVAL`.
+    pub recheck_after: Option<Duration>,
 }
 
 /// Where a candidate came from; the pass reads these to decide and to key
@@ -181,6 +257,22 @@ fn cleanup_lock() -> &'static Mutex<()> {
     &LOCK
 }
 
+/// When each worktree left for its content was last checked, so it waits
+/// `RECHECK_INTERVAL` before the next. Empty after a restart, which checks
+/// each once.
+fn last_checked() -> &'static Mutex<BTreeMap<String, Instant>> {
+    static CHECKED: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+    CHECKED.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// What one pass reads once and reuses: the process listing, and each
+/// repository's fetch of its remotes.
+#[derive(Default)]
+struct PassCache {
+    processes: Option<ProcessListing>,
+    fetched: BTreeMap<String, Result<(), String>>,
+}
+
 /// Retired sessions whose working directory was checked and is not a
 /// candidate (or is settled): not re-run with git on every pass.
 fn working_dirs_done() -> &'static Mutex<HashSet<String>> {
@@ -206,11 +298,22 @@ pub fn run_worktree_cleanup(
     prune_keeps(&conn)?;
     let retired = retired_sessions(&conn, &request)?;
     let events = path_events(&conn)?;
+    let first = request.first.unwrap_or_default();
+    let recheck_after = request.recheck_after.unwrap_or(RECHECK_INTERVAL);
+    let checked = lock(last_checked()).clone();
     let mut candidates = gather(&conn, &request, &retired)?
         .into_values()
         .filter(|candidate| is_pending(candidate, &events))
+        .filter(|candidate| {
+            candidate.sessions.contains(first)
+                || !waits_for_recheck(
+                    candidate,
+                    &events,
+                    checked.get(&candidate.path),
+                    recheck_after,
+                )
+        })
         .collect::<Vec<_>>();
-    let first = request.first.unwrap_or_default();
     candidates
         .sort_by_key(|candidate| (!candidate.sessions.contains(first), candidate.path.clone()));
     if let Some(progress) = request.progress {
@@ -223,19 +326,19 @@ pub fn run_worktree_cleanup(
         );
     }
     let keeps = load_keeps(&conn)?;
-    let mut processes = None;
+    let mut cache = PassCache::default();
     let mut outcomes = Vec::new();
     for candidate in &candidates {
         let grace = candidate.sessions.contains(first);
         let decision = decide(
-            &conn,
-            candidate,
-            &request,
-            &retired,
-            &keeps,
-            &mut processes,
-            grace,
+            &conn, candidate, &request, &retired, &keeps, &mut cache, grace,
         )?;
+        if let Decision::Left {
+            retryable: false, ..
+        } = &decision
+        {
+            lock(last_checked()).insert(candidate.path.clone(), Instant::now());
+        }
         let outcome = record(&conn, candidate, decision, &events)?;
         if let Some(progress) = request.progress {
             lock(progress).outcomes.push(outcome.clone());
@@ -449,14 +552,38 @@ fn after_retire(event: &PathEvent, candidate: &Candidate) -> bool {
     }
 }
 
-/// Pending until a removal, or a final `worktree.left`, is recorded for the
-/// path after the latest of its sessions retired.
+/// Pending until a removal, or a `worktree.left` that settles it (the path
+/// is absent, or is not a worktree sm made), is recorded for the path after
+/// the latest of its sessions retired.
 fn is_pending(candidate: &Candidate, events: &BTreeMap<String, Vec<PathEvent>>) -> bool {
     !events.get(&candidate.path).is_some_and(|events| {
         events.iter().any(|event| {
-            after_retire(event, candidate) && (event.kind == REMOVED || !event.retryable)
+            after_retire(event, candidate) && (event.kind == REMOVED || settles(&event.reason))
         })
     })
+}
+
+/// Left for its content (not a passing reason) by its latest check since
+/// the retire, and checked in this process less than `recheck_after` ago.
+fn waits_for_recheck(
+    candidate: &Candidate,
+    events: &BTreeMap<String, Vec<PathEvent>>,
+    checked: Option<&Instant>,
+    recheck_after: Duration,
+) -> bool {
+    checked.is_some_and(|at| at.elapsed() < recheck_after)
+        && latest_after_retire(candidate, events).is_some_and(|event| !event.retryable)
+}
+
+fn latest_after_retire<'e>(
+    candidate: &Candidate,
+    events: &'e BTreeMap<String, Vec<PathEvent>>,
+) -> Option<&'e PathEvent> {
+    events
+        .get(&candidate.path)?
+        .iter()
+        .rev()
+        .find(|event| after_retire(event, candidate))
 }
 
 fn load_keeps(conn: &Connection) -> Result<BTreeMap<String, String>> {
@@ -570,13 +697,100 @@ pub(crate) fn parse_lsof(text: &str) -> Vec<(u32, String, String)> {
     rows
 }
 
+/// Why `path` is not a linked worktree sm may delete, or its git dirs:
+/// `(common_dir)` on success.
+fn linked_worktree(path: &Path, key: &str) -> std::result::Result<String, &'static str> {
+    let dirs = git(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+            "--show-toplevel",
+        ],
+    );
+    let dirs = dirs
+        .as_deref()
+        .map(|text| text.lines().map(path_key).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let [git_dir, common_dir, top] = dirs.as_slice() else {
+        return Err(NOT_A_WORKTREE);
+    };
+    if top != key {
+        return Err(INSIDE_CHECKOUT);
+    }
+    if git_dir == common_dir {
+        return Err(MAIN_CHECKOUT);
+    }
+    Ok(common_dir.clone())
+}
+
+/// Why a live session or process makes `candidate` unsafe to touch now.
+fn in_use(
+    conn: &Connection,
+    candidate: &Candidate,
+    request: &CleanupRequest<'_>,
+    retired: &BTreeMap<String, Option<OffsetDateTime>>,
+    processes: &mut Option<ProcessListing>,
+    grace: bool,
+) -> Result<Option<String>> {
+    // No other session that is not retired works inside it.
+    for session in request.sessions {
+        if !session.local
+            || retired.contains_key(&session.id)
+            || candidate.sessions.contains(&session.id)
+        {
+            continue;
+        }
+        let cwd = path_key(&session.working_dir);
+        let holds = query_claims(
+            conn,
+            "WHERE session_id = ?1 AND ended_at IS NULL AND worktree_path IS NOT NULL",
+            params![session.id],
+        )?
+        .iter()
+        .any(|claim| {
+            claim
+                .worktree_path
+                .as_deref()
+                .is_some_and(|p| path_key(p) == candidate.path)
+        });
+        if is_inside(&cwd, &candidate.path) || holds {
+            return Ok(Some(format!("in use by {}", session.name)));
+        }
+    }
+    // No process has its cwd inside. The retired agent's own processes may
+    // take a moment to exit after its panes close.
+    let deadline = Instant::now()
+        + if grace {
+            RETIRE_PROCESS_GRACE
+        } else {
+            Duration::ZERO
+        };
+    loop {
+        let listing = match processes.get_or_insert_with(list_process_cwds) {
+            Ok(listing) => listing,
+            Err(error) => return Ok(Some(format!("process check failed: {error}"))),
+        };
+        let Some((pid, command)) = processes_inside(&candidate.path, listing) else {
+            return Ok(None);
+        };
+        if Instant::now() >= deadline {
+            return Ok(Some(format!("process {pid} ({command}) runs in it")));
+        }
+        thread::sleep(Duration::from_millis(500));
+        *processes = None;
+    }
+}
+
 fn decide(
     conn: &Connection,
     candidate: &Candidate,
     request: &CleanupRequest<'_>,
     retired: &BTreeMap<String, Option<OffsetDateTime>>,
     keeps: &BTreeMap<String, String>,
-    processes: &mut Option<ProcessListing>,
+    cache: &mut PassCache,
     grace: bool,
 ) -> Result<Decision> {
     let path = Path::new(&candidate.path);
@@ -599,83 +813,58 @@ fn decide(
         })
     };
     // 1. A linked worktree, never a main checkout.
-    let dirs = git(
-        path,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-            "--show-toplevel",
-        ],
-    );
-    let dirs = dirs
-        .as_deref()
-        .map(|text| text.lines().map(path_key).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let [git_dir, common_dir, top] = dirs.as_slice() else {
-        return final_left("not a linked worktree".to_owned());
+    let common_dir = match linked_worktree(path, &candidate.path) {
+        Ok(common_dir) => common_dir,
+        Err(reason) => return final_left(reason.to_owned()),
     };
-    if git_dir == common_dir || *top != candidate.path {
-        return final_left("not a linked worktree".to_owned());
+    if made_after_retire(path, candidate) {
+        return final_left(NEWER_WORKTREE.to_owned());
     }
-    // 2. No keep.
+    // Without a GitHub remote to confirm the repository, only the checks
+    // tied to commit identity (a merged PR's head, the managed base) apply.
+    let verified = match is_candidates_repo(&common_dir, candidate) {
+        Some(false) => return final_left(OTHER_REPO.to_owned()),
+        Some(true) => true,
+        None => false,
+    };
+    // 2. No keep, unless every PR it names has merged or closed.
     if let Some(reason) = keeps.get(&candidate.path) {
-        return retry_left(format!("kept: {reason}"));
-    }
-    // 3. No other session that is not retired works inside it.
-    for session in request.sessions {
-        if !session.local
-            || retired.contains_key(&session.id)
-            || candidate.sessions.contains(&session.id)
-        {
-            continue;
-        }
-        let cwd = path_key(&session.working_dir);
-        let holds = query_claims(
-            conn,
-            "WHERE session_id = ?1 AND ended_at IS NULL AND worktree_path IS NOT NULL",
-            params![session.id],
-        )?
-        .iter()
-        .any(|claim| {
-            claim
-                .worktree_path
-                .as_deref()
-                .is_some_and(|p| path_key(p) == candidate.path)
-        });
-        if is_inside(&cwd, &candidate.path) || holds {
-            return retry_left(format!("in use by {}", session.name));
+        if !expire_keep(conn, candidate, reason)? {
+            return retry_left(format!("kept: {reason}"));
         }
     }
-    // 4. No process has its cwd inside. The retired agent's own processes
-    // may take a moment to exit after its panes close.
-    let deadline = Instant::now()
-        + if grace {
-            RETIRE_PROCESS_GRACE
-        } else {
-            Duration::ZERO
-        };
-    loop {
-        let listing = match processes.get_or_insert_with(list_process_cwds) {
-            Ok(listing) => listing,
-            Err(error) => return retry_left(format!("process check failed: {error}")),
-        };
-        let Some((pid, command)) = processes_inside(&candidate.path, listing) else {
-            break;
-        };
-        if Instant::now() >= deadline {
-            return retry_left(format!("process {pid} ({command}) runs in it"));
-        }
-        thread::sleep(Duration::from_millis(500));
-        *processes = None;
+    // 3-4. No live session or process inside.
+    if let Some(reason) = in_use(
+        conn,
+        candidate,
+        request,
+        retired,
+        &mut cache.processes,
+        grace,
+    )? {
+        return retry_left(reason);
     }
-    // 5. Nothing committed would be lost.
+    // 5. Nothing would be lost: no uncommitted change, and HEAD is on a
+    // remote or is a merged PR's head.
     let Some(head) = git(path, &["rev-parse", "HEAD"]) else {
-        return final_left("commits not in a merged PR".to_owned());
+        return final_left("no commit checked out".to_owned());
     };
-    let Some(removed_reason) = safe_head(conn, candidate, &head)? else {
-        return final_left("commits not in a merged PR".to_owned());
+    match git(path, &["status", "--porcelain"]) {
+        None => return final_left("git status failed".to_owned()),
+        Some(changes) if !changes.is_empty() => {
+            return final_left(count(changes.lines().count(), "uncommitted change"));
+        }
+        Some(_) => {}
+    }
+    let removed_reason = match safe_head(
+        conn,
+        candidate,
+        &head,
+        &common_dir,
+        verified.then_some(&mut cache.fetched),
+    )? {
+        Ok(reason) => reason,
+        Err(reason) => return final_left(reason),
     };
     // A keep acknowledged while this pass was running wins: re-read it right
     // before the removal instead of trusting the pass's first snapshot.
@@ -685,91 +874,292 @@ fn decide(
     // The branch to delete afterwards is the one checked out: agents may
     // rename the branch setup made (sm#1567).
     let checked_out = git(path, &["branch", "--show-current"]).filter(|b| !b.is_empty());
-    // 6. git removes it, refusing modified or untracked files.
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(common_dir)
-        .args(["worktree", "remove"])
-        .arg(&candidate.path)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let line = stderr
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("git worktree remove failed");
-            let line = line.strip_prefix("fatal: ").unwrap_or(line);
-            return final_left(format!("git refused: {line}"));
-        }
-        Err(error) => return final_left(format!("git refused: {error}")),
+    // 6. git removes it, refusing modified or untracked files. Build output
+    // goes first: a build still writing into `target/` made the removal die
+    // on "Directory not empty" with the worktree half gone.
+    if let Err(error) = remove_worktree(path, &common_dir, false) {
+        return final_left(format!("git refused: {error}"));
     }
     // Squash merges never make the branch an ancestor of main: -D, but only
     // when its tip is still the HEAD that was checked. A detached HEAD falls
-    // back to the branches the claims recorded.
+    // back to the branches the claims recorded. A head kept only because a
+    // remote has it keeps its branch unless `origin/<branch>` holds it, the
+    // ref a restore rebuilds from.
+    let pushed = removed_reason.starts_with("pushed to ");
     let branches = match &checked_out {
         Some(branch) => vec![branch.as_str()],
         None => recorded_branches(candidate),
     };
     for branch in branches {
-        let tip = Command::new("git")
-            .arg("--git-dir")
-            .arg(common_dir)
-            .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("refs/heads/{branch}"))
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        if pushed
+            && git_in(
+                &common_dir,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &head,
+                    &format!("refs/remotes/origin/{branch}"),
+                ],
+            )
+            .is_err()
+        {
+            continue;
+        }
+        let tip = git_in(
+            &common_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .ok();
         if tip.as_deref() == Some(head.as_str()) {
-            let _ = Command::new("git")
-                .arg("--git-dir")
-                .arg(common_dir)
-                .args(["branch", "-D", branch])
-                .output();
+            let _ = git_in(&common_dir, &["branch", "-D", branch]);
         }
     }
     Ok(Decision::Removed {
         reason: removed_reason,
         branch: checked_out,
-        git_common_dir: common_dir.clone(),
+        git_common_dir: common_dir,
     })
 }
 
-/// Condition 5: HEAD is the frozen head of a merged PR one of the
-/// candidate's sessions claimed in its repo, or a managed worktree's base
-/// (nothing was ever committed). The removal reason, or `None`.
-fn safe_head(conn: &Connection, candidate: &Candidate, head: &str) -> Result<Option<String>> {
-    let repos = candidate
-        .sources
-        .iter()
-        .map(|source| source.repo.as_str())
-        .collect::<BTreeSet<_>>();
-    for session in &candidate.sessions {
-        let claims = query_claims(
-            conn,
-            "WHERE session_id = ?1 AND kind = 'pr' AND reserved_at IS NULL ORDER BY claimed_at",
-            params![session],
-        )?;
-        for claim in claims.iter().filter(|c| repos.contains(c.repo.as_str())) {
-            let Some(item) = get_item(conn, &claim.repo, claim.number)? else {
-                continue;
-            };
-            if item.state == "merged" && item.head_sha.as_deref() == Some(head) {
-                return Ok(Some(format!("PR #{} merged", claim.number)));
-            }
-        }
+/// `git --git-dir <common_dir> args`: trimmed stdout, or the first stderr
+/// line without `fatal: `.
+fn git_in(common_dir: &str, args: &[&str]) -> std::result::Result<String, String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(common_dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("git failed");
+    Err(line.strip_prefix("fatal: ").unwrap_or(line).to_owned())
+}
+
+/// `n thing` / `n things`.
+fn count(n: usize, thing: &str) -> String {
+    format!("{n} {thing}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Condition 5: HEAD is a managed worktree's base (nothing was ever
+/// committed), the head of any merged PR sm knows in the repo (a squash
+/// merge whose branch is deleted), or reachable from a remote-tracking ref
+/// after a fetch (`fetched` is `None` when the repository is unconfirmed,
+/// which skips that). `Ok` is the removal reason, `Err` why it is kept.
+fn safe_head(
+    conn: &Connection,
+    candidate: &Candidate,
+    head: &str,
+    common_dir: &str,
+    fetched: Option<&mut BTreeMap<String, Result<(), String>>>,
+) -> Result<std::result::Result<String, String>> {
     if candidate
         .sources
         .iter()
         .any(|source| source.managed_base.as_deref() == Some(head))
     {
-        return Ok(Some("no commits".to_owned()));
+        return Ok(Ok("no commits".to_owned()));
     }
-    Ok(None)
+    let repos = candidate
+        .sources
+        .iter()
+        .map(|source| source.repo.as_str())
+        .collect::<BTreeSet<_>>();
+    for repo in repos {
+        let merged = conn
+            .query_row(
+                "SELECT number FROM work_items
+                  WHERE repo = ?1 AND kind = 'pr' AND state = 'merged' AND head_sha = ?2
+                  ORDER BY number LIMIT 1",
+                params![repo, head],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(number) = merged {
+            return Ok(Ok(format!("PR #{number} merged")));
+        }
+    }
+    let Some(fetched) = fetched else {
+        return Ok(Err("not in a merged PR, and no GitHub remote".to_owned()));
+    };
+    let fetch = fetched
+        .entry(common_dir.to_owned())
+        .or_insert_with(|| git_in(common_dir, &["fetch", "--all", "--prune", "--quiet"]).map(drop));
+    if let Err(error) = fetch {
+        return Ok(Err(format!("fetch failed: {error}")));
+    }
+    if let Some(remote) = remote_ref_containing(common_dir, head) {
+        return Ok(Ok(format!("pushed to {remote}")));
+    }
+    let local = git_in(
+        common_dir,
+        &["rev-list", "--count", head, "--not", "--remotes"],
+    )
+    .ok()
+    .and_then(|n| n.parse::<usize>().ok())
+    .unwrap_or_default();
+    Ok(Err(format!(
+        "{} only on this Mac",
+        count(local.max(1), "commit")
+    )))
+}
+
+/// A remote-tracking branch whose history holds `head`, preferring a named
+/// branch over `origin/HEAD`.
+fn remote_ref_containing(common_dir: &str, head: &str) -> Option<String> {
+    let refs = git_in(
+        common_dir,
+        &[
+            "for-each-ref",
+            "--contains",
+            head,
+            "--format=%(refname:short)",
+            "refs/remotes",
+        ],
+    )
+    .ok()?;
+    let refs = refs
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    refs.iter()
+        .find(|name| !name.ends_with("/HEAD") && name.contains('/'))
+        .or(refs.first())
+        .map(|name| (*name).to_owned())
+}
+
+/// PRs a keep's reason names: `PR #12`, `PR 12`, `pr#12`, or a `/pull/12`
+/// link, with the repo when a full GitHub link gives one.
+pub(crate) fn keep_prs(reason: &str) -> Vec<(Option<String>, i64)> {
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|/pull/(\d+)|\bPR\s*#?\s*(\d+)",
+        )
+        .expect("valid pattern")
+    });
+    let mut prs = pattern
+        .captures_iter(reason)
+        .filter_map(|caps| {
+            let repo = caps.get(1).map(|repo| super::canonical_repo(repo.as_str()));
+            let number = caps.get(2).or(caps.get(3)).or(caps.get(4))?;
+            Some((repo, number.as_str().parse().ok()?))
+        })
+        .collect::<Vec<_>>();
+    prs.sort();
+    prs.dedup();
+    prs
+}
+
+/// A keep whose reason names PRs ends once every one of them has merged or
+/// closed in one of the candidate's repos (sm#1987): the reason it was kept
+/// is over. Deletes the keep and records `worktree.keep_expired`.
+fn expire_keep(conn: &Connection, candidate: &Candidate, reason: &str) -> Result<bool> {
+    let prs = keep_prs(reason);
+    if prs.is_empty() {
+        return Ok(false);
+    }
+    let repos = candidate
+        .sources
+        .iter()
+        .map(|source| source.repo.clone())
+        .collect::<BTreeSet<_>>();
+    for (linked, number) in &prs {
+        // A full link names its repo; a bare number is the candidate's.
+        let mut done = false;
+        let check = match linked {
+            Some(repo) => vec![repo],
+            None => repos.iter().collect(),
+        };
+        for repo in check {
+            if let Some(item) = get_item(conn, repo, *number)? {
+                done |= matches!(item.state.as_str(), "merged" | "closed");
+            }
+        }
+        if !done {
+            return Ok(false);
+        }
+    }
+    let numbers = prs.iter().map(|(_, number)| *number).collect::<Vec<_>>();
+    conn.execute(
+        "DELETE FROM worktree_keeps WHERE path = ?1",
+        params![candidate.path],
+    )?;
+    let source = event_source(candidate);
+    let (ticket, pr) = item_keys(conn, &source.repo, source.kind, source.number)?;
+    write_event(
+        conn,
+        KEEP_EXPIRED,
+        Some(&source.session_id),
+        Some(&source.repo),
+        ticket,
+        pr,
+        json!({"path": candidate.path, "reason": reason, "prs": numbers}),
+        &now_rfc3339(),
+    )?;
+    Ok(true)
+}
+
+/// Ignored build-output directories under `path` (see `BUILD_DIRS`).
+fn build_dirs(path: &Path) -> Vec<PathBuf> {
+    let Some(listing) = git(
+        path,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    listing
+        .lines()
+        .filter_map(|line| line.strip_suffix('/'))
+        .filter(|dir| {
+            Path::new(dir)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| BUILD_DIRS.contains(&name))
+        })
+        .map(|dir| path.join(dir))
+        .collect()
+}
+
+/// Deletes the ignored build output under `path`; the directories removed.
+fn clear_build_output(path: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let dirs = build_dirs(path);
+    for dir in &dirs {
+        fs::remove_dir_all(dir).map_err(|error| format!("deleting {}: {error}", dir.display()))?;
+    }
+    Ok(dirs)
+}
+
+/// Build output first, then `git worktree remove` (`--force` drops
+/// uncommitted changes too). A folder git no longer knows as a worktree is
+/// an error, never silently deleted here.
+fn remove_worktree(path: &Path, common_dir: &str, force: bool) -> std::result::Result<(), String> {
+    clear_build_output(path)?;
+    let target = path.display().to_string();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&target);
+    git_in(common_dir, &args).map(drop)
 }
 
 /// The branch recorded for the path: a managed claim's first, else any.
@@ -835,6 +1225,7 @@ fn record(
             (LEFT, reason, false, payload)
         }
     };
+    let retryable = payload["retryable"].as_bool() == Some(true);
     let history = events.get(&candidate.path);
     let skip = match kind {
         // A path already removed after the retire: nothing more to say.
@@ -843,10 +1234,13 @@ fn record(
                 .iter()
                 .any(|event| event.kind == REMOVED && after_retire(event, candidate))
         }),
-        // A retry writes only when the reason changes.
+        // A retry or recheck writes only when the reason changes.
         LEFT => history
             .and_then(|events| events.last())
-            .is_some_and(|last| last.kind == LEFT && last.reason == reason && last.retryable),
+            .filter(|last| after_retire(last, candidate))
+            .is_some_and(|last| {
+                last.kind == LEFT && last.reason == reason && last.retryable == retryable
+            }),
         _ => false,
     };
     if !skip {
@@ -866,6 +1260,292 @@ fn record(
         removed,
         reason,
     })
+}
+
+/// A worktree of a retired agent that sm has not deleted, as the leftover
+/// worktrees page lists it (sm#1987).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Leftover {
+    pub path: String,
+    pub repo: String,
+    pub ticket: Option<i64>,
+    pub pr: Option<i64>,
+    /// The retired sessions that worked in it, by name.
+    pub sessions: Vec<String>,
+    /// Why sm keeps it: the latest check's reason, or `not checked yet`.
+    pub reason: String,
+    /// The keep's reason, when one holds it.
+    pub kept: Option<String>,
+    pub retired_at: Option<String>,
+    /// When the reason was recorded.
+    pub checked_at: Option<String>,
+}
+
+/// Every candidate still pending whose folder exists.
+pub fn leftover_worktrees(
+    store: &WorkClaimStore,
+    sessions: &[CleanupSession],
+) -> Result<Vec<Leftover>> {
+    let Some(conn) = store.open_existing()? else {
+        return Ok(Vec::new());
+    };
+    let request = CleanupRequest {
+        sessions,
+        ..CleanupRequest::default()
+    };
+    let retired = retired_sessions(&conn, &request)?;
+    let events = path_events(&conn)?;
+    let keeps = load_keeps(&conn)?;
+    let names = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let format = |at: Option<OffsetDateTime>| at.and_then(|at| at.format(&Rfc3339).ok());
+    let mut leftovers = Vec::new();
+    for candidate in gather(&conn, &request, &retired)?.into_values() {
+        if !is_pending(&candidate, &events) || !Path::new(&candidate.path).exists() {
+            continue;
+        }
+        let source = event_source(&candidate);
+        let (ticket, pr) = item_keys(&conn, &source.repo, source.kind, source.number)?;
+        let latest = latest_after_retire(&candidate, &events);
+        let kept = keeps.get(&candidate.path).cloned();
+        leftovers.push(Leftover {
+            path: candidate.path.clone(),
+            repo: source.repo.clone(),
+            ticket,
+            pr,
+            sessions: candidate
+                .sessions
+                .iter()
+                .map(|id| names.get(id.as_str()).copied().unwrap_or(id).to_owned())
+                .collect(),
+            reason: match (&kept, latest) {
+                (Some(reason), _) => format!("kept: {reason}"),
+                (None, Some(event)) => event.reason.clone(),
+                (None, None) => "not checked yet".to_owned(),
+            },
+            kept,
+            retired_at: format(candidate.retired_at),
+            checked_at: format(latest.and_then(|event| event.at)),
+        });
+    }
+    Ok(leftovers)
+}
+
+/// What a leftover's owner action deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteScope {
+    /// Only ignored build output (`BUILD_DIRS`): always safe.
+    BuildOutput,
+    /// The whole worktree, uncommitted changes and all. Its branch stays, so
+    /// commits on it are not lost.
+    Worktree,
+}
+
+/// What a delete did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteOutcome {
+    pub path: String,
+    pub removed: bool,
+    /// Build-output directories deleted.
+    pub cleared: Vec<String>,
+    /// The branch made to keep a detached HEAD's commits.
+    pub rescued: Option<String>,
+}
+
+/// The leftover page's Delete and Delete build output (sm#1987). Only a
+/// path `leftover_worktrees` lists, and never while a live session or
+/// process is inside. `Ok(Err)` is why it was refused.
+pub fn delete_leftover(
+    store: &WorkClaimStore,
+    sessions: &[CleanupSession],
+    path: &str,
+    scope: DeleteScope,
+    actor: &str,
+) -> Result<std::result::Result<DeleteOutcome, String>> {
+    let _guard = cleanup_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(conn) = store.open_existing()? else {
+        return Ok(Err("no worktree records".to_owned()));
+    };
+    let key = path_key(path);
+    let request = CleanupRequest {
+        sessions,
+        ..CleanupRequest::default()
+    };
+    let retired = retired_sessions(&conn, &request)?;
+    let events = path_events(&conn)?;
+    let Some(candidate) = gather(&conn, &request, &retired)?
+        .remove(&key)
+        .filter(|candidate| is_pending(candidate, &events) && Path::new(&key).exists())
+    else {
+        return Ok(Err(format!("{key} is not a left-over worktree")));
+    };
+    let mut processes = None;
+    if let Some(reason) = in_use(&conn, &candidate, &request, &retired, &mut processes, false)? {
+        return Ok(Err(reason));
+    }
+    let dir = Path::new(&key);
+    let linked = linked_worktree(dir, &key);
+    if linked.is_ok() && made_after_retire(dir, &candidate) {
+        return Ok(Err(format!("refused: {NEWER_WORKTREE}")));
+    }
+    let cleared = |dirs: Vec<PathBuf>| {
+        dirs.iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+    };
+    if scope == DeleteScope::BuildOutput {
+        let result = match &linked {
+            Ok(common_dir) if is_candidates_repo(common_dir, &candidate) == Some(false) => {
+                Err(format!("refused: {OTHER_REPO}"))
+            }
+            Ok(_) => clear_build_output(dir),
+            // A folder git no longer knows: its build output by name.
+            Err(NOT_A_WORKTREE) => clear_named_build_dirs(dir),
+            Err(reason) => Err(format!("refused: {reason}")),
+        };
+        return Ok(result.map(|dirs| DeleteOutcome {
+            path: key.clone(),
+            removed: false,
+            cleared: cleared(dirs),
+            rescued: None,
+        }));
+    }
+    let branch = git(dir, &["branch", "--show-current"]).filter(|b| !b.is_empty());
+    let mut rescued = None;
+    let (dirs, common_dir) = match &linked {
+        Ok(common_dir) if is_candidates_repo(common_dir, &candidate) == Some(false) => {
+            return Ok(Err(format!("refused: {OTHER_REPO}")));
+        }
+        Ok(common_dir) => {
+            let dirs = build_dirs(dir);
+            match rescue_head(dir, common_dir) {
+                Ok(branch) => rescued = branch,
+                Err(error) => return Ok(Err(format!("could not keep its commits: {error}"))),
+            }
+            if let Err(error) = remove_worktree(dir, common_dir, true) {
+                return Ok(Err(format!("git refused: {error}")));
+            }
+            (dirs, Some(common_dir.clone()))
+        }
+        Err(NOT_A_WORKTREE) => {
+            if let Err(error) = fs::remove_dir_all(dir) {
+                return Ok(Err(format!("deleting {key}: {error}")));
+            }
+            (Vec::new(), None)
+        }
+        Err(reason) => return Ok(Err(format!("refused: {reason}"))),
+    };
+    conn.execute("DELETE FROM worktree_keeps WHERE path = ?1", params![key])?;
+    let source = event_source(&candidate);
+    let (ticket, pr) = item_keys(&conn, &source.repo, source.kind, source.number)?;
+    let mut payload = json!({"path": key, "branch": branch.as_deref().or(candidate_branch(&candidate)),
+        "reason": format!("deleted by {actor}")});
+    if let Some(common_dir) = common_dir {
+        payload["git_common_dir"] = json!(common_dir);
+    }
+    write_event(
+        &conn,
+        REMOVED,
+        Some(&source.session_id),
+        Some(&source.repo),
+        ticket,
+        pr,
+        payload,
+        &now_rfc3339(),
+    )?;
+    Ok(Ok(DeleteOutcome {
+        path: key,
+        removed: true,
+        cleared: cleared(dirs),
+        rescued,
+    }))
+}
+
+/// A HEAD no local or remote branch holds (a detached worktree's own
+/// commits) gets branch `sm-rescue/<folder>` before a forced delete, so its
+/// commits survive. The branch made, if one was needed.
+fn rescue_head(dir: &Path, common_dir: &str) -> std::result::Result<Option<String>, String> {
+    let Some(head) = git(dir, &["rev-parse", "HEAD"]) else {
+        return Ok(None);
+    };
+    let holders = git_in(
+        common_dir,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            &head,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    if !holders.is_empty() {
+        return Ok(None);
+    }
+    let folder = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worktree".to_owned());
+    let mut branch = format!("sm-rescue/{folder}");
+    let taken = format!("refs/heads/{branch}");
+    if git_in(common_dir, &["rev-parse", "--verify", "--quiet", &taken]).is_ok() {
+        branch = format!("{branch}-{}", &head[..head.len().min(7)]);
+    }
+    git_in(common_dir, &["branch", &branch, &head])?;
+    Ok(Some(branch))
+}
+
+/// `BUILD_DIRS` children of a folder that is not a git worktree.
+fn clear_named_build_dirs(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let dirs = BUILD_DIRS
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    for path in &dirs {
+        fs::remove_dir_all(path)
+            .map_err(|error| format!("deleting {}: {error}", path.display()))?;
+    }
+    Ok(dirs)
+}
+
+/// Build-output directories under a leftover, for sizing: by git's ignore
+/// rules in a worktree, by name in a folder git no longer knows.
+pub fn leftover_build_dirs(path: &str) -> Vec<PathBuf> {
+    let dir = Path::new(path);
+    match linked_worktree(dir, &path_key(path)) {
+        Ok(_) => build_dirs(dir),
+        Err(_) => BUILD_DIRS
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.is_dir())
+            .collect(),
+    }
+}
+
+/// `(repo, PR)` for every keep whose reason names a PR, the repo read from
+/// the kept checkout's origin: what to refresh before a pass so a merged
+/// PR expires its keep.
+pub fn keep_pr_refs(store: &WorkClaimStore) -> Result<Vec<(String, i64)>> {
+    let mut refs = Vec::new();
+    for (path, reason) in store.worktree_keeps()? {
+        let prs = keep_prs(&reason);
+        let origin = (prs.iter().any(|(repo, _)| repo.is_none()))
+            .then(|| crate::work_attribution::git_origin_github_repo(&path))
+            .flatten()
+            .map(|repo| super::canonical_repo(&repo));
+        refs.extend(
+            prs.into_iter()
+                .filter_map(|(repo, number)| Some((repo.or_else(|| origin.clone())?, number))),
+        );
+    }
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
 }
 
 /// What a restore did about the session's working directory (sm#1839,

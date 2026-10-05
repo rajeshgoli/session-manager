@@ -47,6 +47,7 @@ const ASSETS: &[Asset] = &[
     asset!("settings.js", JS),
     asset!("handoff.js", JS),
     asset!("devices.js", JS),
+    asset!("worktrees.js", JS),
     asset!("devices.css", "text/css; charset=utf-8"),
     asset!("terminal.js", JS),
     asset!("terminal-route.js", JS),

@@ -378,3 +378,41 @@ fn keep_and_retire_output() {
     );
     assert!(retire_worktree_lines(&json!({"status": "retired"})).is_empty());
 }
+
+#[test]
+fn list_and_delete_output() {
+    let body = json!({"worktrees": [
+        {"path": "/nowhere/wt-1748", "repo": "acme/widgets", "ticket": 1748, "pr": null,
+         "bytes": 21_474_836_480u64, "build_bytes": 20_401_094_656u64,
+         "reason": "2 commits only on this Mac"},
+        {"path": "/nowhere/wt-pr", "repo": "acme/widgets", "ticket": null, "pr": 12,
+         "bytes": 4096, "build_bytes": 0, "reason": "not a git worktree"}
+    ]});
+    assert_eq!(
+        list_output(200, &body).stdout,
+        vec![
+            "/nowhere/wt-1748  acme/widgets#1748  20 GB (19 GB build output)  2 commits only on this Mac",
+            "/nowhere/wt-pr  acme/widgets PR #12  4 KB  not a git worktree",
+        ]
+    );
+    assert_eq!(
+        list_output(200, &json!({"worktrees": []})).stdout,
+        vec!["No left-over worktrees."]
+    );
+    assert_eq!(
+        delete_output(
+            200,
+            &json!({"path": "/nowhere/wt", "removed": true, "cleared": []})
+        )
+        .stdout,
+        vec!["Deleted /nowhere/wt."]
+    );
+    assert_eq!(
+        delete_output(
+            200,
+            &json!({"path": "/nowhere/wt", "removed": false, "cleared": ["/nowhere/wt/target"]})
+        )
+        .stdout,
+        vec!["Deleted 1 build-output folder in /nowhere/wt."]
+    );
+}
