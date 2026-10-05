@@ -21,6 +21,7 @@ pub mod handoff;
 pub mod handover;
 pub mod http;
 pub mod local_model;
+pub mod local_sockets;
 pub mod mobile_devices;
 pub mod notes;
 pub mod owner_doc_render;
