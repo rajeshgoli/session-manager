@@ -62,13 +62,30 @@ const INSIDE_CHECKOUT: &str = "inside another checkout";
 const NOT_A_WORKTREE: &str = "not a git worktree";
 /// The path now holds a checkout of a repository the claims never named.
 const OTHER_REPO: &str = "another repository's checkout";
+/// The path now holds a worktree made after the agent retired.
+const NEWER_WORKTREE: &str = "a newer worktree at this path";
+/// How much later than the retire a worktree must be made to count as a
+/// newer one: retire times are recorded to the second.
+const REUSE_SLACK: Duration = Duration::from_secs(60);
 
 /// Reasons that settle a candidate for good.
 fn settles(reason: &str) -> bool {
     matches!(
         reason,
-        ABSENT | MAIN_CHECKOUT | INSIDE_CHECKOUT | OTHER_REPO
+        ABSENT | MAIN_CHECKOUT | INSIDE_CHECKOUT | OTHER_REPO | NEWER_WORKTREE
     )
+}
+
+/// Whether the worktree at `path` was made after the candidate's sessions
+/// retired, judged by when git made its admin directory: the path was
+/// reused, so it is not the retired agent's worktree.
+fn made_after_retire(path: &Path, candidate: &Candidate) -> bool {
+    let Some(retired) = candidate.retired_at else {
+        return false;
+    };
+    git(path, &["rev-parse", "--path-format=absolute", "--git-dir"])
+        .and_then(|git_dir| fs::metadata(git_dir).ok()?.created().ok())
+        .is_some_and(|made| OffsetDateTime::from(made) > retired + REUSE_SLACK)
 }
 
 /// Whether a GitHub remote of the repository at `common_dir` is one of the
@@ -800,6 +817,9 @@ fn decide(
         Ok(common_dir) => common_dir,
         Err(reason) => return final_left(reason.to_owned()),
     };
+    if made_after_retire(path, candidate) {
+        return final_left(NEWER_WORKTREE.to_owned());
+    }
     // Without a GitHub remote to confirm the repository, only the checks
     // tied to commit identity (a merged PR's head, the managed base) apply.
     let verified = match is_candidates_repo(&common_dir, candidate) {
@@ -1330,6 +1350,8 @@ pub struct DeleteOutcome {
     pub removed: bool,
     /// Build-output directories deleted.
     pub cleared: Vec<String>,
+    /// The branch made to keep a detached HEAD's commits.
+    pub rescued: Option<String>,
 }
 
 /// The leftover page's Delete and Delete build output (sm#1987). Only a
@@ -1367,6 +1389,9 @@ pub fn delete_leftover(
     }
     let dir = Path::new(&key);
     let linked = linked_worktree(dir, &key);
+    if linked.is_ok() && made_after_retire(dir, &candidate) {
+        return Ok(Err(format!("refused: {NEWER_WORKTREE}")));
+    }
     let cleared = |dirs: Vec<PathBuf>| {
         dirs.iter()
             .map(|dir| dir.display().to_string())
@@ -1386,15 +1411,21 @@ pub fn delete_leftover(
             path: key.clone(),
             removed: false,
             cleared: cleared(dirs),
+            rescued: None,
         }));
     }
     let branch = git(dir, &["branch", "--show-current"]).filter(|b| !b.is_empty());
+    let mut rescued = None;
     let (dirs, common_dir) = match &linked {
         Ok(common_dir) if is_candidates_repo(common_dir, &candidate) == Some(false) => {
             return Ok(Err(format!("refused: {OTHER_REPO}")));
         }
         Ok(common_dir) => {
             let dirs = build_dirs(dir);
+            match rescue_head(dir, common_dir) {
+                Ok(branch) => rescued = branch,
+                Err(error) => return Ok(Err(format!("could not keep its commits: {error}"))),
+            }
             if let Err(error) = remove_worktree(dir, common_dir, true) {
                 return Ok(Err(format!("git refused: {error}")));
             }
@@ -1430,7 +1461,42 @@ pub fn delete_leftover(
         path: key,
         removed: true,
         cleared: cleared(dirs),
+        rescued,
     }))
+}
+
+/// A HEAD no local or remote branch holds (a detached worktree's own
+/// commits) gets branch `sm-rescue/<folder>` before a forced delete, so its
+/// commits survive. The branch made, if one was needed.
+fn rescue_head(dir: &Path, common_dir: &str) -> std::result::Result<Option<String>, String> {
+    let Some(head) = git(dir, &["rev-parse", "HEAD"]) else {
+        return Ok(None);
+    };
+    let holders = git_in(
+        common_dir,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            &head,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    if !holders.is_empty() {
+        return Ok(None);
+    }
+    let folder = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worktree".to_owned());
+    let mut branch = format!("sm-rescue/{folder}");
+    let taken = format!("refs/heads/{branch}");
+    if git_in(common_dir, &["rev-parse", "--verify", "--quiet", &taken]).is_ok() {
+        branch = format!("{branch}-{}", &head[..head.len().min(7)]);
+    }
+    git_in(common_dir, &["branch", &branch, &head])?;
+    Ok(Some(branch))
 }
 
 /// `BUILD_DIRS` children of a folder that is not a git worktree.

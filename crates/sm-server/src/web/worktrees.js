@@ -29,12 +29,12 @@ function Row({ row, act }) {
   return html`<li>
     <div class="device-description"><strong>${homeRelative(row.path)}</strong>
       <span>${row.repo}${item ? ` ${item}` : ''} · ${size(row.bytes)}${build}${row.retired_at ? ` · retired ${since(row.retired_at)} ago` : ''}</span>
-      <span>${row.reason}${row.sessions && row.sessions.length ? ` · ${row.sessions.join(', ')}` : ''}</span>
+      <span>${row.reason}${(row.sessions || []).length ? ` · ${row.sessions.join(', ')}` : ''}</span>
     </div>
     <div class="worktree-actions">
       ${row.build_bytes ? html`<button type="button" class="btn sm" onClick=${() => act(row, 'build')}>Delete build output</button>` : null}
       <${ConfirmButton} label="Delete" className="btn sm danger" confirmLabel="Delete"
-        prompt=${`Delete ${homeRelative(row.path)}? ${row.reason}. Its branch stays.`} onConfirm=${() => act(row, 'worktree')} />
+        prompt=${`Delete ${homeRelative(row.path)}? ${row.reason}.`} onConfirm=${() => act(row, 'worktree')} />
       ${row.kept ? html`<button type="button" class="btn sm" onClick=${() => act(row, 'unkeep')}>Stop keeping</button>`
         : keeping ? html`<form class="worktree-keep" onSubmit=${(event) => { event.preventDefault(); if (reason.trim()) act(row, 'keep', reason.trim()); }}>
             <input type="text" placeholder="Why keep it" value=${reason} onInput=${(event) => setReason(event.target.value)} />
@@ -50,8 +50,7 @@ export function LeftoverWorktrees() {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const act = async (row, action, reason) => {
-    setBusy(true);
-    setError(null);
+    setBusy(true); setError(null);
     const name = homeRelative(row.path);
     try {
       if (action === 'keep' || action === 'unkeep') {
@@ -59,7 +58,7 @@ export function LeftoverWorktrees() {
         toast(action === 'keep' ? `Keeping ${name}` : `No longer keeping ${name}`);
       } else {
         const done = await api('/worktrees/delete', { method: 'POST', body: { path: row.path, scope: action } });
-        toast(done.removed ? `Deleted ${name}` : `Deleted build output in ${name}`);
+        toast(done.removed ? `Deleted ${name}${done.rescued ? `; commits on ${done.rescued}` : ''}` : `Deleted build output in ${name}`);
       }
     } catch (failure) {
       setError(`${name}: ${failure.message}`);
@@ -73,10 +72,10 @@ export function LeftoverWorktrees() {
   const build = rows.reduce((sum, row) => sum + (row.build_bytes || 0), 0);
   return html`<section class="device-settings" aria-label="Left-over worktrees" aria-busy=${busy}>
     <link rel="stylesheet" href=${`/assets/devices.css?v=${config.build_id}`} />
-    <p class="sub">Retired agents' worktrees sm left. sm deletes one itself once nothing in it would be lost, checking hourly.
-      Delete build output is always safe; Delete drops the folder and uncommitted changes, keeping the branch.</p>
+    <p class="sub">Retired agents' worktrees sm left. sm deletes one once nothing in it would be lost, checking hourly.
+      Delete build output is always safe; Delete drops the folder and uncommitted changes, not commits.</p>
     ${error ? html`<p class="device-error" role="alert">${error}</p>` : null}
-    ${loadError ? html`<p class="device-error" role="alert">Could not load worktrees: ${loadError.message}
+    ${loadError ? html`<p class="device-error" role="alert">Could not load: ${loadError.message}
       <button type="button" class="btn sm" onClick=${reload}>Retry</button></p>` : null}
     ${!data && !loadError ? html`<p role="status">Measuring…</p>` : null}
     ${data && !rows.length ? html`<p class="sub">None.</p>` : null}

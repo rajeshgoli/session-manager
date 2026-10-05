@@ -5,7 +5,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const REPO: &str = "acme/widgets";
-const RETIRED_AT: &str = "2026-01-01T00:00:00Z";
+/// Retires happen after the fixture's worktrees are made.
+fn retired_at() -> String {
+    now_rfc3339()
+}
 
 fn temp_dir() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -97,7 +100,7 @@ impl Repo {
                 "INSERT INTO work_items (repo, number, kind, title, state, url, head_ref, head_sha,
                                          synced_at)
                  VALUES (?1, ?2, 'pr', 'PR', 'merged', '', ?3, ?4, ?5)",
-                params![REPO, number, head_ref, head_sha, RETIRED_AT],
+                params![REPO, number, head_ref, head_sha, retired_at()],
             )
             .unwrap();
     }
@@ -127,7 +130,7 @@ impl Repo {
                     session,
                     path,
                     branch,
-                    RETIRED_AT,
+                    retired_at(),
                     managed_base.is_some() as i64,
                     managed_base
                 ],
@@ -198,7 +201,7 @@ fn session(id: &str, working_dir: &str, retired: bool) -> CleanupSession {
         working_dir: working_dir.to_owned(),
         retired,
         stopped: retired,
-        retired_at: retired.then(|| RETIRED_AT.to_owned()),
+        retired_at: retired.then(retired_at),
         local: true,
     }
 }
@@ -424,7 +427,7 @@ fn kept_while_another_session_works_inside_even_a_stopped_one() {
     );
     // Retired too: deleted on the next pass.
     sessions[1].retired = true;
-    sessions[1].retired_at = Some(RETIRED_AT.to_owned());
+    sessions[1].retired_at = Some(retired_at());
     assert_eq!(
         repo.pass(&sessions),
         vec![outcome(&path, true, "no commits")]
@@ -475,16 +478,13 @@ fn a_main_checkout_is_never_deleted() {
         Some("main"),
         Some(&head),
     );
+    let sessions = [session("eng1", &main, true)];
     assert_eq!(
-        repo.pass(&[session("eng1", &main, true)]),
+        repo.pass(&sessions),
         vec![outcome(&main, false, "a main checkout")]
     );
     assert!(repo.main.join(".git").exists());
-    assert_eq!(
-        repo.recheck(&[session("eng1", &main, true)]),
-        vec![],
-        "settled"
-    );
+    assert_eq!(repo.recheck(&sessions), vec![], "settled");
 }
 
 #[test]
@@ -1079,7 +1079,7 @@ fn an_old_final_record_is_checked_again() {
         Some(1705),
         None,
         json!({"path": path, "reason": "commits not in a merged PR"}),
-        "2026-01-02T00:00:00Z",
+        &now_rfc3339(),
     )
     .unwrap();
     assert_eq!(
@@ -1403,4 +1403,70 @@ fn restore_uses_the_branch_the_agent_renamed_to_and_refuses_when_origin_is_unrea
         run_git(Path::new(&path), &["branch", "--show-current"]),
         "11-fix-v2"
     );
+}
+
+/// A worktree made at the path after the agent retired is someone else's.
+#[test]
+fn a_worktree_made_after_the_retire_is_never_deleted() {
+    let repo = Repo::new();
+    let path = repo.dir.join("wt").display().to_string();
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        None,
+    );
+    let long_ago = "2026-01-01T00:00:00Z";
+    repo.conn()
+        .execute("UPDATE work_claims SET ended_at = ?1", params![long_ago])
+        .unwrap();
+    let (path, head) = repo.worktree("wt", "6-other");
+    repo.merged_pr(6, "6-other", &head);
+    let mut sessions = [session("eng1", "/elsewhere", true)];
+    sessions[0].retired_at = Some(long_ago.to_owned());
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "a newer worktree at this path")]
+    );
+    assert!(Path::new(&path).exists());
+    assert_eq!(repo.recheck(&sessions), vec![], "settled");
+}
+
+/// Delete on a detached HEAD with commits no branch holds keeps them on a
+/// rescue branch.
+#[test]
+fn deleting_a_detached_worktree_keeps_its_commits_on_a_rescue_branch() {
+    let repo = Repo::new();
+    let (path, _) = repo.worktree("wt", "5-feature");
+    let dir = Path::new(&path);
+    run_git(dir, &["checkout", "-q", "--detach"]);
+    fs::write(dir.join("a.txt"), "a").unwrap();
+    run_git(dir, &["add", "a.txt"]);
+    run_git(dir, &["commit", "-q", "-m", "a"]);
+    let head = run_git(dir, &["rev-parse", "HEAD"]);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        None,
+    );
+    let sessions = [session("eng1", "/elsewhere", true)];
+    repo.pass(&sessions);
+    let deleted = delete_leftover(
+        &repo.store,
+        &sessions,
+        &path,
+        DeleteScope::Worktree,
+        "owner",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(deleted.rescued.as_deref(), Some("sm-rescue/wt"));
+    assert_eq!(run_git(&repo.main, &["rev-parse", "sm-rescue/wt"]), head);
 }

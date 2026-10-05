@@ -161,7 +161,10 @@ pub(crate) fn delete_output(status: u16, body: &Value) -> Printed {
     let path = home_relative(body["path"].as_str().unwrap_or_default());
     let cleared = body["cleared"].as_array().map_or(0, Vec::len);
     let line = if body["removed"].as_bool() == Some(true) {
-        format!("Deleted {path}.")
+        match body["rescued"].as_str() {
+            Some(branch) => format!("Deleted {path}; its commits are on branch {branch}."),
+            None => format!("Deleted {path}."),
+        }
     } else if cleared == 0 {
         format!("No build output in {path}.")
     } else {
