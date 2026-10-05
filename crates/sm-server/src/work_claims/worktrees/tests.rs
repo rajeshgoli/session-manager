@@ -49,6 +49,17 @@ impl Repo {
         run_git(&main, &["init", "-q", "-b", "main"]);
         run_git(&main, &["config", "user.email", "t@example.com"]);
         run_git(&main, &["config", "user.name", "t"]);
+        // Names the claims' repo; never fetched.
+        run_git(
+            &main,
+            &[
+                "remote",
+                "add",
+                "github",
+                &format!("https://github.com/{REPO}.git"),
+            ],
+        );
+        run_git(&main, &["config", "remote.github.skipFetchAll", "true"]);
         fs::write(main.join(".gitignore"), "target/\n").unwrap();
         run_git(&main, &["add", "."]);
         run_git(&main, &["commit", "-q", "-m", "init"]);
@@ -900,13 +911,115 @@ fn a_keep_naming_a_pr_expires_once_it_merges() {
 
 #[test]
 fn keep_reasons_name_prs_by_number_or_link() {
-    assert_eq!(keep_prs("handoff: memo PR #1789 mid-review"), vec![1789]);
-    assert_eq!(keep_prs("pr#12 and PR 13"), vec![12, 13]);
     assert_eq!(
-        keep_prs("see https://github.com/acme/widgets/pull/44"),
-        vec![44]
+        keep_prs("handoff: memo PR #1789 mid-review"),
+        vec![(None, 1789)]
+    );
+    assert_eq!(keep_prs("pr#12 and PR 13"), vec![(None, 12), (None, 13)]);
+    assert_eq!(
+        keep_prs("see https://github.com/Acme/Gadgets/pull/44"),
+        vec![(Some(super::super::canonical_repo("Acme/Gadgets")), 44)]
     );
     assert!(keep_prs("server on :8421 for ticket #12").is_empty());
+}
+
+/// A keep linking another repo's PR waits for that PR, not this repo's PR
+/// with the same number.
+#[test]
+fn a_keep_linking_another_repos_pr_ignores_this_repos_same_number() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "5-feature");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&head),
+    );
+    repo.keep(&path, "waiting on https://github.com/acme/gadgets/pull/44");
+    repo.merged_pr(44, "44-other", "0000000000000000000000000000000000000000");
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(
+            &path,
+            false,
+            "kept: waiting on https://github.com/acme/gadgets/pull/44"
+        )]
+    );
+}
+
+/// A retired agent's path now holding another repository's worktree is not
+/// the agent's to delete.
+#[test]
+fn a_path_reused_by_another_repository_is_never_deleted() {
+    let repo = Repo::new();
+    let other = Repo::new();
+    let path = repo.dir.join("wt").display().to_string();
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        None,
+    );
+    run_git(
+        &other.main,
+        &[
+            "config",
+            "remote.github.url",
+            "https://github.com/acme/gadgets.git",
+        ],
+    );
+    run_git(&other.main, &["worktree", "add", "-q", "-b", "x", &path]);
+    let head = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    repo.conn()
+        .execute(
+            "UPDATE work_claims SET managed_worktree = 1, base_sha = ?1",
+            params![head],
+        )
+        .unwrap();
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "another repository's checkout")]
+    );
+    assert!(Path::new(&path).exists());
+    assert_eq!(repo.recheck(&sessions), vec![], "settled");
+    assert!(leftover_worktrees(&repo.store, &sessions)
+        .unwrap()
+        .is_empty());
+}
+
+/// A head pushed only under another branch name keeps its local branch:
+/// a restore rebuilds from `origin/<branch>` and would miss it.
+#[test]
+fn a_branch_pushed_under_another_name_is_kept() {
+    let repo = Repo::new();
+    repo.origin();
+    let (path, _) = repo.worktree("wt", "5-feature");
+    let dir = Path::new(&path);
+    fs::write(dir.join("a.txt"), "a").unwrap();
+    run_git(dir, &["add", "a.txt"]);
+    run_git(dir, &["commit", "-q", "-m", "a"]);
+    run_git(dir, &["push", "-q", "origin", "HEAD:review-123"]);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        None,
+    );
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(&path, true, "pushed to origin/review-123")]
+    );
+    assert!(repo.branch_exists("5-feature"));
 }
 
 /// sm#1987: a worktree whose removal git refused is checked again, and a

@@ -60,10 +60,38 @@ const ABSENT: &str = "absent";
 const MAIN_CHECKOUT: &str = "a main checkout";
 const INSIDE_CHECKOUT: &str = "inside another checkout";
 const NOT_A_WORKTREE: &str = "not a git worktree";
+/// The path now holds a checkout of a repository the claims never named.
+const OTHER_REPO: &str = "another repository's checkout";
 
 /// Reasons that settle a candidate for good.
 fn settles(reason: &str) -> bool {
-    matches!(reason, ABSENT | MAIN_CHECKOUT | INSIDE_CHECKOUT)
+    matches!(
+        reason,
+        ABSENT | MAIN_CHECKOUT | INSIDE_CHECKOUT | OTHER_REPO
+    )
+}
+
+/// Whether a GitHub remote of the repository at `common_dir` is one of the
+/// candidate's recorded repos: a path reused by another repository's
+/// worktree is never the retired agent's to delete. `None` when it has no
+/// GitHub remote to tell by.
+fn is_candidates_repo(common_dir: &str, candidate: &Candidate) -> Option<bool> {
+    let urls = git_in(
+        common_dir,
+        &["config", "--get-regexp", r"^remote\..*\.url$"],
+    )
+    .unwrap_or_default();
+    let repos = urls
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(crate::work_attribution::github_repo_from_remote_url)
+        .map(|repo| super::canonical_repo(&repo))
+        .collect::<Vec<_>>();
+    (!repos.is_empty()).then(|| {
+        repos
+            .iter()
+            .any(|repo| candidate.sources.iter().any(|source| source.repo == *repo))
+    })
 }
 
 impl WorkClaimStore {
@@ -772,6 +800,13 @@ fn decide(
         Ok(common_dir) => common_dir,
         Err(reason) => return final_left(reason.to_owned()),
     };
+    // Without a GitHub remote to confirm the repository, only the checks
+    // tied to commit identity (a merged PR's head, the managed base) apply.
+    let verified = match is_candidates_repo(&common_dir, candidate) {
+        Some(false) => return final_left(OTHER_REPO.to_owned()),
+        Some(true) => true,
+        None => false,
+    };
     // 2. No keep, unless every PR it names has merged or closed.
     if let Some(reason) = keeps.get(&candidate.path) {
         if !expire_keep(conn, candidate, reason)? {
@@ -801,7 +836,13 @@ fn decide(
         }
         Some(_) => {}
     }
-    let removed_reason = match safe_head(conn, candidate, &head, &common_dir, &mut cache.fetched)? {
+    let removed_reason = match safe_head(
+        conn,
+        candidate,
+        &head,
+        &common_dir,
+        verified.then_some(&mut cache.fetched),
+    )? {
         Ok(reason) => reason,
         Err(reason) => return final_left(reason),
     };
@@ -821,12 +862,29 @@ fn decide(
     }
     // Squash merges never make the branch an ancestor of main: -D, but only
     // when its tip is still the HEAD that was checked. A detached HEAD falls
-    // back to the branches the claims recorded.
+    // back to the branches the claims recorded. A head kept only because a
+    // remote has it keeps its branch unless `origin/<branch>` holds it, the
+    // ref a restore rebuilds from.
+    let pushed = removed_reason.starts_with("pushed to ");
     let branches = match &checked_out {
         Some(branch) => vec![branch.as_str()],
         None => recorded_branches(candidate),
     };
     for branch in branches {
+        if pushed
+            && git_in(
+                &common_dir,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &head,
+                    &format!("refs/remotes/origin/{branch}"),
+                ],
+            )
+            .is_err()
+        {
+            continue;
+        }
         let tip = git_in(
             &common_dir,
             &[
@@ -878,13 +936,14 @@ fn count(n: usize, thing: &str) -> String {
 /// Condition 5: HEAD is a managed worktree's base (nothing was ever
 /// committed), the head of any merged PR sm knows in the repo (a squash
 /// merge whose branch is deleted), or reachable from a remote-tracking ref
-/// after a fetch. `Ok` is the removal reason, `Err` why it is kept.
+/// after a fetch (`fetched` is `None` when the repository is unconfirmed,
+/// which skips that). `Ok` is the removal reason, `Err` why it is kept.
 fn safe_head(
     conn: &Connection,
     candidate: &Candidate,
     head: &str,
     common_dir: &str,
-    fetched: &mut BTreeMap<String, Result<(), String>>,
+    fetched: Option<&mut BTreeMap<String, Result<(), String>>>,
 ) -> Result<std::result::Result<String, String>> {
     if candidate
         .sources
@@ -912,6 +971,9 @@ fn safe_head(
             return Ok(Ok(format!("PR #{number} merged")));
         }
     }
+    let Some(fetched) = fetched else {
+        return Ok(Err("not in a merged PR, and no GitHub remote".to_owned()));
+    };
     let fetch = fetched
         .entry(common_dir.to_owned())
         .or_insert_with(|| git_in(common_dir, &["fetch", "--all", "--prune", "--quiet"]).map(drop));
@@ -958,38 +1020,50 @@ fn remote_ref_containing(common_dir: &str, head: &str) -> Option<String> {
         .map(|name| (*name).to_owned())
 }
 
-/// PR numbers a keep's reason names: `PR #12`, `PR 12`, `pr#12`, or a
-/// `/pull/12` link.
-pub(crate) fn keep_prs(reason: &str) -> Vec<i64> {
+/// PRs a keep's reason names: `PR #12`, `PR 12`, `pr#12`, or a `/pull/12`
+/// link, with the repo when a full GitHub link gives one.
+pub(crate) fn keep_prs(reason: &str) -> Vec<(Option<String>, i64)> {
     static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bPR\s*#?\s*(\d+)|/pull/(\d+)").expect("valid pattern")
+        regex::Regex::new(
+            r"(?i)github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|/pull/(\d+)|\bPR\s*#?\s*(\d+)",
+        )
+        .expect("valid pattern")
     });
-    let mut numbers = pattern
+    let mut prs = pattern
         .captures_iter(reason)
-        .filter_map(|caps| caps.get(1).or(caps.get(2))?.as_str().parse().ok())
-        .collect::<Vec<i64>>();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
+        .filter_map(|caps| {
+            let repo = caps.get(1).map(|repo| super::canonical_repo(repo.as_str()));
+            let number = caps.get(2).or(caps.get(3)).or(caps.get(4))?;
+            Some((repo, number.as_str().parse().ok()?))
+        })
+        .collect::<Vec<_>>();
+    prs.sort();
+    prs.dedup();
+    prs
 }
 
 /// A keep whose reason names PRs ends once every one of them has merged or
 /// closed in one of the candidate's repos (sm#1987): the reason it was kept
 /// is over. Deletes the keep and records `worktree.keep_expired`.
 fn expire_keep(conn: &Connection, candidate: &Candidate, reason: &str) -> Result<bool> {
-    let numbers = keep_prs(reason);
-    if numbers.is_empty() {
+    let prs = keep_prs(reason);
+    if prs.is_empty() {
         return Ok(false);
     }
     let repos = candidate
         .sources
         .iter()
-        .map(|source| source.repo.as_str())
+        .map(|source| source.repo.clone())
         .collect::<BTreeSet<_>>();
-    for number in &numbers {
+    for (linked, number) in &prs {
+        // A full link names its repo; a bare number is the candidate's.
         let mut done = false;
-        for repo in &repos {
+        let check = match linked {
+            Some(repo) => vec![repo],
+            None => repos.iter().collect(),
+        };
+        for repo in check {
             if let Some(item) = get_item(conn, repo, *number)? {
                 done |= matches!(item.state.as_str(), "merged" | "closed");
             }
@@ -998,6 +1072,7 @@ fn expire_keep(conn: &Connection, candidate: &Candidate, reason: &str) -> Result
             return Ok(false);
         }
     }
+    let numbers = prs.iter().map(|(_, number)| *number).collect::<Vec<_>>();
     conn.execute(
         "DELETE FROM worktree_keeps WHERE path = ?1",
         params![candidate.path],
@@ -1299,6 +1374,9 @@ pub fn delete_leftover(
     };
     if scope == DeleteScope::BuildOutput {
         let result = match &linked {
+            Ok(common_dir) if is_candidates_repo(common_dir, &candidate) == Some(false) => {
+                Err(format!("refused: {OTHER_REPO}"))
+            }
             Ok(_) => clear_build_output(dir),
             // A folder git no longer knows: its build output by name.
             Err(NOT_A_WORKTREE) => clear_named_build_dirs(dir),
@@ -1312,6 +1390,9 @@ pub fn delete_leftover(
     }
     let branch = git(dir, &["branch", "--show-current"]).filter(|b| !b.is_empty());
     let (dirs, common_dir) = match &linked {
+        Ok(common_dir) if is_candidates_repo(common_dir, &candidate) == Some(false) => {
+            return Ok(Err(format!("refused: {OTHER_REPO}")));
+        }
         Ok(common_dir) => {
             let dirs = build_dirs(dir);
             if let Err(error) = remove_worktree(dir, common_dir, true) {
@@ -1386,15 +1467,15 @@ pub fn leftover_build_dirs(path: &str) -> Vec<PathBuf> {
 pub fn keep_pr_refs(store: &WorkClaimStore) -> Result<Vec<(String, i64)>> {
     let mut refs = Vec::new();
     for (path, reason) in store.worktree_keeps()? {
-        let numbers = keep_prs(&reason);
-        if numbers.is_empty() {
-            continue;
-        }
-        let Some(repo) = crate::work_attribution::git_origin_github_repo(&path) else {
-            continue;
-        };
-        let repo = super::canonical_repo(&repo);
-        refs.extend(numbers.into_iter().map(|number| (repo.clone(), number)));
+        let prs = keep_prs(&reason);
+        let origin = (prs.iter().any(|(repo, _)| repo.is_none()))
+            .then(|| crate::work_attribution::git_origin_github_repo(&path))
+            .flatten()
+            .map(|repo| super::canonical_repo(&repo));
+        refs.extend(
+            prs.into_iter()
+                .filter_map(|(repo, number)| Some((repo.or_else(|| origin.clone())?, number))),
+        );
     }
     refs.sort();
     refs.dedup();
