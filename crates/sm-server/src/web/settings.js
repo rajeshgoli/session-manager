@@ -5,10 +5,11 @@ import { TITLES_KEY } from './agents.js';
 import { tokens, tokensOf } from './handoff.js';
 import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
+import { LeftoverWorktrees } from './worktrees.js';
 
 const SECTIONS = [
   ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'], ['reviews', 'Reviews'],
-  ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['about', 'About'],
+  ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['worktrees', 'Worktrees'], ['about', 'About'],
 ];
 const SAMPLE = { repo: 'rajeshgoli/session-manager', number: 1706, title: 'Board Start preselects Fable', url: 'https://github.com/rajeshgoli/session-manager/issues/1706' };
 
@@ -135,6 +136,7 @@ export function SettingsPage() {
     <div class="settings-body" key=${selected}>
       ${selected === 'appearance' ? html`<${Appearance} />` : selected === 'context-handoff' ? html`<${Handoff} write=${write} />`
         : selected === 'notifications' ? html`<${Notifications} write=${write} />` : selected === 'devices-access' ? html`<${Devices} write=${write} />`
+        : selected === 'worktrees' ? html`<h2>Worktrees</h2><${LeftoverWorktrees} />`
         : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'reviews'
           ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`

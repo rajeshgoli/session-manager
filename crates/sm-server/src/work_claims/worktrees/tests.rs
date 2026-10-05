@@ -141,6 +141,19 @@ impl Repo {
         .unwrap()
     }
 
+    /// A pass that rechecks everything left for its content.
+    fn recheck(&self, sessions: &[CleanupSession]) -> Vec<WorktreeOutcome> {
+        run_worktree_cleanup(
+            &self.store,
+            CleanupRequest {
+                sessions,
+                recheck_after: Some(Duration::ZERO),
+                ..CleanupRequest::default()
+            },
+        )
+        .unwrap()
+    }
+
     fn worktree_events(&self) -> Vec<(String, Value)> {
         self.store
             .events()
@@ -236,8 +249,9 @@ fn removed_for_a_managed_worktree_still_at_its_base() {
 }
 
 #[test]
-fn kept_when_head_has_commits_not_in_a_merged_pr_and_that_is_final() {
+fn kept_with_commits_only_on_this_mac_until_they_are_pushed() {
     let repo = Repo::new();
+    repo.origin();
     let (path, head) = repo.worktree("wt", "5-feature");
     repo.claim(
         "c1",
@@ -254,14 +268,20 @@ fn kept_when_head_has_commits_not_in_a_merged_pr_and_that_is_final() {
     let sessions = [session("eng1", "/elsewhere", true)];
     assert_eq!(
         repo.pass(&sessions),
-        vec![outcome(&path, false, "commits not in a merged PR")]
+        vec![outcome(&path, false, "1 commit only on this Mac")]
     );
     assert!(Path::new(&path).exists());
-    assert_eq!(repo.pass(&sessions), vec![], "final: not retried");
+    assert_eq!(repo.pass(&sessions), vec![], "waits for the hourly recheck");
+    run_git(Path::new(&path), &["push", "-q", "origin", "5-feature"]);
+    assert_eq!(
+        repo.recheck(&sessions),
+        vec![outcome(&path, true, "pushed to origin/5-feature")]
+    );
+    assert!(!Path::new(&path).exists());
 }
 
 #[test]
-fn kept_by_git_with_an_untracked_file() {
+fn kept_with_an_uncommitted_change_and_removed_once_it_is_gone() {
     let repo = Repo::new();
     let (path, head) = repo.worktree("wt", "5-feature");
     repo.claim(
@@ -274,17 +294,24 @@ fn kept_by_git_with_an_untracked_file() {
         Some(&head),
     );
     fs::write(Path::new(&path).join("notes.txt"), "unsaved").unwrap();
-    let outcomes = repo.pass(&[session("eng1", "/elsewhere", true)]);
-    assert_eq!(outcomes.len(), 1);
-    assert!(!outcomes[0].removed);
-    assert!(
-        outcomes[0].reason.starts_with("git refused: ")
-            && outcomes[0].reason.contains("modified or untracked files"),
-        "{}",
-        outcomes[0].reason
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "1 uncommitted change")]
     );
     assert!(Path::new(&path).join("notes.txt").exists());
     assert!(repo.branch_exists("5-feature"));
+    // The same reason again writes nothing.
+    assert_eq!(
+        repo.recheck(&sessions),
+        vec![outcome(&path, false, "1 uncommitted change")]
+    );
+    assert_eq!(repo.worktree_events().len(), 1);
+    fs::remove_file(Path::new(&path).join("notes.txt")).unwrap();
+    assert_eq!(
+        repo.recheck(&sessions),
+        vec![outcome(&path, true, "no commits")]
+    );
 }
 
 #[test]
@@ -439,9 +466,14 @@ fn a_main_checkout_is_never_deleted() {
     );
     assert_eq!(
         repo.pass(&[session("eng1", &main, true)]),
-        vec![outcome(&main, false, "not a linked worktree")]
+        vec![outcome(&main, false, "a main checkout")]
     );
     assert!(repo.main.join(".git").exists());
+    assert_eq!(
+        repo.recheck(&[session("eng1", &main, true)]),
+        vec![],
+        "settled"
+    );
 }
 
 #[test]
@@ -743,7 +775,7 @@ fn a_keep_set_while_the_pass_runs_is_honoured() {
         CleanupRequest {
             sessions: &sessions,
             first: Some("eng1"),
-            progress: None,
+            ..CleanupRequest::default()
         },
     )
     .unwrap();
@@ -753,6 +785,320 @@ fn a_keep_set_while_the_pass_runs_is_honoured() {
         vec![outcome(&path, false, "kept: results not yet pushed")]
     );
     assert!(Path::new(&path).exists());
+}
+
+/// sm#1987: work continued on a later branch and the worktree was left
+/// detached at a commit that branch, pushed, contains.
+#[test]
+fn removed_when_a_detached_head_is_on_a_later_remote_branch() {
+    let repo = Repo::new();
+    repo.origin();
+    let (path, _) = repo.worktree("wt", "1748-first");
+    let dir = Path::new(&path);
+    fs::write(dir.join("a.txt"), "a").unwrap();
+    run_git(dir, &["add", "a.txt"]);
+    run_git(dir, &["commit", "-q", "-m", "a"]);
+    let head = run_git(dir, &["rev-parse", "HEAD"]);
+    run_git(dir, &["checkout", "-q", "-b", "1748-chain-compaction"]);
+    fs::write(dir.join("b.txt"), "b").unwrap();
+    run_git(dir, &["add", "b.txt"]);
+    run_git(dir, &["commit", "-q", "-m", "b"]);
+    run_git(dir, &["push", "-q", "origin", "1748-chain-compaction"]);
+    run_git(dir, &["checkout", "-q", "--detach", &head]);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1748,
+        Some(&path),
+        Some("1748-first"),
+        None,
+    );
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(
+            &path,
+            true,
+            "pushed to origin/1748-chain-compaction"
+        )]
+    );
+    assert!(!dir.exists());
+    assert!(
+        repo.branch_exists("1748-chain-compaction"),
+        "not the checked head"
+    );
+}
+
+/// sm#1987: another agent claimed and merged the PR whose head this is.
+#[test]
+fn removed_when_head_is_a_pr_another_agent_merged() {
+    let repo = Repo::new();
+    let (path, _) = repo.worktree("wt", "1771-fix");
+    let dir = Path::new(&path);
+    fs::write(dir.join("a.txt"), "a").unwrap();
+    run_git(dir, &["add", "a.txt"]);
+    run_git(dir, &["commit", "-q", "-m", "a"]);
+    let head = run_git(dir, &["rev-parse", "HEAD"]);
+    repo.merged_pr(1797, "1797-revision", &head);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1771,
+        Some(&path),
+        Some("1771-fix"),
+        None,
+    );
+    repo.claim("c2", "reviser", "pr", 1797, None, None, None);
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(&path, true, "PR #1797 merged")]
+    );
+}
+
+/// sm#1987: a keep naming a PR ends when the PR merges.
+#[test]
+fn a_keep_naming_a_pr_expires_once_it_merges() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "1787-memo");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1787,
+        Some(&path),
+        Some("1787-memo"),
+        Some(&head),
+    );
+    repo.keep(&path, "handoff: memo PR #1789 mid-review");
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(
+            &path,
+            false,
+            "kept: handoff: memo PR #1789 mid-review"
+        )]
+    );
+    repo.merged_pr(
+        1789,
+        "1789-memo",
+        "0000000000000000000000000000000000000000",
+    );
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, true, "no commits")]
+    );
+    assert!(repo.store.worktree_keeps().unwrap().is_empty());
+    let expired = repo
+        .worktree_events()
+        .into_iter()
+        .find(|(kind, _)| kind == "worktree.keep_expired")
+        .expect("keep_expired event");
+    assert_eq!(expired.1["prs"], json!([1789]));
+}
+
+#[test]
+fn keep_reasons_name_prs_by_number_or_link() {
+    assert_eq!(keep_prs("handoff: memo PR #1789 mid-review"), vec![1789]);
+    assert_eq!(keep_prs("pr#12 and PR 13"), vec![12, 13]);
+    assert_eq!(
+        keep_prs("see https://github.com/acme/widgets/pull/44"),
+        vec![44]
+    );
+    assert!(keep_prs("server on :8421 for ticket #12").is_empty());
+}
+
+/// sm#1987: a worktree whose removal git refused is checked again, and a
+/// populated `target/` goes first.
+#[test]
+fn a_refused_removal_is_rechecked_and_build_output_goes_first() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "1709-fix");
+    let dir = Path::new(&path);
+    fs::create_dir_all(dir.join("target/debug/deps")).unwrap();
+    fs::write(dir.join("target/debug/deps/lib.rlib"), "x").unwrap();
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1709,
+        Some(&path),
+        Some("1709-fix"),
+        Some(&head),
+    );
+    // A lock makes git refuse without --force.
+    run_git(&repo.main, &["worktree", "lock", &path]);
+    let sessions = [session("eng1", "/elsewhere", true)];
+    let outcomes = repo.pass(&sessions);
+    assert!(
+        !outcomes[0].removed && outcomes[0].reason.starts_with("git refused: "),
+        "{outcomes:?}"
+    );
+    assert!(!dir.join("target").exists(), "build output cleared first");
+    run_git(&repo.main, &["worktree", "unlock", &path]);
+    assert_eq!(
+        repo.recheck(&sessions),
+        vec![outcome(&path, true, "no commits")]
+    );
+}
+
+/// Records written before sm#1987 settled a worktree for good; it is now
+/// checked again.
+#[test]
+fn an_old_final_record_is_checked_again() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "1705-fix");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1705,
+        Some(&path),
+        Some("1705-fix"),
+        Some(&head),
+    );
+    write_event(
+        &repo.conn(),
+        LEFT,
+        Some("eng1"),
+        Some(REPO),
+        Some(1705),
+        None,
+        json!({"path": path, "reason": "commits not in a merged PR"}),
+        "2026-01-02T00:00:00Z",
+    )
+    .unwrap();
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(&path, true, "no commits")]
+    );
+}
+
+#[test]
+fn leftovers_list_and_delete_build_output_or_the_worktree() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "1854-fix");
+    let dir = Path::new(&path);
+    fs::create_dir_all(dir.join("target")).unwrap();
+    fs::write(dir.join("target/out.bin"), "x").unwrap();
+    fs::write(dir.join("notes.txt"), "unsaved").unwrap();
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1854,
+        Some(&path),
+        Some("1854-fix"),
+        Some(&head),
+    );
+    let sessions = [session("eng1", "/elsewhere", true)];
+    repo.pass(&sessions);
+    let leftovers = leftover_worktrees(&repo.store, &sessions).unwrap();
+    assert_eq!(leftovers.len(), 1);
+    assert_eq!(leftovers[0].path, path);
+    assert_eq!(leftovers[0].ticket, Some(1854));
+    assert_eq!(leftovers[0].sessions, vec!["eng1-agent".to_owned()]);
+    assert_eq!(leftovers[0].reason, "1 uncommitted change");
+    assert_eq!(leftover_build_dirs(&path), vec![dir.join("target")]);
+
+    let refused = delete_leftover(
+        &repo.store,
+        &sessions,
+        "/elsewhere/x",
+        DeleteScope::Worktree,
+        "owner",
+    )
+    .unwrap();
+    assert_eq!(
+        refused,
+        Err("/elsewhere/x is not a left-over worktree".to_owned())
+    );
+    let busy = [
+        session("eng1", "/elsewhere", true),
+        session("live1", &path, false),
+    ];
+    assert_eq!(
+        delete_leftover(&repo.store, &busy, &path, DeleteScope::Worktree, "owner").unwrap(),
+        Err("in use by live1-agent".to_owned())
+    );
+
+    let build = delete_leftover(
+        &repo.store,
+        &sessions,
+        &path,
+        DeleteScope::BuildOutput,
+        "owner",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!build.removed);
+    assert_eq!(
+        build.cleared,
+        vec![dir.join("target").display().to_string()]
+    );
+    assert!(dir.join("notes.txt").exists());
+
+    let deleted = delete_leftover(
+        &repo.store,
+        &sessions,
+        &path,
+        DeleteScope::Worktree,
+        "owner",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(deleted.removed);
+    assert!(!dir.exists());
+    assert!(
+        repo.branch_exists("1854-fix"),
+        "the branch keeps its commits"
+    );
+    assert!(leftover_worktrees(&repo.store, &sessions)
+        .unwrap()
+        .is_empty());
+    assert_eq!(repo.recheck(&sessions), vec![], "settled by the removal");
+}
+
+/// A folder git no longer knows as a worktree (a removal that died half
+/// way) is listed, and Delete removes it.
+#[test]
+fn a_folder_that_is_no_longer_a_worktree_is_listed_and_deletable() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "1709-fix");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        1709,
+        Some(&path),
+        Some("1709-fix"),
+        Some(&head),
+    );
+    fs::remove_file(Path::new(&path).join(".git")).unwrap();
+    run_git(&repo.main, &["worktree", "prune"]);
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "not a git worktree")]
+    );
+    assert_eq!(
+        leftover_worktrees(&repo.store, &sessions).unwrap()[0].reason,
+        "not a git worktree"
+    );
+    assert!(
+        delete_leftover(
+            &repo.store,
+            &sessions,
+            &path,
+            DeleteScope::Worktree,
+            "owner"
+        )
+        .unwrap()
+        .unwrap()
+        .removed
+    );
+    assert!(!Path::new(&path).exists());
 }
 
 impl Repo {

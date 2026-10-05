@@ -1,6 +1,8 @@
 //! `sm ticket <N> --setup-worktree` and `sm worktree keep` (sm#1452,
 //! ticket #1487): sm creates the worktree a ticket is worked in, records it
 //! on the claim, and deletes it at retire unless it is kept.
+//! `sm worktree list` and `sm worktree delete` act on the worktrees sm left
+//! behind (sm#1987).
 
 use super::*;
 
@@ -14,6 +16,26 @@ pub(crate) struct WorktreeArgs {
 enum WorktreeCommand {
     /// Don't delete this worktree when you are retired
     Keep(KeepArgs),
+    /// Retired agents' worktrees sm has not deleted, and why
+    List(ListArgs),
+    /// Delete a left-over worktree, or only its build output
+    Delete(DeleteArgs),
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Print the server's JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DeleteArgs {
+    /// The worktree, as `sm worktree list` prints it
+    path: String,
+    /// Delete only ignored build output (target/, node_modules/, ...)
+    #[arg(long)]
+    build_only: bool,
 }
 
 #[derive(Args)]
@@ -32,11 +54,132 @@ struct KeepArgs {
 pub(crate) fn run_worktree(client: &ApiClient, args: WorktreeArgs) -> Result<()> {
     match args.command {
         WorktreeCommand::Keep(args) => run_keep(client, args),
+        WorktreeCommand::List(args) => run_list(client, args),
+        WorktreeCommand::Delete(args) => run_delete(client, args),
+    }
+}
+
+fn run_list(client: &ApiClient, args: ListArgs) -> Result<()> {
+    let response = client.request("GET", "/worktrees/leftover", None)?;
+    let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+    if args.json && response.status == 200 {
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(());
+    }
+    finish(list_output(response.status, &body))
+}
+
+/// `1.2 GB`, `340 MB`, `12 KB`.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 10.0 || unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// One line per left-over worktree: path, what it was for, size, why.
+pub(crate) fn list_output(status: u16, body: &Value) -> Printed {
+    if status != 200 {
+        return Printed {
+            stdout: Vec::new(),
+            stderr: vec![api_detail(status, body)],
+            exit: 1,
+        };
+    }
+    let rows = body["worktrees"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Printed {
+            stdout: vec!["No left-over worktrees.".to_owned()],
+            stderr: Vec::new(),
+            exit: 0,
+        };
+    }
+    let stdout = rows
+        .iter()
+        .map(|row| {
+            let path = home_relative(row["path"].as_str().unwrap_or_default());
+            let repo = row["repo"].as_str().unwrap_or_default();
+            let item = match (row["ticket"].as_i64(), row["pr"].as_i64()) {
+                (Some(ticket), _) => format!("{repo}#{ticket}"),
+                (None, Some(pr)) => format!("{repo} PR #{pr}"),
+                _ => repo.to_owned(),
+            };
+            let size = match (row["bytes"].as_u64(), row["build_bytes"].as_u64()) {
+                (Some(bytes), Some(build)) if build > 0 => {
+                    format!(
+                        "{} ({} build output)",
+                        human_bytes(bytes),
+                        human_bytes(build)
+                    )
+                }
+                (Some(bytes), _) => human_bytes(bytes),
+                _ => "size unknown".to_owned(),
+            };
+            let reason = row["reason"].as_str().unwrap_or_default();
+            format!("{path}  {item}  {size}  {reason}")
+        })
+        .collect();
+    Printed {
+        stdout,
+        stderr: Vec::new(),
+        exit: 0,
+    }
+}
+
+fn run_delete(client: &ApiClient, args: DeleteArgs) -> Result<()> {
+    let path = absolute_path(Path::new(args.path.trim()))?;
+    let response = client.request(
+        "POST",
+        "/worktrees/delete",
+        Some(json!({
+            "requester_session_id": optional_current_session_id().unwrap_or_default(),
+            "path": path,
+            "scope": if args.build_only { "build" } else { "worktree" },
+        })),
+    )?;
+    let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+    finish(delete_output(response.status, &body))
+}
+
+/// `Deleted ~/worktrees/x.` / `Deleted 2 build-output folders in ~/worktrees/x.`
+pub(crate) fn delete_output(status: u16, body: &Value) -> Printed {
+    if status != 200 {
+        return Printed {
+            stdout: Vec::new(),
+            stderr: vec![api_detail(status, body)],
+            exit: 1,
+        };
+    }
+    let path = home_relative(body["path"].as_str().unwrap_or_default());
+    let cleared = body["cleared"].as_array().map_or(0, Vec::len);
+    let line = if body["removed"].as_bool() == Some(true) {
+        format!("Deleted {path}.")
+    } else if cleared == 0 {
+        format!("No build output in {path}.")
+    } else {
+        format!(
+            "Deleted {cleared} build-output folder{} in {path}.",
+            if cleared == 1 { "" } else { "s" }
+        )
+    };
+    Printed {
+        stdout: vec![line],
+        stderr: Vec::new(),
+        exit: 0,
     }
 }
 
 fn run_keep(client: &ApiClient, args: KeepArgs) -> Result<()> {
-    let session_id = managed_session_id("sm worktree keep")?;
+    // Run by hand (no session), the keep is the owner's.
+    let session_id = optional_current_session_id().unwrap_or_default();
     let path = match args
         .path
         .as_deref()

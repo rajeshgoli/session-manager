@@ -19,3 +19,8 @@
   .device-description { flex: 1; min-width: 10rem; }
   .device-confirm { flex-basis: 100%; }
 }
+/* Settings › Worktrees reuses the device list. */
+.worktree-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex-shrink: 0; max-width: 24rem; }
+.worktree-keep { display: flex; flex-wrap: wrap; gap: 6px; }
+.worktree-keep input { min-width: 10rem; }
+@media (max-width: 600px) { .worktree-actions { justify-content: flex-start; max-width: none; } }

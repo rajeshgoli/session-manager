@@ -1990,6 +1990,11 @@ pub fn router(state: AppState) -> Router {
         .route("/claims/release", post(claims::release_claim))
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
+        .route("/worktrees/delete", post(worktrees::post_worktree_delete))
+        .route(
+            "/worktrees/leftover",
+            get(worktrees::get_leftover_worktrees),
+        )
         .route("/history", get(history::get_history))
         .route("/history/agents", get(agent_history::get_agent_history))
         .route("/history/tickets", get(history::get_history))
@@ -21235,7 +21240,6 @@ mod tests {
             (Method::POST, "/claims"),
             (Method::POST, "/claims/release"),
             (Method::POST, "/claims/worktree"),
-            (Method::POST, "/worktrees/keep"),
             (Method::POST, "/queue-jobs"),
             (Method::POST, "/review-requests"),
             (Method::POST, "/docs"),
@@ -21263,9 +21267,6 @@ mod tests {
                 "/claims/worktree" => json!({
                     "requester_session_id": "abc12345", "claim_id": "c1", "state": "created",
                     "worktree_path": "/wt", "branch": "b", "base_sha": "a"}),
-                "/worktrees/keep" => {
-                    json!({"requester_session_id": "abc12345", "path": "/wt", "off": false})
-                }
                 "/queue-jobs" => json!({"type": "tests", "job_type": "tests", "label": "x",
                     "cwd": "/tmp", "argv": ["true"], "env": {}}),
                 "/review-requests" => json!({"pr_number": 1, "repo": "acme/widgets",

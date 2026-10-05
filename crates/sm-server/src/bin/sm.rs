@@ -122,7 +122,7 @@ enum Command {
     MergeHold(merge_holds::MergeHoldArgs),
     /// Claim the PR you work on; no number uses the current branch's PR
     Pr(claims::PrArgs),
-    /// Keep a worktree past your retirement
+    /// Keep, list or delete worktrees of retired agents
     Worktree(claims::worktree::WorktreeArgs),
     /// Tickets and PRs with their agents, PRs, docs and reviews; --item N for one timeline
     History(history::HistoryArgs),

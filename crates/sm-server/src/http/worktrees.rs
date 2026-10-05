@@ -1,14 +1,21 @@
 //! Worktree lifecycle HTTP surface (sm#1452, ticket #1487):
-//! `POST /claims/worktree`, `POST /worktrees/keep`, and deletion at retire.
+//! `POST /claims/worktree`, `POST /worktrees/keep`, deletion at retire, and
+//! the leftover worktrees page's `GET /worktrees/leftover` and
+//! `POST /worktrees/delete` (sm#1987).
 
-use std::sync::Mutex as StdMutex;
+use std::{
+    collections::BTreeMap as StdBTreeMap,
+    sync::{Mutex as StdMutex, OnceLock},
+    time::Instant,
+};
 
 use super::claims::work_claim_store;
 use super::*;
 use crate::work_claims::{
     worktrees::{
-        keep_path_key, run_worktree_cleanup, CleanupProgress, CleanupRequest, CleanupSession,
-        WorktreeOutcome,
+        delete_leftover, keep_path_key, keep_pr_refs, leftover_build_dirs, leftover_worktrees,
+        run_worktree_cleanup, CleanupProgress, CleanupRequest, CleanupSession, DeleteScope,
+        WorktreeOutcome, RECHECK_INTERVAL,
     },
     WorkKind, MAX_ALIASES_PER_QUERY,
 };
@@ -111,6 +118,7 @@ pub(super) async fn post_claim_worktree(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PostWorktreeKeepRequest {
+    #[serde(default)]
     requester_session_id: String,
     path: String,
     #[serde(default)]
@@ -119,16 +127,21 @@ pub(super) struct PostWorktreeKeepRequest {
     off: bool,
 }
 
-/// `sm worktree keep`: any managed session may set or clear a keep.
+/// `sm worktree keep`: any managed session may set or clear a keep, and so
+/// may the owner from the leftover worktrees page.
 pub(super) async fn post_worktree_keep(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<PostWorktreeKeepRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/worktrees/keep")?;
-    ensure_core_writes_enabled(&state)?;
-    let session = managed_requester(&state, &payload.requester_session_id)?;
+    let actor = requester(
+        &state,
+        &headers,
+        peer_addr,
+        &payload.requester_session_id,
+        "/worktrees/keep",
+    )?;
     let Some(path) = keep_path_key(&payload.path) else {
         return Err(bad_request("path must be absolute"));
     };
@@ -142,10 +155,207 @@ pub(super) async fn post_worktree_keep(
     let Some(reason) = trimmed(&payload.reason) else {
         return Err(bad_request("--reason is required"));
     };
-    store.set_worktree_keep(&path, &session.id, &reason)?;
+    store.set_worktree_keep(&path, &actor, &reason)?;
     Ok(Json(
         json!({ "path": path, "kept": true, "reason": reason }),
     ))
+}
+
+/// Who acts on a worktree: the owner in the browser (`owner`), else the
+/// managed session named by `requester_session_id`. A request with no
+/// session id passes only from the owner's own machine or SM login, as the
+/// `sm` CLI run by hand does (`owner`).
+fn requester(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    session_id: &str,
+    route: &str,
+) -> Result<String, ApiError> {
+    let web_owner = owner_web_guard(state, headers, Some(peer_addr), "POST")?.is_some();
+    if !web_owner {
+        ensure_session_allowed_from_parts(&state.config, headers, Some(peer_addr), route)?;
+    }
+    ensure_core_writes_enabled(state)?;
+    if session_id.trim().is_empty() {
+        return Ok("owner".to_owned());
+    }
+    Ok(managed_requester(state, session_id)?.id)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sizes {
+    bytes: u64,
+    build_bytes: u64,
+}
+
+/// Sizes go stale after this; measuring a 20 GB `target/` takes seconds.
+const SIZE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn size_cache() -> &'static StdMutex<StdBTreeMap<String, (Instant, Sizes)>> {
+    static CACHE: OnceLock<StdMutex<StdBTreeMap<String, (Instant, Sizes)>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(StdBTreeMap::new()))
+}
+
+/// `du -sk` of each path, in bytes; 0 for one it cannot read.
+fn disk_usage(paths: &[std::path::PathBuf]) -> u64 {
+    if paths.is_empty() {
+        return 0;
+    }
+    let Ok(output) = std::process::Command::new("du")
+        .arg("-sk")
+        .args(paths)
+        .output()
+    else {
+        return 0;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+        .sum::<u64>()
+        * 1024
+}
+
+/// Each path's size and build-output size, measured in parallel and cached
+/// for `SIZE_TTL`.
+fn leftover_sizes(paths: &[String]) -> StdBTreeMap<String, Sizes> {
+    let cached = size_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut sizes = StdBTreeMap::new();
+    let mut handles = Vec::new();
+    for path in paths {
+        match cached.get(path) {
+            Some((at, size)) if at.elapsed() < SIZE_TTL => {
+                sizes.insert(path.clone(), *size);
+            }
+            _ => {
+                let path = path.clone();
+                handles.push(std::thread::spawn(move || {
+                    let size = Sizes {
+                        bytes: disk_usage(&[std::path::PathBuf::from(&path)]),
+                        build_bytes: disk_usage(&leftover_build_dirs(&path)),
+                    };
+                    (path, size)
+                }));
+            }
+        }
+    }
+    let mut cache = size_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for handle in handles {
+        if let Ok((path, size)) = handle.join() {
+            cache.insert(path.clone(), (Instant::now(), size));
+            sizes.insert(path, size);
+        }
+    }
+    sizes
+}
+
+/// `GET /worktrees/leftover`: every retired agent's worktree sm has not
+/// deleted, with why, its size and how much of that is build output.
+pub(super) async fn get_leftover_worktrees(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    if owner_web_guard(&state, &headers, Some(peer_addr), "GET")?.is_none() {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            &headers,
+            Some(peer_addr),
+            "/worktrees/leftover",
+        )?;
+    }
+    if !expand_home(&state.config.sm_send.db_path).exists() {
+        return Ok(Json(json!({ "worktrees": [] })));
+    }
+    let task_state = state.clone();
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+        let sessions = cleanup_sessions(&task_state)?;
+        let leftovers = leftover_worktrees(&work_claim_store(&task_state), &sessions)?;
+        let paths = leftovers
+            .iter()
+            .map(|leftover| leftover.path.clone())
+            .collect::<Vec<_>>();
+        let sizes = leftover_sizes(&paths);
+        Ok(leftovers
+            .into_iter()
+            .map(|leftover| {
+                let size = sizes.get(&leftover.path).copied();
+                let mut row = serde_json::to_value(&leftover).unwrap_or(Value::Null);
+                row["bytes"] = json!(size.map(|size| size.bytes));
+                row["build_bytes"] = json!(size.map(|size| size.build_bytes));
+                row
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("leftover worktrees task failed: {error}"))??;
+    Ok(Json(json!({ "worktrees": rows })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PostWorktreeDeleteRequest {
+    #[serde(default)]
+    requester_session_id: String,
+    path: String,
+    /// `worktree` (the default) or `build` for build output only.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// `POST /worktrees/delete`: the leftover page's Delete and Delete build
+/// output, and `sm worktree delete`.
+pub(super) async fn post_worktree_delete(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<PostWorktreeDeleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = requester(
+        &state,
+        &headers,
+        peer_addr,
+        &payload.requester_session_id,
+        "/worktrees/delete",
+    )?;
+    let scope = match payload.scope.as_deref().map(str::trim) {
+        None | Some("") | Some("worktree") => DeleteScope::Worktree,
+        Some("build") => DeleteScope::BuildOutput,
+        Some(other) => return Err(bad_request(format!("unknown scope {other}"))),
+    };
+    let Some(path) = keep_path_key(&payload.path) else {
+        return Err(bad_request("path must be absolute"));
+    };
+    let task_state = state.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let sessions = cleanup_sessions(&task_state)?;
+        delete_leftover(
+            &work_claim_store(&task_state),
+            &sessions,
+            &path,
+            scope,
+            &actor,
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("worktree delete task failed: {error}"))??;
+    match outcome {
+        Ok(outcome) => {
+            size_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&outcome.path);
+            Ok(Json(serde_json::to_value(outcome)?))
+        }
+        Err(reason) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: reason,
+        }),
+    }
 }
 
 fn cleanup_session(record: &SessionRecord) -> CleanupSession {
@@ -182,6 +392,7 @@ fn cleanup_sessions(state: &AppState) -> anyhow::Result<Vec<CleanupSession>> {
 /// A deletion pass over every pending candidate: server start and after
 /// every sync pass.
 pub(super) fn run_cleanup_pass(state: &AppState) -> anyhow::Result<()> {
+    refresh_keep_prs(state);
     let sessions = cleanup_sessions(state)?;
     run_worktree_cleanup(
         &work_claim_store(state),
@@ -191,6 +402,42 @@ pub(super) fn run_cleanup_pass(state: &AppState) -> anyhow::Result<()> {
         },
     )?;
     Ok(())
+}
+
+/// PRs named by keeps that sm has as open or does not know, fetched at most
+/// every `RECHECK_INTERVAL`, so a keep naming a PR expires once it merges.
+fn refresh_keep_prs(state: &AppState) {
+    static LAST: StdMutex<Option<Instant>> = StdMutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|at| at.elapsed() < RECHECK_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let store = work_claim_store(state);
+    let Ok(refs) = keep_pr_refs(&store) else {
+        return;
+    };
+    let mut by_repo = BTreeMap::<String, Vec<i64>>::new();
+    for (repo, number) in refs {
+        let open = store
+            .item(&repo, number)
+            .ok()
+            .flatten()
+            .is_none_or(|item| item.state == "open");
+        if open {
+            by_repo.entry(repo).or_default().push(number);
+        }
+    }
+    for (repo, numbers) in by_repo {
+        for chunk in numbers.chunks(MAX_ALIASES_PER_QUERY) {
+            let fetched = state.work_item_source.fetch(&repo, chunk);
+            if let Err(error) = store.record_fetch(&repo, chunk, &fetched) {
+                eprintln!("refreshing {repo} PRs named by worktree keeps failed: {error:#}");
+            }
+        }
+    }
 }
 
 /// The retired session's PRs that sm still has as open: fetched fresh, so a
@@ -249,6 +496,7 @@ pub(super) async fn cleanup_after_retire(
                 sessions: &sessions,
                 first: Some(&task_session),
                 progress: Some(&task_progress),
+                recheck_after: None,
             },
         )
     });
