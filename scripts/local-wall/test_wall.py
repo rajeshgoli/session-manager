@@ -198,6 +198,37 @@ class WallTests(unittest.TestCase):
         self.assertNotEqual(denied.stdout.strip(), "0")
 
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
+    def test_kernel_process_environment_query_is_denied(self):
+        secret = "fixture-only-outside-process-secret"
+        outsider = subprocess.Popen([PYTHON, "-c", "import time; time.sleep(30)"],
+                                    env={"PATH": "/usr/bin:/bin", "WALL_FIXTURE_SECRET": secret})
+        try:
+            # CTL_KERN=1, KERN_PROCARGS2=49. Query only this disposable PID.
+            script = ("import ctypes; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True); "
+                      f"mib=(ctypes.c_int*3)(1,49,{outsider.pid}); "
+                      "buf=ctypes.create_string_buffer(1024*1024); n=ctypes.c_size_t(len(buf)); "
+                      "rc=lib.sysctl(mib,3,buf,ctypes.byref(n),None,0); "
+                      "errno=ctypes.get_errno()\n"
+                      "if rc != 0: raise OSError(errno, 'sysctl process args denied')\n"
+                      f"assert {secret.encode()!r} in buf.raw[:n.value]")
+            profile = wall.generate(self.args, set(), 65)
+            control = self.state / "sysctl-control.sb"
+            control.write_text(profile.replace("(deny sysctl-read)\n", "")
+                               .replace("(deny process-info*)\n", ""))
+            self.profile = control
+            self.sandbox(script, True, "control kernel query exposes fixture secret")
+            self.profile = self.state / "sysctl-wall.sb"
+            self.profile.write_text(profile)
+            self.sandbox(script, False, "kernel query for outside process environment")
+            self.sandbox("import subprocess; "
+                         "assert int(subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.ncpu'])) > 0; "
+                         "assert subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.osrelease']).strip()",
+                         True, "admitted CPU and OS kernel queries")
+        finally:
+            outsider.terminate()
+            outsider.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_hardlinks_cannot_cross_read_or_write_boundaries(self):
         self.profile = self.state / "link-wall.sb"
         self.profile.write_text(wall.generate(self.args, set(), 65))

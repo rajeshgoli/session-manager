@@ -151,6 +151,10 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Apple-event delegation | No send |
 | Hard links from immutable state or host files into mutable paths | No link |
 | Signals to host services or other sandboxes | Denied; own children permitted |
+| Cross-sandbox process argument/environment queries | Denied |
+| System-control mutations | Denied |
+| Process information for host services or other sandboxes | Denied; own processes permitted |
+| Listed CPU, memory, OS-version and runtime-limit kernel queries | Read |
 
 The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement

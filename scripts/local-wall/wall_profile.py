@@ -194,6 +194,34 @@ def generate(args, listeners, minimum_tmp_length):
     lines.append("(allow file-write* " + " ".join(
         f"(subpath {quoted(p)})" for p in writable) + ")")
     lines.extend(["(deny signal)", "(allow signal (target same-sandbox))"])
+    # Kernel process-argument queries can expose another process's initial
+    # environment without reading its credential files. Admit only runtime
+    # hardware/OS facts, never process argument/environment or mutation queries.
+    lines.extend(["(deny sysctl-read)", "(deny sysctl-write)"])
+    # KERN_PROCARGS2 also uses a process-info check; a sysctl denial alone
+    # does not block that legacy numeric query on this Mac.
+    lines.extend(["(deny process-info*)",
+                  "(allow process-info* (target same-sandbox))"])
+    system_queries = (
+        "hw.activecpu", "hw.byteorder", "hw.cacheconfig", "hw.cachelinesize_compat",
+        "hw.cpufamily", "hw.cpufrequency_compat", "hw.cputype", "hw.cpusubtype",
+        "hw.l1dcachesize_compat", "hw.l1icachesize_compat", "hw.l2cachesize_compat",
+        "hw.l3cachesize_compat", "hw.logicalcpu_max", "hw.machine", "hw.model",
+        "hw.memsize", "hw.ncpu", "hw.nperflevels", "hw.packages", "hw.pagesize_compat",
+        "hw.pagesize", "hw.physicalcpu", "hw.physicalcpu_max", "hw.logicalcpu",
+        "hw.cpufrequency", "hw.tbfrequency_compat", "hw.vectorunit", "machdep.cpu.brand_string",
+        "kern.argmax", "kern.hostname", "kern.maxfilesperproc", "kern.maxproc",
+        "kern.osproductversion", "kern.osrelease", "kern.ostype", "kern.osvariant_status",
+        "kern.osversion", "kern.secure_kernel", "kern.sysv.semmns", "kern.usrstack64",
+        "kern.version", "vm.loadavg", "sysctl.name2oid", "sysctl.oidfmt", "sysctl.name",
+    )
+    lines.append("(allow sysctl-read " + " ".join(
+        f'(sysctl-name "{name}")' for name in system_queries) +
+        ' (sysctl-name-prefix "hw.optional.arm.")'
+        ' (sysctl-name-prefix "hw.optional.armv8_")'
+        ' (sysctl-name-prefix "sysctl.oidfmt.")'
+        ' (sysctl-name-prefix "sysctl.name.")'
+        ' (sysctl-name-prefix "hw.perflevel"))')
     denied_reads = [(home / p).resolve() for p in (
         ".ssh", ".claude", ".codex", ".config/session-manager", ".config/gh", ".config/git", ".gitconfig",
         "Library/Keychains", ".aws", ".claude.json", ".netrc", ".git-credentials",
