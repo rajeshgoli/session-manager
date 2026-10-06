@@ -62,11 +62,14 @@ the launch caller's responsibility.
 The proxy accepts only bounded, well-formed HTTP/1.0 or HTTP/1.1 CONNECT headers
 with an authority on port 443. It resolves outside the wall, rejects the entire
 answer set if any address is non-public, then connects directly to a checked IP.
+After public-address classification, it inspects current host interface addresses
+and netmasks and rejects host addresses and directly connected subnets, including
+globally addressed IPv4/IPv6 LANs. Interface lookup failure refuses the request.
 It blocks IPv4 private/loopback/link-local/unspecified, shared address space,
 multicast/reserved/documentation addresses and IPv6 non-global, mapped private,
 documentation and transition addresses. DNS failure, empty answers, request
 errors and prohibited destinations return 403. Header and DNS/connect operations
-have 15-second deadlines; tunnel reads/writes have five-minute idle deadlines.
+have 15-second deadlines; tunnels have a shared five-minute idle deadline reset by traffic in either direction.
 A shared limit admits at most 256 simultaneous proxy workers.
 
 `connections.jsonl` contains one JSON object per completed connection: `time`
@@ -74,7 +77,7 @@ A shared limit admits at most 256 simultaneous proxy workers.
 `bytes_to_agent`, `duration_ms`, and `outcome`. Refused requests have null fields
 when no valid authority/address is available. Outcomes are `allowed` or a
 specific reason such as `non_public_address`, `port_not_443`, `connect_only`,
-`malformed_request`, `dns_failed`, `connect_failed`, `registration_revoked` or
+`malformed_request`, `dns_failed`, `interface_lookup_failed`, `local_network_address`, `connect_failed`, `registration_revoked` or
 `tunnel_io_error`. Counts exclude proxy headers and include partial transfers.
 Unregister drains workers and logs their revocation. A process crash can lose
 completion records for connections still in flight; existing JSON lines and
@@ -87,7 +90,8 @@ Run Rust tests through `scripts/test-rust-isolated.sh local_egress`. They cover
 request validation, public-address classification, a fixture resolver returning
 mixed public/private answers, refusal logging without request contents, byte
 counts and half-close, registration restore, suspension, safe release and
-stable environment values.
+stable environment values, global LAN prefixes, interface lookup failure, and
+one-way traffic keeping the tunnel alive.
 
 On macOS, explicitly run the live acceptance script after building `sm-server`:
 

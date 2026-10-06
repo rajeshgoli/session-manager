@@ -1,5 +1,6 @@
 //! Host-owned HTTPS CONNECT proxy. The listener port, never client input,
 //! identifies the agent. Call `ServiceClient` before constructing a wall.
+mod networks;
 mod service;
 pub use service::{run_service, ServiceClient};
 
@@ -187,6 +188,7 @@ struct Proxy {
     log: Arc<Mutex<std::fs::File>>,
     resolver: Arc<dyn Resolver>,
     capacity: Arc<tokio::sync::Semaphore>,
+    networks: Arc<dyn networks::Networks>,
 }
 impl Proxy {
     fn new(directory: &Path) -> io::Result<Self> {
@@ -201,6 +203,7 @@ impl Proxy {
             log: Arc::new(Mutex::new(log)),
             resolver: Arc::new(SystemResolver),
             capacity: Arc::new(tokio::sync::Semaphore::new(256)),
+            networks: Arc::new(networks::HostNetworks),
         })
     }
     fn log(&self, record: &ConnectionLog) -> io::Result<()> {
@@ -313,6 +316,17 @@ impl Proxy {
             record.resolved_address = Some(*ip);
             return Err("non_public_address");
         }
+        let networks = self
+            .networks
+            .current()
+            .map_err(|_| "interface_lookup_failed")?;
+        if let Some(ip) = addresses
+            .iter()
+            .find(|ip| networks.iter().any(|network| network.contains(**ip)))
+        {
+            record.resolved_address = Some(*ip);
+            return Err("local_network_address");
+        }
         let mut remote = None;
         for ip in addresses {
             record.resolved_address = Some(ip);
@@ -337,9 +351,22 @@ impl Proxy {
         // Count partial transfers too, rather than losing counts on a reset.
         let (mut cr, mut cw) = client.split();
         let (mut rr, mut rw) = remote.split();
+        let activity = tokio::sync::watch::channel(tokio::time::Instant::now()).0;
         let (up, down) = tokio::join!(
-            copy_counted(&mut cr, &mut rw, &mut record.bytes_to_host),
-            copy_counted(&mut rr, &mut cw, &mut record.bytes_to_agent)
+            copy_counted(
+                &mut cr,
+                &mut rw,
+                &mut record.bytes_to_host,
+                &activity,
+                Duration::from_secs(300)
+            ),
+            copy_counted(
+                &mut rr,
+                &mut cw,
+                &mut record.bytes_to_agent,
+                &activity,
+                Duration::from_secs(300)
+            )
         );
         if up.is_err() || down.is_err() {
             return Err("tunnel_io_error");
@@ -351,27 +378,25 @@ async fn copy_counted<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite 
     reader: &mut R,
     writer: &mut W,
     count: &mut u64,
+    activity: &tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle: Duration,
 ) -> io::Result<()> {
     async {
         let mut buffer = [0; 16384];
         loop {
-            let n = tokio::time::timeout(Duration::from_secs(300), reader.read(&mut buffer))
-                .await
-                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+            let n = with_activity(reader.read(&mut buffer), activity, idle).await?;
             if n == 0 {
-                return writer.shutdown().await;
+                return with_activity(writer.shutdown(), activity, idle).await;
             }
+            activity.send_replace(tokio::time::Instant::now());
             let mut offset = 0;
             while offset < n {
-                let written = tokio::time::timeout(
-                    Duration::from_secs(300),
-                    writer.write(&buffer[offset..n]),
-                )
-                .await
-                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+                let written =
+                    with_activity(writer.write(&buffer[offset..n]), activity, idle).await?;
                 if written == 0 {
                     return Err(io::ErrorKind::WriteZero.into());
                 }
+                activity.send_replace(tokio::time::Instant::now());
                 *count += written as u64;
                 offset += written;
             }
@@ -380,5 +405,27 @@ async fn copy_counted<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite 
     .await
 }
 
+async fn with_activity<T>(
+    operation: impl std::future::Future<Output = io::Result<T>>,
+    activity: &tokio::sync::watch::Sender<tokio::time::Instant>,
+    idle: Duration,
+) -> io::Result<T> {
+    let mut changes = activity.subscribe();
+    tokio::pin!(operation);
+    loop {
+        let deadline = *changes.borrow_and_update() + idle;
+        tokio::select! {
+            biased;
+            result = &mut operation => return result,
+            _ = changes.changed() => {},
+            _ = tokio::time::sleep_until(deadline) => {
+                // A write can race the timer. Check the shared timestamp again.
+                if tokio::time::Instant::now() >= *changes.borrow() + idle {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests;

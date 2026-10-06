@@ -144,10 +144,104 @@ async fn counts_transferred_bytes_and_preserves_half_close() {
     source.write_all(b"opaque TLS bytes").await.unwrap();
     source.shutdown().await.unwrap();
     let mut count = 0;
-    let result = copy_counted(&mut input, &mut output, &mut count).await;
+    let activity = tokio::sync::watch::channel(tokio::time::Instant::now()).0;
+    let result = copy_counted(
+        &mut input,
+        &mut output,
+        &mut count,
+        &activity,
+        Duration::from_secs(1),
+    )
+    .await;
     result.unwrap();
     assert_eq!(count, 16);
     let mut bytes = Vec::new();
     target.read_to_end(&mut bytes).await.unwrap();
     assert_eq!(bytes, b"opaque TLS bytes");
+}
+
+struct FixtureNetworks(Option<Vec<networks::Network>>);
+impl networks::Networks for FixtureNetworks {
+    fn current(&self) -> io::Result<Vec<networks::Network>> {
+        self.0
+            .clone()
+            .ok_or_else(|| io::Error::other("fixture interface failure"))
+    }
+}
+#[tokio::test]
+async fn globally_addressed_lan_and_interface_failures_are_refused() {
+    let dir = directory();
+    for (ip, mask, fail) in [
+        ("8.8.8.8", "255.255.255.0", false),
+        ("2606:4700:1234:5678::abcd", "ffff:ffff:ffff:ffff::", false),
+        ("8.8.8.8", "255.255.255.0", true),
+    ] {
+        let mut proxy = Proxy::new(&dir).unwrap();
+        proxy.resolver = Arc::new(FixtureResolver(vec![ip.parse().unwrap()]));
+        proxy.networks = Arc::new(FixtureNetworks((!fail).then(|| {
+            vec![networks::Network {
+                address: ip.parse().unwrap(),
+                mask: mask.parse().unwrap(),
+            }]
+        })));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            proxy.serve(server, "local-lan".into(), stopped).await;
+        });
+        client
+            .write_all(b"CONNECT public.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        task.await.unwrap();
+        let log = fs::read_to_string(dir.join("connections.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            record["outcome"],
+            if fail {
+                "interface_lookup_failed"
+            } else {
+                "local_network_address"
+            }
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn opposite_direction_activity_keeps_idle_read_alive_then_times_out() {
+    let (mut source, mut input) = tokio::io::duplex(128);
+    let (mut output, mut target) = tokio::io::duplex(128);
+    let activity = tokio::sync::watch::channel(tokio::time::Instant::now()).0;
+    let copy_activity = activity.clone();
+    let task = tokio::spawn(async move {
+        let mut count = 0;
+        copy_counted(
+            &mut input,
+            &mut output,
+            &mut count,
+            &copy_activity,
+            Duration::from_millis(100),
+        )
+        .await
+    });
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        activity.send_replace(tokio::time::Instant::now());
+    }
+    assert!(!task.is_finished());
+    source.write_all(b"still alive").await.unwrap();
+    let mut bytes = [0; 11];
+    target.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"still alive");
+    assert_eq!(
+        task.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
 }
