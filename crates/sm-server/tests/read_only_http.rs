@@ -6985,6 +6985,7 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
         RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: job_type.to_owned(),
                 label: label.to_owned(),
                 requester_session_id: Some("requester".to_owned()),

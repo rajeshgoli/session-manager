@@ -58,6 +58,10 @@ impl GatewayRegistration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedLocalAgent(String);
 impl VerifiedLocalAgent {
+    #[cfg(test)]
+    pub(crate) fn test_identity(agent: &str) -> Self {
+        Self(agent.into())
+    }
     pub fn agent_id(&self) -> &str {
         &self.0
     }

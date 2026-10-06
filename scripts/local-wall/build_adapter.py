@@ -2,6 +2,7 @@
 """Build one immutable adapter with host-owned endpoint and identity constants."""
 import argparse
 import os
+import platform
 from pathlib import Path
 import subprocess
 import tempfile
@@ -66,7 +67,9 @@ def main():
         )
         image = scratch / "adapter.dylib"
         subprocess.run([
-            "clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-dynamiclib", "-pthread",
+            "clang",
+            *(["-arch", "arm64", "-arch", "arm64e"] if platform.machine() == "arm64" else []),
+            "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-dynamiclib", "-pthread",
             "-I", str(source), str(source / "wire_client.c"), str(source / "adapter.c"),
             str(configuration), "-Wl,-install_name," + str(output), "-o", str(image),
         ], check=True)

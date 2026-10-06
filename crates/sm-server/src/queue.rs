@@ -1,3 +1,4 @@
+pub mod local_wall;
 pub mod quiet;
 
 #[cfg(unix)]
@@ -187,6 +188,7 @@ pub struct QueueJobFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueJobRecord {
+    pub local_agent_id: Option<String>,
     pub quiet_alerted_at: Option<String>,
     pub id: String,
     #[serde(rename = "type")]
@@ -280,6 +282,8 @@ pub struct QueueRecoverySummary {
 
 #[derive(Debug, Clone)]
 struct QueueJobRuntimeRecord {
+    local_agent_id: Option<String>,
+    local_binding_json: Option<String>,
     owner: Option<String>,
     id: String,
     label: String,
@@ -320,6 +324,7 @@ enum RecoveredQueueJobAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateQueueJob {
+    pub local_submitter: Option<crate::local_egress::gateway::VerifiedLocalAgent>,
     pub job_type: String,
     pub label: String,
     pub requester_session_id: Option<String>,
@@ -1693,7 +1698,7 @@ impl RetainedQueueStore {
             return get_queue_job_conn(&conn, job_id);
         }
         let process_ceiling = queue_job_process_ceiling(admission_policy.process_reserve);
-        let child = match spawn_queue_job_process(&job, process_ceiling) {
+        let child = match spawn_queue_job_process(&job, process_ceiling, state_dir) {
             Ok(child) => child,
             Err(error) => {
                 finish_queue_job_conn(&conn, &job, "failed", None, Some(message_queue_db_path))?;
@@ -3816,6 +3821,8 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_column(conn, "queue_jobs", "local_agent_id", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "local_binding_json", "TEXT")?;
     ensure_column(conn, "queue_jobs", "quiet_alerted_at", "TEXT")?;
     ensure_column(
         conn,
@@ -3968,10 +3975,16 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
 fn create_queue_job_conn(
     conn: &Connection,
     state_dir: &Path,
-    request: CreateQueueJob,
+    mut request: CreateQueueJob,
     max_wait_seconds: i64,
 ) -> Result<QueueJobRecord> {
     let id = generate_queue_job_id();
+    let local_binding = local_wall::prepare(state_dir, &id, &mut request)?;
+    let local_binding_json = local_binding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let local_agent_id = request.local_submitter.as_ref().map(|a| a.agent_id());
     let job_dir = state_dir.join(&id);
     std::fs::create_dir_all(&job_dir)
         .with_context(|| format!("failed to create queue job dir {}", job_dir.display()))?;
@@ -3987,7 +4000,10 @@ fn create_queue_job_conn(
         None
     };
     let exit_code_path = job_dir.join("exit.code");
-    let wrapper_path = job_dir.join("run.zsh");
+    let wrapper_path = local_binding
+        .as_ref()
+        .map(|b| b.command().to_path_buf())
+        .unwrap_or_else(|| job_dir.join("run.zsh"));
     let log_path = logs_dir.join(format!("{id}.log"));
     OpenOptions::new()
         .create_new(true)
@@ -3996,14 +4012,16 @@ fn create_queue_job_conn(
     let readable_log = logs_dir.join(queue_log_filename(&request.label, &id));
     std::fs::hard_link(&log_path, &readable_log)
         .with_context(|| format!("failed to create readable log {}", readable_log.display()))?;
-    write_queue_job_wrapper(
-        &wrapper_path,
-        &request.cwd,
-        request.argv.as_deref(),
-        script_path.as_deref(),
-        &request.env,
-        &exit_code_path,
-    )?;
+    if local_binding.is_none() {
+        write_queue_job_wrapper(
+            &wrapper_path,
+            &request.cwd,
+            request.argv.as_deref(),
+            script_path.as_deref(),
+            &request.env,
+            &exit_code_path,
+        )?;
+    }
     let queued_at = now_rfc3339();
     let argv_json = request
         .argv
@@ -4019,11 +4037,12 @@ fn create_queue_job_conn(
              gpu_percent, memory_bytes, state,
              holding_reason, queued_at, started_at, finished_at, pid,
              process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
-             queued_notified_at, started_notified_at, completion_notified_at, rank_tickets)
+             queued_notified_at, started_notified_at, completion_notified_at, rank_tickets,
+             local_agent_id, local_binding_json)
         VALUES
             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending',
              NULL, ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?17, ?18,
-             NULL, NULL, NULL, ?19)
+             NULL, NULL, NULL, ?19, ?20, ?21)
         "#,
         params![
             id,
@@ -4045,6 +4064,8 @@ fn create_queue_job_conn(
             exit_code_path.display().to_string(),
             wrapper_path.display().to_string(),
             request.rank_tickets.as_deref().map(rank_tickets_json),
+            local_agent_id,
+            local_binding_json,
         ],
     )?;
     get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")
@@ -4138,7 +4159,7 @@ fn get_queue_job_runtime_conn(
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets, owner
+               rank_tickets, owner, local_agent_id, local_binding_json
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -4155,6 +4176,8 @@ fn get_queue_job_runtime_conn(
     statement
         .query_row(params![job_id], |row| {
             Ok(QueueJobRuntimeRecord {
+                local_agent_id: row.get(28)?,
+                local_binding_json: row.get(29)?,
                 owner: row.get(27)?,
                 id: row.get(0)?,
                 job_type: row.get(1)?,
@@ -4199,7 +4222,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets, owner
+               rank_tickets, owner, local_agent_id, local_binding_json
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -4207,6 +4230,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
     let rows = statement
         .query_map([], |row| {
             Ok(QueueJobRuntimeRecord {
+                local_agent_id: row.get(28)?,
+                local_binding_json: row.get(29)?,
                 owner: row.get(27)?,
                 id: row.get(0)?,
                 job_type: row.get(1)?,
@@ -5410,10 +5435,41 @@ fn perf_blocked_by_tests_after_perf(jobs: &[QueueJobRuntimeRecord]) -> bool {
         })
 }
 
+enum QueueChild {
+    Hosted(Child),
+    #[cfg(target_os = "macos")]
+    Local(crate::local_sockets::launch::RegisteredChild),
+}
+impl QueueChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Hosted(c) => c.id(),
+            #[cfg(target_os = "macos")]
+            Self::Local(c) => c.id(),
+        }
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Hosted(c) => c.try_wait(),
+            #[cfg(target_os = "macos")]
+            Self::Local(c) => c.try_wait(),
+        }
+    }
+    #[cfg(test)]
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Hosted(c) => c.wait(),
+            #[cfg(target_os = "macos")]
+            Self::Local(c) => c.wait(),
+        }
+    }
+}
+
 fn spawn_queue_job_process(
     job: &QueueJobRuntimeRecord,
     process_ceiling: Option<u64>,
-) -> Result<Child> {
+    state_dir: &Path,
+) -> Result<QueueChild> {
     let wrapper_path = job
         .wrapper_path
         .as_deref()
@@ -5436,6 +5492,13 @@ fn spawn_queue_job_process(
     let stderr = log
         .try_clone()
         .with_context(|| format!("failed to clone queue job log {log_path}"))?;
+    match (&job.local_agent_id, &job.local_binding_json) {
+        (Some(agent), Some(binding)) => {
+            return local_wall::spawn(state_dir, agent, binding, (log, stderr, process_ceiling))
+        }
+        (None, None) => {}
+        _ => bail!("incomplete local queue binding"),
+    }
     let mut command = Command::new("/bin/zsh");
     command
         .arg(wrapper_path)
@@ -5472,6 +5535,7 @@ fn spawn_queue_job_process(
     command
         .spawn()
         .with_context(|| format!("failed to start queue job {}", job.id))
+        .map(QueueChild::Hosted)
 }
 
 #[allow(clippy::too_many_arguments)] // the monitor thread takes each owned job input separately
@@ -5479,7 +5543,7 @@ fn monitor_queue_job_completion(
     state_dir: PathBuf,
     message_queue_db_path: PathBuf,
     job_id: String,
-    mut child: Child,
+    mut child: QueueChild,
     timeout_seconds: i64,
     memory_bytes: Option<i64>,
     process_limit: Option<i64>,
@@ -7658,7 +7722,7 @@ fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
     }
 }
 
-fn terminate_child_process_group_with_grace(child: &mut Child, pgid: i64, grace_seconds: u64) {
+fn terminate_child_process_group_with_grace(child: &mut QueueChild, pgid: i64, grace_seconds: u64) {
     terminate_process_group(pgid, false);
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
     let mut force_sent = false;
@@ -8091,6 +8155,11 @@ fn list_queue_jobs_conn(
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
     let rank_column = queue_job_rank_projection(conn)?;
+    let local_column = if queue_job_columns(conn)?.contains("local_agent_id") {
+        "local_agent_id"
+    } else {
+        "NULL AS local_agent_id"
+    };
     let quiet_column = if queue_job_columns(conn)?.contains("quiet_alerted_at") {
         "quiet_alerted_at"
     } else {
@@ -8101,7 +8170,7 @@ fn list_queue_jobs_conn(
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}
         FROM queue_jobs
     "#
     );
@@ -8132,6 +8201,11 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
     let rank_column = queue_job_rank_projection(conn)?;
+    let local_column = if queue_job_columns(conn)?.contains("local_agent_id") {
+        "local_agent_id"
+    } else {
+        "NULL AS local_agent_id"
+    };
     let quiet_column = if queue_job_columns(conn)?.contains("quiet_alerted_at") {
         "quiet_alerted_at"
     } else {
@@ -8142,7 +8216,7 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -8267,6 +8341,7 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         None => None,
     };
     Ok(QueueJobRecord {
+        local_agent_id: row.get(28)?,
         id: row.get(0)?,
         job_type: row.get(1)?,
         label: row.get(2)?,
@@ -8653,6 +8728,7 @@ mod tests {
         let perf_job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "perf".into(),
                 label: "oversized perf".into(),
                 requester_session_id: Some("requester".into()),
@@ -8672,6 +8748,7 @@ mod tests {
         let smaller_perf = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "perf".into(),
                 label: "smaller perf".into(),
                 requester_session_id: Some("requester".into()),
@@ -8691,6 +8768,7 @@ mod tests {
         let _tests_job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "tests".into(),
                 label: "eligible tests".into(),
                 requester_session_id: Some("requester".into()),
@@ -8734,6 +8812,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "perf".into(),
                 label: "blocked perf".into(),
                 requester_session_id: Some("requester".into()),
@@ -8795,6 +8874,7 @@ mod tests {
         RetainedQueueStore::create_queue_job_in_state_dir(
             state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: job_type.into(),
                 label: label.into(),
                 requester_session_id: Some("requester".into()),
@@ -8998,6 +9078,7 @@ mod tests {
         let state_dir = unique_temp_path("queue-ended-reasons");
         let base = create_test_job(&state_dir, "background", "job");
         let with = |state: &str| QueueJobRecord {
+            local_agent_id: None,
             state: state.into(),
             queued_at: "2026-09-28T10:00:00Z".into(),
             finished_at: Some("2026-09-28T10:05:30Z".into()),
@@ -9093,6 +9174,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: "background".into(),
                     label: label.into(),
                     requester_session_id: Some("requester".into()),
@@ -9177,6 +9259,7 @@ mod tests {
         let pending = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
             &listing_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "background".into(),
                 label: "diverged".into(),
                 requester_session_id: Some("requester".into()),
@@ -9306,6 +9389,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "perf".into(),
                 label: "guarded perf".into(),
                 requester_session_id: Some("requester".into()),
@@ -9399,6 +9483,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: job_type.into(),
                 label: label.into(),
                 requester_session_id: Some("requester".into()),
@@ -9569,6 +9654,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "tests".into(),
                 label: "memory hog".into(),
                 requester_session_id: Some("requester".into()),
@@ -9640,6 +9726,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "tests".into(),
                 label: "waits for memory".into(),
                 requester_session_id: Some("requester".into()),
@@ -9695,6 +9782,7 @@ mod tests {
         RetainedQueueStore::create_queue_job_in_state_dir(
             state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: job_type.into(),
                 label: label.into(),
                 requester_session_id: Some("requester".into()),
@@ -10001,6 +10089,7 @@ mod tests {
         RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "perf".into(),
                 label: "bench".into(),
                 requester_session_id: Some("requester".into()),
@@ -10307,7 +10396,10 @@ mod tests {
                 Path::new(job.exit_code_path.as_ref().unwrap()),
             )
             .unwrap();
-            let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
+            let status = spawn_queue_job_process(&job, None, Path::new("/"))
+                .unwrap()
+                .wait()
+                .unwrap();
             let log = fs::read_to_string(job.log_path.as_ref().unwrap()).unwrap();
             assert!(status.success(), "{log}");
             assert!(log.contains("n/dev/null"), "stdin missing: {log}");
@@ -10347,6 +10439,8 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "ceiling".into(),
             id: "job-process-ceiling".to_owned(),
@@ -10382,7 +10476,7 @@ mod tests {
         let Some(ceiling) = queue_job_process_ceiling(7) else {
             return;
         };
-        let status = spawn_queue_job_process(&job, Some(ceiling))
+        let status = spawn_queue_job_process(&job, Some(ceiling), Path::new("/"))
             .unwrap()
             .wait()
             .unwrap();
@@ -10484,6 +10578,7 @@ mod tests {
     #[test]
     fn queue_hold_context_names_other_jobs_and_explains_global_and_type_gates() {
         let record = |id: &str, kind: &str, state: &str, reason: Option<&str>| QueueJobRecord {
+            local_agent_id: None,
             quiet_alerted_at: None,
             id: id.into(),
             label: format!("friendly-{id}"),
@@ -10583,6 +10678,7 @@ mod tests {
     fn queue_labels_resolve_uniquely_and_readable_logs_share_output() {
         let root = unique_temp_path("queue-friendly-labels");
         let request = CreateQueueJob {
+            local_submitter: None,
             job_type: "tests".into(),
             label: "1374-demo-api-8974".into(),
             requester_session_id: Some("a".into()),
@@ -10671,6 +10767,8 @@ mod tests {
     #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job_missing_exit".to_owned(),
@@ -10729,6 +10827,8 @@ mod tests {
         let log_path = unique_temp_path("completion-log");
         fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
         let job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job_completion_log".to_owned(),
@@ -10793,6 +10893,8 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job-missing-executable".to_owned(),
@@ -10824,7 +10926,10 @@ mod tests {
             rank_tickets: None,
         };
 
-        let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
+        let status = spawn_queue_job_process(&job, None, Path::new("/"))
+            .unwrap()
+            .wait()
+            .unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert_eq!(status.code(), Some(127));
         assert!(log.contains("command not found: sm-command-that-does-not-exist"));
@@ -10861,6 +10966,8 @@ mod tests {
         )));
         assert!(!wrapper.contains("source \"$1\""));
         let job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job-missing-script-executable".to_owned(),
@@ -10892,7 +10999,10 @@ mod tests {
             rank_tickets: None,
         };
 
-        let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
+        let status = spawn_queue_job_process(&job, None, Path::new("/"))
+            .unwrap()
+            .wait()
+            .unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert_eq!(status.code(), Some(127));
         assert!(log.contains("command not found: sm-script-command-that-does-not-exist"));
@@ -10905,6 +11015,8 @@ mod tests {
     #[test]
     fn zero_timeout_never_expires() {
         let mut job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job_unbounded".to_owned(),
@@ -10949,6 +11061,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: job_type.to_owned(),
                     label: label.to_owned(),
                     requester_session_id: Some("requester".to_owned()),
@@ -11023,6 +11136,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: "background".to_owned(),
                     label: label.to_owned(),
                     requester_session_id: Some("requester".to_owned()),
@@ -11125,6 +11239,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: job_type.into(),
                     label: label.into(),
                     requester_session_id: Some("requester".into()),
@@ -11185,6 +11300,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: job_type.to_owned(),
                     label: label.to_owned(),
                     requester_session_id: Some("requester".to_owned()),
@@ -11275,6 +11391,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: job_type.to_owned(),
                     label: label.to_owned(),
                     requester_session_id: Some("requester".to_owned()),
@@ -12082,6 +12199,8 @@ mod tests {
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
+            local_agent_id: None,
+            local_binding_json: None,
             owner: None,
             label: "friendly-job".into(),
             id: "job-naive-timeout".to_owned(),
@@ -12350,6 +12469,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: job_type.into(),
                 label: label.into(),
                 requester_session_id: Some("requester".into()),

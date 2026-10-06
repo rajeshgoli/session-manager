@@ -444,6 +444,7 @@ fn prepare(
     let job = RetainedQueueStore::create_owned_queue_job(
         &queue_dir(state),
         CreateQueueJob {
+local_submitter: None,
             job_type: "review".into(),
             label: format!("review {short} #{} r{}", r.pr_number, r.round),
             requester_session_id: r.requester_session_id.clone(),
@@ -965,6 +966,7 @@ mod tests {
             RetainedQueueStore::create_owned_queue_job(
                 &queue_dir(&state),
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: "review".into(),
                     label: format!("review far #1851 r1 step {index}"),
                     requester_session_id: Some("author".into()),

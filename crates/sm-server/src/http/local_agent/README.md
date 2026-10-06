@@ -54,7 +54,7 @@ replaced before typed handler extraction; recipient fields are preserved.
 | `/scheduler/remind` | Query `session_id` is caller; preserve reminder message and timing |
 | `DELETE /scheduler/remind/{id}` | Stored reminder recipient must be caller |
 | `DELETE /review-requests/{id}` | Stored requester must be caller, regardless of notify recipient |
-| `DELETE /queue-jobs/{id}`, `/queue-jobs/{id}/cancel` | Fail closed pending #2009's persisted submitting-agent check |
+| `DELETE /queue-jobs/{id}`, `/queue-jobs/{id}/cancel` | Stored submitting agent must be caller; notification recipient grants no authority |
 | `GET /reparent-requests` and `/{id}` | Verified session headers and existing consent visibility rules |
 
 Explicitly admitted GETs are agent-facing session, registry, node, human,
@@ -70,9 +70,11 @@ Adding a new route never implicitly grants local-agent access. #1956 consumes
 the verified identity for provider-level no-spawn enforcement; this change adds
 no opencode implementation.
 
-Queue submission and cancellation return 503 for verified local agents until
-#2009 installs durable wall binding. This prevents a partially deployed gateway
-from executing a user command on the host. Hosted/owner queues are unchanged.
+Queue submission requires host-registered immutable wall settings and persists
+the verified submitting agent separately from the notification recipient. The
+queue refuses execution if registration, command integrity, or the live socket
+service binding is missing or changed. See `queue/LOCAL_WALL.md` for host setup.
+Hosted/owner queues are unchanged.
 #1974 still owns final runtime composition before local-agent launch.
 
 ## Verification
@@ -82,5 +84,5 @@ middleware to prove either verified dispatch or denial, including scope isolatio
 and preservation of targets. Real-router tests verify forged/omitted identities,
 reminder persistence and cancellation, review cancellation with notify elsewhere,
 parent authorization, own/cross-agent status updates, terminal/owner denials and
-the temporary queue boundary. The unsigned-request test confirms that a forged
+durable queue identity, environment replacement, and own-job cancellation. The unsigned-request test confirms that a forged
 bare local-agent header has no effect on existing hosted/owner behavior.

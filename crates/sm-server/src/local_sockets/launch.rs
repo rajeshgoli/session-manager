@@ -78,6 +78,38 @@ impl LaunchBinding {
         environment: &[(OsString, OsString)],
         checkout: &Path,
     ) -> io::Result<RegisteredChild> {
+        self.spawn_inner(executable, arguments, environment, checkout, None)
+    }
+
+    pub(crate) fn queue_identity(&self) -> io::Result<(&str, &Path)> {
+        if self.control.is_some() {
+            return Err(io::Error::other(
+                "queue launch must not carry a provider control listener",
+            ));
+        }
+        Ok((self.service.agent_id(), &self.profile))
+    }
+
+    pub(crate) fn spawn_queue(
+        &self,
+        executable: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        checkout: &Path,
+        output: (std::fs::File, std::fs::File, Option<u64>),
+    ) -> io::Result<RegisteredChild> {
+        self.queue_identity()?;
+        self.spawn_inner(executable, arguments, environment, checkout, Some(output))
+    }
+
+    fn spawn_inner(
+        &self,
+        executable: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        checkout: &Path,
+        output: Option<(std::fs::File, std::fs::File, Option<u64>)>,
+    ) -> io::Result<RegisteredChild> {
         let (gate, reader) = UnixStream::pair()?;
         // Reserve separate copies above the target descriptors. This avoids
         // dup2 overwriting a source when the host already has many open FDs.
@@ -115,13 +147,30 @@ impl LaunchBinding {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // SAFETY: only async-signal-safe dup2 is called in the forked child.
+        let ceiling = if let Some((stdout, stderr, ceiling)) = output {
+            command
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            ceiling
+        } else {
+            None
+        };
+        // SAFETY: dup2 and setrlimit are async-signal-safe.
         unsafe {
             command.pre_exec(move || {
                 if control_fd.is_some_and(|fd| libc::dup2(fd, CONTROL_FD) == -1)
                     || libc::dup2(reader_fd, GATE_FD) == -1
                 {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(ceiling) = ceiling {
+                    let limit = libc::rlimit {
+                        rlim_cur: ceiling,
+                        rlim_max: ceiling,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
