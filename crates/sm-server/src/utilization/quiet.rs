@@ -371,6 +371,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir(
                 &dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: "background".into(),
                     label: label.into(),
                     requester_session_id: None,

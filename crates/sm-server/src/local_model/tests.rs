@@ -230,6 +230,7 @@ fn perf_and_memory_guard_wait_for_confirmed_model_stop_before_a_job_is_selected(
     let job = crate::queue::RetainedQueueStore::create_queue_job_in_state_dir(
         &root,
         crate::queue::CreateQueueJob {
+            local_submitter: None,
             job_type: "tests".into(),
             label: "must survive model unload".into(),
             requester_session_id: Some("owner".into()),
@@ -394,6 +395,7 @@ fn model_load_cannot_race_running_perf_or_cooldown() {
     let job = crate::queue::RetainedQueueStore::create_queue_job_in_state_dir(
         &root,
         crate::queue::CreateQueueJob {
+            local_submitter: None,
             job_type: "perf".into(),
             label: "quiet run".into(),
             requester_session_id: None,

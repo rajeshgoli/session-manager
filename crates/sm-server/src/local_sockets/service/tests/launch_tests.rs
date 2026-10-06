@@ -2,16 +2,16 @@ use super::*;
 use crate::local_sockets::launch::LaunchBinding;
 use std::{ffi::OsString, process::Command};
 
-struct PreparedLaunch {
+pub(crate) struct PreparedLaunch {
     _directory: TestDirectory,
     service: Arc<AgentService>,
     binding: LaunchBinding,
     paths: serde_json::Value,
-    environment: Vec<(OsString, OsString)>,
+    pub(crate) environment: Vec<(OsString, OsString)>,
     control_port: u16,
 }
 
-fn prepare_launch() -> PreparedLaunch {
+pub(crate) fn prepare_launch() -> PreparedLaunch {
     let directory = TestDirectory::new();
     let broker = directory.path().join("h/s/a/tmp/b");
     fs::create_dir_all(&broker).unwrap();
@@ -21,8 +21,8 @@ fn prepare_launch() -> PreparedLaunch {
     let hub = BrokerHub::new(
         PortPolicy::new(PortConfiguration {
             agent_control: port..=port,
-            gateway: 22000..=22000,
-            egress: 23000..=23000,
+            gateway: 18600..=18600,
+            egress: 18700..=18700,
             model: 24000,
             judge: 24001,
         })
@@ -81,7 +81,7 @@ fn prepare_launch() -> PreparedLaunch {
 }
 
 impl PreparedLaunch {
-    fn queue_binding(&self) -> LaunchBinding {
+    pub(crate) fn queue_binding(&self) -> LaunchBinding {
         LaunchBinding::new(
             self.service.clone(),
             None,
@@ -91,7 +91,7 @@ impl PreparedLaunch {
         )
         .unwrap()
     }
-    fn path(&self, key: &str) -> PathBuf {
+    pub(crate) fn path(&self, key: &str) -> PathBuf {
         PathBuf::from(self.paths[key].as_str().unwrap())
     }
     fn run(&self, executable: &Path, arguments: &[OsString], environment: &[(OsString, OsString)]) {

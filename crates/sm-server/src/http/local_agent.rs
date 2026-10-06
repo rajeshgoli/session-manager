@@ -312,17 +312,5 @@ fn bind_caller(
     Ok(Bytes::from(serde_json::to_vec(&value)?))
 }
 
-/// Call before any queue action; #2009 replaces this closed boundary with
-/// persistence and enforcement of the verified submitting agent's wall.
-pub(super) fn require_queue_confinement() -> Result<(), ApiError> {
-    if crate::local_identity::current().is_some() {
-        return Err(ApiError::Status {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            detail: "local-agent queue confinement is not installed".into(),
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;

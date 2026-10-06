@@ -169,6 +169,9 @@ impl BrokerHub {
 }
 
 impl AgentService {
+    pub(crate) fn agent_id(&self) -> &str {
+        &self.state.agent
+    }
     pub fn endpoint(&self) -> &Path {
         &self.endpoint.path
     }
@@ -502,6 +505,9 @@ fn send(
     }
     Ok(())
 }
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use tests::launch_tests::prepare_launch;
 
 #[cfg(test)]
 mod tests {
@@ -1149,5 +1155,5 @@ mod tests {
         );
     }
 
-    mod launch_tests;
+    pub(crate) mod launch_tests;
 }

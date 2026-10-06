@@ -386,6 +386,7 @@ mod tests {
         let job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
+                local_submitter: None,
                 job_type: "tests".to_owned(),
                 label: "authority fixture".to_owned(),
                 requester_session_id: Some("requester1".to_owned()),

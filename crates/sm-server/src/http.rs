@@ -7474,10 +7474,11 @@ fn project_session_obligations(
                 .entry(id.to_owned())
                 .or_insert_with(|| new_obligation_entry(id));
             entry["waiting_on"].as_array_mut().unwrap().push(json!({
-                "kind": "queue_job", "id": job.id, "label": job.label,
-                "state": job.state, "since": job.queued_at,
-                "requester_session_id": job.requester_session_id,
-            }));
+                    "kind": "queue_job", "id": job.id, "label": job.label,
+                    "state": job.state, "since": job.queued_at,
+                    "requester_session_id": job.requester_session_id,
+            "local_agent_id": job.local_agent_id,
+                }));
         }
     }
     #[derive(Default)]
@@ -8022,7 +8023,6 @@ async fn create_queue_job(
     headers: HeaderMap,
     Json(payload): Json<QueueJobCreateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    local_agent::require_queue_confinement()?;
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/queue-jobs")?;
     ensure_core_writes_enabled(&state)?;
 
@@ -8141,9 +8141,18 @@ async fn create_queue_job(
     let rank_tickets = queue_job_rank_tickets(&state, requester_session_id.as_deref(), &cwd_path)?;
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
+    if let Some(agent) = crate::local_identity::current() {
+        crate::queue::local_wall::validate(&queue_state_dir, agent.agent_id()).map_err(
+            |error| ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: format!("local queue wall unavailable: {error}"),
+            },
+        )?;
+    }
     let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
         &queue_state_dir,
         CreateQueueJob {
+            local_submitter: crate::local_identity::current(),
             job_type: job_type.to_owned(),
             label,
             requester_session_id,
@@ -8232,7 +8241,6 @@ fn cancel_queue_job_inner(
     web_owner: bool,
     detail: Option<&Value>,
 ) -> Result<Json<Value>, ApiError> {
-    local_agent::require_queue_confinement()?;
     if !web_owner {
         ensure_session_allowed_from_parts(
             &state.config,
@@ -8245,13 +8253,20 @@ fn cancel_queue_job_inner(
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
     let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
-    let job_id = RetainedQueueStore::resolve_queue_job_from_path(
+    let submitted_job = RetainedQueueStore::resolve_queue_job_from_path(
         &queue_state_dir.join("queue_runner.db"),
         job_id,
     )
     .map_err(queue_lookup_error)?
-    .ok_or(ApiError::NotFound("Queue job not found"))?
-    .id;
+    .ok_or(ApiError::NotFound("Queue job not found"))?;
+    if let Some(agent) = crate::local_identity::current() {
+        if submitted_job.local_agent_id.as_deref() != Some(agent.agent_id()) {
+            return Err(local_agent::denied(
+                "local agents may cancel only their own submitted jobs",
+            ));
+        }
+    }
+    let job_id = submitted_job.id;
     let Some(job) = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
         &queue_state_dir,
         &message_queue_db_path,
@@ -17065,6 +17080,7 @@ fn queue_job_response_with_names(
         "type": job.job_type,
         "label": job.label,
         "requester_session_id": job.requester_session_id,
+        "local_agent_id": job.local_agent_id,
         "requester_name": requester_name,
         "notify_session_id": job.notify_session_id,
         "notify_name": notify_name,
@@ -17342,6 +17358,7 @@ mod tests {
             findings_json: None,
         };
         let job = QueueJobRecord {
+            local_agent_id: None,
             quiet_alerted_at: None,
             id: "j1".into(),
             job_type: "tests".into(),
@@ -23863,6 +23880,7 @@ mod tests {
             RetainedQueueStore::create_queue_job_in_state_dir(
                 &state_dir,
                 CreateQueueJob {
+                    local_submitter: None,
                     job_type: job_type.into(),
                     label: label.into(),
                     requester_session_id: None,
@@ -24054,6 +24072,7 @@ mod tests {
             let job = RetainedQueueStore::create_queue_job_in_state_dir(
                 &queue_dir,
                 crate::queue::CreateQueueJob {
+                    local_submitter: None,
                     job_type: "test".into(),
                     label: format!("history-{index}"),
                     requester_session_id: Some("requester".into()),

@@ -578,3 +578,98 @@ async fn real_router_preserves_parent_authorization_and_hosted_owner_requests() 
         StatusCode::FORBIDDEN
     );
 }
+
+#[tokio::test]
+async fn queue_identity_survives_storage_and_notify_cannot_cancel() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.canonicalize().unwrap();
+    let checkout = root.join("checkout");
+    let agent_state = root.join("wall-a");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(&agent_state).unwrap();
+    let profile = agent_state.join("wall.sb");
+    let shell = agent_state.join("zsh");
+    // This test exercises durable submission only; production-profile process
+    // confinement is tested with the native launch fixture.
+    fs::write(
+        &profile,
+        "(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))",
+    )
+    .unwrap();
+    fs::write(&shell, "fixture shell, never executed").unwrap();
+    let queue_dir = fixture.state.config.queue_runner_state_dir();
+    fs::create_dir_all(&queue_dir).unwrap();
+    let queue_dir = queue_dir.canonicalize().unwrap();
+    let spec = crate::queue::local_wall::WallSpec {
+        agent_state,
+        checkout: checkout.clone(),
+        profile: profile.clone(),
+        shell,
+        environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+        gateway_port: 18600,
+        egress_port: 18700,
+    };
+    let fingerprint =
+        crate::queue::local_wall::register(&queue_dir, "agent-a", spec.clone()).unwrap();
+    assert_eq!(
+        crate::queue::local_wall::register(&queue_dir, "agent-a", spec.clone()).unwrap(),
+        fingerprint
+    );
+    let mut changed = spec;
+    changed.egress_port = 18701;
+    assert!(crate::queue::local_wall::register(&queue_dir, "agent-a", changed).is_err());
+    let app = router(fixture.state.clone());
+    for requester in ["", "agent-b"] {
+        let response = app.clone().oneshot(signed_request("agent-a", "POST", "/queue-jobs", json!({
+            "type":"background", "cwd":checkout, "argv":["/usr/bin/true"],
+            "requester_session_id":requester, "notify_target":"agent-b",
+            "local_agent_id":"agent-b", "local_submitter":"agent-b",
+            "env":{"CLAUDE_SESSION_MANAGER_ID":"agent-b","SM_API_URL":"http://127.0.0.1:8420","DYLD_INSERT_LIBRARIES":"/tmp/evil"}
+        }))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body["requester_session_id"], "agent-a");
+        assert_eq!(body["local_agent_id"], "agent-a");
+        assert_eq!(body["notify_session_id"], "agent-b");
+        let id = body["id"].as_str().unwrap();
+        let conn = rusqlite::Connection::open(queue_dir.join("queue_runner.db")).unwrap();
+        let (agent, binding, env): (String, String, String) = conn
+            .query_row(
+                "SELECT local_agent_id, local_binding_json, env_json FROM queue_jobs WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, "agent-a");
+        let binding: Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["wall_sha256"], fingerprint);
+        let env: Value = serde_json::from_str(&env).unwrap();
+        assert_eq!(env["CLAUDE_SESSION_MANAGER_ID"], "agent-a");
+        assert_eq!(env["SM_API_URL"], "http://127.0.0.1:18600");
+        assert!(env.get("DYLD_INSERT_LIBRARIES").is_none());
+        let restored =
+            RetainedQueueStore::get_queue_job_from_path(&queue_dir.join("queue_runner.db"), id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored.local_agent_id.as_deref(), Some("agent-a"));
+        let target = format!("/queue-jobs/{id}/cancel");
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_request("agent-b", "POST", &target, json!({})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_request("agent-a", "POST", &target, json!({})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    fs::write(profile, "changed after registration").unwrap();
+    assert!(crate::queue::local_wall::validate(&queue_dir, "agent-a").is_err());
+}
