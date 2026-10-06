@@ -15,6 +15,7 @@ use clap::Parser;
 use sm_server::{
     activity_ledger::ActivityRecorder,
     config::AppConfig,
+    eprintln,
     handover::{self, Shutdown},
     http::{router, AppState, BtwWorkers},
     owner_settings,
@@ -25,6 +26,14 @@ use sm_server::{
     usage_identity::IdentityPoller,
 };
 use tokio::net::TcpListener;
+
+/// Run one pass of a background loop. A panic ends the pass, not the loop:
+/// a dead loop stops its work silently until the next restart (#1996).
+fn run_background_pass(name: &str, pass: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)).is_err() {
+        eprintln!("{name} pass panicked; the loop continues");
+    }
+}
 
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
@@ -256,15 +265,17 @@ async fn main() -> Result<()> {
                 if queue_shutdown.is_stopped() {
                     break;
                 }
-                if let Err(error) =
-                    RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir_with_policy(
-                        &retry_queue_state_dir,
-                        &message_queue_db_path,
-                        admission_policy,
-                    )
-                {
-                    eprintln!("queue completion wake retry failed: {error:#}");
-                }
+                run_background_pass("queue completion wake retry", || {
+                    if let Err(error) =
+                        RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir_with_policy(
+                            &retry_queue_state_dir,
+                            &message_queue_db_path,
+                            admission_policy,
+                        )
+                    {
+                        eprintln!("queue completion wake retry failed: {error:#}");
+                    }
+                });
             });
         }
 
@@ -294,9 +305,11 @@ async fn main() -> Result<()> {
             if reparent_shutdown.is_stopped() {
                 break;
             }
-            if let Err(error) = reparent_state.reconcile_reparent_background() {
-                eprintln!("reparent background reconciliation failed: {error:#}");
-            }
+            run_background_pass("reparent background reconciliation", || {
+                if let Err(error) = reparent_state.reconcile_reparent_background() {
+                    eprintln!("reparent background reconciliation failed: {error:#}");
+                }
+            });
         });
         if state.config().rust_core.runtime_enabled {
             let follow_state = state.clone();
@@ -307,14 +320,16 @@ async fn main() -> Result<()> {
                     if follow_shutdown.is_stopped() {
                         break;
                     }
-                    match follow_state.run_follow_pass(pass % FOLLOW_SWEEP_EVERY_PASSES == 0) {
-                        Ok(problems) => {
-                            for problem in problems {
-                                eprintln!("owner follow: {problem}");
+                    run_background_pass("owner follow", || {
+                        match follow_state.run_follow_pass(pass % FOLLOW_SWEEP_EVERY_PASSES == 0) {
+                            Ok(problems) => {
+                                for problem in problems {
+                                    eprintln!("owner follow: {problem}");
+                                }
                             }
+                            Err(error) => eprintln!("owner follow pass failed: {error:#}"),
                         }
-                        Err(error) => eprintln!("owner follow pass failed: {error:#}"),
-                    }
+                    });
                     pass = pass.wrapping_add(1);
                     thread::sleep(FOLLOW_DELIVERY_INTERVAL);
                 }
@@ -330,9 +345,11 @@ async fn main() -> Result<()> {
                 if finished_shutdown.is_stopped() {
                     break;
                 }
-                if let Err(error) = turns.sweep(time::OffsetDateTime::now_utc()) {
-                    eprintln!("finished row sweep failed: {error:#}");
-                }
+                run_background_pass("finished row sweep", || {
+                    if let Err(error) = turns.sweep(time::OffsetDateTime::now_utc()) {
+                        eprintln!("finished row sweep failed: {error:#}");
+                    }
+                });
             });
             let queue_delivery_state = state.clone();
             let queue_delivery_shutdown = shutdown.clone();
@@ -340,9 +357,11 @@ async fn main() -> Result<()> {
                 if queue_delivery_shutdown.is_stopped() {
                     break;
                 }
-                if let Err(error) = queue_delivery_state.drain_background_retry_wakes() {
-                    eprintln!("background wake delivery retry failed: {error:#}");
-                }
+                run_background_pass("background wake delivery retry", || {
+                    if let Err(error) = queue_delivery_state.drain_background_retry_wakes() {
+                        eprintln!("background wake delivery retry failed: {error:#}");
+                    }
+                });
                 thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
             });
         }
