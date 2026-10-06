@@ -168,7 +168,154 @@ static void provider_control(uint16_t port) {
     close(client); close(fd);
 }
 
+static void inherited_exec(const char *application, int method) {
+    int family = method % 2 ? AF_INET6 : AF_INET;
+    int fd;
+    if (method == 6) {
+        fd = socket(family, SOCK_STREAM, 0);
+        struct sockaddr_storage address;
+        socklen_t size = loopback(&address, family, 0);
+        assert(bind(fd, (struct sockaddr *)&address, size) == 0);
+    } else fd = listening(family);
+    assert(fcntl(fd, F_SETFD, 0) == 0);
+    int copy = dup(fd);
+    assert(copy >= 0);
+    char *failed_arguments[] = { "missing", NULL };
+    char *empty_environment[] = { NULL };
+    assert(execve("/nonexistent-sm-adapter-test", failed_arguments, empty_environment) == -1 && errno == ENOENT);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        char first[32], second[32], family_text[32];
+        snprintf(first, sizeof(first), "%d", fd);
+        snprintf(second, sizeof(second), "%d", copy);
+        snprintf(family_text, sizeof(family_text), "%d", family);
+        char *arguments[] = { (char *)application, "inherited-exec", first, second, family_text, NULL };
+        char *environment[] = { "DYLD_INSERT_LIBRARIES=/tmp/forged.dylib", "SM_BROKER_ENDPOINT=/tmp/forged", NULL };
+        assert(setenv("DYLD_INSERT_LIBRARIES", "/tmp/forged.dylib", 1) == 0);
+        const char *leaf = strrchr(application, '/');
+        assert(leaf);
+        char directory[1024];
+        assert((size_t)(leaf - application) < sizeof(directory));
+        memcpy(directory, application, (size_t)(leaf - application));
+        directory[leaf - application] = 0;
+        assert(setenv("PATH", directory, 1) == 0);
+        switch (method) {
+            case 0: (void)execve(application, arguments, environment); break;
+            case 1: (void)execv(application, arguments); break;
+            case 2: (void)execvp(leaf + 1, arguments); break;
+            case 3: (void)execvP(leaf + 1, directory, arguments); break;
+            case 4: (void)execl(application, application, "inherited-exec", first, second, family_text, (char *)NULL); break;
+            case 5: (void)execlp(leaf + 1, application, "inherited-exec", first, second, family_text, (char *)NULL); break;
+            case 6: (void)execle(application, application, "inherited-exec", first, second, family_text, (char *)NULL, empty_environment); break;
+        }
+        _exit(127);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    roundtrip(fd, family);
+    close(copy); close(fd);
+}
+
+static void inherited_spawn(const char *application) {
+    for (int defaults = 0; defaults < 4; ++defaults) {
+        int fd = listening(AF_INET);
+        posix_spawn_file_actions_t actions;
+        assert(posix_spawn_file_actions_init(&actions) == 0);
+        if (defaults == 2) assert(posix_spawn_file_actions_addinherit_np(&actions, fd) == 0);
+        assert(posix_spawn_file_actions_adddup2(&actions, fd, 101) == 0);
+        assert(posix_spawn_file_actions_adddup2(&actions, 101, 102) == 0);
+        if (defaults != 2) assert(posix_spawn_file_actions_addclose(&actions, fd) == 0);
+        assert(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) == 0);
+        posix_spawnattr_t attributes;
+        assert(posix_spawnattr_init(&attributes) == 0);
+        if (defaults == 1 || defaults == 2) assert(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT) == 0);
+        char *arguments[] = { (char *)application, "inherited-exec", "101", "102", "2", NULL };
+        char *environment[] = { "SM_WALL_RECOVERY_FD=0", NULL };
+        pid_t child;
+        assert(posix_spawn(&child, "/nonexistent-sm-adapter-test", &actions, &attributes, arguments, environment) == ENOENT);
+        assert(fcntl(fd, F_GETFD) & FD_CLOEXEC);
+        roundtrip(fd, AF_INET);
+        int result = defaults == 3 ? posix_spawnp(&child, application, &actions, &attributes, arguments, environment) :
+            posix_spawn(&child, application, &actions, &attributes, arguments, environment);
+        assert(result == 0);
+        close(fd);
+        int status;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(posix_spawn_file_actions_destroy(&actions) == 0);
+        assert(posix_spawnattr_destroy(&attributes) == 0);
+    }
+}
+
+static void immediate_rebind(void) {
+    for (int index = 0; index < 32; ++index) {
+        int fd = listening(AF_INET);
+        uint16_t port = bound_port(fd, AF_INET);
+        int copy = dup(fd);
+        close(fd);
+        roundtrip(copy, AF_INET);
+        close(copy);
+        int replacement = socket(AF_INET, SOCK_STREAM, 0);
+        int reuse = 1;
+        assert(setsockopt(replacement, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+        struct sockaddr_storage address;
+        socklen_t size = loopback(&address, AF_INET, port);
+        assert(bind(replacement, (struct sockaddr *)&address, size) == 0);
+        assert(listen(replacement, 8) == 0);
+        close(replacement);
+    }
+}
+
+static void inherited_tools(void) {
+    const char *programs[] = { getenv("SM_TEST_RUST_APPLICATION"), getenv("SM_TEST_PYTHON") };
+    for (int tool = 0; tool < 2; ++tool) {
+        assert(programs[tool]);
+        int fd = listening(AF_INET);
+        assert(fcntl(fd, F_SETFD, 0) == 0);
+        char number[32];
+        snprintf(number, sizeof(number), "%d", fd);
+        char *rust_arguments[] = { (char *)programs[tool], number, NULL };
+        char *python_arguments[] = { (char *)programs[tool], "-c",
+            "import socket,sys; s=socket.socket(fileno=int(sys.argv[1])); d=s.dup(); s.close(); d.setblocking(True); c=socket.create_connection(d.getsockname()); c.sendall(b'python'); a,_=d.accept(); assert a.recv(6)==b'python'; a.close(); c.close(); d.close()",
+            number, NULL };
+        char *environment[] = { NULL };
+        pid_t child;
+        int result = posix_spawn(&child, programs[tool], NULL, NULL, tool ? python_arguments : rust_arguments, environment);
+        if (result) fprintf(stderr, "tool %s spawn error %d\n", programs[tool], result);
+        assert(result == 0);
+        close(fd);
+        int status;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    }
+}
+
+static int parent_callback_fd = -1;
+static void parent_closes_listener(void) {
+    if (parent_callback_fd >= 0) { close(parent_callback_fd); parent_callback_fd = -1; }
+}
+static void fork_parent_closes(void) {
+    assert(pthread_atfork(NULL, parent_closes_listener, NULL) == 0);
+    int fd = listening(AF_INET);
+    parent_callback_fd = fd;
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) { roundtrip(fd, AF_INET); close(fd); _exit(0); }
+    assert(parent_callback_fd == -1);
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+}
+
 int main(int argc, char **argv) {
+    if (argc == 5 && !strcmp(argv[1], "inherited-exec")) {
+        int first = atoi(argv[2]), second = atoi(argv[3]);
+        int family = atoi(argv[4]);
+        assert(listen(first, 8) == 0);
+        close(first);
+        assert(listen(second, 8) == 0);
+        roundtrip(second, family);
+        close(second);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "raw-control")) { raw_control(1); return 0; }
     raw_control(0);
     if (argc == 2) {
@@ -212,6 +359,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; ++i) assert(pthread_create(&workers[i], NULL, thread_client, NULL) == 0);
     for (int i = 0; i < 4; ++i) assert(pthread_join(workers[i], NULL) == 0);
     puts("ordinary socket IPv4/IPv6, flags, dup, fork and concurrent listeners passed");
+    for (int method = 0; method < 7; ++method) inherited_exec(argv[0], method);
+    inherited_spawn(argv[0]);
+    immediate_rebind();
+    inherited_tools();
+    fork_parent_closes();
     exec_guards();
     return 0;
 }

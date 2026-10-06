@@ -46,6 +46,8 @@ def main():
             + "const uint16_t wall_direct_ports[4] = {" + ",".join(map(str, args.direct_ports)) + "};\n"
             + f"const uint16_t wall_control_port = {args.control_port};\n"
             + f"const int wall_control_fd = {args.control_fd};\n"
+            + "const char wall_image_path[] = {"
+            + ",".join(map(str, os.fsencode(output) + b"\0")) + "};\n"
         )
         image = scratch / "adapter.dylib"
         subprocess.run([

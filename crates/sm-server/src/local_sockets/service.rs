@@ -399,6 +399,9 @@ fn serve_lease(
                 }
             }
             Request::Release { lease: id } if id == lease.id() => {
+                // A successful release reply is a lifetime barrier: a client
+                // may immediately bind the same port after receiving it.
+                drop(lease);
                 send(
                     stream,
                     state,
@@ -520,11 +523,17 @@ mod tests {
     impl TestDirectory {
         fn new() -> Self {
             use std::os::unix::fs::DirBuilderExt;
+            static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = PathBuf::from(format!("/tmp/sms-{}-{nonce}", std::process::id()));
+            let path = PathBuf::from(format!(
+                "/tmp/sms-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
             fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
             Self(path)
         }
@@ -684,8 +693,8 @@ mod tests {
             let (reply, fds) = exchange(&mut control, Request::Release { lease: bound.lease });
             assert_eq!(reply.errno, 0);
             assert!(fds.is_empty());
-            assert_eq!(control.read(&mut [0]).unwrap(), 0);
-            // EOF is after worker lease destruction, so port reuse is no race.
+            // The reply itself guarantees lease destruction; no EOF wait or
+            // retry is needed before immediate reuse of the explicit port.
             let mut rebound = client(&fixture.service);
             let (reply, fds) = exchange(
                 &mut rebound,
@@ -697,6 +706,7 @@ mod tests {
             );
             assert_eq!(reply.errno, 0);
             drop(fds);
+            assert_eq!(control.read(&mut [0]).unwrap(), 0);
         }
     }
 
@@ -1040,6 +1050,23 @@ mod tests {
             String::from_utf8_lossy(&compiled.stderr)
         );
         let profile = "(version 1)(allow default)(deny network-inbound (local ip \"*:*\"))(deny network-outbound (remote ip \"*:*\"))";
+        let rust_application = fixture._directory.path().join("rust-application");
+        let rust_compiled = std::process::Command::new("rustc")
+            .arg(scripts.join("native/test_exec.rs"))
+            .arg("-o")
+            .arg(&rust_application)
+            .output()
+            .unwrap();
+        assert!(
+            rust_compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&rust_compiled.stderr)
+        );
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
         let control_result = std::process::Command::new(&executable)
             .arg("raw-control")
             .env_remove("DYLD_INSERT_LIBRARIES")
@@ -1053,6 +1080,11 @@ mod tests {
         );
         let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
         command
+            .env("SM_TEST_RUST_APPLICATION", &rust_application)
+            .env(
+                "SM_TEST_PYTHON",
+                String::from_utf8(python.stdout).unwrap().trim(),
+            )
             .args(["-p", profile, "/usr/bin/env"])
             .arg(format!("DYLD_INSERT_LIBRARIES={}", library.display()))
             .args([
