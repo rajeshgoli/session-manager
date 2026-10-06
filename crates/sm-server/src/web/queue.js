@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
 import { startNowController } from './queue-start.js';
 
@@ -62,7 +62,7 @@ export function MacChart() {
         ${metric('cpu_avg', 100, 'amber')}${metric('gpu_avg', 100, 'cyan')}
         ${buckets.map((b, i) => html`<rect x=${i * 1000 / buckets.length} y="0" width=${1000 / buckets.length} height="150" fill="transparent" onMouseEnter=${() => setHover(i)}><title>${clock(b.start)} · CPU ${pct(b.cpu_avg)} · GPU ${pct(b.gpu_avg)} · memory ${gb(b.mem_used_avg)} · queue ${gb(b.queue_memory_avg)}, ${pct(b.queue_cpu_avg)} CPU, ${pct(b.queue_gpu_avg)} GPU · ${b.pending_max ?? '—'} waiting</title></rect>`)}
       </svg><div class="q-heading muted"><span>${clock(series.start)}</span><span>${clock(series.end)}</span></div>
-      <p class="q-chart-caption">${selected ? `${clock(selected.start)} · CPU ${pct(selected.cpu_avg)} · GPU ${pct(selected.gpu_avg)} · memory ${gb(selected.mem_used_avg)} · queue ${gb(selected.queue_memory_avg)} / CPU ${pct(selected.queue_cpu_avg)} / GPU ${pct(selected.queue_gpu_avg)} · ${selected.pending_max ?? '—'} waiting` : `Average CPU ${pct(series.summary?.cpu_avg)}, GPU ${pct(series.summary?.gpu_avg)} · elevated memory pressure ${duration(series.summary?.pressure_elevated_seconds || 0)}`}</p>
+      <p class="q-chart-caption">${selected ? `${clock(selected.start)} · CPU ${pct(selected.cpu_avg)} · GPU ${pct(selected.gpu_avg)} · memory ${gb(selected.mem_used_avg)} · queue ${gb(selected.queue_memory_avg)} / CPU ${pct(selected.queue_cpu_avg)} / GPU ${pct(selected.queue_gpu_avg)} · ${selected.pending_max ?? '—'} waiting` : `${coverageNote(series) ? `${coverageNote(series)} · ` : ''}Average CPU ${pct(series.summary?.cpu_avg)}, GPU ${pct(series.summary?.gpu_avg)} · elevated memory pressure ${duration(series.summary?.pressure_elevated_seconds || 0)}`}</p>
     </div>`}
   </section>`;
 }

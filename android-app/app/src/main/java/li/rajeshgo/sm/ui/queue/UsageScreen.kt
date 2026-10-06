@@ -207,7 +207,7 @@ private fun UsageCharts(series: UtilizationSeries, slotMax: Int) {
         }
     }
 
-    val summary = usageSummaryLines(series.summary)
+    val summary = usageSummaryLines(series.summary, series.hours * 3600L)
     if (summary.isNotEmpty()) {
         Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

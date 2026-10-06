@@ -321,9 +321,13 @@ fun pressureShade(pressureMax: Int?): Int = when {
     else -> 0
 }
 
-fun usageSummaryLines(summary: UtilizationSummary?): List<String> {
+/** [windowSeconds] is the chart range; under 95% covered, the first line says how much was recorded (#2006). */
+fun usageSummaryLines(summary: UtilizationSummary?, windowSeconds: Long = 0): List<String> {
     if (summary == null) return emptyList()
     val lines = mutableListOf<String>()
+    if (windowSeconds > 0 && summary.coveredSeconds < windowSeconds * 95 / 100) {
+        lines += "Recorded ${hoursLabel(summary.coveredSeconds)} of the last ${hoursLabel(windowSeconds)}."
+    }
     summary.cpuAvg?.let { avg ->
         val busy = if (summary.cpuBusySeconds > 0) ", over 85% busy for ${hoursLabel(summary.cpuBusySeconds)}" else ""
         lines += "CPU averaged ${avg.roundToLong()}%$busy."
