@@ -1066,11 +1066,11 @@ impl TmuxRuntime {
 
     fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.send_text(tmux_session, text)?;
-        self.wait_for_claude_text_echo(tmux_session, text);
+        let echoed = self.wait_for_claude_text_echo(tmux_session, text);
         thread::sleep(self.compute_settle_delay(text));
         self.send_key(tmux_session, "Enter")?;
         for _ in 0..CLAUDE_SUBMIT_MAX_RETRIES {
-            if !self.claude_composer_keeps_text(tmux_session, text) {
+            if !self.claude_composer_keeps_text(tmux_session, text, echoed) {
                 break;
             }
             self.send_key(tmux_session, "Enter")?;
@@ -1079,21 +1079,27 @@ impl TmuxRuntime {
     }
 
     /// On a Claude composer, wait until it shows `text`: Claude has then read
-    /// the text, so the Enter that follows arrives as its own keypress. Any
-    /// other pane, including Codex, returns at once.
-    fn wait_for_claude_text_echo(&self, tmux_session: &str, text: &str) {
+    /// the text, so the Enter that follows arrives as its own keypress.
+    /// Returns whether it did. A frame whose cursor is outside the composer
+    /// is Claude mid-redraw, so the wait goes on; a pane with no Claude
+    /// composer at all, including Codex, returns false at once.
+    fn wait_for_claude_text_echo(&self, tmux_session: &str, text: &str) -> bool {
         let deadline = Instant::now() + CLAUDE_TEXT_ECHO_WINDOW;
         loop {
             let Some((pane, (_, cursor_y))) = self
                 .capture_pane_text(tmux_session)
                 .zip(self.pane_cursor_position(tmux_session))
             else {
-                return;
+                return false;
             };
-            let echoed = claude_live_composer(&pane, cursor_y)
-                .is_none_or(|composer| composer_holds_text(&composer, text));
-            if echoed || Instant::now() >= deadline {
-                return;
+            if claude_composer_rows(&pane).is_none() {
+                return false;
+            }
+            if claude_composer_holds_text(&pane, cursor_y, text) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
             }
             thread::sleep(CLAUDE_SUBMIT_CHECK_POLL);
         }
@@ -1101,20 +1107,34 @@ impl TmuxRuntime {
 
     /// True when Claude's live composer still ends with `text` once the
     /// check window has passed. Any other pane, including Codex, is false.
-    fn claude_composer_keeps_text(&self, tmux_session: &str, text: &str) -> bool {
+    ///
+    /// After Claude has echoed the text (`echoed`), only a composer seen
+    /// without it twice in a row means the Enter landed. A capture taken
+    /// while Claude redraws, with the cursor parked outside the composer,
+    /// proves nothing; treating it as a submit left a handoff brief unsent
+    /// (#2013). Another Enter on an empty Claude composer does nothing.
+    fn claude_composer_keeps_text(&self, tmux_session: &str, text: &str, echoed: bool) -> bool {
         let deadline = Instant::now() + CLAUDE_SUBMIT_CHECK_WINDOW;
+        let mut cleared_frames = 0;
         loop {
-            let kept = self
+            let held = self
                 .capture_pane_text(tmux_session)
                 .zip(self.pane_cursor_position(tmux_session))
-                .is_some_and(|(pane, (_, cursor_y))| {
-                    claude_composer_holds_text(&pane, cursor_y, text)
-                });
-            if !kept {
-                return false;
+                .and_then(|(pane, (_, cursor_y))| claude_live_composer(&pane, cursor_y))
+                .map(|composer| composer_holds_text(&composer, text));
+            match held {
+                Some(true) => cleared_frames = 0,
+                Some(false) => {
+                    cleared_frames += 1;
+                    if !echoed || cleared_frames >= 2 {
+                        return false;
+                    }
+                }
+                None if !echoed => return false,
+                None => {}
             }
             if Instant::now() >= deadline {
-                return true;
+                return cleared_frames == 0;
             }
             thread::sleep(CLAUDE_SUBMIT_CHECK_POLL);
         }
@@ -2429,6 +2449,21 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
 /// with the cursor inside, whitespace removed because Claude wraps and
 /// indents the draft. `None` when the pane shows no such composer.
 fn claude_live_composer(pane: &str, cursor_y: usize) -> Option<String> {
+    let rows = claude_composer_rows(pane)?;
+    rows.contains(&cursor_y).then(|| {
+        pane.lines()
+            .skip(rows.start)
+            .take(rows.len())
+            .collect::<String>()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    })
+}
+
+/// The rows of Claude's composer: the last prompt row up to the divider
+/// below it, wherever the cursor is.
+fn claude_composer_rows(pane: &str) -> Option<std::ops::Range<usize>> {
     let lines = pane.lines().collect::<Vec<_>>();
     let start = lines.iter().rposition(|line| {
         let line = line.trim_start();
@@ -2438,13 +2473,7 @@ fn claude_live_composer(pane: &str, cursor_y: usize) -> Option<String> {
         .iter()
         .position(|line| claude_composer_footer_divider(line))
         .map(|offset| start + 1 + offset)?;
-    (start..end).contains(&cursor_y).then(|| {
-        lines[start..end]
-            .concat()
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect()
-    })
+    Some(start..end)
 }
 
 /// Whether Claude's live composer still holds `text` or a collapsed paste.
@@ -3148,6 +3177,25 @@ esac
     fn send_input_presses_enter_again_while_claude_holds_the_draft() {
         let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
             r#"if [ "$(grep -c ' Enter$' "$log")" -ge 2 ]; then cat "$empty"; else cat "$held"; fi"#,
+        );
+
+        assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
+
+        assert_eq!(enter_count(&log_path), 2);
+    }
+
+    /// The first capture after Enter catches Claude mid-redraw, its cursor
+    /// outside the composer. That is not a submit: Claude still holds the
+    /// draft, so Enter goes again (#2013).
+    #[cfg(unix)]
+    #[test]
+    fn send_input_does_not_take_a_redraw_frame_for_a_submit() {
+        let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
+            r#"enters=$(grep -c ' Enter$' "$log")
+    since=$(sed -n '/ Enter$/,$p' "$log" | grep -c '^capture-pane')
+    if [ "$enters" -ge 2 ]; then cat "$empty"
+    elif [ "$enters" -eq 1 ] && [ "$since" -le 1 ]; then printf '\n\n\n'; cat "$held"
+    else cat "$held"; fi"#,
         );
 
         assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
