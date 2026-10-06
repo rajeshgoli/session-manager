@@ -232,34 +232,38 @@ impl LocalJudgeRuntime {
         )
     }
 
-    pub fn register(&self, session_id: &str, agent: &Registration) -> Result<JudgeEndpoint> {
-        let request = json!({"op": "register", "session_id": session_id, "agent": agent});
+    fn ensure_and_control(&self, request: Value) -> Result<Value> {
         let mut last_error = None;
-        // Idle shutdown can begin just after a successful readiness check.
-        // Retrying an atomic registration is idempotent and retains its token.
+        // Idle shutdown or replacement can begin after a readiness check.
+        // All control writes used here are idempotent, including spent grants.
         for _ in 0..3 {
             if let Err(error) = self.ensure_running() {
                 last_error = Some(error);
                 continue;
             }
             match self.control(request.clone()) {
-                Ok(result) => return serde_json::from_value(result).context("judge endpoint"),
+                Ok(result) => return Ok(result),
                 Err(error) => last_error = Some(error),
             }
         }
-        Err(last_error.expect("registration attempted"))
+        Err(last_error.expect("control attempted"))
+    }
+
+    pub fn register(&self, session_id: &str, agent: &Registration) -> Result<JudgeEndpoint> {
+        serde_json::from_value(self.ensure_and_control(
+            json!({"op": "register", "session_id": session_id, "agent": agent}),
+        )?)
+        .context("judge endpoint")
     }
 
     pub fn unregister(&self, session_id: &str) -> Result<()> {
-        self.ensure_running()?;
-        self.control(json!({"op": "unregister", "session_id": session_id}))?;
+        self.ensure_and_control(json!({"op": "unregister", "session_id": session_id}))?;
         Ok(())
     }
 
     /// Owner-only host interface. Never wire this to an agent-facing endpoint.
     pub fn allow_once(&self, denial_id: &str) -> Result<Value> {
-        self.ensure_running()?;
-        self.control(json!({"op": "allow", "denial_id": denial_id}))
+        self.ensure_and_control(json!({"op": "allow", "denial_id": denial_id}))
     }
 
     /// Restart recovery: registrations, grants and logs are daemon-owned and
@@ -504,6 +508,33 @@ mod tests {
         upgraded.register("a", &agent).unwrap();
         stub.join().unwrap();
         upgraded.unregister("a").unwrap();
+        // Final retirement must also survive a shutdown between readiness
+        // and its control write, leaving no durable orphan registration.
+        upgraded.register("a", &agent).unwrap();
+        upgraded.control(json!({"op": "shutdown"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while root.join("state/control.sock").exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let socket = root.join("state/control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let generation = upgraded.generation();
+        let stub = thread::spawn(move || {
+            for result in [
+                json!({"result": {"generation": generation}}),
+                json!({"error": "judge stopping"}),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                serde_json::to_writer(&mut stream, &result).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            fs::remove_file(socket).unwrap();
+        });
+        upgraded.unregister("a").unwrap();
+        stub.join().unwrap();
         assert!(upgraded
             .control(json!({"op": "registrations"}))
             .unwrap()

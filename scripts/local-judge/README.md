@@ -33,7 +33,7 @@ admission, drains already admitted decisions, waits for the daemon's lifetime
 lock to release, and starts the new generation against the same durable files.
 New decisions during replacement fail closed. An unchanged sm restart keeps
 the same judge process; a changed policy/configuration takes effect even while
-agents remain registered. Registration retries if idle shutdown begins between
+agents remain registered. Idempotent register, unregister and owner-grant controls retry if shutdown begins between
 readiness and the registration request. If the judge crashes, sm starts
 it again from durable registrations; no provider lookup is required. Explicit
 unregister removes a registration. The judge exits after 60 seconds without
@@ -71,7 +71,9 @@ flags, spaced filenames and direct paths are covered. Delegated scripts are
 recursively scanned; cycles, changed working directories, PATH changes and scan
 limits reach the judge rather than bypassing it. Uncertain parsing, unreadable
 or oversized scripts, and inline interpreter programs reach the judge.
-Shell variable/parameter/command expansions and backticks always reach the
+Absolute paths to protected egress executables are recognized. Wildcards,
+case-aliased credential paths, shell variable/parameter/command expansions
+and backticks always reach the
 judge, even when the literal egress command name is absent. Relative tool paths resolve against the registered
 checkout; symlinks resolve before containment checks. Caller `cwd` does not
 replace this trusted path base.

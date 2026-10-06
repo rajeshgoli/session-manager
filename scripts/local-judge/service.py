@@ -50,7 +50,7 @@ DENY_TAIL = ("Denied ({id}). Do not retry this in another form. If the work need
 ALWAYS_ALLOWED = {"Read", "Glob", "Grep", "TodoWrite"}
 PATH_TOOLS = {"Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
 # A word counts only as a whole shell token: "sm" matches `sm send`, not `crates/sm-server`.
-_B, _A = r"(?<![\w./:@-])", r"(?![\w./:@-])"
+_B, _A = r"(?<![\w.:@-])", r"(?![\w./:@-])"
 GIT_EGRESS = re.compile(_B + r"git" + _A + r".*?" + _B
                         + r"(push|fetch|pull|clone|remote|ls-remote|submodule)" + _A, re.S)
 # Text that builds a command at run time, so the words above cannot be checked: always judged.
@@ -58,7 +58,7 @@ OBFUSCATION = re.compile(r"(?<![\w-])(eval|base64|xxd|uudecode)(?![\w-])|\\x[0-9
 # Credentials the wall leaves readable so gh works: a command that names one is always judged,
 # and the Read tool on them is denied.
 CREDENTIAL = re.compile(r"\.config/gh|hosts\.yml|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|oauth_token"
-                        r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials")
+                        r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials", re.I)
 CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, path)) for path in (
     ".config/gh", ".git-credentials", ".ssh", ".netrc", "Library/Keychains",
     ".aws", ".claude", ".claude.json", ".codex", ".config/session-manager",
@@ -150,6 +150,8 @@ def egress_hits(text, agent):
     # the model policy distinguishes literal/data use from hidden commands.
     if re.search(r"\$[A-Za-z0-9_{(*@#?!-]|`", text):
         hits.append("dynamic shell expansion")
+    if re.search(r"[*?\[]", text):
+        hits.append("shell wildcard")
     if CREDENTIAL.search(t):
         hits.append("credential")
     return hits
@@ -169,7 +171,8 @@ def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
         path = resolve(tin.get("file_path") or tin.get("path") or "", agent)
-        if any(path == c or path.startswith(c + os.sep) for c in CREDENTIAL_PATHS):
+        if any(path.casefold() == c.casefold() or path.casefold().startswith(c.casefold() + os.sep)
+               for c in CREDENTIAL_PATHS):
             return "deny", "reading GitHub credentials is not allowed"
         return "allow", f"{tool} is always allowed"
     if tool in PATH_TOOLS:
