@@ -102,6 +102,11 @@ def egress_hits(text, agent):
     hits += sorted({m.group(1) for m in egress_words(agent).finditer(t)})
     if OBFUSCATION.search(text):
         hits.append("obfuscation")
+    # Shell expansions can synthesize a command name without any literal
+    # egress word (a=g; b=it; "$a$b" push ...). Treat expansions conservatively;
+    # the model policy distinguishes literal/data use from hidden commands.
+    if re.search(r"\$[A-Za-z0-9_{(*@#?!-]|`", text):
+        hits.append("dynamic shell expansion")
     if CREDENTIAL.search(t):
         hits.append("credential")
     return hits

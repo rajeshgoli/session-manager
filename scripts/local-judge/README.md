@@ -45,25 +45,29 @@ Configuration (defaults shown):
 
 ```yaml
 local_judge:
-  root_dir: ~/.local/share/claude-sessions/local-judge
   port: 8431
   proxy_port: 8432
   timeout_seconds: 30
   python: python3
 ```
 
-`root_dir` must be absolute after expanding `~/`.
+The production state directory is fixed at
+`~/.local/share/claude-sessions/local-judge/`. Configuration rejects `root_dir`
+so a deployment cannot strand a detached process at an old state location.
+The isolated test launcher supplies a separate root through
+`SM_TEST_ISOLATION_ROOT`; it must be absolute.
 
 The model endpoint comes from `local_host.base_url`. Policy and request settings
 are lifted from the #1954 proof. Decisions fail closed on model unavailability,
 a malformed answer, overload, logging failure, or the complete model-call
 timeout. SSE (server-sent events, the model's streaming response format) works
 with ordinary and chunked HTTP responses, including an answer completed while
-the stream remains open. Relative tool paths resolve against the registered
+the stream remains open. Shell variable/parameter/command expansions and backticks always reach the
+judge, even when the literal egress command name is absent. Relative tool paths resolve against the registered
 checkout; symlinks resolve before containment checks. Caller `cwd` does not
 replace this trusted path base.
 
-Durable files under `root_dir`:
+Durable files under the fixed state directory:
 
 | File | Purpose |
 | --- | --- |

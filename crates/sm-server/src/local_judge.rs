@@ -15,9 +15,8 @@ use std::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalJudgeConfig {
-    pub root_dir: String,
     pub port: u16,
     pub proxy_port: u16,
     pub timeout_seconds: u64,
@@ -26,7 +25,6 @@ pub struct LocalJudgeConfig {
 impl Default for LocalJudgeConfig {
     fn default() -> Self {
         Self {
-            root_dir: "~/.local/share/claude-sessions/local-judge".into(),
             port: 8431,
             proxy_port: 8432,
             timeout_seconds: 30,
@@ -63,9 +61,16 @@ pub struct LocalJudgeRuntime {
 }
 impl LocalJudgeRuntime {
     pub fn from_config(config: &crate::config::AppConfig) -> Self {
+        // The production location is part of the durable-state contract, not
+        // a configurable per-deployment path. Test launchers isolate it only.
+        let root = std::env::var_os("SM_TEST_ISOLATION_ROOT")
+            .map(|root| PathBuf::from(root).join("local-judge"))
+            .unwrap_or_else(|| {
+                crate::sessions::expand_home("~/.local/share/claude-sessions/local-judge")
+            });
         Self {
             config: config.local_judge.clone(),
-            root: crate::sessions::expand_home(&config.local_judge.root_dir),
+            root,
             model_url: config
                 .local_host
                 .base_url
@@ -112,7 +117,7 @@ impl LocalJudgeRuntime {
 
     pub fn ensure_running(&self) -> Result<()> {
         if !self.root.is_absolute() {
-            bail!("local_judge.root_dir must be absolute (or start with ~/)");
+            bail!("local judge test isolation root must be absolute");
         }
         let generation = self.generation();
         if self.matching_service(&generation) {
@@ -317,15 +322,28 @@ fn install_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn runtime_for(config: &crate::config::AppConfig, root: &std::path::Path) -> LocalJudgeRuntime {
+        let mut runtime = LocalJudgeRuntime::from_config(config);
+        runtime.root = root.join("state");
+        runtime
+    }
+
+    #[test]
+    fn judge_state_root_cannot_change_through_configuration() {
+        assert!(serde_yaml::from_str::<LocalJudgeConfig>("root_dir: /tmp/another-root").is_err());
+        assert!(
+            serde_yaml::from_str::<LocalJudgeConfig>("port: 8431\ntimeout_seconds: 30").is_ok()
+        );
+    }
+
     #[test]
     fn runtime_register_restart_reconcile_and_unregister() {
         let root = PathBuf::from(format!("/tmp/j77-r-{}", std::process::id()));
         fs::create_dir_all(root.join("wt")).unwrap();
         fs::create_dir_all(root.join("tmp")).unwrap();
         let mut config = crate::config::AppConfig::default();
-        config.local_judge.root_dir = root.join("state").to_string_lossy().into();
         config.local_judge.port = 0;
-        let runtime = LocalJudgeRuntime::from_config(&config);
+        let runtime = runtime_for(&config, &root);
         struct Cleanup(LocalJudgeRuntime, PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -377,7 +395,7 @@ mod tests {
             .unwrap();
         // Reconstructing sm's runtime keeps the existing daemon, its process
         // identity and its registration token.
-        let restarted = LocalJudgeRuntime::from_config(&config);
+        let restarted = runtime_for(&config, &root);
         restarted.reconcile().unwrap();
         assert_eq!(
             restarted.control(json!({"op": "health"})).unwrap()["pid"],
@@ -408,7 +426,7 @@ mod tests {
         changed_config.local_judge.timeout_seconds = 29;
         changed_config.local_judge.proxy_port = 8433;
         changed_config.local_host.base_url = "http://127.0.0.1:8001".into();
-        let upgraded = LocalJudgeRuntime::from_config(&changed_config);
+        let upgraded = runtime_for(&changed_config, &root);
         upgraded.reconcile().unwrap();
         let health = upgraded.control(json!({"op": "health"})).unwrap();
         assert_ne!(health["pid"], old_pid);

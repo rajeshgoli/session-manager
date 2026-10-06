@@ -303,11 +303,6 @@ impl AppConfig {
             )
         })?;
 
-        self.local_judge.root_dir = isolate_default_data_path(
-            &self.local_judge.root_dir,
-            &crate::local_judge::LocalJudgeConfig::default().root_dir,
-            &instance,
-        )?;
         let custom_state_file = self.paths.state_file != default_state_file();
         self.paths.state_file =
             isolate_default_data_path(&self.paths.state_file, &default_state_file(), &instance)?;
