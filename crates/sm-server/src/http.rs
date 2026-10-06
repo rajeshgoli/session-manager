@@ -166,6 +166,10 @@ const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
 // give up once this many `@codex review` comments have been posted.
 const CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS: i64 = 120;
 const CODEX_REVIEW_MAX_ATTEMPTS: i64 = 3;
+// A review watcher that hits an error retries after this long, doubling to the
+// maximum, instead of exiting.
+const CODEX_REVIEW_WATCHER_RETRY_MIN: Duration = Duration::from_secs(5);
+const CODEX_REVIEW_WATCHER_RETRY_MAX: Duration = Duration::from_secs(300);
 const MOBILE_TERMINAL_DEFAULT_ROWS: u16 = 24;
 const MOBILE_TERMINAL_DEFAULT_COLS: u16 = 80;
 const MOBILE_TERMINAL_MIN_ROWS: u16 = 2;
@@ -5651,10 +5655,43 @@ fn spawn_codex_review_request_watcher(state: Arc<AppState>, request_id: String) 
         }
     }
     tokio::spawn(async move {
-        if let Err(error) =
-            run_codex_review_request_watcher(state.clone(), request_id.clone()).await
-        {
-            eprintln!("Codex review request watcher {request_id} stopped with error: {error}");
+        // An error (a full disk, a locked database) must not end the watch:
+        // nothing else polls the request until the next restart (#1995). The
+        // watcher resumes from the persisted row, as it does after a restart,
+        // and ends only when the request does.
+        let mut backoff = CODEX_REVIEW_WATCHER_RETRY_MIN;
+        loop {
+            let started = Instant::now();
+            let Err(error) =
+                run_codex_review_request_watcher(state.clone(), request_id.clone()).await
+            else {
+                break;
+            };
+            // A run that outlasted the longest backoff was healthy, so this
+            // error starts a new episode rather than extending the last one.
+            if started.elapsed() > CODEX_REVIEW_WATCHER_RETRY_MAX {
+                backoff = CODEX_REVIEW_WATCHER_RETRY_MIN;
+            }
+            eprintln!(
+                "Codex review request watcher {request_id} failed, retrying in {}s: {error}",
+                backoff.as_secs()
+            );
+            let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                &expand_home(&state.config.sm_send.db_path),
+                &request_id,
+                &now_rfc3339(),
+                &error,
+                None,
+            );
+            let mut stopped = state.shutdown().subscribe();
+            if state.shutdown().is_stopped() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {},
+                _ = stopped.changed() => break,
+            }
+            backoff = std::cmp::min(backoff * 2, CODEX_REVIEW_WATCHER_RETRY_MAX);
         }
         let cleanup_state = state.clone();
         let cleanup_id = request_id.clone();

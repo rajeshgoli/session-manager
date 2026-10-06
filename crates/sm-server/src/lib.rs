@@ -1,3 +1,29 @@
+/// The server's `eprintln!`, in scope for every module below and imported by
+/// `main.rs`. Std's panics when stderr cannot be written, and the server's
+/// stderr is a log file: when the disk filled, every background loop that
+/// logged an error panicked and stopped for good (#1995, #1994, #1996). This
+/// one drops the line instead. Tests keep std's so the harness captures them.
+#[macro_export]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        if cfg!(test) {
+            ::std::eprintln!($($arg)*)
+        } else {
+            $crate::write_stderr_line(format_args!($($arg)*))
+        }
+    };
+}
+
+/// Write one line to stderr, ignoring a failed write rather than panicking.
+#[doc(hidden)]
+pub fn write_stderr_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr
+        .write_fmt(args)
+        .and_then(|()| stderr.write_all(b"\n"));
+}
+
 pub mod activity_ledger;
 pub mod agent_notes;
 pub mod analytics_spend;
@@ -55,3 +81,41 @@ pub mod work_claims;
 pub mod work_history;
 
 pub mod host_status;
+
+#[cfg(test)]
+mod stderr_tests {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::{Command, Stdio};
+
+    const CHILD: &str = "SM_STDERR_BROKEN_PIPE_CHILD";
+
+    /// The child half runs with stderr on a pipe whose reader is gone, so every
+    /// write fails with EPIPE, as a log write did when the disk filled.
+    #[test]
+    fn a_failed_stderr_write_does_not_panic() {
+        if std::env::var_os(CHILD).is_some() {
+            let std_result = std::panic::catch_unwind(|| ::std::eprintln!("lost"));
+            assert!(std_result.is_err(), "std's eprintln! must panic here");
+            super::write_stderr_line(format_args!("lost {}", 1));
+            std::process::exit(0);
+        }
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // The child must not inherit the read end, or the pipe stays readable.
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        drop(reader);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stderr_tests::a_failed_stderr_write_does_not_panic",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(writer))
+            .status()
+            .unwrap();
+        assert!(status.success(), "child failed: {status}");
+    }
+}
