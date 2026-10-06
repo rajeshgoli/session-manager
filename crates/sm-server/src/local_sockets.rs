@@ -63,6 +63,7 @@ pub enum Operation {
     Listen = 2,
     Connect = 3,
     Release = 4,
+    Retain = 5,
 }
 
 impl Operation {
@@ -72,6 +73,7 @@ impl Operation {
             2 => Ok(Self::Listen),
             3 => Ok(Self::Connect),
             4 => Ok(Self::Release),
+            5 => Ok(Self::Retain),
             _ => invalid("unsupported socket operation"),
         }
     }
@@ -95,6 +97,10 @@ pub enum Request {
     Release {
         lease: u64,
     },
+    Retain {
+        ip: IpVersion,
+        port: u16,
+    },
 }
 
 impl Request {
@@ -104,6 +110,7 @@ impl Request {
             Self::Listen { .. } => Operation::Listen,
             Self::Connect { .. } => Operation::Connect,
             Self::Release { .. } => Operation::Release,
+            Self::Retain { .. } => Operation::Retain,
         }
     }
 
@@ -113,7 +120,9 @@ impl Request {
                 invalid("invalid listen lease or backlog")
             }
             Self::Release { lease: 0 } => invalid("invalid release lease"),
-            Self::Connect { port: 0, .. } => invalid("connection requires an allocated test port"),
+            Self::Connect { port: 0, .. } | Self::Retain { port: 0, .. } => {
+                invalid("request requires an allocated test port")
+            }
             _ => Ok(()),
         }
     }
@@ -137,7 +146,7 @@ impl Request {
                 frame[8..10].copy_from_slice(&port.to_be_bytes());
                 frame[24..40].copy_from_slice(&ip.address());
             }
-            Self::Connect { ip, port } => {
+            Self::Connect { ip, port } | Self::Retain { ip, port } => {
                 frame[6] = ip.code();
                 frame[8..10].copy_from_slice(&port.to_be_bytes());
                 frame[24..40].copy_from_slice(&ip.address());
@@ -163,12 +172,12 @@ impl Request {
         let backlog = u16::from_be_bytes(frame[10..12].try_into().unwrap());
         let lease = u64::from_be_bytes(frame[16..24].try_into().unwrap());
         let request = match op {
-            Operation::Bind | Operation::Connect => {
+            Operation::Bind | Operation::Connect | Operation::Retain => {
                 let ip = IpVersion::decode(frame[6])?;
                 if frame[24..40] != ip.address() || backlog != 0 || lease != 0 {
                     return invalid("socket request is not an exact loopback allocation");
                 }
-                if frame[7] > 1 || (op == Operation::Connect && frame[7] != 0) {
+                if frame[7] > 1 || (op != Operation::Bind && frame[7] != 0) {
                     return invalid("unsupported socket flags");
                 }
                 if op == Operation::Bind {
@@ -177,6 +186,8 @@ impl Request {
                         port,
                         reuse_address: frame[7] == 1,
                     }
+                } else if op == Operation::Retain {
+                    Self::Retain { ip, port }
                 } else {
                     Self::Connect { ip, port }
                 }
@@ -243,7 +254,7 @@ impl Reply {
             };
         }
         let valid = match self.operation {
-            Operation::Bind => {
+            Operation::Bind | Operation::Retain => {
                 self.descriptors == 1 && self.ip.is_some() && self.port != 0 && self.lease != 0
             }
             Operation::Connect => {
