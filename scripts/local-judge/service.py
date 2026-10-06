@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 HOME = os.path.expanduser("~")
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
+ap.add_argument("--generation", default="standalone")
 ap.add_argument("--port", type=int, default=8431)
 ap.add_argument("--model-url", default="http://127.0.0.1:8000")
 ap.add_argument("--timeout", type=float, default=30.0)
@@ -36,6 +37,9 @@ ARGS.allow_file = os.path.join(ARGS.root, "allows.jsonl")
 CONTROL = os.path.join(ARGS.root, "control.sock")
 LOCK = threading.RLock()
 STOPPING = False
+ACTIVE = 0
+DRAIN = threading.Condition(LOCK)
+STOP_EVENT = threading.Event()
 
 DENY_TAIL = ("Denied ({id}). Do not retry this in another form. If the work needs it, tell your parent "
              "with sm send, then continue with what you can do, or stop.")
@@ -406,10 +410,17 @@ class H(BaseHTTPRequestHandler):
                     {"ok": True} if self.path == "/health" else {"error": "not found"})
 
     def do_POST(self):
+        global ACTIVE
+        admitted = False
         if self.path != "/decide":
             self.close_connection = True
             return self._reply(404, {"error": "not found"})
         try:
+            with LOCK:
+                if STOPPING:
+                    raise RuntimeError("judge stopping")
+                ACTIVE += 1
+                admitted = True
             size = int(self.headers.get("Content-Length") or 0)
             if not 0 < size <= 2_000_000:
                 raise ValueError("invalid request length")
@@ -426,10 +437,16 @@ class H(BaseHTTPRequestHandler):
             self._reply(200, {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
                 "permissionDecisionReason": "judge unavailable; retry this command in a minute"}})
+        finally:
+            if admitted:
+                with DRAIN:
+                    ACTIVE -= 1
+                    DRAIN.notify_all()
 
 
 class Control(socketserver.StreamRequestHandler):
     def handle(self):
+        global STOPPING
         self.request.settimeout(5)
         try:
             body = json.loads(self.rfile.readline(2_000_001))
@@ -437,7 +454,12 @@ class Control(socketserver.StreamRequestHandler):
             if STOPPING:
                 raise RuntimeError("judge stopping")
             if op == "health":
-                result = {"ok": True, "pid": os.getpid(), "port": HTTP.server_port}
+                result = {"ok": True, "pid": os.getpid(), "port": HTTP.server_port, "generation": ARGS.generation}
+            elif op == "shutdown":
+                with LOCK:
+                    STOPPING = True
+                    STOP_EVENT.set()
+                result = {"ok": True}
             elif op == "allow":
                 result = owner_allow(body["denial_id"])
                 if result is None:
@@ -517,8 +539,11 @@ if __name__ == "__main__":
     # agent's register-before-launch operation. Startup can also be pre-launch.
     empty_since = time.monotonic()
     while True:
-        time.sleep(1)
+        STOP_EVENT.wait(1)
         with LOCK:
+            if STOPPING:
+                os.unlink(CONTROL)
+                break
             if read_agents():
                 empty_since = time.monotonic()
             elif time.monotonic() - empty_since >= 60:
@@ -527,5 +552,12 @@ if __name__ == "__main__":
                 STOPPING = True
                 os.unlink(CONTROL)
                 break
+    # No new decisions can enter after STOPPING. Finish and durably log every
+    # admitted decision before releasing the lifetime lock for the replacement.
+    with DRAIN:
+        while ACTIVE:
+            DRAIN.wait()
     HTTP.shutdown()
+    HTTP.server_close()
     control.shutdown()
+    control.server_close()

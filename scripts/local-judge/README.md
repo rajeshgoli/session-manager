@@ -26,7 +26,15 @@ The service refuses a registration whose writable folders contain its state.
 
 The sm daemon reconciles every five seconds when runtime is enabled. The judge
 is detached from sm's process group, survives sm restart, and holds a lifetime
-file lock. Concurrent starts share one process. If the judge crashes, sm starts
+file lock. Concurrent starts share one process. Health carries a generation: a hash of the
+embedded service, policy, startup configuration, and model URL. sm reuses a
+healthy process only when that generation matches. For a mismatch it closes
+admission, drains already admitted decisions, waits for the daemon's lifetime
+lock to release, and starts the new generation against the same durable files.
+New decisions during replacement fail closed. An unchanged sm restart keeps
+the same judge process; a changed policy/configuration takes effect even while
+agents remain registered. Registration retries if idle shutdown begins between
+readiness and the registration request. If the judge crashes, sm starts
 it again from durable registrations; no provider lookup is required. Explicit
 unregister removes a registration. The judge exits after 60 seconds without
 registrations, allowing a replacement launch to register during that interval.
@@ -83,7 +91,8 @@ also checks two registrations, private controls, forged tokens, relative paths,
 symlinks, unavailable/malformed/timed-out model replies, chunked streams, twelve
 concurrent identical retries with one success, and unused/consumed grants across
 process restart. Rust tests check concurrent host startup, sm runtime
-reconstruction retaining the same judge PID, and daemon crash reconciliation.
+reconstruction retaining the same judge PID, daemon crash reconciliation, generation replacement preserving tokens, and an
+idle-shutdown response precisely between readiness and registration.
 The recorded replay tests service migration, not fresh model judgment accuracy.
 An already running real model can be tested with `SM_JUDGE_TEST_MODEL_URL`,
 without having the tests load model weights.

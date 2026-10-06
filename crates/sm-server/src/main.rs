@@ -207,7 +207,11 @@ async fn main() -> Result<()> {
         if config.rust_core.runtime_enabled {
             sm_server::local_model::register_live(&config)?;
             let judge = sm_server::local_judge::LocalJudgeRuntime::from_config(&config);
+            let judge_shutdown = shutdown.clone();
             thread::spawn(move || loop {
+                if judge_shutdown.is_stopped() {
+                    break;
+                }
                 run_background_pass("local judge", || {
                     if let Err(error) = judge.reconcile() {
                         eprintln!("local judge reconcile failed: {error:#}");

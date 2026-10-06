@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalJudgeConfig {
     pub root_dir: String,
@@ -95,11 +95,27 @@ impl LocalJudgeRuntime {
 
     /// Idempotent across concurrent starts and sm blue/green handover. The
     /// daemon's lifetime flock selects one process, not a remembered PID.
+    fn generation(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let identity = json!({
+            "service": include_str!("../../../scripts/local-judge/service.py"),
+            "policy": include_str!("../../../scripts/local-judge/policy.md"),
+            "config": self.config, "model_url": self.model_url,
+        });
+        format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+    }
+
+    fn matching_service(&self, generation: &str) -> bool {
+        self.control(json!({"op": "health"}))
+            .is_ok_and(|health| health["generation"] == generation)
+    }
+
     pub fn ensure_running(&self) -> Result<()> {
         if !self.root.is_absolute() {
             bail!("local_judge.root_dir must be absolute (or start with ~/)");
         }
-        if self.control(json!({"op": "health"})).is_ok() {
+        let generation = self.generation();
+        if self.matching_service(&generation) {
             return Ok(());
         }
         if self.config.timeout_seconds == 0 || self.config.timeout_seconds > 30 {
@@ -117,9 +133,35 @@ impl LocalJudgeRuntime {
         if unsafe { libc::flock(startup_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if self.control(json!({"op": "health"})).is_ok() {
+        if self.matching_service(&generation) {
             return Ok(());
         }
+        if self.control(json!({"op": "health"})).is_ok() {
+            self.control(json!({"op": "shutdown"}))
+                .context("drain outdated local judge")?;
+        }
+        // A draining/idle daemon may already have unlinked its socket. Wait
+        // on its lifetime lock, never signal a self-reported PID. The existing
+        // model deadline bounds drain; failures remain closed to new actions.
+        let lifetime = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("service.lock"))?;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if unsafe { libc::flock(lifetime.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error.into());
+            }
+            if Instant::now() >= deadline {
+                bail!("local judge did not finish draining");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        drop(lifetime);
         // Content-addressed installed sources outlive temporary worktrees and
         // cannot be overwritten under a running Python process by a new build.
         let service = install_source(
@@ -141,6 +183,8 @@ impl LocalJudgeRuntime {
         let mut command = Command::new(&self.config.python);
         command
             .arg(service)
+            .arg("--generation")
+            .arg(&generation)
             .arg("--root")
             .arg(&self.root)
             .arg("--port")
@@ -172,7 +216,7 @@ impl LocalJudgeRuntime {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if self.control(json!({"op": "health"})).is_ok() {
+            if self.matching_service(&generation) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(25));
@@ -184,11 +228,18 @@ impl LocalJudgeRuntime {
     }
 
     pub fn register(&self, session_id: &str, agent: &Registration) -> Result<JudgeEndpoint> {
-        self.ensure_running()?;
-        serde_json::from_value(
-            self.control(json!({"op": "register", "session_id": session_id, "agent": agent}))?,
-        )
-        .context("judge endpoint")
+        let request = json!({"op": "register", "session_id": session_id, "agent": agent});
+        let mut last_error = None;
+        // Idle shutdown can begin just after a successful readiness check.
+        // Retrying an atomic registration is idempotent and retains its token.
+        for _ in 0..3 {
+            self.ensure_running()?;
+            match self.control(request.clone()) {
+                Ok(result) => return serde_json::from_value(result).context("judge endpoint"),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("registration attempted"))
     }
 
     pub fn unregister(&self, session_id: &str) -> Result<()> {
@@ -350,9 +401,61 @@ mod tests {
             restarted.register("a", &agent).unwrap().token,
             endpoint.token
         );
-        restarted.unregister("a").unwrap();
-        restarted.unregister("b").unwrap();
-        assert!(restarted
+        // Configuration changes replace a healthy detached process; this is
+        // also the path used when the embedded service or policy hash changes.
+        let old_pid = restarted.control(json!({"op": "health"})).unwrap()["pid"].clone();
+        let mut changed_config = config.clone();
+        changed_config.local_judge.timeout_seconds = 29;
+        changed_config.local_judge.proxy_port = 8433;
+        changed_config.local_host.base_url = "http://127.0.0.1:8001".into();
+        let upgraded = LocalJudgeRuntime::from_config(&changed_config);
+        upgraded.reconcile().unwrap();
+        let health = upgraded.control(json!({"op": "health"})).unwrap();
+        assert_ne!(health["pid"], old_pid);
+        assert_eq!(health["generation"], upgraded.generation());
+        assert_eq!(
+            upgraded.register("a", &agent).unwrap().token,
+            endpoint.token
+        );
+        assert_eq!(
+            upgraded
+                .control(json!({"op": "registrations"}))
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        upgraded.unregister("a").unwrap();
+        upgraded.unregister("b").unwrap();
+        // Kill the empty daemon, then simulate an idle-shutdown response
+        // precisely between ensure's successful health check and register.
+        upgraded.control(json!({"op": "shutdown"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while root.join("state/control.sock").exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let socket = root.join("state/control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let generation = upgraded.generation();
+        let stub = thread::spawn(move || {
+            for result in [
+                json!({"result": {"generation": generation}}),
+                json!({"error": "judge stopping"}),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                serde_json::to_writer(&mut stream, &result).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            fs::remove_file(socket).unwrap();
+        });
+        upgraded.register("a", &agent).unwrap();
+        stub.join().unwrap();
+        upgraded.unregister("a").unwrap();
+        assert!(upgraded
             .control(json!({"op": "registrations"}))
             .unwrap()
             .as_object()

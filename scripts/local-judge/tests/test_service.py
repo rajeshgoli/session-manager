@@ -256,6 +256,21 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.ruling('Read', {}), 'deny')
         self.assertEqual(len(self.control('registrations')), 1)
 
+    def test_shutdown_drains_decisions_and_preserves_records(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            decision = pool.submit(self.ruling, tin={'command': 'curl slow'})
+            deadline = time.monotonic() + 2
+            while not self.model.requests:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.005)
+            self.control('shutdown')
+            self.assertEqual(decision.result(), 'deny')
+            self.process.wait(timeout=3)
+            self.assertEqual(self.logs()[-1]['command'], 'curl slow')
+            self.stop(); self.start()
+            self.assertEqual(len(self.control('registrations')), 2)
+            self.assertEqual(self.ruling('Read', {}), 'allow')
+
     def test_fail_closed_and_streaming(self):
         for command in ['curl invalid', 'curl prefix', 'curl preamble', 'curl slow']:
             start = time.monotonic()
