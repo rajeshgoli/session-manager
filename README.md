@@ -84,6 +84,32 @@ of every ticket and PR with the agents, reviews and documents behind it.
 
 ![The Inbox: an agent's thread, its documents for review, and a reply box](docs/assets/inbox.jpg)
 
+## Specs you review like code
+
+Larger work starts as a written spec, and the spec is where you steer. Open
+it in the reader, select any sentence and comment on it, then approve,
+request changes, or hold the merge until you release it. Your review lands
+on the pull request and wakes the agent that wrote the spec; it revises,
+republishes, and asks for the next round. **Ask** puts a question to the
+document, and its author answers in your Inbox.
+
+It works like a whiteboard session with your agents, with the precision of a
+code review: every comment is pinned to the sentence it's about, and every
+revision is kept.
+
+![Commenting on a sentence in a draft](docs/assets/doc_comment.png)
+
+## On your phone
+
+The Android app carries the same view: every agent with its context and
+work, the Inbox with a reply box, and the document reader with review.
+
+<p>
+<img src="docs/assets/phone_agent.png" width="32%" alt="An agent's card on the phone: context, hand off, ticket and PR">
+<img src="docs/assets/phone_inbox.png" width="32%" alt="An Inbox thread on the phone with a reply box">
+<img src="docs/assets/phone_doc.png" width="32%" alt="A document open for review on the phone">
+</p>
+
 ## How agents talk to Session Manager
 
 Agents live in text, so they get a command-line tool, `sm`. These are small,
