@@ -1131,10 +1131,10 @@ impl TmuxRuntime {
                     }
                 }
                 None if !echoed => return false,
-                None => {}
+                None => cleared_frames = 0,
             }
             if Instant::now() >= deadline {
-                return cleared_frames == 0;
+                return true;
             }
             thread::sleep(CLAUDE_SUBMIT_CHECK_POLL);
         }
@@ -3195,6 +3195,25 @@ esac
     since=$(sed -n '/ Enter$/,$p' "$log" | grep -c '^capture-pane')
     if [ "$enters" -ge 2 ]; then cat "$empty"
     elif [ "$enters" -eq 1 ] && [ "$since" -le 1 ]; then printf '\n\n\n'; cat "$held"
+    else cat "$held"; fi"#,
+        );
+
+        assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
+
+        assert_eq!(enter_count(&log_path), 2);
+    }
+
+    /// Two empty-composer frames split by a redraw frame are not two in a
+    /// row, so they do not count as a submit.
+    #[cfg(unix)]
+    #[test]
+    fn send_input_needs_consecutive_empty_frames_for_a_submit() {
+        let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
+            r#"enters=$(grep -c ' Enter$' "$log")
+    since=$(sed -n '/ Enter$/,$p' "$log" | grep -c '^capture-pane')
+    if [ "$enters" -ge 2 ]; then cat "$empty"
+    elif [ "$enters" -eq 1 ] && [ "$since" -eq 2 ]; then printf '\n\n\n'; cat "$held"
+    elif [ "$enters" -eq 1 ] && [ "$since" -le 3 ]; then cat "$empty"
     else cat "$held"; fi"#,
         );
 
