@@ -25,5 +25,6 @@ int wall_retain(const struct wall_configuration *, uint8_t, uint16_t,
                 struct wall_socket *);
 int wall_listen(struct wall_socket *, unsigned);
 int wall_release(struct wall_socket *);
+int wall_is_control(const struct wall_configuration *, int);
 void wall_dispose(struct wall_socket *);
 #endif

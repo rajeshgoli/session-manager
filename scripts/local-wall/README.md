@@ -178,6 +178,8 @@ python3 scripts/local-wall/build_adapter.py \
   --peer-token "$peer0" "$peer1" "$peer2" "$peer3" "$peer4" "$peer5" "$peer6" "$peer7" \
   --direct-ports "$gateway_port" "$egress_port" "$model_port" "$judge_port" \
   --control-port "$agent_port" --control-fd "$inherited_control_fd" \
+  --immutable-exec-dir "$host_staged_executables" \
+  --immutable-exec-dir "$approved_python_installation" \
   --output "$state_dir/xdg/config/socket-adapter.dylib"
 ```
 
@@ -203,20 +205,49 @@ socket calls retain their ordinary behavior under the wall's own restrictions.
 The service limits each agent to 16 live test listeners and 32 control connections;
 the adapter tracks up to 1024 application descriptor copies.
 
-#1998 completes exec and posix_spawn inheritance. Until it lands, the adapter
-returns EACCES on exec with an adapted descriptor that would survive exec, and
-conservatively refuses spawn file actions while adapted descriptors exist.
-It permits spawn without file actions when every adapted descriptor is
-close-on-exec. This library is not yet integrated into provider launch: #1986
-depends on #1998 and proves full Rust/Python/Bun and pinned opencode compatibility
-with the production profile. When a protected executable strips the loader
-variable, direct TCP bind/connect remain constrained by the operating-system
-wall; the caller must never widen that wall to restore adaptation.
+Exec and posix_spawn recover inherited listeners and bound sockets from kernel
+socket state. The adapter restores its compiled absolute loader path even with
+a cleared or forged environment. Recovery opens a fresh authenticated retain
+connection per listener before closing inherited control streams; duplicated
+application descriptors share the recovered lease. Connected sockets retain
+their ordinary lifetime and are not mistaken for listeners. Final listener
+close waits for the host to drop that process's lease before acknowledging it.
+Fork and ordinary spawn return only after the child has recovered, so a parent
+may immediately close its copy. Spawn forwards ordered close, dup2, open,
+inherit and working-directory actions, including close-on-exec defaults.
+Python's process-replacement spawn mode follows the exec recovery path.
+
+The adapter supports native-architecture unsigned and ad-hoc signed Mach-O
+executables. Inherited adapted sockets require a canonical executable path below
+a compiled `--immutable-exec-dir`. The host must stage these directories before
+launch and deny agent writes to their files, entries and ancestors; no writable
+ancestor may move or replace a trusted root. Reject hard links to mutable files.
+These checks apply to same-user writable tool installations as well as own
+state. Canonical execution prevents a mutable symlink from substituting another
+image between validation and execution. With no roots configured, inheritance
+is refused. Agents can execute mutable programs when no adapted socket survives;
+the host must stage a program in immutable state before it inherits a listener.
+It refuses surviving adapted descriptors for platform, restricted,
+hardened, library-validated or unsupported images and suspended spawn. Such
+executables may run when no adapted descriptors survive. Relative spawn paths
+resolve after ordered directory actions. The adapter mirrors up to 64 live file-action objects and
+256 actions per object; it does not inspect libc's private representation.
+An internal `SM_WALL_RECOVERY_FD` value identifies only a parent completion
+socket, verified through its kernel parent identity and an expected marker.
+It never chooses broker identity, endpoint, agent attribution or socket rights.
+Caller loader and completion overrides are replaced; other environment values
+are forwarded. Two-second recovery waits fail closed if the child does not
+confirm initialization. This library is not integrated into provider launch:
+#1986 proves full Rust/Python/Bun and pinned opencode compatibility with the
+production profile. Direct kernel TCP calls stay constrained by the wall;
+the caller must never widen it to restore adaptation.
 
 The macOS Rust tests under `local_sockets` compile native fixtures with warnings
 as errors and exercise the real service, forged peer identity, malformed replies
 and descriptor cleanup, provider-control refusal, ordinary IPv4/IPv6 socket calls,
-duplication, fork, concurrency, flags, and conservative exec/spawn refusal.
+duplication, fork, concurrency, flags, all exec entry points, spawn file actions,
+cleared/forged environments, unsupported-image refusal, immediate port reuse,
+and ordinary Rust/Python programs inheriting listeners.
 The socket fixture also proves raw bind succeeds outside its sandbox and fails
 inside it. Full launch/restore and production-profile validation remain #1986.
 

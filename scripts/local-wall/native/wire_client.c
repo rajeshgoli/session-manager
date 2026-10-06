@@ -65,6 +65,18 @@ static int close_on_exec(int fd) {
     return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+int wall_is_control(const struct wall_configuration *configuration, int fd) {
+    struct sockaddr_un peer = {0};
+    socklen_t size = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &size) < 0 || peer.sun_family != AF_UNIX ||
+        strnlen(peer.sun_path, sizeof(peer.sun_path)) == sizeof(peer.sun_path) ||
+        strcmp(peer.sun_path, configuration->endpoint)) return 0;
+    uint32_t token[8];
+    size = sizeof(token);
+    return getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, token, &size) == 0 &&
+        size == sizeof(token) && !memcmp(token, configuration->peer_token, sizeof(token));
+}
+
 static int broker(const struct wall_configuration *configuration) {
     if (!configuration || !configuration->endpoint) return fail(EINVAL);
     size_t length = strnlen(configuration->endpoint, sizeof(((struct sockaddr_un *)0)->sun_path));
