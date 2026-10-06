@@ -83,6 +83,8 @@ scripts/local-wall/wall_profile.sh \
   --egress-port 18700 --egress-port-range 18700-18799 \
   --model-port 8000 --judge-port 8441 \
   --service-state-dir "$judge_state" --service-state-dir "$proxy_state" \
+  --broker-dir "$state_dir/tmp/broker" \
+  --immutable-exec-dir "$host_staged_executables" \
   > "$state_dir/wall.sb.new"
 ```
 
@@ -188,8 +190,10 @@ The host stages this library in agent-readable, agent-write-denied state and
 loads it with `DYLD_INSERT_LIBRARIES` in a cleared launch environment. The host
 must also make the broker endpoint directory and its short alias agent-write-denied
 while keeping the endpoint inside the permitted private Unix socket subtree.
-The generator's general tmp write grant does not itself exclude a nested broker
-directory; #1986 supplies that launch composition. Mode 0500 on the library and
+Pass `--broker-dir` to exclude the endpoint directory from tmp writes, and repeat
+`--immutable-exec-dir` for every root compiled into the adapter. The profile
+protects their contents and containing directories against replacement.
+Application TMPDIR must be outside the broker directory. Mode 0500 on the library and
 0700 on the endpoint directory do not replace sandbox write denials, because
 the host and agent use the same operating-system user.
 
@@ -237,8 +241,9 @@ socket, verified through its kernel parent identity and an expected marker.
 It never chooses broker identity, endpoint, agent attribution or socket rights.
 Caller loader and completion overrides are replaced; other environment values
 are forwarded. Two-second recovery waits fail closed if the child does not
-confirm initialization. This library is not integrated into provider launch:
-#1986 proves full Rust/Python/Bun and pinned opencode compatibility with the
+confirm initialization. `local_sockets::launch::LaunchBinding` provides host
+launch composition, proved with native fixtures, Rust/Python inheritance,
+pinned opencode's Bun HTTP server, and sm's HTTP/queue socket fixtures under the
 production profile. Direct kernel TCP calls stay constrained by the wall;
 the caller must never widen it to restore adaptation.
 
@@ -249,7 +254,27 @@ duplication, fork, concurrency, flags, all exec entry points, spawn file actions
 cleared/forged environments, unsupported-image refusal, immediate port reuse,
 and ordinary Rust/Python programs inheriting listeners.
 The socket fixture also proves raw bind succeeds outside its sandbox and fails
-inside it. Full launch/restore and production-profile validation remain #1986.
+inside it. The production launch fixture covers fresh registrations, forged or
+absent requester variables, cancellation cleanup and hard-link rejection.
+
+Compile `native/launch_supervisor.c` with clang's `-std=c11 -Wall -Wextra -Werror`
+flags into immutable host-owned state. Build the adapter with control descriptor
+198 (`launch::CONTROL_FD`). Construct `LaunchBinding` with the shared
+`AgentService`, its exact-loopback control listener, profile, adapter and
+supervisor. The three host files must have no hard-link aliases. The host must
+also reject mutable aliases into trusted executable roots before launch.
+Pass an explicit host environment allowlist and checkout to `spawn`; drain
+its piped stdout/stderr while it runs. Caller loader overrides are replaced.
+Unrelated host descriptors and environment are not inherited.
+
+The trusted supervisor waits for host registration before forking the sandboxed
+application and remains its ancestry root across exec. A private completion
+socket returns the application's exit status. Completion or cancellation kills
+the private process group and revokes registration. The supervisor's PID stays
+reserved until cleanup. Drop the service at shutdown and create a new service
+after host restart. Queue jobs share the agent's binding with fresh process
+registrations; requester environment never selects socket authority.
+Actual provider launch and stamped queue dispatch integration remains #1974.
 
 Run fixture validation through the durable queue:
 
