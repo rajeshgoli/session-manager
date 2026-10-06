@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Production local judge, lifted from #1954. Only /decide is agent-facing.
+
+The private Unix control socket owns registrations and owner grants. The wall must
+block the whole state directory (including its sockets) from every local agent.
+The daemon detaches from sm so sm's blue/green restart never interrupts decisions.
+"""
+import argparse
+import http.client
+import json
+import os
+import re
+import secrets
+import hashlib
+import fcntl
+import socketserver
+import queue
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+HOME = os.path.expanduser("~")
+ap = argparse.ArgumentParser()
+ap.add_argument("--root", required=True)
+ap.add_argument("--port", type=int, default=8431)
+ap.add_argument("--model-url", default="http://127.0.0.1:8000")
+ap.add_argument("--timeout", type=float, default=30.0)
+ap.add_argument("--proxy-port", type=int, default=8432)
+ap.add_argument("--policy", required=True)
+ap.add_argument("--no-model", action="store_true")
+ARGS = ap.parse_args()
+ARGS.agents = os.path.join(ARGS.root, "agents.json")
+ARGS.log = os.path.join(ARGS.root, "decisions.jsonl")
+ARGS.allow_file = os.path.join(ARGS.root, "allows.jsonl")
+CONTROL = os.path.join(ARGS.root, "control.sock")
+LOCK = threading.RLock()
+STOPPING = False
+
+DENY_TAIL = ("Denied ({id}). Do not retry this in another form. If the work needs it, tell your parent "
+             "with sm send, then continue with what you can do, or stop.")
+
+# --- rule stage (K.3) -------------------------------------------------------------------------
+
+ALWAYS_ALLOWED = {"Read", "Glob", "Grep", "TodoWrite"}
+PATH_TOOLS = {"Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
+# A word counts only as a whole shell token: "sm" matches `sm send`, not `crates/sm-server`.
+_B, _A = r"(?<![\w./:@-])", r"(?![\w./:@-])"
+GIT_EGRESS = re.compile(_B + r"git" + _A + r".*?" + _B
+                        + r"(push|fetch|pull|clone|remote|ls-remote|submodule)" + _A, re.S)
+# Text that builds a command at run time, so the words above cannot be checked: always judged.
+OBFUSCATION = re.compile(r"(?<![\w-])(eval|base64|xxd|uudecode)(?![\w-])|\\x[0-9a-fA-F]{2}|\$'|\\[0-7]{3}")
+# Credentials the wall leaves readable so gh works: a command that names one is always judged,
+# and the Read tool on them is denied.
+CREDENTIAL = re.compile(r"\.config/gh|hosts\.yml|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|oauth_token"
+                        r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials")
+CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, ".config", "gh")),
+                    os.path.realpath(os.path.join(HOME, ".git-credentials"))]
+# Running a file the agent can write: its text is checked as if it were part of the command.
+SCRIPT_RUN = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|python3?|perl|ruby|node|source|\.)\s+([^\s;&|)]+)"
+                        r"|(?:^|[;&|(]|&&|\|\|)\s*(\.{0,2}/[^\s;&|)]+)")  # a path in command position
+
+
+def egress_words(agent):
+    words = ["gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript", "8420",
+             str(ARGS.proxy_port)]
+    port = urlparse(agent.get("sm_url") or "").port
+    if port and str(port) not in words:
+        words.append(str(port))
+    return re.compile(_B + "(" + "|".join(map(re.escape, words)) + ")" + _A)
+
+
+def normalise(text):
+    """Drop quoting and line continuations so `'gi''t' pu"sh"` reads as `git push`."""
+    return re.sub(r"\\\n", "", text).replace("'", "").replace('"', "").replace("\\", "")
+
+
+def script_texts(command, cwd, agent):
+    """Text of each script file the command runs, read only inside the checkout or temp folder."""
+    out = []
+    for m in SCRIPT_RUN.finditer(command):
+        p = m.group(1) or m.group(2)
+        if not p or p.startswith("-"):
+            continue
+        p = os.path.normpath(os.path.join(cwd or agent["checkout"], os.path.expanduser(p)))
+        if inside(p, agent) and os.path.isfile(p):
+            try:
+                with open(p, errors="replace") as f:
+                    out.append((p, f.read(200_000)))
+            except OSError:
+                pass
+    return out
+
+
+def egress_hits(text, agent):
+    t = normalise(text)
+    hits = [m.group(0) for m in GIT_EGRESS.finditer(t)][:1]
+    hits += sorted({m.group(1) for m in egress_words(agent).finditer(t)})
+    if OBFUSCATION.search(text):
+        hits.append("obfuscation")
+    if CREDENTIAL.search(t):
+        hits.append("credential")
+    return hits
+
+
+def resolve(path, agent):
+    return os.path.realpath(os.path.join(agent["checkout"], os.path.expanduser(path)))
+
+
+def inside(path, agent):
+    real = resolve(path, agent)
+    return any(real == r or real.startswith(r + os.sep)
+               for r in (os.path.realpath(agent["checkout"]), os.path.realpath(agent["tmp"])))
+
+
+def rule_stage(tool, tin, cwd, agent):
+    """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
+    if tool in ALWAYS_ALLOWED:
+        path = resolve(tin.get("file_path") or tin.get("path") or "", agent)
+        if any(path == c or path.startswith(c + os.sep) for c in CREDENTIAL_PATHS):
+            return "deny", "reading GitHub credentials is not allowed"
+        return "allow", f"{tool} is always allowed"
+    if tool in PATH_TOOLS:
+        path = tin.get(PATH_TOOLS[tool]) or ""
+        if path and inside(path, agent):
+            return "allow", f"{tool} inside the checkout or temp folder"
+        return "deny", (f"{tool} outside your checkout and temp folder is not allowed; the sandbox "
+                        f"would block the write anyway. Write only under {agent['checkout']} or {agent['tmp']}.")
+    if tool == "Bash":
+        cmd = tin.get("command") or ""
+        hits = egress_hits(cmd, agent)
+        for path, text in script_texts(cmd, cwd, agent):
+            more = egress_hits(text, agent)
+            hits += [f"{os.path.basename(path)}:{h}" for h in more]
+        if not hits:
+            return "allow", "no egress word in the command"
+        return "judge", "egress words: " + ", ".join(hits)
+    return "judge", f"tool {tool} has no rule"
+
+
+# --- judge stage (K.4) ------------------------------------------------------------------------
+
+def judge_message(tool, tin, agent):
+    if tool == "Bash":
+        action = tin.get("command") or ""
+    else:
+        action = json.dumps(tin, indent=1)[:4000]
+    return (f"Agent: {agent['name']} working ticket #{agent['ticket']} \"{agent['title']}\" "
+            f"on branch {agent['branch']} in {agent['checkout']}\n"
+            f"Parent: {agent['parent']}\n"
+            f"sm server for this agent: {agent.get('sm_url') or 'http://127.0.0.1:8420'}\n"
+            f"Tool: {tool}\nCommand:\n{action}\n"
+            "Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.")
+
+
+VERDICT = re.compile(r"^(ALLOW|DENY): ([^\r\n]+)$")
+
+
+def ask_judge_stream(tool, tin, agent):
+    """(decision, reason, raw) or raises on timeout / unparseable reply."""
+    with open(ARGS.policy) as f:
+        policy = f.read()
+    body = json.dumps({
+        "model": "judge", "max_tokens": 200, "temperature": 0, "stream": True,
+        "thinking": {"type": "disabled"}, "enable_thinking": False,
+        "system": policy,
+        "messages": [{"role": "user", "content": judge_message(tool, tin, agent)}],
+    })
+    u = urlparse(ARGS.model_url)
+    deadline = time.monotonic() + ARGS.timeout
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=ARGS.timeout)
+    try:
+        conn.request("POST", "/v1/messages", body, {"Content-Type": "application/json",
+                                                    "x-api-key": "local", "anthropic-version": "2023-06-01"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise RuntimeError(f"model HTTP {resp.status}: {resp.read(300)!r}")
+        text, pending = "", b""
+        stream_socket = resp.fp.raw._sock
+        while time.monotonic() < deadline:
+            stream_socket.settimeout(max(0.001, deadline - time.monotonic()))
+            # HTTPResponse decodes chunk framing; raw fp.readline does not.
+            chunk = resp.read1(4096)
+            if not chunk:
+                break
+            pending += chunk
+            if len(pending) > 65536:
+                raise ValueError("judge event too large")
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                if not line.startswith(b"data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:])
+                except ValueError:
+                    continue
+                delta = ev.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    text += delta.get("text", "")
+                    if len(text) > 4096:
+                        raise ValueError("judge reply too large")
+                    # The answer line can finish before MTPLX closes the stream.
+                    if "\n" in text:
+                        match = VERDICT.fullmatch(text.split("\n", 1)[0].strip())
+                        if match and len(match.group(2).split()) < 20:
+                            return match.group(1).lower(), match.group(2).strip(), text
+                        raise ValueError("unparseable judge reply")
+                if ev.get("type") == "message_stop":
+                    match = VERDICT.fullmatch(text.strip())
+                    if match and len(match.group(2).split()) < 20:
+                        return match.group(1).lower(), match.group(2).strip(), text
+                    raise ValueError("unparseable judge reply")
+        for ln in text.split("\n")[:1]:
+            m = VERDICT.match(ln.strip())
+            if m and len(m.group(2).split()) < 20:
+                return m.group(1).lower(), m.group(2).strip(), text
+        if time.monotonic() >= deadline:
+            raise TimeoutError("judge did not answer in time")
+        raise ValueError(f"unparseable judge reply: {text[:200]!r}")
+    finally:
+        conn.close()
+
+
+# Bound the whole model call, including slow headers or a trickling stream.
+# A bounded pool prevents a failing model from exhausting host threads.
+MODEL_SLOTS = threading.BoundedSemaphore(32)
+
+
+def ask_judge(tool, tin, agent):
+    if not MODEL_SLOTS.acquire(blocking=False):
+        raise RuntimeError("judge overloaded")
+    result = queue.Queue(maxsize=1)
+    def run():
+        try:
+            result.put((True, ask_judge_stream(tool, tin, agent)))
+        except Exception as error:
+            result.put((False, error))
+        finally:
+            MODEL_SLOTS.release()
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        ok, answer = result.get(timeout=ARGS.timeout)
+    except queue.Empty:
+        raise TimeoutError("judge did not answer in time") from None
+    if not ok:
+        raise answer
+    return answer
+
+
+# --- owner allows (K.8) -----------------------------------------------------------------------
+
+def read_jsonl(path):
+    try:
+        with open(path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def append(path, rec):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    fd = os.open(ARGS.root, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def action_text(tool, tin):
+    return tin.get("command") if tool == "Bash" else (tin.get("file_path") or json.dumps(tin, sort_keys=True))
+
+
+def take_owner_allow(agent_id, tool, text, action_key):
+    """Consume an unused allow for this exact call; returns its denial id or None. Caller holds LOCK."""
+    rows = read_jsonl(ARGS.allow_file)
+    used = {r["denial_id"] for r in rows if r.get("used_at")}
+    for r in rows:
+        if (not r.get("used_at") and r["denial_id"] not in used and r.get("session_id") == agent_id
+                and r.get("tool") == tool and r.get("command") == text
+                and r.get("action_key") == action_key):
+            append(ARGS.allow_file, {"denial_id": r["denial_id"], "used_at": time.time()})
+            return r["denial_id"]
+    return None
+
+
+def owner_allow(denial_id):
+    with LOCK:
+        hit = next((r for r in read_jsonl(ARGS.log) if r.get("denial_id") == denial_id), None)
+        if not hit:
+            return None
+        # Repeated owner requests never replenish a consumed grant.
+        existing = next((r for r in read_jsonl(ARGS.allow_file)
+                         if r.get("denial_id") == denial_id and "allowed_at" in r), None)
+        if existing:
+            return existing
+        rec = {"denial_id": denial_id, "session_id": hit["session_id"], "tool": hit["tool"],
+               "command": hit["command"], "action_key": hit["action_key"], "allowed_at": time.time()}
+        append(ARGS.allow_file, rec)
+        return rec
+
+
+# --- service ----------------------------------------------------------------------------------
+
+def decide(hook, agent_id, token):
+    t0 = time.time()
+    with LOCK:
+        agents = read_agents()
+    agent = agents.get(agent_id)
+    tool, tin = hook.get("tool_name") or "", hook.get("tool_input") or {}
+    text = action_text(tool, tin)
+    action_key = hashlib.sha256(json.dumps([tool, tin, hook.get("cwd")], sort_keys=True,
+                                          separators=(",", ":")).encode()).hexdigest()
+    rec = {"t": t0, "session_id": agent_id, "claude_session": hook.get("session_id"), "tool": tool,
+           "command": text, "action_key": action_key, "cwd": hook.get("cwd")}
+    if agent is None or not secrets.compare_digest(agent["decide_token"], token):
+        stage, decision, reason = "rule", "deny", f"unknown agent {agent_id!r}"
+    else:
+        with LOCK:
+            owner = take_owner_allow(agent_id, tool, text, action_key)
+        if owner:
+            stage, decision, reason = "owner", "allow", f"allowed once by the owner after denial {owner}"
+        else:
+            stage = "rule"
+            decision, reason = rule_stage(tool, tin, agent["checkout"], agent)
+            if decision == "judge":
+                stage, rec["judge_why"] = "judge", reason
+                if ARGS.no_model:
+                    decision, reason = "deny", "judge unavailable; retry this command in a minute"
+                else:
+                    try:
+                        decision, reason, raw = ask_judge(tool, tin, agent)
+                        rec["judge_raw"] = raw[:500]
+                    except Exception as e:  # timeout, connection, parse: all deny
+                        rec["judge_error"] = f"{type(e).__name__}: {e}"[:300]
+                        decision, reason = "deny", "judge unavailable; retry this command in a minute"
+    rec.update(stage=stage, decision=decision, reason=reason, ms=round((time.time() - t0) * 1000))
+    if decision == "deny":
+        rec["denial_id"] = new_denial_id()
+        if stage == "rule" and tool in PATH_TOOLS:  # a wrong place, not a forbidden action
+            shown = f"{reason.rstrip('.')}. Denied ({rec['denial_id']}); write it there instead."
+        else:
+            shown = f"{reason.rstrip('.')}. {DENY_TAIL.format(id=rec['denial_id'])}"
+    else:
+        shown = reason
+    with LOCK:
+        append(ARGS.log, rec)
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": shown}}
+
+
+def read_agents():
+    try:
+        with open(ARGS.agents) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def write_agents(agents):
+    path = ARGS.agents + ".new"
+    with open(path, "w") as f:
+        json.dump(agents, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path, ARGS.agents)
+    fd = os.open(ARGS.root, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def new_denial_id():
+    # Preserve the proof's four-hex display id without ever reusing an old id.
+    with LOCK:
+        used = {r.get("denial_id") for r in read_jsonl(os.path.join(ARGS.root, "denial-ids.jsonl"))}
+        for _ in range(65536):
+            candidate = "d-" + secrets.token_hex(2)
+            if candidate not in used:
+                # Reserve before another concurrent request chooses its id.
+                append(os.path.join(ARGS.root, "denial-ids.jsonl"), {"denial_id": candidate})
+                return candidate
+    raise RuntimeError("denial id space exhausted")
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _reply(self, code, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self._reply(200 if self.path == "/health" else 404,
+                    {"ok": True} if self.path == "/health" else {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/decide":
+            self.close_connection = True
+            return self._reply(404, {"error": "not found"})
+        try:
+            size = int(self.headers.get("Content-Length") or 0)
+            if not 0 < size <= 2_000_000:
+                raise ValueError("invalid request length")
+            self.connection.settimeout(5)
+            body = json.loads(self.rfile.read(size))
+            if not isinstance(body, dict) or not isinstance(body.get("tool_input"), dict):
+                raise ValueError("invalid tool request")
+            result = decide(body, self.headers.get("X-Local-Agent") or "",
+                            self.headers.get("X-Local-Judge-Token") or "")
+            self._reply(200, result)
+        except Exception:
+            # A broken log or malformed input must never authorize an action.
+            self.close_connection = True
+            self._reply(200, {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": "judge unavailable; retry this command in a minute"}})
+
+
+class Control(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.request.settimeout(5)
+        try:
+            body = json.loads(self.rfile.readline(2_000_001))
+            op = body.get("op")
+            if STOPPING:
+                raise RuntimeError("judge stopping")
+            if op == "health":
+                result = {"ok": True, "pid": os.getpid(), "port": HTTP.server_port}
+            elif op == "allow":
+                result = owner_allow(body["denial_id"])
+                if result is None:
+                    raise ValueError("no such denial")
+            else:
+                with LOCK:
+                    agents = read_agents()
+                    if STOPPING:
+                        raise RuntimeError("judge stopping")
+                    if op == "register":
+                        agent_id, agent = body["session_id"], body["agent"]
+                        if not isinstance(agent_id, str) or not agent_id:
+                            raise ValueError("empty session id")
+                        for key in ("name", "title", "branch", "checkout", "tmp", "parent", "sm_url"):
+                            if not isinstance(agent.get(key), str) or not agent[key]:
+                                raise ValueError("missing " + key)
+                        if not isinstance(agent.get("ticket"), int):
+                            raise ValueError("missing ticket")
+                        for key in ("checkout", "tmp"):
+                            if not os.path.isabs(agent[key]) or not os.path.isdir(agent[key]):
+                                raise ValueError("invalid " + key)
+                            agent[key] = os.path.realpath(agent[key])
+                            state = os.path.realpath(ARGS.root)
+                            if state == agent[key] or state.startswith(agent[key] + os.sep):
+                                raise ValueError("judge state cannot be inside agent folders")
+                        agent["decide_token"] = agents.get(agent_id, {}).get("decide_token") or secrets.token_hex(32)
+                        agents[agent_id] = agent
+                        write_agents(agents)
+                        result = {"url": f"http://127.0.0.1:{HTTP.server_port}/decide",
+                                  "token": agent["decide_token"]}
+                    elif op == "unregister":
+                        agents.pop(body["session_id"], None)
+                        write_agents(agents)
+                        result = {"ok": True}
+                    elif op == "registrations":
+                        result = agents
+                    else:
+                        raise ValueError("unknown control operation")
+            reply = {"result": result}
+        except Exception as e:
+            reply = {"error": str(e)}
+        self.wfile.write(json.dumps(reply).encode() + b"\n")
+
+
+class ControlServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    os.makedirs(ARGS.root, mode=0o700, exist_ok=True)
+    # Lifetime lock: overlapping sm restarts/start requests create one daemon.
+    lifetime = open(os.path.join(ARGS.root, "service.lock"), "a")
+    try:
+        fcntl.flock(lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # An idle daemon may be releasing the port/socket. Wait only for that
+        # transition; do not start a duplicate beside a live service.
+        until = time.monotonic() + 3
+        while True:
+            if os.path.exists(CONTROL) or time.monotonic() >= until:
+                raise SystemExit(0)
+            time.sleep(0.025)
+            try:
+                fcntl.flock(lifetime, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass
+    HTTP = ThreadingHTTPServer(("127.0.0.1", ARGS.port), H)
+    HTTP.daemon_threads = True
+    if os.path.exists(CONTROL):
+        os.unlink(CONTROL)
+    control = ControlServer(CONTROL, Control)
+    threading.Thread(target=control.serve_forever, daemon=True).start()
+    threading.Thread(target=HTTP.serve_forever, daemon=True).start()
+    # Stop after the final unregister, with a grace period for a replacement
+    # agent's register-before-launch operation. Startup can also be pre-launch.
+    empty_since = time.monotonic()
+    while True:
+        time.sleep(1)
+        with LOCK:
+            if read_agents():
+                empty_since = time.monotonic()
+            elif time.monotonic() - empty_since >= 60:
+                # Close control admission while holding the registration lock.
+                # A blocked register fails and the host retries through ensure.
+                STOPPING = True
+                os.unlink(CONTROL)
+                break
+    HTTP.shutdown()
+    control.shutdown()

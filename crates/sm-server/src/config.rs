@@ -62,6 +62,7 @@ pub struct AppConfig {
     pub push: PushConfig,
     pub utilization: UtilizationConfig,
     pub local_host: crate::local_model::LocalHostConfig,
+    pub local_judge: crate::local_judge::LocalJudgeConfig,
     pub activity: ActivityConfig,
     /// How sm names the owner in text it writes to agents (sm#1580): the
     /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
@@ -136,6 +137,7 @@ impl Default for AppConfig {
             push: PushConfig::default(),
             utilization: UtilizationConfig::default(),
             local_host: crate::local_model::LocalHostConfig::default(),
+            local_judge: crate::local_judge::LocalJudgeConfig::default(),
             activity: ActivityConfig::default(),
             owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
@@ -301,6 +303,11 @@ impl AppConfig {
             )
         })?;
 
+        self.local_judge.root_dir = isolate_default_data_path(
+            &self.local_judge.root_dir,
+            &crate::local_judge::LocalJudgeConfig::default().root_dir,
+            &instance,
+        )?;
         let custom_state_file = self.paths.state_file != default_state_file();
         self.paths.state_file =
             isolate_default_data_path(&self.paths.state_file, &default_state_file(), &instance)?;
@@ -2218,6 +2225,8 @@ struct RawConfig {
     #[serde(default)]
     local_host: crate::local_model::LocalHostConfig,
     #[serde(default)]
+    local_judge: crate::local_judge::LocalJudgeConfig,
+    #[serde(default)]
     activity: ActivityConfig,
     #[serde(default)]
     owner_name: Option<String>,
@@ -2340,6 +2349,7 @@ impl From<RawConfig> for AppConfig {
             push: raw.push,
             utilization: raw.utilization,
             local_host: raw.local_host,
+            local_judge: raw.local_judge,
             activity: raw.activity,
             owner_name: normalize_owner_name(raw.owner_name.as_deref())
                 .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),

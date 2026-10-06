@@ -46,6 +46,7 @@ pub mod guestbook;
 pub mod handoff;
 pub mod handover;
 pub mod http;
+pub mod local_judge;
 pub mod local_model;
 pub mod local_sockets;
 pub mod mobile_devices;
