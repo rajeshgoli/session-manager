@@ -1,696 +1,209 @@
 # Session Manager
 
-## Dispatch teams of Claude and Codex agents
+**Stop hoping your agent finishes. Run your agents like an engineering team.**
 
-**Agent swarms without babysitting.** Spawn real Claude and Codex sessions,
-route work between them, keep every agent observable, and jump in from your
-terminal or phone when the swarm needs a nudge.
+Pool Claude, Codex and local models into one team. Plan the sprint, give each
+ticket to the right model from whichever subscription has room, and watch the
+plan move on one screen, from your desk or your phone.
 
-Session Manager is built for the messy reality of running many agents at once:
+![The Agents page: Claude and Codex agents sorted by what needs attention](docs/assets/agents.png)
+<!-- ASSET: "Try the live demo" link to sm-demo.rajeshgo.li once it is up. -->
 
-- **Fast enough to stay out of the way**: migration baselines show roughly
-  85-90% lower server memory and common read paths around 3x-20x faster than
-  the previous Python service.
-- **Ruggedized for real operations**: Rust owns the runtime, state stores have
-  backup/restore and freeze/drain gates, and cutover evidence is executable
-  instead of vibes.
-- **Secure on the public edge**: the mobile app path is designed for
-  Cloudflare Access mTLS first, then origin-side auth, then route-local shell
-  proofs before terminal attach.
-- **Remote when you need it**: the Android app is the on-the-go command center;
-  email/human-recipient delivery remains the fallback for replies and alerts.
+---
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         ORCHESTRATOR                            │
-│                    "Implement Epic #987"                        │
-└──────────────┬────────────────┬────────────────┬───────────────┘
-               │                │                │
-         sm spawn          sm spawn          sm spawn
-               │                │                │
-               ▼                ▼                ▼
-        ┌──────────┐     ┌──────────┐     ┌──────────┐
-        │ Engineer │     │ Architect│     │  Scout   │
-        │  Agent   │     │  Agent   │     │  Agent   │
-        └────┬─────┘     └────┬─────┘     └────┬─────┘
-             │                │                │
-             └────────────────┼────────────────┘
-                              │
-                         sm send em
-                        "done: PR #42"
-                              │
-              ┌───────────────┼───────────────┐
-              ▼                               ▼
-    ┌─────────────────┐             ┌─────────────────┐
-    │ Orchestrator    │             │ Phone shows the │
-    │ routes next     │             │ swarm in flight │
-    └─────────────────┘             └─────────────────┘
+## The problem: hope-driven agents
+
+Modern coding agents are strong enough that you can hand one an entire epic
+and tell it to keep going until it's done. Often it even gets there. But:
+
+- **You can't see progress.** All you have is a transcript. "How far along is
+  it?" is a guess, and "almost done" can last three hours.
+- **It forgets.** The epic doesn't fit in one agent's context. It compacts,
+  loses decisions it made an hour ago, and drifts.
+- **It marks its own homework.** The model that wrote the code also decides
+  the code is good.
+- **It spends your best model on everything**, including the trivial steps.
+- **Coordination costs tokens.** An agent that checks on its own progress, or
+  supervises helper agents, pays for every check.
+- **Your machine is a free-for-all.** Two test suites or a benchmark and a
+  build run at once, and every result is garbage.
+
+## The fix: a planned team
+
+Session Manager runs agents the way a good engineering lead runs people:
+
+```mermaid
+flowchart LR
+    G[Goal] --> P[Plan: tickets<br/>and dependencies]
+    P --> T1[Ticket → Opus]
+    P --> T2[Ticket → Codex]
+    P --> T3[Ticket → local model]
+    T1 --> Q[(Shared machine<br/>job queue)]
+    T2 --> Q
+    Q --> R[Review by a<br/>different model]
+    R --> M[Merged]
+    M -. next ticket starts<br/>when ready .-> P
 ```
 
----
+- **Plan up front.** A goal becomes tickets with dependencies. Each ticket is
+  sized so one agent can finish it within its own context.
+- **Right model per ticket.** Design work goes to a top model, routine
+  implementation to a mid-tier one, mechanical chores to a cheap or local one.
+  You draw from all of your subscriptions at once.
+- **The server coordinates, so no tokens go on it.** When a ticket's
+  dependencies finish, its agent starts. When a test job finishes, the waiting
+  agent wakes. When a PR is ready, a reviewer from another model is assigned.
+  Agents sit idle for free until there is something to do.
+- **No compaction.** The server watches each agent's context and hands the
+  work to a fresh successor before the window fills, so every transcript stays
+  whole for later inspection.
+- **A second model reviews each PR.** Claude's work can go to Codex for
+  review, and the reverse.
+- **The machine is scheduled.** Tests, benchmarks and GPU jobs wait in a queue.
+  A benchmark can have the whole machine to itself.
+- **You know when it will land.** Count the tickets left on the dependency
+  chain.
 
-## Agent Nirvana
+## One screen for the whole team
 
-**Let agents swarm loose on your problems while you do something better than
-watching terminals.**
+You run the team from a web dashboard, served by the Session Manager server.
+The Android app shows the same view on your phone.
 
-No more opaque subagents you cannot follow. Every agent is a full terminal
-session with durable state and a real lifecycle.
+| Page | What you see |
+|---|---|
+| **Agents** | Every agent sorted by what needs attention: *Needs you*, *Moving*, *Idle*. Each card shows its model, ticket, a one-line summary of what it's doing, its jobs and how full its context is. One click opens its terminal. |
+| **Board** | Tickets under each goal, what each one waits on, and who is working it. Start a ticket with a model preset, or arm it with **Start when ready** so it launches the moment its prerequisites are done. |
+| **Queue** | Running and waiting jobs (tests, benchmarks, background work) over a live chart of CPU, GPU and memory. |
+| **Inbox** | Questions agents have for you, threaded. Reply in place and the agent carries on. |
+| **Side rail** | Quota left on each subscription (Claude's 5-hour and weekly limits, Codex's weekly limit) and your machine's load, always visible. |
 
-- **Watch from anywhere** — the Android app shows live sessions, activity, app
-  updates, analytics, and mobile terminal attach.
-- **Jump in anytime** — `sm attach engineer` opens the actual tmux session.
-- **Coordinate without polling** — `sm send`, parent wakes, stop notifications,
-  and queue-backed delivery keep work moving while coordinators sleep.
-- **Keep the fallback** — email/human-recipient delivery keeps a simple reply
-  path when the app is not the right tool.
-- **Real sessions** — not abstractions. Real tmux. Real Claude Code. Real
-  Codex. `sm attach` and you are there.
+Also: ⌘K command palette, keyboard navigation, usage analytics, and a history
+of every ticket and PR with the agents, reviews and documents behind it.
 
-```
-Your Phone                           Your Agents
-──────────                           ───────────
-                                     EM: "Spawning engineer for #123"
-[engineer spawned]             <────
-                                     Engineer: working
-                                     Engineer: "done: PR #456 created"
-[engineer -> EM: done]         <────
-                                     EM: "Routing to architect"
-[architect review requested]   <────
-                                     Architect: reviewing
-[architect: approved]          <────
-                                     EM: "Merging..."
-[PR #456 merged]               <────
+![The Board: a goal's tickets, who works each, what each waits on, and Start when ready](docs/assets/board.jpg)
 
-You: not babysitting terminals
-```
+![The Inbox: an agent's thread, its documents for review, and a reply box](docs/assets/inbox.jpg)
 
----
+## Specs you review like code
 
-## Why This Exists
+Larger work starts as a written spec, and the spec is where you steer. Open
+it in the reader, select any sentence and comment on it, then approve,
+request changes, or hold the merge until you release it. Your review lands
+on the pull request and wakes the agent that wrote the spec; it revises,
+republishes, and asks for the next round. **Ask** puts a question to the
+document, and its author answers in your Inbox.
 
-**Problem:** agents burn context while waiting, subagents are hard to inspect,
-and parallel work gets chaotic when every terminal is its own little island.
+It works like a whiteboard session with your agents, with the precision of a
+code review: every comment is pinned to the sentence it's about, and every
+revision is kept.
 
-**Solution:** a central manager that lets agents go idle, wakes the right
-session when something happens, and keeps the whole swarm visible. Spawn
-workers, send them work, go to sleep, wake on signal, and attach only when you
-need to intervene.
+![Commenting on a sentence in the local-agents spec](docs/assets/doc_comment.png)
 
-**Result:** complex multi-agent workflows with less token waste, lower operator
-load, and a real control plane for agent work.
+## On your phone
 
----
+The Android app carries the same view: every agent with its context and
+work, the Inbox with a reply box, and the document reader with review.
 
-## What It Enables
+<p>
+<img src="docs/assets/phone_agent.png" width="32%" alt="An agent's card on the phone: context, hand off, ticket and PR">
+<img src="docs/assets/phone_inbox.png" width="32%" alt="An Inbox thread on the phone with a reply box">
+<img src="docs/assets/phone_doc.png" width="32%" alt="A document open for review on the phone">
+</p>
 
-### Agent Swarms
+## How agents talk to Session Manager
 
-Spawn specialized agents that work in parallel. Engineer implements while
-Architect reviews while Scout investigates. You keep the graph, not every token.
+Agents live in text, so they get a command-line tool, `sm`. These are small,
+neutral building blocks. Your process is built from them; Session Manager
+doesn't impose one.
 
-### Full Transparency
+| Command | What it does |
+|---|---|
+| `sm spawn` | Start a Claude or Codex agent as a child of the current one, in its own terminal session |
+| `sm send` | Durable message to another agent, or to you |
+| `sm queue run` | Queue a test, benchmark or background job; the agent is woken when it finishes |
+| `sm request-review` | Assign a PR to a reviewer agent, falling back to another if one fails |
+| `sm remind` | Wake an agent later |
+| `sm ticket` / `sm pr` | Claim the work an agent is doing, so you and other agents can see it |
+| `sm board` | Record ticket order and dependencies |
+| `sm doc publish` | Publish a document for you to read and review |
 
-Every agent is a real Claude Code or Codex session. No black boxes. `sm attach`
-to any session. `sm tail` when you want the recent trail. Android when you are
-away from the desk.
+Every agent is a real Claude Code or Codex session in tmux, not a hidden
+subagent. You can open any one of them and type.
 
-### Async Orchestration
+Agents also sign a guestbook when they finish, saying how the job went. Some
+are candid:
 
-The Orchestrator/EM pattern: fan out known work, route tickets to the right
-agents, collect results, and wake only on useful state changes. Never wait
-synchronously unless you choose to.
+![A guestbook entry from the agent that built the guestbook](docs/assets/guestbook.png)
 
-### Named Maintainers
+## When one agent is the right tool
 
-The Maintainer pattern is different: one named agent keeps infrastructure and
-long-running project state healthy. It is the session you page when the system
-itself needs attention.
+Planning costs something: a spec and a set of tickets, written once. For a
+small fix, or exploratory work you can't plan ahead, hand it to one agent.
+Session Manager runs that too, as one card on the Agents page.
 
-### Remote Control
+## "Isn't this just another vibe-coded app?"
 
-On the go? Use the app. Need a low-friction fallback? Use email/human delivery.
-Need to debug? Attach from a terminal and take over the live pane.
+AI agents wrote all of Session Manager's code, directed by one person who
+didn't write a line of it, and ran through Session Manager itself. That's the point: it's the test of the method.
+What keeps the output from being slop is the same discipline you'd expect from
+a human team.
 
-### Workspace Coordination
+**The process**
 
-State, parent/child relationships, queue jobs, review requests, and runtime
-recovery are durable. Agents can swarm the same codebase without everything
-turning into terminal archaeology.
+- Work starts as a ticket. Larger changes start as a written spec that is
+  reviewed before any code is written.
+- Every change lands as a pull request. 194 of the last 200 merged PRs carry
+  a review.
+- `cargo clippy -D warnings` and `cargo fmt --check` must pass before a PR
+  opens.
 
----
+**The numbers** (October 2026)
 
-## Why The Rust Rewrite Matters
+| | |
+|---|---|
+| Merged pull requests since late January 2026 | ~950 |
+| Automated tests | ~1,700 |
+| Rust server and CLI | ~200k lines |
+| Written specs | ~60 |
 
-The migration baseline in
-`.local/rust-mvp-rehearsals/20260612T-full-after-938/baseline/` measured:
+**The engineering**
 
-| Metric | Previous Python service | Rust service | Rounded improvement |
-| --- | ---: | ---: | ---: |
-| RSS | 154.7 MiB | 19.8 MiB | about 87% lower |
-| Physical footprint | 66.4 MiB | 6.7 MiB | about 90% lower |
-| `/health` median | 4.17 ms | 0.28 ms | about 15x faster |
-| `/client/bootstrap` median | 6.62 ms | 0.30 ms | about 20x faster |
-| `/sessions` median | 25.75 ms | 7.97 ms | about 3x faster |
-| `/client/sessions` median | 58.49 ms | 7.95 ms | about 7x faster |
+- **Rust server** (Axum + Tokio). Rewriting the earlier Python service cut
+  memory by about 87% and made common reads 3–20× faster.
+- **Durable state in SQLite.** Messages, reminders and queue jobs survive
+  restarts. Agents can be restored with their context weeks later.
+- **Layered security for remote access.** By default the server listens only
+  on localhost. When you expose it for the phone app, the path is gated by
+  Cloudflare Access mutual TLS, then Google sign-in at the server, then a
+  separate proof before any terminal opens. Devices are enrolled with their
+  own certificates and can be revoked.
 
-Current live Rust server RSS is around 24 MiB on the maintainer machine. Exact
-numbers depend on host load and retained state size, but the direction is not
-subtle: the daemon is smaller, faster, and easier to reason about under load.
+## Try it
 
----
-
-## Quick Start
-
-Build the Rust service and CLI:
+**Requirements:** macOS, tmux, Rust, and Claude Code and/or Codex CLI.
 
 ```bash
 git clone https://github.com/rajeshgoli/session-manager
 cd session-manager
 cargo build -p sm-server --release
-```
+./scripts/install-sm-cli.sh                    # installs sm to .local/bin
+export PATH="$PWD/.local/bin:$PATH"
 
-The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
-environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
-
-In `sm watch`, jobs appear under their requesting agent with their type (`[tests]`, `[perf]`, or
-`[background]`), friendly label, state, and elapsed time. Pending rows also show their scheduler hold reason
-(performance cooldown, test jobs, or an available slot); an unreported reason is
-marked explicitly. Running jobs are green and show their PID on the row and in
-expanded details. Idle agents waiting for a queue
-job or review result appear in cyan as **waiting**, with a clock beside their name.
-A single visible job supplies its own detail row; multiple obligations get a compact
-summary such as “Waiting for 2 jobs and 1 review”. PR reviews have their own rows
-with the PR number, wait age, and landed review counts tracked by sm (not all GitHub
-reviews), including how many this agent requested. Select a review and press `Tab`
-for watcher details and its PR URL. Agent output previews use the rendered terminal
-screen so spinner redraws do not accumulate into garbled text.
-
-Select a job with `j/k`. The first `Tab` opens a compact inline card with metadata
-and six live output lines; a second `Tab` opens the full-screen live log. The log
-fills the available terminal height and follows new output automatically, including
-after a resize. `PgUp/PgDn` scrolls the fetched history; `End` resumes following.
-The buffer holds at least 200 lines and grows with the terminal. `q` or `Esc`
-returns to the dashboard, and closes an inline card before quitting.
-
-`Tab` on an agent expands its activity and output; `J` opens its job browser.
-The browser supports the same two-step job expansion, `t`/`Enter` for live output,
-and `g` to switch between the agent's jobs and all jobs. Network reads run in the
-background; unavailable data is marked explicitly. Finished jobs remain visible
-while their browser or inline log is open.
-
-`sm queue status`, `sm queue log`, and `sm queue cancel` accept a durable ID or an
-exact, unique friendly label, for example `sm queue status 1374-demo-api-8974`.
-Duplicate labels return an ambiguity error listing IDs; exact IDs take precedence.
-`sm queue run` explains a pending job immediately, and `sm queue status` refreshes
-that explanation. The response names blocking jobs and explains global performance
-windows, test fairness, capacity limits, and cooldowns. For example, a new test job
-can be paused while existing tests drain to give a performance job a quiet window;
-`awaiting_tests` does not mean that the job depends on itself. JSON responses keep
-`holding_reason` and add `holding.summary`, `holding.detail`, and `holding.blocking_jobs`.
-Blocker lists are current snapshots; they can advance after a scheduler hold was recorded.
-Completion messages lead with the label and retain the ID for diagnostics.
-New jobs have readable `label--job_id.log` hard-link aliases sharing the canonical
-log's contents. Existing ID-based log paths continue to work.
-
-Pending jobs show "Waiting to start — no log yet"; the tail starts automatically
-when the job runs.
-
-The dashboard retains session trees, filtering, send/rename/create/attach,
-double-press retirement, reparent decisions/repair, and `--restore` browsing.
-Use `PgUp/PgDn` to scroll expanded details and `?` for the keyboard reference.
-
-Create local config from the example and adjust host/auth/state paths:
-
-```bash
 cp config.yaml.example config.yaml
-vim config.yaml
-```
-
-Run the server directly:
-
-```bash
 target/release/sm-server --host 127.0.0.1 --port 8420 --config config.yaml
 ```
 
-Or install/start the launchd-managed Rust service:
+Open <http://127.0.0.1:8420>, press **New agent**, and pick Claude or Codex.
+Or from a terminal:
 
 ```bash
-./scripts/restart-rust-server.sh --update
-./scripts/rust-service-cutover.sh status
-```
-
-Deploy with `--update`: it fast-forwards the checkout to `origin/main` under the
-restart lock and then builds what it fetched. Never `git pull` in the deployed
-checkout by hand; a pull while another restart is building moves the source
-under that build, and the restart refuses to install when it sees the source
-changed.
-
-`restart-rust-server.sh` builds, signs, installs, restarts, and verifies in the
-one safe order, and registers launchd against an installed copy at
-`.local/bin/sm-server` rather than `target/release/sm-server`. Do not call
-`rust-service-cutover.sh start-rust` directly to bring the service up: it only
-registers whatever binary is already installed. It refuses a `--binary` inside a
-cargo target directory, because registering cargo's output lets any later
-`cargo build` replace the executable launchd is running, which is how the service
-was taken down twice on 2026-07-27. See `specs/1134_rust_restart_procedure.md`.
-The durable non-secret default lives in `config/rust-server-signing.env` and
-must be the exact persistent certificate fingerprint from `security
-find-identity -v -p codesigning`; the script refuses ad-hoc signing or an
-implicit keychain default. During an intentional certificate rotation, supply a
-validated replacement with both `SM_SIGN_IDENTITY=<40-hex-fingerprint>` and
-the exact `SM_SIGN_DESIGNATED_REQUIREMENT` captured from disposable signing
-proof, then update that tracked config before treating it as the new default.
-
-If a deployment is already registered against `target/release/sm-server`, migrate
-it once with:
-
-```bash
-./scripts/restart-rust-server.sh --adopt --allow-plist-change
-```
-
-Install the Rust CLI:
-
-```bash
-./scripts/install-sm-cli.sh
-```
-
-This installs `sm` to `.local/bin/sm`, beside the installed `sm-server`, and
-`restart-rust-server.sh` refreshes it on every restart. Install it rather than
-running cargo's output directly: `cargo clean` deletes the whole target
-directory, so a `sm` that only exists at `target/release/sm` disappears with
-it - along with every spawned session's ability to run `sm` at all. Nothing in
-a cargo invocation writes `.local/bin`, so the installed copy survives a clean.
-
-Put `.local/bin` on your `PATH` so `sm` resolves to the installed Rust CLI:
-
-```bash
-export PATH="/path/to/session-manager/.local/bin:$PATH"
-
-sm status
 sm spawn claude "say hello and exit" --name hello-agent
-sm spawn codex --model gpt-5.6-terra --effort high "review this change"
-sm spawn codex --prompt-file specs/1264_implementation_brief.md --name implementer
-generate-brief | sm spawn claude --prompt-stdin --name researcher
-sm all
 ```
 
----
-
-## Core CLI
-
-| Command | Purpose |
-| --- | --- |
-| `sm status` | Show your status and active sessions |
-| `sm me` | Show the current session identity |
-| `sm all` | List active sessions |
-| `sm spawn <provider> <prompt> \| --prompt-file <path> \| --prompt-stdin [--model <model>] [--effort <level>]` | Start a managed agent. File/stdin briefs are accepted atomically, copied into private durable state, then delivered to the runtime as the verified accepted bytes. |
-| `sm send <id> "<text>"` / `sm send <id> - <<'EOF'` | Send input to an agent; with no text or `-`, the message is read from piped stdin |
-| `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
-| `sm wait <id> <seconds>` | Wait for a session state transition |
-| `sm attach <id>` | Attach to the live tmux session |
-| `sm tail <id>` | Show recent output/tool activity |
-| `sm output <id>` | Print recent terminal output |
-| `sm clear <id>` | Clear a session for a new task |
-| `sm retire <id>` | Stop and retire a session |
-| `sm restore <id>` | Restore a stopped/restorable session |
-| `sm children` | List child agents |
-| `sm task-complete` | Mark task completion and wake parent/maintainer |
-| `sm turn-complete` | Mark a turn boundary |
-| `sm queue list/status/run/cancel` | Manage retained queue jobs |
-| `sm watch` | Agent dashboard with queue ages, hold reasons, and live job logs |
-| `sm request-review [PR]` | Request and track a PR review; defaults to the current branch's PR |
-| `sm device enroll <name>` | Enroll a Mac certificate for Chrome sign-in |
-| `sm device repair-key-access <name>` | Repair Chrome signing access and the prompt name for an existing Mac key |
-| `sm enroll-device` | Enroll an Android app device certificate |
-| `sm list-devices` | List enrolled mobile devices |
-| `sm remove-device <id>` | Revoke an enrolled mobile device |
-
-### Mac browser certificate setup
-
-Browser device certificates are opt-in (`cloudflare_access.browser.device_policy`,
-false by default). Retain the existing email Access policy as the fallback.
-Enrollment does not require a zone-wide HTTP/3 setting or Zone Settings Read
-permission: the working browser connection is what matters, not whether the
-zone offers HTTP/3 to other hostnames.
-
-For Chrome certificate compatibility, start with a hostname-specific Cloudflare
-Response Header Transform Rule: match `(http.host eq "sm.example.com")` (substitute
-the configured browser hostname) and remove the `Alt-Svc` response header, which
-advertises alternative connection protocols. Leave HTTP/3 enabled for the zone.
-This configuration passed certificate sign-in and terminal input on Studio.
-[Cloudflare documents this targeted workaround](https://developers.cloudflare.com/speed/optimization/protocol/troubleshooting/protocol-troubleshooting/#resolution),
-but also notes that DNS HTTPS records can advertise HTTP/3 and browsers can cache
-advertisements for up to 24 hours. The rule does not guarantee every browser will
-use HTTP/2; verify sign-in and terminal input on each computer before keeping
-browser certificate requests enabled. If the scoped rule is insufficient,
-disabling HTTP/3 for the zone is an optional, broader diagnostic fallback.
-
-Run `sm device enroll <name>` on each Mac, then **quit Chrome completely and reopen
-it**. Reloading a tab can retain an older connection and leave terminals unable
-to connect. A fresh Incognito session can be used for verification: Settings →
-Devices & access should show the certificate name, and a terminal must reach Live.
-Verify email-based access as well before treating a rollout as complete.
-
-For a previously enrolled key whose prompt says `<key>` or repeatedly requests
-Chrome signing permission, run `sm device repair-key-access <name>`. Authorize the
-macOS permission-change dialog locally. This repairs only the existing key's
-signing access entries and display description, and removes legacy Swift
-interpreter signing trust. It preserves key material, certificates, unrelated
-permissions, and non-exportability. The CLI compiles and signs a dedicated helper
-before running Keychain operations; new keys trust that executable and installed
-Chrome, never the general Swift interpreter. Retrying enrollment may request
-approval for the newly compiled helper.
-
-If the rollout fails, disable browser enrollment in the installed config, remove
-only the browser hostname from the Cloudflare client-certificate authority's
-hostname associations, and restart with `scripts/restart-rust-server.sh` if the
-config changed. Keep the phone hostname and existing Access policies. Remove the
-browser association before undoing the transport workaround (disabling the scoped
-header rule, or re-enabling HTTP/3 if it was turned off). Merely disabling enrollment
-in the config does not remove an already-established Cloudflare association.
-
-Message delivery modes:
-
-```bash
-sm send agent "message"              # Sequential: wait for idle
-sm send agent "message" --important  # Queue behind current work
-sm send agent "message" --urgent     # Interrupt immediately
-```
-
-A message with backticks or `$()` is safest as a quoted heredoc on stdin, which
-the shell does not expand:
-
-```bash
-sm send agent - <<'EOF'
-Review `src/lib.rs`; $(this) is not run.
-EOF
-```
-
-For a multiline or large spawn brief, use `--prompt-file` or `--prompt-stdin`
-instead of a temporary stand-by prompt followed by `sm send`. The three prompt
-forms are mutually exclusive. The file/stdin content must be nonempty UTF-8;
-Session Manager records its SHA-256 and preserves the accepted bytes in its
-state directory before creating the child.
-
-The old transcript summarizer and its `--lines`/`--deep` options remain retired.
-`sm what` now delegates to the target provider's native `/btw` command. Use
-`sm what <agent>` to summarize the agent's main conversation thread; an optional
-prompt replaces that default. Use
-`sm retire`, not legacy kill aliases.
-
----
-
-## Android App
-
-The Android app is the supported remote operator surface. It can:
-
-- list sessions by repo and activity state;
-- show health, analytics, and app update status;
-- request session status updates;
-- attach to mobile terminal sessions when configured;
-- enroll and store a Cloudflare Access client certificate;
-- authenticate with Google at the origin after client-certificate proof.
-
-Publish a debug APK to the local artifact server:
-
-```bash
-cd android-app
-SM_VERSION_CODE=1072 SM_VERSION_NAME=0.1.2 ./gradlew assembleDebug
-cd ..
-VERSION_CODE=1072 VERSION_NAME=0.1.2 RELEASE_NOTES="Describe what changed and what to try." ./scripts/deploy_android_app.sh
-```
-
-The app checks:
-
-- `/apps/session-manager-android/meta.json`
-- `/apps/session-manager-android/latest.apk`
-- immutable `/apps/session-manager-android/{hash}.apk`
-
-Device enrollment flow:
-
-```bash
-sm enroll-device
-```
-
-Scan the generated QR with the phone camera. The deep link opens the app, the
-app submits a CSR, Session Manager issues a device certificate, and the device
-stores it internally. The certificate is not displayed in the app UI.
-
----
-
-## Public Access Model
-
-The hardened public path is layered:
-
-1. **Cloudflare Access mTLS** gates the app hostname before origin traffic is
-   allowed.
-2. **Origin auth** verifies Google/device identity for the Session Manager user.
-3. **Route-local proofs** gate sensitive shell attach flows.
-4. **Device revocation** removes a device from both Session Manager state and
-   the Cloudflare Access certificate policy.
-
-The browser/operator hostname and app hostname should be isolated in Cloudflare
-Access policy. The app hostname should not expose unauthenticated origin
-responses to the public internet.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SESSION MANAGER                          │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ Rust HTTP   │  │ SQLite      │  │ tmux Runtime        │  │
-│  │ API/CLI     │  │ state/queue │  │ Claude/Codex panes  │  │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘  │
-│         │                │                    │             │
-│         └────────────────┼────────────────────┘             │
-│                          │                                  │
-│         ┌────────────────┼────────────────┐                 │
-│         ▼                ▼                ▼                 │
-│  ┌────────────┐   ┌────────────┐   ┌────────────┐          │
-│  │ Android    │   │ Email/     │   │ Cutover    │          │
-│  │ app API    │   │ human send │   │ gates      │          │
-│  └────────────┘   └────────────┘   └────────────┘          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-Key stores and surfaces:
-
-- session state JSON;
-- SQLite message queue;
-- queue runner state;
-- tool/audit log DB;
-- Codex events, requests, and observability DBs;
-- app artifact store;
-- bug report store;
-- Cloudflare/mobile device enrollment DB.
-
-Cutover tooling lives under `scripts/rust_migration/` and records preflight,
-backup, restore, freeze/drain, fixture, shadow, and canary evidence.
-
----
-
-## API Reference
-
-| Endpoint | Method | Purpose |
-| --- | --- | --- |
-| `/health` | GET | Health check |
-| `/health/detailed` | GET | Detailed service state |
-| `/sessions` | GET/POST | List/create sessions |
-| `/sessions/{id}` | GET/PATCH | Read/update session metadata |
-| `/sessions/{id}/input` | POST | Send input |
-| `/sessions/{id}/output` | GET | Tail terminal output |
-| `/sessions/{id}/attach-descriptor` | GET | Describe attach support |
-| `/sessions/{id}/codex-events` | GET | Durable Codex lifecycle events |
-| `/sessions/{id}/codex-pending-requests` | GET | Structured request state |
-| `/sessions/{id}/activity-actions` | GET | Provider-neutral activity projection |
-| `/client/bootstrap` | GET | Native app bootstrap |
-| `/client/sessions` | GET | Native app session list |
-| `/auth/session` | GET | Auth/session status |
-| `/auth/device/google` | POST | Native Google ID-token exchange |
-| `/apps/{name}/meta.json` | GET | App artifact metadata |
-| `/apps/{name}/latest.apk` | GET | Latest APK redirect/download |
-| `/deploy/{name}` | POST | Local/authenticated app artifact upload |
-| `/queue-jobs` | GET/POST | Queue job list/create |
-| `/queue-jobs/{id-or-label}` | GET/DELETE | Queue job detail/cancel (unique exact label or ID) |
-| `/session-obligations` | GET | Pending job/review results and sm-tracked PR history, keyed by session ID |
-| `/review-requests` | GET/POST | Review request list/create |
-| `/nodes` | GET | Node registry projection |
-
-Full docs are available from the running service at `http://127.0.0.1:8420/docs`
-when API docs are enabled.
-
----
-
-## Configuration
-
-Start with `config.yaml.example`. Common sections:
-
-```yaml
-server:
-  host: "127.0.0.1"
-  port: 8420
-
-paths:
-  state_file: "~/.claude-sessions/state.json"
-  app_artifacts_dir: "~/.local/share/claude-sessions/apps"
-
-rust_core:
-  runtime_enabled: true
-
-auth:
-  google:
-    enabled: true
-    allowlist_emails:
-      - "you@example.com"
-
-cloudflare_access:
-  mobile_app:
-    enabled: true
-    hostname: "sm-app.example.com"
-
-mobile_terminal:
-  enabled: true
-```
-
-Local/private config stays in `config.yaml` and optional local env overlays; do
-not commit secrets, Cloudflare tokens, Google client secrets, or device CA keys.
-
----
-
-## Waiting outside sm and partner auto-start
-
-```bash
-sm board waiting 1940 --text "Trial 1: 20 cases waiting in fr" --url https://fr.example.com/trials/1
-sm board waiting 1940 --clear
-```
-
-The text is at most 120 characters and the link must use HTTPS. Setting a mark
-replaces the previous mark. It belongs to the ticket, survives agent retirement,
-and clears when sm observes the ticket closing or when explicitly cleared. The
-board shows **Needs you**, the text, and **Open**, with its usual count and state
-precedence. Setting it does not send an alert. Local API callers use
-`PUT /board/waiting` with `{repo, number, text, url}` or `{repo, number, clear: true}`.
-
-To let a partner forward the owner's Cloudflare Access login, configure its
-application audience tag in the installed server config:
-
-```yaml
-partner_access_audiences:
-  - "partner-application-audience-tag"
-```
-
-Only `PUT /client/board/auto-start` accepts `x-sm-partner-assertion`. It requires a
-direct loopback request with a local Host and no proxy forwarding headers. sm
-verifies the RS256 signature against `cloudflare_access.team_domain` certificates,
-issuer, configured audience, expiration, and the owner's email from
-`auth.google.allowlist_emails`. Invalid partner assertions return 403 with a
-reason. Other routes ignore the header and retain their existing authentication.
-The partner forwards the login from the owner's current request without storing it.
-
-## Testing
-
-Rust server and CLI:
-
-```bash
-cargo fmt --check
-cargo test -p sm-server
-```
-
-Migration contract harness:
-
-```bash
-./venv/bin/python -m pytest tests/unit/test_rust_migration_contracts.py
-./venv/bin/python -m scripts.rust_migration.contracts --target rust --base-url http://127.0.0.1:8420 --json
-```
-
-MVP rehearsal/cutover evidence:
-
-```bash
-./venv/bin/python -m scripts.rust_migration.mvp_rehearsal --output-dir .local/rust-mvp-rehearsals/$(date -u +%Y%m%dT%H%M%SZ)
-./venv/bin/python -m scripts.rust_migration.live_canary_report --fail-on-blockers --json
-```
-
-Android app:
-
-```bash
-cd android-app
-./gradlew testDebugUnitTest assembleDebug
-```
-
----
-
-## Operator Notes
-
-- Prefer `sm status`, `sm all`, `sm tail`, and the Android app for live state.
-- Use `sm what <agent>` for a bounded context summary without disturbing the
-  target's main conversation.
-- Use `sm retire` for lifecycle stop; avoid legacy kill terminology.
-- Keep app updates and Cloudflare mobile device policy changes auditable through
-  Session Manager commands.
-- If the public app path fails, check Cloudflare Access mTLS first, then origin
-  auth, then route-local attach proof.
-
-### Usage ledger
-
-`usage.db` stores minute-level `seat_tokens` facts. Do not sum rows across
-`window_kind`: a token can belong to more than one quota window. For correct
-current unscoped per-seat totals, use the `current_seat_token_totals` view,
-which selects the latest observed unscoped window and filters facts by that
-window's timestamp range. Scoped model pools remain available through `sm
-usage`'s model-aware report:
-
-```bash
-sqlite3 ~/.local/share/claude-sessions/usage.db \
-  'SELECT seat_id, window_kind, SUM(input_tokens + output_tokens + reasoning_tokens + cache_write_5m + cache_write_1h + cache_read_tokens) AS tokens FROM current_seat_token_totals GROUP BY seat_id, window_kind;'
-```
-
----
-
-## Requirements
-
-- macOS with tmux
-- Rust toolchain
-- Claude Code and/or Codex CLI
-- Android app optional but recommended for mobile operation
-- Cloudflare Access optional for public mobile access, strongly recommended for
-  exposed app/browser hostnames
-
----
+Running it as a background service, the phone app, remote access and the full
+command reference are covered in the
+[operator guide](docs/product/operator_guide.md).
 
 ## License
 
 MIT
-
----
-
-**Built for the age of AI agents.** When one agent is not enough, let the swarm
-work while you stay in control.
-
-### Waiting-state API for desktop clients
-
-`GET /session-obligations` is a protected, read-only snapshot with `schema_version: 1`
-and a `sessions` array. Join each entry's `session_id` to `/sessions`. Each contains:
-
-- `waiting_on`: pending/running queue jobs and active review watches, with `kind`
-  (`queue_job` or `review`), `id`, friendly `label`, `state`, `since`, and
-  `requester_session_id`. Reviews also include `repo`, `pr_number`, `last_polled_at`,
-  and `last_error`.
-- `waiting_since`: oldest outstanding request timestamp, or null.
-- `review_history`: per-PR `repo`, `pr_number`, `scope: "sm_tracked"`,
-  `request_count`, `requested_by_agent`, `landed_count`, and
-  `landed_requested_by_agent`. Landed reviews deduplicate by review URL.
-
-Decorate only an **idle** agent with nonempty `waiting_on` as waiting. Keep the
-underlying `activity_state` unchanged. Obligations belong to the notification
-recipient; history attributes requests to the requesting agent. A successful
-snapshot omitting an agent means no tracked obligations or history. Preserve a
-stale/unknown indication on request failure rather than treating failure as empty.
-An obligation ends when the job finishes or the review watch becomes inactive;
-this API does not represent unread completion messages. It makes no GitHub calls.
-For individual review records and timestamps, use
-`GET /review-requests?include_inactive=true&repo=OWNER/REPO&pr_number=N`.
