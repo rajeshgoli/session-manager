@@ -6,7 +6,7 @@ Pool Claude, Codex and local models into one team. Plan the sprint, give each
 ticket to the right model from whichever subscription has room, and watch the
 plan move on one screen, from your desk or your phone.
 
-<!-- ASSET: hero screenshot of the Agents page on demo data (Needs you / Moving / Idle, Claude and Codex cards side by side). -->
+![The Agents page: Claude and Codex agents sorted by what needs attention](docs/assets/agents.jpg)
 <!-- ASSET: "Try the live demo" link to sm-demo.rajeshgo.li once it is up. -->
 
 ---
@@ -80,7 +80,9 @@ The Android app shows the same view on your phone.
 Also: ⌘K command palette, keyboard navigation, usage analytics, and a history
 of every ticket and PR with the agents, reviews and documents behind it.
 
-<!-- ASSET: 20-second GIF of the Board: a ticket armed with Start when ready → agent starts → tests wait in Queue → review returns → merged. -->
+![The Board: a goal's tickets, who works each, what each waits on, and Start when ready](docs/assets/board.jpg)
+
+![The Queue: job slots by type over the machine's CPU, GPU and memory](docs/assets/queue.jpg)
 
 ## How agents talk to Session Manager
 

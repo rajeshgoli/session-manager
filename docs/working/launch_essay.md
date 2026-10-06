@@ -7,14 +7,31 @@
 Modern coding agents are good enough that you can hand one an entire epic and
 tell it to keep going until it's done.
 
-[Rajesh: the epic that failed this way, in your words — how long it ran, how
-far off the completion estimates were, how fast the quota went, and why you
-abandoned it.]
+This summer I did that with a large piece of my research codebase. An
+orchestrating agent got the epic, wrote a plan of 32 to 34 tickets, and ran
+it with helper agents. The first tickets closed in a day or two. Then they
+stretched to days each, and some stayed open for three weeks. The 34 planned
+tickets became about 91 issues and 95 pull requests. Eighteen days in, I froze
+the lane: 32 live agent sessions, 275 worktrees, and a branch nearly 200,000
+lines ahead of main with 13 merge conflicts. Not one ticket-level pull
+request was safe to merge. My weekly quota read 79%, 85%, 89%, 92% over four
+days. I closed the epic a month after opening it and rebuilt the work from
+scratch on main.
+
+[Rajesh: if you have one, a completion estimate the orchestrator gave you and
+what actually happened. The repo has no estimates on record.]
 
 The agents weren't the problem. They wrote good code in small pieces. The
 problem was that nothing about the setup told me where the work stood, why it
 was late, or where the quota went. I had a transcript and an estimate, and the
-estimate was a guess.
+estimate was a guess. When I measured it, driving the agents myself was three
+to four times more token-efficient than letting an orchestrator agent drive
+them. My note that week: "No orchestrator. That model is dead. I'm the
+orchestrator."
+
+Being the orchestrator by hand doesn't scale, though. What I needed was the
+orchestrator's job done by something that spends no tokens and doesn't lose
+track.
 
 ## A team, not a genius
 
@@ -30,10 +47,21 @@ agents, and called it Session Manager.
 
 ## What changed
 
-[Rajesh: the planned sprints that worked — predicted vs actual wall time,
-discoveries that came to you as decisions, new tickets appearing on the board,
-and the split of wall time between agents working, waiting for the machine
-and waiting on you.]
+A month later the same codebase ran as planned sprints. Each iteration
+started with a plan memo: a fixed set of tickets, a prediction of when the
+result would land, and a table of a dozen decisions only I could make, each
+with a recommendation.
+
+Iteration 7 planned 14 tickets and a readout about 28 hours after approval.
+It took 53. A design question discovered midway changed the hardware plan,
+and eight tickets were added for the new work. Each appeared as a ticket I
+could see, not as a silent detour in a transcript. Iteration 8 planned 11
+tickets and a readout in two to three days. It landed in 2.9. Individual
+tickets missed both ways (one planned at three hours took one, another
+planned at five took eight), but the sprint landed when the plan said. When a
+cheap probe showed one planned input wasn't worth having, it came to me as a
+decision, and I dropped it. By iteration 9, the board showed where the wall
+time went: agents working, waiting for the machine, or waiting on me.
 
 A late sprint with a breakdown of where the time went is something you can
 fix. A late agent with a transcript is something you can only wait on.
@@ -70,7 +98,9 @@ page overlays jobs on the machine's CPU, GPU and memory. Quota meters for each
 subscription sit on every page. Questions from agents arrive in an inbox I can
 answer from anywhere.
 
-<!-- ASSET: Agents page screenshot on demo data. -->
+![The Agents page](../assets/agents.jpg)
+
+![The Board](../assets/board.jpg)
 
 Running local models as agents on the same machine is the newest part. It
 deserves its own post.
@@ -113,6 +143,9 @@ stops everything for days, so when cost and speed conflict, I spend time.
 Don't put yourself in the agent's loop. If an agent has to wait for me before
 it can take its next step, it stops. Agents should bring me decisions, with a
 recommendation, and carry on with everything else.
+
+"Done" means merged, not opened. In the failed epic, the driving agent
+counted an opened pull request as a finished ticket in 6 of 40 tickets.
 
 Never let an agent grade its own work. A second model reviewing the pull
 request catches what the first one talked itself into. Review findings get
