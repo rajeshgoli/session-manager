@@ -5442,7 +5442,13 @@ fn spawn_queue_job_process(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(unix)]
     {
-        command.process_group(0);
+        #[cfg(test)]
+        let already_confined = std::env::var_os("SM_TEST_FD_PROBE").is_some();
+        #[cfg(not(test))]
+        let already_confined = false;
+        if !already_confined {
+            command.process_group(0);
+        }
         if let Some(ceiling) = process_ceiling {
             // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
             // state. Lowering a limit cannot fail for a value at or below the

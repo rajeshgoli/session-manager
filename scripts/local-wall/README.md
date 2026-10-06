@@ -83,7 +83,7 @@ scripts/local-wall/wall_profile.sh \
   --egress-port 18700 --egress-port-range 18700-18799 \
   --model-port 8000 --judge-port 8441 \
   --service-state-dir "$judge_state" --service-state-dir "$proxy_state" \
-  --broker-dir "$state_dir/tmp/broker" \
+  --broker-dir "$state_dir/tmp/broker" --contained-processes \
   --immutable-exec-dir "$host_staged_executables" \
   > "$state_dir/wall.sb.new"
 ```
@@ -180,12 +180,13 @@ python3 scripts/local-wall/build_adapter.py \
   --peer-token "$peer0" "$peer1" "$peer2" "$peer3" "$peer4" "$peer5" "$peer6" "$peer7" \
   --direct-ports "$gateway_port" "$egress_port" "$model_port" "$judge_port" \
   --control-port "$agent_port" --control-fd "$inherited_control_fd" \
+  --contained-spawns \
   --immutable-exec-dir "$host_staged_executables" \
   --immutable-exec-dir "$approved_python_installation" \
   --output "$state_dir/xdg/config/socket-adapter.dylib"
 ```
 
-Omit both control arguments for a process without a provider control capability.
+Omit both control arguments for an adapter without a provider control capability.
 The host stages this library in agent-readable, agent-write-denied state and
 loads it with `DYLD_INSERT_LIBRARIES` in a cleared launch environment. The host
 must also make the broker endpoint directory and its short alias agent-write-denied
@@ -260,7 +261,7 @@ absent requester variables, cancellation cleanup and hard-link rejection.
 Compile `native/launch_supervisor.c` with clang's `-std=c11 -Wall -Wextra -Werror`
 flags into immutable host-owned state. Build the adapter with control descriptor
 198 (`launch::CONTROL_FD`). Construct `LaunchBinding` with the shared
-`AgentService`, its exact-loopback control listener, profile, adapter and
+`AgentService`, an optional exact-loopback control listener, profile, adapter and
 supervisor. The three host files must have no hard-link aliases. The host must
 also reject mutable aliases into trusted executable roots before launch.
 Pass an explicit host environment allowlist and checkout to `spawn`; drain
@@ -273,7 +274,22 @@ socket returns the application's exit status. Completion or cancellation kills
 the private process group and revokes registration. The supervisor's PID stays
 reserved until cleanup. Drop the service at shutdown and create a new service
 after host restart. Queue jobs share the agent's binding with fresh process
-registrations; requester environment never selects socket authority.
+registrations; requester environment never selects socket authority. Pass `Some`
+control listener only for the provider and `None` for queue commands. The latter
+receive no provider descriptor, even when they share the provider's adapter.
+The application starts with the normal default SIGPIPE disposition.
+
+Production launch requires a profile generated with `--contained-processes`
+and an adapter built with `--contained-spawns`. `LaunchBinding` rejects a profile
+without the required syscall denial. The kernel denies `setsid`, `setpgid` and
+raw `posix_spawn`, including calls that bypass the adapter. The adapter implements
+supported `posix_spawn` calls using kernel fork followed by ordered file actions
+and exec. It supports signal defaults/masks, reset IDs, close-on-exec defaults
+and process replacement. Requests for a new process group or session fail with
+EPERM; other unsupported flags fail with ENOTSUP. Tools that bypass the adapter
+for spawning also fail closed. The standalone file/network profile without
+`--contained-processes` does not promise descendant cleanup and cannot be used
+with `LaunchBinding`.
 Actual provider launch and stamped queue dispatch integration remains #1974.
 
 Run fixture validation through the durable queue:

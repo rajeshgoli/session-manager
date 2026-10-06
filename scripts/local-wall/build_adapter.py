@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--control-port", type=int, default=0)
     parser.add_argument("--control-fd", type=int, default=-1)
     parser.add_argument("--immutable-exec-dir", type=Path, action="append", default=[])
+    parser.add_argument("--contained-spawns", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     endpoint = os.fsencode(args.endpoint)
@@ -55,6 +56,7 @@ def main():
             + "const uint16_t wall_direct_ports[4] = {" + ",".join(map(str, args.direct_ports)) + "};\n"
             + f"const uint16_t wall_control_port = {args.control_port};\n"
             + f"const int wall_control_fd = {args.control_fd};\n"
+            + f"const int wall_contained_spawns = {int(args.contained_spawns)};\n"
             + "const char wall_image_path[] = {"
             + ",".join(map(str, os.fsencode(output) + b"\0")) + "};\n"
             + root_definitions

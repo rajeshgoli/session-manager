@@ -219,6 +219,11 @@ def generate(args, listeners, minimum_tmp_length):
             [f"(subpath {quoted(p)})" for p in protected_writes]
             + [f"(literal {quoted(p)})" for p in ancestors]) + ")")
     lines.extend(["(deny signal)", "(allow signal (target same-sandbox))"])
+    # Keep every descendant in the host's private launch group. A raw spawn
+    # syscall can set a new session internally, so it is denied too; the
+    # contained adapter implements supported spawns with fork and exec.
+    if args.contained_processes:
+        lines.append("(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))")
     # Kernel process-argument queries can expose another process's initial
     # environment without reading its credential files. Admit only runtime
     # hardware/OS facts, never process argument/environment or mutation queries.
@@ -294,6 +299,8 @@ def parser():
     result.add_argument("--read-only-dir", action="append", default=[],
                         help="host-approved credential-free toolchain or dedicated log directory")
     result.add_argument("--broker-dir", help="host-owned endpoint directory inside private state/tmp")
+    result.add_argument("--contained-processes", action="store_true",
+                        help="require fork/exec adapter spawns; prevent descendants leaving the host process group")
     result.add_argument("--immutable-exec-dir", action="append", default=[],
                         help="host-staged executable root; protect contents and all ancestors")
     return result

@@ -25,7 +25,7 @@ const GATE_FD: i32 = 199;
 /// from caller environment variables.
 pub struct LaunchBinding {
     service: Arc<AgentService>,
-    control: TcpListener,
+    control: Option<TcpListener>,
     profile: PathBuf,
     adapter: PathBuf,
     supervisor: PathBuf,
@@ -34,19 +34,35 @@ pub struct LaunchBinding {
 impl LaunchBinding {
     pub fn new(
         service: Arc<AgentService>,
-        control: TcpListener,
+        control: Option<TcpListener>,
         profile: &Path,
         adapter: &Path,
         supervisor: &Path,
     ) -> io::Result<Self> {
-        let address = control.local_addr()?;
-        if !address.ip().is_loopback() || address.port() != service.control_port() {
+        if let Some(control) = &control {
+            let address = control.local_addr()?;
+            if ![
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ]
+            .contains(&address.ip())
+                || address.port() != service.control_port()
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
+        }
+        let profile = host_file(profile)?;
+        // Reject accidental composition with a standalone file/network wall.
+        // The immutable host-generated profile must also confine descendants.
+        if !std::fs::read_to_string(&profile)?.lines().any(|line| {
+            line == "(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))"
+        }) {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         Ok(Self {
             service,
             control,
-            profile: host_file(profile)?,
+            profile,
             adapter: host_file(adapter)?,
             supervisor: host_file(supervisor)?,
         })
@@ -65,9 +81,13 @@ impl LaunchBinding {
         let (gate, reader) = UnixStream::pair()?;
         // Reserve separate copies above the target descriptors. This avoids
         // dup2 overwriting a source when the host already has many open FDs.
-        let control = duplicate_high(self.control.as_raw_fd())?;
+        let control = self
+            .control
+            .as_ref()
+            .map(|listener| duplicate_high(listener.as_raw_fd()))
+            .transpose()?;
         let reader = duplicate_high(reader.as_raw_fd())?;
-        let control_fd = control.as_raw_fd();
+        let control_fd = control.as_ref().map(AsRawFd::as_raw_fd);
         let reader_fd = reader.as_raw_fd();
         let mut command = Command::new(&self.supervisor);
         command.env_clear().current_dir(checkout).process_group(0);
@@ -81,6 +101,11 @@ impl LaunchBinding {
         let mut loader = OsString::from("DYLD_INSERT_LIBRARIES=");
         loader.push(&self.adapter);
         command
+            .arg(if control_fd.is_some() {
+                "--control"
+            } else {
+                "--no-control"
+            })
             .args([OsStr::new("sandbox-exec"), OsStr::new("-f")])
             .arg(&self.profile)
             .arg("/usr/bin/env")
@@ -93,7 +118,8 @@ impl LaunchBinding {
         // SAFETY: only async-signal-safe dup2 is called in the forked child.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(control_fd, CONTROL_FD) == -1 || libc::dup2(reader_fd, GATE_FD) == -1
+                if control_fd.is_some_and(|fd| libc::dup2(fd, CONTROL_FD) == -1)
+                    || libc::dup2(reader_fd, GATE_FD) == -1
                 {
                     return Err(io::Error::last_os_error());
                 }

@@ -31,6 +31,7 @@ def prepare(args):
                     "--endpoint", str(broker / "s"), "--peer-token", *map(str, args.peer_token),
                     "--direct-ports", "22000", "23000", "24000", "24001",
                     "--control-port", str(args.control_port), "--control-fd", "198",
+                    "--contained-spawns",
                     "--immutable-exec-dir", str(executables),
                     "--immutable-exec-dir", str(python_root), "--output", str(library)],
                    check=True, stdout=subprocess.DEVNULL)
@@ -49,6 +50,7 @@ def prepare(args):
         "--egress-port", "23000", "--egress-port-range", "23000-23000",
         "--model-port", "24000", "--judge-port", "24001", "--service-state-dir", str(secret),
         "--broker-dir", str(broker), "--immutable-exec-dir", str(executables),
+        "--contained-processes",
         "--immutable-exec-dir", str(python_root), "--read-only-dir", str(python_root),
     ])
     profile = state / "wall.sb"
@@ -64,6 +66,7 @@ def prepare(args):
         "SM_TEST_RUST_APPLICATION": str(executables / "rust-application"),
         "SM_TEST_PYTHON": str(python), "SM_TEST_MUTABLE": tmp,
         "SM_TEST_FD_PROBE": str(executables / "descriptor-probe"),
+        "SM_TEST_CONTAINED": "1",
     }
     environment.update({f"XDG_{name.upper()}_HOME": str(state / "xdg" / name)
                         for name in ("config", "data", "cache", "state")})

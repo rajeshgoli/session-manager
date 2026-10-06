@@ -58,7 +58,7 @@ fn prepare_launch() -> PreparedLaunch {
     let path = |key: &str| PathBuf::from(prepared[key].as_str().unwrap());
     let binding = LaunchBinding::new(
         service.clone(),
-        control,
+        Some(control),
         &path("profile"),
         &path("adapter"),
         &path("supervisor"),
@@ -81,12 +81,22 @@ fn prepare_launch() -> PreparedLaunch {
 }
 
 impl PreparedLaunch {
+    fn queue_binding(&self) -> LaunchBinding {
+        LaunchBinding::new(
+            self.service.clone(),
+            None,
+            &self.path("profile"),
+            &self.path("adapter"),
+            &self.path("supervisor"),
+        )
+        .unwrap()
+    }
     fn path(&self, key: &str) -> PathBuf {
         PathBuf::from(self.paths[key].as_str().unwrap())
     }
     fn run(&self, executable: &Path, arguments: &[OsString], environment: &[(OsString, OsString)]) {
         let mut child = self
-            .binding
+            .queue_binding()
             .spawn(executable, arguments, environment, &self.path("checkout"))
             .unwrap();
         let mut stdout = child.take_stdout().unwrap();
@@ -121,6 +131,11 @@ fn production_wall_launch_registers_before_socket_use_and_restores() {
     };
     let environment = &prepared.environment;
     run(&path("application"), &[], environment);
+    run(
+        &path("application"),
+        &["queue-capabilities".into()],
+        environment,
+    );
     // New host registrations model queue jobs and restored launches. Neither
     // a missing requester ID nor forged caller metadata supplies authority.
     for forged in [false, true] {
@@ -176,13 +191,45 @@ fn production_wall_launch_registers_before_socket_use_and_restores() {
         .unwrap();
     assert!(LaunchBinding::new(
         prepared.service.clone(),
-        control,
+        Some(control),
         &path("profile"),
         &path("adapter"),
         &path("supervisor")
     )
     .is_err());
     fs::remove_file(alias).unwrap();
+    // A child whose parent completes stays in the kernel-confined launch
+    // group even after attempting to daemonize; completion must remove it.
+    let script = "import os,socket,time\ns=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\nr,w=os.pipe()\npid=os.fork()\nif pid == 0:\n os.close(r)\n try: os.setsid(); raise AssertionError('detached')\n except PermissionError: pass\n print(os.getpid(),s.getsockname()[1],flush=True)\n os.write(w,b'R'); os.close(w); time.sleep(60)\nelse:\n os.close(w); assert os.read(r,1)==b'R'; os._exit(0)";
+    let mut child = prepared
+        .queue_binding()
+        .spawn(
+            &path("python"),
+            &["-c".into(), script.into()],
+            &prepared.environment,
+            &path("checkout"),
+        )
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.take_stdout().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let parts: Vec<_> = line.split_whitespace().collect();
+    let descendant = ProcessIdentity::capture(parts[0].parse().unwrap()).unwrap();
+    let port: u16 = parts[1].parse().unwrap();
+    assert!(child.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "orphan retained its listener");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !descendant.is_live(),
+        "orphan still runs after launch completion"
+    );
 }
 
 #[test]
