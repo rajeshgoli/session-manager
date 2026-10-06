@@ -59,8 +59,11 @@ OBFUSCATION = re.compile(r"(?<![\w-])(eval|base64|xxd|uudecode)(?![\w-])|\\x[0-9
 # and the Read tool on them is denied.
 CREDENTIAL = re.compile(r"\.config/gh|hosts\.yml|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|oauth_token"
                         r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials")
-CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, ".config", "gh")),
-                    os.path.realpath(os.path.join(HOME, ".git-credentials"))]
+CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, path)) for path in (
+    ".config/gh", ".git-credentials", ".ssh", ".netrc", "Library/Keychains",
+    ".aws", ".claude", ".claude.json", ".codex", ".config/session-manager",
+    ".local/share/claude-sessions/local-judge",
+)]
 
 
 def egress_words(agent):
@@ -77,9 +80,13 @@ def normalise(text):
     return re.sub(r"\\\n", "", text).replace("'", "").replace('"', "").replace("\\", "")
 
 
-def script_texts(command, cwd, agent):
+def script_texts(command, cwd, agent, seen=None, depth=0):
     """Text of each script file the command runs, read only inside the checkout or temp folder."""
     out = []
+    if seen is None:
+        seen = set()
+    if depth >= 8 or len(seen) >= 64:
+        return [("script-scan-limit", "eval")]
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
         lexer.whitespace_split = True
@@ -90,11 +97,15 @@ def script_texts(command, cwd, agent):
     interpreters = {"sh", "bash", "zsh", "dash", "ksh", "python", "python3",
                     "perl", "ruby", "node", "source", "."}
     candidates = set()
+    if len(tokens) > 10000:
+        return [("script-scan-limit", "eval")]
     for index, token in enumerate(tokens):
         # Check explicit path tokens conservatively even when a shell operator
         # or quoting obscures command position. shlex removes/joins shell quotes
         # and escapes, including paths containing spaces.
-        if "/" in token:
+        if token == "cd" or token.startswith("PATH="):
+            out.append(("script-working-directory", "eval"))
+        if not token.startswith("-"):
             candidates.add(token)
         if os.path.basename(token) in interpreters:
             for arg in tokens[index + 1:]:
@@ -110,6 +121,11 @@ def script_texts(command, cwd, agent):
     for candidate in candidates:
         path = os.path.normpath(os.path.join(cwd or agent["checkout"], os.path.expanduser(candidate)))
         if inside(path, agent) and os.path.isfile(path):
+            path = os.path.realpath(path)
+            if path in seen:
+                out.append(("script-cycle", "eval"))
+                continue
+            seen.add(path)
             try:
                 with open(path, errors="replace") as f:
                     text = f.read(200_001)
@@ -117,6 +133,7 @@ def script_texts(command, cwd, agent):
                     out.append((path, "eval"))
                 else:
                     out.append((path, text))
+                    out.extend(script_texts(text, cwd, agent, seen, depth + 1))
             except OSError:
                 out.append((path, "eval"))
     return out

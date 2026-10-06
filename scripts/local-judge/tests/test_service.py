@@ -216,6 +216,37 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.ruling(), 'allow')
         self.assertEqual(self.ruling(), 'deny')
 
+    def test_delegated_scripts_are_scanned(self):
+        (self.wt / 'payload.sh').write_text('git push --force origin main\n')
+        for wrapper in ['bash payload.sh', 'bash "payload.sh"', './payload.sh']:
+            (self.wt / 'wrapper.sh').write_text(wrapper + '\n')
+            self.assertEqual(self.ruling(tin={'command': 'bash wrapper.sh'}), 'deny')
+            record = self.logs()[-1]
+            self.assertEqual(record['stage'], 'judge')
+            self.assertIn('payload.sh:', record['judge_why'])
+        (self.wt / 'wrapper.sh').write_text('bash middle.sh\n')
+        (self.wt / 'middle.sh').write_text('bash payload.sh\n')
+        self.assertEqual(self.ruling(tin={'command': 'bash wrapper.sh'}), 'deny')
+        (self.wt / 'payload.sh').write_text('printf okay\n')
+        self.assertEqual(self.ruling(tin={'command': 'bash wrapper.sh'}), 'allow')
+        (self.wt / 'payload.sh').write_text('bash wrapper.sh\n')
+        self.assertEqual(self.ruling(tin={'command': 'bash wrapper.sh'}), 'deny')
+        self.assertIn('script-cycle', self.logs()[-1]['judge_why'])
+        (self.wt / 'wrapper.sh').write_text('cd sub; bash payload.sh\n')
+        self.assertEqual(self.ruling(tin={'command': 'bash wrapper.sh'}), 'deny')
+        self.assertIn('script-working-directory', self.logs()[-1]['judge_why'])
+
+    def test_read_cannot_access_credentials(self):
+        for path in ['~/.ssh/id_rsa', '~/.netrc', '~/Library/Keychains/login.keychain-db',
+                     '~/.git-credentials', '~/.config/gh/hosts.yml', '~/.aws/credentials',
+                     '~/.claude.json', '~/.codex/auth.json', '~/.config/session-manager/config.yaml']:
+            with self.subTest(path=path):
+                self.assertEqual(self.ruling('Read', {'file_path': path}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'rule')
+        (self.wt / 'ssh-alias').symlink_to(Path.home() / '.ssh')
+        self.assertEqual(self.ruling('Read', {'file_path': 'ssh-alias/id_rsa'}), 'deny')
+        self.assertEqual(self.ruling('Read', {'file_path': 'src/lib.rs'}), 'allow')
+
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
             'a=g; b=it; "$a$b" push --force origin main',

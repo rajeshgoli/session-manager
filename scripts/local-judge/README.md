@@ -57,13 +57,19 @@ so a deployment cannot strand a detached process at an old state location.
 The isolated test launcher supplies a separate root through
 `SM_TEST_ISOLATION_ROOT`; it must be absolute.
 
+Read access to GitHub credentials, SSH keys, netrc, keychains, AWS credentials,
+provider credentials, Session Manager configuration and judge state is denied
+before the model stage, including paths that resolve there through symlinks.
+
 The model endpoint comes from `local_host.base_url`. Policy and request settings
 are lifted from the #1954 proof. Decisions fail closed on model unavailability,
 a malformed answer, overload, logging failure, or the complete model-call
 timeout. SSE (server-sent events, the model's streaming response format) works
 with ordinary and chunked HTTP responses, including an answer completed while
 the stream remains open. Writable scripts are scanned after parsing shell quotes and escapes; interpreter
-flags, spaced filenames and direct paths are covered. Uncertain parsing, unreadable
+flags, spaced filenames and direct paths are covered. Delegated scripts are
+recursively scanned; cycles, changed working directories, PATH changes and scan
+limits reach the judge rather than bypassing it. Uncertain parsing, unreadable
 or oversized scripts, and inline interpreter programs reach the judge.
 Shell variable/parameter/command expansions and backticks always reach the
 judge, even when the literal egress command name is absent. Relative tool paths resolve against the registered
