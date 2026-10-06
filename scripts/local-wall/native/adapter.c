@@ -10,6 +10,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/un.h>
+#include <limits.h>
 
 extern const struct wall_configuration wall_configuration;
 extern const uint16_t wall_direct_ports[4];
@@ -21,6 +24,8 @@ struct entry { int fd; struct wall_socket socket; };
 static struct entry entries[TRACKED_LIMIT];
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 static int refresh_after_fork;
+static int control_source = -1;
+static int fork_pending;
 /* libSystem invokes interposed functions before this image's constructor.
  * No pthread operation or thread-local access is safe in that startup window. */
 static _Atomic int initialized;
@@ -48,7 +53,17 @@ static struct entry *vacant(void) {
 static void forget(struct entry *entry) {
     if (!entry) return;
     int saved = errno;
-    if (entry->socket.control >= 0) close(entry->socket.control);
+    if (entry->socket.control >= 0) {
+        int final = entry->socket.lease != 0 && !fork_pending;
+        for (unsigned i = 0; i < TRACKED_LIMIT; ++i)
+            if (&entries[i] != entry && entries[i].fd >= 0 &&
+                entries[i].socket.lease == entry->socket.lease) final = 0;
+        if (final) {
+            struct wall_socket releasing = entry->socket;
+            releasing.descriptor = -1;
+            (void)wall_release(&releasing);
+        } else close(entry->socket.control);
+    }
     entry->fd = -1;
     errno = saved;
 }
@@ -167,7 +182,8 @@ static int refresh(void) {
     return 0;
 }
 
-static void fork_prepare(void) { lock_table(); }
+static void hold_fork_leases(void);
+static void fork_prepare(void) { lock_table(); hold_fork_leases(); }
 static void fork_parent(void) { unlock_table(); }
 static void fork_child(void) {
     /* Drop kernel-closed entries before application code can reuse their
@@ -179,6 +195,8 @@ static void fork_child(void) {
     unlock_table();
 }
 
+#include "exec_recovery.c"
+
 __attribute__((constructor)) static void initialize(void) {
     for (unsigned i = 0; i < TRACKED_LIMIT; ++i) entries[i].fd = -1;
     if (wall_control_fd >= 0) {
@@ -186,13 +204,17 @@ __attribute__((constructor)) static void initialize(void) {
         socklen_t size = sizeof(address);
         uint8_t family; uint16_t port;
         int flags = fcntl(wall_control_fd, F_GETFD);
-        if (flags < 0 || getsockname(wall_control_fd, (struct sockaddr *)&address, &size) < 0 ||
+        if (flags < 0 && errno != EBADF) _exit(126);
+        if (flags >= 0 && (getsockname(wall_control_fd, (struct sockaddr *)&address, &size) < 0 ||
             destination((struct sockaddr *)&address, size, &family, &port) < 0 ||
             port != wall_control_port || tcp_socket(wall_control_fd, family) < 0 ||
-            fcntl(wall_control_fd, F_SETFD, flags | FD_CLOEXEC) < 0) _exit(126);
+            fcntl(wall_control_fd, F_SETFD, flags | FD_CLOEXEC) < 0)) _exit(126);
+        if (flags >= 0) control_source = wall_control_fd;
     }
+    if (recover_inherited() < 0) _exit(126);
     if (pthread_atfork(fork_prepare, fork_parent, fork_child)) _exit(126);
     atomic_store_explicit(&initialized, 1, memory_order_release);
+    acknowledge_recovery();
 }
 
 static int wrapped_bind(int fd, const struct sockaddr *address, socklen_t size) {
@@ -214,10 +236,10 @@ static int wrapped_bind(int fd, const struct sockaddr *address, socklen_t size) 
         struct sockaddr_storage source;
         socklen_t length = sizeof(source);
         uint8_t source_family; uint16_t source_port;
-        if (wall_control_fd < 0 || getsockname(wall_control_fd, (struct sockaddr *)&source, &length) < 0 ||
+        if (control_source < 0 || getsockname(control_source, (struct sockaddr *)&source, &length) < 0 ||
             destination((struct sockaddr *)&source, length, &source_family, &source_port) < 0 ||
-            source_family != family || source_port != port || tcp_socket(wall_control_fd, family) < 0) { errno = EACCES; goto finish; }
-        prepared.descriptor = dup(wall_control_fd);
+            source_family != family || source_port != port || tcp_socket(control_source, family) < 0) { errno = EACCES; goto finish; }
+        prepared.descriptor = dup(control_source);
         if (prepared.descriptor < 0) goto finish;
         prepared.family = family; prepared.port = port;
     } else {
@@ -267,6 +289,7 @@ static int wrapped_connect(int fd, const struct sockaddr *address, socklen_t siz
 static int wrapped_close(int fd) {
     if (!adapter_ready()) return close(fd);
     lock_table();
+    if (refresh() < 0) { int saved = errno; unlock_table(); return failure(saved); }
     struct entry *entry = find(fd);
     int result = close(fd), saved = errno;
     if (result == 0) {
@@ -390,3 +413,5 @@ INTERPOSE(wrapped_dup2, dup2);
 INTERPOSE(wrapped_fcntl, fcntl);
 
 #include "exec_guards.c"
+
+#include "fork_lifecycle.c"
