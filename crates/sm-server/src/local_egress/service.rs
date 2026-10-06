@@ -1,4 +1,7 @@
-use super::{Proxy, Registration, FIRST_PORT, LAST_PORT};
+use super::{
+    gateway::{Gateway, GatewayRegistration},
+    Proxy, Registration, FIRST_PORT, LAST_PORT,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -24,6 +27,7 @@ use tokio::{
 #[derive(Serialize, Deserialize)]
 enum Request {
     Register(String),
+    RegisterGateway(String, std::net::SocketAddr),
     Unregister(String),
     Get(String),
     Release(String),
@@ -63,6 +67,26 @@ impl ServiceClient {
         self.ensure_running()?;
         self.request(Request::Register(agent.into()))?
             .ok_or_else(|| io::Error::other("missing registration"))
+    }
+    /// Host-only: the upstream is sm's fixed loopback listener. Existing
+    /// gateways are immutable until the wall is fully released.
+    pub fn register_gateway(
+        &self,
+        agent: &str,
+        upstream: std::net::SocketAddr,
+    ) -> io::Result<Registration> {
+        validate_agent(agent)?;
+        GatewayRegistration {
+            port: super::gateway::FIRST_PORT,
+            upstream,
+        }
+        .validate()?;
+        self.ensure_running()?;
+        self.request(Request::RegisterGateway(agent.into(), upstream))?
+            .ok_or_else(|| io::Error::other("missing gateway registration"))
+    }
+    pub fn stamp_verifier(&self) -> super::gateway::StampVerifier {
+        super::gateway::StampVerifier::new(self.directory.clone())
     }
     pub fn unregister_agent(&self, agent: &str) -> io::Result<()> {
         validate_agent(agent)?;
@@ -156,7 +180,7 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
-fn validate_agent(agent: &str) -> io::Result<()> {
+pub(super) fn validate_agent(agent: &str) -> io::Result<()> {
     if agent.is_empty()
         || agent.len() > 128
         || !agent
@@ -234,6 +258,8 @@ struct Registry {
     records: BTreeMap<String, Registration>,
     listeners: BTreeMap<String, ListenerTask>,
     proxy: Proxy,
+    gateway: Gateway,
+    gateway_listeners: BTreeMap<String, ListenerTask>,
 }
 impl Registry {
     async fn open(directory: &Path) -> io::Result<Self> {
@@ -244,8 +270,15 @@ impl Registry {
             Err(error) => return Err(error),
         };
         let mut ports = std::collections::BTreeSet::new();
+        let mut gateway_ports = std::collections::BTreeSet::new();
         for (agent, record) in &records {
             validate_agent(agent)?;
+            if let Some(gateway) = &record.gateway {
+                gateway.validate()?;
+                if !gateway_ports.insert(gateway.port) {
+                    return Err(io::Error::other("duplicate saved gateway port"));
+                }
+            }
             if record.agent_id != *agent
                 || !(FIRST_PORT..=LAST_PORT).contains(&record.port)
                 || !ports.insert(record.port)
@@ -258,8 +291,17 @@ impl Registry {
             records,
             listeners: BTreeMap::new(),
             proxy: Proxy::new(directory)?,
+            gateway: Gateway::open(directory)?,
+            gateway_listeners: BTreeMap::new(),
         };
         for record in registry.records.values().filter(|r| r.active) {
+            if let Some(gateway) = &record.gateway {
+                registry.gateway_listeners.insert(
+                    record.agent_id.clone(),
+                    start_gateway_listener(&record.agent_id, gateway, registry.gateway.clone())
+                        .await?,
+                );
+            }
             registry.listeners.insert(
                 record.agent_id.clone(),
                 start_listener(record, registry.proxy.clone()).await?,
@@ -276,6 +318,7 @@ impl Registry {
     async fn request(&mut self, request: Request) -> io::Result<Option<Registration>> {
         let agent = match &request {
             Request::Register(a)
+            | Request::RegisterGateway(a, _)
             | Request::Unregister(a)
             | Request::Get(a)
             | Request::Release(a) => a,
@@ -297,39 +340,17 @@ impl Registry {
                 }
                 Ok(None)
             }
-            Request::Register(agent) => {
-                if let Some(record) = self.records.get(&agent).filter(|r| r.active) {
-                    return Ok(Some(record.clone()));
-                }
-                let port = match self.records.get(&agent) {
-                    Some(record) => record.port,
-                    None => (FIRST_PORT..=LAST_PORT)
-                        .find(|port| !self.records.values().any(|r| r.port == *port))
-                        .ok_or_else(|| io::Error::other("egress port reservations exhausted"))?,
-                };
-                let record = Registration {
-                    agent_id: agent.clone(),
-                    port,
-                    active: true,
-                };
-                let listener = start_listener(&record, self.proxy.clone()).await?;
-                let old = self.records.insert(agent.clone(), record.clone());
-                if let Err(error) = self.save() {
-                    self.records.remove(&agent);
-                    if let Some(old) = old {
-                        self.records.insert(agent, old);
-                    }
-                    return Err(error);
-                }
-                self.listeners.insert(agent, listener);
-                Ok(Some(record))
-            }
+            Request::Register(agent) => self.register(agent, None).await,
+            Request::RegisterGateway(agent, upstream) => self.register(agent, Some(upstream)).await,
             Request::Unregister(agent) => {
                 if let Some(old) = self.records.get(&agent).cloned() {
                     self.records.get_mut(&agent).unwrap().active = false;
                     if let Err(error) = self.save() {
                         self.records.insert(agent, old);
                         return Err(error);
+                    }
+                    if let Some(listener) = self.gateway_listeners.remove(&agent) {
+                        listener.shutdown().await;
                     }
                     if let Some(listener) = self.listeners.remove(&agent) {
                         listener.shutdown().await;
@@ -339,6 +360,119 @@ impl Registry {
             }
         }
     }
+    async fn register(
+        &mut self,
+        agent: String,
+        upstream: Option<std::net::SocketAddr>,
+    ) -> io::Result<Option<Registration>> {
+        let old = self.records.get(&agent).cloned();
+        let port = match &old {
+            Some(record) => record.port,
+            None => (FIRST_PORT..=LAST_PORT)
+                .find(|port| !self.records.values().any(|r| r.port == *port))
+                .ok_or_else(|| io::Error::other("egress port reservations exhausted"))?,
+        };
+        let mut gateway = old.as_ref().and_then(|r| r.gateway.clone());
+        if let Some(upstream) = upstream {
+            if let Some(existing) = &gateway {
+                if existing.upstream != upstream {
+                    return Err(io::Error::other(
+                        "gateway upstream is immutable until release",
+                    ));
+                }
+            } else {
+                let port = (super::gateway::FIRST_PORT..=super::gateway::LAST_PORT)
+                    .find(|port| {
+                        !self
+                            .records
+                            .values()
+                            .any(|r| r.gateway.as_ref().is_some_and(|g| g.port == *port))
+                    })
+                    .ok_or_else(|| io::Error::other("gateway port reservations exhausted"))?;
+                gateway = Some(GatewayRegistration { port, upstream });
+            }
+        }
+        if let Some(gateway) = &gateway {
+            gateway.validate()?;
+        }
+        let record = Registration {
+            agent_id: agent.clone(),
+            port,
+            active: true,
+            gateway,
+        };
+        if old.as_ref() == Some(&record) {
+            return Ok(Some(record));
+        }
+        let proxy_listener = if old.as_ref().is_some_and(|r| r.active) {
+            None
+        } else {
+            Some(start_listener(&record, self.proxy.clone()).await?)
+        };
+        let gateway_listener = if old
+            .as_ref()
+            .is_some_and(|r| r.active && r.gateway.is_some())
+        {
+            None
+        } else if let Some(gateway) = &record.gateway {
+            Some(start_gateway_listener(&agent, gateway, self.gateway.clone()).await?)
+        } else {
+            None
+        };
+        self.records.insert(agent.clone(), record.clone());
+        if let Err(error) = self.save() {
+            self.records.remove(&agent);
+            if let Some(old) = old {
+                self.records.insert(agent, old);
+            }
+            return Err(error);
+        }
+        if let Some(listener) = proxy_listener {
+            self.listeners.insert(agent.clone(), listener);
+        }
+        if let Some(listener) = gateway_listener {
+            self.gateway_listeners.insert(agent, listener);
+        }
+        Ok(Some(record))
+    }
+}
+async fn start_gateway_listener(
+    agent: &str,
+    registration: &GatewayRegistration,
+    gateway: Gateway,
+) -> io::Result<ListenerTask> {
+    registration.validate()?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, registration.port)).await?;
+    let agent = agent.to_owned();
+    let upstream = registration.upstream;
+    let (stop, mut stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut workers = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = stopped.changed() => break,
+                Some(_) = workers.join_next(), if !workers.is_empty() => {},
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _)) => {
+                            let gateway = gateway.clone(); let agent = agent.clone(); let stopped = stopped.clone();
+                            workers.spawn(async move { gateway.serve(stream, agent, upstream, stopped).await; });
+                        }
+                        Err(_) => tokio::select! {
+                            _ = stopped.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                        },
+                    }
+                }
+            }
+        }
+        drop(listener);
+        while workers.join_next().await.is_some() {}
+    });
+    Ok(ListenerTask {
+        stop,
+        task: Some(task),
+    })
 }
 async fn start_listener(record: &Registration, proxy: Proxy) -> io::Result<ListenerTask> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, record.port)).await?;
@@ -466,6 +600,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(a.port, b.port);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = upstream_listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            |headers: axum::http::HeaderMap| async move {
+                headers[super::super::gateway::AGENT_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, app).await.unwrap();
+        });
+        let a = registry
+            .request(Request::RegisterGateway("a".into(), upstream))
+            .await
+            .unwrap()
+            .unwrap();
+        let b = registry
+            .request(Request::RegisterGateway("b".into(), upstream))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            a.gateway.as_ref().unwrap().port,
+            b.gateway.as_ref().unwrap().port
+        );
+        let occupied = TcpListener::bind((
+            std::net::Ipv4Addr::LOCALHOST,
+            super::super::gateway::FIRST_PORT + 2,
+        ))
+        .await
+        .unwrap();
+        assert!(registry
+            .request(Request::RegisterGateway("conflict".into(), upstream))
+            .await
+            .is_err());
+        assert!(!registry.records.contains_key("conflict"));
+        drop(occupied);
+        let original_key = fs::read(dir.join("gateway.key")).unwrap();
+        for record in [&a, &b] {
+            let mut stream = tokio::net::TcpStream::connect((
+                std::net::Ipv4Addr::LOCALHOST,
+                record.gateway.as_ref().unwrap().port,
+            ))
+            .await
+            .unwrap();
+            stream.write_all(b"GET /health HTTP/1.1\r\nHost: forged\r\nX-SM-Local-Agent: forged\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert!(String::from_utf8(bytes)
+                .unwrap()
+                .ends_with(&record.agent_id));
+        }
         assert_eq!(
             a,
             registry
@@ -477,8 +665,12 @@ mod tests {
         for (_, listener) in std::mem::take(&mut registry.listeners) {
             listener.shutdown().await;
         }
+        for (_, listener) in std::mem::take(&mut registry.gateway_listeners) {
+            listener.shutdown().await;
+        }
         drop(registry);
         let mut registry = Registry::open(&dir).await.unwrap();
+        assert_eq!(original_key, fs::read(dir.join("gateway.key")).unwrap());
         assert_eq!(
             a,
             registry
@@ -491,6 +683,19 @@ mod tests {
             .request(Request::Unregister("a".into()))
             .await
             .unwrap();
+        assert!(tokio::net::TcpStream::connect((
+            std::net::Ipv4Addr::LOCALHOST,
+            a.gateway.as_ref().unwrap().port
+        ))
+        .await
+        .is_err());
+        assert!(registry
+            .request(Request::RegisterGateway(
+                "a".into(),
+                "127.0.0.1:8421".parse().unwrap()
+            ))
+            .await
+            .is_err());
         let c = registry
             .request(Request::Register("c".into()))
             .await
@@ -528,6 +733,11 @@ mod tests {
         assert_eq!(env["GIT_CONFIG_VALUE_0"], "");
         assert_eq!(env["GIT_CONFIG_VALUE_1"], "!gh auth git-credential");
         assert_eq!(env["CARGO_NET_OFFLINE"], "false");
+        assert_eq!(
+            env["SM_API_URL"],
+            format!("http://127.0.0.1:{}", a.gateway.as_ref().unwrap().port)
+        );
+        server.abort();
         drop(registry);
         fs::remove_dir_all(dir).unwrap();
     }
