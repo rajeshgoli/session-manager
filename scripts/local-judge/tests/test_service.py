@@ -88,6 +88,8 @@ class JudgeTests(unittest.TestCase):
         self.root.mkdir()
         self.wt, self.tmp = self.base / 'wt', self.base / 'tmp'
         self.wt.mkdir(); self.tmp.mkdir()
+        (self.wt / '.git').mkdir()
+        (self.wt / '.git/HEAD').write_text('ref: refs/heads/1855-local\n')
         self.model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
         self.model.daemon_threads = True
         self.model.requests = []
@@ -296,6 +298,26 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
                 self.assertEqual(self.logs()[-1]['stage'], 'judge')
                 self.assertIn('interpreted-program', self.logs()[-1]['judge_why'])
+
+    def test_push_checks_current_branch_instead_of_registration(self):
+        command = 'git push origin HEAD'
+        self.model.answers[command] = 'allow'
+        self.assertEqual(self.ruling(tin={'command': command}), 'allow')
+        (self.wt / '.git/HEAD').write_text('ref: refs/heads/main\n')
+        for action in [command, 'git push -u origin HEAD', '/usr/bin/git push origin HEAD']:
+            self.assertEqual(self.ruling(tin={'command': action}), 'deny')
+            self.assertEqual(self.logs()[-1]['stage'], 'rule')
+        (self.wt / '.git/HEAD').write_text('0123456789abcdef\n')
+        self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+        (self.wt / '.git/HEAD').unlink()
+        (self.wt / '.git').rmdir()
+        git_dir = self.base / 'linked-git'
+        git_dir.mkdir()
+        (git_dir / 'HEAD').write_text('ref: refs/heads/1855-local\n')
+        (self.wt / '.git').write_text(f'gitdir: {git_dir}\n')
+        self.assertEqual(self.ruling(tin={'command': command}), 'allow')
+        self.assertIn('Current checkout branch: "1855-local"',
+                      self.model.requests[-1]['messages'][0]['content'])
 
     def test_git_credential_retrieval_is_denied_by_rules(self):
         (self.wt / 'git-alias').symlink_to('/usr/bin/git')

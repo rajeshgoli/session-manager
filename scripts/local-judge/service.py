@@ -286,6 +286,26 @@ def git_credential_request(command, agent):
     return False
 
 
+def current_branch(agent):
+    """Read live Git metadata, including linked worktrees; registration is not HEAD."""
+    try:
+        git_dir = os.path.join(agent["checkout"], ".git")
+        if os.path.isfile(git_dir):
+            with open(git_dir) as f:
+                link = f.read(4096).strip()
+            if not link.startswith("gitdir: "):
+                return None
+            git_dir = os.path.realpath(os.path.join(agent["checkout"], link[8:]))
+        with open(os.path.join(git_dir, "HEAD")) as f:
+            head = f.read(4096).strip()
+        prefix = "ref: refs/heads/"
+        if head.startswith(prefix) and re.fullmatch(r"[\w./-]+", head[len(prefix):]):
+            return head[len(prefix):]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
@@ -308,9 +328,15 @@ def rule_stage(tool, tin, cwd, agent):
         if command_protected_paths(cmd, agent):
             return "deny", "reading protected credentials is not allowed"
         hits = egress_hits(cmd, agent)
+        texts = [cmd]
         for path, text in script_texts(cmd, cwd, agent):
+            texts.append(text)
             more = egress_hits(text, agent)
             hits += [f"{os.path.basename(path)}:{h}" for h in more]
+        if any(match.group(1) == "push" for text in texts
+               for match in GIT_EGRESS.finditer(normalise(text))):
+            if current_branch(agent) != agent["branch"]:
+                return "deny", "checkout HEAD does not name the registered branch"
         if not hits:
             return "allow", "no egress word in the command"
         return "judge", "egress words: " + ", ".join(hits)
@@ -326,6 +352,7 @@ def judge_message(tool, tin, agent):
         action = json.dumps(tin, indent=1)[:4000]
     return (f"Agent: {agent['name']} working ticket #{agent['ticket']} \"{agent['title']}\" "
             f"on branch {agent['branch']} in {agent['checkout']}\n"
+            f"Current checkout branch: {json.dumps(current_branch(agent))}\n"
             f"Parent: {agent['parent']}\n"
             f"sm server for this agent: {agent.get('sm_url') or 'http://127.0.0.1:8420'}\n"
             f"Egress proxy port: {agent.get('proxy_port', 'unknown')}\n"
