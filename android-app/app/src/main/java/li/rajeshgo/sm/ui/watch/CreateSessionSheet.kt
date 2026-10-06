@@ -41,6 +41,7 @@ data class TicketStart(
     val effort: String,
     val whenReady: Boolean = false,
     val agentTypes: List<AgentTypeChoice> = emptyList(),
+    val selectedType: String? = null,
 )
 
 data class AgentTypeChoice(val name: String, val provider: String, val model: String, val effort: String)
@@ -53,8 +54,10 @@ fun agentTypeChoices(settings: JsonObject): List<AgentTypeChoice> =
             (item["model"] as? JsonPrimitive)?.contentOrNull.orEmpty(), (item["effort"] as? JsonPrimitive)?.contentOrNull.orEmpty())
     }
 
-fun matchAgentType(types: List<AgentTypeChoice>, provider: String, model: String?, effort: String?): AgentTypeChoice? =
-    types.firstOrNull { it.provider == provider && it.model == model.orEmpty() && it.effort == effort.orEmpty() }
+fun matchAgentType(types: List<AgentTypeChoice>, provider: String, model: String?, effort: String?, preferredName: String? = null): AgentTypeChoice? {
+    val matches = types.filter { it.provider == provider && it.model == model.orEmpty() && it.effort == effort.orEmpty() }
+    return matches.firstOrNull { it.name == preferredName } ?: matches.firstOrNull()
+}
 
 /**
  * Report a bug (spec 1859 C4): the sheet takes the bug's text and
@@ -100,6 +103,7 @@ fun CreateSessionSheet(
     bugDraft: String = "",
     onBugDraftChange: (String) -> Unit = {},
     onClearBugDraft: () -> Unit = {},
+    onAgentTypeChange: (String?) -> Unit = {},
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     // The agent fields open on the bug defaults once they arrive.
@@ -117,6 +121,7 @@ fun CreateSessionSheet(
     var model by rememberSaveable(sheetKey) { mutableStateOf(template.model.orEmpty()) }
     var effort by rememberSaveable(sheetKey) { mutableStateOf(template.reasoningEffort.orEmpty()) }
     var otherType by rememberSaveable(sheetKey) { mutableStateOf(false) }
+    var selectedTypeName by rememberSaveable(sheetKey) { mutableStateOf(ticket?.selectedType) }
     var typesInitialized by rememberSaveable(sheetKey) { mutableStateOf(false) }
     var agentTypes by remember { mutableStateOf(ticket?.agentTypes.orEmpty()) }
     var typesLoading by remember { mutableStateOf(true) }
@@ -132,11 +137,15 @@ fun CreateSessionSheet(
     }
     LaunchedEffect(sheetKey, typesLoading) {
         if (!typesLoading && !typesInitialized) {
-            otherType = matchAgentType(agentTypes, provider, model, effort) == null
+            selectedTypeName = matchAgentType(agentTypes, provider, model, effort, selectedTypeName)?.name
+            otherType = selectedTypeName == null
             typesInitialized = true
         }
     }
-    val selectedType = if (otherType) null else matchAgentType(agentTypes, provider, model, effort)
+    val selectedType = if (otherType) null else matchAgentType(agentTypes, provider, model, effort, selectedTypeName)
+    LaunchedEffect(selectedType?.name, typesInitialized) {
+        if (typesInitialized) onAgentTypeChange(selectedType?.name)
+    }
     val customConfig = !typesLoading && selectedType == null
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
@@ -200,7 +209,7 @@ fun CreateSessionSheet(
                     FilterChip(
                         selected = selectedType == choice,
                         onClick = {
-                            otherType = false; provider = choice.provider; model = choice.model; effort = choice.effort
+                            selectedTypeName = choice.name; otherType = false; provider = choice.provider; model = choice.model; effort = choice.effort
                             customModel = false
                         },
                         enabled = !busy && !typesLoading,

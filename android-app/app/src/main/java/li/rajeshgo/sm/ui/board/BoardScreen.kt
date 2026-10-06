@@ -553,6 +553,7 @@ fun BoardScreen(
                         it.provider == defaults?.provider && it.model == defaults?.model && it.effort == defaults?.reasoningEffort
                     }
             } else null
+            var chosenTypeName by remember(start.ticket.repo, start.ticket.number) { mutableStateOf(selectedAgentType?.name) }
             CreateSessionSheet(
                 source = null,
                 sessions = emptyList(),
@@ -571,7 +572,9 @@ fun BoardScreen(
                     effort = selectedAgentType?.effort ?: start.ticket.autoStart?.effort ?: defaults?.reasoningEffort ?: "high",
                     whenReady = start.whenReady,
                     agentTypes = state.agentTypes,
+                    selectedType = selectedAgentType?.name,
                 ),
+                onAgentTypeChange = { chosenTypeName = it },
                 extra = { enabled ->
                     StartReviewerRow(
                         laneDefault = policy?.takeUnless { ticketOwn },
@@ -583,7 +586,7 @@ fun BoardScreen(
             ) { request ->
                 if (start.whenReady) {
                     val type = state.agentTypes.firstOrNull {
-                        it.provider == request.provider && it.model == request.model && it.effort == request.reasoningEffort
+                        it.name == chosenTypeName && it.provider == request.provider && it.model == request.model && it.effort == request.reasoningEffort
                     }
                     viewModel.authorizeStart(
                         li.rajeshgo.sm.data.model.BoardAutoStartChoice(start.ticket.repo, start.ticket.number,
