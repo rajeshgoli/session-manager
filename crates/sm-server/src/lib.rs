@@ -48,6 +48,7 @@ pub mod handover;
 pub mod http;
 pub mod local_egress;
 pub mod local_identity;
+pub mod local_judge;
 pub mod local_model;
 pub mod local_sockets;
 pub mod mobile_devices;
