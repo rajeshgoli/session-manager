@@ -97,7 +97,7 @@ It works like a whiteboard session with your agents, with the precision of a
 code review: every comment is pinned to the sentence it's about, and every
 revision is kept.
 
-![Commenting on a sentence in a draft](docs/assets/doc_comment.png)
+![Commenting on a sentence in the local-agents spec](docs/assets/doc_comment.png)
 
 ## On your phone
 
@@ -170,7 +170,6 @@ a human team.
 
 - **Rust server** (Axum + Tokio). Rewriting the earlier Python service cut
   memory by about 87% and made common reads 3–20× faster.
-  [Measurements](docs/product/operator_guide.md#why-the-rust-rewrite-matters).
 - **Durable state in SQLite.** Messages, reminders and queue jobs survive
   restarts. Agents can be restored with their context weeks later.
 - **Layered security for remote access.** By default the server listens only
