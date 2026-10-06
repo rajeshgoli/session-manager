@@ -2160,6 +2160,10 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn get_scheduled_reminder(&self, reminder_id: &str) -> Result<Option<ScheduledReminder>> {
+        self.with_connection(|conn| scheduled_reminder_conn(conn, reminder_id))
+    }
+
     pub fn cancel_scheduled_reminder(
         &self,
         reminder_id: &str,

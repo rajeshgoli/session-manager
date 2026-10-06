@@ -32,6 +32,11 @@ pub(super) fn owner_guard(
     method: &str,
     uri: &Uri,
 ) -> Result<String, ApiError> {
+    if crate::local_identity::current().is_some() {
+        return Err(local_agent::denied(
+            "owner actions are not available to local agents",
+        ));
+    }
     let request_target = request_target_from_uri(uri);
     let access_context =
         ensure_mobile_cloudflare_access_from_parts(state, headers, Some(peer_addr))?;
