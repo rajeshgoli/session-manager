@@ -60,6 +60,7 @@ pub struct LocalJudgeRuntime {
     config: LocalJudgeConfig,
     root: PathBuf,
     model_url: String,
+    model_auth_token: String,
 }
 impl LocalJudgeRuntime {
     pub fn from_config(config: &crate::config::AppConfig) -> Self {
@@ -72,6 +73,7 @@ impl LocalJudgeRuntime {
             });
         Self {
             config: config.local_judge.clone(),
+            model_auth_token: config.local_host.auth_token.clone(),
             root,
             model_url: config
                 .local_host
@@ -102,14 +104,53 @@ impl LocalJudgeRuntime {
 
     /// Idempotent across concurrent starts and sm blue/green handover. The
     /// daemon's lifetime flock selects one process, not a remembered PID.
-    fn generation(&self) -> String {
+    fn generation(&self, port: u16) -> String {
         use sha2::{Digest, Sha256};
         let identity = json!({
             "service": include_str!("../../../scripts/local-judge/service.py"),
             "policy": include_str!("../../../scripts/local-judge/policy.md"),
             "config": self.config, "model_url": self.model_url,
+            "model_auth_token": self.model_auth_token, "effective_port": port,
         });
         format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+    }
+
+    fn effective_port(&self) -> Result<u16> {
+        let agents = self.root.join("agents.json");
+        if agents.exists() {
+            let registrations: serde_json::Map<String, Value> =
+                serde_json::from_slice(&fs::read(agents)?)?;
+            if !registrations.is_empty() {
+                let endpoint = self.root.join("endpoint.json");
+                let saved: Value = if endpoint.exists() {
+                    serde_json::from_slice(&fs::read(endpoint)?)?
+                } else {
+                    self.control(json!({"op": "health"}))
+                        .context("active judge is missing its saved endpoint")?
+                };
+                let port = saved["port"]
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0)
+                    .context("invalid saved judge port")?;
+                return Ok(port);
+            }
+        }
+        Ok(self.config.port)
+    }
+
+    fn save_endpoint(&self, port: u16) -> Result<()> {
+        let staged = self.root.join("endpoint.json.new");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staged)?;
+        serde_json::to_writer(&mut file, &json!({"port": port}))?;
+        file.sync_all()?;
+        fs::rename(staged, self.root.join("endpoint.json"))?;
+        fs::File::open(&self.root)?.sync_all()?;
+        Ok(())
     }
 
     fn matching_service(&self, generation: &str) -> bool {
@@ -124,7 +165,7 @@ impl LocalJudgeRuntime {
         if self.config.port == 0 {
             bail!("local_judge.port must be nonzero so existing hook URLs survive recovery");
         }
-        let generation = self.generation();
+        let generation = self.generation(self.effective_port()?);
         if self.matching_service(&generation) {
             return Ok(());
         }
@@ -143,6 +184,7 @@ impl LocalJudgeRuntime {
         if unsafe { libc::flock(startup_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let generation = self.generation(self.effective_port()?);
         if self.matching_service(&generation) {
             return Ok(());
         }
@@ -172,6 +214,11 @@ impl LocalJudgeRuntime {
             thread::sleep(Duration::from_millis(25));
         }
         drop(lifetime);
+        // Recompute after draining: a registration may have won admission
+        // just before shutdown. Active hook URLs retain their durable port.
+        let port = self.effective_port()?;
+        self.save_endpoint(port)?;
+        let generation = self.generation(port);
         // Content-addressed installed sources outlive temporary worktrees and
         // cannot be overwritten under a running Python process by a new build.
         let service = install_source(
@@ -186,6 +233,12 @@ impl LocalJudgeRuntime {
             include_str!("../../../scripts/local-judge/policy.md"),
             "md",
         )?;
+        let connection = install_source(
+            &self.root,
+            "connection",
+            &json!({"auth_token": self.model_auth_token}).to_string(),
+            "json",
+        )?;
         let stderr = OpenOptions::new()
             .create(true)
             .append(true)
@@ -198,11 +251,13 @@ impl LocalJudgeRuntime {
             .arg("--root")
             .arg(&self.root)
             .arg("--port")
-            .arg(self.config.port.to_string())
+            .arg(port.to_string())
             .arg("--proxy-port")
             .arg(self.config.proxy_port.to_string())
             .arg("--timeout")
             .arg(self.config.timeout_seconds.to_string())
+            .arg("--model-auth-file")
+            .arg(connection)
             .arg("--model-url")
             .arg(&self.model_url)
             .arg("--policy")
@@ -454,11 +509,19 @@ mod tests {
         changed_config.local_judge.timeout_seconds = 29;
         changed_config.local_judge.proxy_port = 8433;
         changed_config.local_host.base_url = "http://127.0.0.1:8001".into();
+        changed_config.local_host.auth_token = "fixture-upgraded-key".into();
+        let original_port = changed_config.local_judge.port;
+        changed_config.local_judge.port = if original_port == 60000 { 60001 } else { 60000 };
         let upgraded = runtime_for(&changed_config, &root);
         upgraded.reconcile().unwrap();
         let health = upgraded.control(json!({"op": "health"})).unwrap();
         assert_ne!(health["pid"], old_pid);
-        assert_eq!(health["generation"], upgraded.generation());
+        assert_eq!(health["port"], original_port);
+        assert_eq!(upgraded.register("a", &agent).unwrap().url, endpoint.url);
+        assert_eq!(
+            health["generation"],
+            upgraded.generation(upgraded.effective_port().unwrap())
+        );
         assert_eq!(
             upgraded.register("a", &agent).unwrap().token,
             endpoint.token
@@ -484,7 +547,7 @@ mod tests {
         }
         let socket = root.join("state/control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let generation = upgraded.generation();
+        let generation = upgraded.generation(upgraded.effective_port().unwrap());
         let stub = thread::spawn(move || {
             for result in [
                 json!({"result": {"generation": generation}}),
@@ -540,7 +603,7 @@ mod tests {
         }
         let socket = root.join("state/control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let generation = upgraded.generation();
+        let generation = upgraded.generation(upgraded.effective_port().unwrap());
         let stub = thread::spawn(move || {
             for result in [
                 json!({"result": {"generation": generation}}),

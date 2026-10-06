@@ -72,7 +72,15 @@ require a shell egress command. Git credential retrieval/manipulation is denied
 by the rules, including absolute paths, helper subcommands and renamed aliases.
 Other Git commands reach the judge even when no listed remote subcommand appears.
 
-The model endpoint comes from `local_host.base_url`. Policy and request settings
+The model endpoint and API key come from `local_host.base_url` and
+`local_host.auth_token`. The key is installed in a private content-addressed
+connection file, never argv or the daemon environment, and participates in the
+generation identity. The saved `endpoint.json` retains the actual listening port
+while registrations exist, including a port configuration change or daemon crash.
+A changed configured port takes effect only when no registrations remain.
+Unrecognized executables, package/compile tools and uncertain shell operations
+reach the judge; rule allowances are limited to simple shell/file operations or
+recursively inspected local scripts. Policy and request settings
 are lifted from the #1954 proof. Decisions fail closed on model unavailability,
 a malformed answer, overload, logging failure, or the complete model-call
 timeout. SSE (server-sent events, the model's streaming response format) works
@@ -97,6 +105,8 @@ Durable files under the fixed state directory:
 
 | File | Purpose |
 | --- | --- |
+| `endpoint.json` | Durable port retained for existing hook URLs |
+| `connection-<hash>.json` | Private configured model API key |
 | `agents.json` | Authoritative registrations and per-agent tokens; atomic replacement |
 | `decisions.jsonl` | Proof decision fields, plus `cwd` and `action_key` |
 | `allows.jsonl` | Proof owner-grant and consumption fields, plus `action_key` |

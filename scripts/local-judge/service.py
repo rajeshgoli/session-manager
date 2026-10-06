@@ -25,6 +25,7 @@ HOME = os.path.expanduser("~")
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
 ap.add_argument("--generation", default="standalone")
+ap.add_argument("--model-auth-file")
 ap.add_argument("--port", type=int, default=8431)
 ap.add_argument("--model-url", default="http://127.0.0.1:8000")
 ap.add_argument("--timeout", type=float, default=30.0)
@@ -32,6 +33,10 @@ ap.add_argument("--proxy-port", type=int, default=8432)
 ap.add_argument("--policy", required=True)
 ap.add_argument("--no-model", action="store_true")
 ARGS = ap.parse_args()
+MODEL_TOKEN = "local"
+if ARGS.model_auth_file:
+    with open(ARGS.model_auth_file) as f:
+        MODEL_TOKEN = json.load(f)["auth_token"]
 ARGS.agents = os.path.join(ARGS.root, "agents.json")
 ARGS.log = os.path.join(ARGS.root, "decisions.jsonl")
 ARGS.allow_file = os.path.join(ARGS.root, "allows.jsonl")
@@ -155,10 +160,51 @@ def script_texts(command, cwd, agent, seen=None, depth=0):
     return out
 
 
+def unrecognized_commands(command, agent):
+    # Restrict rule allowances to simple shell/file operations. Package tools,
+    # compilers, unknown binaries and language runtimes can perform networking
+    # without containing any literal network word; the model decides those.
+    safe = {"echo", "printf", "pwd", "ls", "cat", "head", "tail", "wc", "grep",
+            "true", "false", "test", ":", "cd", "mkdir", "rmdir", "touch", "cp",
+            "mv", "rm", "ln", "chmod", "sh", "bash", "zsh", "dash", "ksh", "source", "."}
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    command_position = True
+    for token in tokens:
+        if not token.strip() or any(char in token for char in ";&|()") and set(token) <= set(";&|()\n"):
+            command_position = True
+            continue
+        if token in ("<", ">", ">>", "<<", "<<<", "<&", ">&"):
+            # Redirections include shell /dev/tcp transport and inline input;
+            # never infer no egress from the executable name alone.
+            return True
+        if token == "PATH" or token.startswith(("PATH=", "BASH_ENV=", "ENV=", "LD_PRELOAD=", "DYLD_")):
+            return True
+        if not command_position:
+            continue
+        if token in {"command", "exec", "env", "sudo", "builtin", "time"} or "=" in token:
+            continue
+        command_position = False
+        if os.path.basename(token) not in safe:
+            path = resolve(token, agent)
+            # Local files are recursively inspected by script_texts. Native
+            # binary content, unsafe operations and uncertain scans are judged.
+            if not inside(path, agent) or not os.path.isfile(path):
+                return True
+    return False
+
+
 def egress_hits(text, agent):
     t = normalise(text)
     hits = [m.group(0) for m in GIT_EGRESS.finditer(t)][:1]
     hits += sorted({m.group(1) for m in egress_words(agent).finditer(t)})
+    if unrecognized_commands(text, agent):
+        hits.append("unrecognized executable or shell operation")
     if OBFUSCATION.search(text):
         hits.append("obfuscation")
     # Shell expansions can synthesize a command name without any literal
@@ -291,7 +337,7 @@ def ask_judge_stream(tool, tin, agent):
     conn = http.client.HTTPConnection(u.hostname, u.port, timeout=ARGS.timeout)
     try:
         conn.request("POST", "/v1/messages", body, {"Content-Type": "application/json",
-                                                    "x-api-key": "local", "anthropic-version": "2023-06-01"})
+                                                    "x-api-key": MODEL_TOKEN, "anthropic-version": "2023-06-01"})
         resp = conn.getresponse()
         if resp.status != 200:
             raise RuntimeError(f"model HTTP {resp.status}: {resp.read(300)!r}")
