@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
@@ -93,6 +94,53 @@ def temporary_directory(state_dir, minimum_length):
     return str(path) + "/"
 
 
+def github_hosts(home):
+    """Validate the owner's one explicit credential-file grant without reading it."""
+    gh = home / ".config/gh"
+    hosts = gh / "hosts.yml"
+    for path in (home / ".config", gh, hosts):
+        if path.is_symlink():
+            raise ValueError("GitHub credential path must not contain symlinks")
+    if hosts.exists():
+        metadata = hosts.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("GitHub credentials must be a regular file without hard-link aliases")
+    return hosts
+
+
+def prepare_github_config(home, state):
+    """Host-only preparation; the agent wall must deny writes to xdg/config."""
+    hosts = github_hosts(physical(home))
+    state = physical(state)
+    config = state / "xdg/config"
+    if physical(config) != config or not config.is_dir():
+        raise ValueError("GitHub configuration requires physical immutable agent config")
+    directory = config / "gh"
+    if directory.is_symlink():
+        raise ValueError("private GitHub configuration must not be a symlink")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    target = directory / "hosts.yml"
+    if target.is_symlink():
+        if target.readlink() != hosts:
+            raise ValueError("private GitHub credential link has an unexpected target")
+    elif target.exists():
+        raise ValueError("private GitHub credentials must use the approved host file")
+    else:
+        target.symlink_to(hosts)
+    settings = directory / "config.yml"
+    if settings.is_symlink():
+        raise ValueError("private GitHub settings must not be a symlink")
+    try:
+        with settings.open("x") as stream:
+            stream.write("version: 1\n")
+        settings.chmod(0o400)
+    except FileExistsError:
+        metadata = settings.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or settings.read_text() != "version: 1\n":
+            raise ValueError("private GitHub settings must contain only the supported format version")
+    return directory
+
+
 def generate(args, listeners, minimum_tmp_length):
     checkout = physical(args.checkout)
     state_root = physical(args.state_root)
@@ -115,6 +163,13 @@ def generate(args, listeners, minimum_tmp_length):
         raise ValueError("cargo and state_root must not overlap")
     if checkout == cargo or below(checkout, cargo) or below(cargo, checkout):
         raise ValueError("checkout and host cargo must not overlap")
+    # Owner policy in #1978 admits this one GitHub credential file. Never
+    # resolve an alias into some other credential grant.
+    gh = home / ".config/gh"
+    gh_hosts = github_hosts(home)
+    if any(path == gh or below(path, gh) or below(gh, path)
+           for path in (checkout, state_root)):
+        raise ValueError("GitHub credential directory and mutable agent trees must not overlap")
     mutable = [state / name for name in ("xdg/data", "xdg/cache", "xdg/state", "tmp")]
     for path in mutable:
         if physical(path) != path or not path.is_dir():
@@ -207,6 +262,7 @@ def generate(args, listeners, minimum_tmp_length):
     )]
     lines.append("(allow file-read-data " + " ".join(
         f"(subpath {quoted(p)})" for p in [checkout, state, *runtime, *read_only]) + ")")
+    lines.append(f"(allow file-read-data (literal {quoted(gh_hosts)}))")
     # Do not allow the whole Darwin temp directory or the entire state folder.
     # Profile, plugin, launch scripts, password and usage ledger are host-owned.
     writable = [checkout, *mutable, Path("/dev")]
@@ -253,12 +309,14 @@ def generate(args, listeners, minimum_tmp_length):
         ' (sysctl-name-prefix "sysctl.name.")'
         ' (sysctl-name-prefix "hw.perflevel"))')
     denied_reads = [(home / p).resolve() for p in (
-        ".ssh", ".claude", ".codex", ".config/session-manager", ".config/gh", ".config/git", ".gitconfig",
+        ".ssh", ".claude", ".codex", ".config/session-manager", ".config/git", ".gitconfig",
         "Library/Keychains", ".aws", ".claude.json", ".netrc", ".git-credentials",
         ".cargo/credentials", ".cargo/credentials.toml", ".cargo/config", ".cargo/config.toml",
     )] + services
     lines.append("(deny file-read* " + " ".join(
         f"(subpath {quoted(p)})" for p in denied_reads) + ")")
+    lines.append(f"(deny file-read-data (require-all (subpath {quoted(gh)}) "
+                 f"(require-not (literal {quoted(gh_hosts)}))))")
     # Host services run outside this process's wall. Do not let tools delegate
     # keychain access, application launching or other privileged operations to
     # them. IPC needed by local tools uses private Unix sockets or admitted TCP.
@@ -311,6 +369,8 @@ def main():
         if len(sys.argv) == 3 and sys.argv[1] == "--prepare-tmp":
             state = physical(sys.argv[2])
             print(temporary_directory(state, len(user_temp())))
+        elif len(sys.argv) == 4 and sys.argv[1] == "--prepare-gh":
+            print(prepare_github_config(sys.argv[2], sys.argv[3]))
         else:
             args = parser().parse_args()
             # Build and validate EVERYTHING before emitting any profile bytes.

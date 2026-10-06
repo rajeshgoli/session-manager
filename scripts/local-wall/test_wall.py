@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,46 @@ class WallTests(unittest.TestCase):
         data.symlink_to(self.checkout, target_is_directory=True)
         with self.assertRaises(ValueError):
             wall.generate(self.args, set(), 65)
+
+    def test_github_credential_aliases_and_mutable_overlap_rejected(self):
+        gh = self.home / ".config/gh"
+        gh.mkdir(parents=True)
+        hosts = gh / "hosts.yml"
+        hosts.symlink_to(self.checkout / "credential")
+        with self.assertRaises(ValueError):
+            wall.generate(self.args, set(), 65)
+        hosts.unlink()
+        hosts.write_text("fixture-token")
+        os.link(hosts, self.checkout / "credential")
+        with self.assertRaises(ValueError):
+            wall.generate(self.args, set(), 65)
+        (self.checkout / "credential").unlink()
+        self.args.checkout = str(gh)
+        with self.assertRaises(ValueError):
+            wall.generate(self.args, set(), 65)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_github_client_reads_only_approved_credentials(self):
+        executable = shutil.which("gh")
+        self.assertIsNotNone(executable, "GitHub CLI is required for this fixture")
+        gh = self.home / ".config/gh"
+        gh.mkdir(parents=True)
+        (gh / "hosts.yml").write_text("github.com:\n    oauth_token: fixture-github-token\n    user: fixture\n    git_protocol: https\n")
+        (gh / "config.yml").write_text("editor: fixture-private-config\n")
+        private = wall.prepare_github_config(self.home, self.state)
+        self.assertEqual(wall.prepare_github_config(self.home, self.state), private)
+        self.profile = self.state / "github-wall.sb"
+        self.profile.write_text(wall.generate(self.args, set(), 65))
+        self.sandbox("import os,subprocess; env=dict(os.environ); "
+                     f"env['GH_CONFIG_DIR']={str(private)!r}; "
+                     f"result=subprocess.run([{executable!r}, 'auth', 'token', '--hostname', 'github.com'], "
+                     "env=env,capture_output=True,text=True); "
+                     "assert result.returncode == 0, result.stderr; "
+                     "assert result.stdout.strip() == 'fixture-github-token'",
+                     True, "unmodified GitHub CLI credential access")
+        for path in (private / "hosts.yml", private / "config.yml"):
+            self.sandbox(f"import os; os.unlink({str(path)!r})", False,
+                         "private GitHub configuration unlink")
 
     def test_service_secrets_cannot_overlap_writable_checkout(self):
         self.args.service_state_dir = [str(self.checkout)]
@@ -383,7 +424,7 @@ class WallTests(unittest.TestCase):
         for path in [self.state / p for p in ("server.secret", "launch-serve.sh", "xdg/config/sm_judge.js")]:
             path.write_text("fixture-immutable")
         for name in (".ssh/key", ".claude/settings.json", ".codex/auth.json", ".aws/credentials",
-                     ".config/session-manager/config.yaml", ".config/gh/hosts.yml", ".config/git/credentials",
+                     ".config/session-manager/config.yaml", ".config/gh/config.yml", ".config/git/credentials",
                      ".gitconfig", "Library/Keychains/key", ".npmrc", ".pypirc",
                      "Library/Application Support/Firefox/Profiles/default/cookies.sqlite",
                      "Library/Application Support/Google/Chrome/Default/Cookies",
@@ -394,6 +435,16 @@ class WallTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("fixture-credential")
             self.sandbox(f"open({str(target)!r}).read()", False, f"read {name}")
+        gh_hosts = self.home / ".config/gh/hosts.yml"
+        gh_hosts.write_text("fixture-github-token")
+        self.sandbox(f"assert open({str(gh_hosts)!r}).read() == 'fixture-github-token'",
+                     True, "owner-approved GitHub credential read")
+        self.sandbox(f"open({str(gh_hosts)!r}, 'w').write('modified')",
+                     False, "GitHub credential write")
+        self.sandbox(f"import os; os.link({str(gh_hosts)!r}, {str(self.checkout / 'gh-alias')!r})",
+                     False, "GitHub credential hardlink")
+        self.sandbox(f"import os; os.listdir({str(gh_hosts.parent)!r})",
+                     False, "GitHub configuration listing")
         for name in ("wall.sb", "server.secret", "launch-serve.sh", "xdg/config/sm_judge.js"):
             target = self.state / name
             original = target.read_text()
