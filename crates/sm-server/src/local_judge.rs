@@ -238,7 +238,10 @@ impl LocalJudgeRuntime {
         // Idle shutdown can begin just after a successful readiness check.
         // Retrying an atomic registration is idempotent and retains its token.
         for _ in 0..3 {
-            self.ensure_running()?;
+            if let Err(error) = self.ensure_running() {
+                last_error = Some(error);
+                continue;
+            }
             match self.control(request.clone()) {
                 Ok(result) => return serde_json::from_value(result).context("judge endpoint"),
                 Err(error) => last_error = Some(error),
@@ -460,6 +463,34 @@ mod tests {
         let stub = thread::spawn(move || {
             for result in [
                 json!({"result": {"generation": generation}}),
+                json!({"error": "judge stopping"}),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                serde_json::to_writer(&mut stream, &result).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+            fs::remove_file(socket).unwrap();
+        });
+        upgraded.register("a", &agent).unwrap();
+        stub.join().unwrap();
+        upgraded.unregister("a").unwrap();
+        // The generation-mismatch shutdown request can itself race idle
+        // shutdown. Readiness failure must also retry the whole operation.
+        upgraded.control(json!({"op": "shutdown"})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while root.join("state/control.sock").exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let socket = root.join("state/control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let stub = thread::spawn(move || {
+            for result in [
+                json!({"result": {"generation": "outdated"}}),
+                json!({"result": {"generation": "outdated"}}),
+                json!({"result": {"generation": "outdated"}}),
                 json!({"error": "judge stopping"}),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();

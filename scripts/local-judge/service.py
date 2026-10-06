@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import hashlib
 import fcntl
 import socketserver
@@ -60,9 +61,6 @@ CREDENTIAL = re.compile(r"\.config/gh|hosts\.yml|GH_TOKEN|GITHUB_TOKEN|GH_ENTERP
                         r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials")
 CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, ".config", "gh")),
                     os.path.realpath(os.path.join(HOME, ".git-credentials"))]
-# Running a file the agent can write: its text is checked as if it were part of the command.
-SCRIPT_RUN = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|python3?|perl|ruby|node|source|\.)\s+([^\s;&|)]+)"
-                        r"|(?:^|[;&|(]|&&|\|\|)\s*(\.{0,2}/[^\s;&|)]+)")  # a path in command position
 
 
 def egress_words(agent):
@@ -82,17 +80,45 @@ def normalise(text):
 def script_texts(command, cwd, agent):
     """Text of each script file the command runs, read only inside the checkout or temp folder."""
     out = []
-    for m in SCRIPT_RUN.finditer(command):
-        p = m.group(1) or m.group(2)
-        if not p or p.startswith("-"):
-            continue
-        p = os.path.normpath(os.path.join(cwd or agent["checkout"], os.path.expanduser(p)))
-        if inside(p, agent) and os.path.isfile(p):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        # An uncertain shell parse must not silently skip executable content.
+        return [("shell-parse", "eval")]
+    interpreters = {"sh", "bash", "zsh", "dash", "ksh", "python", "python3",
+                    "perl", "ruby", "node", "source", "."}
+    candidates = set()
+    for index, token in enumerate(tokens):
+        # Check explicit path tokens conservatively even when a shell operator
+        # or quoting obscures command position. shlex removes/joins shell quotes
+        # and escapes, including paths containing spaces.
+        if "/" in token:
+            candidates.add(token)
+        if os.path.basename(token) in interpreters:
+            for arg in tokens[index + 1:]:
+                if arg in (";", "&&", "||", "|", "(", ")", "<", ">"):
+                    break
+                if arg in ("-c", "-e", "-m", "--eval", "--command"):
+                    # Inline interpreter programs can invoke another script;
+                    # never treat an unscanned nested program as a rule allow.
+                    out.append(("inline-program", "eval"))
+                    break
+                if not arg.startswith("-"):
+                    candidates.add(arg)
+    for candidate in candidates:
+        path = os.path.normpath(os.path.join(cwd or agent["checkout"], os.path.expanduser(candidate)))
+        if inside(path, agent) and os.path.isfile(path):
             try:
-                with open(p, errors="replace") as f:
-                    out.append((p, f.read(200_000)))
+                with open(path, errors="replace") as f:
+                    text = f.read(200_001)
+                if len(text) > 200_000:
+                    out.append((path, "eval"))
+                else:
+                    out.append((path, text))
             except OSError:
-                pass
+                out.append((path, "eval"))
     return out
 
 
@@ -384,16 +410,17 @@ def write_agents(agents):
 
 
 def new_denial_id():
-    # Preserve the proof's four-hex display id without ever reusing an old id.
+    # Preserve the d- prefix; use 64 random bits for the durable production
+    # namespace, and keep old four-hex ids valid without reusing them.
     with LOCK:
         used = {r.get("denial_id") for r in read_jsonl(os.path.join(ARGS.root, "denial-ids.jsonl"))}
         for _ in range(65536):
-            candidate = "d-" + secrets.token_hex(2)
+            candidate = "d-" + secrets.token_hex(8)
             if candidate not in used:
                 # Reserve before another concurrent request chooses its id.
                 append(os.path.join(ARGS.root, "denial-ids.jsonl"), {"denial_id": candidate})
                 return candidate
-    raise RuntimeError("denial id space exhausted")
+    raise RuntimeError("unable to allocate unique denial id")
 
 
 class H(BaseHTTPRequestHandler):

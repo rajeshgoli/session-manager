@@ -62,7 +62,10 @@ are lifted from the #1954 proof. Decisions fail closed on model unavailability,
 a malformed answer, overload, logging failure, or the complete model-call
 timeout. SSE (server-sent events, the model's streaming response format) works
 with ordinary and chunked HTTP responses, including an answer completed while
-the stream remains open. Shell variable/parameter/command expansions and backticks always reach the
+the stream remains open. Writable scripts are scanned after parsing shell quotes and escapes; interpreter
+flags, spaced filenames and direct paths are covered. Uncertain parsing, unreadable
+or oversized scripts, and inline interpreter programs reach the judge.
+Shell variable/parameter/command expansions and backticks always reach the
 judge, even when the literal egress command name is absent. Relative tool paths resolve against the registered
 checkout; symlinks resolve before containment checks. Caller `cwd` does not
 replace this trusted path base.
@@ -80,7 +83,9 @@ Durable files under the fixed state directory:
 | `service-<hash>.py`, `policy-<hash>.md` | Installed sources independent of the checkout |
 
 `action_key` is a SHA-256 hash of the tool name, complete tool input and caller
-`cwd`, encoded as sorted compact JSON. A grant still carries the proof's
+`cwd`, encoded as sorted compact JSON. Production denial ids use `d-` plus 16 hexadecimal characters (64 random bits);
+legacy four-hex ids remain valid. This prevents exhausting the proof's 65,536-id
+namespace while retaining unambiguous durable owner grants. A grant still carries the proof's
 `session_id`, `tool`, and `command`. All must match. Consumption is appended and
 synced under the daemon lock **before** replying allow. A repeated grant request
 for the same denial never replenishes it. Changed write content, tool arguments,

@@ -188,6 +188,34 @@ class JudgeTests(unittest.TestCase):
             self.assertEqual(request['thinking'], {'type': 'disabled'})
             self.assertFalse(request['enable_thinking'])
 
+    def test_quoted_script_paths_and_nested_interpreters(self):
+        (self.wt / 'push.sh').write_text('git push --force origin main\n')
+        (self.wt / 'push file.sh').write_text('sm spawn claude\n')
+        commands = [
+            'bash "push.sh"', "bash 'push.sh'", "bash pu'sh'.sh",
+            'bash "push file.sh"', r'bash push\ file.sh',
+            f'/bin/bash "{self.wt}/push.sh"', 'python3 -u "push.sh"',
+            'python3 -W ignore push.sh', 'python3 -m push', './"push.sh"', """bash -c 'bash "push.sh"'""",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                record = self.logs()[-1]
+                self.assertEqual(record['stage'], 'judge')
+                self.assertTrue('push' in record['judge_why'] or 'inline-program' in record['judge_why'])
+        (self.wt / 'safe script.sh').write_text('printf okay\n')
+        self.assertEqual(self.ruling(tin={'command': 'bash "safe script.sh"'}), 'allow')
+
+    def test_denial_identifiers_do_not_exhaust_proof_namespace(self):
+        # A full legacy namespace cannot disable subsequent owner grants.
+        (self.root / 'denial-ids.jsonl').write_text(''.join(
+            json.dumps({'denial_id': f'd-{index:04x}'}) + '\n' for index in range(65536)))
+        denial = self.denial()
+        self.assertRegex(denial, r'^d-[0-9a-f]{16}$')
+        self.control('allow', denial_id=denial)
+        self.assertEqual(self.ruling(), 'allow')
+        self.assertEqual(self.ruling(), 'deny')
+
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
             'a=g; b=it; "$a$b" push --force origin main',
