@@ -1,9 +1,11 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -240,6 +242,7 @@ static void inherited_spawn(const char *application) {
         roundtrip(fd, AF_INET);
         int result = defaults == 3 ? posix_spawnp(&child, application, &actions, &attributes, arguments, environment) :
             posix_spawn(&child, application, &actions, &attributes, arguments, environment);
+        if (result) fprintf(stderr, "inherited spawn result=%d\n", result);
         assert(result == 0);
         close(fd);
         int status;
@@ -393,6 +396,13 @@ static void executable_boundaries(const char *application) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "queue-capabilities")) {
+        errno = 0;
+        assert(fcntl(198, F_GETFD) == -1 && errno == EBADF);
+        struct sigaction action;
+        assert(sigaction(SIGPIPE, NULL, &action) == 0 && action.sa_handler == SIG_DFL);
+        return 0;
+    }
     if (argc == 3 && !strcmp(argv[1], "cwd-child")) {
         char directory[PATH_MAX];
         assert(getcwd(directory, sizeof(directory)) && !strcmp(directory, argv[2]));
@@ -410,6 +420,25 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "raw-control")) { raw_control(1); return 0; }
     raw_control(0);
+    if (getenv("SM_TEST_CONTAINED")) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        assert(syscall(SYS_setsid) == -1 && errno == EPERM);
+        assert(syscall(SYS_setpgid, 0, 0) == -1 && errno == EPERM);
+#pragma clang diagnostic pop
+        posix_spawnattr_t attributes;
+        assert(!posix_spawnattr_init(&attributes));
+        assert(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSID));
+        char *args[] = {"true", NULL}; pid_t child;
+        assert(posix_spawn(&child, "/usr/bin/true", NULL, &attributes, args, NULL) == EPERM);
+        void *libc_image = dlopen("/usr/lib/system/libsystem_c.dylib", RTLD_NOW);
+        assert(libc_image);
+        int (*native_spawn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+            const posix_spawnattr_t *, char *const [], char *const []) = dlsym(libc_image, "posix_spawn");
+        assert(native_spawn && native_spawn(&child, "/usr/bin/true", NULL, &attributes, args, NULL) == EPERM);
+        dlclose(libc_image);
+        assert(!posix_spawnattr_destroy(&attributes));
+    }
     if (argc == 2) {
         unsigned long port = strtoul(argv[1], NULL, 10);
         assert(port && port <= UINT16_MAX);

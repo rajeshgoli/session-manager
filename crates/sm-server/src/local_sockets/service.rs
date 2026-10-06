@@ -172,6 +172,9 @@ impl AgentService {
     pub fn endpoint(&self) -> &Path {
         &self.endpoint.path
     }
+    pub fn control_port(&self) -> u16 {
+        self.state.control_port
+    }
     pub fn peer_token(&self) -> PeerToken {
         self.token
     }
@@ -512,7 +515,7 @@ mod tests {
     };
 
     struct Fixture {
-        service: AgentService,
+        service: Arc<AgentService>,
         _hub: BrokerHub,
         _directory: TestDirectory,
         root: ProcessIdentity,
@@ -595,7 +598,7 @@ mod tests {
             .unwrap()
             .push(control_reservation.try_clone().unwrap());
         Fixture {
-            service,
+            service: Arc::new(service),
             _hub: hub,
             _directory: directory,
             root,
@@ -1031,7 +1034,7 @@ mod tests {
         let scripts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall");
         let library = fixture._directory.path().join("adapter.dylib");
         let python_paths = std::process::Command::new("python3")
-            .args(["-c", "import os,sys; print(sys.executable); print(os.path.commonpath([os.path.realpath(sys.executable),os.path.realpath(sys.prefix)]))"])
+            .args(["-c", "import os,sys; print(os.path.realpath(sys._base_executable)); print(os.path.commonpath([os.path.realpath(sys._base_executable),os.path.realpath(sys.base_prefix)]))"])
             .output().unwrap();
         assert!(python_paths.status.success());
         let python_paths = String::from_utf8(python_paths.stdout).unwrap();
@@ -1145,4 +1148,6 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+
+    mod launch_tests;
 }

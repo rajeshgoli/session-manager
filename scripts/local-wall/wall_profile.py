@@ -125,6 +125,25 @@ def generate(args, listeners, minimum_tmp_length):
     if len(str(tmp) + "/") < minimum_tmp_length:
         raise ValueError("TMPDIR is shorter than the macOS per-user temporary path")
 
+    # The broker socket lives below private tmp so Unix IPC remains private,
+    # but neither the endpoint nor a containing directory may be replaced.
+    # Executable roots carry the same protection across native exec/spawn.
+    protected_writes = [physical(value) for value in args.immutable_exec_dir]
+    for path in protected_writes:
+        if not path.is_dir() or path == Path("/"):
+            raise ValueError("immutable executable root must be a narrow directory")
+        if path == checkout or below(path, checkout) or below(checkout, path):
+            raise ValueError("immutable executables must not overlap the checkout")
+        if any(path == p or below(path, p) or below(p, path) for p in mutable):
+            raise ValueError("immutable executables must not overlap mutable state")
+    if args.broker_dir:
+        broker = physical(args.broker_dir)
+        if not broker.is_dir() or not below(broker, state / "tmp"):
+            raise ValueError("broker directory must be strictly inside private state/tmp")
+        if tmp == broker or below(tmp, broker):
+            raise ValueError("application TMPDIR must not be inside the broker directory")
+        protected_writes.append(broker)
+
     agent_ports = port_range(args.agent_port_range)
     gateways = port_range(args.gateway_port_range)
     egress = port_range(args.egress_port_range)
@@ -193,7 +212,18 @@ def generate(args, listeners, minimum_tmp_length):
     writable = [checkout, *mutable, Path("/dev")]
     lines.append("(allow file-write* " + " ".join(
         f"(subpath {quoted(p)})" for p in writable) + ")")
+    if protected_writes:
+        ancestors = sorted({parent for path in protected_writes
+                            for parent in path.parents if parent != Path("/")})
+        lines.append("(deny file-write* " + " ".join(
+            [f"(subpath {quoted(p)})" for p in protected_writes]
+            + [f"(literal {quoted(p)})" for p in ancestors]) + ")")
     lines.extend(["(deny signal)", "(allow signal (target same-sandbox))"])
+    # Keep every descendant in the host's private launch group. A raw spawn
+    # syscall can set a new session internally, so it is denied too; the
+    # contained adapter implements supported spawns with fork and exec.
+    if args.contained_processes:
+        lines.append("(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))")
     # Kernel process-argument queries can expose another process's initial
     # environment without reading its credential files. Admit only runtime
     # hardware/OS facts, never process argument/environment or mutation queries.
@@ -268,6 +298,11 @@ def parser():
                         help="host-owned judge/proxy secret directory; repeat for each")
     result.add_argument("--read-only-dir", action="append", default=[],
                         help="host-approved credential-free toolchain or dedicated log directory")
+    result.add_argument("--broker-dir", help="host-owned endpoint directory inside private state/tmp")
+    result.add_argument("--contained-processes", action="store_true",
+                        help="require fork/exec adapter spawns; prevent descendants leaving the host process group")
+    result.add_argument("--immutable-exec-dir", action="append", default=[],
+                        help="host-staged executable root; protect contents and all ancestors")
     return result
 
 

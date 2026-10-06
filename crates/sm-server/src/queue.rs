@@ -5442,7 +5442,13 @@ fn spawn_queue_job_process(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     #[cfg(unix)]
     {
-        command.process_group(0);
+        #[cfg(test)]
+        let already_confined = std::env::var_os("SM_TEST_FD_PROBE").is_some();
+        #[cfg(not(test))]
+        let already_confined = false;
+        if !already_confined {
+            command.process_group(0);
+        }
         if let Some(ceiling) = process_ceiling {
             // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
             // state. Lowering a limit cannot fail for a value at or below the
@@ -10254,7 +10260,7 @@ mod tests {
         let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let lan = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         // macOS Unix socket paths have a small length limit.
-        let socket_dir = PathBuf::from(format!("/tmp/sm-1913-{}", job.id));
+        let socket_dir = std::env::temp_dir().join(format!("sm-1913-{}", &job.id[..8]));
         fs::create_dir_all(&socket_dir).unwrap();
         let authority_path = socket_dir.join("authority.sock");
         let handover_path = socket_dir.join("handover.sock");
@@ -10273,6 +10279,11 @@ mod tests {
             authority_path.display().to_string(),
             handover_path.display().to_string(),
         ];
+        // lsof enumerates the host process list even with -p. The strict-wall
+        // harness supplies a native observer restricted to self and parent.
+        let inspect = std::env::var("SM_TEST_FD_PROBE")
+            .map(|path| shell_quote(&path))
+            .unwrap_or_else(|_| "/usr/sbin/lsof -nP -a -p $$,$PPID -Fn".into());
         for has_lan in [false, true] {
             crate::handover::send_listeners(&old, &listeners[..3 + usize::from(has_lan)], has_lan)
                 .unwrap();
@@ -10285,8 +10296,7 @@ mod tests {
                     "/bin/zsh".into(),
                     "-c".into(),
                     // Inspect both the queue wrapper and its descendant command.
-                    "/usr/sbin/lsof -nP -a -p $$,$PPID -Fn; print stdout-ok; print -u2 stderr-ok"
-                        .into(),
+                    format!("{inspect} || exit 1; print stdout-ok; print -u2 stderr-ok"),
                 ]),
                 None,
                 &BTreeMap::new(),

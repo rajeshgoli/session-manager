@@ -75,6 +75,29 @@ class WallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             wall.generate(self.args, set(), len(self.tmp) + 1)
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox")
+    def test_broker_and_executable_roots_cannot_be_replaced(self):
+        broker = self.state / "tmp/broker"
+        executable_root = self.state / "xdg/config/executables"
+        broker.mkdir()
+        executable_root.mkdir()
+        endpoint = broker / "endpoint"
+        endpoint.write_text("fixture")
+        application = executable_root / "application"
+        application.write_text("fixture")
+        self.args.broker_dir = str(broker)
+        self.args.immutable_exec_dir = [str(executable_root)]
+        self.profile = self.state / "protected-wall.sb"
+        self.profile.write_text(wall.generate(self.args, set(), 65))
+        self.sandbox(f"open({str(Path(self.tmp) / 'ordinary')!r}, 'w').write('ok')",
+                     True, "ordinary tmp writes")
+        for path in (endpoint, application):
+            self.sandbox(f"import os; os.unlink({str(path)!r})", False,
+                         "protected file unlink")
+        for path in (broker, broker.parent, executable_root, executable_root.parent):
+            self.sandbox(f"import os; os.rename({str(path)!r}, {str(path) + '-moved'!r})",
+                         False, "protected ancestor rename")
+
     def test_symlink_mutable_state_rejected(self):
         data = self.state / "xdg/data"
         data.rmdir()
