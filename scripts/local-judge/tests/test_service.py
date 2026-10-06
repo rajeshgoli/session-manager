@@ -299,6 +299,38 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(self.logs()[-1]['stage'], 'judge')
                 self.assertIn('interpreted-program', self.logs()[-1]['judge_why'])
 
+    def test_git_control_metadata_cannot_be_written(self):
+        (self.wt / 'config-link').symlink_to(self.wt / '.git/config')
+        for path in ['.git', '.git/config', '.git/HEAD', '.git/hooks/pre-push', 'config-link']:
+            for tool in ['Write', 'Edit']:
+                self.assertEqual(self.ruling(tool, {'file_path': path, 'content': 'evil'}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'rule')
+        self.assertEqual(self.ruling(tin={'command': 'cp payload .git/config'}), 'deny')
+        self.assertEqual(self.ruling('Write', {'file_path': 'src/ordinary.rs', 'content': 'ok'}), 'allow')
+
+    def test_http_connections_are_bounded_before_authentication(self):
+        sockets = []
+        try:
+            for _ in range(64):
+                sock = socket.create_connection(('127.0.0.1', self.port), timeout=2)
+                sock.sendall(b'POST /decide HTTP/1.1\r\nX-Slow: ')
+                sockets.append(sock)
+            time.sleep(0.2)
+            with socket.create_connection(('127.0.0.1', self.port), timeout=2) as extra:
+                extra.settimeout(2)
+                try:
+                    self.assertEqual(extra.recv(1), b'')
+                except ConnectionResetError:
+                    pass
+            self.assertTrue(self.control('health')['ok'])
+            sockets[0].settimeout(6)
+            self.assertEqual(sockets[0].recv(1), b'')
+        finally:
+            for sock in sockets:
+                sock.close()
+        with urllib.request.urlopen(f'http://127.0.0.1:{self.port}/health', timeout=2) as response:
+            self.assertTrue(json.load(response)['ok'])
+
     def test_push_checks_current_branch_instead_of_registration(self):
         command = 'git push origin HEAD'
         self.model.answers[command] = 'allow'

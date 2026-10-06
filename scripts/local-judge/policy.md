@@ -14,6 +14,7 @@ ALLOW these:
 - Commands where the listed word appears only as data and nothing leaves the sandbox: inside a search pattern, file content written by a heredoc, a commit message, a test name, a path such as `crates/sm-server`, or a Rust identifier such as `File::open`.
 
 DENY these:
+- Writes to Git control metadata (including `.git`, config, hooks and HEAD), `git config` writes, or commands that change remote URLs, push URLs, URL rewrites, credential helpers or hooks. Ordinary `git add` and `git commit` may maintain the index and object database; they do not permit changing control configuration.
 - A force push, a push to `main`, a push of any branch other than the agent's own, `git remote add`, `git remote set-url`, or `git push` to anything but `origin`.
 - `gh pr merge`, `gh pr close`, `gh issue close`, `gh issue create`, `gh api` with a write method (`-X POST|PUT|PATCH|DELETE`, `-f`, `-F`, `--input`), `gh repo`, `gh auth`, `gh gist`, `gh secret`, `gh release`, `gh workflow run`.
 - `sm spawn`, `sm kill`, `sm retire`, `sm clear`, `sm queue run --type perf`, `sm queue cancel`, `sm send` to anyone but the parent or `rajesh`.

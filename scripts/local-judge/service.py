@@ -245,6 +245,21 @@ def protected_path(path, agent, ancestors=False):
                for credential in CREDENTIAL_PATHS)
 
 
+def git_control_path(path, agent):
+    metadata = os.path.join(agent["checkout"], ".git")
+    roots = [os.path.realpath(metadata)]
+    try:
+        if os.path.isfile(metadata):
+            with open(metadata) as f:
+                link = f.read(4096).strip()
+            if link.startswith("gitdir: "):
+                roots.append(os.path.realpath(os.path.join(agent["checkout"], link[8:])))
+    except OSError:
+        pass
+    target = resolve(path, agent).casefold()
+    return any(target == r.casefold() or target.startswith(r.casefold() + os.sep) for r in roots)
+
+
 def command_protected_paths(command, agent):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
@@ -254,7 +269,8 @@ def command_protected_paths(command, agent):
                         or re.match(r"^-[^-]*[rR]", token) for token in tokens)
         # Option values can carry a path too (e.g. --input=/path). Recursive
         # readers/copiers must also protect parents containing credentials.
-        return any(protected_path(token.split("=", 1)[-1], agent, recursive) for token in tokens)
+        return any(protected_path(token.split("=", 1)[-1], agent, recursive)
+                   or git_control_path(token.split("=", 1)[-1], agent) for token in tokens)
     except ValueError:
         return False  # script_texts sends uncertain parsing to the judge
 
@@ -315,6 +331,8 @@ def rule_stage(tool, tin, cwd, agent):
         return "allow", f"{tool} is always allowed"
     if tool in PATH_TOOLS:
         path = tin.get(PATH_TOOLS[tool]) or ""
+        if path and git_control_path(path, agent):
+            return "deny", "writes to Git control metadata are not allowed"
         if path and inside(path, agent):
             return "allow", f"{tool} inside the checkout or temp folder"
         return "deny", (f"{tool} outside your checkout and temp folder is not allowed; the sandbox "
@@ -598,6 +616,10 @@ def new_denial_id():
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        self.request.settimeout(5)
+        super().setup()
+
     def log_message(self, *a):
         pass
 
@@ -710,6 +732,30 @@ class Control(socketserver.StreamRequestHandler):
         self.wfile.write(json.dumps(reply).encode() + b"\n")
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args):
+        self.slots = threading.BoundedSemaphore(64)
+        super().__init__(*args)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class ControlServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
@@ -734,7 +780,7 @@ if __name__ == "__main__":
                 break
             except BlockingIOError:
                 pass
-    HTTP = ThreadingHTTPServer(("127.0.0.1", ARGS.port), H)
+    HTTP = BoundedHTTPServer(("127.0.0.1", ARGS.port), H)
     HTTP.daemon_threads = True
     if os.path.exists(CONTROL):
         os.unlink(CONTROL)
