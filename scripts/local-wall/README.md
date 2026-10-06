@@ -53,6 +53,18 @@ Missing tools must fail the launch or be staged into immutable own state;
 never respond by admitting a broad host tree. The old credential-path denials
 remain as extra protection, not an exhaustive credential inventory.
 
+The owner policy in #1978 admits exactly `~/.config/gh/hosts.yml` for reads.
+Other files and directory listings under `~/.config/gh` remain denied; the token
+file remains unwritable. Profile generation rejects symlink components,
+hard-linked credentials and overlaps with mutable checkout/state trees. The
+host runs `scripts/local-wall/wall_profile.sh --prepare-gh "$home_dir" "$state_dir"`
+before launch and sets `GH_CONFIG_DIR` to the returned directory. This prepares
+a private `config.yml` containing only `version: 1` and a symlink to the approved host `hosts.yml`
+under immutable `xdg/config/gh`. No host settings are copied. Do not export a
+token. The judge still checks every gh command and git push, and credential
+reads remain subject to its rules. Network requests use the assigned logged
+proxy; this file grant does not permit direct internet access.
+
 Set `CARGO_HOME` to `<state_dir>/xdg/cache/cargo`, a private mutable directory.
 Prepare any required dependency caches there outside the wall before launch;
 copy cache data without host configuration or credentials. Host Cargo binaries
@@ -93,7 +105,7 @@ all inputs before writing profile bytes; nevertheless the caller must check the
 exit status. `--home` defaults to the current user's home; tests override it with
 a fixture. Secret directories must exist before generation. Include every
 directory containing judge registrations, allow records, gateway secrets,
-proxy private keys and GitHub credentials.
+proxy private keys and other host credentials.
 The host must prepare the checkout/state without hard links to protected host
 files or immutable state. File aliases already created outside the wall retain
 their inode identity; the launch check must reject such shared inodes. Inside
@@ -142,7 +154,8 @@ paths for the lifetime of every launched wall, including across sm restarts.
 | Host Cargo home | No write; read only explicitly admitted tool directories |
 | Other agents' state, including future siblings | No read or write |
 | Own config, judge plugin, profile, launch files, server secret | Read; no write |
-| GitHub config, both standard Git credential stores, host global Git config, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
+| GitHub `hosts.yml` | Read only, under owner policy #1978 |
+| Other GitHub config, both standard Git credential stores, host global Git config, SSH/Claude/Codex/AWS credentials, keychains, sm config | No read |
 | Judge/proxy service-secret directories | No read or write |
 | Dedicated credential-free sm log directories | Read only when explicitly admitted |
 | All other host file contents, including npm tokens and browser cookies | No read |
