@@ -5660,9 +5660,18 @@ fn spawn_codex_review_request_watcher(state: Arc<AppState>, request_id: String) 
         // watcher resumes from the persisted row, as it does after a restart,
         // and ends only when the request does.
         let mut backoff = CODEX_REVIEW_WATCHER_RETRY_MIN;
-        while let Err(error) =
-            run_codex_review_request_watcher(state.clone(), request_id.clone()).await
-        {
+        loop {
+            let started = Instant::now();
+            let Err(error) =
+                run_codex_review_request_watcher(state.clone(), request_id.clone()).await
+            else {
+                break;
+            };
+            // A run that outlasted the longest backoff was healthy, so this
+            // error starts a new episode rather than extending the last one.
+            if started.elapsed() > CODEX_REVIEW_WATCHER_RETRY_MAX {
+                backoff = CODEX_REVIEW_WATCHER_RETRY_MIN;
+            }
             eprintln!(
                 "Codex review request watcher {request_id} failed, retrying in {}s: {error}",
                 backoff.as_secs()
