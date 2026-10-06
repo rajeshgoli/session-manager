@@ -60,6 +60,9 @@ The isolated test launcher supplies a separate root through
 Read access to GitHub credentials, SSH keys, netrc, keychains, AWS credentials,
 provider credentials, Session Manager configuration and judge state is denied
 before the model stage, including paths that resolve there through symlinks.
+Parsed Bash path arguments use the same protected set. Resolved executable
+basenames are inspected before a rule allowance, so renamed symlinks to egress
+binaries still reach the judge.
 
 The model endpoint comes from `local_host.base_url`. Policy and request settings
 are lifted from the #1954 proof. Decisions fail closed on model unavailability,

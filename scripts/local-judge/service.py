@@ -58,7 +58,9 @@ OBFUSCATION = re.compile(r"(?<![\w-])(eval|base64|xxd|uudecode)(?![\w-])|\\x[0-9
 # Credentials the wall leaves readable so gh works: a command that names one is always judged,
 # and the Read tool on them is denied.
 CREDENTIAL = re.compile(r"\.config/gh|hosts\.yml|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|oauth_token"
-                        r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials", re.I)
+                        r"|\.netrc|\.ssh/|Keychains|security\s+find-|\.git-credentials|\.aws/"
+                        r"|\.claude(?:/|\.json)|\.codex/|\.config/session-manager"
+                        r"|\.local/share/claude-sessions/local-judge", re.I)
 CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, path)) for path in (
     ".config/gh", ".git-credentials", ".ssh", ".netrc", "Library/Keychains",
     ".aws", ".claude", ".claude.json", ".codex", ".config/session-manager",
@@ -120,6 +122,10 @@ def script_texts(command, cwd, agent, seen=None, depth=0):
                     candidates.add(arg)
     for candidate in candidates:
         path = os.path.normpath(os.path.join(cwd or agent["checkout"], os.path.expanduser(candidate)))
+        resolved = os.path.realpath(path)
+        protected_executables = {"git", "gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript"}
+        if os.path.basename(resolved) in protected_executables:
+            out.append(("resolved-executable", "eval"))
         if inside(path, agent) and os.path.isfile(path):
             path = os.path.realpath(path)
             if path in seen:
@@ -129,7 +135,7 @@ def script_texts(command, cwd, agent, seen=None, depth=0):
             try:
                 with open(path, errors="replace") as f:
                     text = f.read(200_001)
-                if len(text) > 200_000:
+                if len(text) > 200_000 or "\x00" in text:
                     out.append((path, "eval"))
                 else:
                     out.append((path, text))
@@ -152,7 +158,7 @@ def egress_hits(text, agent):
         hits.append("dynamic shell expansion")
     if re.search(r"[*?\[]", text):
         hits.append("shell wildcard")
-    if CREDENTIAL.search(t):
+    if CREDENTIAL.search(t) or command_protected_paths(text, agent):
         hits.append("credential")
     return hits
 
@@ -167,13 +173,28 @@ def inside(path, agent):
                for r in (os.path.realpath(agent["checkout"]), os.path.realpath(agent["tmp"])))
 
 
+def protected_path(path, agent):
+    path = resolve(path, agent).casefold()
+    return any(path == credential.casefold() or path.startswith(credential.casefold() + os.sep)
+               for credential in CREDENTIAL_PATHS)
+
+
+def command_protected_paths(command, agent):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        # Option values can carry a path too (e.g. --input=/path).
+        return any(protected_path(token.split("=", 1)[-1], agent) for token in lexer)
+    except ValueError:
+        return False  # script_texts sends uncertain parsing to the judge
+
+
 def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
         path = resolve(tin.get("file_path") or tin.get("path") or "", agent)
-        if any(path.casefold() == c.casefold() or path.casefold().startswith(c.casefold() + os.sep)
-               for c in CREDENTIAL_PATHS):
-            return "deny", "reading GitHub credentials is not allowed"
+        if protected_path(path, agent):
+            return "deny", "reading protected credentials is not allowed"
         return "allow", f"{tool} is always allowed"
     if tool in PATH_TOOLS:
         path = tin.get(PATH_TOOLS[tool]) or ""
@@ -183,6 +204,8 @@ def rule_stage(tool, tin, cwd, agent):
                         f"would block the write anyway. Write only under {agent['checkout']} or {agent['tmp']}.")
     if tool == "Bash":
         cmd = tin.get("command") or ""
+        if command_protected_paths(cmd, agent):
+            return "deny", "reading protected credentials is not allowed"
         hits = egress_hits(cmd, agent)
         for path, text in script_texts(cmd, cwd, agent):
             more = egress_hits(text, agent)

