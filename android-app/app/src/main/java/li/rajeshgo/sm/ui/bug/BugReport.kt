@@ -211,6 +211,12 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    suspend fun sessionAgentTypes(): List<li.rajeshgo.sm.ui.watch.AgentTypeChoice> {
+        val (url, token) = credentials() ?: return emptyList()
+        val types = li.rajeshgo.sm.ui.watch.agentTypeChoices(repository.fetchOwnerSettings(url, token))
+        return types
+    }
+
     suspend fun sessionModels(provider: String, workingDir: String): List<String> {
         val (url, token) = credentials() ?: return emptyList()
         return repository.fetchSessionModels(url, token, provider, workingDir)

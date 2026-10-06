@@ -281,6 +281,7 @@ private fun BugReportSheet(viewModel: BugReportViewModel) {
         source = null,
         sessions = emptyList(),
         loadModels = viewModel::sessionModels,
+        loadAgentTypes = viewModel::sessionAgentTypes,
         busy = sheet.busy,
         error = sheet.error,
         onDismiss = viewModel::close,

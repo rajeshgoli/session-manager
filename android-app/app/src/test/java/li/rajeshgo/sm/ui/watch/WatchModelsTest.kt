@@ -9,6 +9,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WatchModelsTest {
+    @Test fun configuredAgentTypesMatchAllThreeLaunchFieldsExactly() {
+        val settings = kotlinx.serialization.json.Json.parseToJsonElement("""{"new_agent":{"agent_types":[
+            {"name":"Fast","provider":"codex-fork","model":"gpt-6-sol","effort":"medium"},
+            {"name":"Deep","provider":"claude","model":"fable","effort":"max"},
+            {"name":"Defaults","provider":"claude","model":null,"effort":null}]}}""") as kotlinx.serialization.json.JsonObject
+        val types = agentTypeChoices(settings)
+        assertEquals(listOf("Fast", "Deep", "Defaults"), types.map { it.name })
+        assertEquals("Fast", matchAgentType(types, "codex-fork", "gpt-6-sol", "medium")?.name)
+        assertEquals(null, matchAgentType(types, "codex", "gpt-6-sol", "medium"))
+        assertEquals(null, matchAgentType(types, "codex-fork", "gpt-6-astra", "medium"))
+        assertEquals(null, matchAgentType(types, "codex-fork", "gpt-6-sol", "high"))
+        assertEquals("Defaults", matchAgentType(types, "claude", null, null)?.name)
+        assertTrue(agentTypeChoices(kotlinx.serialization.json.JsonObject(emptyMap())).isEmpty())
+    }
+
     @Test fun releasedTicketRemainsVisibleButCurrentClaimWins() {
         val previous = li.rajeshgo.sm.data.model.SessionClaim(kind = "ticket", number = 1928, title = "App fixes", state = "closed")
         val finished = session(status = "idle", activityState = "idle").copy(lastTicket = previous)

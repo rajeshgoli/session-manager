@@ -73,6 +73,17 @@ fun inboxSections(filter: InboxFilter, rows: List<InboxRow>): List<Pair<String?,
         }
 }
 
+fun shownInboxRows(filter: InboxFilter, rows: List<InboxRow>, foldedOpen: Boolean): List<InboxRow> =
+    inboxSections(filter, rows).flatMap { (heading, section) ->
+        if (heading?.startsWith("FOLDED") == true && !foldedOpen) emptyList() else section
+    }
+
+fun nextInboxRow(rows: List<InboxRow>, key: String?): InboxRow? {
+    val index = rows.indexOfFirst { it.threadKey == key }
+    if (index < 0) return null
+    return rows.getOrNull(index + 1) ?: rows.getOrNull(index - 1)
+}
+
 class InboxViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private val repository = SessionManagerRepository(settingsRepository)

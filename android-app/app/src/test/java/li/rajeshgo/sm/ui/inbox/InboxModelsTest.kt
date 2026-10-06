@@ -9,6 +9,30 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InboxModelsTest {
+    @Test fun doneAndArchiveChooseAdjacentVisibleRowsAcrossSections() {
+        val rows = listOf(
+            InboxRow(threadKey = "folded", group = "folded"),
+            InboxRow(threadKey = "earlier", group = "earlier"),
+            InboxRow(threadKey = "new", group = "new"),
+            InboxRow(threadKey = "needs", group = "needs_you"),
+            InboxRow(threadKey = "finished", group = "finished"),
+        )
+        val shown = shownInboxRows(InboxFilter.Open, rows, false)
+        assertEquals(listOf("needs", "finished", "new", "earlier"), shown.map { it.threadKey })
+        assertEquals("finished", nextInboxRow(shown, "needs")?.threadKey)
+        assertEquals("new", nextInboxRow(shown, "finished")?.threadKey)
+        assertEquals("new", nextInboxRow(shown, "earlier")?.threadKey)
+        assertNull(nextInboxRow(shown, "folded"))
+        assertNull(nextInboxRow(shown, "missing"))
+        assertNull(nextInboxRow(shown.take(1), "needs"))
+        assertNull(nextInboxRow(emptyList(), "needs"))
+        val expanded = shownInboxRows(InboxFilter.Open, rows, true)
+        assertEquals("folded", nextInboxRow(expanded, "earlier")?.threadKey)
+        assertEquals("earlier", nextInboxRow(expanded, "folded")?.threadKey)
+        assertEquals(rows, shownInboxRows(InboxFilter.Docs, rows, false))
+        assertEquals(rows, shownInboxRows(InboxFilter.Done, rows, false))
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     @Test fun parsesTheServerRow() {

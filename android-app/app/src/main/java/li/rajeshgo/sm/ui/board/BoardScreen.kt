@@ -557,6 +557,7 @@ fun BoardScreen(
                 source = null,
                 sessions = emptyList(),
                 loadModels = viewModel::sessionModels,
+                loadAgentTypes = viewModel::sessionAgentTypes,
                 busy = start.busy,
                 error = start.error,
                 onDismiss = viewModel::closeStart,
@@ -570,7 +571,6 @@ fun BoardScreen(
                     effort = selectedAgentType?.effort ?: start.ticket.autoStart?.effort ?: defaults?.reasoningEffort ?: "high",
                     whenReady = start.whenReady,
                     agentTypes = state.agentTypes,
-                    selectedType = selectedAgentType?.name,
                 ),
                 extra = { enabled ->
                     StartReviewerRow(

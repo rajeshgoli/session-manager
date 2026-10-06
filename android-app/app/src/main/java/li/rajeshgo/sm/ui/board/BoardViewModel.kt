@@ -323,15 +323,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(start = BoardStartState(ticket, startBlocked = startBlocked, whenReady = whenReady)) }
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch
-            if (whenReady) runCatching { repository.fetchOwnerSettings(url, token) }.onSuccess { settings ->
-                val types = settings["new_agent"]?.jsonObject?.get("agent_types")?.jsonArray.orEmpty().mapNotNull { entry ->
-                    val item = entry.jsonObject
-                    val name = item["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                    AgentTypeChoice(name, item["provider"]?.jsonPrimitive?.content ?: "claude",
-                        item["model"]?.jsonPrimitive?.content ?: "", item["effort"]?.jsonPrimitive?.content ?: "high")
-                }
-                _uiState.update { it.copy(agentTypes = types) }
-            }
+            if (whenReady) runCatching { sessionAgentTypes() }
             runCatching { repository.fetchBoardStartOptions(url, token, ticket.repo, ticket.number, startBlocked) }
                 .onSuccess { options -> updateStart(ticket) { it.copy(options = options) } }
                 .onFailure { error ->
@@ -349,6 +341,13 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
             val start = state.start?.takeIf { it.ticket.repo == ticket.repo && it.ticket.number == ticket.number }
             if (start == null) state else state.copy(start = change(start))
         }
+    }
+
+    suspend fun sessionAgentTypes(): List<li.rajeshgo.sm.ui.watch.AgentTypeChoice> {
+        val (url, token) = credentials() ?: return emptyList()
+        val types = li.rajeshgo.sm.ui.watch.agentTypeChoices(repository.fetchOwnerSettings(url, token))
+        _uiState.update { it.copy(agentTypes = types) }
+        return types
     }
 
     suspend fun sessionModels(provider: String, workingDir: String): List<String> {

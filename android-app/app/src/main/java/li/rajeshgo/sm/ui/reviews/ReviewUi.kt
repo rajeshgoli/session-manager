@@ -161,6 +161,14 @@ private fun Dropdown(label: String, value: String, options: List<String>, enable
  */
 @Composable
 fun StartReviewerRow(laneDefault: li.rajeshgo.sm.data.model.StartReviewPolicy?, value: Reviewer?, onChange: (Reviewer?) -> Unit, enabled: Boolean) {
+    var expanded by remember { mutableStateOf(false) }
+    if (!expanded) {
+        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text("Reviewer · ${value?.let(::reviewerLabel) ?: laneDefault?.resolved?.let(::reviewerLabel) ?: "Default policy"}", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            TextButton(onClick = { expanded = true }, enabled = enabled) { Text("Change") }
+        }
+        return
+    }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Reviewer for this ticket", style = MaterialTheme.typography.titleSmall)
         SegmentedChoice(listOf("inherit" to "Lane default", "own" to "This ticket"), if (value == null) "inherit" else "own", enabled) {
