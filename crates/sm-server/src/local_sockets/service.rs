@@ -310,18 +310,17 @@ fn serve(
 ) -> io::Result<()> {
     let initial = request(&mut stream, &state, &capability, false)?;
     let lease = match initial {
-        Request::Bind {
-            ip,
-            port,
-            reuse_address,
-        } => match state.pool.bind(ip, port, reuse_address) {
+        Request::Bind { ip, port, .. } | Request::Retain { ip, port } => match match initial {
+            Request::Bind { reuse_address, .. } => state.pool.bind(ip, port, reuse_address),
+            _ => state.pool.retain(ip, port),
+        } {
             Ok(lease) => {
                 send(
                     &stream,
                     &state,
                     &capability,
                     Reply {
-                        operation: Operation::Bind,
+                        operation: operation(initial),
                         errno: 0,
                         ip: Some(ip),
                         port: lease.port(),
@@ -333,7 +332,7 @@ fn serve(
                 lease
             }
             Err(error) => {
-                send_error(&stream, &state, &capability, Operation::Bind, error)?;
+                send_error(&stream, &state, &capability, operation(initial), error)?;
                 return Ok(());
             }
         },
@@ -436,6 +435,7 @@ fn operation(request: Request) -> Operation {
         Request::Listen { .. } => Operation::Listen,
         Request::Connect { .. } => Operation::Connect,
         Request::Release { .. } => Operation::Release,
+        Request::Retain { .. } => Operation::Retain,
     }
 }
 
@@ -853,5 +853,234 @@ mod tests {
                 &directory.path().join("other")
             )
             .is_err());
+    }
+
+    #[test]
+    fn native_wire_client_uses_real_service_and_checks_kernel_identity() {
+        let fixture = fixture();
+        let native =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall/native");
+        let executable = fixture._directory.path().join("client");
+        let compiled = std::process::Command::new("clang")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(native.join("wire_client.c"))
+            .arg(native.join("test_wire_client.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = std::process::Command::new(executable)
+            .arg(fixture.service.endpoint())
+            .args(fixture.service.peer_token().0.map(|word| word.to_string()))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn native_adapter_preserves_ordinary_socket_calls_under_tcp_denial() {
+        let fixture = fixture();
+        run_adapter_fixture(&fixture, None);
+    }
+
+    #[test]
+    fn native_wire_rejects_malformed_descriptors_without_leaks() {
+        let fixture = fixture();
+        let path = fixture._directory.path().join("malformed");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let wildcard = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        let invalid = fs::File::open("/dev/null").unwrap();
+        let native =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall/native");
+        let executable = fixture._directory.path().join("client");
+        let compiled = std::process::Command::new("clang")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(native.join("wire_client.c"))
+            .arg(native.join("test_wire_client.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let worker = thread::spawn(move || {
+            for case in 0..5 {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(peer) => break peer,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("malformed fixture peer did not arrive: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; REQUEST_SIZE];
+                stream.read_exact(&mut request).unwrap();
+                assert!(matches!(
+                    Request::decode(&request).unwrap(),
+                    Request::Bind { .. }
+                ));
+                let success = Reply {
+                    operation: Operation::Bind,
+                    errno: 0,
+                    ip: Some(IpVersion::V4),
+                    port,
+                    lease: 1,
+                    descriptors: 1,
+                }
+                .encode()
+                .unwrap();
+                let failed = Reply::error(Operation::Bind, libc::EACCES)
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+                let frame = match case {
+                    2 => &failed[..],
+                    3 => &success[..8],
+                    _ => &success[..],
+                };
+                let fds = match case {
+                    1 => vec![wildcard.as_raw_fd()],
+                    4 => vec![invalid.as_raw_fd(); 64],
+                    _ => vec![invalid.as_raw_fd()],
+                };
+                sendmsg::<()>(
+                    stream.as_raw_fd(),
+                    &[IoSlice::new(frame)],
+                    &[ControlMessage::ScmRights(&fds)],
+                    MsgFlags::empty(),
+                    None,
+                )
+                .unwrap();
+            }
+        });
+        let result = std::process::Command::new(executable)
+            .arg(path)
+            .args(fixture.service.peer_token().0.map(|word| word.to_string()))
+            .arg("malformed")
+            .output()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(
+            result.status.success(),
+            "status: {}\nstdout: {}\nstderr: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn native_adapter_uses_host_control_capability_without_test_client_access() {
+        let fixture = fixture();
+        let control = fixture.service.control_listener(IpVersion::V4).unwrap();
+        run_adapter_fixture(&fixture, Some(control.as_raw_fd()));
+    }
+
+    fn run_adapter_fixture(fixture: &Fixture, control: Option<i32>) {
+        use std::os::unix::process::CommandExt;
+        let scripts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall");
+        let library = fixture._directory.path().join("adapter.dylib");
+        let mut builder = std::process::Command::new("python3");
+        builder
+            .arg(scripts.join("build_adapter.py"))
+            .arg("--endpoint")
+            .arg(fixture.service.endpoint())
+            .arg("--peer-token")
+            .args(fixture.service.peer_token().0.map(|word| word.to_string()))
+            .args(["--direct-ports", "22000", "23000", "24000", "24001"])
+            .arg("--output")
+            .arg(&library);
+        if let Some(fd) = control {
+            builder
+                .arg("--control-port")
+                .arg(fixture.control_port.to_string())
+                .arg("--control-fd")
+                .arg(fd.to_string());
+        }
+        let compiled = builder.output().unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let executable = fixture._directory.path().join("application");
+        let compiled = std::process::Command::new("clang")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(scripts.join("native/test_adapter.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let profile = "(version 1)(allow default)(deny network-inbound (local ip \"*:*\"))(deny network-outbound (remote ip \"*:*\"))";
+        let control_result = std::process::Command::new(&executable)
+            .arg("raw-control")
+            .env_remove("DYLD_INSERT_LIBRARIES")
+            .output()
+            .unwrap();
+        assert!(
+            control_result.status.success(),
+            "raw control status: {}\nstderr: {}",
+            control_result.status,
+            String::from_utf8_lossy(&control_result.stderr)
+        );
+        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+        command
+            .args(["-p", profile, "/usr/bin/env"])
+            .arg(format!("DYLD_INSERT_LIBRARIES={}", library.display()))
+            .args([
+                "SM_BROKER_ENDPOINT=/tmp/forged",
+                "SM_LOOPBACK_LISTENER_FD=0",
+            ])
+            .arg(executable);
+        if let Some(fd) = control {
+            command.arg(fixture.control_port.to_string());
+            // SAFETY: the child callback calls only async-signal-safe fcntl.
+            // The live parent's copy retains its original close-on-exec flag.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "status: {}\nstdout: {}\nstderr: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

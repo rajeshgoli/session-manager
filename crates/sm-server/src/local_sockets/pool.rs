@@ -33,7 +33,7 @@ pub struct PortPolicy {
 
 impl PortPolicy {
     pub fn new(configuration: PortConfiguration) -> io::Result<Self> {
-        let mut reserved = BTreeSet::from([1234, 1235, 1236, 8000, 8420, 8443]);
+        let mut reserved = BTreeSet::from([8420, 8443]);
         for range in [
             &configuration.agent_control,
             &configuration.gateway,
@@ -43,7 +43,7 @@ impl PortPolicy {
                 return Err(error(libc::EINVAL));
             }
             for port in range.clone() {
-                if !reserved.insert(port) {
+                if [1234, 1235, 1236, 8000].contains(&port) || !reserved.insert(port) {
                     return Err(error(libc::EINVAL));
                 }
             }
@@ -53,6 +53,9 @@ impl PortPolicy {
                 return Err(error(libc::EINVAL));
             }
         }
+        // Model/judge services may use their established ports (8000 and
+        // 1234-1236); these stay forbidden to test allocations either way.
+        reserved.extend([1234, 1235, 1236, 8000]);
         Ok(Self {
             agent_control: configuration.agent_control,
             reserved,
@@ -144,6 +147,20 @@ impl SocketPool {
     }
 
     pub fn connect(&self, ip: IpVersion, port: u16) -> io::Result<TcpStream> {
+        let lease = self.retain(ip, port)?;
+        if !lease.listening.load(Ordering::Acquire) {
+            return Err(error(libc::ECONNREFUSED));
+        }
+        // Keep the actual listener alive throughout connect. A client cannot
+        // release/rebind the port and redirect this request to a new service.
+        let connection = TcpStream::connect_timeout(&address(ip, port), Duration::from_secs(1));
+        drop(lease);
+        connection
+    }
+
+    /// Acquire an existing allocation for a forked or restored descriptor.
+    /// This never binds a new socket and never reaches a provider control.
+    pub fn retain(&self, ip: IpVersion, port: u16) -> io::Result<Arc<SocketLease>> {
         if !self.policy.permits_test(port) {
             return Err(error(libc::EACCES));
         }
@@ -155,14 +172,7 @@ impl SocketPool {
             .get(&(ip, port))
             .and_then(Weak::upgrade)
             .ok_or_else(|| error(libc::EACCES))?;
-        if !lease.listening.load(Ordering::Acquire) {
-            return Err(error(libc::ECONNREFUSED));
-        }
-        // Keep the actual listener alive throughout connect. A client cannot
-        // release/rebind the port and redirect this request to a new service.
-        let connection = TcpStream::connect_timeout(&address(ip, port), Duration::from_secs(1));
-        drop(lease);
-        connection
+        Ok(lease)
     }
 
     /// Host-only control listener; never inserted in the test allocation map.
@@ -401,7 +411,35 @@ mod tests {
     }
 
     #[test]
+    fn retaining_existing_listener_preserves_lifetime_without_allocating_ports() {
+        let pool = pool();
+        let foreign = SocketPool::new(pool.policy.clone());
+        let initial = pool.bind(IpVersion::V4, 0, false).unwrap();
+        let port = initial.port();
+        let id = initial.id();
+        assert!(foreign.retain(IpVersion::V4, port).is_err());
+        let retained = pool.retain(IpVersion::V4, port).unwrap();
+        assert_eq!(retained.id(), id);
+        drop(initial);
+        assert!(pool.bind(IpVersion::V4, port, false).is_err());
+        retained.listen(8).unwrap();
+        assert!(pool.connect(IpVersion::V4, port).is_ok());
+        drop(retained);
+        assert!(pool.retain(IpVersion::V4, port).is_err());
+        assert!(pool.retain(IpVersion::V4, 8420).is_err());
+    }
+
+    #[test]
     fn port_policy_rejects_overlaps_and_invalid_ranges() {
+        let mut default_model = configuration();
+        default_model.model = 8000;
+        default_model.judge = 8441;
+        let default_policy = PortPolicy::new(default_model).unwrap();
+        assert!(!default_policy.permits_test(8000));
+        assert!(!default_policy.permits_test(8441));
+        let mut lm_studio = configuration();
+        lm_studio.model = 1234;
+        assert!(PortPolicy::new(lm_studio).is_ok());
         let mut config = configuration();
         config.egress = 22010..=23000;
         assert!(PortPolicy::new(config).is_err());

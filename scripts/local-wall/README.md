@@ -111,11 +111,14 @@ plus sm and LM Studio's fixed ports; admitted services override the fixed
 8000/1234–1236 denials. `lsof` errors, diagnostics or malformed socket records
 fail the generation. The wall denies every new IP listener, including loopback
 and wildcard binds. macOS cannot express an inbound rule restricted to loopback:
-its `localhost` filter also accepts wildcard binds. The trusted host must create,
-bind to exactly `127.0.0.1` or `::1`, and listen on each socket before passing it
-into the wall. The agent may accept and reply on those prebound descriptors.
+its `localhost` filter also accepts wildcard binds. The trusted host creates
+and binds each socket to exactly `127.0.0.1` or `::1`. The socket service activates
+test listening outside the wall when the adapter requests it; provider control
+listeners are already listening before launch. The agent may accept and reply
+on those prebound descriptors.
 Ordinary bind/listen APIs need an immutable host-supplied adapter backed by the
-trusted listener broker; creating that broker is a separate #1974 prerequisite.
+trusted socket service in `sm_server::local_sockets`; launch composition remains
+a separate #1974 prerequisite.
 Test-client connections to broker-allocated test listeners likewise use trusted
 connected descriptors. The broker may connect only to that agent's registered
 test listeners; it must refuse provider control ports, privileged service ports,
@@ -160,6 +163,62 @@ The profile is a process-wide operating-system restriction. It does not decide
 which GitHub action or sm route is permitted. The judge and gateway implement
 those policies. Launch with a cleared environment: tokens or inherited open
 connections cannot be removed by denying reads of their source files.
+
+The native adapter is a shared library that replaces selected socket calls.
+`build_adapter.py` compiles one signed library with the host's immutable Unix
+endpoint, full kernel peer token, four admitted direct service ports, and optional
+provider-control descriptor/port. It reads no environment value to choose an
+endpoint, agent identity or control descriptor. Use `AgentService::peer_token()`
+and `AgentService::endpoint()` from the trusted service when building it. Set
+`peer0` through `peer7` to the eight unsigned words returned by `peer_token()`:
+
+```sh
+python3 scripts/local-wall/build_adapter.py \
+  --endpoint "$broker_endpoint" \
+  --peer-token "$peer0" "$peer1" "$peer2" "$peer3" "$peer4" "$peer5" "$peer6" "$peer7" \
+  --direct-ports "$gateway_port" "$egress_port" "$model_port" "$judge_port" \
+  --control-port "$agent_port" --control-fd "$inherited_control_fd" \
+  --output "$state_dir/xdg/config/socket-adapter.dylib"
+```
+
+Omit both control arguments for a process without a provider control capability.
+The host stages this library in agent-readable, agent-write-denied state and
+loads it with `DYLD_INSERT_LIBRARIES` in a cleared launch environment. The host
+must also make the broker endpoint directory and its short alias agent-write-denied
+while keeping the endpoint inside the permitted private Unix socket subtree.
+The generator's general tmp write grant does not itself exclude a nested broker
+directory; #1986 supplies that launch composition. Mode 0500 on the library and
+0700 on the endpoint directory do not replace sandbox write denials, because
+the host and agent use the same operating-system user.
+
+The adapter validates received descriptor type and exact address before replacing
+the application's descriptor. Bind and listen remain separate operations. Dup,
+dup2 and fcntl duplication retain the lease; close releases that descriptor's
+copy. Forked processes obtain independent authenticated control connections via
+the service's retain operation, which only references an existing same-agent
+listener and never allocates another port. Nonblocking and close-on-exec flags
+survive replacement. TCP service connections go directly only to the four
+compiled service ports; own test connections use the trusted service. Unix
+socket calls retain their ordinary behavior under the wall's own restrictions.
+The service limits each agent to 16 live test listeners and 32 control connections;
+the adapter tracks up to 1024 application descriptor copies.
+
+#1998 completes exec and posix_spawn inheritance. Until it lands, the adapter
+returns EACCES on exec with an adapted descriptor that would survive exec, and
+conservatively refuses spawn file actions while adapted descriptors exist.
+It permits spawn without file actions when every adapted descriptor is
+close-on-exec. This library is not yet integrated into provider launch: #1986
+depends on #1998 and proves full Rust/Python/Bun and pinned opencode compatibility
+with the production profile. When a protected executable strips the loader
+variable, direct TCP bind/connect remain constrained by the operating-system
+wall; the caller must never widen that wall to restore adaptation.
+
+The macOS Rust tests under `local_sockets` compile native fixtures with warnings
+as errors and exercise the real service, forged peer identity, malformed replies
+and descriptor cleanup, provider-control refusal, ordinary IPv4/IPv6 socket calls,
+duplication, fork, concurrency, flags, and conservative exec/spawn refusal.
+The socket fixture also proves raw bind succeeds outside its sandbox and fails
+inside it. Full launch/restore and production-profile validation remain #1986.
 
 Run fixture validation through the durable queue:
 
