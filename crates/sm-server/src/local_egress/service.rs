@@ -351,7 +351,19 @@ async fn start_listener(record: &Registration, proxy: Proxy) -> io::Result<Liste
                 _ = stopped.changed() => break,
                 Some(_) = workers.join_next(), if !workers.is_empty() => {},
                 result = listener.accept() => {
-                    let Ok((stream, _)) = result else { break; };
+                    let (stream, _) = match result {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            eprintln!("local egress accept failed for {agent}: {error}");
+                            // Descriptor/resource pressure and transient accept
+                            // failures must not strand a saved registration.
+                            tokio::select! {
+                                _ = stopped.changed() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                            }
+                            continue;
+                        }
+                    };
                     let proxy = proxy.clone(); let agent = agent.clone();
                     let stopped = stopped.clone();
                     workers.spawn(async move { proxy.serve(stream, agent, stopped).await; });

@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
     if let Some(directory) = args.local_egress_service {
+        raise_open_file_soft_limit();
         return sm_server::local_egress::run_service(&directory)
             .await
             .map_err(Into::into);

@@ -1,5 +1,6 @@
 //! Host-owned HTTPS CONNECT proxy. The listener port, never client input,
 //! identifies the agent. Call `ServiceClient` before constructing a wall.
+mod log;
 mod networks;
 mod service;
 pub use service::{run_service, ServiceClient};
@@ -185,20 +186,14 @@ impl Resolver for SystemResolver {
 
 #[derive(Clone)]
 struct Proxy {
-    log: Arc<Mutex<std::fs::File>>,
+    log: Arc<Mutex<log::ConnectionLogger>>,
     resolver: Arc<dyn Resolver>,
     capacity: Arc<tokio::sync::Semaphore>,
     networks: Arc<dyn networks::Networks>,
 }
 impl Proxy {
     fn new(directory: &Path) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join("connections.jsonl"))?;
+        let log = log::ConnectionLogger::open(directory)?;
         Ok(Self {
             log: Arc::new(Mutex::new(log)),
             resolver: Arc::new(SystemResolver),
@@ -207,13 +202,10 @@ impl Proxy {
         })
     }
     fn log(&self, record: &ConnectionLog) -> io::Result<()> {
-        use std::io::Write;
-        let mut line = serde_json::to_vec(record)?;
-        line.push(b'\n');
         self.log
             .lock()
             .map_err(|_| io::Error::other("log lock poisoned"))?
-            .write_all(&line)
+            .write(record)
     }
     async fn serve(
         &self,

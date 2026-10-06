@@ -72,6 +72,14 @@ errors and prohibited destinations return 403. Header and DNS/connect operations
 have 15-second deadlines; tunnels have a shared five-minute idle deadline reset by traffic in either direction.
 A shared limit admits at most 256 simultaneous proxy workers.
 
+`connections.jsonl` rotates before exceeding 8 MiB and retains four numbered
+archives (`connections.jsonl.1` newest through `.4` oldest), bounding total
+retention to 40 MiB plus at most one bounded record per file. Older records are
+removed by rotation. Each file contains complete JSON lines; startup resumes
+the current file and its saved size. The service raises its descriptor limit to
+8192 where the hard limit permits, and retries transient accept errors with a
+100 ms delay rather than losing an agent listener.
+
 `connections.jsonl` contains one JSON object per completed connection: `time`
 (UTC RFC3339), `agent_id`, `host`, `resolved_address`, `port`, `bytes_to_host`,
 `bytes_to_agent`, `duration_ms`, and `outcome`. Refused requests have null fields
@@ -91,7 +99,7 @@ request validation, public-address classification, a fixture resolver returning
 mixed public/private answers, refusal logging without request contents, byte
 counts and half-close, registration restore, suspension, safe release and
 stable environment values, global LAN prefixes, interface lookup failure, and
-one-way traffic keeping the tunnel alive.
+one-way traffic keeping the tunnel alive, and bounded log retention after restart.
 
 On macOS, explicitly run the live acceptance script after building `sm-server`:
 
