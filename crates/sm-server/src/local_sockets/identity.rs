@@ -26,12 +26,13 @@ impl ProcessIdentity {
     }
 
     pub(crate) fn is_live(self) -> bool {
-        Self::capture(self.pid).is_ok_and(|current| current == self)
+        snapshot(self.pid).is_ok_and(|current| current.identity == self && !current.exited)
     }
 }
 
 pub(crate) struct ProcessSnapshot {
     pub identity: ProcessIdentity,
+    pub exited: bool,
     pub parent_pid: u32,
     pub parent_unique_id: u64,
 }
@@ -82,6 +83,7 @@ pub(crate) fn snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
         return Err(denied());
     }
     Ok(ProcessSnapshot {
+        exited: info.bsd.pbi_status == 5, // Darwin SZOMB: exited but not reaped.
         identity: ProcessIdentity {
             pid,
             unique_id: info.unique.unique_id,

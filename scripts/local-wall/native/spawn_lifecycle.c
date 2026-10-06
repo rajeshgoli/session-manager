@@ -1,4 +1,5 @@
 #include "spawn_directory.c"
+#include "spawn_contained.c"
 struct future_descriptor { int fd, source, keep; };
 #define FUTURE_LIMIT (TRACKED_LIMIT + ACTION_LIMIT + 1)
 static struct future_descriptor *future_find(struct future_descriptor *future, int fd) {
@@ -44,6 +45,7 @@ static int spawn_process(pid_t *pid, const char *path,
     short spawn_flags = 0;
     if (attributes && (result = posix_spawnattr_getflags(attributes, &spawn_flags))) goto done;
     struct action_list *list = action_list(actions);
+    if (wall_contained_spawns && actions && !list) { result = EACCES; goto done; }
     int tracked = 0, minimum = 3;
     for (unsigned i = 0; i < TRACKED_LIMIT; ++i) {
         if (entries[i].fd < 0) continue;
@@ -146,7 +148,9 @@ static int spawn_process(pid_t *pid, const char *path,
     prepared = exec_environment(environment, insert, notification[1]);
     if (!prepared) { result = errno; goto done; }
     pid_t child;
-    result = posix_spawn(&child, resolved, actions && !list ? actions : &clone, attributes, argv, prepared);
+    result = wall_contained_spawns ? contained_spawn(&child, resolved, list, attributes, spawn_flags,
+        argv, prepared, holds, hold_count, notification[1], minimum) :
+        posix_spawn(&child, resolved, actions && !list ? actions : &clone, attributes, argv, prepared);
     if (!result && insert && !replaces_current) {
         close(notification[1]); notification[1] = -1;
         struct pollfd item = { .fd = notification[0], .events = POLLIN };

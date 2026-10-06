@@ -1,5 +1,6 @@
 //! Host-owned HTTPS CONNECT proxy. The listener port, never client input,
 //! identifies the agent. Call `ServiceClient` before constructing a wall.
+pub mod gateway;
 mod log;
 mod networks;
 mod service;
@@ -29,6 +30,8 @@ pub struct Registration {
     pub agent_id: String,
     pub port: u16,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<gateway::GatewayRegistration>,
 }
 impl Registration {
     /// Apply to a cleared launch environment. No token is present. Empty first
@@ -36,6 +39,12 @@ impl Registration {
     pub fn environment(&self) -> BTreeMap<String, String> {
         let proxy = format!("http://127.0.0.1:{}", self.port);
         let mut env = BTreeMap::new();
+        if let Some(gateway) = &self.gateway {
+            env.insert(
+                "SM_API_URL".into(),
+                format!("http://127.0.0.1:{}", gateway.port),
+            );
+        }
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
             env.insert(key.into(), proxy.clone());
         }

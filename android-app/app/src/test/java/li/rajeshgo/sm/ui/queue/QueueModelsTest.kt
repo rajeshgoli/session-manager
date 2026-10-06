@@ -203,6 +203,11 @@ class QueueModelsTest {
             ),
             usageSummaryLines(summary),
         )
+        assertEquals(
+            "Recorded 3.5 h of the last 24.0 h.",
+            usageSummaryLines(summary.copy(coveredSeconds = 12_437), 86_400).first(),
+        )
+        assertEquals(3, usageSummaryLines(summary.copy(coveredSeconds = 86_000), 86_400).size)
         val tooltip = bucketTooltip(UtilizationBucket(start = "2026-09-28T11:00:00Z", samples = 0), 300, ZoneOffset.UTC)
         assertEquals(listOf("Sep 28 11:00 – 11:05", "No samples (server down)"), tooltip)
     }

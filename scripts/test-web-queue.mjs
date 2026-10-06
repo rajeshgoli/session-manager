@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath } from '../crates/sm-server/src/web/queue-model.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote } from '../crates/sm-server/src/web/queue-model.js';
 
 test('quiet red starts at server quiet_since; earlier run stays green', () => {
   const now = Date.parse('2026-09-29T12:00:00Z');
@@ -41,4 +41,10 @@ test('Ask agent targets the notification recipient and uses a polling side quest
     busyCalls.push(args); throw Object.assign(new Error('already answering request somebody-else'), { status: 409 });
   }, 'Rajesh', job, 'How long?'), /Responsible agent is answering another question/);
   assert.equal(busyCalls.length, 1, 'must not attach to or poll the conflicting question');
+});
+test('usage caption names recorded time when samples cover under 95% of the range', () => {
+  assert.equal(coverageNote({ hours: 24, summary: { covered_seconds: 12437 } }), 'Recorded 3h 27m of the last 24h');
+  assert.equal(coverageNote({ hours: 168, summary: { covered_seconds: 0 } }), 'Recorded 0m of the last 7d');
+  assert.equal(coverageNote({ hours: 1, summary: { covered_seconds: 3420 } }), '');
+  assert.equal(coverageNote(null), '');
 });

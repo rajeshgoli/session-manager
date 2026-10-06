@@ -214,6 +214,10 @@ pub fn terminal_lan_router(state: Arc<AppState>) -> Router {
             get(browser_terminal::probe).options(browser_terminal::probe_options),
         )
         .layer(axum::Extension(DirectTerminalLan))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            local_agent::authenticate,
+        ))
         .with_state(state)
 }
 
@@ -365,6 +369,7 @@ mod guestbook_page;
 mod handoff;
 mod history;
 mod inbox;
+mod local_agent;
 mod local_model;
 mod merge_holds;
 mod messages;
@@ -657,6 +662,7 @@ fn btw_worker_blocks_handover_across_rollback_generations() {
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
+    local_agent_verifier: crate::local_egress::gateway::StampVerifier,
     shutdown: crate::handover::Shutdown,
     btw_workers: BtwWorkers,
     listen_port: u16,
@@ -835,7 +841,13 @@ impl AppState {
         let terminal_limits = Arc::new(std::sync::RwLock::new(
             crate::owner_settings::terminal_limits(&config, &settings),
         ));
+        let gateway_directory = test_isolation_root_from_environment()?
+            .map(|root| root.join("local-egress"))
+            .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
         Ok(Self {
+            local_agent_verifier: crate::local_egress::gateway::StampVerifier::new(
+                gateway_directory,
+            ),
             config,
             shutdown: crate::handover::Shutdown::default(),
             btw_workers: BtwWorkers::default(),
@@ -893,6 +905,13 @@ impl AppState {
 
     pub fn shutdown(&self) -> crate::handover::Shutdown {
         self.shutdown.clone()
+    }
+
+    /// Host composition and isolated servers must use the same private service
+    /// directory as their local-egress ServiceClient. Never expose this as HTTP input.
+    pub fn with_local_agent_gateway_directory(mut self, directory: PathBuf) -> Self {
+        self.local_agent_verifier = crate::local_egress::gateway::StampVerifier::new(directory);
+        self
     }
 
     pub fn with_listen_port(mut self, port: u16) -> Self {
@@ -2248,6 +2267,10 @@ pub fn router(state: AppState) -> Router {
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         mark_in_app,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        local_agent::authenticate,
     ))
     .with_state(state)
 }
@@ -4223,6 +4246,10 @@ fn reconcile_reparent_notifications_best_effort(state: &AppState) {
 }
 
 fn reparent_session_credential(headers: &HeaderMap) -> Result<String, ApiError> {
+    if crate::local_identity::current().is_some() {
+        // The store checks the scoped verified identity, never this placeholder.
+        return Ok("verified-local-gateway".into());
+    }
     let credential = header_text(headers, "x-sm-session-credential").unwrap_or_default();
     if credential.is_empty() {
         return Err(ApiError::Status {
@@ -6916,6 +6943,16 @@ async fn cancel_scheduled_reminder(
     )?;
     ensure_core_writes_enabled(&state)?;
     let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+    if let Some(agent) = crate::local_identity::current() {
+        let reminder = queue
+            .get_scheduled_reminder(&reminder_id)?
+            .ok_or(ApiError::NotFound("Reminder not found"))?;
+        if reminder.target_session_id != agent.agent_id() {
+            return Err(local_agent::denied(
+                "local agents may cancel only their own reminders",
+            ));
+        }
+    }
     let Some(reminder) = queue.cancel_scheduled_reminder(&reminder_id)? else {
         return Err(ApiError::NotFound("Reminder not found"));
     };
@@ -7072,6 +7109,17 @@ async fn cancel_codex_review_request(
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
     let before =
         RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)?;
+    if let Some(agent) = crate::local_identity::current() {
+        if before
+            .as_ref()
+            .and_then(|r| r.requester_session_id.as_deref())
+            != Some(agent.agent_id())
+        {
+            return Err(local_agent::denied(
+                "local agents may cancel only their own review requests",
+            ));
+        }
+    }
     let Some(registration) =
         RetainedQueueStore::cancel_codex_review_request_in_path(&queue_db_path, &request_id)?
     else {
@@ -7974,6 +8022,7 @@ async fn create_queue_job(
     headers: HeaderMap,
     Json(payload): Json<QueueJobCreateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    local_agent::require_queue_confinement()?;
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/queue-jobs")?;
     ensure_core_writes_enabled(&state)?;
 
@@ -8183,6 +8232,7 @@ fn cancel_queue_job_inner(
     web_owner: bool,
     detail: Option<&Value>,
 ) -> Result<Json<Value>, ApiError> {
+    local_agent::require_queue_confinement()?;
     if !web_owner {
         ensure_session_allowed_from_parts(
             &state.config,
@@ -15731,6 +15781,9 @@ fn owner_web_guard(
     peer_addr: Option<SocketAddr>,
     method: &str,
 ) -> Result<Option<String>, ApiError> {
+    if crate::local_identity::current().is_some() {
+        return Ok(None);
+    }
     let application = request_hostname(headers).and_then(|hostname| {
         cloudflare_access_application_for_host(&state.config.cloudflare_access, &hostname)
     });
@@ -15812,6 +15865,9 @@ fn ensure_session_allowed_from_parts(
     peer_addr: Option<SocketAddr>,
     path: &str,
 ) -> Result<(), ApiError> {
+    if crate::local_identity::current().is_some() {
+        return Ok(());
+    }
     let auth = &config.google_auth;
     if !auth.requested() {
         return Ok(());
@@ -15993,6 +16049,9 @@ fn request_actor_email_from_parts(
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
 ) -> Option<String> {
+    if crate::local_identity::current().is_some() {
+        return None;
+    }
     if let Some(user) = authenticated_user(headers, config) {
         return Some(user.email.trim().to_ascii_lowercase());
     }
@@ -16182,6 +16241,9 @@ fn is_local_bypass_request(
     peer_addr: Option<SocketAddr>,
     config: &AppConfig,
 ) -> bool {
+    if crate::local_identity::current().is_some() {
+        return false;
+    }
     let Some(peer_addr) = peer_addr else {
         return false;
     };

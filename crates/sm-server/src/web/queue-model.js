@@ -29,6 +29,16 @@ export function waitingGroups(jobs) {
   }
   return [...groups.values()];
 }
+/** "Recorded 3h 27m of the last 24h" when samples cover under 95% of the
+ * range, so a stopped recorder reads as missing data, not an idle Mac (#2006). */
+export function coverageNote(series) {
+  const window = (series?.hours || 0) * 3600, covered = series?.summary?.covered_seconds || 0;
+  if (!window || covered >= window * 0.95) return '';
+  const minutes = Math.floor(covered / 60);
+  const recorded = minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `Recorded ${recorded} of the last ${series.hours <= 24 ? `${series.hours}h` : `${series.hours / 24}d`}`;
+}
+
 export function chartPath(buckets, key, max, height = 120) {
   let path = '', pen = false;
   buckets.forEach((bucket, index) => {

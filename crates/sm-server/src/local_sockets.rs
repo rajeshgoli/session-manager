@@ -19,6 +19,9 @@ pub mod pool;
 #[cfg(target_os = "macos")]
 pub mod service;
 
+#[cfg(target_os = "macos")]
+pub mod launch;
+
 pub const REQUEST_SIZE: usize = 40;
 pub const REPLY_SIZE: usize = 32;
 pub const MAX_BACKLOG: u16 = 4096;
