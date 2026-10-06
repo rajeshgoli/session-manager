@@ -67,6 +67,11 @@ static void free_exec_environment(char **environment) {
     free(environment);
 }
 static int execute_path(const char *path, char *const argv[], char *const environment[]) {
+    char canonical[PATH_MAX];
+    if (inherit_exec) {
+        if (immutable_executable(path, canonical) < 0) return -1;
+        path = canonical;
+    }
     int insert = image_permits(path) == 0;
     int permission_error = errno;
     if (!insert && inherit_exec) return failure(permission_error ? permission_error : EACCES);
@@ -76,8 +81,21 @@ static int execute_path(const char *path, char *const argv[], char *const enviro
     free_exec_environment(prepared);
     return failure(saved == 0 && result < 0 ? EACCES : saved);
 }
+static int execute_shell(const char *path, char *const argv[], char *const environment[]) {
+    size_t count = 0;
+    while (argv[count]) if (++count > 65536) return failure(E2BIG);
+    char **shell = calloc(count + 3, sizeof(*shell));
+    if (!shell) return -1;
+    shell[0] = "/bin/sh"; shell[1] = (char *)path;
+    for (size_t i = 1; i < count; ++i) shell[i + 1] = argv[i];
+    execute_path(shell[0], shell, environment);
+    int saved = errno; free(shell); return failure(saved);
+}
 static int execute_search(const char *path, const char *search, char *const argv[], char *const environment[]) {
-    if (strchr(path, '/')) return execute_path(path, argv, environment);
+    if (strchr(path, '/')) {
+        execute_path(path, argv, environment);
+        return errno == ENOEXEC && !inherit_exec ? execute_shell(path, argv, environment) : -1;
+    }
     if (!search) search = "/usr/bin:/bin";
     int denied = 0;
     const char *start = search;
@@ -90,7 +108,9 @@ static int execute_search(const char *path, const char *search, char *const argv
         else snprintf(candidate, sizeof(candidate), "%s", path);
         execute_path(candidate, argv, environment);
         if (errno == EACCES) denied = 1;
-        else if (errno != ENOENT && errno != ENOTDIR) return -1;
+        else if (errno == ENOEXEC && !inherit_exec) {
+            return execute_shell(candidate, argv, environment);
+        } else if (errno != ENOENT && errno != ENOTDIR) return -1;
         if (!end) break;
         start = end + 1;
     }

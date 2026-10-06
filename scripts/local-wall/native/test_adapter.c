@@ -12,6 +12,8 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <stdatomic.h>
+#include <limits.h>
 
 /* This application uses only ordinary socket APIs. It links no broker code. */
 /* A dedicated negative-control check bypasses interposition to prove that
@@ -305,7 +307,97 @@ static void fork_parent_closes(void) {
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
 }
 
+static _Atomic int stop_alias;
+struct alias_paths { char alias[PATH_MAX], next[PATH_MAX]; const char *application; };
+static void *swap_alias(void *context) {
+    struct alias_paths *paths = context;
+    for (unsigned i = 0; !atomic_load(&stop_alias); ++i) {
+        unlink(paths->next);
+        assert(symlink(i % 2 ? paths->application : "/usr/bin/false", paths->next) == 0);
+        assert(rename(paths->next, paths->alias) == 0);
+    }
+    return NULL;
+}
+static void executable_boundaries(const char *application) {
+    const char *mutable = getenv("SM_TEST_MUTABLE");
+    assert(mutable);
+    assert(unlink(application) == -1 && (errno == EPERM || errno == EACCES));
+    struct alias_paths paths = { .application = application };
+    snprintf(paths.alias, sizeof(paths.alias), "%s/alias", mutable);
+    snprintf(paths.next, sizeof(paths.next), "%s/next", mutable);
+    assert(symlink(application, paths.alias) == 0);
+    pthread_t mutator;
+    assert(pthread_create(&mutator, NULL, swap_alias, &paths) == 0);
+    for (unsigned i = 0; i < 16; ++i) {
+        int first = listening(AF_INET);
+        assert(fcntl(first, F_SETFD, 0) == 0);
+        int second = dup(first);
+        pid_t child = fork();
+        assert(child >= 0);
+        if (!child) {
+            char first_text[32], second_text[32];
+            snprintf(first_text, sizeof(first_text), "%d", first);
+            snprintf(second_text, sizeof(second_text), "%d", second);
+            char *arguments[] = { paths.alias, "inherited-exec", first_text, second_text, "2", NULL };
+            char *environment[] = { NULL };
+            if (i % 3 == 0) execve(paths.alias, arguments, environment);
+            else if (i % 3 == 1) {
+                posix_spawnattr_t attributes;
+                assert(posix_spawnattr_init(&attributes) == 0);
+                assert(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC) == 0);
+                int result = posix_spawn(NULL, paths.alias, NULL, &attributes, arguments, environment);
+                if (result != EACCES) fprintf(stderr, "alias SETEXEC error=%d\n", result);
+                _exit(result == EACCES ? 33 : 127);
+            } else {
+                pid_t nested;
+                int result = posix_spawn(&nested, paths.alias, NULL, NULL, arguments, environment);
+                if (result) {
+                    if (result != EACCES) fprintf(stderr, "alias spawn error=%d\n", result);
+                    _exit(result == EACCES ? 33 : 127);
+                }
+                int status;
+                assert(waitpid(nested, &status, 0) == nested && WIFEXITED(status));
+                _exit(WEXITSTATUS(status));
+            }
+            if (errno != EACCES) fprintf(stderr, "alias exec error=%d\n", errno);
+            _exit(errno == EACCES ? 33 : 127);
+        }
+        int status;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+        if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 33)
+            fprintf(stderr, "alias method=%u exit=%d\n", i % 3, WEXITSTATUS(status));
+        assert(WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 33);
+        close(second); close(first);
+    }
+    atomic_store(&stop_alias, 1);
+    assert(pthread_join(mutator, NULL) == 0);
+    char text[PATH_MAX];
+    snprintf(text, sizeof(text), "%s/text-command", mutable);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) { char *arguments[] = { text, NULL }; execvp(text, arguments); _exit(127); }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+    char directory[PATH_MAX];
+    assert(realpath(application, directory));
+    char *leaf = strrchr(directory, '/');
+    assert(leaf); *leaf++ = 0;
+    posix_spawn_file_actions_t actions;
+    assert(posix_spawn_file_actions_init(&actions) == 0);
+    assert(posix_spawn_file_actions_addchdir(&actions, directory) == 0);
+    char *arguments[] = { leaf, "cwd-child", directory, NULL };
+    char *environment[] = { NULL };
+    assert(posix_spawn(&child, leaf, &actions, NULL, arguments, environment) == 0);
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+    assert(posix_spawn_file_actions_destroy(&actions) == 0);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "cwd-child")) {
+        char directory[PATH_MAX];
+        assert(getcwd(directory, sizeof(directory)) && !strcmp(directory, argv[2]));
+        return 37;
+    }
     if (argc == 5 && !strcmp(argv[1], "inherited-exec")) {
         int first = atoi(argv[2]), second = atoi(argv[3]);
         int family = atoi(argv[4]);
@@ -365,5 +457,6 @@ int main(int argc, char **argv) {
     inherited_tools();
     fork_parent_closes();
     exec_guards();
+    executable_boundaries(argv[0]);
     return 0;
 }

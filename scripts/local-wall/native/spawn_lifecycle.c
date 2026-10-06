@@ -1,3 +1,4 @@
+#include "spawn_directory.c"
 struct future_descriptor { int fd, source, keep; };
 #define FUTURE_LIMIT (TRACKED_LIMIT + ACTION_LIMIT + 1)
 static struct future_descriptor *future_find(struct future_descriptor *future, int fd) {
@@ -90,6 +91,14 @@ static int spawn_process(pid_t *pid, const char *path,
     if (asynchronous_start && inherited) { result = EACCES; goto done; }
     char resolved[PATH_MAX];
     if ((result = resolve_spawn_path(path, search, resolved))) goto done;
+    char child_path[PATH_MAX];
+    if (child_executable_path(list, resolved, child_path) < 0) { result = errno; goto done; }
+    strcpy(resolved, child_path);
+    if (inherited) {
+        char canonical[PATH_MAX];
+        if (immutable_executable(resolved, canonical) < 0) { result = errno; goto done; }
+        strcpy(resolved, canonical);
+    }
     int insert = image_permits(resolved) == 0;
     int permission_error = errno;
     if (!insert && inherited) {
@@ -101,10 +110,6 @@ static int spawn_process(pid_t *pid, const char *path,
     if ((result = posix_spawn_file_actions_init(&clone))) goto done;
     clone_ready = 1;
     if (list) for (unsigned i = 0; i < list->count; ++i) {
-        if (inherited && resolved[0] != '/' &&
-            (list->actions[i].kind == ACTION_CHDIR || list->actions[i].kind == ACTION_FCHDIR)) {
-            result = EACCES; goto done;
-        }
         if ((result = replay_action(&clone, &list->actions[i]))) goto done;
     }
     // Original hidden streams never leak into an unadapted child. Temporary

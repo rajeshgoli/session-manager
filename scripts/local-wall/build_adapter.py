@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--direct-ports", type=int, nargs=4, required=True)
     parser.add_argument("--control-port", type=int, default=0)
     parser.add_argument("--control-fd", type=int, default=-1)
+    parser.add_argument("--immutable-exec-dir", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     endpoint = os.fsencode(args.endpoint)
@@ -32,12 +33,20 @@ def main():
         parser.error("output must not be a symlink")
     parent = output.parent.resolve(strict=True)
     output = parent / output.name
+    executable_roots = [root.resolve(strict=True) for root in args.immutable_exec_dir]
+    if any(not root.is_dir() or root == Path("/") for root in executable_roots):
+        parser.error("immutable executable roots must be narrow physical directories")
     source = Path(__file__).resolve().parent / "native"
     # Only numeric byte initializers enter generated C: no input can inject
     # source or options. The host stages the output in write-denied own state.
     with tempfile.TemporaryDirectory(prefix=".adapter-", dir=parent) as directory:
         scratch = Path(directory)
         configuration = scratch / "configuration.c"
+        root_definitions = "".join(
+            f"static const char executable_root_{index}[] = {{"
+            + ",".join(map(str, os.fsencode(root) + b"\0")) + "};\n"
+            for index, root in enumerate(executable_roots)
+        )
         configuration.write_text(
             '#include "wire_client.h"\n'
             + "static const char endpoint[] = {" + ",".join(map(str, endpoint + b"\0")) + "};\n"
@@ -48,6 +57,10 @@ def main():
             + f"const int wall_control_fd = {args.control_fd};\n"
             + "const char wall_image_path[] = {"
             + ",".join(map(str, os.fsencode(output) + b"\0")) + "};\n"
+            + root_definitions
+            + "const char *const wall_executable_roots[] = {"
+            + ",".join(f"executable_root_{index}" for index in range(len(executable_roots)))
+            + ("," if executable_roots else "") + "0};\n"
         )
         image = scratch / "adapter.dylib"
         subprocess.run([

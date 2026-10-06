@@ -178,6 +178,8 @@ python3 scripts/local-wall/build_adapter.py \
   --peer-token "$peer0" "$peer1" "$peer2" "$peer3" "$peer4" "$peer5" "$peer6" "$peer7" \
   --direct-ports "$gateway_port" "$egress_port" "$model_port" "$judge_port" \
   --control-port "$agent_port" --control-fd "$inherited_control_fd" \
+  --immutable-exec-dir "$host_staged_executables" \
+  --immutable-exec-dir "$approved_python_installation" \
   --output "$state_dir/xdg/config/socket-adapter.dylib"
 ```
 
@@ -216,11 +218,19 @@ inherit and working-directory actions, including close-on-exec defaults.
 Python's process-replacement spawn mode follows the exec recovery path.
 
 The adapter supports native-architecture unsigned and ad-hoc signed Mach-O
-executables. It refuses surviving adapted descriptors for platform, restricted,
+executables. Inherited adapted sockets require a canonical executable path below
+a compiled `--immutable-exec-dir`. The host must stage these directories before
+launch and deny agent writes to their files, entries and ancestors; no writable
+ancestor may move or replace a trusted root. Reject hard links to mutable files.
+These checks apply to same-user writable tool installations as well as own
+state. Canonical execution prevents a mutable symlink from substituting another
+image between validation and execution. With no roots configured, inheritance
+is refused. Agents can execute mutable programs when no adapted socket survives;
+the host must stage a program in immutable state before it inherits a listener.
+It refuses surviving adapted descriptors for platform, restricted,
 hardened, library-validated or unsupported images and suspended spawn. Such
-executables may run when no adapted descriptors survive. A relative executable
-combined with a spawn working-directory action is refused when adapted
-descriptors survive. The adapter mirrors up to 64 live file-action objects and
+executables may run when no adapted descriptors survive. Relative spawn paths
+resolve after ordered directory actions. The adapter mirrors up to 64 live file-action objects and
 256 actions per object; it does not inspect libc's private representation.
 An internal `SM_WALL_RECOVERY_FD` value identifies only a parent completion
 socket, verified through its kernel parent identity and an expected marker.

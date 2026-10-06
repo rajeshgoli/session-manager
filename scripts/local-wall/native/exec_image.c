@@ -6,6 +6,21 @@
 #include <mach-o/fat.h>
 #include <sys/stat.h>
 #include <limits.h>
+extern const char *const wall_executable_roots[];
+
+static int immutable_executable(const char *path, char canonical[PATH_MAX]) {
+    if (!realpath(path, canonical)) {
+        // Darwin can report EINVAL when a symlink changes during resolution.
+        // An unverifiable inheritance path is refused, never retried by name.
+        if (errno == ENOENT || errno == ENOTDIR) return -1;
+        return failure(EACCES);
+    }
+    for (unsigned i = 0; wall_executable_roots[i]; ++i) {
+        size_t length = strlen(wall_executable_roots[i]);
+        if (!strncmp(canonical, wall_executable_roots[i], length) && canonical[length] == '/') return 0;
+    }
+    return failure(EACCES);
+}
 
 static int read_exact(int fd, void *bytes, size_t length, off_t offset) {
     size_t done = 0;

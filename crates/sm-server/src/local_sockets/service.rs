@@ -517,6 +517,16 @@ mod tests {
         _directory: TestDirectory,
         root: ProcessIdentity,
         control_port: u16,
+        control_listener: TcpListener,
+    }
+
+    impl Fixture {
+        fn control_listener(&self, ip: IpVersion) -> io::Result<TcpListener> {
+            // The host fixture supplies its already-bound exact-loopback
+            // capability; never release and race to bind the same port again.
+            assert_eq!(ip, IpVersion::V4);
+            self.control_listener.try_clone()
+        }
     }
 
     struct TestDirectory(PathBuf);
@@ -552,11 +562,11 @@ mod tests {
         // long TMPDIR. The host may provide an equivalent immutable alias.
         let directory = TestDirectory::new();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let control_port = loop {
+        let (control_reservation, control_port) = loop {
             let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
             if ![22000, 23000, 24000, 24001].contains(&port) {
-                break port;
+                break (probe, port);
             }
         };
         let policy = PortPolicy::new(PortConfiguration {
@@ -578,12 +588,19 @@ mod tests {
             .unwrap();
         let root = ProcessIdentity::capture(std::process::id()).unwrap();
         service.add_root(root).unwrap();
+        service
+            .state
+            .control
+            .lock()
+            .unwrap()
+            .push(control_reservation.try_clone().unwrap());
         Fixture {
             service,
             _hub: hub,
             _directory: directory,
             root,
             control_port,
+            control_listener: control_reservation,
         }
     }
 
@@ -713,7 +730,7 @@ mod tests {
     #[test]
     fn failures_carry_no_descriptors_and_control_is_host_only() {
         let fixture = fixture();
-        let _control = fixture.service.control_listener(IpVersion::V4).unwrap();
+        let _control = fixture.control_listener(IpVersion::V4).unwrap();
         for request in [
             Request::Bind {
                 ip: IpVersion::V4,
@@ -1005,7 +1022,7 @@ mod tests {
     #[test]
     fn native_adapter_uses_host_control_capability_without_test_client_access() {
         let fixture = fixture();
-        let control = fixture.service.control_listener(IpVersion::V4).unwrap();
+        let control = fixture.control_listener(IpVersion::V4).unwrap();
         run_adapter_fixture(&fixture, Some(control.as_raw_fd()));
     }
 
@@ -1013,6 +1030,14 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let scripts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall");
         let library = fixture._directory.path().join("adapter.dylib");
+        let python_paths = std::process::Command::new("python3")
+            .args(["-c", "import os,sys; print(sys.executable); print(os.path.commonpath([os.path.realpath(sys.executable),os.path.realpath(sys.prefix)]))"])
+            .output().unwrap();
+        assert!(python_paths.status.success());
+        let python_paths = String::from_utf8(python_paths.stdout).unwrap();
+        let mut python_paths = python_paths.lines();
+        let python_executable = python_paths.next().unwrap();
+        let python_root = python_paths.next().unwrap();
         let mut builder = std::process::Command::new("python3");
         builder
             .arg(scripts.join("build_adapter.py"))
@@ -1022,7 +1047,11 @@ mod tests {
             .args(fixture.service.peer_token().0.map(|word| word.to_string()))
             .args(["--direct-ports", "22000", "23000", "24000", "24001"])
             .arg("--output")
-            .arg(&library);
+            .arg(&library)
+            .arg("--immutable-exec-dir")
+            .arg(fixture._directory.path())
+            .arg("--immutable-exec-dir")
+            .arg(python_root);
         if let Some(fd) = control {
             builder
                 .arg("--control-port")
@@ -1049,7 +1078,15 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        let profile = "(version 1)(allow default)(deny network-inbound (local ip \"*:*\"))(deny network-outbound (remote ip \"*:*\"))";
+        let mutable = TestDirectory::new();
+        fs::write(mutable.path().join("text-command"), "exit 37\n").unwrap();
+        fs::set_permissions(
+            mutable.path().join("text-command"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mutable_path = mutable.path().canonicalize().unwrap();
+        let profile = format!("(version 1)(allow default)(deny network-inbound (local ip \"*:*\"))(deny network-outbound (remote ip \"*:*\"))(deny file-write*)(allow file-write* (subpath \"/dev\"))(allow file-write* (subpath \"{}\"))", mutable_path.display());
         let rust_application = fixture._directory.path().join("rust-application");
         let rust_compiled = std::process::Command::new("rustc")
             .arg(scripts.join("native/test_exec.rs"))
@@ -1062,11 +1099,6 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&rust_compiled.stderr)
         );
-        let python = std::process::Command::new("python3")
-            .args(["-c", "import sys; print(sys.executable)"])
-            .output()
-            .unwrap();
-        assert!(python.status.success());
         let control_result = std::process::Command::new(&executable)
             .arg("raw-control")
             .env_remove("DYLD_INSERT_LIBRARIES")
@@ -1081,11 +1113,9 @@ mod tests {
         let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
         command
             .env("SM_TEST_RUST_APPLICATION", &rust_application)
-            .env(
-                "SM_TEST_PYTHON",
-                String::from_utf8(python.stdout).unwrap().trim(),
-            )
-            .args(["-p", profile, "/usr/bin/env"])
+            .env("SM_TEST_PYTHON", python_executable)
+            .env("SM_TEST_MUTABLE", mutable.path())
+            .args(["-p", &profile, "/usr/bin/env"])
             .arg(format!("DYLD_INSERT_LIBRARIES={}", library.display()))
             .args([
                 "SM_BROKER_ENDPOINT=/tmp/forged",
