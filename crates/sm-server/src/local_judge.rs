@@ -43,6 +43,8 @@ pub struct Registration {
     pub tmp: PathBuf,
     pub parent: String,
     pub sm_url: String,
+    /// Assigned listener from the host local-egress registration.
+    pub proxy_port: u16,
 }
 
 /// Provider hook configuration returned only to the host at registration.
@@ -401,6 +403,7 @@ mod tests {
             tmp: root.join("tmp"),
             parent: "parent".into(),
             sm_url: "http://127.0.0.1:8420".into(),
+            proxy_port: 18700,
         };
         let endpoint = runtime.register("a", &agent).unwrap();
         runtime.register("b", &agent).unwrap();

@@ -69,12 +69,18 @@ CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, path)) for path in (
 
 
 def egress_words(agent):
-    words = ["git", "gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript", "8420",
-             str(ARGS.proxy_port)]
+    words = ["git", "gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript"]
+    ports = {8420, ARGS.proxy_port}
+    if agent.get("proxy_port"):
+        ports.add(agent["proxy_port"])
     port = urlparse(agent.get("sm_url") or "").port
-    if port and str(port) not in words:
-        words.append(str(port))
-    return re.compile(_B + "(" + "|".join(map(re.escape, words)) + ")" + _A)
+    if port:
+        ports.add(port)
+    # Numeric ports also occur after ':' in socket addresses. Command-word
+    # boundaries deliberately reject ':', so they cannot be reused for ports.
+    command_pattern = _B + "(?:" + "|".join(map(re.escape, words)) + ")" + _A
+    port_pattern = r"(?<![0-9])(?:" + "|".join(str(port) for port in sorted(ports)) + r")(?![0-9])"
+    return re.compile("(" + command_pattern + "|" + port_pattern + ")")
 
 
 def normalise(text):
@@ -160,7 +166,7 @@ def egress_hits(text, agent):
     # the model policy distinguishes literal/data use from hidden commands.
     if re.search(r"\$[A-Za-z0-9_{(*@#?!-]|`", text):
         hits.append("dynamic shell expansion")
-    if re.search(r"[*?\[]", text):
+    if re.search(r"[*?\[{}]", text):
         hits.append("shell wildcard")
     if CREDENTIAL.search(t) or command_protected_paths(text, agent):
         hits.append("credential")
@@ -235,6 +241,8 @@ def rule_stage(tool, tin, cwd, agent):
                         f"would block the write anyway. Write only under {agent['checkout']} or {agent['tmp']}.")
     if tool == "Bash":
         cmd = tin.get("command") or ""
+        if not agent.get("proxy_port"):
+            return "judge", "registration lacks an authoritative egress proxy port"
         if git_credential_request(cmd, agent):
             return "deny", "retrieving or changing Git credentials is not allowed"
         if command_protected_paths(cmd, agent):
@@ -260,6 +268,7 @@ def judge_message(tool, tin, agent):
             f"on branch {agent['branch']} in {agent['checkout']}\n"
             f"Parent: {agent['parent']}\n"
             f"sm server for this agent: {agent.get('sm_url') or 'http://127.0.0.1:8420'}\n"
+            f"Egress proxy port: {agent.get('proxy_port', 'unknown')}\n"
             f"Tool: {tool}\nCommand:\n{action}\n"
             "Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.")
 
@@ -586,6 +595,8 @@ class Control(socketserver.StreamRequestHandler):
                                 raise ValueError("missing " + key)
                         if not isinstance(agent.get("ticket"), int):
                             raise ValueError("missing ticket")
+                        if type(agent.get("proxy_port")) is not int or not 1 <= agent["proxy_port"] <= 65535:
+                            raise ValueError("missing or invalid proxy_port")
                         for key in ("checkout", "tmp"):
                             if not os.path.isabs(agent[key]) or not os.path.isdir(agent[key]):
                                 raise ValueError("invalid " + key)

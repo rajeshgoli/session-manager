@@ -3,7 +3,8 @@
 `LocalJudgeRuntime::from_config(&AppConfig)` is the host interface. The caller
 uses `register(session_id, &Registration)` **before launch** and `unregister`
 on failed launch or final retirement. A registration contains name, ticket,
-title, branch, absolute checkout, absolute temporary folder, parent, and sm URL.
+title, branch, absolute checkout, absolute temporary folder, parent, sm URL, and the assigned egress proxy port
+from the host local-egress registration.
 This API works without a provider or an existing sm session record.
 
 Registration returns the `/decide` URL and a private per-agent token. The
@@ -81,7 +82,11 @@ flags, spaced filenames and direct paths are covered. Delegated scripts are
 recursively scanned; cycles, changed working directories, PATH changes and scan
 limits reach the judge rather than bypassing it. Uncertain parsing, unreadable
 or oversized scripts, and inline interpreter programs reach the judge.
-Absolute paths to protected egress executables are recognized. Wildcards,
+Each registration's actual proxy port is recognized inside socket addresses;
+legacy records missing it conservatively send Bash actions to the judge until
+the host re-registers them. The global `proxy_port` is only a legacy additional
+scan value, not a substitute for per-agent assignment. Absolute paths to
+protected egress executables are recognized. Wildcards and brace expansions,
 case-aliased credential paths, shell variable/parameter/command expansions
 and backticks always reach the
 judge, even when the literal egress command name is absent. Relative tool paths resolve against the registered
