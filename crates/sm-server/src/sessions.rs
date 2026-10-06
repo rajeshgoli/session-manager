@@ -14042,6 +14042,12 @@ fn session_credential_matches(
     credential: &str,
 ) -> bool {
     let session_id = session_id.trim();
+    if let Some(agent) = crate::local_identity::current() {
+        return agent.agent_id() == session_id
+            && sessions
+                .iter()
+                .any(|s| s.id == session_id && !s.is_stopped());
+    }
     let credential = credential.trim();
     if session_id.is_empty() || credential.is_empty() {
         return false;
