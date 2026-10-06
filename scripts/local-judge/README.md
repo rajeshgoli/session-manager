@@ -64,6 +64,13 @@ Parsed Bash path arguments use the same protected set. Resolved executable
 basenames are inspected before a rule allowance, so renamed symlinks to egress
 binaries still reach the judge.
 
+The production TCP port must be nonzero so registered hook URLs stay stable
+across daemon crashes and replacement. General-purpose interpreted programs
+(Python, Node, Perl, Ruby, Lua, etc.) always reach the judge: networking does not
+require a shell egress command. Git credential retrieval/manipulation is denied
+by the rules, including absolute paths, helper subcommands and renamed aliases.
+Other Git commands reach the judge even when no listed remote subcommand appears.
+
 The model endpoint comes from `local_host.base_url`. Policy and request settings
 are lifted from the #1954 proof. Decisions fail closed on model unavailability,
 a malformed answer, overload, logging failure, or the complete model-call

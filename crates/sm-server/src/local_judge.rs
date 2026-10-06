@@ -119,6 +119,9 @@ impl LocalJudgeRuntime {
         if !self.root.is_absolute() {
             bail!("local judge test isolation root must be absolute");
         }
+        if self.config.port == 0 {
+            bail!("local_judge.port must be nonzero so existing hook URLs survive recovery");
+        }
         let generation = self.generation();
         if self.matching_service(&generation) {
             return Ok(());
@@ -344,12 +347,25 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_judge_ports_are_rejected() {
+        let mut config = crate::config::AppConfig::default();
+        config.local_judge.port = 0;
+        assert!(LocalJudgeRuntime::from_config(&config)
+            .ensure_running()
+            .unwrap_err()
+            .to_string()
+            .contains("nonzero"));
+    }
+
+    #[test]
     fn runtime_register_restart_reconcile_and_unregister() {
         let root = PathBuf::from(format!("/tmp/j77-r-{}", std::process::id()));
         fs::create_dir_all(root.join("wt")).unwrap();
         fs::create_dir_all(root.join("tmp")).unwrap();
         let mut config = crate::config::AppConfig::default();
-        config.local_judge.port = 0;
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config.local_judge.port = port.local_addr().unwrap().port();
+        drop(port);
         let runtime = runtime_for(&config, &root);
         struct Cleanup(LocalJudgeRuntime, PathBuf);
         impl Drop for Cleanup {
@@ -412,6 +428,7 @@ mod tests {
             restarted.register("a", &agent).unwrap().token,
             endpoint.token
         );
+        assert_eq!(restarted.register("a", &agent).unwrap().url, endpoint.url);
         // Daemon crash: the next reconcile rebinds using durable registrations.
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
@@ -428,6 +445,7 @@ mod tests {
         );
         // Configuration changes replace a healthy detached process; this is
         // also the path used when the embedded service or policy hash changes.
+        assert_eq!(restarted.register("a", &agent).unwrap().url, endpoint.url);
         let old_pid = restarted.control(json!({"op": "health"})).unwrap()["pid"].clone();
         let mut changed_config = config.clone();
         changed_config.local_judge.timeout_seconds = 29;

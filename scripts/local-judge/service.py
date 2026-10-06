@@ -69,7 +69,7 @@ CREDENTIAL_PATHS = [os.path.realpath(os.path.join(HOME, path)) for path in (
 
 
 def egress_words(agent):
-    words = ["gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript", "8420",
+    words = ["git", "gh", "sm", "curl", "wget", "nc", "ssh", "scp", "rsync", "open", "osascript", "8420",
              str(ARGS.proxy_port)]
     port = urlparse(agent.get("sm_url") or "").port
     if port and str(port) not in words:
@@ -97,7 +97,7 @@ def script_texts(command, cwd, agent, seen=None, depth=0):
         # An uncertain shell parse must not silently skip executable content.
         return [("shell-parse", "eval")]
     interpreters = {"sh", "bash", "zsh", "dash", "ksh", "python", "python3",
-                    "perl", "ruby", "node", "source", "."}
+                    "perl", "ruby", "node", "lua", "php", "Rscript", "deno", "bun", "source", "."}
     candidates = set()
     if len(tokens) > 10000:
         return [("script-scan-limit", "eval")]
@@ -109,6 +109,10 @@ def script_texts(command, cwd, agent, seen=None, depth=0):
             out.append(("script-working-directory", "eval"))
         if not token.startswith("-"):
             candidates.add(token)
+        if os.path.basename(token) in (interpreters - {"sh", "bash", "zsh", "dash", "ksh", "source", "."}):
+            # Language runtimes can make network calls without ever invoking
+            # curl/git/etc. Absence of those words cannot establish no egress.
+            out.append(("interpreted-program", "eval"))
         if os.path.basename(token) in interpreters:
             for arg in tokens[index + 1:]:
                 if arg in (";", "&&", "||", "|", "(", ")", "<", ">"):
@@ -189,6 +193,33 @@ def command_protected_paths(command, agent):
         return False  # script_texts sends uncertain parsing to the judge
 
 
+def git_credential_request(command, agent):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    separators = {";", "&&", "||", "|", "(", ")"}
+    command_position = True
+    for index, token in enumerate(tokens):
+        if token in separators:
+            command_position = True
+            continue
+        if not command_position:
+            continue
+        if token in {"command", "exec", "env", "sudo"} or "=" in token:
+            continue
+        command_position = False
+        if os.path.basename(resolve(token, agent)) == "git":
+            for arg in tokens[index + 1:]:
+                if arg in separators:
+                    break
+                if arg == "credential" or arg.startswith("credential-"):
+                    return True
+    return False
+
+
 def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
@@ -204,6 +235,8 @@ def rule_stage(tool, tin, cwd, agent):
                         f"would block the write anyway. Write only under {agent['checkout']} or {agent['tmp']}.")
     if tool == "Bash":
         cmd = tin.get("command") or ""
+        if git_credential_request(cmd, agent):
+            return "deny", "retrieving or changing Git credentials is not allowed"
         if command_protected_paths(cmd, agent):
             return "deny", "reading protected credentials is not allowed"
         hits = egress_hits(cmd, agent)

