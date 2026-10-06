@@ -54,6 +54,9 @@ flowchart LR
   dependencies finish, its agent starts. When a test job finishes, the waiting
   agent wakes. When a PR is ready, a reviewer from another model is assigned.
   Agents sit idle for free until there is something to do.
+- **No compaction.** The server watches each agent's context and hands the
+  work to a fresh successor before the window fills, so every transcript stays
+  whole for later inspection.
 - **A second model reviews each PR.** Claude's work can go to Codex for
   review, and the reverse.
 - **The machine is scheduled.** Tests, benchmarks and GPU jobs wait in a queue.
@@ -107,8 +110,8 @@ Session Manager runs that too, as one card on the Agents page.
 
 ## "Isn't this just another vibe-coded app?"
 
-AI agents wrote nearly all of Session Manager, directed by one person and run
-through Session Manager itself. That's the point: it's the test of the method.
+AI agents wrote all of Session Manager's code, directed by one person who
+didn't write a line of it, and ran through Session Manager itself. That's the point: it's the test of the method.
 What keeps the output from being slop is the same discipline you'd expect from
 a human team.
 
