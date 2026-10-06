@@ -62,6 +62,9 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     local_env: Option<PathBuf>,
+    /// Run the separately supervised host-only local-agent HTTPS proxy.
+    #[arg(long)]
+    local_egress_service: Option<PathBuf>,
     /// Load and validate the configuration, then exit without binding a port or
     /// touching any state. scripts/restart-rust-server.sh uses this to reject a
     /// bad config while the old server is still running, rather than discovering
@@ -79,6 +82,11 @@ async fn main() -> Result<()> {
     // enables more than one crypto backend, so choose one before either runs.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
+    if let Some(directory) = args.local_egress_service {
+        return sm_server::local_egress::run_service(&directory)
+            .await
+            .map_err(Into::into);
+    }
     let config = AppConfig::load_from_path_with_local_env(&args.config, args.local_env.as_deref())?;
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
