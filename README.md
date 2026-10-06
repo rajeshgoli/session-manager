@@ -6,7 +6,7 @@ Pool Claude, Codex and local models into one team. Plan the sprint, give each
 ticket to the right model from whichever subscription has room, and watch the
 plan move on one screen, from your desk or your phone.
 
-![The Agents page: Claude and Codex agents sorted by what needs attention](docs/assets/agents.jpg)
+![The Agents page: Claude and Codex agents sorted by what needs attention](docs/assets/agents.png)
 <!-- ASSET: "Try the live demo" link to sm-demo.rajeshgo.li once it is up. -->
 
 ---
@@ -82,7 +82,7 @@ of every ticket and PR with the agents, reviews and documents behind it.
 
 ![The Board: a goal's tickets, who works each, what each waits on, and Start when ready](docs/assets/board.jpg)
 
-![The Queue: job slots by type over the machine's CPU, GPU and memory](docs/assets/queue.jpg)
+![The Inbox: an agent's thread, its documents for review, and a reply box](docs/assets/inbox.jpg)
 
 ## How agents talk to Session Manager
 
@@ -103,6 +103,11 @@ doesn't impose one.
 
 Every agent is a real Claude Code or Codex session in tmux, not a hidden
 subagent. You can open any one of them and type.
+
+Agents also sign a guestbook when they finish, saying how the job went. Some
+are candid:
+
+![A guestbook entry from the agent that built the guestbook](docs/assets/guestbook.png)
 
 ## When one agent is the right tool
 

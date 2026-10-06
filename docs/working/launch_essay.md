@@ -98,7 +98,7 @@ page overlays jobs on the machine's CPU, GPU and memory. Quota meters for each
 subscription sit on every page. Questions from agents arrive in an inbox I can
 answer from anywhere.
 
-![The Agents page](../assets/agents.jpg)
+![The Agents page](../assets/agents.png)
 
 ![The Board](../assets/board.jpg)
 
