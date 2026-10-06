@@ -346,6 +346,27 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.ruling(tin={'command': 'curl valid'}), 'allow')
         self.assertEqual(self.model.api_keys[-1], self.auth_token)
 
+    def test_safe_names_do_not_hide_executable_identity(self):
+        for name in ['cat', 'ls', 'printf']:
+            alias = self.wt / name
+            alias.symlink_to(sys.executable)
+            self.assertEqual(self.ruling(tin={'command': f'./{name} -c "print(1)"'}), 'deny')
+            record = self.logs()[-1]
+            self.assertEqual(record['stage'], 'judge')
+            self.assertIn('unrecognized executable', record['judge_why'])
+            alias.unlink()
+        self.assertEqual(self.ruling(tin={'command': '/bin/cat src/lib.rs'}), 'allow')
+
+    def test_recursive_reads_protect_credential_ancestors(self):
+        for command in ['cp -R ~/.config copied', 'grep -R . ~/.config',
+                        'cp -a ~ copied', 'grep -nr . ~', 'cp --recursive ~/.config copied']:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruling(tin={'command': command}), 'deny')
+                self.assertEqual(self.logs()[-1]['stage'], 'rule')
+        for tool in ['Grep', 'Glob']:
+            self.assertEqual(self.ruling(tool, {'path': str(Path.home() / '.config')}), 'deny')
+        self.assertEqual(self.ruling(tin={'command': 'cp -R src copied'}), 'allow')
+
     def test_dynamic_command_expansion_cannot_skip_judgment(self):
         for command in [
             'a=g; b=it; "$a$b" push --force origin main',

@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import hashlib
 import fcntl
 import socketserver
@@ -190,10 +191,18 @@ def unrecognized_commands(command, agent):
         if token in {"command", "exec", "env", "sudo", "builtin", "time"} or "=" in token:
             continue
         command_position = False
-        if os.path.basename(token) not in safe:
-            path = resolve(token, agent)
-            # Local files are recursively inspected by script_texts. Native
-            # binary content, unsafe operations and uncertain scans are judged.
+        local_path = resolve(token, agent)
+        if "/" in token or os.path.lexists(os.path.join(agent["checkout"], token)):
+            path = local_path
+        else:
+            path = os.path.realpath(shutil.which(token) or local_path)
+        builtins = {"echo", "printf", "pwd", "true", "false", "test", ":", "cd", "source", "."}
+        is_builtin = token in builtins and "/" not in token
+        trusted_system = os.path.dirname(path) in {"/bin", "/usr/bin"} and os.path.basename(path) in safe
+        # A link's spelling is never its executable identity. Only trusted
+        # system paths or shell builtins qualify by name; local source files
+        # still require recursive inspection, including binary detection.
+        if not is_builtin and not trusted_system:
             if not inside(path, agent) or not os.path.isfile(path):
                 return True
     return False
@@ -229,9 +238,10 @@ def inside(path, agent):
                for r in (os.path.realpath(agent["checkout"]), os.path.realpath(agent["tmp"])))
 
 
-def protected_path(path, agent):
+def protected_path(path, agent, ancestors=False):
     path = resolve(path, agent).casefold()
     return any(path == credential.casefold() or path.startswith(credential.casefold() + os.sep)
+               or ancestors and (credential.casefold().startswith(path.rstrip(os.sep) + os.sep))
                for credential in CREDENTIAL_PATHS)
 
 
@@ -239,8 +249,12 @@ def command_protected_paths(command, agent):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
         lexer.whitespace_split = True
-        # Option values can carry a path too (e.g. --input=/path).
-        return any(protected_path(token.split("=", 1)[-1], agent) for token in lexer)
+        tokens = list(lexer)
+        recursive = any(token in {"--recursive", "--archive", "-a"}
+                        or re.match(r"^-[^-]*[rR]", token) for token in tokens)
+        # Option values can carry a path too (e.g. --input=/path). Recursive
+        # readers/copiers must also protect parents containing credentials.
+        return any(protected_path(token.split("=", 1)[-1], agent, recursive) for token in tokens)
     except ValueError:
         return False  # script_texts sends uncertain parsing to the judge
 
@@ -276,7 +290,7 @@ def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
         path = resolve(tin.get("file_path") or tin.get("path") or "", agent)
-        if protected_path(path, agent):
+        if protected_path(path, agent, tool in {"Glob", "Grep"}):
             return "deny", "reading protected credentials is not allowed"
         return "allow", f"{tool} is always allowed"
     if tool in PATH_TOOLS:
