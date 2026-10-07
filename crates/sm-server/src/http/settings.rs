@@ -14,10 +14,15 @@ pub(super) async fn get_settings(
 ) -> Result<Json<Value>, ApiError> {
     board::owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let config_limits = terminal_config_limits(&state);
-    let settings = tokio::task::spawn_blocking(move || state.session_store.owner_settings())
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
-    Ok(Json(with_config_limits(settings, config_limits)))
+    let settings = tokio::task::spawn_blocking(move || {
+        state
+            .session_store
+            .owner_settings()
+            .map(|settings| with_config_limits(settings, config_limits))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(settings))
 }
 
 pub(super) async fn put_settings(
@@ -78,11 +83,11 @@ pub(super) async fn put_settings(
         if body.get("new_agent").is_some() {
             board::request_recompute(&state);
         }
-        Ok(settings)
+        Ok(with_config_limits(settings, config_limits))
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
-    Ok(Json(with_config_limits(settings, config_limits)))
+    Ok(Json(settings))
 }
 
 /// Config's terminal limits, which a `null` owner value falls back to.
@@ -94,8 +99,34 @@ fn terminal_config_limits(state: &AppState) -> Value {
 /// and the web can show what Reset restores. It is read-only: a `PUT`
 /// naming it is refused as an unknown field.
 fn with_config_limits(mut settings: Value, config_limits: Value) -> Value {
+    let parent = settings["new_agent"]["workspace_parent"]
+        .as_str()
+        .unwrap_or("~/projects")
+        .to_owned();
+    match workspace_folders(&expand_home(&parent)) {
+        Ok(folders) => settings["workspace_folders"] = json!(folders),
+        Err(_) => {
+            settings["workspace_folders"] = json!([]);
+            settings["workspace_error"] = json!(format!(
+                "Cannot read folders in {parent}. Choose a saved workspace or enter a path."
+            ));
+        }
+    }
     settings["terminal_config_limits"] = config_limits;
     settings
+}
+
+/// Immediate child directories only; no recursive scan or shell expansion.
+fn workspace_folders(parent: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut folders = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') && entry.path().is_dir() {
+            folders.push(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    folders.sort();
+    Ok(folders)
 }
 
 /// Run an admission pass so a raised limit starts waiting jobs now.

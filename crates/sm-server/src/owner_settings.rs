@@ -77,6 +77,7 @@ pub fn defaults() -> Value {
             "provider": "claude",
             "claude": { "model": null, "effort": null },
             "codex": { "model": null, "effort": null },
+            "workspace_parent": "~/projects",
             "workspaces": [
                 workspace("fractal-algo-rust"),
                 workspace("session-manager"),
@@ -353,6 +354,12 @@ fn validate_new_agent(value: &Value) -> Result<(), String> {
                 efforts.join(", ")
             ));
         }
+    }
+    if !value["workspace_parent"]
+        .as_str()
+        .is_some_and(|path| expand_home(path).is_absolute())
+    {
+        return Err("new_agent.workspace_parent must be an absolute or ~/ path".to_owned());
     }
     let workspaces_ok = value["workspaces"].as_array().is_some_and(|workspaces| {
         workspaces.iter().all(|path| {
