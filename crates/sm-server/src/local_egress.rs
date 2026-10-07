@@ -199,6 +199,8 @@ struct Proxy {
     resolver: Arc<dyn Resolver>,
     capacity: Arc<tokio::sync::Semaphore>,
     networks: Arc<dyn networks::Networks>,
+    #[cfg(test)]
+    dial_fixture: Option<SocketAddr>,
 }
 impl Proxy {
     fn new(directory: &Path) -> io::Result<Self> {
@@ -208,6 +210,8 @@ impl Proxy {
             resolver: Arc::new(SystemResolver),
             capacity: Arc::new(tokio::sync::Semaphore::new(256)),
             networks: Arc::new(networks::HostNetworks),
+            #[cfg(test)]
+            dial_fixture: None,
         })
     }
     fn log(&self, record: &ConnectionLog) -> io::Result<()> {
@@ -332,9 +336,12 @@ impl Proxy {
         for ip in addresses {
             record.resolved_address = Some(ip);
             // Use the checked IP, never resolve the hostname a second time.
+            let destination = SocketAddr::new(ip, port);
+            // Deterministic tests replace only the dial after production address checks.
+            #[cfg(test)]
+            let destination = self.dial_fixture.unwrap_or(destination);
             if let Ok(Ok(stream)) =
-                tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, port)))
-                    .await
+                tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(destination)).await
             {
                 remote = Some(stream);
                 break;
@@ -428,5 +435,8 @@ async fn with_activity<T>(
         }
     }
 }
+#[cfg(all(test, target_os = "macos"))]
+mod acceptance;
+
 #[cfg(test)]
 mod tests;
