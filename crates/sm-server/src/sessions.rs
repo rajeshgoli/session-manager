@@ -10447,7 +10447,7 @@ mod opencode_records_tests;
 
 #[path = "opencode/events_store.rs"]
 mod opencode_events_store;
-pub use opencode_events_store::OpencodeEventInput;
+pub use opencode_events_store::{OpencodeEventInput, OpencodeStopSignal};
 
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

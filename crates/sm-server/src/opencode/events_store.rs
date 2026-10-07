@@ -15,6 +15,28 @@ pub enum OpencodeEventInput<'a> {
     },
 }
 
+/// Retained until the caller schedules the handoff check and acknowledges this
+/// exact signal. An older acknowledgement cannot erase a newer applied stop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpencodeStopSignal {
+    pub key: String,
+    pub conversation: String,
+}
+
+fn pending_stop(session: &Map<String, Value>) -> Result<Option<OpencodeStopSignal>> {
+    if raw_session_is_stopped(session) {
+        return Ok(None);
+    }
+    Ok(session
+        .get("opencode_stop_signal")
+        .cloned()
+        .map(serde_json::from_value::<OpencodeStopSignal>)
+        .transpose()?
+        .filter(|signal| {
+            session.get("provider_resume_id").and_then(Value::as_str) == Some(&signal.conversation)
+        }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingEffect {
     key: String,
@@ -32,7 +54,8 @@ struct PendingEffect {
 impl SessionStore {
     /// Apply a live frame or reconnect snapshot. Callers supply all persisted
     /// host-generated message IDs, including the brief, before decoding owner
-    /// input. A true result requests the same handoff check as an applied Stop.
+    /// input. A true result requests the same handoff check as an applied Stop;
+    /// read and acknowledge the retained signal only after scheduling that check.
     pub fn apply_opencode_events(
         &self,
         session_id: &str,
@@ -198,6 +221,41 @@ impl SessionStore {
         Ok(stop)
     }
 
+    pub fn opencode_pending_stop_signal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<OpencodeStopSignal>> {
+        let state = self.load_parsed_state()?;
+        raw_session_object(&state.raw, session_id)
+            .map(pending_stop)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn acknowledge_opencode_stop_signal(
+        &self,
+        session_id: &str,
+        expected: &OpencodeStopSignal,
+    ) -> Result<bool> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(session) = session_object_mut(ensure_sessions_array_mut(&mut state)?, session_id)
+        else {
+            return Ok(false);
+        };
+        let stored = session
+            .get("opencode_stop_signal")
+            .cloned()
+            .map(serde_json::from_value::<OpencodeStopSignal>)
+            .transpose()?;
+        if stored.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        session.remove("opencode_stop_signal");
+        self.write_raw_json_value(&state)?;
+        Ok(true)
+    }
+
     fn wake_opencode_owner(&self, needed: bool) {
         if needed {
             if let Some(wake) = &self.owner_answered_wake {
@@ -207,7 +265,11 @@ impl SessionStore {
     }
 
     fn drain_opencode_effects(&self, state: &mut Value, session_id: &str) -> Result<(bool, bool)> {
-        let mut stop = false;
+        let mut stop = raw_session_object(state, session_id)
+            .map(pending_stop)
+            .transpose()?
+            .flatten()
+            .is_some();
         let mut owner_wake = false;
         while let Some(session) = raw_session_object(state, session_id) {
             let Some(raw) = session
@@ -325,6 +387,15 @@ impl SessionStore {
             }
             let session = session_object_mut(ensure_sessions_array_mut(state)?, session_id)
                 .context("missing session")?;
+            if current && matches!(pending.effect, Effect::TurnStop { .. }) {
+                session.insert(
+                    "opencode_stop_signal".into(),
+                    serde_json::to_value(OpencodeStopSignal {
+                        key: pending.key,
+                        conversation: pending.conversation,
+                    })?,
+                );
+            }
             session
                 .get_mut("opencode_pending_effects")
                 .and_then(Value::as_array_mut)

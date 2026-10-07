@@ -138,7 +138,11 @@ an old prompt cannot answer a question created after it was typed.
 
 The caller supplies the effective loaded-model configuration, tool-log database
 and all persisted host-generated message IDs (including the initial brief).
-A true result requests the usual handoff check after an applied stop. Context
+A true result requests the usual handoff check after an applied stop. Read
+`opencode_pending_stop_signal`, schedule the check, then acknowledge that exact
+signal with `acknowledge_opencode_stop_signal`. The signal survives later write
+failures and restart until acknowledged; a stale acknowledgement cannot clear
+a newer stop. Context
 measurements use the existing context-update path; provider capability and
 usage-seat attribution remain separate integration work. Event-reader start,
 reconnect and shutdown wiring remains on #2044; public entry points stay disabled.

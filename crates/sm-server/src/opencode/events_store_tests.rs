@@ -58,7 +58,7 @@ impl Fixture {
         }
     }
     fn apply(&self) -> Result<bool> {
-        self.store.apply_opencode_events(
+        let stopped = self.store.apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
                 messages: &self.messages,
@@ -67,7 +67,17 @@ impl Fixture {
             &OpencodeConfig::default(),
             &BTreeSet::from(["msg_user".into()]),
             &self.tool_db,
-        )
+        )?;
+        self.acknowledge_stop();
+        Ok(stopped)
+    }
+    fn acknowledge_stop(&self) {
+        if let Some(signal) = self.store.opencode_pending_stop_signal("agent").unwrap() {
+            assert!(self
+                .store
+                .acknowledge_opencode_stop_signal("agent", &signal)
+                .unwrap());
+        }
     }
     fn raw(&self) -> Value {
         self.store.load_raw_json_value().unwrap()
@@ -191,6 +201,7 @@ fn failed_tool_write_retains_ordered_effects_and_recovery_does_not_count_twice()
     // the registry. Receipts and usage part IDs prevent duplicate side effects.
     fixture.save(&interrupted);
     assert!(fixture.store.recover_opencode_effects("agent").unwrap());
+    fixture.acknowledge_stop();
     assert!(fixture
         .store
         .turn_message_store()
@@ -401,4 +412,130 @@ fn title_error_and_compaction_keep_provider_activity_and_clear_context() {
     );
     assert_eq!(state["sessions"][0]["context_used_percentage"], Value::Null);
     assert_eq!(state["sessions"][0]["turns_completed"], 1);
+}
+
+#[test]
+fn applied_stop_survives_a_later_tool_failure_restart_and_stale_acknowledgement() {
+    let mut fixture = Fixture::new();
+    // The first turn completes while disconnected; the following turn starts
+    // and its tool log cannot be written. The stop precedes the failing effect.
+    fixture.messages[1]["parts"] = json!([fixture.messages[1]["parts"][2].clone()]);
+    let next_user = json!({"info":{"id":"msg_next","sessionID":"ses_test","role":"user","time":{"created":fixture.started+1100}},
+        "parts":[{"id":"prt_nextprompt","sessionID":"ses_test","messageID":"msg_next","type":"text","text":"next"}]});
+    let next_reply = json!({"info":{"id":"msg_nextreply","sessionID":"ses_test","role":"assistant","parentID":"msg_next","time":{"created":fixture.started+1200}},
+        "parts":[{"id":"prt_nexttool","sessionID":"ses_test","messageID":"msg_nextreply","type":"tool","callID":"call-next",
+            "tool":"bash","state":{"status":"running","input":{"command":"git status"}}}]});
+    fixture.messages.extend([next_user, next_reply]);
+    fs::create_dir(&fixture.tool_db).unwrap();
+    assert!(fixture
+        .store
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Backfill {
+                messages: &fixture.messages,
+                activity: Activity::Busy
+            },
+            &OpencodeConfig::default(),
+            &BTreeSet::from(["msg_user".into(), "msg_next".into()]),
+            &fixture.tool_db
+        )
+        .is_err());
+    let signal = fixture
+        .store
+        .opencode_pending_stop_signal("agent")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture.raw()["sessions"][0]["opencode_pending_effects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fixture.raw()["sessions"][0]["turns_completed"], 1);
+    fs::remove_dir(&fixture.tool_db).unwrap();
+    let reopened =
+        SessionStore::new_with_queue(fixture.store.state_file.clone(), fixture.queue.clone());
+    assert!(reopened.recover_opencode_effects("agent").unwrap());
+    assert!(reopened.recover_opencode_effects("agent").unwrap());
+    assert_eq!(
+        reopened.opencode_pending_stop_signal("agent").unwrap(),
+        Some(signal.clone())
+    );
+    let idle = json!({"type":"session.status","properties":{"sessionID":"ses_test","status":{"type":"idle"}}});
+    assert!(reopened
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Live(&idle),
+            &OpencodeConfig::default(),
+            &BTreeSet::new(),
+            &fixture.tool_db
+        )
+        .unwrap());
+    let newer = reopened
+        .opencode_pending_stop_signal("agent")
+        .unwrap()
+        .unwrap();
+    assert_ne!(signal, newer);
+    assert!(!reopened
+        .acknowledge_opencode_stop_signal("agent", &signal)
+        .unwrap());
+    assert!(reopened
+        .acknowledge_opencode_stop_signal("agent", &newer)
+        .unwrap());
+    assert!(!reopened.recover_opencode_effects("agent").unwrap());
+}
+
+#[test]
+fn stop_without_completion_metadata_uses_observation_time_to_fill_finished_row() {
+    let mut fixture = Fixture::new();
+    fixture.messages[1]["info"]["time"]
+        .as_object_mut()
+        .unwrap()
+        .remove("completed");
+    fixture.messages[1]["info"]
+        .as_object_mut()
+        .unwrap()
+        .remove("finish");
+    assert!(!fixture
+        .store
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Backfill {
+                messages: &fixture.messages,
+                activity: Activity::Busy
+            },
+            &OpencodeConfig::default(),
+            &BTreeSet::from(["msg_user".into()]),
+            &fixture.tool_db
+        )
+        .unwrap());
+    fixture
+        .store
+        .turn_message_store()
+        .unwrap()
+        .record_finished("agent", OffsetDateTime::now_utc())
+        .unwrap();
+    let idle = json!({"type":"session.status","properties":{"sessionID":"ses_test","status":{"type":"idle"}}});
+    assert!(fixture
+        .store
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Live(&idle),
+            &OpencodeConfig::default(),
+            &BTreeSet::new(),
+            &fixture.tool_db
+        )
+        .unwrap());
+    assert_eq!(
+        fixture
+            .store
+            .turn_message_store()
+            .unwrap()
+            .finished()
+            .unwrap()[0]
+            .text
+            .as_deref(),
+        Some("done")
+    );
 }

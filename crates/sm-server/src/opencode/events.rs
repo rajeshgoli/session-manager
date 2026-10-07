@@ -164,13 +164,15 @@ impl Projection {
     /// Native message times order replayed turns and owner input correctly.
     /// The adapter falls back to its observation time when metadata is absent.
     pub fn message_time_ms(&self, id: &str, completed: bool) -> Option<i64> {
-        self.message_times.get(id).and_then(|(created, end)| {
-            if completed {
-                end.or(*created)
-            } else {
-                *created
-            }
-        })
+        self.message_times.get(id).and_then(
+            |(created, end)| {
+                if completed {
+                    *end
+                } else {
+                    *created
+                }
+            },
+        )
     }
 
     /// Work on a clone. If committing the batch fails, retain the old
