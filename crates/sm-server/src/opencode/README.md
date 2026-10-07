@@ -76,6 +76,10 @@ cursor, so subsequent reconnects revisit its growing parts. A completed model
 request ending in `tool-calls` continues the same agent turn. It does not emit
 a turn stop. Live turn starts come from busy/retry status, after user text parts
 have supplied the prompt; owner-answer effects also work while already busy.
+Owner-reply effects wait for nonempty user text. Pending reply IDs survive a
+checkpoint/reopen and hold the replay cursor until their text arrives. A
+host-generated message retains that classification even if its text arrives
+after a reconnect and its queue row is no longer in the generated-ID input.
 
 `Client::event_stream` authenticates with the same secret and refuses redirects
 and proxies. Each connection is limited to twenty seconds, including healthy

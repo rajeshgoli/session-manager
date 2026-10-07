@@ -115,6 +115,8 @@ pub struct Projection {
     #[serde(default)]
     users: BTreeSet<String>,
     #[serde(default)]
+    pending_owner_prompts: BTreeSet<String>,
+    #[serde(default)]
     tools: BTreeSet<String>,
     #[serde(default)]
     usage: BTreeSet<String>,
@@ -138,6 +140,7 @@ impl Projection {
             cursor: None,
             activity,
             users: BTreeSet::new(),
+            pending_owner_prompts: BTreeSet::new(),
             tools: BTreeSet::new(),
             usage: BTreeSet::new(),
             stops: BTreeSet::new(),
@@ -223,6 +226,12 @@ impl Projection {
                 .as_array()
                 .context("backfill message missing parts")?;
             self.message(info, parts, generated_user_ids, true, &mut effects)?;
+            // Metadata can precede the user's text, even in a snapshot taken
+            // during submission. Keep revisiting it until the reply is known.
+            if self.pending_owner_prompts.contains(id) && !held {
+                held = true;
+                self.cursor = Some(id.into());
+            }
             if info["role"] == "assistant" {
                 self.last_assistant = Some(id.into());
                 for part in parts {
@@ -266,30 +275,32 @@ impl Projection {
         let id = info["id"].as_str().context("opencode message missing id")?;
         validate_id(id, "msg")?;
         if info["role"] == "user" {
-            let text = parts
+            let mut text = parts
                 .iter()
                 .filter(|part| part["type"] == "text")
                 .filter_map(|part| part["text"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
+            if text.is_empty() {
+                text = self.message_text(id);
+            }
             if !text.is_empty() {
                 self.last_user = text.clone();
             }
-            if self.users.insert(id.into()) {
+            let new_user = self.users.insert(id.into());
+            if new_user {
                 self.last_user_id = Some(id.into());
                 if !generated.contains(id) {
-                    effects.push(Effect::OwnerPrompt {
-                        message_id: id.into(),
-                        text,
-                    });
+                    self.pending_owner_prompts.insert(id.into());
                 }
-                if backfill && self.activity == Activity::Idle {
-                    self.activity = Activity::Busy;
-                    effects.push(Effect::TurnStart {
-                        message_id: Some(id.into()),
-                        prompt: self.last_user.clone(),
-                    });
-                }
+            }
+            self.owner_prompt(id, &text, effects);
+            if new_user && backfill && self.activity == Activity::Idle {
+                self.activity = Activity::Busy;
+                effects.push(Effect::TurnStart {
+                    message_id: Some(id.into()),
+                    prompt: self.last_user.clone(),
+                });
             }
         } else if info["role"] == "assistant" {
             self.last_assistant = Some(id.into());
@@ -312,13 +323,11 @@ impl Projection {
                     .entry(message_id.into())
                     .or_default()
                     .insert(id.into(), part["text"].as_str().unwrap_or_default().into());
+                let text = self.message_text(message_id);
                 if self.last_user_id.as_deref() == Some(message_id) {
-                    self.last_user = self.text[message_id]
-                        .values()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    self.last_user = text.clone();
                 }
+                self.owner_prompt(message_id, &text, effects);
             }
             Some("tool")
                 if part["state"]["status"] == "running"
@@ -352,12 +361,27 @@ impl Projection {
         Ok(())
     }
 
+    fn message_text(&self, message_id: &str) -> String {
+        self.text
+            .get(message_id)
+            .map(|parts| parts.values().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    }
+
     fn assistant_text(&self) -> String {
         self.last_assistant
             .as_ref()
-            .and_then(|id| self.text.get(id))
-            .map(|parts| parts.values().cloned().collect::<Vec<_>>().join("\n"))
+            .map(|id| self.message_text(id))
             .unwrap_or_default()
+    }
+
+    fn owner_prompt(&mut self, message_id: &str, text: &str, effects: &mut Vec<Effect>) {
+        if !text.is_empty() && self.pending_owner_prompts.remove(message_id) {
+            effects.push(Effect::OwnerPrompt {
+                message_id: message_id.into(),
+                text: text.into(),
+            });
+        }
     }
 
     fn change_activity(

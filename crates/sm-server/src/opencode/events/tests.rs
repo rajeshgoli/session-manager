@@ -167,9 +167,24 @@ fn live_prompt_parts_arrive_before_busy_and_supply_the_turn_start_text() {
         )
         .unwrap();
     assert_eq!(starts(&effects), 0);
-    projection
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
+    let effects = projection
         .live(&live_part(prompt["parts"][0].clone()), &BTreeSet::new())
         .unwrap();
+    assert_eq!(
+        effects,
+        vec![Effect::OwnerPrompt {
+            message_id: "msg_01".into(),
+            text: "new prompt".into(),
+        }]
+    );
+    assert!(!projection
+        .live(&live_part(prompt["parts"][0].clone()), &BTreeSet::new())
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
     let effects = projection
         .live(
             &json!({"type":"session.status", "properties":{"sessionID":"ses_test", "status":{"type":"busy"}}}),
@@ -191,9 +206,15 @@ fn live_stop_is_not_reapplied_by_history_and_owner_typing_while_busy_is_observed
     let owner = user("msg_01", "owner answer");
     let event = json!({"type": "message.updated", "properties": {"info": owner["info"]}});
     let effects = projection.live(&event, &BTreeSet::new()).unwrap();
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
+    let effects = projection
+        .live(&live_part(owner["parts"][0].clone()), &BTreeSet::new())
+        .unwrap();
     assert!(effects
         .iter()
-        .any(|e| matches!(e, Effect::OwnerPrompt { message_id, .. } if message_id == "msg_01")));
+        .any(|e| matches!(e, Effect::OwnerPrompt { message_id, text } if message_id == "msg_01" && text == "owner answer")));
     assert_eq!(starts(&effects), 0);
     assert_eq!(
         starts(&projection.live(&event, &BTreeSet::new()).unwrap()),
@@ -217,6 +238,84 @@ fn live_stop_is_not_reapplied_by_history_and_owner_typing_while_busy_is_observed
         ),
         0
     );
+}
+
+#[test]
+fn pending_owner_reply_survives_reopen_and_backfill_cursor_does_not_skip_its_text() {
+    let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+    let mut prompt = user("msg_01", "reply after disconnect");
+    let parts = prompt["parts"].take();
+    prompt["parts"] = json!([]);
+    let history = vec![prompt.clone(), assistant("msg_02", false, "", vec![])];
+    projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(projection.cursor.as_deref(), Some("msg_01"));
+    let mut reopened: Projection =
+        serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+    prompt["parts"] = parts;
+    let history = vec![prompt, assistant("msg_02", false, "", vec![])];
+    let effects = reopened
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(
+        effects,
+        vec![Effect::OwnerPrompt {
+            message_id: "msg_01".into(),
+            text: "reply after disconnect".into(),
+        }]
+    );
+    assert_eq!(reopened.cursor.as_deref(), Some("msg_02"));
+    assert!(reopened
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn generated_classification_survives_reopen_and_text_before_metadata_is_supported() {
+    for generated in [false, true] {
+        let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+        let prompt = user("msg_01", "message body");
+        let ids = if generated {
+            BTreeSet::from(["msg_01".into()])
+        } else {
+            BTreeSet::new()
+        };
+        let metadata = json!({"type":"message.updated", "properties":{"info":prompt["info"]}});
+        let part = live_part(prompt["parts"][0].clone());
+        projection.live(&metadata, &ids).unwrap();
+        let mut reopened: Projection =
+            serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+        let effects = reopened.live(&part, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::OwnerPrompt { text, .. } if text == "message body"))
+                .count(),
+            usize::from(!generated)
+        );
+        assert!(!reopened
+            .live(&metadata, &BTreeSet::new())
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
+
+        let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+        assert!(!projection
+            .live(&part, &ids)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
+        let effects = projection.live(&metadata, &ids).unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::OwnerPrompt { text, .. } if text == "message body"))
+                .count(),
+            usize::from(!generated)
+        );
+    }
 }
 
 #[test]
