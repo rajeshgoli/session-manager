@@ -382,6 +382,20 @@ pub fn revoke_config_device_key(db_path: &Path, user_id: &str, device_id: &str) 
     Ok(changed > 0)
 }
 
+pub fn clear_config_device_key_revocation(
+    db_path: &Path,
+    user_id: &str,
+    device_id: &str,
+) -> Result<()> {
+    open_device_db(db_path)?
+        .execute(
+            "DELETE FROM revoked_config_device_keys WHERE user_id = ? AND device_id = ?",
+            params![user_id, device_id],
+        )
+        .context("failed to clear config device key revocation")?;
+    Ok(())
+}
+
 pub fn revoked_config_device_keys(db_path: &Path) -> Result<BTreeSet<(String, String)>> {
     if !db_path.exists() {
         return Ok(BTreeSet::new());
@@ -709,6 +723,16 @@ async fn complete_device_enrollment(
         let _ = revoke_device(&state.db_path, &completed_registration.user_id, &device_id);
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
+    // Pairing again is the owner's way back from a revocation, including one of
+    // a config-file key with the same id. Clear it only once the edge allows the
+    // device; on failure the key stays revoked. The server reloads it on restart.
+    if let Err(error) = clear_config_device_key_revocation(
+        &state.db_path,
+        &completed_registration.user_id,
+        &device_id,
+    ) {
+        eprintln!("clearing config key revocation for {device_id} failed: {error:#}");
+    }
     println!(
         "Enrolled device: {device_id} (user_id={})",
         completed_registration.user_id
@@ -982,14 +1006,6 @@ fn complete_pairing_registration(
             ],
         )
         .context("failed to upsert mobile device enrollment")?;
-    // Pairing again is the owner's way back from a revocation, including one
-    // of a config-file key with the same id; the server reloads it on restart.
-    transaction
-        .execute(
-            "DELETE FROM revoked_config_device_keys WHERE user_id = ? AND device_id = ?",
-            params![registration.user_id, device_id],
-        )
-        .context("failed to clear config device key revocation")?;
     insert_audit_event(
         &transaction,
         Some(&registration.user_id),
@@ -2043,6 +2059,8 @@ mod tests {
         let pairing = create_pairing_registration(&db, "owner", 15).unwrap();
         complete_pairing_registration(&db, &pairing.token, "phone", "Phone", "public-key", None)
             .unwrap();
+        assert_eq!(revoked_config_device_keys(&db).unwrap().len(), 1);
+        clear_config_device_key_revocation(&db, "owner", "phone").unwrap();
         assert!(revoked_config_device_keys(&db).unwrap().is_empty());
         let users = BTreeSet::from(["owner".into()]);
         let device = list_active_devices_for_users(&db, &users)
