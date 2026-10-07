@@ -358,6 +358,61 @@ pub fn revoke_device(db_path: &Path, user_id: &str, device_id: &str) -> Result<b
     Ok(changed > 0)
 }
 
+/// Keys listed in config.yaml cannot be edited by the server, so their
+/// revocation is kept here and reloaded at startup; otherwise it would end at
+/// the next restart and the key would be admitted again.
+pub fn revoke_config_device_key(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
+    let connection = open_device_db(db_path)?;
+    let changed = connection
+        .execute(
+            "INSERT OR IGNORE INTO revoked_config_device_keys (user_id, device_id, revoked_at) VALUES (?, ?, ?)",
+            params![user_id, device_id, local_timestamp()],
+        )
+        .context("failed to persist config device key revocation")?;
+    if changed > 0 {
+        insert_audit_event(
+            &connection,
+            Some(user_id),
+            Some(device_id),
+            "config_device_key_revoked",
+            None,
+            None,
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+pub fn clear_config_device_key_revocation(
+    db_path: &Path,
+    user_id: &str,
+    device_id: &str,
+) -> Result<()> {
+    open_device_db(db_path)?
+        .execute(
+            "DELETE FROM revoked_config_device_keys WHERE user_id = ? AND device_id = ?",
+            params![user_id, device_id],
+        )
+        .context("failed to clear config device key revocation")?;
+    Ok(())
+}
+
+pub fn revoked_config_device_keys(db_path: &Path) -> Result<BTreeSet<(String, String)>> {
+    if !db_path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let connection = open_device_db(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT user_id, device_id FROM revoked_config_device_keys")
+        .context("failed to prepare config device key revocation query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query config device key revocations")?;
+    rows.collect::<rusqlite::Result<_>>()
+        .context("failed to read config device key revocation row")
+}
+
 pub fn create_pairing_registration(
     db_path: &Path,
     user_id: &str,
@@ -668,6 +723,16 @@ async fn complete_device_enrollment(
         let _ = revoke_device(&state.db_path, &completed_registration.user_id, &device_id);
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
+    // Pairing again is the owner's way back from a revocation, including one of
+    // a config-file key with the same id. Clear it only once the edge allows the
+    // device; on failure the key stays revoked. The server reloads it on restart.
+    if let Err(error) = clear_config_device_key_revocation(
+        &state.db_path,
+        &completed_registration.user_id,
+        &device_id,
+    ) {
+        eprintln!("clearing config key revocation for {device_id} failed: {error:#}");
+    }
     println!(
         "Enrolled device: {device_id} (user_id={})",
         completed_registration.user_id
@@ -799,6 +864,13 @@ fn migrate_device_db(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_timestamp ON mobile_device_enrollment_audit(timestamp);
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_device_id ON mobile_device_enrollment_audit(device_id);
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_event ON mobile_device_enrollment_audit(event);
+
+            CREATE TABLE IF NOT EXISTS revoked_config_device_keys (
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                revoked_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            );
             "#,
         )
         .context("failed to migrate mobile device enrollment DB")?;
@@ -1982,9 +2054,14 @@ mod tests {
         }
         let dir = temporary_dir("sm-browser-device-test").unwrap();
         let db = dir.join("devices.db");
+        assert!(revoke_config_device_key(&db, "owner", "phone").unwrap());
+        assert!(!revoke_config_device_key(&db, "owner", "phone").unwrap());
         let pairing = create_pairing_registration(&db, "owner", 15).unwrap();
         complete_pairing_registration(&db, &pairing.token, "phone", "Phone", "public-key", None)
             .unwrap();
+        assert_eq!(revoked_config_device_keys(&db).unwrap().len(), 1);
+        clear_config_device_key_revocation(&db, "owner", "phone").unwrap();
+        assert!(revoked_config_device_keys(&db).unwrap().is_empty());
         let users = BTreeSet::from(["owner".into()]);
         let device = list_active_devices_for_users(&db, &users)
             .unwrap()
