@@ -165,6 +165,7 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
             &queue_dir,
             agent,
             local_wall::WallSpec {
+                host_authority_sha256: None,
                 agent_state: fixture.path("profile").parent().unwrap().to_path_buf(),
                 checkout: fixture.path("checkout"),
                 profile: fixture.path("profile"),

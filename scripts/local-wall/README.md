@@ -64,6 +64,20 @@ Missing or replaced artifacts fail before launch, with no host execution fallbac
 An uncertain egress registration result triggers deactivation while preserving
 its durable port assignments.
 
+The live server owns `GenerationWalls`, the retained walls for one serving
+process. It restores saved production registrations before queue recovery,
+retries unavailable predecessor locks/services every five seconds, and makes the
+retained walls available through `AppState::local_walls` for the future provider.
+Shutdown stops preparation and launch admission and detaches queue launchers;
+running children keep their service references until supervisor cleanup. A valid
+pending command without a live launcher waits with `holding_reason=local_wall`
+and leaves unrelated hosted jobs eligible. Invalid artifact or authority hashes
+still cause failed starts. Recovery requires the host-authority hash pinned in
+the durable manifest; legacy manually attached queue primitives do not become
+production wall registrations automatically. Host authority is persisted before
+the first queue manifest is published, so an interrupted first preparation can
+retry without manual deletion.
+
 The input state layout is:
 
 ```text

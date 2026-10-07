@@ -663,6 +663,8 @@ fn btw_worker_blocks_handover_across_rollback_generations() {
 pub struct AppState {
     config: AppConfig,
     local_agent_verifier: crate::local_egress::gateway::StampVerifier,
+    #[cfg(target_os = "macos")]
+    local_walls: Option<Arc<crate::local_wall::recovery::GenerationWalls>>,
     shutdown: crate::handover::Shutdown,
     btw_workers: BtwWorkers,
     listen_port: u16,
@@ -845,6 +847,8 @@ impl AppState {
             .map(|root| root.join("local-egress"))
             .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            local_walls: None,
             local_agent_verifier: crate::local_egress::gateway::StampVerifier::new(
                 gateway_directory,
             ),
@@ -897,6 +901,19 @@ impl AppState {
     pub fn with_btw_workers(mut self, workers: BtwWorkers) -> Self {
         self.btw_workers = workers;
         self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn with_local_walls(
+        mut self,
+        walls: Arc<crate::local_wall::recovery::GenerationWalls>,
+    ) -> Self {
+        self.local_walls = Some(walls);
+        self
+    }
+    #[cfg(target_os = "macos")]
+    pub fn local_walls(&self) -> Option<Arc<crate::local_wall::recovery::GenerationWalls>> {
+        self.local_walls.clone()
     }
 
     pub fn btw_workers(&self) -> BtwWorkers {

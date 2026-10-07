@@ -310,6 +310,28 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     let d = host
         .prepare_for_queue(&d_registration, &queue_state)
         .unwrap();
+    // Refuse manifest publication after authority has persisted, then retry.
+    let publication = registration("wall-publication", 18505);
+    let registry = queue_state.join("local-walls");
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o500)).unwrap();
+    let interrupted = host.prepare_for_queue(&publication, &queue_state);
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(interrupted.is_err());
+    assert!(host
+        .config
+        .state_root
+        .join(&publication.id)
+        .join("xdg/config/queue-authority.json")
+        .is_file());
+    assert!(
+        crate::queue::local_wall::registered_spec(&queue_state, &publication.id)
+            .unwrap()
+            .is_none()
+    );
+    let publication = host.prepare_for_queue(&publication, &queue_state).unwrap();
+    publication.suspend().unwrap();
+    publication.retire_queue().unwrap();
+    drop(publication);
     let request = |wall: &Arc<PreparedWall>, other: &AgentRegistration| {
         let other_network = egress.registration(&other.id).unwrap().unwrap();
         crate::queue::CreateQueueJob {
@@ -359,26 +381,49 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     )
     .unwrap();
     let manifest = queue_state.join("local-walls/wall-c.json");
-    let mut holding = request(&c, &d_registration);
-    holding.script = None;
-    holding.argv = Some(vec![
-        c.artifacts.tools["probe"].display().to_string(),
-        "hold".into(),
-    ]);
-    let holding = RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, holding).unwrap();
-    let holding_id = holding.id.clone();
     assert!(crate::queue::local_wall::retire_registration(&queue_state, &c.id).is_err());
     let saved_manifest = fs::read(&manifest).unwrap();
     let saved_profile = fs::read(&c.artifacts.profile).unwrap();
     c.detach_queue().unwrap();
     d.detach_queue().unwrap();
-    assert!(RetainedQueueStore::start_queue_job_in_state_dir(
+    let held = RetainedQueueStore::start_queue_job_in_state_dir(
         &queue_state,
         &root.join("messages.db"),
         &refused.id,
-        0
+        0,
     )
-    .is_err());
+    .unwrap()
+    .unwrap();
+    assert_eq!(held.state, "pending");
+    assert_eq!(held.holding_reason.as_deref(), Some("local_wall"));
+    let mut hosted = request(&c, &d_registration);
+    hosted.local_submitter = None;
+    hosted.requester_session_id = None;
+    hosted.env.clear();
+    hosted.script = Some("print hosted-wall-recovery-ok".into());
+    let hosted = RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, hosted).unwrap();
+    RetainedQueueStore::admit_queue_jobs_in_state_dir(&queue_state, &root.join("messages.db"), 0)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let result = RetainedQueueStore::get_queue_job_strict_from_path(
+            &queue_state.join("queue_runner.db"),
+            &hosted.id,
+        )
+        .unwrap()
+        .unwrap();
+        if result.state != "running" && result.state != "pending" {
+            let output = fs::read_to_string(result.log_path.unwrap()).unwrap();
+            assert_eq!(result.state, "succeeded", "{output}");
+            assert!(output.contains("hosted-wall-recovery-ok"), "{output}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hosted job blocked by restoration"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(c);
     drop(d);
     // An unrelated new host listener must not change the saved profile hash.
@@ -397,7 +442,15 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
         .unwrap();
     assert_eq!(fs::read(manifest).unwrap(), saved_manifest);
     assert_eq!(fs::read(&c.artifacts.profile).unwrap(), saved_profile);
-    for job in [c_job, d_job, holding] {
+    let mut holding = request(&c, &d_registration);
+    holding.script = None;
+    holding.argv = Some(vec![
+        c.artifacts.tools["probe"].display().to_string(),
+        "hold".into(),
+    ]);
+    let holding = RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, holding).unwrap();
+    let holding_id = holding.id.clone();
+    for job in [c_job, d_job, holding, refused] {
         RetainedQueueStore::start_queue_job_in_state_dir(
             &queue_state,
             &root.join("messages.db"),
@@ -436,11 +489,85 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    let corrupted_job = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state,
+        request(&c, &d_registration),
+    )
+    .unwrap();
+    let authority_path = host
+        .config
+        .state_root
+        .join(&c.id)
+        .join("xdg/config/queue-authority.json");
+    let saved_authority = fs::read(&authority_path).unwrap();
+    fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&authority_path, b"{}").unwrap();
+    fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o400)).unwrap();
+    let corrupted_start = RetainedQueueStore::start_queue_job_in_state_dir(
+        &queue_state,
+        &root.join("messages.db"),
+        &corrupted_job.id,
+        0,
+    );
+    fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&authority_path, saved_authority).unwrap();
+    fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(
+        corrupted_start.is_err(),
+        "changed host authority must fail closed"
+    );
+    assert_eq!(
+        RetainedQueueStore::get_queue_job_strict_from_path(
+            &queue_state.join("queue_runner.db"),
+            &corrupted_job.id,
+        )
+        .unwrap()
+        .unwrap()
+        .state,
+        "failed"
+    );
     let saved_judge_token = c.environment["LOCAL_JUDGE_TOKEN"].clone();
+    let restarted_job = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state,
+        request(&c, &d_registration),
+    )
+    .unwrap();
+    let restart_input = root.join("restart-input.json");
+    let manifest_path = queue_state.join("local-walls/wall-c.json");
+    let manifest_before_restart = fs::read(&manifest_path).unwrap();
+    fs::write(
+        &restart_input,
+        serde_json::to_vec(&json!({
+            "queue": queue_state, "python": host.config.python,
+            "upstream": upstream_address, "model_url": config.local_host.base_url,
+            "egress": egress.directory(), "judge": judge.directory(),
+            "judge_port": judge.port().unwrap(), "old_peer": c.broker_peer_token().0,
+            "job": restarted_job.id,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     c.suspend().unwrap();
     d.suspend().unwrap();
     drop(c);
     drop(d);
+    let restarted = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "local_wall::recovery::tests::restore_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SM_WALL_RESTORE_FIXTURE", &restart_input)
+        .output()
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "restart stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&restarted.stdout),
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    assert_eq!(fs::read(manifest_path).unwrap(), manifest_before_restart);
     let c = host
         .prepare_for_queue(&c_registration, &queue_state)
         .unwrap();

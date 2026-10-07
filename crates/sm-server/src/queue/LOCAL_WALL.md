@@ -46,6 +46,12 @@ The saved host authority pins agent metadata, source hashes, service assignments
 and profile generator. Matching restores keep the original profile and saved
 judge credential, while compiling a fresh adapter against the live broker.
 Changed authority fails closed instead of changing an admitted job's fingerprint.
+Production manifests also pin the host preparation authority file's hash.
+The server restores those registrations before startup admission and retries
+temporarily unavailable old-generation services. Valid work without its live
+launcher stays pending with `local_wall`; it does not block hosted work. Invalid
+saved authority follows the failed-start path. A server-generation shutdown stops
+new launches and detaches bindings while preserving durable registrations.
 
 ## Submission, execution, and restart
 
@@ -65,8 +71,9 @@ files, other agents, and direct network endpoints while the socket adapter
 provides authorized ordinary socket behavior.
 
 Restore the saved profile/environment and attach the reconstructed socket service
-before admitting pending jobs after restart. Missing or changed state produces a
-failed start, never a host execution fallback. Detaching removes only the live
+before admitting pending jobs after restart. Missing or changed immutable state
+produces a failed start; a valid registration waiting for its live launcher stays
+pending. Neither path permits host execution fallback. Detaching removes only the live
 binding. Dropping a running supervisor kills its descendants; a restart cannot
 claim a successful exit without recorded evidence. The host removes immutable
 queue input files when retiring the agent, after its queued/running work ends.
