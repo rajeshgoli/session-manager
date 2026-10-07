@@ -5,6 +5,7 @@
 (function () {
   'use strict';
   const REPO_URL = 'https://github.com/rajeshgoli/session-manager';
+  const INSTALL_URL = `${REPO_URL}/blob/main/docs/product/operator_guide.md#install-on-macos`;
   const me = document.currentScript;
   const appModule = me && me.dataset.app;
   const topLevel = window.top === window;
@@ -54,10 +55,13 @@
       toastNode = el('div', { className: 'sm-demo-toast', role: 'status' });
       document.body.append(toastNode);
     }
-    toastNode.textContent = text;
+    // The notice says what the real app would do; a link names where to get it.
+    toastNode.replaceChildren(text.replace(/[;.]?\s*Install Session Manager[^.]*\.?$/i, '. '),
+      ...(/Install Session Manager/i.test(text)
+        ? [el('a', { href: INSTALL_URL, target: '_blank', rel: 'noopener', textContent: 'Install Session Manager →' })] : []));
     toastNode.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastNode.classList.remove('show'), 2500);
+    toastTimer = setTimeout(() => toastNode.classList.remove('show'), 6000);
   }
 
   // ---- boot ------------------------------------------------------------------

@@ -74,6 +74,19 @@ TICKETS = {
     45: ("Order confirmation emails", 40, [42]),
     46: ("Checkout page", 40, [44, 45]),
 }
+# Last week's sprint, finished before the recording starts. Its agents are the
+# retired ones History offers to bring back.
+PAST_TICKETS = {
+    30: ("Cart v1", None, []),
+    31: ("Cart line items and quantities", 30, []),
+    32: ("Keep a cart across devices", 30, []),
+    33: ("Cart page empty and loading states", 30, []),
+    34: ("Format prices for the shopper's locale", 30, []),
+}
+BODIES = {
+    40: "Ship the new checkout: totals, coupons, search, payments, emails and the page itself.",
+    30: "A cart shoppers can trust: items, quantities, prices and the same cart on every device.",
+}
 
 AGENTS = {
     # id: (name, provider, model, effort, parent, ticket)
@@ -86,6 +99,22 @@ AGENTS = {
     "a0000045": ("shop-45", "codex", "gpt-5.5", "high", "a0000001", 45),
     "a0000046": ("shop-46", "claude", "sonnet", "high", "a0000001", 46),
 }
+PAST_AGENTS = {
+    # id: (name, provider, model, effort, parent, ticket, PR, days ago it retired, last turn)
+    "a0000030": ("planner", "claude", "fable", "xhigh", None, None, None, 4.2,
+                 "Cart v1 is done: all four tickets merged. Closing the goal."),
+    "a0000031": ("cart-31", "claude", "opus[1m]", "high", "a0000030", 31, 35, 6.1,
+                 "PR #35 merged. Line items now carry quantity limits and a stock check."),
+    "a0000032": ("cart-32", "codex", "gpt-5.5", "high", "a0000030", 32, 36, 5.3,
+                 "Merged #36. Carts sync through the account; guest carts merge on sign-in."),
+    "a0000033": ("cart-33", "claude", "sonnet", "high", "a0000030", 33, 37, 4.9,
+                 "Empty and loading states are in (#37). Screenshots are on the PR."),
+    "a0000034": ("cart-34", "codex", "qwen3-coder-next", "high", "a0000030", 34, 38, 4.4,
+                 "Prices format by locale (#38): currency symbol, separators and rounding."),
+    "a0000029": ("scout", "claude", "sonnet", "high", None, None, None, 2.0,
+                 "Compared three payment providers; my notes are in the Checkout v2 plan."),
+}
+AGENTS.update({agent_id: spec[:6] for agent_id, spec in PAST_AGENTS.items()})
 BY_NAME = {spec[0]: agent_id for agent_id, spec in AGENTS.items()}
 
 
@@ -100,13 +129,15 @@ class World:
         self.world_file = f"{ROOT}/gh-world.json"
         self.live = {}  # agent id -> {"working": bool, "since": iso}
         self.gh = {"repos": {REPO: {"issues": {}, "prs": {}}}}
-        for number, (title, parent, blocked_by) in TICKETS.items():
-            self.gh["repos"][REPO]["issues"][str(number)] = {
-                "title": title, "state": "open", "parent": parent, "blocked_by": blocked_by,
-                "sub_issues": [n for n, t in TICKETS.items() if t[1] == number],
-                "body": f"Part of the Checkout v2 goal (#40)." if parent else "Ship the new checkout.",
-                "updated_at": iso_s(ago(3600)),
-            }
+        for tickets, goal in ((TICKETS, "Checkout v2"), (PAST_TICKETS, "Cart v1")):
+            for number, (title, parent, blocked_by) in tickets.items():
+                self.gh["repos"][REPO]["issues"][str(number)] = {
+                    "title": title, "state": "open", "parent": parent, "blocked_by": blocked_by,
+                    "sub_issues": [n for n, t in tickets.items() if t[1] == number],
+                    "body": BODIES.get(number) or f"Part of the {goal} goal (#{parent}).",
+                    "author": "alex-demo", "created_at": iso_s(ago(9 * 86400)),
+                    "updated_at": iso_s(ago(3600)),
+                }
         self.jobs = {}  # label -> job id
         self.messages = {}  # key -> owner message id
         self.reviews = {}  # key -> registration id
@@ -169,7 +200,7 @@ class World:
 
     def worktree(self, agent_id):
         name = AGENTS[agent_id][0]
-        return SHOP if name == "lead" else f"{HOME}/worktrees/shop-{name.split('-')[1]}"
+        return f"{HOME}/worktrees/{name}" if "-" in name else SHOP
 
     # ---- sessions -----------------------------------------------------------
 
@@ -442,6 +473,40 @@ class World:
 # ---- the storyline ------------------------------------------------------------
 # (seconds into the sprint, chapter caption or None, action)
 
+def prologue(w):
+    """Last week's Cart v1 sprint, played through the real CLI and then moved
+    into the past, so History has retired agents and finished tickets."""
+    def backdate(agent_id, days, pr, ticket):
+        end, start = ago(days * 86400), ago(days * 86400 + 95 * 60)
+        w.patch_session(agent_id, created_at=iso(start), spawned_at=iso(start), stopped_at=iso(end),
+                        completed_at=iso(end), last_activity=iso(end), activity_hook_at=iso(end),
+                        activity_turn_start_hook_at=iso(end))
+        w.sql("UPDATE work_claims SET claimed_at = ?, ended_at = ? WHERE session_id = ?",
+              (iso_s(start), iso_s(end), agent_id))
+        w.sql("UPDATE turn_messages SET at = ? WHERE session_id = ?", (iso(end), agent_id))
+        if pr:
+            w.sql("UPDATE work_items SET merged_at = ?, closed_at = ? WHERE repo = ? AND number = ?",
+                  (iso_s(end), iso_s(end), REPO, pr))
+            w.gh["repos"][REPO]["prs"][str(pr)].update(merged_at=iso_s(end), closed_at=iso_s(end))
+            w.gh["repos"][REPO]["issues"][str(ticket)].update(closed_at=iso_s(end), updated_at=iso_s(end))
+            w.save_gh()
+
+    for agent_id, spec in sorted(PAST_AGENTS.items(), key=lambda kv: -kv[1][7]):
+        name, _, _, _, _, ticket, pr, days, last = spec
+        w.spawn(agent_id, minutes_ago=int(days * 1440) + 95)
+        if ticket:
+            w.sm(agent_id, "ticket", str(ticket), "--repo", REPO)
+        if pr:
+            w.open_pr(agent_id, pr, ticket, PAST_TICKETS[ticket][0])
+            w.merge(pr, ticket)
+        w.turn(agent_id, last)
+        w.retire(agent_id)
+        backdate(agent_id, days, pr, ticket)
+    w.close(30)
+    w.gh["repos"][REPO]["issues"]["30"].update(closed_at=iso_s(ago(4.2 * 86400)), updated_at=iso_s(ago(4.2 * 86400)))
+    w.save_gh()
+
+
 def storyline(w):
     lead, a41, a42, a43, a44, a45, a46 = (BY_NAME[n] for n in
                                           ("lead", "shop-41", "shop-42", "shop-43", "shop-44", "shop-45", "shop-46"))
@@ -641,6 +706,7 @@ GLOBAL = [
     "/inbox?format=json", "/inbox?format=json&filter=open", "/inbox?format=json&filter=docs",
     "/inbox?format=json&filter=done",
     "/guestbook?format=json&repo=&before=",
+    "/history?format=json&repo=&before=", "/history/agents?format=json&q=&before=",
     "/docs", "/client/sessions", "/client/settings",
     "/client/session-models?provider=claude", "/client/session-models?provider=codex",
     "/client/session-models?provider=codex-fork",
@@ -763,7 +829,18 @@ def detail_urls(captured):
     for doc in json.loads(captured.get("/docs", b"{}") or b"{}").get("docs", []):
         did = doc["id"]
         urls += [f"/docs/{did}?format=json", f"/docs/{did}/ask-target", f"/docs/{did}/ask-items"]
+    # The ticket panel (History rows, Board cards, PR links): GitHub view and sm history.
+    numbers = set()
+    for row in json.loads(captured.get("/history?format=json&repo=&before=", b"{}") or b"{}").get("rows", []):
+        numbers.add(row["number"])
+        numbers.update(pr["number"] for pr in row.get("prs", []))
+        urls.append(f"/t/{REPO.split('/')[1]}/{row['number']}?format=json")
     board = json.loads(captured.get("/client/board?clock_hours=3", b"{}") or b"{}")
+    for lane in board.get("lanes", []):
+        numbers.update(ticket["number"] for ticket in lane.get("tickets", []))
+        if (lane.get("goal") or {}).get("number"):
+            numbers.add(lane["goal"]["number"])
+    urls += [f"/client/github/{REPO}/{number}" for number in sorted(numbers)]
     for lane in board.get("lanes", []):
         for ticket in lane.get("tickets", []):
             if ticket.get("state") not in ("done", "closed"):
@@ -980,6 +1057,7 @@ def main():
     seed(w)
     start_server(w, args)
     # The lead was already planning when the recording starts.
+    prologue(w)
     w.spawn("a0000001", minutes_ago=18)
     # Record beside the destination and swap it in only after the leak scan.
     final_out, args.out = args.out, args.out.rstrip("/") + ".partial"
@@ -1019,6 +1097,13 @@ def main():
     }
     with open(os.path.join(args.out, "timeline.json"), "w") as out:
         json.dump(timeline, out, indent=1)
+    # The static layer (Analytics, notes) is not part of the recording; keep it.
+    for name in ("static", "static.json"):
+        src = os.path.join(final_out, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(args.out, name))
+        elif os.path.exists(src):
+            shutil.copy(src, args.out)
 
     leaks = []
     words = denylist()

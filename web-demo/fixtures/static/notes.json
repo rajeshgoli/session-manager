@@ -1,0 +1,67 @@
+{
+ "captured_at": "2026-10-07T01:00:00Z",
+ "notes": [
+  {
+   "id": "n-checkout",
+   "body": "# Checkout v2: things to watch\n\n- [x] Plan approved: six tickets under goal #40\n- [ ] Coupons: confirm they **don't stack** with sale prices (asked in #42)\n- [ ] Payment adapter (#44) waits on cart totals (#41)\n- [ ] Ask `lead` for a demo once #46 merges\n\nThe search index (#43) runs on the local Qwen model. Compare its PR with the Codex ones.",
+   "version": 2,
+   "updated_at": "2026-10-07T00:36:00Z",
+   "revisions": [
+    {
+     "version": 2,
+     "at": "2026-10-07T00:36:00Z",
+     "body": "# Checkout v2: things to watch\n\n- [x] Plan approved: six tickets under goal #40\n- [ ] Coupons: confirm they **don't stack** with sale prices (asked in #42)\n- [ ] Payment adapter (#44) waits on cart totals (#41)\n- [ ] Ask `lead` for a demo once #46 merges\n\nThe search index (#43) runs on the local Qwen model. Compare its PR with the Codex ones."
+    },
+    {
+     "version": 1,
+     "at": "2026-10-06T21:36:00Z",
+     "body": "# Checkout v2: things to watch\n\n- [ ] Plan review\n- [ ] Coupons stacking?"
+    }
+   ]
+  },
+  {
+   "id": "n-models",
+   "body": "# Which model gets which ticket\n\n- **Plans, specs, unclear problems:** Top seat (Fable)\n- **Well-specified tickets:** Mid seat (Opus or Codex)\n- **Mechanical changes and docs:** Local seat (Qwen on the Mac)\n\nCodex reviews every PR. One P1 blocks the merge; P2s don't.",
+   "version": 1,
+   "updated_at": "2026-10-05T23:00:00Z",
+   "revisions": [
+    {
+     "version": 1,
+     "at": "2026-10-05T23:00:00Z",
+     "body": "# Which model gets which ticket\n\n- **Plans, specs, unclear problems:** Top seat (Fable)\n- **Well-specified tickets:** Mid seat (Opus or Codex)\n- **Mechanical changes and docs:** Local seat (Qwen on the Mac)\n\nCodex reviews every PR. One P1 blocks the merge; P2s don't."
+    }
+   ]
+  },
+  {
+   "id": "n-standup",
+   "body": "# Friday notes\n\nCart v1 shipped this week: four tickets, four agents, no rework.\n\n1. Next sprint: **Checkout v2**\n2. Keep the tests slot at 1 so jobs don't fight over the Mac\n3. Try the local model on a real ticket\n\n> Write the plan first; the agents are faster than I can review.",
+   "version": 2,
+   "updated_at": "2026-10-04T23:00:00Z",
+   "revisions": [
+    {
+     "version": 2,
+     "at": "2026-10-04T23:00:00Z",
+     "body": "# Friday notes\n\nCart v1 shipped this week: four tickets, four agents, no rework.\n\n1. Next sprint: **Checkout v2**\n2. Keep the tests slot at 1 so jobs don't fight over the Mac\n3. Try the local model on a real ticket\n\n> Write the plan first; the agents are faster than I can review."
+    },
+    {
+     "version": 1,
+     "at": "2026-10-04T20:00:00Z",
+     "body": "# Friday notes\n\nCart v1 shipped."
+    }
+   ]
+  },
+  {
+   "id": "n-ideas",
+   "body": "Ideas\n\n- Gift cards after Checkout v2\n- Saved addresses\n- A `/status` page for the shop",
+   "version": 1,
+   "updated_at": "2026-10-02T01:00:00Z",
+   "revisions": [
+    {
+     "version": 1,
+     "at": "2026-10-02T01:00:00Z",
+     "body": "Ideas\n\n- Gift cards after Checkout v2\n- Saved addresses\n- A `/status` page for the shop"
+    }
+   ]
+  }
+ ]
+}

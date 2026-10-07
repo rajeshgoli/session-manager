@@ -95,7 +95,12 @@ The responses come from a real `sm-server` on fresh state, except where noted.
   machine): `/client/host-status`, the `host` field of `/client/queue`,
   `/client/utilization/series`, `/client/queue/stats` and `/client/usage/meters`.
 - **Fake tools on the server's PATH** (`generate/fake-bin/`): `gh` answers from the recorder's
-  world file (`gh-world.json`); `codex` lists models. Nothing reaches GitHub.
+  world file (`gh-world.json`), including the issue, comment, PR and check reads behind the
+  ticket panel; `codex` lists models. Nothing reaches GitHub.
+- **Last week's sprint** (`prologue` in `record.py`): before the recording starts, a planner and
+  four agents work goal #30 *Cart v1* (#31–#34, PRs #35–#38) through the same CLI calls, plus a
+  `scout` with no ticket; then all of them retire and their times move 2–6 days into the past.
+  They are what History lists and offers to bring back.
 - The local-model agent is a Codex session whose model is `qwen3-coder-next`; Codex agents carry
   a tmux session name on a socket no tmux server listens on, because the server drops Codex
   sessions without one.
@@ -116,6 +121,23 @@ with compressed real time); `--out DIR` writes elsewhere (via `DIR.partial`, swa
 The scratch server runs from `/tmp/smdemo-rec` with `rust_core.runtime_enabled: false`, so it
 never adopts, runs or stops queue jobs, and its config points every database at that directory.
 `record.log`, `server.log` and `fake-gh.log` there explain a failed run.
+
+## The static layer
+
+Two pages are not part of the storyline, so they are not recorded per tick:
+
+- **Analytics.** `generate/analytics.py` snapshots a real server's spend and time reports
+  (every range, and each spend provider) into `fixtures/static/`, indexed in
+  `fixtures/static.json`. The numbers are real; every repo, ticket, agent and account name is
+  invented (the biggest repo becomes `pricing-engine`, tickets get numbers from 101 and made-up
+  titles), agent and history links are dropped, and the script refuses to write if any original
+  name survives. Rerun it against the live server to refresh the numbers:
+  `python3 web-demo/generate/analytics.py [--server URL]`.
+- **Notes.** `fixtures/static/notes.json` holds four invented notes with revisions. The worker
+  serves them and lets a visitor create, edit, search, preview and restore notes for the
+  length of the visit; each save shows "Nothing is saved in the demo".
+
+`record.py` carries `static/` and `static.json` over when it replaces `fixtures/`.
 
 ## The static site
 
@@ -144,19 +166,22 @@ How it replays:
   which the host serves. A page navigation gets the shell; a `/docs/…` navigation (the
   reader's iframe, or a doc opened full screen) gets the recorded doc page. Every other GET is
   looked up in the current tick by path and query (query order and the reader's `from` are
-  ignored) and answered with the recorded status and body; a URL the tick lacks is a 404.
+  ignored) and answered with the recorded status and body; a URL the tick lacks is looked up in
+  `static.json`, and failing that is a 404.
   Doc review drafts and the reopen target are not recorded; the worker answers them as a doc
   with no drafts that cannot be reopened, which shows the review sheet with Submit disabled.
 - **The clock** starts on a visitor's first request and loops every `duration_seconds`; a
   visitor back after 15 minutes idle, or a new build, starts from the beginning. The banner's ↺
   restarts it. Timestamps in each response are shifted so that ages read as they did live.
-- **Nothing writes.** Any non-GET request gets 403 `Demo — read only`, and the page shows that
-  as a notice. That covers New agent, Start, Send, Retire, Archive, review submit, terminal
-  attach and `/btw`.
+- **Nothing writes.** Any non-GET request gets 403 `Demo — read only`, and the page shows a
+  notice saying what the real app would have done, with a link to install it. That covers New
+  agent, Start, Send, Retire, Restore, Archive, review submit, terminal attach and `/btw`.
+  Notes are the exception (above), and `POST /client/board/seen`, which the Board sends by
+  itself, gets a quiet 200.
 - **The first visit** registers the worker and loads the app once the worker controls the
   page, so the app's first request already goes to the worker. Browsers without service
   workers get a one-line explanation.
 
 For checking: `POST /__demo/seek?t=<seconds>` jumps the clock, and `GET /__demo/misses` lists
 URLs the UI asked for that the current tick did not have. `node web-demo/site/sw.test.js`
-tests the timestamp shift and the lookup key.
+tests the timestamp shift, the lookup key and the notes helpers.

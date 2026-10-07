@@ -157,11 +157,49 @@ def pr_view(args):
     }
 
 
+def rest(args):
+    """`gh api repos/{owner}/{repo}/…`: the ticket panel's issue, comment, PR and check reads."""
+    m = re.match(r"repos/([^/]+/[^/]+)/(issues|pulls|commits)/([^/?]+)(/comments|/check-runs)?", args[1])
+    if not m:
+        raise SystemExit(f"fake gh: unhandled api path: {args[1]}")
+    slug, kind, key, sub = m.group(1).lower(), m.group(2), m.group(3), m.group(4)
+    repo = repo_of(world(), slug)
+    if kind == "commits":
+        return {"total_count": 2, "check_runs": [{"name": "build", "conclusion": "success"},
+                                                  {"name": "tests", "conclusion": "success"}]}
+    if sub == "/comments":
+        item = repo["issues"].get(key) or repo["prs"].get(key) or {}
+        return [{"user": {"login": c["author"]}, "created_at": c["at"], "body": c["body"]}
+                for c in item.get("comments", [])]
+    pr, issue = repo["prs"].get(key), repo["issues"].get(key)
+    if kind == "pulls":
+        if pr is None:
+            raise SystemExit(f"fake gh: no PR {slug}#{key}")
+        return {"head": {"ref": pr["head_ref"], "sha": pr["head_sha"]}, "base": {"ref": "main"}, "draft": False,
+                "merged": pr["state"] == "merged", "mergeable": True}
+    item = pr or issue
+    if item is None:
+        raise SystemExit(f"fake gh: no issue {slug}#{key}")
+    state = "closed" if item["state"] in ("closed", "merged") else "open"
+    body = item.get("body") or (f"Closes #{', #'.join(map(str, pr['closes']))}." if pr else "")
+    value = {"title": item["title"], "state": state, "state_reason": (item.get("state_reason") or "").lower() or None,
+             "user": {"login": item.get("author", "alex-demo")}, "created_at": item.get("created_at"),
+             "html_url": f"https://github.com/{slug}/{'pull' if pr else 'issues'}/{key}",
+             "labels": [{"name": name} for name in item.get("labels", [])], "body": body}
+    if pr:
+        value["pull_request"] = {}
+    return value
+
+
 def main():
     args = sys.argv[1:]
     log(" ".join(args))
     if args[:2] == ["api", "graphql"]:
         result = graphql(args)
+    elif args[:1] == ["api"] and len(args) > 1 and args[1].startswith("repos/"):
+        result = rest(args)
+    elif args[:2] == ["pr", "view"] and "reviewDecision" in args:
+        result = {"reviewDecision": "APPROVED"}
     elif args[:2] == ["pr", "view"] and len(args) > 2 and args[2].isdigit():
         result = pr_view(args)
     elif args[:2] == ["repo", "view"]:

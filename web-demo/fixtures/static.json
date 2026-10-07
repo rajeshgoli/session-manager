@@ -1,0 +1,77 @@
+{
+ "responses": {
+  "/client/analytics/spend?range=4w": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_4w.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=4w&provider=claude": {
+   "captured_at": "2026-10-07T20:18:10Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_4w_provider_claude.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=4w&provider=codex": {
+   "captured_at": "2026-10-07T20:18:10Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_4w_provider_codex.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=last_week": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_last_week.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=last_week&provider=claude": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_last_week_provider_claude.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=last_week&provider=codex": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_last_week_provider_codex.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=week": {
+   "captured_at": "2026-10-07T20:18:08Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_week.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=week&provider=claude": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_week_provider_claude.json",
+   "status": 200
+  },
+  "/client/analytics/spend?range=week&provider=codex": {
+   "captured_at": "2026-10-07T20:18:09Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_spend_range_week_provider_codex.json",
+   "status": 200
+  },
+  "/client/analytics/time?range=24h": {
+   "captured_at": "2026-10-07T20:18:10Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_time_range_24h.json",
+   "status": 200
+  },
+  "/client/analytics/time?range=30d": {
+   "captured_at": "2026-10-07T20:18:11Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_time_range_30d.json",
+   "status": 200
+  },
+  "/client/analytics/time?range=7d": {
+   "captured_at": "2026-10-07T20:18:10Z",
+   "content_type": "application/json",
+   "file": "static/client_analytics_time_range_7d.json",
+   "status": 200
+  }
+ },
+ "schema_version": 1
+}
