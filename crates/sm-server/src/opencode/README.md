@@ -1,6 +1,6 @@
 # Opencode transport foundation
 
-This module implements #2043, the first implementation ticket under #1956.
+This module supplies the HTTP, replay and persistence foundations for #1956.
 It does not admit opencode session creation. #2044 owns wall-backed launch and
 event projection; #2045 owns session-store delivery and lifecycle integration.
 
@@ -38,6 +38,26 @@ the password. Construct the event reader separately with its streaming timeout
 and the same authentication. The client methods here are blocking; call them
 on the existing blocking runtime workers.
 
+## Persisted runtime and launch identities
+
+`SessionRecord::opencode` stores the port, absolute state directory, provider
+version and model endpoint. `RuntimeBinding::validate` checks their shape;
+launch must still check the physical path, reserve the port and verify the
+installed version and model. The optional binding and replay cursor are omitted
+from existing providers' serialized records. Clear removes the replay cursor
+while retaining the runtime binding.
+
+Store reads normalize opencode reasoning effort to null. An opencode record
+without a binding loads as stopped with the missing-binding error; both typed
+and raw runtime decisions refuse to treat it as live. Explicit retirement
+markers remain authoritative.
+
+Call `SessionRuntimeLaunchRecord::ensure_opencode_brief_binding` only after
+setting its conversation ID. Persist the updated launch record before any HTTP
+attempt. Reopening a record reuses its message/part pair; a partial or invalid
+pair is an error and cannot authorize generating replacement IDs. The helper
+itself does not write the store or send the brief.
+
 ## Judge and launch integration
 
 Copy `scripts/opencode/sm_judge.js` into the agent's immutable config folder at
@@ -61,7 +81,8 @@ The fixed brief addendum is `docs/product/local_agent_addendum.md`.
 
 `events` (#2057) supplies conversation-scoped decoding, replay checkpoints and a
 host-owned usage journal. It does not start a reader thread or mutate the
-session store. #2044 supplies that integration and the durable runtime binding.
+session store. #2075 supplies the durable runtime metadata; #2044 supplies
+launch, recovery and reader integration.
 
 The adapter must read the session's current conversation on every event and
 replace `Projection` after clear. Work on a clone, apply the returned effects,
