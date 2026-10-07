@@ -52,8 +52,9 @@ for (const width of [390, 1440]) test(`New agent offers project folders and subm
     await page.getByRole('button', { name: 'Start', exact: true }).click();
     await page.getByText('Choose a workspace: an absolute path or ~/ path.', { exact: true }).waitFor();
     assert.equal(requests.filter(r => !(r instanceof URL)).length, 0);
+    const modelsResponse = page.waitForResponse(r => new URL(r.url()).searchParams.get('working_dir') === '~/projects/another');
     await input.fill(' ~/projects/another ');
-    await page.waitForResponse(r => new URL(r.url()).searchParams.get('working_dir') === '~/projects/another');
+    await modelsResponse;
     await page.getByRole('button', { name: 'Start', exact: true }).click();
     await page.waitForFunction(() => window.closedPopover);
     assert.equal(requests.at(-1).working_dir, '~/projects/another');
