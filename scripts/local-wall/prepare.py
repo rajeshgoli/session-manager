@@ -33,9 +33,14 @@ def prepare(request):
         raise ValueError("agent configuration must be a physical directory")
     if executables.is_symlink():
         raise ValueError("staged executables must not be a symlink")
-    executables.mkdir(mode=0o700, exist_ok=True)
     for root in [checkout, state]:
         independent_tree(root)
+    # The host holds the preparation lock and has finished every old launch.
+    # Rebuild the entire admitted root: withdrawn tools and interrupted copies
+    # must not survive into a new registration.
+    if executables.exists():
+        shutil.rmtree(executables)
+    executables.mkdir(mode=0o700)
     # A linked worktree's common Git directory is shared mutable host state.
     # Providers must supply an independent checkout, with no shared objects.
     git = checkout / ".git"
@@ -102,7 +107,10 @@ def prepare(request):
     profile = config / "wall.sb"
     temporary_profile = config / ".wall.sb.new"
     if temporary_profile.exists() or temporary_profile.is_symlink():
-        raise ValueError("unexpected profile temporary file")
+        if (temporary_profile.is_symlink() or not temporary_profile.is_file()
+                or temporary_profile.stat().st_nlink != 1):
+            raise ValueError("profile temporary file has aliases or an unexpected type")
+        temporary_profile.unlink()
     try:
         temporary_profile.write_text(wall.generate(wall.parser().parse_args(arguments), wall.listening_ports(), len(wall.user_temp())))
         temporary_profile.chmod(0o400)

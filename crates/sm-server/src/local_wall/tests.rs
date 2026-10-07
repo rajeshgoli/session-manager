@@ -159,7 +159,11 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
             }],
         }
     };
-    let a_request = registration("wall-a", 18500);
+    let mut a_request = registration("wall-a", 18500);
+    a_request.tools.push(StageTool {
+        name: "wall-withdrawn".into(),
+        source: tool_source.clone(),
+    });
     let b_request = registration("wall-b", 18501);
     let a = host.prepare(&a_request).unwrap();
     let b = host.prepare(&b_request).unwrap();
@@ -242,8 +246,23 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     eprintln!("host fixture: both queue launches completed");
     let old_adapter = fs::read(&a.artifacts.adapter).unwrap();
     a.suspend().unwrap();
+    let executables = a.artifacts.executables.clone();
+    assert!(executables.join("wall-withdrawn").is_file());
     drop(a);
+    // Simulate host termination during tool, supervisor and profile writes.
+    fs::write(executables.join(".probe.new"), b"interrupted").unwrap();
+    fs::write(executables.join(".supervisor.new"), b"interrupted").unwrap();
+    fs::write(
+        executables.parent().unwrap().join(".wall.sb.new"),
+        b"interrupted",
+    )
+    .unwrap();
+    a_request.tools.retain(|tool| tool.name != "wall-withdrawn");
     let restored = host.prepare(&a_request).unwrap();
+    assert!(!executables.join("wall-withdrawn").exists());
+    assert!(!executables.join(".probe.new").exists());
+    assert!(!executables.join(".supervisor.new").exists());
+    assert!(restored.spawn_queue("wall-withdrawn", &[]).is_err());
     assert_eq!(
         egress.registration("wall-a").unwrap().unwrap(),
         a_registration

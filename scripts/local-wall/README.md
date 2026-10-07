@@ -38,6 +38,8 @@ broker identity. A short private directory below `/private/tmp` holds only
 host-owned broker aliases, allowing long production state paths without granting
 agents general temporary-directory access. Runtime preparation is a library
 primitive; provider activation and durable queue admission remain caller work.
+Preparation rebuilds the staged executable directory from the current tool
+registration, removing withdrawn tools and interrupted copies before launch.
 
 The input state layout is:
 
