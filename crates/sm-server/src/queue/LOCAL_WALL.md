@@ -53,6 +53,49 @@ launcher stays pending with `local_wall`; it does not block hosted work. Invalid
 saved authority follows the failed-start path. A server-generation shutdown stops
 new launches and detaches bindings while preserving durable registrations.
 
+## Durable provider ownership
+
+`GenerationWalls::stage_provider(configuration, agent, ProviderLaunch,
+installed_executable)` returns `HostLaunch`: the exact executable and arguments
+to run in the host tmux serve window. This launcher owns the provider, broker
+and queued process roots independently of sm's blue/green server slots.
+For opencode, the host selects staged tool `opencode`, arguments `serve` plus
+host-approved options, and extra settings in `ProviderLaunch`. Provider stdout
+and stderr stream to tmux; stdin is closed. The ordinary provider environment
+validation, immutable profile, tool staging and gated root registration apply.
+
+Private queue state contains `local-wall-owners/<agent>/launch.json`, storing
+the host configuration, agent registration, provider launch, egress client and
+judge runtime. Staging is immutable and serialized across server processes.
+The launcher is a content-named copy of the installed sm-server so an upgrade
+cannot replace a live executable. It holds the agent preparation lock throughout
+its lifetime. Queue state, launcher files and the host control socket are denied
+to local agents by the production profile. Control also checks the kernel peer
+user. None of this interface is exposed through HTTP.
+
+`GenerationWalls::reconcile` reconnects with `OwnerClient` and compares the live
+wall with the validated saved registration. `get_durable(agent)` returns that
+host handle. Generation shutdown detaches its queue client, retaining provider
+roots, broker audit token and test socket leases. An unavailable owner holds
+valid jobs with `local_wall`; its marker forbids generation-owned fallback.
+Server recovery does not start a provider.
+
+Queue control transfers host-opened output descriptors, the saved command
+binding and process ceiling. The owner revalidates the binding and supplies the
+registered shell, cwd and environment. Each job retains a Unix connection in
+sm; closure on process death or a lost launch reply kills/revokes only that job.
+Provider lifetime does not depend on those connections. Queue status and
+cancellation retain the existing durable lifecycle; no successful result is
+invented after owner loss.
+
+`OwnerClient::retire()` stops launch admission, kills/reaps provider and queued
+descendants, revokes their roots, and unregisters egress/judge before replying.
+Host SIGINT/SIGTERM and provider exit perform the same cleanup; unsuccessful
+provider exit fails the launcher. The provider integration calls this on agent
+retirement, cancels pending jobs, then removes queue registration/input files
+and releases reserved ports. An explicit host restore can reuse the saved
+launch configuration with identical immutable choices.
+
 ## Submission, execution, and restart
 
 Submission requires a physical working directory inside the registered checkout.
@@ -92,3 +135,9 @@ Hosted owner operations keep their existing authority.
   tests argv cancellation, and refuses missing/restored/changed launch bindings.
 - `local_sockets::service::tests::launch_tests` exercises descendants, inherited
   descriptors, socket registration, and supervisor cleanup.
+- `local_wall::tests::host_preparation_two_agents_restore_and_failed_launch_are_confined`
+  keeps a real provider and its sockets alive across generation teardown and a
+  separate recovery process; verifies unchanged broker, profile, adapter and
+  manifest; admits recovered queue work; revokes an abandoned queue tree after
+  an sm process crash; denies agent reads of launch configuration and host socket
+  control; and verifies retirement kills provider descendants and disables egress.

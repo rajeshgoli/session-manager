@@ -662,6 +662,231 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     );
     drop(c);
     drop(unrelated);
+    // A host tmux launcher outlives two sm generations, retaining the actual
+    // provider root, control listener, test lease and immutable queue manifest.
+    let durable = registration("wall-durable", 18504);
+    let launch_path = queue_state.join("local-wall-owners/wall-durable/launch.json");
+    let hash = format!("{:x}", Sha256::digest(durable.id.as_bytes()));
+    let control_socket = host.config.alias_root.join(format!("{}.host", &hash[..16]));
+    let installed_fixture = root.join("installed-owner");
+    fs::copy(std::env::current_exe().unwrap(), &installed_fixture).unwrap();
+    let generation = || {
+        Arc::new(
+            recovery::GenerationWalls::new(
+                queue_state.clone(),
+                host.config.python.clone(),
+                upstream_address,
+                &config.local_host.base_url,
+                egress.clone(),
+                judge.clone(),
+            )
+            .unwrap(),
+        )
+    };
+    let first = generation();
+    let launch = first
+        .stage_provider(
+            host.config.clone(),
+            durable,
+            owner::ProviderLaunch {
+                tool: "probe".into(),
+                arguments: vec![
+                    "provider-persistent".into(),
+                    launch_path.clone().into_os_string(),
+                    control_socket.into_os_string(),
+                ],
+                settings: BTreeMap::new(),
+            },
+            &installed_fixture,
+        )
+        .unwrap();
+    let owner_output = root.join("owner.log");
+    struct OwnerGuard {
+        client: owner::OwnerClient,
+        child: std::process::Child,
+    }
+    impl Drop for OwnerGuard {
+        fn drop(&mut self) {
+            let _ = self.client.retire();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    let mut owner_process = OwnerGuard {
+        client: launch.client.clone(),
+        child: Command::new(&launch.executable)
+            .args([
+                "--exact",
+                "local_wall::owner::tests::owner_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SM_WALL_OWNER_FIXTURE", &launch_path)
+            .stdout(File::create(&owner_output).unwrap())
+            .stderr(File::create(root.join("owner.err")).unwrap())
+            .spawn()
+            .unwrap(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if launch.client.ready(&queue_state).is_ok()
+            && fs::read_to_string(&owner_output)
+                .unwrap()
+                .contains("owner-provider-ready")
+        {
+            break;
+        }
+        assert!(
+            owner_process.child.try_wait().unwrap().is_none(),
+            "owner exited: {}",
+            fs::read_to_string(root.join("owner.err")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "owner not ready: {}",
+            fs::read_to_string(root.join("owner.err")).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let output = fs::read_to_string(&owner_output).unwrap();
+    let fields = output
+        .lines()
+        .find(|line| line.starts_with("owner-provider-ready "))
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let test_port: u16 = fields[1].parse().unwrap();
+    let descendant =
+        crate::local_sockets::identity::ProcessIdentity::capture(fields[2].parse().unwrap())
+            .unwrap();
+    let verify_provider = || {
+        for (port, expected) in [(18504, &b"provider"[..]), (test_port, &b"socket"[..])] {
+            let mut stream = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = vec![0; expected.len()];
+            stream.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+    };
+    verify_provider();
+    let info = launch.client.info_for_test();
+    let spec = crate::queue::local_wall::registered_spec(&queue_state, "wall-durable")
+        .unwrap()
+        .unwrap();
+    let manifest_path = queue_state.join("local-walls/wall-durable.json");
+    let manifest = fs::read(&manifest_path).unwrap();
+    let profile = fs::read(&spec.profile).unwrap();
+    let adapter_path = spec.agent_state.join("xdg/config/adapter.dylib");
+    let adapter = fs::read(&adapter_path).unwrap();
+    first.reconcile().unwrap();
+    assert!(first.get_durable("wall-durable").unwrap().is_some());
+    first.stop().unwrap();
+    drop(first);
+    verify_provider();
+    assert!(descendant.is_live());
+    let mut queue_request = crate::queue::CreateQueueJob {
+        local_submitter: Some(crate::local_egress::gateway::VerifiedLocalAgent::test_identity("wall-durable")),
+        job_type: "tests".into(), label: "owner-recovery".into(), requester_session_id: None,
+        notify_session_id: "wall-durable".into(), cwd: spec.checkout.display().to_string(), argv: None,
+        script: Some(format!("'{}' -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(); c=socket.create_connection(s.getsockname()); a,_=s.accept(); c.sendall(b\"ok\"); assert a.recv(2)==b\"ok\"' || exit 1\nprint owner-queue-ok", host.config.python.display())),
+        env: BTreeMap::new(), timeout_seconds: 20, cpu_percent: None, gpu_percent: None, memory_bytes: None, rank_tickets: None,
+    };
+    let job =
+        RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, queue_request.clone())
+            .unwrap();
+    let recovered = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "local_wall::owner::tests::recovered_generation_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SM_WALL_OWNER_FIXTURE", &launch_path)
+        .env("SM_WALL_OWNER_JOB", &job.id)
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "recovery stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    verify_provider();
+    assert!(descendant.is_live());
+    assert_eq!(launch.client.info_for_test(), info);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+    assert_eq!(fs::read(&spec.profile).unwrap(), profile);
+    assert_eq!(fs::read(&adapter_path).unwrap(), adapter);
+    queue_request.script = Some(format!(
+        "'{}' -c 'import time; time.sleep(60)'",
+        host.config.python.display()
+    ));
+    let abandoned =
+        RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, queue_request).unwrap();
+    let crashed = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "local_wall::owner::tests::recovered_generation_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SM_WALL_OWNER_FIXTURE", &launch_path)
+        .env("SM_WALL_OWNER_JOB", &abandoned.id)
+        .env("SM_WALL_CRASH_AFTER_LAUNCH", "1")
+        .output()
+        .unwrap();
+    assert!(
+        crashed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    let abandoned = RetainedQueueStore::get_queue_job_strict_from_path(
+        &queue_state.join("queue_runner.db"),
+        &abandoned.id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(abandoned.state, "running");
+    let pgid = i32::try_from(abandoned.process_group_id.unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(-pgid, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "abandoned queue process group survived the sm crash"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    RetainedQueueStore::cancel_queue_job_in_state_dir(
+        &queue_state,
+        &queue_state.join("messages.db"),
+        &abandoned.id,
+        0,
+        crate::queue::QueueAdmissionPolicy::default(),
+        false,
+    )
+    .unwrap();
+    verify_provider();
+    assert!(descendant.is_live());
+    launch.client.retire().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while descendant.is_live() {
+        assert!(
+            Instant::now() < deadline,
+            "retired provider descendant survived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!egress.registration("wall-durable").unwrap().unwrap().active);
+    assert!(launch.client.ready(&queue_state).is_err());
+    assert!(generation()
+        .reconcile()
+        .unwrap()
+        .iter()
+        .any(|failure| failure.starts_with("wall-durable:")));
+    assert!(owner_process.child.wait().unwrap().success());
+    drop(owner_process);
     // Simulate durable activation followed by a lost registration reply.
     let uncertain = root.join("uncertain-egress");
     private_directory(&uncertain).unwrap();

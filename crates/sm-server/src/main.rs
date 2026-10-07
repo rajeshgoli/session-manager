@@ -62,6 +62,9 @@ struct Args {
     /// Run the separately supervised host-only local-agent HTTPS proxy.
     #[arg(long)]
     local_egress_service: Option<PathBuf>,
+    /// Own a local provider and its queue/socket authority in a host tmux window.
+    #[arg(long)]
+    local_wall_owner: Option<PathBuf>,
     /// Load and validate the configuration, then exit without binding a port or
     /// touching any state. scripts/restart-rust-server.sh uses this to reject a
     /// bad config while the old server is still running, rather than discovering
@@ -79,6 +82,15 @@ async fn main() -> Result<()> {
     // enables more than one crypto backend, so choose one before either runs.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
+    if let Some(path) = args.local_wall_owner {
+        #[cfg(target_os = "macos")]
+        {
+            raise_open_file_soft_limit();
+            return sm_server::local_wall::owner::run(path).await;
+        }
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("local wall ownership requires macOS: {}", path.display());
+    }
     if let Some(directory) = args.local_egress_service {
         raise_open_file_soft_limit();
         return sm_server::local_egress::run_service(&directory)
