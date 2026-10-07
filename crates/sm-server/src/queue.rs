@@ -1,4 +1,5 @@
 pub mod local_wall;
+mod opencode_messages;
 pub mod quiet;
 
 #[cfg(unix)]
@@ -3699,6 +3700,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
     )?;
     ensure_column(conn, "message_queue", "notify_on_stop", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "message_queue", "from_sm_send", "INTEGER DEFAULT 0")?;
+    for column in [
+        "provider_message_id",
+        "provider_part_id",
+        "provider_conversation_id",
+    ] {
+        ensure_column(conn, "message_queue", column, "TEXT")?;
+    }
     ensure_column(conn, "message_queue", "remind_soft_threshold", "INTEGER")?;
     ensure_column(conn, "message_queue", "remind_hard_threshold", "INTEGER")?;
     ensure_column(
