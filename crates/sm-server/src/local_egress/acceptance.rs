@@ -67,6 +67,7 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
     let mut registrations = BTreeMap::new();
     let mut tasks = Vec::new();
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    let (proxy_completed, mut completed) = tokio::sync::mpsc::unbounded_channel();
     for agent in ["agent-a", "agent-b"] {
         let listener = port(gateway::FIRST_PORT + 50, gateway::LAST_PORT).await;
         let gateway_port = listener.local_addr().unwrap().port();
@@ -103,14 +104,17 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
         let service = proxy.clone();
         let agent_id = agent.to_owned();
         let stopped_proxy = stopped.clone();
+        let proxy_completed = proxy_completed.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 let (stream, _) = egress.accept().await.unwrap();
                 let service = service.clone();
                 let agent = agent_id.clone();
                 let stopped = stopped_proxy.clone();
+                let proxy_completed = proxy_completed.clone();
                 tokio::spawn(async move {
                     service.serve(stream, agent, stopped).await;
+                    let _ = proxy_completed.send(());
                 });
             }
         }));
@@ -265,6 +269,14 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
             assert!(Instant::now() < deadline, "job did not finish: {id}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+    // Tunnel EOF can precede the final log append. Join all six proxy handlers
+    // before inspecting attribution rather than relying on job completion.
+    for _ in 0..6 {
+        tokio::time::timeout(Duration::from_secs(5), completed.recv())
+            .await
+            .unwrap()
+            .expect("proxy completion channel closed");
     }
     let log = fs::read_to_string(service_dir.join("connections.jsonl")).unwrap();
     for agent in ["agent-a", "agent-b"] {
