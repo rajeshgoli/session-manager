@@ -63,6 +63,13 @@ pub struct LocalJudgeRuntime {
     model_auth_token: String,
 }
 impl LocalJudgeRuntime {
+    #[cfg(test)]
+    pub(crate) fn isolated(config: &crate::config::AppConfig, root: PathBuf) -> Self {
+        let mut runtime = Self::from_config(config);
+        runtime.root = root;
+        runtime
+    }
+
     pub fn from_config(config: &crate::config::AppConfig) -> Self {
         // The production location is part of the durable-state contract, not
         // a configurable per-deployment path. Test launchers isolate it only.
@@ -307,6 +314,16 @@ impl LocalJudgeRuntime {
             }
         }
         Err(last_error.expect("control attempted"))
+    }
+
+    pub fn directory(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// Authoritative saved port, including registrations surviving a config change.
+    pub fn port(&self) -> Result<u16> {
+        self.ensure_running()?;
+        self.effective_port()
     }
 
     pub fn register(&self, session_id: &str, agent: &Registration) -> Result<JudgeEndpoint> {
