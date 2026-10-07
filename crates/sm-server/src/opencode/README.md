@@ -143,7 +143,16 @@ usage file's seat association and applies context measurements.
 ## Host launch driver
 
 `launch` (#2079, macOS) prepares private config, the judge plugin, an independent
-plugin SDK copy and the persistent server password. It stages opencode through
+plugin SDK copy and the persistent server password. SDK preparation installs
+the judge plugin before running `opencode debug config`, so the pinned runtime
+waits for its dependency installation before exiting. The installed-provider
+check is available separately (requires opencode 1.17.9 and npm access):
+
+```sh
+scripts/test-rust-isolated.sh --lib production_opencode_prepares_its_real_plugin_sdk_outside_the_wall -- --ignored
+```
+
+It stages opencode through
 the production durable wall owner; tmux runs that owner rather than a provider
 outside the wall. The host serve script restarts at most five times within ten
 minutes, and handles termination by stopping the owner. `serve.pid` identifies

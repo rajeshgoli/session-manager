@@ -513,12 +513,20 @@ fn prepare_sdk(config: &OpencodeConfig, root: &Path) -> Result<PathBuf> {
     {
         return Ok(folder);
     }
-    for path in ["config/opencode", "data", "cache", "state", "home"] {
+    for path in ["config/opencode/plugins", "data", "cache", "state", "home"] {
         private_directory(&sdk.join(path))?;
     }
     host_write(
         &folder.join("opencode.json"),
         b"{\"autoupdate\":false,\"share\":\"disabled\",\"snapshot\":false,\"plugin\":[]}\n",
+        0o600,
+    )?;
+    // The pinned runtime waits for its background dependency installation only
+    // when it discovers an external plugin. Prepare with the same judge plugin
+    // that the agent will load, so debug config cannot exit before npm finishes.
+    host_write(
+        &folder.join("plugins/sm_judge.js"),
+        include_bytes!("../../../../scripts/opencode/sm_judge.js"),
         0o600,
     )?;
     let mut command = Command::new(expand_home(&config.binary));
