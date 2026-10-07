@@ -480,7 +480,7 @@ fn reconnect_during_submission_does_not_fabricate_a_start_or_stop() {
         assert_eq!(
             effects,
             vec![Effect::TurnStart {
-                message_id: None,
+                message_id: Some("msg_01".into()),
                 prompt: "actual prompt".into()
             }]
         );
@@ -595,7 +595,7 @@ fn live_prompt_parts_arrive_before_busy_and_supply_the_turn_start_text() {
     assert_eq!(
         effects,
         vec![Effect::TurnStart {
-            message_id: None,
+            message_id: Some("msg_01".into()),
             prompt: "new prompt".into(),
         }]
     );

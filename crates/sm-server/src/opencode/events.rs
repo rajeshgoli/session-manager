@@ -1,5 +1,6 @@
 //! Conversation-scoped event decoding, reconnect replay and usage journaling.
-//! The session-store adapter applies effects and saves the checkpoint together.
+//! The session-store adapter saves activity, the checkpoint and retained effects
+//! together, then finishes SQL and journal writes with retry receipts.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
@@ -77,7 +78,7 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Effect {
     TurnStart {
         message_id: Option<String>,
@@ -104,7 +105,7 @@ pub enum Effect {
     Touch,
 }
 
-/// Host checkpoint, saved by the adapter only after the effects are applied.
+/// Host checkpoint, saved atomically with cached activity and retained effects.
 /// A clear replaces this with a checkpoint for the new conversation; the
 /// usage journal remains shared across all conversations of the sm session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +135,8 @@ pub struct Projection {
     last_user_id: Option<String>,
     #[serde(default)]
     last_assistant: Option<String>,
+    #[serde(default)]
+    message_times: BTreeMap<String, (Option<i64>, Option<i64>)>,
 }
 
 impl Projection {
@@ -154,11 +157,26 @@ impl Projection {
             last_user: String::new(),
             last_user_id: None,
             last_assistant: None,
+            message_times: BTreeMap::new(),
         })
     }
 
-    /// Work on a clone. If applying effects fails, retain the old checkpoint
-    /// and replay, using the store's idempotent turn/tool mutations and journal.
+    /// Native message times order replayed turns and owner input correctly.
+    /// The adapter falls back to its observation time when metadata is absent.
+    pub fn message_time_ms(&self, id: &str, completed: bool) -> Option<i64> {
+        self.message_times.get(id).and_then(
+            |(created, end)| {
+                if completed {
+                    *end
+                } else {
+                    *created
+                }
+            },
+        )
+    }
+
+    /// Work on a clone. If committing the batch fails, retain the old
+    /// checkpoint; effects committed to the retained list are safe to retry.
     pub fn live(
         &mut self,
         event: &Value,
@@ -355,6 +373,9 @@ impl Projection {
     ) -> Result<()> {
         let id = info["id"].as_str().context("opencode message missing id")?;
         validate_id(id, "msg")?;
+        let times = self.message_times.entry(id.into()).or_default();
+        times.0 = info["time"]["created"].as_i64().or(times.0);
+        times.1 = info["time"]["completed"].as_i64().or(times.1);
         if info["role"] == "user" {
             if generated.contains(id) {
                 self.generated_users.insert(id.into());
@@ -477,7 +498,7 @@ impl Projection {
     ) {
         if self.activity == Activity::Idle && activity != Activity::Idle {
             effects.push(Effect::TurnStart {
-                message_id,
+                message_id: message_id.or_else(|| self.last_user_id.clone()),
                 prompt: self.last_user.clone(),
             });
         } else if self.activity != Activity::Idle && activity == Activity::Idle {

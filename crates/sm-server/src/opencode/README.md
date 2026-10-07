@@ -84,11 +84,11 @@ host-owned usage journal. It does not start a reader thread or mutate the
 session store. #2075 supplies the durable runtime metadata; #2044 supplies
 launch, recovery and reader integration.
 
-The adapter must read the session's current conversation on every event and
-replace `Projection` after clear. Work on a clone, apply the returned effects,
-then save the checkpoint. Discard the clone on error. Store effects must be
-idempotent across a crash before checkpoint persistence; `UsageJournal` already
-deduplicates usage across reopen. Supply all host-generated user message IDs
+The adapter reads the session's current conversation on every event and
+replaces `Projection` after clear. It decodes on a clone, then commits the
+checkpoint, activity and pending effects together before finishing external
+writes. Receipts and the usage journal make those writes safe to retry.
+Supply all host-generated user message IDs
 (including the launch brief), so those messages cannot count as owner answers.
 
 On connection, backfill message history before reconciling current activity.
@@ -120,11 +120,32 @@ streams: the caller reconnects with the specified backoff and backfills again.
 This bounds a stalled read before checking whether the session has stopped.
 `read_event` limits a frame to two MiB and discards incomplete frames on EOF.
 
-Open one `UsageJournal` writer per sm session, shared across conversation
-changes. It synchronizes compact Claude-format JSON lines before returning,
+Usage writes share the session-store writer lock across conversation changes.
+`UsageJournal` synchronizes compact Claude-format JSON lines before returning,
 adds reasoning to output tokens, and repairs an interrupted final line on
-reopen. A malformed complete line is an error. The adapter still supplies the
-usage file's seat association and applies context measurements.
+reopen. A malformed complete line is an error.
+
+`SessionStore::apply_opencode_events` accepts either a live frame or a reconnect
+snapshot. It atomically saves cached activity, the `Projection` checkpoint,
+cursor, sequence and ordered pending effects in the session registry. SQL
+history, tool logging and owner answers commit with receipts; usage lines
+deduplicate by part ID. Failed writes retain the first unfinished effect.
+`recover_opencode_effects` finishes those writes before replay, including for
+stopped sessions. Old-conversation usage still reaches the journal after clear,
+while its context sample cannot overwrite the new conversation's gauge.
+Native message creation/completion times order history and owner answers;
+an old prompt cannot answer a question created after it was typed.
+
+The caller supplies the effective loaded-model configuration, tool-log database
+and all persisted host-generated message IDs (including the initial brief).
+A true result requests the usual handoff check after an applied stop. Read
+`opencode_pending_stop_signal`, schedule the check, then acknowledge that exact
+signal with `acknowledge_opencode_stop_signal`. The signal survives later write
+failures and restart until acknowledged; a stale acknowledgement cannot clear
+a newer stop. Context
+measurements use the existing context-update path; provider capability and
+usage-seat attribution remain separate integration work. Event-reader start,
+reconnect and shutdown wiring remains on #2044; public entry points stay disabled.
 
 - `scripts/test-rust-isolated.sh opencode -- --test-threads=1`: native-shaped
   IDs, approved config fixture, config loading, duplicate-append stub and
