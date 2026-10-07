@@ -566,7 +566,7 @@ export function AgentPanel({ id, controls }) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
   }
-  const claim = claims.find((c) => c.kind === 'ticket') || claims[0];
+  const claim = (agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0];
   const since = agent.state === 'stopped' ? agent.last_activity : agent.activity_since || agent.last_activity;
   const parts = [
     providerLabel(agent.provider),
