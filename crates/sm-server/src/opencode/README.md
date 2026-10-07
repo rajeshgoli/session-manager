@@ -71,6 +71,11 @@ deduplicates usage across reopen. Supply all host-generated user message IDs
 (including the launch brief), so those messages cannot count as owner answers.
 
 On connection, backfill message history before reconciling current activity.
+Order by the provider's `time.created` and use recorded replayed-message IDs,
+not an ID comparison with the cursor: a host ID allocated before a failed
+delivery can be accepted after newer turns. Resolve assistant starts to their
+parent user's cached prompt. Completed error responses (including aborted
+responses without `finish`) close a prior turn when a later assistant exists.
 User submissions have no `time.completed`; metadata or text alone while the
 provider is idle does not prove processing began. Backfill starts a turn only
 on an assistant message or current busy/retry status. An unfinished assistant

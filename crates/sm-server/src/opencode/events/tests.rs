@@ -2,7 +2,12 @@ use super::*;
 use crate::opencode::tests::ScratchDir;
 
 fn user(id: &str, text: &str) -> Value {
-    json!({"info": {"id": id, "sessionID": "ses_test", "role": "user", "time": {"created": 1}},
+    let created = id
+        .strip_prefix("msg_")
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(1)
+        * 10;
+    json!({"info": {"id": id, "sessionID": "ses_test", "role": "user", "time": {"created": created}},
         "parts": [{"id": "prt_prompt", "sessionID": "ses_test", "messageID": id, "type": "text", "text": text}]})
 }
 fn usage_part(id: &str) -> Value {
@@ -14,10 +19,14 @@ fn tool_part(id: &str, status: &str) -> Value {
         "tool": "bash", "state": {"status": status, "input": {"command": "git status"}}})
 }
 fn assistant(id: &str, completed: bool, finish: &str, parts: Vec<Value>) -> Value {
-    let mut info =
-        json!({"id": id, "sessionID": "ses_test", "role": "assistant", "time": {"created": 2}});
+    let created = id
+        .strip_prefix("msg_")
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(2)
+        * 10;
+    let mut info = json!({"id": id, "sessionID": "ses_test", "role": "assistant", "time": {"created": created}});
     if completed {
-        info["time"]["completed"] = json!(3);
+        info["time"]["completed"] = json!(created + 1);
         info["finish"] = json!(finish);
     }
     json!({"info": info, "parts": parts})
@@ -128,6 +137,133 @@ fn two_disconnects_during_one_assistant_keep_cursor_and_replay_only_new_parts() 
     assert_eq!(usages(&effects), 0);
     assert!(projection
         .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn late_host_message_below_cursor_uses_its_own_prompt_and_parent_id() {
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let first = vec![
+        user("msg_01", "previous prompt"),
+        assistant("msg_02", true, "stop", vec![]),
+    ];
+    projection
+        .backfill(&first, Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(projection.cursor.as_deref(), Some("msg_02"));
+
+    // The ID was retained through a failed HTTP attempt, then accepted later.
+    let mut late = user("msg_00", "late accepted prompt");
+    late["info"]["time"]["created"] = json!(40);
+    let mut response = assistant("msg_03", false, "", vec![]);
+    response["info"]["time"]["created"] = json!(50);
+    response["info"]["parentID"] = json!("msg_00");
+    let mut history = vec![response, first[1].clone(), late, first[0].clone()];
+    let generated = BTreeSet::from(["msg_00".into()]);
+    let effects = projection
+        .backfill(&history, Activity::Busy, &generated)
+        .unwrap();
+    assert_eq!(
+        effects,
+        vec![Effect::TurnStart {
+            message_id: Some("msg_00".into()),
+            prompt: "late accepted prompt".into(),
+        }]
+    );
+    assert_eq!(projection.cursor.as_deref(), Some("msg_03"));
+    let mut reopened: Projection =
+        serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+    assert!(reopened
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+    history[0]["info"]["time"]["completed"] = json!(51);
+    history[0]["info"]["finish"] = json!("stop");
+    let effects = reopened
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(stops(&effects), 1);
+    assert!(reopened
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn aborted_turn_without_finish_is_separate_from_a_later_busy_turn() {
+    let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+    let mut aborted = assistant("msg_02", true, "stop", vec![]);
+    aborted["info"].as_object_mut().unwrap().remove("finish");
+    aborted["info"]["error"] = json!({"name":"MessageAbortedError", "data":{"message":"aborted"}});
+    let history = vec![
+        user("msg_01", "aborted prompt"),
+        aborted,
+        user("msg_03", "next prompt"),
+        assistant("msg_04", false, "", vec![]),
+    ];
+    let effects = projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(stops(&effects), 1);
+    assert_eq!(starts(&effects), 1);
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::TurnStop { message_id: Some(id), .. } if id == "msg_02")));
+    assert!(effects.iter().any(|e| matches!(e, Effect::TurnStart { message_id: Some(id), prompt } if id == "msg_03" && prompt == "next prompt")));
+    assert!(projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn recorded_live_completion_survives_replay_of_prior_tool_call_requests() {
+    let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+    let final_info = assistant("msg_03", true, "stop", vec![])["info"].clone();
+    projection
+        .live(
+            &json!({"type":"message.updated", "properties":{"info":final_info}}),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let idle = json!({"type":"session.status", "properties":{"sessionID":"ses_test", "status":{"type":"idle"}}});
+    assert_eq!(stops(&projection.live(&idle, &BTreeSet::new()).unwrap()), 1);
+    let history = vec![
+        user("msg_01", "prompt"),
+        assistant("msg_02", true, "tool-calls", vec![]),
+        assistant("msg_03", true, "stop", vec![]),
+    ];
+    let effects = projection
+        .backfill(&history, Activity::Idle, &BTreeSet::from(["msg_01".into()]))
+        .unwrap();
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(stops(&effects), 0);
+    assert_eq!(projection.activity, Activity::Idle);
+}
+
+#[test]
+fn native_aborted_response_is_completed_before_a_later_busy_turn() {
+    let history: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/proof-history.json")).unwrap();
+    let conversation = history[0]["info"]["sessionID"].as_str().unwrap();
+    let aborted = history
+        .iter()
+        .find(|message| message["info"]["error"]["name"] == "MessageAbortedError")
+        .unwrap();
+    assert!(aborted["info"]["time"]["completed"].is_number());
+    assert!(aborted["info"]["finish"].is_null());
+    let aborted_id = aborted["info"]["id"].as_str().unwrap();
+    let mut projection = Projection::new(conversation, Activity::Idle).unwrap();
+    let effects = projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::TurnStop { message_id: Some(id), .. } if id == aborted_id)));
+    assert!(projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
         .unwrap()
         .is_empty());
 }

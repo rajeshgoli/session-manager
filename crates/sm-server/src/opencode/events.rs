@@ -117,6 +117,8 @@ pub struct Projection {
     #[serde(default)]
     pending_owner_prompts: BTreeSet<String>,
     #[serde(default)]
+    replayed_messages: BTreeSet<String>,
+    #[serde(default)]
     tools: BTreeSet<String>,
     #[serde(default)]
     usage: BTreeSet<String>,
@@ -141,6 +143,7 @@ impl Projection {
             activity,
             users: BTreeSet::new(),
             pending_owner_prompts: BTreeSet::new(),
+            replayed_messages: BTreeSet::new(),
             tools: BTreeSet::new(),
             usage: BTreeSet::new(),
             stops: BTreeSet::new(),
@@ -208,32 +211,43 @@ impl Projection {
             })
             .collect();
         ordered.sort_by(|left, right| {
-            left["info"]["id"]
+            left["info"]["time"]["created"]
+                .as_u64()
+                .cmp(&right["info"]["time"]["created"].as_u64())
+                .then_with(|| {
+                    left["info"]["id"]
+                        .as_str()
+                        .cmp(&right["info"]["id"].as_str())
+                })
+        });
+        let latest_assistant = ordered
+            .iter()
+            .rposition(|message| message["info"]["role"] == "assistant");
+        let stopped_through = ordered.iter().rposition(|message| {
+            message["info"]["id"]
                 .as_str()
-                .cmp(&right["info"]["id"].as_str())
+                .is_some_and(|id| self.stops.contains(id))
         });
-        let latest_assistant_id = ordered.iter().rev().find_map(|message| {
-            (message["info"]["role"] == "assistant")
-                .then(|| message["info"]["id"].as_str())
-                .flatten()
-        });
-        let cursor = self.cursor.clone();
         let mut effects = Vec::new();
         let mut held = false;
-        for message in ordered {
+        for (index, message) in ordered.into_iter().enumerate() {
             let info = &message["info"];
             let id = info["id"].as_str().context("backfill message missing id")?;
             validate_id(id, "msg")?;
-            if cursor.as_deref().is_some_and(|cursor| id < cursor) {
+            // IDs are allocated before delivery: a newly accepted retry can
+            // have an ID below the cursor. Skip only rows actually replayed.
+            if self.replayed_messages.contains(id) {
                 continue;
             }
             let parts = message["parts"]
                 .as_array()
                 .context("backfill message missing parts")?;
             self.message(info, parts, generated_user_ids, &mut effects)?;
+            let mut pending = self.pending_owner_prompts.contains(id)
+                || (info["role"] == "user" && self.message_text(id).is_empty());
             // Metadata can precede the user's text, even in a snapshot taken
             // during submission. Keep revisiting it until the reply is known.
-            if self.pending_owner_prompts.contains(id) && !held {
+            if pending && !held {
                 held = true;
                 self.cursor = Some(id.into());
             }
@@ -241,7 +255,14 @@ impl Projection {
                 // A submitted user message can precede processing. Only an
                 // assistant or the final busy/retry status proves a turn
                 // began. A previously applied stop must remain untouched.
-                if self.activity == Activity::Idle && !self.stops.contains(id) {
+                let already_stopped = stopped_through.is_some_and(|last| index <= last);
+                if self.activity == Activity::Idle && !already_stopped {
+                    if let Some(parent_id) = info["parentID"].as_str() {
+                        if self.users.contains(parent_id) {
+                            self.last_user_id = Some(parent_id.into());
+                            self.last_user = self.message_text(parent_id);
+                        }
+                    }
                     self.change_activity(Activity::Busy, self.last_user_id.clone(), &mut effects);
                 }
                 self.last_assistant = Some(id.into());
@@ -253,14 +274,19 @@ impl Projection {
                     // agent turn. tool-calls completes that request while the
                     // tools and next request still belong to the same turn.
                     if info["finish"] != "tool-calls"
-                        && (info["finish"].as_str().is_some() || activity == Activity::Idle)
+                        && (info["finish"].as_str().is_some()
+                            || !info["error"].is_null()
+                            || activity == Activity::Idle
+                            || latest_assistant.is_some_and(|later| later > index))
                         && !self.stops.contains(id)
                     {
                         // Persistence can precede the provider's idle status.
                         // A later assistant proves the next turn began; absent
                         // that proof, wait for idle and keep replaying this row.
-                        if activity == Activity::Idle
-                            || latest_assistant_id.is_some_and(|later| later > id)
+                        if already_stopped {
+                            self.stops.insert(id.into());
+                        } else if activity == Activity::Idle
+                            || latest_assistant.is_some_and(|later| later > index)
                         {
                             self.stops.insert(id.into());
                             self.activity = Activity::Idle;
@@ -268,15 +294,26 @@ impl Projection {
                                 message_id: Some(id.into()),
                                 text: self.assistant_text(),
                             });
-                        } else if !held {
-                            held = true;
-                            self.cursor = Some(id.into());
+                        } else {
+                            pending = true;
                         }
+                    } else if info["finish"] != "tool-calls"
+                        && !already_stopped
+                        && !self.stops.contains(id)
+                    {
+                        // Completion metadata can arrive before finish/error.
+                        pending = true;
                     }
-                } else if !held {
-                    held = true;
-                    self.cursor = Some(id.into());
+                } else {
+                    pending = true;
                 }
+            }
+            if pending && !held {
+                held = true;
+                self.cursor = Some(id.into());
+            }
+            if !pending {
+                self.replayed_messages.insert(id.into());
             }
             if !held {
                 self.cursor = Some(id.into());
@@ -296,6 +333,14 @@ impl Projection {
         let id = info["id"].as_str().context("opencode message missing id")?;
         validate_id(id, "msg")?;
         if info["role"] == "user" {
+            for part in parts.iter().filter(|part| part["type"] == "text") {
+                let part_id = part["id"].as_str().context("user text missing part id")?;
+                validate_id(part_id, "prt")?;
+                self.text.entry(id.into()).or_default().insert(
+                    part_id.into(),
+                    part["text"].as_str().unwrap_or_default().into(),
+                );
+            }
             let mut text = parts
                 .iter()
                 .filter(|part| part["type"] == "text")
