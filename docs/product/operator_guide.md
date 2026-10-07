@@ -295,6 +295,24 @@ as one GitHub review with each comment quoting its sentence, and wakes the
 agent with `[sm review]`. **Ask** puts a question to the document's author,
 who answers in your Inbox.
 
+### Rebuild the demo
+
+<https://sm-demo.rajeshgo.li> replays a recorded sprint in this dashboard,
+built from `web-demo/` (its `README.md` has the details). Cloudflare Pages
+builds and deploys it from `main` whenever a push changes `web-demo/` or
+`crates/sm-server/src/web/`, so a dashboard change reaches the demo on merge.
+
+1. **Regenerate the recording** when the dashboard's data calls change (new
+   pages or fields the recording lacks). It plays in real time, about ten
+   minutes. From a shell, run `python3 web-demo/generate/record.py`; an agent
+   submits it to the queue instead:
+   `sm queue run --type background --max-wait 2h --timeout 30m --label demo-record --cwd <repo> -- python3 web-demo/generate/record.py`
+2. **Rebuild and check it locally:** `python3 web-demo/build.py --serve`, then
+   open <http://localhost:8440/>.
+3. **Redeploy** by merging the change to `main`. To redeploy without a
+   change, use **Retry deployment** on the `sm-demo` project in the Cloudflare
+   Pages dashboard.
+
 ---
 
 ## The Android app
