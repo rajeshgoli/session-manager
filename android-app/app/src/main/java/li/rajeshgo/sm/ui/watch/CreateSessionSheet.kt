@@ -23,6 +23,7 @@ import li.rajeshgo.sm.data.model.BugReportIssue
 import li.rajeshgo.sm.ui.bug.BugAgentChoice
 import li.rajeshgo.sm.ui.bug.BugFiling
 import li.rajeshgo.sm.ui.theme.Border
+import kotlinx.serialization.json.*
 
 fun supportsSessionCloning(provider: String?): Boolean = provider in listOf("claude", "codex", "codex-fork")
 
@@ -44,6 +45,19 @@ data class TicketStart(
 )
 
 data class AgentTypeChoice(val name: String, val provider: String, val model: String, val effort: String)
+
+fun agentTypeChoices(settings: JsonObject): List<AgentTypeChoice> =
+    (settings["new_agent"] as? JsonObject)?.get("agent_types")?.let { it as? JsonArray }.orEmpty().mapNotNull { entry ->
+        val item = entry as? JsonObject ?: return@mapNotNull null
+        val name = (item["name"] as? JsonPrimitive)?.contentOrNull ?: return@mapNotNull null
+        AgentTypeChoice(name, (item["provider"] as? JsonPrimitive)?.contentOrNull ?: "claude",
+            (item["model"] as? JsonPrimitive)?.contentOrNull.orEmpty(), (item["effort"] as? JsonPrimitive)?.contentOrNull.orEmpty())
+    }
+
+fun matchAgentType(types: List<AgentTypeChoice>, provider: String, model: String?, effort: String?, preferredName: String? = null): AgentTypeChoice? {
+    val matches = types.filter { it.provider == provider && it.model == model.orEmpty() && it.effort == effort.orEmpty() }
+    return matches.firstOrNull { it.name == preferredName } ?: matches.firstOrNull()
+}
 
 /**
  * Report a bug (spec 1859 C4): the sheet takes the bug's text and
@@ -77,6 +91,7 @@ fun CreateSessionSheet(
     source: ClientSession?,
     sessions: List<ClientSession>,
     loadModels: suspend (String, String) -> List<String>,
+    loadAgentTypes: suspend () -> List<AgentTypeChoice>,
     busy: Boolean,
     error: String?,
     onDismiss: () -> Unit,
@@ -88,6 +103,7 @@ fun CreateSessionSheet(
     bugDraft: String = "",
     onBugDraftChange: (String) -> Unit = {},
     onClearBugDraft: () -> Unit = {},
+    onAgentTypeChange: (String?) -> Unit = {},
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     // The agent fields open on the bug defaults once they arrive.
@@ -104,21 +120,45 @@ fun CreateSessionSheet(
     var provider by rememberSaveable(sheetKey) { mutableStateOf(template.provider) }
     var model by rememberSaveable(sheetKey) { mutableStateOf(template.model.orEmpty()) }
     var effort by rememberSaveable(sheetKey) { mutableStateOf(template.reasoningEffort.orEmpty()) }
-    var selectedType by rememberSaveable(sheetKey) { mutableStateOf(ticket?.selectedType) }
+    var otherType by rememberSaveable(sheetKey) { mutableStateOf(false) }
+    var selectedTypeName by rememberSaveable(sheetKey) { mutableStateOf(ticket?.selectedType) }
+    var typesInitialized by rememberSaveable(sheetKey) { mutableStateOf(false) }
+    var agentTypes by remember { mutableStateOf(ticket?.agentTypes.orEmpty()) }
+    var typesLoading by remember { mutableStateOf(true) }
+    var typesError by remember { mutableStateOf(false) }
+    var typesAttempt by remember { mutableStateOf(0) }
+    LaunchedEffect(typesAttempt) {
+        typesLoading = true
+        typesError = false
+        try { agentTypes = loadAgentTypes() }
+        catch (error: kotlinx.coroutines.CancellationException) { throw error }
+        catch (_: Exception) { typesError = true }
+        finally { typesLoading = false }
+    }
+    LaunchedEffect(sheetKey, typesLoading) {
+        if (!typesLoading && !typesInitialized) {
+            selectedTypeName = matchAgentType(agentTypes, provider, model, effort, selectedTypeName)?.name
+            otherType = selectedTypeName == null
+            typesInitialized = true
+        }
+    }
+    val selectedType = if (otherType) null else matchAgentType(agentTypes, provider, model, effort, selectedTypeName)
+    LaunchedEffect(selectedType?.name, typesInitialized) {
+        if (typesInitialized) onAgentTypeChange(selectedType?.name)
+    }
+    val customConfig = !typesLoading && selectedType == null
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name.orEmpty()) }
     var prompt by rememberSaveable(sheetKey) { mutableStateOf(ticket?.brief.orEmpty()) }
-    // Start preselects the catalog's first model when the board's default is missing from it.
-    var defaultUnavailable by rememberSaveable(sheetKey) { mutableStateOf(false) }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()
     var catalog by remember(provider, directory) { mutableStateOf(emptyList<String>()) }
     var modelsLoading by remember(provider, directory) { mutableStateOf(true) }
     var modelsError by remember(provider, directory) { mutableStateOf(false) }
     var catalogAttempt by remember { mutableStateOf(0) }
-    LaunchedEffect(provider, directory, catalogAttempt, bugAgent) {
-        if (bug != null && (!bugAgent || directory.isBlank())) {
+    LaunchedEffect(provider, directory, catalogAttempt, bugAgent, customConfig) {
+        if (!customConfig || (bug != null && (!bugAgent || directory.isBlank()))) {
             modelsLoading = false
             return@LaunchedEffect
         }
@@ -127,10 +167,6 @@ fun CreateSessionSheet(
         try {
             kotlinx.coroutines.delay(300)
             catalog = loadModels(provider, directory.trim())
-            if (startLike && catalog.isNotEmpty() && model !in catalog) {
-                defaultUnavailable = model.isNotBlank()
-                model = catalog.first()
-            }
         }
         catch (error: kotlinx.coroutines.CancellationException) { throw error }
         catch (_: Exception) { modelsError = true }
@@ -167,34 +203,40 @@ fun CreateSessionSheet(
                     TextButton(onClick = onClearBugDraft, enabled = !busy) { Text("Clear draft") }
                 }
             }
-            if (ticket?.whenReady == true) {
-                var typeMenu by remember { mutableStateOf(false) }
-                Box {
-                    OutlinedButton(onClick = { typeMenu = true }, enabled = !busy) { Text("Agent type: ${selectedType ?: "Custom"}") }
-                    DropdownMenu(expanded = typeMenu, onDismissRequest = { typeMenu = false }) {
-                        ticket.agentTypes.forEach { choice ->
-                            DropdownMenuItem(text = { Text(choice.name) }, onClick = {
-                                selectedType = choice.name; provider = choice.provider; model = choice.model; effort = choice.effort; typeMenu = false
-                            })
-                        }
-                        DropdownMenuItem(text = { Text("Custom") }, onClick = { selectedType = null; typeMenu = false })
-                    }
-                }
-            }
             if (bug == null || bugAgent) {
-                val providers = if (startLike) listOf("claude", "codex-fork") else listOf("claude", "codex")
-                SessionChoice("Provider", provider, (providers + provider).distinct(), !busy) {
-                    provider = it; model = ""; effort = "high"; customModel = false; defaultUnavailable = false
+                Text("Agent type", style = MaterialTheme.typography.titleSmall)
+                agentTypes.forEach { choice ->
+                    FilterChip(
+                        selected = selectedType == choice,
+                        onClick = {
+                            selectedTypeName = choice.name; otherType = false; provider = choice.provider; model = choice.model; effort = choice.effort
+                            customModel = false
+                        },
+                        enabled = !busy && !typesLoading,
+                        label = { Column {
+                            Text(choice.name)
+                            Text("${choice.provider} · ${choice.model.ifBlank { "Provider default" }} · ${choice.effort.ifBlank { "Default effort" }}", style = MaterialTheme.typography.bodySmall)
+                        } },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
-                SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
-                    if (it == "Other model…") customModel = true else { model = it; customModel = false }
+                FilterChip(selected = customConfig, onClick = { otherType = true }, enabled = !busy && !typesLoading, label = { Text("Other") })
+                if (typesLoading) Text("Loading agent types…", style = MaterialTheme.typography.bodySmall)
+                if (typesError) TextButton(onClick = { typesAttempt++ }, enabled = !busy) { Text("Couldn't load agent types · Retry") }
+                if (customConfig) {
+                    val providers = if (startLike) listOf("claude", "codex-fork") else listOf("claude", "codex")
+                    SessionChoice("Provider", provider, (providers + provider).distinct(), !busy) {
+                        provider = it; model = ""; effort = "high"; customModel = false
+                    }
+                    SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
+                        if (it == "Other model…") customModel = true else { model = it; customModel = false }
+                    }
+                    if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
+                    if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
+                    if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                    val efforts = if (startLike) startEfforts(provider) else listOf("medium", "high")
+                    SessionChoice("Effort", effort, (efforts + effort).distinct(), !busy) { effort = it }
                 }
-                if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
-                if (defaultUnavailable && !modelsLoading) Text("The default model is unavailable; the first available model is selected.", style = MaterialTheme.typography.bodySmall)
-                if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
-                if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                val efforts = if (startLike) startEfforts(provider) else listOf("medium", "high")
-                SessionChoice("Effort", effort, (efforts + effort).distinct(), !busy) { effort = it }
                 if (!startLike) {
                     SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
                         if (it == "Other directory…") customDirectory = true else { directory = it; customDirectory = false }
@@ -222,7 +264,7 @@ fun CreateSessionSheet(
                 )
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            val agentReady = directory.trim().startsWith('/') && (!startLike || (model.isNotBlank() && !modelsLoading))
+            val agentReady = directory.trim().startsWith('/') && !typesLoading
             val enabled = !busy && if (bug != null) {
                 bugText.isNotBlank() && (!bugAgent || (bug.defaults != null && bug.agentNote == null && agentReady))
             } else agentReady

@@ -786,6 +786,10 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         }
     }
 
+    suspend fun sessionAgentTypes(): List<li.rajeshgo.sm.ui.watch.AgentTypeChoice> {
+        return li.rajeshgo.sm.ui.watch.agentTypeChoices(sessionRepository.fetchOwnerSettings(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first()))
+    }
+
     suspend fun sessionModels(provider: String, workingDir: String): List<String> = sessionRepository.fetchSessionModels(
         settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), provider, workingDir,
     )

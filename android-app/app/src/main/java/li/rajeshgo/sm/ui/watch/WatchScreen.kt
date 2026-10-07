@@ -501,7 +501,7 @@ fun WatchScreen(
         }
 
         if (creating) {
-            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, createBusy, createError, onDismiss = { creating = false }) { request ->
+            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, viewModel::sessionAgentTypes, createBusy, createError, onDismiss = { creating = false }) { request ->
                 createBusy = true
                 createError = null
                 viewModel.createSession(request) { result ->

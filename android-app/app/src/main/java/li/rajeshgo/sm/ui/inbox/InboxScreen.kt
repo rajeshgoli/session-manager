@@ -286,6 +286,7 @@ fun InboxScreen(
         }
 
         openThread?.let { target ->
+            val shownRows = shownInboxRows(state.filter, state.rows, foldedOpen)
             ThreadScreen(
                 target = target,
                 onClose = { openThread = null },
@@ -294,7 +295,12 @@ fun InboxScreen(
                     li.rajeshgo.sm.ui.navigation.TerminalOpenRequests.pending = sessionId
                     onNavigateToWatch()
                 },
-                onDone = { openThread = null },
+                onDone = {
+                    val next = nextInboxRow(shownRows, target.key ?: target.sessionId?.let { "agent:$it" })
+                    viewModel.refresh()
+                    openThread = next?.let(::inboxThreadTarget)
+                    openRow = next?.takeIf { inboxThreadTarget(it) == null }
+                },
                 onMessage = { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() },
             )
         }
