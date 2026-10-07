@@ -21512,7 +21512,8 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 24] = [
+    const OWNER_WEB_READS: [&str; 25] = [
+        "/claims?session=fork1001&active=false",
         "/client/model",
         "/client/queue",
         "/client/queue/stats",
