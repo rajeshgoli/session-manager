@@ -298,6 +298,9 @@ impl LocalWallRuntime {
                 }
                 request["preserve_profile"] = json!(true);
             }
+            request["git_identity"] = json!({
+                "name": agent.name, "email": format!("{}@local-agent.invalid", agent.id),
+            });
             let request_path = config.join("preparation.json");
             atomic_write(&request_path, serde_json::to_vec(&request)?.as_slice())?;
             let output = run_python(
@@ -436,11 +439,60 @@ impl PreparedWall {
         tool: &str,
         arguments: &[OsString],
     ) -> Result<WallChild> {
-        self.spawn(tool, arguments, true)
+        self.spawn_provider_with_environment(tool, arguments, &BTreeMap::new())
+    }
+
+    /// Extra settings come only from the host provider, never submitted jobs.
+    /// Wall identity, network, loader and private-state settings are reserved.
+    pub fn spawn_provider_with_environment(
+        self: &Arc<Self>,
+        tool: &str,
+        arguments: &[OsString],
+        settings: &BTreeMap<String, String>,
+    ) -> Result<WallChild> {
+        for (key, value) in settings {
+            let upper = key.to_ascii_uppercase();
+            let valid = !key.is_empty()
+                && key.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || (index > 0 && byte.is_ascii_digit())
+                });
+            let reserved = self
+                .environment
+                .keys()
+                .any(|name| name.to_ascii_uppercase() == upper)
+                || upper.ends_with("_PROXY")
+                || [
+                    "DYLD_",
+                    "LD_",
+                    "GIT_",
+                    "CARGO_",
+                    "GH_",
+                    "GITHUB_",
+                    "XDG_",
+                    "LOCAL_",
+                    "SESSION_MANAGER_",
+                    "CLAUDE_SESSION_",
+                    "ANTHROPIC_",
+                    "OPENAI_",
+                ]
+                .iter()
+                .any(|prefix| upper.starts_with(prefix))
+                || (upper.starts_with("SM_")
+                    && !matches!(
+                        key.as_str(),
+                        "SM_SESSION_CREDENTIAL" | "SM_JUDGE_PLUGIN_LOG"
+                    ));
+            if !valid || value.contains('\0') || reserved {
+                bail!("invalid or wall-reserved provider setting: {key}");
+            }
+        }
+        self.spawn(tool, arguments, true, settings)
     }
 
     pub fn spawn_queue(self: &Arc<Self>, tool: &str, arguments: &[OsString]) -> Result<WallChild> {
-        self.spawn(tool, arguments, false)
+        self.spawn(tool, arguments, false, &BTreeMap::new())
     }
 
     fn spawn(
@@ -448,6 +500,7 @@ impl PreparedWall {
         tool: &str,
         arguments: &[OsString],
         provider: bool,
+        settings: &BTreeMap<String, String>,
     ) -> Result<WallChild> {
         let mut life = self
             .life
@@ -464,6 +517,7 @@ impl PreparedWall {
         let environment: Vec<_> = self
             .environment
             .iter()
+            .chain(settings.iter())
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
         let binding = if provider {

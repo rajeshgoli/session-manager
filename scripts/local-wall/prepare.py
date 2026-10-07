@@ -50,6 +50,20 @@ def prepare(request):
     if git.is_symlink() or (git.exists() and not git.is_dir()) or any(
             (git / path).exists() for path in ("commondir", "objects/info/alternates")):
         raise ValueError("local agents require independent Git metadata inside the checkout")
+    if git.exists():
+        configuration = git / "config"
+        if configuration.is_symlink() or (configuration.exists() and (
+                not configuration.is_file() or configuration.stat().st_nlink != 1)):
+            raise ValueError("checkout Git configuration must be an independent regular file")
+        lock = git / "config.lock"
+        if lock.exists() or lock.is_symlink():
+            raise ValueError("checkout Git configuration is already locked")
+        identity = request["git_identity"]
+        for key, value in [("user.name", identity["name"]), ("user.email", identity["email"])]:
+            subprocess.run(["/usr/bin/git", "-C", str(checkout), "config", "--local",
+                            "--no-includes", key, value], check=True,
+                           env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
+                                "GIT_CONFIG_GLOBAL": "/dev/null"})
     names = {"supervisor"}
     staged = {}
     for tool in request["tools"]:
