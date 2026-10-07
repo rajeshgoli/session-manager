@@ -45,6 +45,34 @@ printf 'fixture-lock\n' > "$folder/bun.lock"
     }
 }
 
+#[test]
+#[ignore = "requires installed pinned opencode 1.17.9 and npm access"]
+fn production_opencode_prepares_its_real_plugin_sdk_outside_the_wall() {
+    let fixture = Fixture::new();
+    let config = OpencodeConfig {
+        binary: "/opt/homebrew/bin/opencode".into(),
+        ..fixture.config.clone()
+    };
+    let files = LaunchFiles::prepare(&config, "native-sdk", 18503).unwrap();
+    let folder = Path::new(&files.binding.state_dir).join("xdg/config/opencode");
+    let package: Value = serde_json::from_slice(
+        &fs::read(folder.join("node_modules/@opencode-ai/plugin/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(package["name"], "@opencode-ai/plugin");
+    assert!(folder.join("plugins/sm_judge.js").is_file());
+    assert!(folder.join("package.json").is_file());
+    assert!(
+        folder.join("bun.lock").is_file()
+            || folder.join("bun.lockb").is_file()
+            || folder.join("package-lock.json").is_file()
+    );
+    assert_eq!(
+        fs::metadata(folder.join("opencode.json")).unwrap().mode() & 0o777,
+        0o600
+    );
+}
+
 fn model(state: &str) -> ModelRecord {
     serde_json::from_value(json!({"key":"fixture", "server":"mtplx", "identifier":"actual-model", "seats":1,
         "context":200000, "reservation_bytes":0, "measured_peak_bytes":0, "state":state, "desired":true,
