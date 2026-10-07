@@ -12,6 +12,10 @@ pub(crate) struct PreparedLaunch {
 }
 
 pub(crate) fn prepare_launch() -> PreparedLaunch {
+    prepare_launch_for("launch", 18600, 18700)
+}
+
+pub(crate) fn prepare_launch_for(agent: &str, gateway: u16, egress: u16) -> PreparedLaunch {
     let directory = TestDirectory::new();
     let broker = directory.path().join("h/s/a/tmp/b");
     fs::create_dir_all(&broker).unwrap();
@@ -21,15 +25,15 @@ pub(crate) fn prepare_launch() -> PreparedLaunch {
     let hub = BrokerHub::new(
         PortPolicy::new(PortConfiguration {
             agent_control: port..=port,
-            gateway: 18600..=18600,
-            egress: 18700..=18700,
+            gateway: gateway..=gateway,
+            egress: egress..=egress,
             model: 24000,
             judge: 24001,
         })
         .unwrap(),
     );
     let service = Arc::new(
-        hub.register_agent("launch", port, &broker, &broker.join("s"))
+        hub.register_agent(agent, port, &broker, &broker.join("s"))
             .unwrap(),
     );
     service
@@ -45,6 +49,12 @@ pub(crate) fn prepare_launch() -> PreparedLaunch {
         .arg(directory.path())
         .arg("--control-port")
         .arg(port.to_string())
+        .args([
+            "--gateway-port",
+            &gateway.to_string(),
+            "--egress-port",
+            &egress.to_string(),
+        ])
         .arg("--peer-token")
         .args(service.peer_token().0.map(|word| word.to_string()))
         .output()

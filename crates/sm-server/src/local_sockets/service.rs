@@ -507,7 +507,7 @@ fn send(
 }
 
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) use tests::launch_tests::prepare_launch;
+pub(crate) use tests::launch_tests::{prepare_launch, prepare_launch_for};
 
 #[cfg(test)]
 mod tests {

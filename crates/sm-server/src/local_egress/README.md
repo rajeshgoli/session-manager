@@ -83,3 +83,27 @@ Tests: `scripts/test-rust-isolated.sh local_egress:: -- --test-threads=1` covers
 forged headers, signature tampering/expiry, state revocation, legacy records,
 streaming, rejected targets/redirects, port conflicts, two-agent attribution,
 restart and reserved-port lifetime, plus the original egress behavior.
+
+## Combined gateway and queue acceptance
+
+`local_egress::acceptance::two_agents_gateway_queue_restart_and_egress_attribution`
+runs two production sandbox profiles, socket adapters, gateways, the real HTTP
+router, SQLite queue storage, queue launch supervisors, and egress proxies. Each
+agent submits with omitted, empty, and forged requester identity, with session
+variables absent during submission and forged in the job environment. Every
+notification targets the other session. The test restarts the HTTP server and
+restores the host launch bindings before normal admission of the pending jobs.
+
+All six jobs must finish successfully. Their connections must be logged under
+their submitting agents, with exactly one tunnel per job and correct byte counts.
+The sandbox must return a permission denial for direct public egress, the direct
+sm listener, the other agent's gateway/proxy ports, and gateway-secret reads.
+Gateway input carries forged identity, stamp, session, and credential headers.
+The stored requester and durable wall identity must still match the listener.
+
+This test has no external network dependency: a test-only DNS answer and dial
+fixture send the proxy's approved public CONNECT tunnel to a local echo server.
+The production destination checks and tunnel accounting still run. The dial
+fixture is absent from production builds. Separate gateway verification, complete
+HTTP route-policy, cancellation, hosted/owner, and native launch tests cover the
+remaining #1979 acceptance cases.

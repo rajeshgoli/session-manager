@@ -29,7 +29,7 @@ def prepare(args):
     library = state / "xdg/config/adapter.dylib"
     subprocess.run([str(python), str(scripts / "build_adapter.py"),
                     "--endpoint", str(broker / "s"), "--peer-token", *map(str, args.peer_token),
-                    "--direct-ports", "18600", "18700", "24000", "24001",
+                    "--direct-ports", str(args.gateway_port), str(args.egress_port), "24000", "24001",
                     "--control-port", str(args.control_port), "--control-fd", "198",
                     "--contained-spawns",
                     "--immutable-exec-dir", str(executables),
@@ -46,8 +46,8 @@ def prepare(args):
         "--home", str(home), "--checkout", str(checkout), "--state-root", str(home / "s"),
         "--state-dir", str(state), "--tmp-dir", tmp,
         "--agent-port", str(args.control_port), "--agent-port-range", f"{args.control_port}-{args.control_port}",
-        "--gateway-port", "18600", "--gateway-port-range", "18600-18600",
-        "--egress-port", "18700", "--egress-port-range", "18700-18700",
+        "--gateway-port", str(args.gateway_port), "--gateway-port-range", f"{args.gateway_port}-{args.gateway_port}",
+        "--egress-port", str(args.egress_port), "--egress-port-range", f"{args.egress_port}-{args.egress_port}",
         "--model-port", "24000", "--judge-port", "24001", "--service-state-dir", str(secret),
         "--broker-dir", str(broker), "--immutable-exec-dir", str(executables),
         "--contained-processes",
@@ -80,5 +80,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--control-port", type=int, required=True)
+    parser.add_argument("--gateway-port", type=int, default=18600)
+    parser.add_argument("--egress-port", type=int, default=18700)
     parser.add_argument("--peer-token", type=int, nargs=8, required=True)
     prepare(parser.parse_args())
