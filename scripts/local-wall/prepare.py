@@ -115,9 +115,13 @@ def prepare(request):
             raise ValueError("profile temporary file has aliases or an unexpected type")
         temporary_profile.unlink()
     try:
-        temporary_profile.write_text(wall.generate(wall.parser().parse_args(arguments), wall.listening_ports(), len(wall.user_temp())))
-        temporary_profile.chmod(0o400)
-        temporary_profile.replace(profile)
+        generated = wall.generate(wall.parser().parse_args(arguments), wall.listening_ports(), len(wall.user_temp()))
+        # Rust has checked the saved queue registration and host configuration.
+        # Its original launch-time deny list must retain the pending job hash.
+        if not request.get("preserve_profile", False):
+            temporary_profile.write_text(generated)
+            temporary_profile.chmod(0o400)
+            temporary_profile.replace(profile)
     finally:
         temporary_profile.unlink(missing_ok=True)
     adapter = config / "adapter.dylib"

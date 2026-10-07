@@ -31,6 +31,7 @@ use std::{
 };
 
 /// All values come from sm's host configuration, never a tool or queue body.
+#[derive(Clone)]
 pub struct HostConfiguration {
     pub home: PathBuf,
     pub state_root: PathBuf,
@@ -50,6 +51,7 @@ pub struct StageTool {
     pub source: PathBuf,
 }
 
+#[derive(Serialize)]
 pub struct AgentRegistration {
     pub id: String,
     pub name: String,
@@ -124,6 +126,26 @@ impl LocalWallRuntime {
     /// Call only after all previous launches using this state have exited.
     /// A live broker/host preparation lock causes refusal, never replacement.
     pub fn prepare(&self, agent: &AgentRegistration) -> Result<Arc<PreparedWall>> {
+        self.prepare_inner(agent, None)
+    }
+
+    /// The caller pauses queue admission during preparation and restoration.
+    /// Existing pending jobs retain their original immutable registration.
+    pub fn prepare_for_queue(
+        &self,
+        agent: &AgentRegistration,
+        queue_state: &Path,
+    ) -> Result<Arc<PreparedWall>> {
+        private_directory(queue_state)?;
+        crate::queue::local_wall::ensure_no_running_jobs(queue_state, &agent.id)?;
+        self.prepare_inner(agent, Some(queue_state))
+    }
+
+    fn prepare_inner(
+        &self,
+        agent: &AgentRegistration,
+        queue_state: Option<&Path>,
+    ) -> Result<Arc<PreparedWall>> {
         if agent.id.is_empty()
             || agent.id.len() > 64
             || !agent
@@ -155,6 +177,10 @@ impl LocalWallRuntime {
         {
             bail!("agent wall is already prepared or its lock has aliases");
         }
+        let saved = queue_state
+            .map(|root| crate::queue::local_wall::registered_spec(root, &agent.id))
+            .transpose()?
+            .flatten();
         let broker = state.join("tmp/b");
         let alias_name = format!("{:x}", Sha256::digest(agent.id.as_bytes()));
         let alias = self.config.alias_root.join(&alias_name[..16]);
@@ -173,10 +199,12 @@ impl LocalWallRuntime {
                     .register_agent(&agent.id, agent.control_port, &broker, &endpoint)?,
             );
         let control = service.control_listener(IpVersion::V4)?;
-        let egress = self
-            .egress
-            .register_gateway(&agent.id, self.config.sm_upstream)?;
         let result = (|| {
+            // A lost reply can hide a successful durable registration. Include
+            // the call itself in rollback, retaining its assigned ports.
+            let egress = self
+                .egress
+                .register_gateway(&agent.id, self.config.sm_upstream)?;
             let temporary = run_python(
                 &self.config.python,
                 &install_sources(&config)?.join("wall_profile.py"),
@@ -186,20 +214,29 @@ impl LocalWallRuntime {
                 ],
             )?;
             let tmp = PathBuf::from(String::from_utf8(temporary)?.trim());
-            let judge = self.judge.register(
-                &agent.id,
-                &JudgeRegistration {
-                    name: agent.name.clone(),
-                    ticket: agent.ticket,
-                    title: agent.title.clone(),
-                    branch: agent.branch.clone(),
-                    checkout: agent.checkout.clone(),
-                    tmp,
-                    parent: agent.parent.clone(),
-                    sm_url: format!("http://{}", self.config.sm_upstream),
-                    proxy_port: egress.port,
-                },
-            )?;
+            let registration = JudgeRegistration {
+                name: agent.name.clone(),
+                ticket: agent.ticket,
+                title: agent.title.clone(),
+                branch: agent.branch.clone(),
+                checkout: agent.checkout.clone(),
+                tmp,
+                parent: agent.parent.clone(),
+                sm_url: format!("http://{}", self.config.sm_upstream),
+                proxy_port: egress.port,
+            };
+            let judge = if let Some(saved) = &saved {
+                self.judge.register_restored(
+                    &agent.id,
+                    &registration,
+                    saved
+                        .environment
+                        .get("LOCAL_JUDGE_TOKEN")
+                        .context("saved judge credential missing")?,
+                )?
+            } else {
+                self.judge.register(&agent.id, &registration)?
+            };
             if loopback_port(&judge.url)? != self.judge_port {
                 bail!("judge endpoint changed during preparation");
             }
@@ -207,17 +244,60 @@ impl LocalWallRuntime {
                 .gateway
                 .as_ref()
                 .context("missing registered sm gateway")?;
-            let request = json!({
+            let mut tools = serde_json::to_value(&agent.tools)?;
+            if queue_state.is_some() {
+                if agent.tools.iter().any(|tool| tool.name == "queue-zsh") {
+                    bail!("queue-zsh is reserved for the host shell");
+                }
+                tools
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name": "queue-zsh", "source": "/bin/zsh"}));
+            }
+            let mut service_roots = vec![self.egress.directory(), self.judge.directory()];
+            if let Some(root) = queue_state {
+                service_roots.push(root);
+            }
+            let mut request = json!({
                 "home": self.config.home, "state_root": self.config.state_root, "state": state,
                 "checkout": agent.checkout, "broker_dir": broker, "endpoint": endpoint,
-                "peer_token": service.peer_token().0, "tools": agent.tools,
+                "peer_token": service.peer_token().0, "tools": tools,
                 "ports": {"agent": agent.control_port, "gateway": gateway.port, "egress": egress.port,
                     "model": self.config.model_port, "judge": self.judge_port},
                 "ranges": {"agent": format!("{}-{}", self.config.control_ports.start(), self.config.control_ports.end()),
                     "gateway": "18600-18699", "egress": "18700-18799"},
-                "service_roots": [self.egress.directory(), self.judge.directory()],
+                "service_roots": service_roots,
                 "read_only_roots": self.config.read_only_roots, "executable_roots": self.config.executable_roots,
             });
+            let mut authority = request.clone();
+            authority.as_object_mut().unwrap().remove("peer_token");
+            authority["registration"] = serde_json::to_value(agent)?;
+            // Pin trusted source contents, not just their locations.
+            let mut hashes = BTreeMap::new();
+            for tool in tools.as_array().unwrap() {
+                let source = tool["source"].as_str().unwrap();
+                hashes.insert(source, format!("{:x}", Sha256::digest(fs::read(source)?)));
+            }
+            authority["tool_hashes"] = serde_json::to_value(hashes)?;
+            authority["generator_sha256"] = json!(format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../../scripts/local-wall/wall_profile.py"
+                ))
+            ));
+            let authority = serde_json::to_vec(&authority)?;
+            let authority_path = config.join("queue-authority.json");
+            if let Some(saved) = &saved {
+                if saved.agent_state != state
+                    || saved.checkout != agent.checkout
+                    || saved.profile != config.join("wall.sb")
+                    || saved.shell != config.join("executables/queue-zsh")
+                    || fs::read(&authority_path)? != authority
+                {
+                    bail!("saved queue authority differs from current host configuration");
+                }
+                request["preserve_profile"] = json!(true);
+            }
             let request_path = config.join("preparation.json");
             atomic_write(&request_path, serde_json::to_vec(&request)?.as_slice())?;
             let output = run_python(
@@ -235,18 +315,36 @@ impl LocalWallRuntime {
                 &artifacts.adapter,
                 &artifacts.supervisor,
             )?;
-            let queue = LaunchBinding::new(
+            let queue = Arc::new(LaunchBinding::new(
                 service.clone(),
                 None,
                 &artifacts.profile,
                 &artifacts.adapter,
                 &artifacts.supervisor,
-            )?;
+            )?);
+            if let Some(root) = queue_state {
+                crate::queue::local_wall::register(
+                    root,
+                    &agent.id,
+                    crate::queue::local_wall::WallSpec {
+                        agent_state: state,
+                        checkout: agent.checkout.clone(),
+                        profile: artifacts.profile.clone(),
+                        shell: artifacts.tools["queue-zsh"].clone(),
+                        environment: environment.clone(),
+                        gateway_port: gateway.port,
+                        egress_port: egress.port,
+                    },
+                )?;
+                atomic_write(&authority_path, &authority)?;
+                crate::queue::local_wall::attach(root, &agent.id, queue.clone())?;
+            }
             Ok(Arc::new(PreparedWall {
                 artifacts,
                 environment,
                 provider,
                 queue,
+                queue_state: queue_state.map(Path::to_path_buf),
                 checkout: agent.checkout.clone(),
                 id: agent.id.clone(),
                 egress: self.egress.clone(),
@@ -280,7 +378,8 @@ pub struct PreparedWall {
     pub artifacts: WallArtifacts,
     environment: BTreeMap<String, String>,
     provider: LaunchBinding,
-    queue: LaunchBinding,
+    queue: Arc<LaunchBinding>,
+    queue_state: Option<PathBuf>,
     checkout: PathBuf,
     id: String,
     egress: ServiceClient,
@@ -290,6 +389,29 @@ pub struct PreparedWall {
 }
 
 impl PreparedWall {
+    /// After suspension and all pending/running queue work ends, permit a new
+    /// configuration. The caller still owns immutable command-file cleanup.
+    pub fn retire_queue(&self) -> Result<()> {
+        let life = self
+            .life
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wall lifecycle lock poisoned"))?;
+        if life.active || life.children != 0 {
+            bail!("suspend the wall before retiring queue authority");
+        }
+        if let Some(root) = &self.queue_state {
+            crate::queue::local_wall::retire_registration(root, &self.id)?;
+        }
+        Ok(())
+    }
+    /// Caller pauses admission first; pending jobs remain durable for restart.
+    pub fn detach_queue(&self) -> Result<()> {
+        if let Some(root) = &self.queue_state {
+            crate::queue::local_wall::ensure_no_running_jobs(root, &self.id)?;
+            crate::queue::local_wall::detach(root, &self.id)?;
+        }
+        Ok(())
+    }
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
@@ -332,7 +454,7 @@ impl PreparedWall {
         let binding = if provider {
             &self.provider
         } else {
-            &self.queue
+            self.queue.as_ref()
         };
         let child = binding.spawn(executable, arguments, &environment, &self.checkout)?;
         life.children += 1;
@@ -352,6 +474,7 @@ impl PreparedWall {
         if life.children != 0 {
             bail!("agent wall still has running children");
         }
+        self.detach_queue()?;
         life.active = false;
         let judge = self.judge.unregister(&self.id);
         let egress = self.egress.unregister_agent(&self.id);

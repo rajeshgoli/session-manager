@@ -301,6 +301,220 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     b.suspend().unwrap();
     drop(restored);
     drop(b);
+    let queue_state = root.join("queue-service");
+    let mut c_registration = registration("wall-c", 18502);
+    let d_registration = registration("wall-d", 18503);
+    let c = host
+        .prepare_for_queue(&c_registration, &queue_state)
+        .unwrap();
+    let d = host
+        .prepare_for_queue(&d_registration, &queue_state)
+        .unwrap();
+    let request = |wall: &Arc<PreparedWall>, other: &AgentRegistration| {
+        let other_network = egress.registration(&other.id).unwrap().unwrap();
+        crate::queue::CreateQueueJob {
+            local_submitter: Some(
+                crate::local_egress::gateway::VerifiedLocalAgent::test_identity(&wall.id),
+            ),
+            job_type: "tests".into(),
+            label: "host-composed-wall".into(),
+            requester_session_id: Some("forged".into()),
+            notify_session_id: "another-agent".into(),
+            cwd: wall.checkout.display().to_string(),
+            argv: None,
+            script: Some(format!(
+                "'{}' {} {} {} '{}' || exit 1\nprint durable-wall-ok\n",
+                wall.artifacts.tools["probe"].display(),
+                other_network.gateway.unwrap().port,
+                other_network.port,
+                model_port,
+                wall.artifacts.profile.display()
+            )),
+            env: BTreeMap::from([
+                ("LOCAL_AGENT_ID".into(), "forged".into()),
+                ("DYLD_INSERT_LIBRARIES".into(), "/does-not-exist".into()),
+                ("SM_API_URL".into(), "http://127.0.0.1:8420".into()),
+            ]),
+            timeout_seconds: 30,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
+            rank_tickets: None,
+        }
+    };
+    use crate::queue::RetainedQueueStore;
+    let c_job = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state,
+        request(&c, &d_registration),
+    )
+    .unwrap();
+    let d_job = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state,
+        request(&d, &c_registration),
+    )
+    .unwrap();
+    let refused = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state,
+        request(&c, &d_registration),
+    )
+    .unwrap();
+    let manifest = queue_state.join("local-walls/wall-c.json");
+    let mut holding = request(&c, &d_registration);
+    holding.script = None;
+    holding.argv = Some(vec![
+        c.artifacts.tools["probe"].display().to_string(),
+        "hold".into(),
+    ]);
+    let holding = RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, holding).unwrap();
+    let holding_id = holding.id.clone();
+    assert!(crate::queue::local_wall::retire_registration(&queue_state, &c.id).is_err());
+    let saved_manifest = fs::read(&manifest).unwrap();
+    let saved_profile = fs::read(&c.artifacts.profile).unwrap();
+    c.detach_queue().unwrap();
+    d.detach_queue().unwrap();
+    assert!(RetainedQueueStore::start_queue_job_in_state_dir(
+        &queue_state,
+        &root.join("messages.db"),
+        &refused.id,
+        0
+    )
+    .is_err());
+    drop(c);
+    drop(d);
+    // An unrelated new host listener must not change the saved profile hash.
+    let unrelated = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let original_title = c_registration.title.clone();
+    c_registration.title.push_str(" changed");
+    assert!(host
+        .prepare_for_queue(&c_registration, &queue_state)
+        .is_err());
+    c_registration.title = original_title;
+    let c = host
+        .prepare_for_queue(&c_registration, &queue_state)
+        .unwrap();
+    let d = host
+        .prepare_for_queue(&d_registration, &queue_state)
+        .unwrap();
+    assert_eq!(fs::read(manifest).unwrap(), saved_manifest);
+    assert_eq!(fs::read(&c.artifacts.profile).unwrap(), saved_profile);
+    for job in [c_job, d_job, holding] {
+        RetainedQueueStore::start_queue_job_in_state_dir(
+            &queue_state,
+            &root.join("messages.db"),
+            &job.id,
+            0,
+        )
+        .unwrap();
+        if job.id == holding_id {
+            assert!(
+                c.detach_queue().is_err(),
+                "running queue child must retain launcher"
+            );
+            assert!(
+                c.suspend().is_err(),
+                "running queue child must retain active services"
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let result = RetainedQueueStore::get_queue_job_strict_from_path(
+                &queue_state.join("queue_runner.db"),
+                &job.id,
+            )
+            .unwrap()
+            .unwrap();
+            if result.state != "running" && result.state != "pending" {
+                let output = fs::read_to_string(result.log_path.unwrap()).unwrap();
+                assert_eq!(result.state, "succeeded", "{output}");
+                assert!(output.contains("durable-wall-ok"), "{output}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "durable queue job did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let saved_judge_token = c.environment["LOCAL_JUDGE_TOKEN"].clone();
+    c.suspend().unwrap();
+    d.suspend().unwrap();
+    drop(c);
+    drop(d);
+    let c = host
+        .prepare_for_queue(&c_registration, &queue_state)
+        .unwrap();
+    assert_eq!(c.environment["LOCAL_JUDGE_TOKEN"], saved_judge_token);
+    c.suspend().unwrap();
+    c.retire_queue().unwrap();
+    assert!(
+        crate::queue::local_wall::registered_spec(&queue_state, &c.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(c);
+    drop(unrelated);
+    // Simulate durable activation followed by a lost registration reply.
+    let uncertain = root.join("uncertain-egress");
+    private_directory(&uncertain).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(uncertain.join("control.sock")).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let record_path = uncertain.join("active");
+    let thread_record = record_path.clone();
+    let daemon = thread::spawn(move || {
+        use std::io::BufRead;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "missing rollback request");
+            let (mut stream, _) = match socket.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            // Readiness probes close immediately; Darwin can reject a timeout
+            // option on their disconnected sockets. Bound readiness with poll.
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(unsafe { libc::poll(&mut descriptor, 1, 5000) } > 0);
+            let mut request = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut request)
+                .unwrap();
+            if request.is_empty() {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            if request.get("RegisterGateway").is_some() {
+                fs::write(&thread_record, "true").unwrap();
+                // Close without the committed registration's reply.
+            } else {
+                assert!(request.get("Unregister").is_some(), "{request}");
+                fs::write(&thread_record, "false").unwrap();
+                stream
+                    .write_all(b"{\"registration\":null,\"error\":null}\n")
+                    .unwrap();
+                break;
+            }
+        }
+    });
+    let uncertain_host = LocalWallRuntime::new(
+        host.config.clone(),
+        ServiceClient::new(uncertain, std::env::current_exe().unwrap()),
+        judge.clone(),
+    )
+    .unwrap();
+    assert!(uncertain_host
+        .prepare(&registration("wall-uncertain", 18504))
+        .is_err());
+    daemon.join().unwrap();
+    assert_eq!(fs::read_to_string(record_path).unwrap(), "false");
+    drop(uncertain_host);
     drop(host);
     drop(fixture);
 }

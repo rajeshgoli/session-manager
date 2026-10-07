@@ -713,7 +713,14 @@ class Control(socketserver.StreamRequestHandler):
                             state = os.path.realpath(ARGS.root)
                             if state == agent[key] or state.startswith(agent[key] + os.sep):
                                 raise ValueError("judge state cannot be inside agent folders")
-                        agent["decide_token"] = agents.get(agent_id, {}).get("decide_token") or secrets.token_hex(32)
+                        restored_token = body.get("restore_token")
+                        existing_token = agents.get(agent_id, {}).get("decide_token")
+                        if restored_token is not None:
+                            if (not isinstance(restored_token, str)
+                                    or not re.fullmatch(r"[0-9a-f]{64}", restored_token)
+                                    or existing_token and not secrets.compare_digest(existing_token, restored_token)):
+                                raise ValueError("invalid or conflicting restored judge token")
+                        agent["decide_token"] = existing_token or restored_token or secrets.token_hex(32)
                         agents[agent_id] = agent
                         write_agents(agents)
                         result = {"url": f"http://127.0.0.1:{HTTP.server_port}/decide",
