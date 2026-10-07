@@ -4508,7 +4508,9 @@ async fn create_client_session(
     let request = CreateCoreSessionRequest {
         id: payload.id,
         name: payload.name,
-        working_dir: payload.working_dir,
+        working_dir: payload
+            .working_dir
+            .map(|path| expand_home(path.trim()).to_string_lossy().into_owned()),
         provider: payload.provider,
         parent_session_id: None,
         node: None,
@@ -21810,7 +21812,7 @@ mod tests {
             "sm.example.com",
             Some(&owner),
             &origin,
-            &json!({"name": "web-agent", "working_dir": "/tmp", "provider": "claude",
+            &json!({"name": "web-agent", "working_dir": "~/projects", "provider": "claude",
                     "parent_session_id": "fork1001", "node": "elsewhere", "wait": 30}),
         );
         let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
@@ -21821,6 +21823,10 @@ mod tests {
         let (_, session) =
             browser_host_get(&app, &format!("/client/sessions/{id}"), Some(&owner)).await;
         assert_eq!(session["parent_session_id"], Value::Null, "{session}");
+        assert_eq!(
+            session["working_dir"],
+            expand_home("~/projects").to_string_lossy().as_ref()
+        );
     }
 
     /// The phone's hostname ignores the browser login: its own checks apply.
@@ -25355,6 +25361,49 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             body["new_agent"]["claude"],
             json!({"model": "opus", "effort": "high"})
         );
+
+        // Project folders are discovered from the saved parent and refreshed on GET.
+        let projects =
+            std::env::temp_dir().join(format!("sm-settings-folders-{}", random_urlsafe_token(8)));
+        fs::create_dir_all(projects.join("zeta/nested")).unwrap();
+        fs::create_dir_all(projects.join("alpha")).unwrap();
+        fs::create_dir_all(projects.join(".hidden")).unwrap();
+        fs::write(projects.join("file"), "not a folder").unwrap();
+        let (status, body) = put(
+            json!({"new_agent": {"workspace_parent": projects.to_string_lossy()}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = json!([
+            projects.join("alpha").to_string_lossy(),
+            projects.join("zeta").to_string_lossy()
+        ]);
+        assert_eq!(body["workspace_folders"], expected);
+        let (_, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
+        assert_eq!(body["workspace_folders"], expected);
+        fs::remove_dir_all(&projects).unwrap();
+        let (_, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
+        assert_eq!(body["workspace_folders"], json!([]));
+        assert!(body["workspace_error"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot read folders"));
+        let (status, _) = put(
+            json!({"new_agent": {"workspace_parent": "~/projects"}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = put(
+            json!({"new_agent": {"workspace_parent": "relative"}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // A partial PUT merges; null restores the default; the limit applies
         // to the queue without a restart.

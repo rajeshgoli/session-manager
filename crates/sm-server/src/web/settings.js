@@ -206,6 +206,9 @@ function NewAgents({ data, retire, restart, write }) {
       hint="One owner/repository = shortname per line. Short names use 1–12 lowercase letters or digits and must be unique."
       onDraft=${value => { try { patch('repo_short', shortNames(value)); } catch { /* Keep the last parseable preview. */ } }}
       save=${value => save({ repo_short: shortNames(value) })} />
+    <${Field} label="Project folders" initial=${data.workspace_parent || '~/projects'}
+      hint="New agent offers folders inside this directory. Use an absolute path or ~/ path."
+      save=${value => save({ workspace_parent: value.trim() })} />
     <${Field} label="Workspaces" type="textarea" initial=${data.workspaces.join('\n')} hint="One absolute path per line."
       save=${value => save({ workspaces: value.split('\n').map(path => path.trim()).filter(Boolean) })} />
     <${AgentTypes} types=${data.agent_types || []} save=${save} />

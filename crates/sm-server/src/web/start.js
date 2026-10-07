@@ -17,7 +17,7 @@ const defaultsKey = (provider) => (provider === 'claude' ? 'claude' : 'codex');
 const normalizeProvider = (provider) => (provider && provider.startsWith('codex') ? 'codex-fork' : 'claude');
 const providerDefaultModel = (provider) => (provider === 'claude' ? 'Claude Code default model' : 'Codex default model');
 
-/** Folders offered for a new agent: saved workspaces, then live agents' folders. */
+/** Folders offered for a new agent: saved workspaces, project folders, then live agents' folders. */
 function workspaceChoices(settings, watch) {
   const seen = new Set();
   const out = [];
@@ -28,9 +28,12 @@ function workspaceChoices(settings, watch) {
     }
   };
   (settings.new_agent.workspaces || []).forEach(add);
+  (settings.workspace_folders || []).forEach(add);
   for (const agent of (watch && watch.sessions) || []) if (agent.state !== 'stopped') add(agent.repo);
   return out;
 }
+
+const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~' || path.startsWith('~/'));
 
 /**
  * `prefill` may carry provider, model, effort and workspace (Clone).
@@ -76,7 +79,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     // A slower answer for an earlier provider or folder must not replace this one.
     let current = true;
     const query = new URLSearchParams({ provider: form.provider });
-    if (folder && folder.startsWith('/')) query.set('working_dir', folder);
+    if (validWorkspace(folder)) query.set('working_dir', folder);
     api(`/client/session-models?${query}`)
       .then((value) => current && setModels(value.models || []))
       .catch(() => current && setModels([]));
@@ -90,8 +93,8 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   };
 
   const start = async () => {
-    if (!folder || !folder.startsWith('/')) {
-      setError('Choose a workspace: an absolute folder path.');
+    if (!validWorkspace(folder)) {
+      setError('Choose a workspace: an absolute path or ~/ path.');
       setExpanded(true);
       return;
     }
@@ -149,9 +152,10 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
               <option value=${OTHER}>Other…</option>
             </select></div>
           ${form.workspace === OTHER
-            ? html`<div class="fld"><span class="l"></span><input class="inp mono" placeholder="/Users/…/projects/repo"
+            ? html`<div class="fld"><span class="l"></span><input class="inp mono" placeholder="~/projects/repo"
                 value=${form.otherWorkspace} onInput=${(e) => set({ otherWorkspace: e.target.value })} /></div>`
             : null}
+          ${settings.workspace_error ? html`<p class="muted">${settings.workspace_error}</p>` : null}
           <div class="fld"><span class="l">Name</span>
             <input class="inp" placeholder="sm picks one" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></div>
           <div class="fld top"><span class="l">First message</span>
