@@ -1669,6 +1669,8 @@ impl SessionStore {
             log_file: spec.log_file.display().to_string(),
             provider: session.provider.clone(),
             provider_resume_id: Some(rotation.provider_resume_id.clone()),
+            brief_message_id: None,
+            brief_part_id: None,
             credential_rotation_id: Some(rotation.id.clone()),
             restore_authorized: false,
             initial_message: None,
@@ -4677,6 +4679,8 @@ impl SessionStore {
             log_file: spec.log_file.display().to_string(),
             provider: record.provider.clone(),
             provider_resume_id: record.provider_resume_id.clone(),
+            brief_message_id: None,
+            brief_part_id: None,
             credential_rotation_id: None,
             restore_authorized: false,
             initial_message: runtime_initial_message,
@@ -5899,6 +5903,8 @@ impl SessionStore {
             log_file: spec.log_file.display().to_string(),
             provider: record.provider.clone(),
             provider_resume_id: provider_resume_id.clone(),
+            brief_message_id: None,
+            brief_part_id: None,
             credential_rotation_id: None,
             // This durable intent is written before the explicit restore
             // clears a retired/killed completion marker. Startup recovery may
@@ -8636,6 +8642,8 @@ impl SessionStore {
             usage_cap_fraction: None,
             log_file: Some(log_file.display().to_string()),
             provider_resume_id: None,
+            opencode: None,
+            provider_event_cursor: None,
             transcript_path: None,
             codex_thread_id: None,
             forked_from_session_id: None,
@@ -10402,6 +10410,40 @@ fn snapshot_from_raw_value(value: &Value) -> Result<StateSnapshot> {
     StateSnapshot::try_from(raw).context("failed to parse raw session records")
 }
 
+const OPENCODE_MISSING_BINDING: &str = "opencode session missing its runtime binding";
+
+fn normalize_opencode_runtime_record(value: &mut Value) {
+    let Some(session) = value.as_object_mut() else {
+        return;
+    };
+    if session.get("provider").and_then(Value::as_str) != Some("opencode") {
+        return;
+    }
+    session.insert("reasoning_effort".into(), Value::Null);
+    if session
+        .get("opencode")
+        .is_some_and(|binding| !binding.is_null())
+    {
+        return;
+    }
+    session.insert("status".into(), json!("stopped"));
+    session.insert("agent_status_text".into(), json!(OPENCODE_MISSING_BINDING));
+    if session.get("stopped_at").is_none_or(Value::is_null) {
+        if let Some(observed) = session.get("last_activity").cloned() {
+            session.insert("stopped_at".into(), observed);
+        }
+    }
+    // A malformed legacy runtime must not erase an explicit retirement.
+    if !completion_status_is_retired(session.get("completion_status").and_then(Value::as_str)) {
+        session.insert("completion_status".into(), json!("error"));
+        session.insert("completion_message".into(), json!(OPENCODE_MISSING_BINDING));
+    }
+}
+
+#[cfg(test)]
+#[path = "opencode/records_tests.rs"]
+mod opencode_records_tests;
+
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StateFileStamp {
@@ -10440,7 +10482,12 @@ struct ParsedState {
 }
 
 impl ParsedState {
-    fn new(raw: Value) -> Self {
+    fn new(mut raw: Value) -> Self {
+        if let Some(sessions) = raw.get_mut("sessions").and_then(Value::as_array_mut) {
+            for session in sessions {
+                normalize_opencode_runtime_record(session);
+            }
+        }
         Self {
             raw,
             snapshot: std::sync::OnceLock::new(),
@@ -12634,6 +12681,7 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     // this a cleared codex session's latches would stay set and suppress every
     // warning in the new cycle.
     reset_context_oneshot_flags(session);
+    session.remove("provider_event_cursor");
     clear_context_snapshot(session);
     session.insert("context_compaction_active".to_owned(), Value::Bool(false));
     session.insert("agent_status_text".to_owned(), Value::Null);
@@ -15371,10 +15419,11 @@ impl TryFrom<RawStateSnapshot> for StateSnapshot {
 
     fn try_from(raw: RawStateSnapshot) -> std::result::Result<Self, Self::Error> {
         let mut sessions = Vec::new();
-        for raw_session in raw.sessions {
+        for mut raw_session in raw.sessions {
             if is_legacy_codex_app_record(&raw_session) {
                 continue;
             }
+            normalize_opencode_runtime_record(&mut raw_session);
             sessions.push(serde_json::from_value(raw_session)?);
         }
         Ok(Self {
@@ -15945,6 +15994,10 @@ pub struct SessionRuntimeLaunchRecord {
     pub provider: String,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_part_id: Option<String>,
     #[serde(default)]
     pub credential_rotation_id: Option<String>,
     /// Set only by explicit restore admission after it has authorized a
@@ -15973,6 +16026,37 @@ pub struct SessionRuntimeLaunchRecord {
 }
 
 impl SessionRuntimeLaunchRecord {
+    /// The caller persists this pair and the conversation before HTTP delivery.
+    /// A partial or invalid existing pair is an error, never permission to
+    /// generate another identity and repeat an already accepted brief.
+    pub fn ensure_opencode_brief_binding(&mut self) -> Result<crate::opencode::MessageBinding> {
+        if self.provider != "opencode" {
+            anyhow::bail!("brief ID binding requires an opencode launch");
+        }
+        let conversation = self
+            .provider_resume_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("opencode launch has no conversation"))?;
+        match (&self.brief_message_id, &self.brief_part_id) {
+            (Some(message), Some(part)) => {
+                let binding = crate::opencode::MessageBinding {
+                    message_id: message.clone(),
+                    part_id: part.clone(),
+                    conversation_id: conversation.into(),
+                };
+                binding.validate()?;
+                Ok(binding)
+            }
+            (None, None) => {
+                let binding = crate::opencode::MessageBinding::new(conversation)?;
+                self.brief_message_id = Some(binding.message_id.clone());
+                self.brief_part_id = Some(binding.part_id.clone());
+                Ok(binding)
+            }
+            _ => anyhow::bail!("opencode launch has a partial brief ID binding"),
+        }
+    }
+
     fn is_authorized_restore_intent(&self) -> bool {
         self.operation_kind == "restore" && self.restore_authorized
     }
@@ -16098,6 +16182,10 @@ pub struct SessionRecord {
     pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<crate::opencode::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_event_cursor: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
@@ -16343,6 +16431,7 @@ impl SessionRecord {
         // Retirement persists both fields. Keep the terminal marker authoritative
         // if a delayed status-only writer leaves the activity status behind.
         normalized_status(&self.status) == "stopped"
+            || (self.provider == "opencode" && self.opencode.is_none())
             || completion_status_is_retired(self.completion_status.as_deref())
     }
 
@@ -16688,6 +16777,8 @@ fn completion_status_is_retired(status: Option<&str>) -> bool {
 fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
     normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
         || completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
+        || (session.get("provider").and_then(Value::as_str) == Some("opencode")
+            && session.get("opencode").is_none_or(Value::is_null))
 }
 
 fn raw_session_is_finished_idle(session: &Map<String, Value>) -> bool {
@@ -19705,6 +19796,8 @@ sleep 30
             usage_cap_fraction: None,
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
+            opencode: None,
+            provider_event_cursor: None,
             transcript_path: None,
             codex_thread_id: None,
             forked_from_session_id: None,

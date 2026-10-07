@@ -1,6 +1,8 @@
 //! HTTP and persisted-delivery primitives for the pinned local harness.
 //! Production admission and outbox completion remain owned by the session store.
+mod binding;
 pub mod events;
+pub use binding::RuntimeBinding;
 use std::{
     sync::Mutex,
     thread,
