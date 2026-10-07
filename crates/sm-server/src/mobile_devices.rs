@@ -982,6 +982,14 @@ fn complete_pairing_registration(
             ],
         )
         .context("failed to upsert mobile device enrollment")?;
+    // Pairing again is the owner's way back from a revocation, including one
+    // of a config-file key with the same id; the server reloads it on restart.
+    transaction
+        .execute(
+            "DELETE FROM revoked_config_device_keys WHERE user_id = ? AND device_id = ?",
+            params![registration.user_id, device_id],
+        )
+        .context("failed to clear config device key revocation")?;
     insert_audit_event(
         &transaction,
         Some(&registration.user_id),
@@ -2030,9 +2038,12 @@ mod tests {
         }
         let dir = temporary_dir("sm-browser-device-test").unwrap();
         let db = dir.join("devices.db");
+        assert!(revoke_config_device_key(&db, "owner", "phone").unwrap());
+        assert!(!revoke_config_device_key(&db, "owner", "phone").unwrap());
         let pairing = create_pairing_registration(&db, "owner", 15).unwrap();
         complete_pairing_registration(&db, &pairing.token, "phone", "Phone", "public-key", None)
             .unwrap();
+        assert!(revoked_config_device_keys(&db).unwrap().is_empty());
         let users = BTreeSet::from(["owner".into()]);
         let device = list_active_devices_for_users(&db, &users)
             .unwrap()
