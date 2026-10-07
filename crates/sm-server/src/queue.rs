@@ -5782,12 +5782,16 @@ fn finish_live_queue_job_until_recorded(
 }
 
 fn process_group_rss_bytes(pgid: i64) -> Option<i64> {
-    parse_process_group_rss_bytes(&process_group_rss_listing()?, pgid)
+    job_memory_by_process_group(&process_listing()?, &[pgid], job_process_footprint)
+        .get(&pgid)
+        .copied()
+        .or(Some(0))
 }
 
-fn process_group_rss_listing() -> Option<String> {
+/// Every process: pid, parent pid, process group, resident KiB.
+fn process_listing() -> Option<String> {
     let output = Command::new("ps")
-        .args(["-axo", "pgid=,rss="])
+        .args(["-axo", "pid=,ppid=,pgid=,rss="])
         .output()
         .ok()?;
     output
@@ -5796,31 +5800,69 @@ fn process_group_rss_listing() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let row_pgid = fields.next()?.parse::<i64>().ok()?;
-            let rss_kib = fields.next()?.parse::<i64>().ok()?;
-            (row_pgid == pgid).then_some(rss_kib)
-        })
-        .try_fold(0i64, |total, rss_kib| total.checked_add(rss_kib))?
-        .checked_mul(1024)
+/// Physical footprint of one process on macOS: Activity Monitor's Memory
+/// column. It counts Metal buffers such as MLX's cache, which RSS misses,
+/// and leaves out shared file mappings, which RSS counts in full (sm#2053).
+fn job_process_footprint(pid: i32) -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::utilization::mac::phys_footprint(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
-/// Resident bytes per process group, from one `ps` listing.
-fn parse_rss_bytes_by_process_group(text: &str) -> HashMap<i64, i64> {
+/// Memory of each job in `pgids`, from one [`process_listing`]: the job's
+/// process group plus descendants that left it with `setsid`. Each process
+/// counts `footprint`, or its resident bytes when that is unavailable.
+fn job_memory_by_process_group(
+    listing: &str,
+    pgids: &[i64],
+    footprint: impl Fn(i32) -> Option<i64>,
+) -> HashMap<i64, i64> {
+    let rows: Vec<(i32, i32, i64, i64)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+            ))
+        })
+        .collect();
     let mut totals = HashMap::new();
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(Ok(pgid)), Some(Ok(rss_kib))) = (
-            fields.next().map(str::parse::<i64>),
-            fields.next().map(str::parse::<i64>),
-        ) else {
+    for &pgid in pgids {
+        let mut members: Vec<i32> = rows
+            .iter()
+            .filter(|(_, _, group, _)| *group == pgid)
+            .map(|(pid, ..)| *pid)
+            .collect();
+        if members.is_empty() {
             continue;
-        };
-        let total: &mut i64 = totals.entry(pgid).or_default();
-        *total = total.saturating_add(rss_kib.saturating_mul(1024));
+        }
+        let mut next = 0;
+        while next < members.len() {
+            let parent = members[next];
+            next += 1;
+            for (pid, ppid, ..) in &rows {
+                if *ppid == parent && !members.contains(pid) {
+                    members.push(*pid);
+                }
+            }
+        }
+        let total = rows
+            .iter()
+            .filter(|(pid, ..)| members.contains(pid))
+            .map(|(pid, _, _, rss_kib)| {
+                footprint(*pid).unwrap_or_else(|| rss_kib.saturating_mul(1024))
+            })
+            .fold(0i64, i64::saturating_add);
+        totals.insert(pgid, total);
     }
     totals
 }
@@ -5976,6 +6018,14 @@ fn host_pressure_victim<'a>(
         })
 }
 
+fn running_job_process_groups(conn: &Connection) -> Result<Vec<i64>> {
+    Ok(list_queue_job_runtime_records_conn(conn)?
+        .iter()
+        .filter(|job| job.state == "running")
+        .filter_map(|job| job.process_group_id.or(job.pid))
+        .collect())
+}
+
 /// One host memory guard check. When available memory is below the reserve,
 /// records the chosen job as `memory_terminating` with cause
 /// `host_memory_pressure` and returns it with its process group to stop.
@@ -6052,12 +6102,16 @@ pub fn spawn_host_memory_guard(
             if host.is_none_or(|(_, available)| available >= reserve) {
                 continue;
             }
-            let Some(listing) = process_group_rss_listing() else {
+            let Some(listing) = process_listing() else {
                 continue;
             };
-            let rss_by_pgid = parse_rss_bytes_by_process_group(&listing);
             let outcome =
                 open_queue_jobs_connection(&state_dir.join("queue_runner.db")).and_then(|conn| {
+                    let rss_by_pgid = job_memory_by_process_group(
+                        &listing,
+                        &running_job_process_groups(&conn)?,
+                        job_process_footprint,
+                    );
                     host_memory_guard_pass(
                         &conn,
                         host,
@@ -8828,10 +8882,6 @@ mod tests {
             2 * 1024 * 1024 * 1024,
             (256 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
         ));
-        assert_eq!(
-            parse_process_group_rss_bytes(" 42 1024\n 7 9000\n 42 2048\n", 42),
-            Some(3 * 1024 * 1024)
-        );
     }
 
     #[test]
@@ -9831,7 +9881,11 @@ mod tests {
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
         let deadline = Instant::now() + StdDuration::from_secs(30);
         let (job_id, pgid) = loop {
-            let rss = parse_rss_bytes_by_process_group(&process_group_rss_listing().unwrap());
+            let rss = job_memory_by_process_group(
+                &process_listing().unwrap(),
+                &running_job_process_groups(&conn).unwrap(),
+                job_process_footprint,
+            );
             if let Some(victim) =
                 host_memory_guard_pass(&conn, Some((256 * GIB, 0)), 8 * GIB, &rss).unwrap()
             {
@@ -10316,10 +10370,19 @@ mod tests {
     }
 
     #[test]
-    fn rss_listing_sums_each_process_group() {
-        let totals = parse_rss_bytes_by_process_group("  10 100\n 10 50\n 11 7\nbad line\n");
-        assert_eq!(totals.get(&10), Some(&(150 * 1024)));
-        assert_eq!(totals.get(&11), Some(&(7 * 1024)));
+    fn job_memory_counts_footprints_of_the_group_and_its_setsid_descendants() {
+        // pgid 10: 10 and 11, plus 12, which left with setsid, and its child 13.
+        // 20 is another job; 30 is not a job.
+        let listing = " 10 1 10 100\n 11 10 10 50\n 12 11 12 4\n 13 12 12 2\n 20 1 20 7\n 30 1 30 9\nbad line\n";
+        // An MLX process: 1 GiB footprint behind 4 KiB of RSS. 13 has exited.
+        let footprint = |pid: i32| match pid {
+            12 => Some(1 << 30),
+            13 => None,
+            pid => Some(i64::from(pid)),
+        };
+        let totals = job_memory_by_process_group(listing, &[10, 20, 40], footprint);
+        assert_eq!(totals.get(&10), Some(&(10 + 11 + (1 << 30) + 2 * 1024)));
+        assert_eq!(totals.get(&20), Some(&20));
         assert_eq!(totals.len(), 2);
     }
 
