@@ -152,20 +152,30 @@ pub(super) fn start(state: Arc<AppState>) {
                 if state.shutdown.is_stopped() {
                     break;
                 }
-                match state.session_store.list_sessions(true) {
-                    Ok(sessions) => {
+                match state
+                    .session_store
+                    .list_sessions(true)
+                    .and_then(|sessions| {
+                        Ok((
+                            sessions,
+                            state.session_store.opencode_pending_effect_session_ids()?,
+                        ))
+                    }) {
+                    Ok((sessions, pending)) => {
                         for session in sessions
                             .into_iter()
                             .filter(|s| s.provider == "opencode" && is_primary_node(&s.node))
                         {
                             if session.is_stopped() {
-                                if let Err(error) =
-                                    state.session_store.recover_opencode_effects(&session.id)
-                                {
-                                    eprintln!(
-                                        "opencode retained effects {}: {error:#}",
-                                        session.id
-                                    );
+                                if pending.contains(&session.id) {
+                                    if let Err(error) =
+                                        state.session_store.recover_opencode_effects(&session.id)
+                                    {
+                                        eprintln!(
+                                            "opencode retained effects {}: {error:#}",
+                                            session.id
+                                        );
+                                    }
                                 }
                             } else if let Err(error) =
                                 readers.start_session(&state, &handle, session.id)

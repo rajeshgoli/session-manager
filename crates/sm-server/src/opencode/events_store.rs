@@ -68,6 +68,29 @@ impl Drop for OwnerWakeAfterUnlock {
 }
 
 impl SessionStore {
+    /// Read the cached registry once without its exclusive writer lock. The
+    /// supervisor recovers only unfinished effects, not all retired sessions.
+    pub fn opencode_pending_effect_session_ids(&self) -> Result<BTreeSet<String>> {
+        let state = self.load_parsed_state()?;
+        Ok(state
+            .raw
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|session| {
+                session["provider"] == "opencode"
+                    && session
+                        .get("opencode_pending_effects")
+                        .is_some_and(|effects| {
+                            !effects.is_null()
+                                && effects.as_array().is_none_or(|effects| !effects.is_empty())
+                        })
+            })
+            .filter_map(|session| session["id"].as_str().map(str::to_owned))
+            .collect())
+    }
+
     pub fn opencode_generated_message_ids(
         &self,
         session_id: &str,

@@ -157,6 +157,8 @@ bounds a blocked stream. Live activity expires after sixty seconds without a
 successful observation and never falls back to reading the viewer's pane.
 Generated IDs include delivered queue rows and the persisted launch brief.
 Owner answers wake the board after unlocking even when a later effect fails.
+The supervisor scans the cached registry once for unfinished effects; stopped
+sessions with completed recovery do not take the writer lock on every scan.
 Tool-call history reads opencode's receipt-backed tool log independently of the
 hosted usage setting. Launch/restore integration remains on #2044; HTTP outbox
 delivery and public entry points remain on #2045.

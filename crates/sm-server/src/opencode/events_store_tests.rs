@@ -266,6 +266,50 @@ fn failed_tool_write_retains_ordered_effects_and_recovery_does_not_count_twice()
 }
 
 #[test]
+fn stopped_session_recovery_scan_skips_completed_history_without_taking_writer_lock() {
+    let mut fixture = Fixture::new();
+    fixture.tool_db = fixture.root.join("blocked-tools");
+    fs::create_dir(&fixture.tool_db).unwrap();
+    assert!(fixture.apply().is_err());
+    let mut state = fixture.raw();
+    state["sessions"][0]["status"] = json!("stopped");
+    for index in 0..100 {
+        let mut historical = state["sessions"][0].clone();
+        historical["id"] = json!(format!("historical-{index}"));
+        historical["opencode_pending_effects"] = json!([]);
+        state["sessions"].as_array_mut().unwrap().push(historical);
+    }
+    fixture.save(&state);
+    {
+        let _writer = fixture.store.write_lock.lock().unwrap();
+        assert_eq!(
+            fixture.store.opencode_pending_effect_session_ids().unwrap(),
+            BTreeSet::from(["agent".into()])
+        );
+        assert_eq!(fixture.raw(), state);
+    }
+    // Failed recovery remains selected; successful recovery disappears from
+    // the next scan while its history and usage still commit after retirement.
+    assert!(fixture.store.recover_opencode_effects("agent").is_err());
+    assert_eq!(
+        fixture
+            .store
+            .opencode_pending_effect_session_ids()
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir(&fixture.tool_db).unwrap();
+    fixture.store.recover_opencode_effects("agent").unwrap();
+    assert!(fixture
+        .store
+        .opencode_pending_effect_session_ids()
+        .unwrap()
+        .is_empty());
+    assert!(fixture.root.join("usage.jsonl").exists());
+}
+
+#[test]
 fn replayed_owner_input_answers_only_questions_existing_when_it_was_typed() {
     let fixture = Fixture::new();
     fixture.question("earlier", fixture.started - 1000);
