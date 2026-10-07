@@ -358,6 +358,47 @@ pub fn revoke_device(db_path: &Path, user_id: &str, device_id: &str) -> Result<b
     Ok(changed > 0)
 }
 
+/// Keys listed in config.yaml cannot be edited by the server, so their
+/// revocation is kept here and reloaded at startup; otherwise it would end at
+/// the next restart and the key would be admitted again.
+pub fn revoke_config_device_key(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
+    let connection = open_device_db(db_path)?;
+    let changed = connection
+        .execute(
+            "INSERT OR IGNORE INTO revoked_config_device_keys (user_id, device_id, revoked_at) VALUES (?, ?, ?)",
+            params![user_id, device_id, local_timestamp()],
+        )
+        .context("failed to persist config device key revocation")?;
+    if changed > 0 {
+        insert_audit_event(
+            &connection,
+            Some(user_id),
+            Some(device_id),
+            "config_device_key_revoked",
+            None,
+            None,
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+pub fn revoked_config_device_keys(db_path: &Path) -> Result<BTreeSet<(String, String)>> {
+    if !db_path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let connection = open_device_db(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT user_id, device_id FROM revoked_config_device_keys")
+        .context("failed to prepare config device key revocation query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query config device key revocations")?;
+    rows.collect::<rusqlite::Result<_>>()
+        .context("failed to read config device key revocation row")
+}
+
 pub fn create_pairing_registration(
     db_path: &Path,
     user_id: &str,
@@ -799,6 +840,13 @@ fn migrate_device_db(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_timestamp ON mobile_device_enrollment_audit(timestamp);
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_device_id ON mobile_device_enrollment_audit(device_id);
             CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_event ON mobile_device_enrollment_audit(event);
+
+            CREATE TABLE IF NOT EXISTS revoked_config_device_keys (
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                revoked_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            );
             "#,
         )
         .context("failed to migrate mobile device enrollment DB")?;

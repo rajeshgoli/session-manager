@@ -828,6 +828,9 @@ impl AppState {
                 }
                 None => None,
             };
+        let mobile_terminal_revoked_keys =
+            mobile_devices::revoked_config_device_keys(&mobile_device_db_path(&config))
+                .context("loading revoked mobile device keys failed")?;
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
@@ -883,7 +886,7 @@ impl AppState {
             public_edge_assertion_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             cloudflare_access_jwks_cache: Arc::new(Mutex::new(BTreeMap::new())),
             google_id_token_jwks_cache: Arc::new(Mutex::new(None)),
-            mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
+            mobile_terminal_revoked_keys: Arc::new(Mutex::new(mobile_terminal_revoked_keys)),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
@@ -8950,7 +8953,7 @@ async fn list_mobile_terminal_devices(
         browser_sign_in,
         devices,
         owner_view,
-        runtime_only_revocations: true,
+        runtime_only_revocations: false,
     }))
 }
 
@@ -8976,11 +8979,13 @@ async fn revoke_mobile_terminal_device(
         &device_key_id,
         query.user_id.as_deref(),
     )?;
-    let persisted_revoked = mobile_devices::revoke_device(
-        &mobile_device_db_path(&state.config),
-        &target_user_id,
-        &device_key_id,
-    )?;
+    let db_path = mobile_device_db_path(&state.config);
+    let mut persisted_revoked =
+        mobile_devices::revoke_device(&db_path, &target_user_id, &device_key_id)?;
+    if mobile_terminal_config_device_key_exists(&state, &target_user_id, &device_key_id) {
+        persisted_revoked |=
+            mobile_devices::revoke_config_device_key(&db_path, &target_user_id, &device_key_id)?;
+    }
     if let Err(error) = follows::push_store(&state).delete_device_tokens(&device_key_id) {
         eprintln!("push token cleanup for revoked device {device_key_id} failed: {error:#}");
     }
@@ -9009,7 +9014,7 @@ async fn revoke_mobile_terminal_device(
         already_revoked: already_revoked && !persisted_revoked,
         pending_tickets_revoked,
         active_attaches_terminated: active_stops.len(),
-        runtime_only: !persisted_revoked,
+        runtime_only: false,
     }))
 }
 
@@ -13893,6 +13898,23 @@ fn mobile_terminal_device_revoked(
             detail: "Mobile terminal revoked key store is unavailable".to_owned(),
         })?
         .contains(&(user_id.to_owned(), device_key_id.to_owned())))
+}
+
+fn mobile_terminal_config_device_key_exists(
+    state: &AppState,
+    user_id: &str,
+    device_key_id: &str,
+) -> bool {
+    state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .get(user_id)
+        .is_some_and(|user| {
+            user.registered_device_keys
+                .iter()
+                .any(|key| key.id.trim() == device_key_id)
+        })
 }
 
 fn mobile_terminal_user_device_exists(
@@ -19278,6 +19300,12 @@ mod tests {
             .unwrap();
         let mut config = AppConfig::default();
         config.paths.state_file = write_session_state("fork1001", "running");
+        // Revocations persist, so each fixture needs its own device store.
+        config.mobile_terminal.device_enrollment_db_path =
+            std::path::Path::new(&config.paths.state_file)
+                .with_file_name("mobile_devices.db")
+                .display()
+                .to_string();
         config.mobile_terminal.enabled = true;
         config.mobile_terminal.ws_url = Some("wss://sm.rajeshgo.li/client/terminal".to_owned());
         config.mobile_terminal.allowed_users.insert(
@@ -24522,7 +24550,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["owner_view"], false);
-        assert_eq!(body["runtime_only_revocations"], true);
+        assert_eq!(body["runtime_only_revocations"], false);
         assert_eq!(body["devices"].as_array().unwrap().len(), 1);
         let device = &body["devices"][0];
         assert_eq!(device["user_id"], "local_bypass");
@@ -24643,9 +24671,15 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
                 "already_revoked": false,
                 "pending_tickets_revoked": 1,
                 "active_attaches_terminated": 1,
-                "runtime_only": true,
+                "runtime_only": false,
             })
         );
+        let restarted = AppState::new(AppConfig::clone(&state.config));
+        assert!(restarted
+            .mobile_terminal_revoked_keys
+            .lock()
+            .unwrap()
+            .contains(&("local_bypass".to_owned(), "test-device".to_owned())));
         assert!(state
             .mobile_terminal_revoked_keys
             .lock()
