@@ -5823,7 +5823,27 @@ fn job_memory_by_process_group(
     pgids: &[i64],
     footprint: impl Fn(i32) -> Option<i64>,
 ) -> HashMap<i64, i64> {
-    let rows: Vec<(i32, i32, i64, i64)> = listing
+    let rows = parse_process_listing(listing);
+    let mut totals = HashMap::new();
+    for &pgid in pgids {
+        let tree = job_process_tree(&rows, pgid);
+        if tree.is_empty() {
+            continue;
+        }
+        let total = tree
+            .iter()
+            .map(|(pid, _, _, rss_kib)| {
+                footprint(*pid).unwrap_or_else(|| rss_kib.saturating_mul(1024))
+            })
+            .fold(0i64, i64::saturating_add);
+        totals.insert(pgid, total);
+    }
+    totals
+}
+
+/// (pid, parent pid, process group, resident KiB) rows of a [`process_listing`].
+fn parse_process_listing(listing: &str) -> Vec<(i32, i32, i64, i64)> {
+    listing
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -5834,37 +5854,60 @@ fn job_memory_by_process_group(
                 fields.next()?.parse().ok()?,
             ))
         })
+        .collect()
+}
+
+/// The rows of a job's processes: its process group, plus descendants that
+/// left it with `setsid`.
+fn job_process_tree(rows: &[(i32, i32, i64, i64)], pgid: i64) -> Vec<(i32, i32, i64, i64)> {
+    let mut members: Vec<i32> = rows
+        .iter()
+        .filter(|(_, _, group, _)| *group == pgid)
+        .map(|(pid, ..)| *pid)
         .collect();
-    let mut totals = HashMap::new();
-    for &pgid in pgids {
-        let mut members: Vec<i32> = rows
-            .iter()
-            .filter(|(_, _, group, _)| *group == pgid)
-            .map(|(pid, ..)| *pid)
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let mut next = 0;
-        while next < members.len() {
-            let parent = members[next];
-            next += 1;
-            for (pid, ppid, ..) in &rows {
-                if *ppid == parent && !members.contains(pid) {
-                    members.push(*pid);
-                }
+    let mut next = 0;
+    while next < members.len() {
+        let parent = members[next];
+        next += 1;
+        for (pid, ppid, ..) in rows {
+            if *ppid == parent && !members.contains(pid) {
+                members.push(*pid);
             }
         }
-        let total = rows
-            .iter()
-            .filter(|(pid, ..)| members.contains(pid))
-            .map(|(pid, _, _, rss_kib)| {
-                footprint(*pid).unwrap_or_else(|| rss_kib.saturating_mul(1024))
-            })
-            .fold(0i64, i64::saturating_add);
-        totals.insert(pgid, total);
     }
-    totals
+    rows.iter()
+        .filter(|(pid, ..)| members.contains(pid))
+        .copied()
+        .collect()
+}
+
+/// Descendants of a job that left its process group with `setsid`. Taken
+/// before the first signal: once their parent dies they are reparented and
+/// can no longer be traced to the job (sm#2060).
+fn escaped_job_processes(pgid: i64) -> Vec<i64> {
+    let Some(listing) = process_listing() else {
+        return Vec::new();
+    };
+    job_process_tree(&parse_process_listing(&listing), pgid)
+        .into_iter()
+        .filter(|(_, _, group, _)| *group != pgid)
+        .map(|(pid, ..)| i64::from(pid))
+        .collect()
+}
+
+fn signal_processes(pids: &[i64], force: bool) {
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    for pid in pids {
+        if let Ok(pid) = i32::try_from(*pid) {
+            if pid > 0 {
+                let _ = kill(Pid::from_raw(pid), signal);
+            }
+        }
+    }
 }
 
 /// The sample that made the perf memory guard stop a job. It is persisted
@@ -7835,31 +7878,40 @@ fn terminate_process_group(pgid: i64, force: bool) {
 }
 
 fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
+    let escaped = escaped_job_processes(pgid);
+    let alive = |escaped: &[i64]| {
+        process_group_exists(pgid) || escaped.iter().any(|pid| process_exists(*pid))
+    };
     terminate_process_group(pgid, false);
+    signal_processes(&escaped, false);
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
-    while process_group_exists(pgid) {
+    while alive(&escaped) {
         if Instant::now() >= deadline {
             terminate_process_group(pgid, true);
+            signal_processes(&escaped, true);
             break;
         }
         thread::sleep(StdDuration::from_millis(100));
     }
-    while process_group_exists(pgid) {
+    while alive(&escaped) {
         thread::sleep(StdDuration::from_millis(100));
     }
 }
 
 fn terminate_child_process_group_with_grace(child: &mut QueueChild, pgid: i64, grace_seconds: u64) {
+    let escaped = escaped_job_processes(pgid);
     terminate_process_group(pgid, false);
+    signal_processes(&escaped, false);
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
     let mut force_sent = false;
     loop {
         let _ = child.try_wait();
-        if !process_group_exists(pgid) {
+        if !process_group_exists(pgid) && !escaped.iter().any(|pid| process_exists(*pid)) {
             return;
         }
         if !force_sent && Instant::now() >= deadline {
             terminate_process_group(pgid, true);
+            signal_processes(&escaped, true);
             force_sent = true;
         }
         thread::sleep(StdDuration::from_millis(100));
@@ -10367,6 +10419,40 @@ mod tests {
         );
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn stopping_a_job_also_stops_children_that_left_its_process_group() {
+        use std::os::unix::process::CommandExt;
+        let dir = unique_temp_path("escaped-child");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!(
+            "python3 -c 'import os,time; os.setsid(); open(\"{}\",\"w\").write(str(os.getpid())); time.sleep(300)' & wait",
+            pid_file.display()
+        );
+        let mut job = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = i64::from(job.id());
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        let escaped = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.parse::<i64>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "child never detached");
+            thread::sleep(StdDuration::from_millis(50));
+        };
+        assert_eq!(escaped_job_processes(pgid), [escaped]);
+        terminate_process_group_with_grace(pgid, 2);
+        let _ = job.wait();
+        assert!(!process_exists(escaped), "setsid child survived the stop");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
