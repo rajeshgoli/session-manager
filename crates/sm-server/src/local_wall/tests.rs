@@ -258,6 +258,19 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     )
     .unwrap();
     a_request.tools.retain(|tool| tool.name != "wall-withdrawn");
+    let hidden = a_request.checkout.join("unreadable");
+    fs::create_dir(&hidden).unwrap();
+    fs::hard_link(&tool_source, hidden.join("host-alias")).unwrap();
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable_result = host.prepare(&a_request);
+    // Restore permissions even if the assertion fails, so fixture cleanup works.
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        unreadable_result.is_err(),
+        "uninspected directories must fail closed"
+    );
+    fs::remove_file(hidden.join("host-alias")).unwrap();
+    fs::remove_dir(hidden).unwrap();
     let restored = host.prepare(&a_request).unwrap();
     assert!(!executables.join("wall-withdrawn").exists());
     assert!(!executables.join(".probe.new").exists());

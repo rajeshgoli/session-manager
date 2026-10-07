@@ -15,7 +15,10 @@ import wall_profile as wall
 
 def independent_tree(root):
     """Reject pre-existing aliases before granting a mutable tree to an agent."""
-    for directory, folders, files in os.walk(root, followlinks=False):
+    def traversal_error(error):
+        raise error
+
+    for directory, folders, files in os.walk(root, followlinks=False, onerror=traversal_error):
         for name in [*folders, *files]:
             path = Path(directory) / name
             if not path.is_symlink() and path.is_file() and path.stat().st_nlink != 1:
