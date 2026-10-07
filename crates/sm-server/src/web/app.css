@@ -680,6 +680,8 @@ button.sw-sec { cursor: pointer; }
 .review-policy-pop { width: min(30rem, calc(100vw - 32px)); }
 .review-banner { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 12px; margin: 0 0 18px; border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--amber) 8%, var(--panel)); }
 .review-banner > span:nth-child(2) { flex: 1 1 16rem; }
+.restart-members { flex: 1 1 100%; display: grid; gap: 4px; }
+.restart-members > div { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .review-policy-row { display: grid; grid-template-columns: 11rem minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); }
 .review-policy-row > span { overflow-wrap: anywhere; }
 .review-day p { margin: 6px 0; }

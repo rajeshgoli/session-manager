@@ -824,6 +824,7 @@ pub fn notification_for(follow: &Follow) -> Notification {
                 "timed_out" => format!("{label} timed out"),
                 "cancelled" => format!("{label} was cancelled"),
                 "displaced" => format!("{label} was displaced"),
+                "host_restart" => format!("{label} was killed by a host restart"),
                 "unknown" => format!("{label} ended"),
                 other => format!("{label} ended ({})", other.replace('_', " ")),
             };

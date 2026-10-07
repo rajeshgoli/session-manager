@@ -337,6 +337,7 @@ pub(super) fn restore_session_with_work(
             eprintln!("telling {session_id} its worktree is detached failed: {error:#}");
         }
     }
+    super::host_restart::after_restore(state, session_id);
     Ok(session)
 }
 

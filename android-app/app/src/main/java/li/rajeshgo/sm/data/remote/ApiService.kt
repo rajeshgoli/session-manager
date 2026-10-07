@@ -367,6 +367,24 @@ interface ApiService {
     @POST("client/review-requests/{request_id}/dismiss")
     suspend fun dismissReviewRequest(@Path("request_id") requestId: String): kotlinx.serialization.json.JsonObject
 
+    /** The latest host restart and the agents it interrupted (sm#2054). */
+    @GET("host-restarts/latest")
+    suspend fun getLatestHostRestart(): kotlinx.serialization.json.JsonObject
+
+    /** Restores the restart's waiting agents, or only `session_ids`, as `sm recover` does. */
+    @POST("host-restarts/{restart_id}/restore")
+    suspend fun restoreHostRestart(
+        @Path("restart_id") restartId: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): kotlinx.serialization.json.JsonObject
+
+    /** Retires one interrupted agent instead of restoring it. */
+    @POST("host-restarts/{restart_id}/members/{session_id}/leave")
+    suspend fun leaveHostRestartMember(
+        @Path("restart_id") restartId: String,
+        @Path("session_id") sessionId: String,
+    ): kotlinx.serialization.json.JsonObject
+
     /** Brings a stopped or retired agent back, as `sm restore` does. */
     @POST("sessions/{session_id}/restore")
     suspend fun restoreSession(@Path("session_id") sessionId: String): kotlinx.serialization.json.JsonObject

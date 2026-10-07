@@ -260,10 +260,9 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .collect();
         let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
-        // Raw source bytes, excluding vendors. Settings > Worktrees (#1990) and
-        // subsequent UI fixes bring the app to 344,872 bytes (#2055); 344 KiB
-        // restores ~2% headroom while retaining a fixed cap on future growth.
-        const BUDGET: usize = 344 * 1024;
+        // Raw source bytes, excluding vendors. The host restart banner (#2054)
+        // brings the app to 347,582 bytes; 346 KiB leaves ~2% headroom.
+        const BUDGET: usize = 346 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

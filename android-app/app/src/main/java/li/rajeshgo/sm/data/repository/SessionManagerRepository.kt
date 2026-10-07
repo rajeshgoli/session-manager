@@ -355,6 +355,26 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).setOwnerSettings(patch) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun fetchLatestHostRestart(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getLatestHostRestart() }
+    }
+
+    suspend fun restoreHostRestart(
+        baseUrl: String,
+        token: String,
+        restartId: String,
+        body: kotlinx.serialization.json.JsonObject,
+    ) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 300).restoreHostRestart(restartId, body) }
+            .mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun leaveHostRestartMember(baseUrl: String, token: String, restartId: String, sessionId: String) =
+        withContext(Dispatchers.IO) {
+            runCatching { api(baseUrl, token, readTimeoutSeconds = 120).leaveHostRestartMember(restartId, sessionId) }
+                .mapFailure(::classifyWriteFailure)
+        }
+
     suspend fun retireSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val response = api(baseUrl, token).retireSession(sessionId)

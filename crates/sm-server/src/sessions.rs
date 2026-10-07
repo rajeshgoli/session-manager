@@ -7,7 +7,6 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex, Weak},
     thread,
@@ -984,16 +983,26 @@ impl SessionStore {
     }
 
     /// Preserve resumable records after reboot, but stop advertising lost runtimes as live.
-    pub fn reconcile_missing_session_runtimes(&self) -> Result<()> {
-        self.reconcile_missing_session_runtimes_at_boot(system_boot_time())
+    /// Returns each session it stopped, as it was before. `stopped_message`
+    /// replaces the default error message (a host restart names itself).
+    pub fn reconcile_missing_session_runtimes(
+        &self,
+        stopped_message: Option<&str>,
+    ) -> Result<Vec<SessionRecord>> {
+        self.reconcile_missing_session_runtimes_at_boot(
+            crate::host_restart::system_boot_time(),
+            stopped_message,
+        )
     }
 
     fn reconcile_missing_session_runtimes_at_boot(
         &self,
         boot_time: Option<OffsetDateTime>,
-    ) -> Result<()> {
+        stopped_message: Option<&str>,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut stopped = Vec::new();
         let Some(runtime) = self.delivery_runtime.as_ref() else {
-            return Ok(());
+            return Ok(stopped);
         };
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -1033,14 +1042,20 @@ impl SessionStore {
             if let Some(session) = session_object_mut(sessions, &record.id) {
                 session.insert("status".to_owned(), json!("stopped"));
                 session.insert("stopped_at".to_owned(), json!(now_rfc3339()));
-                session.insert("error_message".to_owned(), json!("Session runtime disappeared; use sm restore to resume the saved conversation"));
+                session.insert(
+                    "error_message".to_owned(),
+                    json!(stopped_message.unwrap_or(
+                        "Session runtime disappeared; use sm restore to resume the saved conversation"
+                    )),
+                );
                 changed = true;
+                stopped.push(record);
             }
         }
         if changed {
             self.write_raw_json_value(&state)?;
         }
-        Ok(())
+        Ok(stopped)
     }
 
     pub fn recover_session_runtime_launches(&self) -> Result<()> {
@@ -5790,7 +5805,7 @@ impl SessionStore {
         if !record.is_stopped() && session_restore_is_fenced(&state, &record.id) {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
-        if session_predates_boot(&record, system_boot_time()) {
+        if session_predates_boot(&record, crate::host_restart::system_boot_time()) {
             let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
             if record.is_stopped() {
                 session_runtime.ensure_server_anchor()?;
@@ -13305,45 +13320,6 @@ fn session_restore_is_fenced(state: &Value, session_id: &str) -> bool {
         })
 }
 
-/// Read the OS boot timestamp. Unknown platforms conservatively require tmux proof.
-fn system_boot_time() -> Option<OffsetDateTime> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8(output.stdout).ok()?;
-        let seconds = text
-            .split("sec = ")
-            .nth(1)?
-            .split(',')
-            .next()?
-            .trim()
-            .parse::<i64>()
-            .ok()?;
-        OffsetDateTime::from_unix_timestamp(seconds).ok()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string("/proc/stat").ok()?;
-        let seconds = stat
-            .lines()
-            .find_map(|line| line.strip_prefix("btime "))?
-            .trim()
-            .parse::<i64>()
-            .ok()?;
-        OffsetDateTime::from_unix_timestamp(seconds).ok()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
 fn session_predates_boot(record: &SessionRecord, boot_time: Option<OffsetDateTime>) -> bool {
     boot_time
         .zip(parse_timestamp(&record.last_activity))
@@ -17384,7 +17360,10 @@ esac
                 .with_tmux_binary_for_test(tmux.display().to_string());
             let store = SessionStore::new(path).with_delivery_runtime(Some(runtime));
             store
-                .reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z"))
+                .reconcile_missing_session_runtimes_at_boot(
+                    parse_timestamp("2001-01-01T00:00:00Z"),
+                    None,
+                )
                 .unwrap();
             let state = store.load_raw_json_value().unwrap();
             if failed_anchor {
@@ -17420,7 +17399,7 @@ esac
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
             .with_tmux_binary_for_test(tmux.display().to_string());
         let store = SessionStore::new(path).with_delivery_runtime(Some(runtime.clone()));
-        store.reconcile_missing_session_runtimes().unwrap();
+        store.reconcile_missing_session_runtimes(None).unwrap();
         let state = store.load_raw_json_value().unwrap();
         assert_eq!(state["sessions"][0]["status"], "stopped");
         assert_eq!(
@@ -17431,7 +17410,7 @@ esac
             assert_eq!(state["sessions"][index]["status"], "running");
         }
         assert_eq!(state["sessions"][4], records[4]);
-        store.reconcile_missing_session_runtimes().unwrap();
+        store.reconcile_missing_session_runtimes(None).unwrap();
         assert_eq!(store.load_raw_json_value().unwrap(), state);
         for id in ["live", "ambiguous"] {
             assert!(matches!(

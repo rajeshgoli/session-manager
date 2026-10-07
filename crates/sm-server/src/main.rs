@@ -42,6 +42,8 @@ const FOLLOW_DELIVERY_INTERVAL: Duration = Duration::from_secs(5);
 const FOLLOW_SWEEP_EVERY_PASSES: u64 = 3;
 /// How often Finished rows are checked for the 10-minute text fallback.
 const FINISHED_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How long after a post-restart start sm waits before restoring agents.
+const HOST_RESTART_RESTORE_DELAY: Duration = Duration::from_secs(10);
 /// The open-file soft limit sm-server raises itself to at startup. launchd
 /// starts it at 256, which every queue job, tmux server, and agent it spawns
 /// inherits; a parallel test suite run as a queue job exhausts that ("Too many
@@ -317,11 +319,12 @@ async fn main() -> Result<()> {
                 cancel_grace_seconds,
                 admission_policy,
             );
-            match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+            match RetainedQueueStore::recover_queue_jobs_in_state_dir_after_boot(
                 &queue_state_dir,
                 &message_queue_db_path,
                 cancel_grace_seconds,
                 admission_policy,
+                sm_server::host_restart::system_boot_time(),
             ) {
                 Ok(summary) if summary != QueueRecoverySummary::default() => {
                     eprintln!("queue runtime recovery: {summary:?}");
@@ -361,6 +364,17 @@ async fn main() -> Result<()> {
         } else {
             state
         };
+        if state.detected_host_restart().is_some() {
+            // Restored agents' hooks call back into this server, so give it a
+            // moment to start serving first (sm#2054).
+            let restore_state = state.clone();
+            thread::spawn(move || {
+                thread::sleep(HOST_RESTART_RESTORE_DELAY);
+                run_background_pass("host restart auto-restore", || {
+                    restore_state.auto_restore_after_host_restart();
+                });
+            });
+        }
         let lan_control = terminal_lan::LanControl::default();
         let expected_lan = inherited_lan.is_some();
         if state.config().terminal_direct.lan.enabled {

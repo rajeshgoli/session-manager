@@ -63,6 +63,8 @@ enum Command {
     Adopt(AdoptArgs),
     Recredential(RecredentialArgs),
     Restore(RestoreArgs),
+    /// List or restore the agents the last host restart interrupted.
+    Recover(RecoverArgs),
     Attach(SessionIdArgs),
     Output(OutputArgs),
     Clear(ClearArgs),
@@ -476,6 +478,18 @@ struct RestoreArgs {
     session_id: String,
     #[arg(long)]
     node: Option<String>,
+}
+
+#[derive(Args)]
+struct RecoverArgs {
+    /// Restore these interrupted agents; with none, list the cohort.
+    session_ids: Vec<String>,
+    /// Restore every agent still waiting.
+    #[arg(long, conflicts_with_all = ["session_ids", "leave"])]
+    all: bool,
+    /// Retire this interrupted agent instead of restoring it.
+    #[arg(long, value_name = "SESSION_ID", conflicts_with = "session_ids")]
+    leave: Option<String>,
 }
 
 #[derive(Args)]
@@ -1172,6 +1186,7 @@ fn run() -> Result<()> {
         Command::Restore(args) => {
             restore_session(&client, args)?;
         }
+        Command::Recover(args) => recover(&client, args)?,
         Command::Attach(args) => attach_session(&client, &args.session_id)?,
         Command::Clear(args) => {
             let requester_session_id = optional_current_session_id();
@@ -4816,6 +4831,116 @@ fn restore_session(client: &ApiClient, args: RestoreArgs) -> Result<()> {
         println!("Session restored: {restored_id}");
     }
     Ok(())
+}
+
+fn recover(client: &ApiClient, args: RecoverArgs) -> Result<()> {
+    let latest = client.get_json("/host-restarts/latest")?;
+    let Some(restart) = latest.get("restart").filter(|value| !value.is_null()) else {
+        println!("sm has recorded no host restart.");
+        return Ok(());
+    };
+    let restart_id = restart["id"].as_str().unwrap_or_default();
+    if let Some(session_id) = args.leave {
+        let payload = client.post_json(
+            &format!(
+                "/host-restarts/{}/members/{}/leave",
+                encode_path_segment(restart_id),
+                encode_path_segment(&session_id)
+            ),
+            json!({}),
+        )?;
+        println!("Retired {session_id}; it stays out of the restart's cohort.");
+        print_recover_cohort(&payload["restart"]);
+        return Ok(());
+    }
+    if !args.all && args.session_ids.is_empty() {
+        print_recover_cohort(restart);
+        return Ok(());
+    }
+    let body = if args.all {
+        json!({})
+    } else {
+        json!({ "session_ids": args.session_ids })
+    };
+    let payload = client.post_json(
+        &format!("/host-restarts/{}/restore", encode_path_segment(restart_id)),
+        body,
+    )?;
+    let results = payload["results"].as_array().cloned().unwrap_or_default();
+    if results.is_empty() {
+        println!("Nothing to restore: no named agent is waiting.");
+    }
+    for result in &results {
+        let name = result["name"].as_str().unwrap_or_default();
+        let id = result["session_id"].as_str().unwrap_or_default();
+        match result["outcome"].as_str() {
+            Some("restored") => println!("Restored {name} ({id}); it gets the restart notice."),
+            Some("left") => println!("Skipped {name} ({id}): it was retired since the restart."),
+            _ => println!(
+                "Failed {name} ({id}): {}",
+                result["error"].as_str().unwrap_or("unknown error")
+            ),
+        }
+    }
+    if results.iter().any(|result| result["outcome"] == "failed") {
+        bail!("some agents were not restored; `sm recover` lists them");
+    }
+    Ok(())
+}
+
+fn print_recover_cohort(restart: &Value) {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    println!(
+        "The Mac restarted at {} ({}).",
+        text(&restart["restarted_at_text"]),
+        text(&restart["id"])
+    );
+    println!("{}", text(&restart["cause_summary"]));
+    let members = restart["members"].as_array().cloned().unwrap_or_default();
+    let open = restart["open_count"].as_u64().unwrap_or(0);
+    println!(
+        "{} agent{} interrupted, {open} waiting on a decision.",
+        members.len(),
+        if members.len() == 1 { "" } else { "s" }
+    );
+    for member in &members {
+        let decision = match text(&member["decision"]).as_str() {
+            "pending" => "waiting".to_owned(),
+            "restored" => "restored".to_owned(),
+            "left" => "retired".to_owned(),
+            "failed" => format!("restore failed: {}", text(&member["error"])),
+            other => other.to_owned(),
+        };
+        let jobs = member["killed_jobs"]
+            .as_array()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|job| format!("{} ({})", text(&job["label"]), text(&job["job_id"])))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        println!(
+            "  {:<24} {:<10} {:<8} {}{}",
+            text(&member["name"]),
+            text(&member["session_id"]),
+            if member["mid_turn"] == json!(true) {
+                "mid-turn"
+            } else {
+                "idle"
+            },
+            decision,
+            if jobs.is_empty() {
+                String::new()
+            } else {
+                format!("  killed jobs: {}", jobs.join(", "))
+            }
+        );
+    }
+    if open > 0 {
+        println!(
+            "Restore all: sm recover --all · one: sm recover <session-id> · retire one: sm recover --leave <session-id>"
+        );
+    }
 }
 
 fn restore_session_path(session_id: &str, node: Option<&str>) -> String {
