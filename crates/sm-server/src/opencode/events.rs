@@ -173,7 +173,7 @@ impl Projection {
                 self.change_activity(Activity::from_value(&props["status"])?, None, &mut effects)
             }
             Some("message.updated") => {
-                self.message(&props["info"], &[], generated_user_ids, false, &mut effects)?
+                self.message(&props["info"], &[], generated_user_ids, &mut effects)?
             }
             Some("message.part.updated") => self.part(&props["part"], false, &mut effects)?,
             Some("session.updated") => {
@@ -225,7 +225,7 @@ impl Projection {
             let parts = message["parts"]
                 .as_array()
                 .context("backfill message missing parts")?;
-            self.message(info, parts, generated_user_ids, true, &mut effects)?;
+            self.message(info, parts, generated_user_ids, &mut effects)?;
             // Metadata can precede the user's text, even in a snapshot taken
             // during submission. Keep revisiting it until the reply is known.
             if self.pending_owner_prompts.contains(id) && !held {
@@ -233,6 +233,12 @@ impl Projection {
                 self.cursor = Some(id.into());
             }
             if info["role"] == "assistant" {
+                // A submitted user message can precede processing. Only an
+                // assistant or the final busy/retry status proves a turn
+                // began. A previously applied stop must remain untouched.
+                if self.activity == Activity::Idle && !self.stops.contains(id) {
+                    self.change_activity(Activity::Busy, self.last_user_id.clone(), &mut effects);
+                }
                 self.last_assistant = Some(id.into());
                 for part in parts {
                     self.part(part, true, &mut effects)?;
@@ -269,7 +275,6 @@ impl Projection {
         info: &Value,
         parts: &[Value],
         generated: &BTreeSet<String>,
-        backfill: bool,
         effects: &mut Vec<Effect>,
     ) -> Result<()> {
         let id = info["id"].as_str().context("opencode message missing id")?;
@@ -284,7 +289,7 @@ impl Projection {
             if text.is_empty() {
                 text = self.message_text(id);
             }
-            if !text.is_empty() {
+            if !text.is_empty() || !self.users.contains(id) {
                 self.last_user = text.clone();
             }
             let new_user = self.users.insert(id.into());
@@ -295,13 +300,6 @@ impl Projection {
                 }
             }
             self.owner_prompt(id, &text, effects);
-            if new_user && backfill && self.activity == Activity::Idle {
-                self.activity = Activity::Busy;
-                effects.push(Effect::TurnStart {
-                    message_id: Some(id.into()),
-                    prompt: self.last_user.clone(),
-                });
-            }
         } else if info["role"] == "assistant" {
             self.last_assistant = Some(id.into());
         }

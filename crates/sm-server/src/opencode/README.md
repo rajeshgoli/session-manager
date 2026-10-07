@@ -71,8 +71,10 @@ deduplicates usage across reopen. Supply all host-generated user message IDs
 (including the launch brief), so those messages cannot count as owner answers.
 
 On connection, backfill message history before reconciling current activity.
-User submissions have no `time.completed`; an unfinished assistant holds the
-cursor, so subsequent reconnects revisit its growing parts. A completed model
+User submissions have no `time.completed`; metadata or text alone while the
+provider is idle does not prove processing began. Backfill starts a turn only
+on an assistant message or current busy/retry status. An unfinished assistant
+holds the cursor, so subsequent reconnects revisit its growing parts. A completed model
 request ending in `tool-calls` continues the same agent turn. It does not emit
 a turn stop. Live turn starts come from busy/retry status, after user text parts
 have supplied the prompt; owner-answer effects also work while already busy.

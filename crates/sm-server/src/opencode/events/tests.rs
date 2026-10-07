@@ -133,6 +133,95 @@ fn two_disconnects_during_one_assistant_keep_cursor_and_replay_only_new_parts() 
 }
 
 #[test]
+fn reconnect_during_submission_does_not_fabricate_a_start_or_stop() {
+    for generated in [false, true] {
+        let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+        // A previous turn's prompt must not leak into a metadata-only start.
+        projection.last_user = "previous prompt".into();
+        let ids = if generated {
+            BTreeSet::from(["msg_01".into()])
+        } else {
+            BTreeSet::new()
+        };
+        let prompt = user("msg_01", "actual prompt");
+        let mut metadata_only = prompt.clone();
+        metadata_only["parts"] = json!([]);
+        for _ in 0..2 {
+            let effects = projection
+                .backfill(&[metadata_only.clone()], Activity::Idle, &ids)
+                .unwrap();
+            assert_eq!(starts(&effects), 0);
+            assert_eq!(stops(&effects), 0);
+            assert_eq!(projection.activity, Activity::Idle);
+            projection = serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+        }
+        for _ in 0..2 {
+            let effects = projection
+                .backfill(std::slice::from_ref(&prompt), Activity::Idle, &ids)
+                .unwrap();
+            assert_eq!(starts(&effects), 0);
+            assert_eq!(stops(&effects), 0);
+            assert_eq!(projection.activity, Activity::Idle);
+        }
+        let busy = json!({"type":"session.status", "properties":{"sessionID":"ses_test", "status":{"type":"busy"}}});
+        let effects = projection.live(&busy, &ids).unwrap();
+        assert_eq!(
+            effects,
+            vec![Effect::TurnStart {
+                message_id: None,
+                prompt: "actual prompt".into()
+            }]
+        );
+        assert_eq!(
+            starts(
+                &projection
+                    .backfill(std::slice::from_ref(&prompt), Activity::Busy, &ids)
+                    .unwrap()
+            ),
+            0
+        );
+        let history = vec![prompt, assistant("msg_02", true, "stop", vec![])];
+        let effects = projection.backfill(&history, Activity::Idle, &ids).unwrap();
+        assert_eq!(starts(&effects), 0);
+        assert_eq!(stops(&effects), 1);
+        assert!(projection
+            .backfill(&history, Activity::Idle, &ids)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn assistant_or_busy_status_proves_a_turn_started_before_user_text_is_available() {
+    for activity in [Activity::Busy, Activity::Retry] {
+        let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+        projection.last_user = "previous prompt".into();
+        let mut prompt = user("msg_01", "not persisted yet");
+        prompt["parts"] = json!([]);
+        let effects = projection
+            .backfill(&[prompt], activity, &BTreeSet::new())
+            .unwrap();
+        assert_eq!(starts(&effects), 1);
+        assert_eq!(stops(&effects), 0);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::TurnStart { prompt, .. } if prompt.is_empty())));
+    }
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let mut prompt = user("msg_01", "not persisted yet");
+    prompt["parts"] = json!([]);
+    let effects = projection
+        .backfill(
+            &[prompt, assistant("msg_02", true, "stop", vec![])],
+            Activity::Idle,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    assert_eq!(starts(&effects), 1);
+    assert_eq!(stops(&effects), 1);
+}
+
+#[test]
 fn busy_and_idle_reconnect_matches_do_not_fabricate_transitions() {
     for activity in [Activity::Idle, Activity::Busy, Activity::Retry] {
         let mut projection = Projection::new("ses_test", activity).unwrap();
