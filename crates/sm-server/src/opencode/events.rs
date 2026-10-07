@@ -212,6 +212,11 @@ impl Projection {
                 .as_str()
                 .cmp(&right["info"]["id"].as_str())
         });
+        let latest_assistant_id = ordered.iter().rev().find_map(|message| {
+            (message["info"]["role"] == "assistant")
+                .then(|| message["info"]["id"].as_str())
+                .flatten()
+        });
         let cursor = self.cursor.clone();
         let mut effects = Vec::new();
         let mut held = false;
@@ -249,13 +254,24 @@ impl Projection {
                     // tools and next request still belong to the same turn.
                     if info["finish"] != "tool-calls"
                         && (info["finish"].as_str().is_some() || activity == Activity::Idle)
-                        && self.stops.insert(id.into())
+                        && !self.stops.contains(id)
                     {
-                        self.activity = Activity::Idle;
-                        effects.push(Effect::TurnStop {
-                            message_id: Some(id.into()),
-                            text: self.assistant_text(),
-                        });
+                        // Persistence can precede the provider's idle status.
+                        // A later assistant proves the next turn began; absent
+                        // that proof, wait for idle and keep replaying this row.
+                        if activity == Activity::Idle
+                            || latest_assistant_id.is_some_and(|later| later > id)
+                        {
+                            self.stops.insert(id.into());
+                            self.activity = Activity::Idle;
+                            effects.push(Effect::TurnStop {
+                                message_id: Some(id.into()),
+                                text: self.assistant_text(),
+                            });
+                        } else if !held {
+                            held = true;
+                            self.cursor = Some(id.into());
+                        }
                     }
                 } else if !held {
                     held = true;

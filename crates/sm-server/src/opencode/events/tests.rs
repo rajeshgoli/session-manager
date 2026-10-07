@@ -133,6 +133,102 @@ fn two_disconnects_during_one_assistant_keep_cursor_and_replay_only_new_parts() 
 }
 
 #[test]
+fn completed_assistant_with_busy_snapshot_waits_for_live_idle_once() {
+    for activity in [Activity::Busy, Activity::Retry] {
+        let mut projection = Projection::new("ses_test", activity).unwrap();
+        let history = vec![
+            user("msg_01", "prompt"),
+            assistant("msg_02", true, "stop", vec![usage_part("prt_usage")]),
+        ];
+        for _ in 0..2 {
+            let effects = projection
+                .backfill(&history, activity, &BTreeSet::new())
+                .unwrap();
+            assert_eq!(starts(&effects), 0);
+            assert_eq!(stops(&effects), 0);
+            assert_eq!(projection.cursor.as_deref(), Some("msg_02"));
+            projection = serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+        }
+        let idle = json!({"type":"session.status", "properties":{"sessionID":"ses_test", "status":{"type":"idle"}}});
+        assert_eq!(stops(&projection.live(&idle, &BTreeSet::new()).unwrap()), 1);
+        assert_eq!(stops(&projection.live(&idle, &BTreeSet::new()).unwrap()), 0);
+        assert!(projection
+            .backfill(&history, Activity::Idle, &BTreeSet::new())
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn missed_turn_with_lagging_busy_status_starts_once_and_stops_on_idle_replay() {
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let history = vec![
+        user("msg_01", "prompt"),
+        assistant("msg_02", true, "stop", vec![]),
+    ];
+    let effects = projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(starts(&effects), 1);
+    assert_eq!(stops(&effects), 0);
+    assert_eq!(projection.cursor.as_deref(), Some("msg_02"));
+    let mut reopened: Projection =
+        serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+    assert!(reopened
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+    let effects = reopened
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(stops(&effects), 1);
+    assert!(reopened
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn later_assistant_proves_an_earlier_turn_ended_while_current_turn_is_busy() {
+    let mut projection = Projection::new("ses_test", Activity::Busy).unwrap();
+    let mut history = vec![
+        user("msg_01", "first"),
+        assistant("msg_02", true, "stop", vec![]),
+        user("msg_03", "next"),
+        assistant("msg_04", false, "", vec![]),
+    ];
+    let effects = projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(stops(&effects), 1);
+    assert_eq!(starts(&effects), 1);
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::TurnStart { prompt, .. } if prompt == "next")));
+    assert_eq!(projection.cursor.as_deref(), Some("msg_04"));
+    assert!(projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+    history[3]["info"]["time"]["completed"] = json!(5);
+    history[3]["info"]["finish"] = json!("stop");
+    assert!(projection
+        .backfill(&history, Activity::Busy, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+    let effects = projection
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(stops(&effects), 1);
+    assert_eq!(starts(&effects), 0);
+    assert!(projection
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn reconnect_during_submission_does_not_fabricate_a_start_or_stop() {
     for generated in [false, true] {
         let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
