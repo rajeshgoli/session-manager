@@ -146,3 +146,17 @@ test('the card title is the title of the claim the card numbers (sm#1900)', () =
   assert.equal(ticketTitle({ claims: [] }), '');
   assert.equal(ticketTitle({}), '');
 });
+
+
+test('agent details retain completed tickets and PRs without duplicate claim links', () => {
+  const ticket = { repo: 'rajeshgoli/session-manager', kind: 'ticket', number: 2071 };
+  const pr = { repo: ticket.repo, kind: 'pr', number: 2072, ended_at: '2026-10-07', state: 'merged', url: 'https://github.com/rajeshgoli/session-manager/pull/2072' };
+  const old = { ...ticket, ended_at: '2026-10-06', state: 'closed' };
+  const active = { ...ticket, ended_at: null, state: 'open' };
+  const history = [old, pr, active];
+  assert.deepEqual(agents.namespace.detailClaims([active], history), [active, pr]);
+  assert.deepEqual(agents.namespace.detailClaims([], [old, pr]), [pr, old]);
+  assert.deepEqual(history, [old, pr, active]);
+  assert.equal(agents.namespace.detailClaims([], [old, { ...old, repo: 'rajeshgoli/other' }]).length, 2);
+  assert.deepEqual(agents.namespace.detailClaims(), []);
+});

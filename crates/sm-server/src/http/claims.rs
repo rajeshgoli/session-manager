@@ -407,7 +407,7 @@ pub(super) async fn list_claims(
     Query(query): Query<ListClaimsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let active = query.active.unwrap_or(true);
     let store = work_claim_store(&state);
     let claims = match query

@@ -535,14 +535,30 @@ function AgentCard({ agent, depth, now, showRepo, titles, selected, cursor, onAn
 
 // ---- agent panel -------------------------------------------------------------
 
+// Display retained work without projecting ended claims as current ownership.
+export function detailClaims(active = [], retained = []) {
+  const items = new Map();
+  for (const claim of [...active, ...retained.slice().reverse()]) {
+    const key = `${claim.repo}#${claim.number}:${claim.kind}`;
+    if (!items.has(key)) items.set(key, claim);
+  }
+  return [...items.values()];
+}
+
 function useAgent(id) {
-  const [doc, error, reload] = usePoll(() => api(`/watch/state?session=${encodeURIComponent(id)}`), refreshMs(), [id]);
+  const [doc, error, reload] = usePoll(async () => {
+    const [watch, history] = await Promise.all([
+      api(`/watch/state?session=${encodeURIComponent(id)}`),
+      api(`/claims?session=${encodeURIComponent(id)}&active=false`),
+    ]);
+    return { ...watch, retainedClaims: history.claims };
+  }, refreshMs(), [id]);
   const agent = doc && (doc.sessions || []).find((session) => session.id === id);
-  return { agent, reload, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
+  return { agent, claims: detailClaims(agent?.claims, doc?.retainedClaims), reload, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
 }
 
 export function AgentPanel({ id, controls }) {
-  const { agent, reload, loading, error } = useAgent(id);
+  const { agent, claims, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
   const [tab, setTab] = useState('work');
   useEffect(() => setTab('work'), [id]);
@@ -550,7 +566,7 @@ export function AgentPanel({ id, controls }) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
   }
-  const claim = (agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0];
+  const claim = claims.find((c) => c.kind === 'ticket') || claims[0];
   const since = agent.state === 'stopped' ? agent.last_activity : agent.activity_since || agent.last_activity;
   const parts = [
     providerLabel(agent.provider),
@@ -567,8 +583,8 @@ export function AgentPanel({ id, controls }) {
       <span class="s">${parts.join(' · ')}</span>
     </div>
     <${AgentActions} agent=${agent} onRetired=${(done) => { if (done) closePanel(); reload(); }} />
-    <${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
-      prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
+    <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
+      prs=${claims.filter(item => item.kind === 'pr')}
       jobs=${agent.jobs || []} thread=${agent.thread}
       docs=${agent.docs || []} />
     <div class="tabs" role="tablist">
@@ -578,7 +594,7 @@ export function AgentPanel({ id, controls }) {
       )}
     </div>
     <div class="pbody">
-      ${tab === 'work' ? html`<${WorkTab} agent=${agent} now=${now} onAnswered=${reload} />` : null}
+      ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload} />` : null}
       ${tab === 'activity' ? html`<${ActivityTab} id=${agent.id} />` : null}
       ${tab === 'summary' ? html`<${SummaryTab} agent=${agent} />` : null}
     </div>
@@ -673,8 +689,7 @@ function MoreMenu({ agent, onClose }) {
 
 const DOC_LINK = (doc) => doc.reader_path || doc.browser_url || doc.url;
 
-function WorkTab({ agent, now, onAnswered }) {
-  const claims = agent.claims || [];
+function WorkTab({ agent, claims, now, onAnswered }) {
   const jobs = (agent.jobs || []).filter((job) => ['running', 'pending'].includes(job.state));
   const reviews = (agent.waiting_on || []).filter((w) => w.kind === 'review');
   const docs = agent.docs || [];
@@ -687,12 +702,15 @@ function WorkTab({ agent, now, onAnswered }) {
     ${ticketClaims.length
       ? html`<section><h3>Ticket</h3><ul>${ticketClaims.map((claim) => html`<li>
           ${itemButton('ticket', `${claim.repo}#${claim.number}`, claim.url,
-            html`<span class="tk">#${claim.number}</span> ${claim.title || claim.repo}`)}</li>`)}</ul></section>`
+            html`<span class="tk">#${claim.number}</span> ${claim.title || claim.repo}`)}
+          ${claim.state ? html` <span class="sub">${claim.state}</span>` : null}
+          ${claim.ended_at ? html` <span class="sub">· claim ended</span>` : null}</li>`)}</ul></section>`
       : null}
     ${prClaims.length
       ? html`<section><h3>Pull requests</h3><ul>${prClaims.map((claim) => html`<li>
           <a href=${claim.url} target="_blank" rel="noopener"><span class="tk">PR #${claim.number}</span> ${claim.title || ''}</a>
-          ${claim.state ? html` <span class="sub">${claim.state}</span>` : null}</li>`)}</ul></section>`
+          ${claim.state ? html` <span class="sub">${claim.state}</span>` : null}
+          ${claim.ended_at ? html` <span class="sub">· claim ended</span>` : null}</li>`)}</ul></section>`
       : null}
     ${reviews.length
       ? html`<section><h3>Reviews</h3><ul>${reviews.map((review) => html`<li>
