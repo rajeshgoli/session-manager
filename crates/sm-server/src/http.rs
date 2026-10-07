@@ -375,6 +375,7 @@ mod local_model;
 mod merge_holds;
 mod messages;
 mod notes;
+mod opencode_readers;
 mod review_paired;
 mod review_policies;
 mod review_runs;
@@ -673,6 +674,7 @@ pub struct AppState {
     /// The host restart this server's start detected (sm#2054).
     detected_host_restart: Option<String>,
     session_store: SessionStore,
+    opencode_readers: opencode_readers::Readers,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     owner_doc_source: Arc<dyn OwnerDocSource>,
     /// PR state and head per `(repo, pr)` for owner docs, cached for 30s.
@@ -864,6 +866,7 @@ impl AppState {
             server_instance: random_urlsafe_token(24),
             detected_host_restart,
             session_store,
+            opencode_readers: opencode_readers::Readers::default(),
             github_review_poster: Arc::new(GhCliReviewPoster),
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1800,6 +1803,7 @@ pub fn router(state: AppState) -> Router {
         .map(|bridge| bridge.webhook_path())
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
     let state = Arc::new(state);
+    opencode_readers::start(state.clone());
     web::server_started_at();
     if let Err(error) = RetainedQueueStore::ensure_codex_review_requests_schema_from_path(
         &expand_home(&state.config.sm_send.db_path),
@@ -11789,7 +11793,13 @@ async fn session_tool_calls(
             detail: "limit must be between 1 and 100".to_owned(),
         });
     };
-    let tool_calls = if state.config.usage.enabled {
+    let tool_calls = if session.provider == "opencode" {
+        crate::tool_usage::list_recent_tool_calls_from_path(
+            &expand_home(&state.config.tool_logging.db_path),
+            &session.id,
+            limit,
+        )?
+    } else if state.config.usage.enabled {
         let db_path = expand_home(&state.config.activity.db_path);
         list_recent_tool_calls_from_path(&db_path, &session.id, limit)?
     } else if session.provider == "codex-fork" {
@@ -12981,6 +12991,9 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     }
     if session.tmux_session.trim().is_empty() {
         return None;
+    }
+    if session.provider == "opencode" {
+        return state.opencode_readers.activity(session);
     }
     if session.provider.trim() == "claude" {
         // Hook state is posted to the primary from every node, so it is answered

@@ -141,7 +141,7 @@ impl MessageBinding {
     }
 }
 
-fn validate_id(id: &str, prefix: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str, prefix: &str) -> Result<()> {
     let tail = id.strip_prefix(prefix).and_then(|s| s.strip_prefix('_'));
     if tail.is_none_or(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphanumeric())) {
         bail!("invalid opencode {prefix} identifier");

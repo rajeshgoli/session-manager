@@ -144,8 +144,22 @@ signal with `acknowledge_opencode_stop_signal`. The signal survives later write
 failures and restart until acknowledged; a stale acknowledgement cannot clear
 a newer stop. Context
 measurements use the existing context-update path; provider capability and
-usage-seat attribution remain separate integration work. Event-reader start,
-reconnect and shutdown wiring remains on #2044; public entry points stay disabled.
+usage-seat attribution remain separate integration work.
+
+The serving generation starts one authenticated event reader per active primary
+opencode session. It opens the stream before backfill, surrounds each history
+GET with matching status observations, and fences the snapshot's conversation
+under the registry write lock. Buffered status frames trigger another snapshot;
+buffered complete-message frames cannot regress replayed text. Reconnects use
+one, two, four and then five seconds of backoff. HTTP failures do not stop the
+session. Shutdown prevents further application; the twenty-second body timeout
+bounds a blocked stream. Live activity expires after sixty seconds without a
+successful observation and never falls back to reading the viewer's pane.
+Generated IDs include delivered queue rows and the persisted launch brief.
+Owner answers wake the board after unlocking even when a later effect fails.
+Tool-call history reads opencode's receipt-backed tool log independently of the
+hosted usage setting. Launch/restore integration remains on #2044; HTTP outbox
+delivery and public entry points remain on #2045.
 
 - `scripts/test-rust-isolated.sh opencode -- --test-threads=1`: native-shaped
   IDs, approved config fixture, config loading, duplicate-append stub and

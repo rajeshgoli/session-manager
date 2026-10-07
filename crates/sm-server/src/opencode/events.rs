@@ -27,7 +27,7 @@ pub enum Activity {
 }
 
 impl Activity {
-    fn from_value(value: &Value) -> Result<Self> {
+    pub(crate) fn from_value(value: &Value) -> Result<Self> {
         match value["type"].as_str() {
             Some("idle") => Ok(Self::Idle),
             Some("busy") => Ok(Self::Busy),
@@ -189,6 +189,15 @@ impl Projection {
             .or_else(|| props["info"]["sessionID"].as_str())
             .or_else(|| props["info"]["id"].as_str());
         if session != Some(self.conversation_id.as_str()) {
+            return Ok(Vec::new());
+        }
+        // Complete messages were covered by the reconnect snapshot; buffered
+        // metadata cannot select an older assistant or regress its text.
+        if props["part"]["messageID"]
+            .as_str()
+            .or_else(|| props["info"]["id"].as_str())
+            .is_some_and(|id| self.replayed_messages.contains(id))
+        {
             return Ok(Vec::new());
         }
         if let Some(id) = props["part"]["messageID"]
