@@ -1,0 +1,1 @@
+{"default":{"fallback":[{"effort":"medium","kind":"codex","model":"gpt-6-sol"},{"effort":"high","kind":"claude","model":"opus"}],"reviewer":{"kind":"github_codex"},"source":"default"},"policies":[]}

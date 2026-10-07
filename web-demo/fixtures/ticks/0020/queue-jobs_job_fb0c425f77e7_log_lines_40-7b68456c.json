@@ -1,0 +1,1 @@
+{"job_id":"job_fb0c425f77e7","lines":40,"log_path":"/q/logs/job_fb0c425f77e7.log","text":"   Compiling shop v0.4.0\n   Running tests/cart_totals.rs\ntest cart::totals_with_tax ... ok\ntest cart::discount_rounding ... ok\n"}

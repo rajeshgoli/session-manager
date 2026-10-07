@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""A stand-in for the GitHub CLI, for the demo recorder's scratch server.
+
+It answers the few `gh` calls sm makes (board reads, claim lookups, PR views)
+from the world file the recorder keeps current ($SMDEMO_WORLD). Anything else
+fails loudly and is logged next to the world file, so a new call shows up as
+an error instead of reaching GitHub.
+"""
+import json
+import os
+import re
+import sys
+
+WORLD = os.environ["SMDEMO_WORLD"]
+LOG = os.path.join(os.path.dirname(WORLD), "fake-gh.log")
+
+
+def log(line):
+    with open(LOG, "a") as out:
+        out.write(line + "\n")
+
+
+def world():
+    with open(WORLD) as src:
+        return json.load(src)
+
+
+def repo_of(w, slug):
+    return w["repos"].get(slug.lower(), {"issues": {}, "prs": {}})
+
+
+def ref(slug, number, issue):
+    return {
+        "number": number,
+        "title": issue["title"],
+        "url": f"https://github.com/{slug}/issues/{number}",
+        "state": issue["state"].upper(),
+        "stateReason": issue.get("state_reason"),
+        "closedAt": issue.get("closed_at"),
+        "repository": {"nameWithOwner": slug},
+    }
+
+
+def connection(nodes):
+    return {"totalCount": len(nodes), "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}
+
+
+def issues_page(w, slug):
+    repo = repo_of(w, slug)
+    issues = repo["issues"]
+    nodes = []
+    for key, issue in sorted(issues.items(), key=lambda kv: int(kv[0])):
+        if issue["state"] != "open":
+            continue
+        number = int(key)
+        parent = issue.get("parent")
+        prs = [
+            {"number": int(n), "state": repo["prs"][n]["state"].upper(),
+             "url": f"https://github.com/{slug}/pull/{n}", "repository": {"nameWithOwner": slug}}
+            for n, pr in repo["prs"].items() if number in pr.get("closes", [])
+        ]
+        nodes.append({
+            "number": number,
+            "title": issue["title"],
+            "body": issue.get("body", ""),
+            "url": f"https://github.com/{slug}/issues/{number}",
+            "updatedAt": issue.get("updated_at"),
+            "stateReason": issue.get("state_reason"),
+            "parent": ref(slug, parent, issues[str(parent)]) if parent else None,
+            "blockedBy": connection([ref(slug, b, issues[str(b)]) for b in issue.get("blocked_by", [])]),
+            "subIssues": connection([ref(slug, s, issues[str(s)]) for s in issue.get("sub_issues", [])]),
+            "closedByPullRequestsReferences": {"nodes": prs},
+        })
+    return {"data": {
+        "rateLimit": {"remaining": 5000, "resetAt": "2099-01-01T00:00:00Z"},
+        "repository": {"issues": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}},
+    }}
+
+
+def resolve(w, query):
+    data, errors = {}, []
+    for alias, owner, name, number in re.findall(
+            r'(r\d+): repository\(owner: "([^"]+)", name: "([^"]+)"\) \{ issue\(number: (\d+)\)', query):
+        slug = f"{owner}/{name}".lower()
+        issue = repo_of(w, slug)["issues"].get(number)
+        if issue is None:
+            data[alias] = None
+            errors.append({"type": "NOT_FOUND", "path": [alias], "message": f"no issue {number}"})
+            continue
+        node = ref(slug, int(number), issue)
+        node["id"] = f"I_{name}_{number}"
+        parent = issue.get("parent")
+        node["parent"] = {"number": parent, "repository": {"nameWithOwner": slug}} if parent else None
+        node["blockedBy"] = {"nodes": [{"number": b, "repository": {"nameWithOwner": slug}}
+                                       for b in issue.get("blocked_by", [])]}
+        data[alias] = {"issue": node}
+    out = {"data": data}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def items(w, query):
+    owner, name = re.search(r'repository\(owner: "([^"]+)", name: "([^"]+)"\)', query).groups()
+    slug = f"{owner}/{name}".lower()
+    repo = repo_of(w, slug)
+    found = {}
+    for number in re.findall(r"i(\d+): issueOrPullRequest", query):
+        if number in repo["prs"]:
+            pr = repo["prs"][number]
+            closes = [{"number": n, "repository": {"nameWithOwner": slug}} for n in pr.get("closes", [])]
+            found[f"i{number}"] = {
+                "__typename": "PullRequest", "title": pr["title"], "state": pr["state"].upper(),
+                "isDraft": False, "mergedAt": pr.get("merged_at"), "closedAt": pr.get("closed_at"),
+                "url": f"https://github.com/{slug}/pull/{number}", "headRefName": pr["head_ref"],
+                "headRefOid": pr["head_sha"],
+                "closingIssuesReferences": connection(closes),
+            }
+        elif number in repo["issues"]:
+            issue = repo["issues"][number]
+            found[f"i{number}"] = {
+                "__typename": "Issue", "title": issue["title"], "state": issue["state"].upper(),
+                "stateReason": issue.get("state_reason"), "closedAt": issue.get("closed_at"),
+                "url": f"https://github.com/{slug}/issues/{number}",
+            }
+        else:
+            found[f"i{number}"] = None
+    return {"data": {"repository": found}}
+
+
+def graphql(args):
+    path = args[args.index("--input") + 1]
+    with open(path) as src:
+        query = json.load(src)["query"]
+    w = world()
+    if "issues(states: OPEN" in query:
+        owner, name = re.search(r'repository\(owner: "([^"]+)", name: "([^"]+)"\)', query).groups()
+        return issues_page(w, f"{owner}/{name}")
+    if "r0: repository(" in query:
+        return resolve(w, query)
+    if "issueOrPullRequest(" in query:
+        return items(w, query)
+    if query.lstrip().startswith("mutation"):
+        return {"data": {}}
+    raise SystemExit(f"fake gh: unhandled GraphQL query: {query[:200]}")
+
+
+def pr_view(args):
+    number = args[2]
+    slug = args[args.index("--repo") + 1].lower() if "--repo" in args else next(iter(world()["repos"]))
+    pr = repo_of(world(), slug)["prs"].get(number)
+    if pr is None:
+        raise SystemExit(f"fake gh: no PR {slug}#{number}")
+    return {
+        "id": f"PR_{number}", "number": int(number), "title": pr["title"], "state": pr["state"].upper(),
+        "headRefOid": pr["head_sha"], "url": f"https://github.com/{slug}/pull/{number}",
+    }
+
+
+def main():
+    args = sys.argv[1:]
+    log(" ".join(args))
+    if args[:2] == ["api", "graphql"]:
+        result = graphql(args)
+    elif args[:2] == ["pr", "view"] and len(args) > 2 and args[2].isdigit():
+        result = pr_view(args)
+    elif args[:2] == ["repo", "view"]:
+        result = {"nameWithOwner": next(iter(world()["repos"]))}
+    else:
+        log(f"  unhandled: {args}")
+        sys.stderr.write(f"fake gh: unhandled call: gh {' '.join(args)}\n")
+        sys.exit(1)
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

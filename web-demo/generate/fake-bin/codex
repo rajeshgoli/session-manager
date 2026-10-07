@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stand-in for the Codex CLI. The scratch server only runs `codex [flags] debug
+# models` (for the New agent model list); answer that with neutral model names.
+case " $* " in
+  *" debug models"*)
+    echo '{"models":[{"slug":"gpt-5.5","visibility":"list"},{"slug":"gpt-5.5-mini","visibility":"list"},{"slug":"qwen3-coder-next","visibility":"list"}]}'
+    exit 0 ;;
+esac
+echo "fake codex: unhandled call: codex $*" >&2
+exit 1
