@@ -75,6 +75,10 @@ async function handle(request, url) {
   if (!entry && /^\/docs\/[^/]+\/drafts$/.test(url.pathname)) return json(200, { drafts: [] });
   if (!entry && /^\/docs\/[^/]+\/reopen-target$/.test(url.pathname)) return json(200, { kind: 'refused', reason: READ_ONLY });
   if (!entry) {
+    const history = await historyJobRoute(url);
+    if (history) return history;
+  }
+  if (!entry) {
     const key = url.pathname + url.search;
     if (misses.size < 500 || misses.has(key)) misses.set(key, [...(misses.get(key) || []), Math.floor(now.t)].slice(-5));
     return json(404, { detail: 'Not found' });
@@ -233,6 +237,19 @@ async function withQueueHistory(body) {
   doc.ended = [...(doc.ended || []), ...history.ended.filter((job) => !ids.has(job.id))]
     .sort((a, b) => (a.finished_at < b.finished_at ? 1 : -1));
   return JSON.stringify(doc);
+}
+
+// The job panel for a snapshot job: its list entry is its detail; the snapshot
+// keeps no log or usage.
+async function historyJobRoute(url) {
+  const m = url.pathname.match(/^\/(?:queue-jobs|client\/queue\/jobs)\/([^/]+)(\/log|\/usage)?$/);
+  if (!m) return null;
+  const id = decodeURIComponent(m[1]);
+  const job = JSON.parse(await staticText('static/queue_history.json')).ended.find((j) => j.id === id);
+  if (!job) return null;
+  if (m[2] === '/log') return json(200, { job_id: id, lines: Number(url.searchParams.get('lines')) || 40, log_path: job.log_path, text: '' });
+  if (m[2] === '/usage') return json(200, { available: false });
+  return url.pathname.startsWith('/queue-jobs/') ? json(200, job) : null;
 }
 
 // A file from fixtures/static/ with its times moved to now; it names its own
