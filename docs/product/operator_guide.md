@@ -304,7 +304,8 @@ builds and deploys it from `main` whenever a push changes `web-demo/` or
 
 1. **Regenerate the recording** when the dashboard's data calls change (new
    pages or fields the recording lacks). It plays in real time, about ten
-   minutes:
+   minutes. From a shell, run `python3 web-demo/generate/record.py`; an agent
+   submits it to the queue instead:
    `sm queue run --type background --max-wait 2h --timeout 30m --label demo-record --cwd <repo> -- python3 web-demo/generate/record.py`
 2. **Rebuild and check it locally:** `python3 web-demo/build.py --serve`, then
    open <http://localhost:8440/>.
