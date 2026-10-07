@@ -156,6 +156,28 @@ pub fn bind_socket(state_dir: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// Connects to the serving slot for `--take-over`. `None` means no server is
+/// serving: the socket is missing, or nothing listens on it because the slot
+/// that bound it died. launchd relaunches a slot with the arguments it was
+/// installed with, so after a crash or reboot the only slot left still asks
+/// for a handover; it must cold-start rather than fail forever.
+pub fn connect_serving(state_dir: &Path) -> Result<Option<UnixStream>> {
+    let path = socket_path(state_dir);
+    match UnixStream::connect(&path) {
+        Ok(stream) => Ok(Some(stream)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot connect to serving slot at {}", path.display())),
+    }
+}
+
 pub fn send_request(stream: &mut UnixStream) -> Result<()> {
     let mut request = serde_json::to_vec(&Request::current())?;
     request.push(b'\n');
@@ -658,6 +680,23 @@ mod tests {
             );
         }
         assert!(send_listeners(&old, &[tcp.as_raw_fd()], false).is_err());
+    }
+
+    #[test]
+    fn take_over_without_a_serving_slot_cold_starts() {
+        // Short path: Unix socket paths are limited to 104 bytes on macOS.
+        let dir = PathBuf::from(format!("/tmp/sm-ho-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(connect_serving(&dir).unwrap().is_none());
+
+        // A dead slot leaves its socket file behind with nobody listening.
+        drop(UnixListener::bind(socket_path(&dir)).unwrap());
+        assert!(connect_serving(&dir).unwrap().is_none());
+
+        let listener = bind_socket(&dir).unwrap();
+        assert!(connect_serving(&dir).unwrap().is_some());
+        drop(listener);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

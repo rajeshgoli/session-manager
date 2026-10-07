@@ -1,9 +1,6 @@
 use std::{
     net::SocketAddr,
-    os::{
-        fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
-    },
+    os::{fd::AsRawFd, unix::net::UnixListener},
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
     thread,
@@ -159,10 +156,17 @@ async fn main() -> Result<()> {
     let handover_dir = state_file
         .parent()
         .context("session state has no parent directory")?;
+    let serving_slot = if args.take_over {
+        let serving = handover::connect_serving(handover_dir)?;
+        if serving.is_none() {
+            eprintln!("no serving slot to take over from; starting cold");
+        }
+        serving
+    } else {
+        None
+    };
     let (listener, mut authority_server, handover_listener, mut takeover_stream, mut inherited_lan) =
-        if args.take_over {
-            let mut stream = UnixStream::connect(handover::socket_path(handover_dir))
-                .context("cannot connect to serving slot for handover")?;
+        if let Some(mut stream) = serving_slot {
             handover::send_request(&mut stream)?;
             let (mut fds, has_lan) = handover::receive_listeners(&stream)?;
             let listener = std::net::TcpListener::from(fds.remove(0));
