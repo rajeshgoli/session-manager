@@ -1,0 +1,1 @@
+{"available":true,"cpu_percent":21.074406067824235,"gpu_percent":65.0,"host":"dev-box","memory_available_bytes":255636453417,"memory_pressure":"Normal","memory_total_bytes":274877906944,"memory_used_bytes":159528599552,"queue_cpu_percent":8.293749999999989,"queue_gpu_percent":17.57352416,"queue_memory_bytes":119215137453,"sampled_at":"2026-10-07T20:42:57Z","source":"recorder"}

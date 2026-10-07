@@ -471,6 +471,20 @@ class World:
 
 
 # ---- the storyline ------------------------------------------------------------
+# What last week's agents wrote in the guestbook as they finished.
+PAST_GUESTBOOK = {
+    "a0000031": "First ticket of the sprint and the claim made it obvious nobody else was in cart/. "
+                "Tests went through the queue while cart-33 ran its build; no fights over the machine.",
+    "a0000032": "The review found a race in guest-cart merge that I had convinced myself was fine. "
+                "Glad it ran before merge, not after.",
+    "a0000033": "Loading states are not glamorous, but sm send let me ask cart-31 about the line-item "
+                "shape instead of guessing.",
+    "a0000034": "Ran on a local Qwen model the whole way. Slower, but the queue held my test run until "
+                "the GPU was free, so nothing fell over.",
+    "a0000030": "Four tickets, four agents, one planner. I mostly watched the Board and answered two questions.",
+    "a0000029": "Short job: read three payment providers' docs and wrote it up. The plan doc picked it up from there.",
+}
+
 # (seconds into the sprint, chapter caption or None, action)
 
 def prologue(w):
@@ -484,6 +498,7 @@ def prologue(w):
         w.sql("UPDATE work_claims SET claimed_at = ?, ended_at = ? WHERE session_id = ?",
               (iso_s(start), iso_s(end), agent_id))
         w.sql("UPDATE turn_messages SET at = ? WHERE session_id = ?", (iso(end), agent_id))
+        w.sql("UPDATE guestbook_entries SET signed_at = ? WHERE session_id = ?", (iso(end), agent_id))
         if pr:
             w.sql("UPDATE work_items SET merged_at = ?, closed_at = ? WHERE repo = ? AND number = ?",
                   (iso_s(end), iso_s(end), REPO, pr))
@@ -500,6 +515,7 @@ def prologue(w):
             w.open_pr(agent_id, pr, ticket, PAST_TICKETS[ticket][0])
             w.merge(pr, ticket)
         w.turn(agent_id, last)
+        w.sm(agent_id, "task-complete", "--sign-guestbook", "-", stdin=PAST_GUESTBOOK[agent_id])
         w.retire(agent_id)
         backdate(agent_id, days, pr, ticket)
     w.close(30)
@@ -699,9 +715,6 @@ GLOBAL = [
     "/client/board", "/client/board?clock_hours=3", "/client/board?clock_hours=6", "/client/board?clock_hours=24",
     "/client/board/badge",
     "/client/queue", "/client/queue?ended_hours=24",
-    "/client/queue/stats?hours=24", "/client/queue/stats?hours=168", "/client/queue/stats?hours=720",
-    "/client/utilization/series?hours=1", "/client/utilization/series?hours=24",
-    "/client/utilization/series?hours=168", "/client/utilization/series?hours=720",
     "/client/host-status", "/client/usage/meters", "/client/follows",
     "/inbox?format=json", "/inbox?format=json&filter=open", "/inbox?format=json&filter=docs",
     "/inbox?format=json&filter=done",
@@ -712,9 +725,9 @@ GLOBAL = [
     "/client/session-models?provider=codex-fork",
     "/handoff-defaults", "/review-policies",
 ]
-SYNTHETIC = ("/client/host-status", "/client/usage/meters", "/client/utilization/series",
-             "/client/queue/stats")
-MEMORY_TOTAL = 128 * 1024 ** 3
+# The Queue page's charts and host load are real snapshots in fixtures/static/
+# (analytics.py, queue.py).
+SYNTHETIC = ("/client/host-status", "/client/usage/meters")
 
 
 def synthetic(url, t, w):
@@ -725,76 +738,26 @@ def synthetic(url, t, w):
         except sqlite3.OperationalError:  # no job submitted yet, so no table
             return 0
     running, pending = jobs("running"), jobs("pending")
-    cpu = round(18 + 22 * running + 6 * ((t // 5) % 3), 1)
-    host = {"available": True, "cpu_percent": cpu, "gpu_percent": 4.0 if running else 1.0, "host": "demo-mac",
-            "memory_available_bytes": MEMORY_TOTAL - int((38 + 9 * running) * 1024 ** 3),
-            "memory_pressure": "Normal", "memory_total_bytes": MEMORY_TOTAL,
-            "memory_used_bytes": int((38 + 9 * running) * 1024 ** 3), "sampled_at": iso(), "source": "live"}
+    # The real host's load (queue.py's snapshot), plus the storyline's own jobs.
+    with open(os.path.join(WEB_DEMO, "fixtures", "static", "host_status.json")) as f:
+        real = json.load(f)
+    used = real["memory_used_bytes"] + running * 9 * 1024 ** 3
+    host = dict(real, cpu_percent=round(real["cpu_percent"] + 12 * running + 3 * ((t // 5) % 3), 1),
+                memory_used_bytes=used, memory_available_bytes=real["memory_total_bytes"] - used,
+                sampled_at=iso(), source="live")
     if url == "/client/host-status":
         return host
     if url == "/client/usage/meters":
-        resets = lambda hours: iso_s(now_utc() + datetime.timedelta(hours=hours))
-        return {"meters": [
-            {"account_key": "claude:demo", "label": "demo team (Claude)", "observed_at": iso_s(),
-             "pace": {"kind": "on_pace", "percent": 41.0}, "percent": round(22 + t / 40, 1),
-             "provider": "claude", "resets_at": resets(3), "scope": None, "window": "five_hour"},
-            {"account_key": "claude:demo", "label": "demo team (Claude)", "observed_at": iso_s(),
-             "pace": {"kind": "on_pace", "percent": 63.0}, "percent": round(48 + t / 120, 1),
-             "provider": "claude", "resets_at": resets(70), "scope": None, "window": "week"},
-            {"account_key": "codex:demo", "label": "demo team (Codex)", "observed_at": iso_s(),
-             "pace": {"kind": "on_pace", "percent": 37.0}, "percent": round(29 + t / 150, 1),
-             "provider": "codex", "resets_at": resets(90), "scope": None, "window": "week"}]}
-    if url.startswith("/client/utilization/series"):
-        hours = int(url.split("hours=")[1])
-        # The server's bucket size and count for each range (series_bucket_seconds).
-        seconds, count = {1: (15, 240), 24: (300, 288), 168: (1800, 336), 720: (7200, 360)}[hours]
-        epoch = int(now_utc().timestamp())
-        end = datetime.datetime.fromtimestamp(epoch - epoch % seconds, datetime.timezone.utc)
-        buckets = []
-        for i in range(count):
-            start = end - datetime.timedelta(seconds=seconds * (count - 1 - i))
-            hour = start.hour + start.minute / 60
-            busy = 1 if 9 <= (hour + 7) % 24 <= 19 else 0  # a working day, in the viewer's past
-            wave = (hash((i * 7919) % 104729) % 100) / 100
-            buckets.append({
-                "start": iso_s(start), "samples": max(1, seconds // 5),
-                "cpu_avg": round(12 + busy * (30 + 25 * wave), 1), "cpu_max": round(min(100, 20 + busy * (55 + 40 * wave)), 1),
-                "gpu_avg": round(busy * 6 * wave, 1), "gpu_max": round(busy * 15 * wave, 1),
-                "local_model_memory_avg": busy * 18 * 1024 ** 3, "local_model_memory_max": busy * 18 * 1024 ** 3,
-                "mem_available_min": MEMORY_TOTAL - int((30 + busy * 40 * wave) * 1024 ** 3),
-                "mem_used_avg": int((28 + busy * 30 * wave) * 1024 ** 3),
-                "mem_used_max": int((30 + busy * 40 * wave) * 1024 ** 3),
-                "pending_max": busy * int(3 * wave), "pressure_max": 0,
-                "queue_cpu_avg": round(busy * 20 * wave, 1), "queue_gpu_avg": 0.0,
-                "queue_memory_avg": int(busy * 6 * wave * 1024 ** 3),
-                "running": {"background": round(busy * wave, 2), "perf": 0.0, "service": 0.0,
-                            "tests": round(busy * 1.5 * wave, 2)}})
-        buckets[-1].update(pending_max=pending, running={"background": 0.0, "perf": 0.0, "service": 0.0,
-                                                         "tests": float(running)})
-        return {"available": True, "bucket_seconds": seconds, "buckets": buckets, "end": iso_s(end),
-                "hours": hours, "memory_total_bytes": MEMORY_TOTAL, "start": buckets[0]["start"],
-                "summary": {"covered_seconds": hours * 3600, "cpu_avg": 31.4, "cpu_busy_seconds": 9200,
-                            "gpu_avg": 2.1, "headroom_seconds": 71000,
-                            "mem_used_max": 70 * 1024 ** 3, "pressure_elevated_seconds": 0,
-                            "unknown_seconds": 0}}
-    if url.startswith("/client/queue/stats"):
-        hours = int(url.split("hours=")[1])
-        gib = 1024 ** 3
-        return {"available": True, "hours": hours, "window_seconds": hours * 3600, "covered_seconds": hours * 3600,
-                "thresholds": {"available_memory_at_least_fraction": 0.25, "cpu_busy_below_pct": 60.0,
-                               "pressure": "normal"},
-                "by_type": [
-                    {"type": "tests", "jobs": 46, "cpu_cores_p95": 7.5, "peak_rss_p50_bytes": 3 * gib,
-                     "peak_rss_p95_bytes": 9 * gib, "peak_rss_max_bytes": 14 * gib},
-                    {"type": "review", "jobs": 18, "cpu_cores_p95": 1.2, "peak_rss_p50_bytes": gib,
-                     "peak_rss_p95_bytes": 2 * gib, "peak_rss_max_bytes": 2 * gib},
-                    {"type": "background", "jobs": 7, "cpu_cores_p95": 3.1, "peak_rss_p50_bytes": 4 * gib,
-                     "peak_rss_p95_bytes": 11 * gib, "peak_rss_max_bytes": 12 * gib}],
-                "waiting": [
-                    {"group": "limits", "job_seconds": 2400, "headroom_job_seconds": 900, "unknown_job_seconds": 0},
-                    {"group": "perf_rules", "job_seconds": 0, "headroom_job_seconds": 0, "unknown_job_seconds": 0},
-                    {"group": "memory", "job_seconds": 0, "headroom_job_seconds": 0, "unknown_job_seconds": 0},
-                    {"group": "other", "job_seconds": 120, "headroom_job_seconds": 0, "unknown_job_seconds": 0}]}
+        # The real meters (queue.py's snapshot), rising a little over the loop.
+        with open(os.path.join(WEB_DEMO, "fixtures", "static", "usage_meters.json")) as f:
+            meters = json.load(f)["meters"]
+        for meter in meters:
+            observed = datetime.datetime.fromisoformat(meter["observed_at"].replace("Z", "+00:00"))
+            resets = datetime.datetime.fromisoformat(meter["resets_at"].replace("Z", "+00:00"))
+            rise = t / (40 if meter["window"] == "five_hour" else 150)
+            meter.update(percent=round(meter["percent"] + rise, 1), observed_at=iso_s(),
+                         resets_at=iso_s(now_utc() + (resets - observed)))
+        return {"meters": meters}
     raise KeyError(url)
 
 
@@ -879,7 +842,6 @@ def denylist():
 
 
 SAVED = {}  # url -> {"digest", "entry"} of the last file written for it
-SERIES = {}  # url -> the utilization series body, built at the first tick
 
 
 def capture_tick(w, index, t, chapter, out_dir):
@@ -907,14 +869,8 @@ def capture_tick(w, index, t, chapter, out_dir):
         responses[url] = entry
 
     def grab(url):
-        if url.startswith("/client/utilization/series") and url in SAVED:
-            save(url, 200, "application/json", SERIES[url])
-            return
         if url.startswith(SYNTHETIC):
             body = json.dumps(synthetic(url, t, w)).encode()
-            if url.startswith("/client/utilization/series"):
-                # A day of history: built once, so every tick shares one file.
-                SERIES[url] = body
             save(url, 200, "application/json", body)
             return
         status, content_type, body, final = fetch(w.base, url)

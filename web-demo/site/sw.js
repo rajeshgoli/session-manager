@@ -11,6 +11,7 @@ const BUILD = '__SM_DEMO_BUILD__';
 const STATE_CACHE = 'sm-demo-state';
 const CLOCK_KEY = '/__demo/clock-state';
 const NOTES_KEY = '/__demo/notes-state';
+const WORKTREES_KEY = '/__demo/worktrees-state';
 // A visitor who comes back after this long starts the story again.
 const IDLE_RESTART_MS = 15 * 60 * 1000;
 const READ_ONLY = 'Demo — read only';
@@ -46,6 +47,12 @@ async function handle(request, url) {
   if (url.pathname.startsWith('/__demo/')) return demoRoute(request, url);
   if (request.mode === 'navigate' && !READER_PATH.test(url.pathname)) return fetch('/');
   if (url.pathname.startsWith('/notes')) return notesRoute(request, url);
+  if (url.pathname.startsWith('/worktrees/')) return worktreesRoute(request, url);
+  // The terminal's socket: demo.js answers it in the page (a worker can't).
+  const attach = url.pathname.match(/^\/client\/sessions\/([^/]+)\/browser-attach-ticket$/);
+  if (attach && request.method === 'POST') {
+    return json(200, { ticket_id: 'demo', ticket_secret: 'demo', ws_url: `/__demo/terminal/${attach[1]}` });
+  }
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     if (SILENT_WRITES.test(url.pathname)) return json(200, {});
     readOnly(url.pathname);
@@ -68,12 +75,17 @@ async function handle(request, url) {
   if (!entry && /^\/docs\/[^/]+\/drafts$/.test(url.pathname)) return json(200, { drafts: [] });
   if (!entry && /^\/docs\/[^/]+\/reopen-target$/.test(url.pathname)) return json(200, { kind: 'refused', reason: READ_ONLY });
   if (!entry) {
+    const history = await historyJobRoute(url);
+    if (history) return history;
+  }
+  if (!entry) {
     const key = url.pathname + url.search;
     if (misses.size < 500 || misses.has(key)) misses.set(key, [...(misses.get(key) || []), Math.floor(now.t)].slice(-5));
     return json(404, { detail: 'Not found' });
   }
   let body = shiftTimes(await fileText(entry.file), Date.now() - recordedAt);
   if (filter) body = JSON.stringify(filter.apply(JSON.parse(body)));
+  if (url.pathname === '/client/queue') body = await withQueueHistory(body);
   const html = (entry.content_type || '').includes('text/html');
   if (html) body = injectDemo(body);
   return new Response(request.method === 'HEAD' ? null : body, {
@@ -217,6 +229,36 @@ function historyFilter(url) {
   return null;
 }
 
+// The storyline's ended jobs, then the real machine's (queue.py), newest first.
+async function withQueueHistory(body) {
+  const doc = JSON.parse(body);
+  const history = JSON.parse(await staticText('static/queue_history.json'));
+  const ids = new Set((doc.ended || []).map((job) => job.id));
+  doc.ended = [...(doc.ended || []), ...history.ended.filter((job) => !ids.has(job.id))]
+    .sort((a, b) => (a.finished_at < b.finished_at ? 1 : -1));
+  return JSON.stringify(doc);
+}
+
+// The job panel for a snapshot job: its list entry is its detail; the snapshot
+// keeps no log or usage.
+async function historyJobRoute(url) {
+  const m = url.pathname.match(/^\/(?:queue-jobs|client\/queue\/jobs)\/([^/]+)(\/log|\/usage)?$/);
+  if (!m) return null;
+  const id = decodeURIComponent(m[1]);
+  const job = JSON.parse(await staticText('static/queue_history.json')).ended.find((j) => j.id === id);
+  if (!job) return null;
+  if (m[2] === '/log') return json(200, { job_id: id, lines: Number(url.searchParams.get('lines')) || 40, log_path: job.log_path, text: '' });
+  if (m[2] === '/usage') return json(200, { available: false });
+  return url.pathname.startsWith('/queue-jobs/') ? json(200, job) : null;
+}
+
+// A file from fixtures/static/ with its times moved to now; it names its own
+// capture time, or the index does.
+async function staticText(file, capturedAt) {
+  const text = await fileText(file);
+  return shiftTimes(text, Date.now() - parseTime(capturedAt || JSON.parse(text).captured_at));
+}
+
 // ---- responses ----------------------------------------------------------------
 
 function json(status, value) {
@@ -231,43 +273,82 @@ async function readOnly(path) {
   for (const client of windows) client.postMessage({ type: 'sm-demo-read-only', text });
 }
 
+// ---- worktrees ------------------------------------------------------------------
+
+// Settings › Worktrees works for the visit: Delete build output, Delete and
+// Keep change the list as the real server would, starting from settings.py's rows.
+const worktreesState = visitState(WORKTREES_KEY, async () => {
+  const entry = (await loadStatic()).get('/worktrees/leftover');
+  return JSON.parse(await staticText(entry.file, entry.captured_at)).worktrees;
+});
+
+async function worktreesRoute(request, url) {
+  const rows = await worktreesState.load();
+  if (url.pathname === '/worktrees/leftover' && request.method === 'GET') return json(200, { worktrees: rows });
+  if (request.method !== 'POST') return json(404, { detail: 'Not found' });
+  const input = await request.json().catch(() => ({}));
+  const row = rows.find((candidate) => candidate.path === input.path);
+  if (!row) return json(404, { detail: 'Not a left-over worktree' });
+  let answer = {};
+  if (url.pathname === '/worktrees/delete' && input.scope === 'build') {
+    Object.assign(row, { bytes: row.bytes - row.build_bytes, build_bytes: 0 });
+    answer = { removed: false };
+  } else if (url.pathname === '/worktrees/delete') {
+    rows.splice(rows.indexOf(row), 1);
+    // Delete keeps unpushed commits on a rescue branch.
+    const rescued = row.reason.startsWith('commits not pushed') ? `sm-rescue/${row.path.split('/').pop()}` : null;
+    answer = { removed: true, rescued };
+  } else if (url.pathname === '/worktrees/keep') {
+    Object.assign(row, input.off ? { kept: null, reason: 'not checked yet' } : { kept: input.reason, reason: `kept: ${input.reason}` });
+  } else {
+    return json(404, { detail: 'Not found' });
+  }
+  await worktreesState.save(rows);
+  return json(200, answer);
+}
+
 // ---- notes ----------------------------------------------------------------------
 
 // Notes work for real within a visit (new, edit, search, preview, history),
 // starting from fixtures/static/notes.json. The browser may stop the worker
 // between requests, so changes are kept in the state cache for the visit (one
 // story clock); a new visit starts from the seed again.
-let notesPromise = null;
-let notesVisit = null;
 let lastSaveNotice = 0;
+const notesState = visitState(NOTES_KEY, seedNotes,
+  (notes) => [...notes.values()], (list) => new Map(list.map((note) => [note.id, note])));
 
 async function visitId() {
   const current = await loadClock();
   return current ? `${current.build}:${current.start}` : null;
 }
 
-async function loadNotes() {
-  const visit = await visitId();
-  if (notesPromise && visit !== notesVisit) notesPromise = null;
-  notesVisit = visit;
-  if (!notesPromise) notesPromise = storedNotes(visit).then((stored) => stored || seedNotes());
-  notesPromise.catch(() => { notesPromise = null; });
-  return notesPromise;
-}
-
-async function storedNotes(visit) {
-  try {
-    const stored = await (await caches.open(STATE_CACHE)).match(NOTES_KEY);
-    const state = stored ? await stored.json() : null;
-    return state && visit && state.visit === visit ? new Map(state.notes.map((note) => [note.id, note])) : null;
-  } catch (_) { return null; }
-}
-
-async function saveNotes(notes) {
-  try {
-    const state = { visit: notesVisit, notes: [...notes.values()] };
-    await (await caches.open(STATE_CACHE)).put(NOTES_KEY, new Response(JSON.stringify(state)));
-  } catch (_) { /* Notes still work from memory. */ }
+// A value a visitor changes, kept in the state cache under the visit's id;
+// `encode` and `decode` turn it into JSON and back.
+function visitState(key, seed, encode = (value) => value, decode = (value) => value) {
+  let promise = null;
+  let visit = null;
+  const stored = async (current) => {
+    try {
+      const response = await (await caches.open(STATE_CACHE)).match(key);
+      const state = response ? await response.json() : null;
+      return state && current && state.visit === current ? decode(state.value) : null;
+    } catch (_) { return null; }
+  };
+  return {
+    async load() {
+      const current = await visitId();
+      if (promise && current !== visit) promise = null;
+      visit = current;
+      if (!promise) promise = stored(current).then((value) => value || seed());
+      promise.catch(() => { promise = null; });
+      return promise;
+    },
+    async save(value) {
+      try {
+        await (await caches.open(STATE_CACHE)).put(key, new Response(JSON.stringify({ visit, value: encode(value) })));
+      } catch (_) { /* It still works from memory. */ }
+    },
+  };
 }
 
 function seedNotes() {
@@ -312,9 +393,9 @@ function saveNote(note, body) {
 }
 
 async function notesRoute(request, url) {
-  const notes = await loadNotes();
+  const notes = await notesState.load();
   const response = await notesResponse(notes, request, url);
-  if (request.method !== 'GET' && response.ok) await saveNotes(notes);
+  if (request.method !== 'GET' && response.ok) await notesState.save(notes);
   return response;
 }
 

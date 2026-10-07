@@ -1,0 +1,148 @@
+{
+ "_comment": "Each agent's terminal, by agent name (terminal.js). A step shows once the storyline reaches its t. user: what arrived as input; say: the agent's reply; tool and out: a tool call and its output; done: the end-of-turn line. Times and events follow generate/record.py's storyline.",
+ "lead": {
+  "cwd": "~/shop",
+  "steps": [
+   {"t": 0, "user": "Plan Checkout v2 (goal #40 in acme/shop). Split it into tickets, order them, publish the plan for my review, and start whatever can start now."},
+   {"t": 0, "tool": "Read(docs/checkout_v1_notes.md)", "out": ["Read 184 lines"]},
+   {"t": 0, "tool": "Bash(gh issue create --repo acme/shop --title \"Cart totals service with tax and discounts\" …)", "out": ["https://github.com/acme/shop/issues/41", "https://github.com/acme/shop/issues/42", "… +4 lines (ctrl+o to expand)"]},
+   {"t": 0, "say": "I split **Checkout v2** into six tickets. #44 waits on #41, #45 on #42, and #46 on both. Adding the lane now."},
+   {"t": 5, "tool": "Bash(sm board under 41 40 && sm board after 44 41 && sm board after 45 42 && sm board after 46 44 45)", "out": ["#41 is under goal #40", "#44 starts after #41", "#45 starts after #42", "#46 starts after #44, #45"]},
+   {"t": 15, "tool": "Write(docs/checkout_v2_plan.html)", "out": ["Wrote 212 lines to docs/checkout_v2_plan.html"]},
+   {"t": 15, "tool": "Bash(sm doc publish docs/checkout_v2_plan.html --review)", "out": ["Published \"Checkout v2 plan\" (shop/docs/checkout_v2_plan.html @ 610cc95)", "Review requested from Alex. sm wakes you when it lands."]},
+   {"t": 15, "say": "Published the Checkout v2 plan for review. Starting the three independent tickets while you read it."},
+   {"t": 25, "tool": "Bash(sm spawn claude --name shop-41 --model opus --ticket 41 && sm spawn codex --name shop-42 --ticket 42 && sm spawn codex --name shop-43 --model qwen3-coder-next --ticket 43)", "out": ["Spawned shop-41 (claude, opus) on #41", "Spawned shop-42 (codex, gpt-5.5) on #42", "Spawned shop-43 (codex, qwen3-coder-next, local) on #43"]},
+   {"t": 25, "say": "Spawned shop-41 (Claude), shop-42 (Codex) and shop-43 (local Qwen)."},
+   {"t": 25, "done": "Worked for 1m 48s"},
+   {"t": 240, "user": "[sm review] Alex requested changes on \"Checkout v2 plan\": Good split. Two changes: say what happens to carts mid-checkout at cutover, and move search (#43) out of the critical path."},
+   {"t": 245, "tool": "Read(docs/checkout_v2_plan.html)", "out": ["Read 212 lines"]},
+   {"t": 260, "tool": "Update(docs/checkout_v2_plan.html)", "out": ["Updated docs/checkout_v2_plan.html with 24 additions and 6 removals"]},
+   {"t": 275, "tool": "Bash(git commit -am \"Plan: cutover section; search off the critical path\" && sm doc publish docs/checkout_v2_plan.html --review)", "out": ["[main a57276c] Plan: cutover section; search off the critical path", "Published \"Checkout v2 plan\" (shop/docs/checkout_v2_plan.html @ a57276c)", "Review requested from Alex."]},
+   {"t": 275, "say": "Revised the plan: added the cutover section and took #43 off the critical path."},
+   {"t": 275, "done": "Worked for 41s"},
+   {"t": 380, "user": "[sm review] Alex approved \"Checkout v2 plan\": Approved. Ship it."},
+   {"t": 380, "say": "Plan approved. #44 and #45 are underway; #46 starts when both land."},
+   {"t": 380, "done": "Worked for 6s"},
+   {"t": 560, "user": "[sm] shop-46: #46 merged in #56."},
+   {"t": 560, "tool": "Bash(gh issue list --repo acme/shop --milestone \"Checkout v2\" --state all)", "out": ["#46  Checkout page                               closed", "#45  Order confirmation emails                   closed", "… +4 lines (ctrl+o to expand)"]},
+   {"t": 560, "say": "**Checkout v2 is done.** Six tickets, five agents, one review finding fixed before merge."},
+   {"t": 575, "tool": "Bash(sm task-complete --sign-guestbook -)", "out": ["Signed the guestbook.", "Task complete."]},
+   {"t": 575, "done": "Worked for 22s"}
+  ]
+ },
+ "shop-41": {
+  "cwd": "~/worktrees/shop-41",
+  "steps": [
+   {"t": 25, "user": "[sm] You are shop-41. Ticket #41 in acme/shop: Cart totals service with tax and discounts. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 25, "tool": "Bash(sm ticket 41 --setup-worktree)", "out": ["Claimed ticket #41 \"Cart totals service with tax and discounts\" (shop).", "Worktree ~/worktrees/shop-41 on branch 41-cart-totals from origin/main (9c41e2a)."]},
+   {"t": 30, "tool": "Read(src/pricing/mod.rs)", "out": ["Read 212 lines"]},
+   {"t": 33, "tool": "Search(pattern: \"fn apply_discount\", path: \"src\")", "out": ["Found 3 files (ctrl+o to expand)"]},
+   {"t": 40, "tool": "Write(src/cart/totals.rs)", "out": ["Wrote 164 lines to src/cart/totals.rs"]},
+   {"t": 48, "tool": "Write(tests/cart_totals.rs)", "out": ["Wrote 138 lines to tests/cart_totals.rs"]},
+   {"t": 60, "tool": "Bash(sm queue run --type tests --label \"shop-41 cart tests\" -- cargo test cart)", "out": ["Queued shop-41 cart tests [running] (job_4c1e09a2b7d3)", "sm wakes you when it finishes."]},
+   {"t": 60, "done": "Worked for 2m 6s"},
+   {"t": 120, "user": "[sm queue] shop-41 cart tests completed: succeeded exit=0 runtime=58s. test result: ok. 48 passed; 0 failed"},
+   {"t": 120, "say": "All 48 cart tests pass. Opening the PR."},
+   {"t": 140, "tool": "Bash(gh pr create --title \"Cart totals service with tax and discounts\" --body-file /tmp/pr41.md && sm pr && sm request-review 51)", "out": ["https://github.com/acme/shop/pull/51", "Claimed PR #51 (shop).", "Review requested for PR #51 at 3f2a9c1. sm wakes you when it lands."]},
+   {"t": 140, "done": "Worked for 24s"},
+   {"t": 200, "user": "[sm review] Codex review of PR #51 @ 3f2a9c1 is here: 1 finding (P1)."},
+   {"t": 200, "tool": "Bash(gh api repos/acme/shop/pulls/51/comments --jq '.[].body')", "out": ["[P1] Discount applied after tax — src/cart/totals.rs:88", "Percentage discounts are applied to the taxed total, so tax is charged on the discounted-away amount."]},
+   {"t": 200, "say": "Codex found one P1: discounts were applied after tax. Fixing it now."},
+   {"t": 210, "tool": "Update(src/cart/totals.rs)", "out": ["Updated src/cart/totals.rs with 7 additions and 5 removals"]},
+   {"t": 230, "tool": "Bash(git commit -am \"Apply discounts before tax\" && git push && sm request-review 51)", "out": ["[41-cart-totals 8b04e7d] Apply discounts before tax", "   3f2a9c1..8b04e7d  41-cart-totals -> 41-cart-totals", "Review requested for PR #51 at 8b04e7d."]},
+   {"t": 230, "done": "Worked for 34s"},
+   {"t": 260, "user": "[sm review] Codex review of PR #51 @ 8b04e7d is here: no findings."},
+   {"t": 260, "say": "Codex re-review is clean. Merging #51."},
+   {"t": 270, "tool": "Bash(gh pr merge 51 --squash --delete-branch && sm task-complete --sign-guestbook -)", "out": ["✓ Squashed and merged pull request acme/shop#51", "Signed the guestbook. Task complete."]},
+   {"t": 270, "say": "#41 is done: cart totals with tax and discounts merged in #51."},
+   {"t": 270, "done": "Worked for 12s"}
+  ]
+ },
+ "shop-42": {
+  "cwd": "~/worktrees/shop-42",
+  "steps": [
+   {"t": 25, "user": "[sm] You are shop-42. Ticket #42 in acme/shop: Coupon rules engine. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 25, "tool": "Ran sm ticket 42 --setup-worktree", "out": ["Claimed ticket #42 \"Coupon rules engine\" (shop).", "Worktree ~/worktrees/shop-42 on branch 42-coupon-rules from origin/main (9c41e2a)."]},
+   {"t": 30, "tool": "Explored", "out": ["Search coupon in src", "Read rules.rs, discount.rs"]},
+   {"t": 55, "tool": "Edited src/coupons/rules.rs (+118 -9)", "out": []},
+   {"t": 80, "tool": "Ran rg -c \"stacked\" reports/margin_q3.csv", "out": ["412"]},
+   {"t": 90, "tool": "Ran sm send alex --blocking", "out": ["Sent to Alex (needs you)."]},
+   {"t": 90, "say": "Asked Alex whether coupons stack with sale prices. I recommended **best of**: stacked discounts hit 6% of orders in the margin report. Waiting for the answer."},
+   {"t": 90, "done": "Worked for 1m 05s"},
+   {"t": 185, "user": "[sm] Alex: Best of. Keep stacking behind a flag for the spring sale."},
+   {"t": 185, "say": "Best of it is, with stacking behind a flag."},
+   {"t": 190, "tool": "Edited src/coupons/rules.rs (+42 -11)", "out": []},
+   {"t": 200, "tool": "Edited src/flags.rs (+6 -0)", "out": []},
+   {"t": 230, "tool": "Ran sm queue run --type tests --label \"shop-42 coupon tests\" -- cargo test coupons", "out": ["Queued shop-42 coupon tests [running] (job_9a7d3e14c0b2)"]},
+   {"t": 300, "tool": "Ran gh pr create --title \"Coupon rules engine with best-of discounts\" --body-file /tmp/pr42.md", "out": ["https://github.com/acme/shop/pull/52"]},
+   {"t": 300, "say": "PR #52 is up: best-of discounts, stacking behind `coupons.stack`."},
+   {"t": 340, "tool": "Ran gh pr merge 52 --squash --delete-branch && sm task-complete", "out": ["✓ Squashed and merged pull request acme/shop#52", "Task complete."]},
+   {"t": 340, "say": "#42 merged in #52: best-of discounts, stacking behind a flag."},
+   {"t": 340, "done": "Worked for 2m 40s"}
+  ]
+ },
+ "shop-43": {
+  "cwd": "~/worktrees/shop-43",
+  "steps": [
+   {"t": 25, "user": "[sm] You are shop-43. Ticket #43 in acme/shop: Product search index. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 25, "tool": "Ran sm ticket 43 --setup-worktree", "out": ["Claimed ticket #43 \"Product search index\" (shop).", "Worktree ~/worktrees/shop-43 on branch 43-search-index from origin/main (9c41e2a)."]},
+   {"t": 30, "tool": "Ran cargo run --bin index-catalog -- --dry-run", "out": ["indexed 12,480 products in 3.2s (dry run)"]},
+   {"t": 40, "tool": "Edited src/search/index.rs (+204 -0)", "out": []},
+   {"t": 50, "tool": "Edited src/search/mod.rs (+12 -1)", "out": []},
+   {"t": 75, "tool": "Ran sm queue run --type tests --label \"shop-43 search tests\" -- cargo test search", "out": ["Queued shop-43 search tests [waiting] (job_2e8b51f7a0c9)", "Waiting for the tests slot: shop-41 cart tests is running."]},
+   {"t": 75, "done": "Worked for 52s"},
+   {"t": 190, "user": "[sm queue] shop-43 search tests completed: succeeded exit=0 runtime=70s. test result: ok. 31 passed; 0 failed"},
+   {"t": 190, "tool": "Ran gh pr create --title \"Product search index\" --body-file /tmp/pr43.md && sm request-review 53", "out": ["https://github.com/acme/shop/pull/53", "Review requested for PR #53 at 6d2c9b0."]},
+   {"t": 190, "say": "PR #53 is up; lead is reviewing."},
+   {"t": 255, "user": "[sm] lead: #53 looks good, merged."},
+   {"t": 255, "say": "#53 merged; search index ships."},
+   {"t": 255, "done": "Worked for 18s"}
+  ]
+ },
+ "shop-44": {
+  "cwd": "~/worktrees/shop-44",
+  "steps": [
+   {"t": 280, "user": "[sm] Start when ready: #41 is done, so you start ticket #44 in acme/shop: Payment provider adapter. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 280, "tool": "Bash(sm ticket 44 --setup-worktree)", "out": ["Claimed ticket #44 \"Payment provider adapter\" (shop).", "Worktree ~/worktrees/shop-44 on branch 44-payment-adapter from origin/main (51ab0f3)."]},
+   {"t": 285, "tool": "Read(docs/payments/providers.md)", "out": ["Read 96 lines"]},
+   {"t": 330, "tool": "Write(src/payments/adapter.rs)", "out": ["Wrote 188 lines to src/payments/adapter.rs"]},
+   {"t": 340, "tool": "Update(src/checkout/mod.rs)", "out": ["Updated src/checkout/mod.rs with 14 additions and 3 removals"]},
+   {"t": 360, "tool": "Bash(sm queue run --type tests --label \"shop-44 payment tests\" -- cargo test payments)", "out": ["Queued shop-44 payment tests [running] (job_7f30c2d9e1a4)"]},
+   {"t": 400, "user": "[sm queue] shop-44 payment tests completed: succeeded exit=0 runtime=33s. test result: ok. 22 passed; 0 failed"},
+   {"t": 420, "tool": "Bash(gh pr create --title \"Payment provider adapter\" --body-file /tmp/pr44.md && sm request-review 54)", "out": ["https://github.com/acme/shop/pull/54", "Review requested for PR #54 at c1d7e42."]},
+   {"t": 440, "tool": "Bash(gh pr merge 54 --squash --delete-branch && sm task-complete)", "out": ["✓ Squashed and merged pull request acme/shop#54", "Task complete."]},
+   {"t": 440, "say": "#44 merged in #54."},
+   {"t": 440, "done": "Worked for 9s"}
+  ]
+ },
+ "shop-45": {
+  "cwd": "~/worktrees/shop-45",
+  "steps": [
+   {"t": 345, "user": "[sm] Start when ready: #42 is done, so you start ticket #45 in acme/shop: Order confirmation emails. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 345, "tool": "Ran sm ticket 45 --setup-worktree", "out": ["Claimed ticket #45 \"Order confirmation emails\" (shop).", "Worktree ~/worktrees/shop-45 on branch 45-confirmation-emails from origin/main (7e02c55)."]},
+   {"t": 350, "tool": "Explored", "out": ["List templates/email", "Read receipt.html, layout.html"]},
+   {"t": 400, "tool": "Edited templates/email/confirmation.html (+86 -0)", "out": []},
+   {"t": 410, "tool": "Ran cargo run --bin render-email-previews -- confirmation", "out": ["wrote previews/confirmation-light.png", "wrote previews/confirmation-dark.png"]},
+   {"t": 470, "tool": "Ran gh pr create --title \"Order confirmation emails\" --body-file /tmp/pr45.md && sm request-review 55", "out": ["https://github.com/acme/shop/pull/55", "Review requested for PR #55 at 0b9e6f1."]},
+   {"t": 480, "tool": "Ran gh pr merge 55 --squash --delete-branch && sm task-complete", "out": ["✓ Squashed and merged pull request acme/shop#55", "Task complete."]},
+   {"t": 480, "say": "#45 merged in #55."},
+   {"t": 480, "done": "Worked for 2m 15s"}
+  ]
+ },
+ "shop-46": {
+  "cwd": "~/worktrees/shop-46",
+  "steps": [
+   {"t": 485, "user": "[sm] Start when ready: #44 and #45 are done, so you start ticket #46 in acme/shop: Checkout page. Claim it in your own worktree, run tests through sm queue, open a PR and request review."},
+   {"t": 485, "tool": "Bash(sm ticket 46 --setup-worktree)", "out": ["Claimed ticket #46 \"Checkout page\" (shop).", "Worktree ~/worktrees/shop-46 on branch 46-checkout-page from origin/main (d48a1c9)."]},
+   {"t": 490, "tool": "Read(src/web/checkout/page.rs)", "out": ["Read 74 lines"]},
+   {"t": 500, "tool": "Update(src/web/checkout/page.rs)", "out": ["Updated src/web/checkout/page.rs with 131 additions and 22 removals"]},
+   {"t": 515, "tool": "Bash(sm queue run --type tests --label \"shop-46 checkout e2e\" -- cargo test --test checkout)", "out": ["Queued shop-46 checkout e2e [running] (job_b5e2a8c1d930)", "sm wakes you when it finishes."]},
+   {"t": 515, "done": "Worked for 1m 3s"},
+   {"t": 545, "user": "[sm queue] shop-46 checkout e2e completed: succeeded exit=0 runtime=29s. test result: ok. 12 passed; 0 failed"},
+   {"t": 545, "tool": "Bash(gh pr create --title \"Checkout page\" --body-file /tmp/pr46.md && sm request-review 56)", "out": ["https://github.com/acme/shop/pull/56", "Review requested for PR #56 at e7c3a05."]},
+   {"t": 560, "tool": "Bash(gh pr merge 56 --squash --delete-branch && sm task-complete)", "out": ["✓ Squashed and merged pull request acme/shop#56", "Task complete."]},
+   {"t": 560, "say": "#46 merged in #56."},
+   {"t": 560, "done": "Worked for 18s"}
+  ]
+ }
+}

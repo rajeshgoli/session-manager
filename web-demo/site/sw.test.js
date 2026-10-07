@@ -30,4 +30,15 @@ assert.deepStrictEqual(agents.apply({ agents: [{ id: 'a1', name: 'cart-31' }, { 
 assert.strictEqual(historyFilter(new URL('http://demo/history/agents?format=json&q=&before=')), null);
 const tickets = historyFilter(new URL('http://demo/history?format=json&repo=acme/shop&before='));
 assert.deepStrictEqual(tickets.apply({ rows: [{ repo: 'acme/shop' }, { repo: 'acme/web' }], next_before: null }).rows, [{ repo: 'acme/shop' }]);
+// Terminal: wrapping ignores markup; **bold** carries across wrapped lines.
+globalThis.window = {};
+const { wrap, markup, claudeStep, codexStep } = require('./terminal.js');
+assert.deepStrictEqual(wrap('aa **bb** cc', 5), ['aa **bb**', 'cc']);
+assert.deepStrictEqual(markup(['**a', 'b**'], '0'), ['\x1b[1ma\x1b[0m', '\x1b[1mb\x1b[22m\x1b[0m']);
+assert.ok(claudeStep({ tool: 'Bash(ls)', out: ['x'] }, 40)[1].includes('⎿'));
+assert.ok(codexStep({ tool: 'Ran ls', out: ['x'] }, 40)[1].includes('└'));
+for (const [name, agent] of Object.entries(require('./terminals.json'))) {
+  if (name.startsWith('_')) continue;
+  agent.steps.forEach((step, i) => assert.ok(i === 0 || step.t >= agent.steps[i - 1].t, `${name} step ${i} goes back in time`));
+}
 console.log('ok');

@@ -64,6 +64,21 @@
     toastTimer = setTimeout(() => toastNode.classList.remove('show'), 6000);
   }
 
+  // ---- terminal ------------------------------------------------------------------
+
+  // Agent terminals connect to /__demo/terminal/<id>; terminal.js answers them.
+  function terminalSockets() {
+    const RealSocket = window.WebSocket;
+    function DemoSocket(url, protocols) {
+      const parsed = new URL(url, location.href);
+      if (parsed.pathname.startsWith('/__demo/terminal/') && window.SmDemoTerminal) return new window.SmDemoTerminal(parsed);
+      return protocols === undefined ? new RealSocket(url) : new RealSocket(url, protocols);
+    }
+    Object.assign(DemoSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+    window.WebSocket = DemoSocket;
+    window.addEventListener('sm-demo-notice', (event) => toast(event.detail));
+  }
+
   // ---- boot ------------------------------------------------------------------
 
   function fail(text) {
@@ -94,6 +109,7 @@
       if (event.data && event.data.type === 'sm-demo-read-only') toast(event.data.text);
     });
     if (!appModule) return;
+    terminalSockets();
     if (navigator.serviceWorker.controller) { loadApp(); return; }
     // First visit: the app's first request must already go to the worker.
     // A first visit to a reader path got the shell (the host's 404.html);

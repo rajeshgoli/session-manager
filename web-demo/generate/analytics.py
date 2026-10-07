@@ -6,7 +6,7 @@
 
 The numbers stay real: spend percentages and tokens, active and parked time,
 the model and activity splits, and how they divide between repos, tickets
-and agents. Every repo, ticket, agent and account name is replaced, agent
+and agents; the Queue page's utilization and job-type charts. Every repo, ticket, agent and account name is replaced, agent
 links are dropped, and the result is checked for any original name before it
 is written to fixtures/static/ (see README.md, "The static layer").
 """
@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import urllib.request
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
@@ -24,6 +25,13 @@ FIXTURES = os.path.join(os.path.dirname(HERE), "fixtures")
 REPORTS = [f"/client/analytics/spend?range={r}{p}" for r in ("week", "last_week", "4w")
            for p in ("", "&provider=claude", "&provider=codex")]
 REPORTS += [f"/client/analytics/time?range={r}" for r in ("24h", "7d", "30d")]
+# The Queue page's charts: host utilization and what each job type used. Numbers
+# only; check_numeric refuses any text but the server's own words and times.
+NUMERIC = [f"/client/utilization/series?hours={h}" for h in (1, 24, 168, 720)]
+NUMERIC += [f"/client/queue/stats?hours={h}" for h in (24, 168, 720)]
+SERVER_WORDS = {"tests", "perf", "background", "service", "review", "limits", "perf_rules", "memory",
+                "other", "normal", "elevated", "critical"}
+TIME = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$")
 
 # Biggest real repo first gets the first name.
 REPO_NAMES = ["pricing-engine", "shop", "infra", "mobile-app", "data-pipeline", "docs-site",
@@ -44,6 +52,17 @@ TEXT_FIELDS = ("id", "label", "history_path", "session_id")
 def fetch(server, path):
     with urllib.request.urlopen(server + path, timeout=60) as response:
         return json.load(response)
+
+
+def check_numeric(url, node):
+    if isinstance(node, dict):
+        for value in node.values():
+            check_numeric(url, value)
+    elif isinstance(node, list):
+        for value in node:
+            check_numeric(url, value)
+    elif isinstance(node, str) and node not in SERVER_WORDS and not TIME.match(node):
+        raise SystemExit(f"refusing to write: {url} holds text {node!r}")
 
 
 def walk(node):
@@ -189,9 +208,18 @@ def main():
             json.dump(report, f, separators=(",", ":"))
         index["responses"][url] = {"file": f"static/{name}", "captured_at": report["generated_at"],
                                    "status": 200, "content_type": "application/json"}
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for url in NUMERIC:
+        report = fetch(args.server, url)
+        check_numeric(url, report)
+        name = re.sub(r"[^A-Za-z0-9]+", "_", url.strip("/")) + ".json"
+        with open(os.path.join(static_dir, name), "w") as f:
+            json.dump(report, f, separators=(",", ":"))
+        index["responses"][url] = {"file": f"static/{name}", "captured_at": now,
+                                   "status": 200, "content_type": "application/json"}
     with open(index_path, "w") as f:
         json.dump(index, f, indent=1, sort_keys=True)
-    print(f"wrote {len(scrubbed)} reports to {static_dir}")
+    print(f"wrote {len(scrubbed)} reports and {len(NUMERIC)} queue charts to {static_dir}")
     return 0
 
 

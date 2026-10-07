@@ -13,6 +13,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -33,6 +34,15 @@ VENDOR_IMPORTS = {
 # of the shell so a first visit by deep link works before the worker runs.
 PAGE_PATHS = ["board", "queue", "inbox", "notes", "analytics", "history", "history/agents",
               "history/tickets", "guestbook", "settings", "watch"]
+# Words the demo's copy of the app changes: the visitor's machine is not
+# necessarily a Mac, and Studio SSH is the owner's own setup. Each must match
+# exactly once, so a change in the app fails the build instead of passing silently.
+PATCHES = [
+    ("queue.js", "<h2>Mac usage</h2>", "<h2>Dev machine usage</h2>"),
+    ("queue.js", "The Mac had room to run", "The machine had room to run"),
+    ("app.js", '<span class="dh">Mac</span>', '<span class="dh">Dev machine</span>'),
+    ("settings.js", re.compile(r"<h3>Studio SSH</h3><\$\{Resource\} state=\$\{ssh\}.*?</\$\{Resource\}>", re.S), ""),
+]
 
 
 def web_files():
@@ -94,11 +104,24 @@ def shell(build, timeline):
 <link rel="stylesheet" href="/demo/demo.css?v={build}">
 <script type="importmap">{inline_json({"imports": imports})}</script>
 <script type="application/json" id="sm-config">{inline_json(config)}</script>
+<script src="/demo/terminal.js?v={build}" defer></script>
 <script src="/demo/demo.js?v={build}" data-app="/assets/app.js?v={build}" defer></script>
 </head>
 <body><div id="app"></div></body>
 </html>
 """
+
+
+def patch(assets):
+    for name, old, new in PATCHES:
+        path = os.path.join(assets, name)
+        with open(path) as f:
+            text = f.read()
+        pattern = old if isinstance(old, re.Pattern) else re.compile(re.escape(old))
+        if len(pattern.findall(text)) != 1:
+            sys.exit(f"build.py PATCHES: {name} no longer has exactly one {pattern.pattern[:60]!r}")
+        with open(path, "w") as f:
+            f.write(pattern.sub(lambda _: new, text))
 
 
 def build(out):
@@ -108,9 +131,10 @@ def build(out):
     staging = out + ".partial"
     shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(WEB, os.path.join(staging, "assets"))
+    patch(os.path.join(staging, "assets"))
     shutil.copytree(FIXTURES, os.path.join(staging, "fixtures"))
     os.makedirs(os.path.join(staging, "demo"))
-    for name in ("demo.js", "demo.css"):
+    for name in ("demo.js", "demo.css", "terminal.js", "terminals.json"):
         shutil.copy(os.path.join(SITE, name), os.path.join(staging, "demo", name))
     with open(os.path.join(SITE, "sw.js")) as f:
         worker = f.read()
