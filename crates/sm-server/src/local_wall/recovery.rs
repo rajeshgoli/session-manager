@@ -229,6 +229,7 @@ impl GenerationWalls {
     /// service reference until supervisor cleanup; durable registrations remain.
     pub fn stop(&self) -> Result<()> {
         self.stopped.store(true, Ordering::Release);
+        let _admission = crate::queue::admission_guard();
         let mut owned = self
             .owned
             .lock()
@@ -317,10 +318,74 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        walls.stop().unwrap();
+        let pending = RetainedQueueStore::create_queue_job_in_state_dir(
+            &queue,
+            crate::queue::CreateQueueJob {
+                local_submitter: Some(
+                    crate::local_egress::gateway::VerifiedLocalAgent::test_identity("wall-c"),
+                ),
+                job_type: "tests".into(),
+                label: "generation-shutdown".into(),
+                requester_session_id: None,
+                notify_session_id: "wall-c".into(),
+                cwd: wall.checkout.display().to_string(),
+                argv: None,
+                script: Some("print must-not-launch-after-stop".into()),
+                env: BTreeMap::new(),
+                timeout_seconds: 10,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+                rank_tickets: None,
+            },
+        )
+        .unwrap();
+        // Represent an admission pass still publishing its running row. Stop
+        // must wait for that complete critical section before detaching.
+        let admission = crate::queue::admission_guard();
+        let stopping = walls.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopping_thread = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let result = stopping.stop();
+            done_tx.send(result).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(admission);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        stopping_thread.join().unwrap();
+        let held = RetainedQueueStore::start_queue_job_in_state_dir(
+            &queue,
+            &queue.join("messages.db"),
+            &pending.id,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(held.state, "pending");
+        assert_eq!(held.holding_reason.as_deref(), Some("local_wall"));
         assert!(walls.get("wall-c").is_err());
         assert!(wall.spawn_provider("probe", &["provider".into()]).is_err());
         assert!(wall.spawn_queue("probe", &["hold".into()]).is_err());
+        let cancelled = RetainedQueueStore::cancel_queue_job_in_state_dir(
+            &queue,
+            &queue.join("messages.db"),
+            &pending.id,
+            0,
+            crate::queue::QueueAdmissionPolicy::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
         drop(wall);
     }
 }

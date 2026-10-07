@@ -625,6 +625,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        File::open(path.parent().context("host artifact has no parent")?)?.sync_all()?;
         Ok(())
     })();
     let _ = fs::remove_file(temporary);

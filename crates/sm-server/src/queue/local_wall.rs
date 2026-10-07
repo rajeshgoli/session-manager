@@ -416,14 +416,14 @@ pub(super) fn spawn(
     let (wall, binding) = validated_binding(state_dir, agent, binding_json)?;
     #[cfg(target_os = "macos")]
     {
-        let launcher = launchers()
+        // Keep the registry locked through spawn: detachment cannot return
+        // while a previously obtained binding can still launch a child.
+        let launchers = launchers()
             .lock()
-            .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?
-            .get(&registry_path(state_dir, agent)?)
-            .cloned()
-            .context(
-                "local queue launcher is unavailable; restore host binding before admission",
-            )?;
+            .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?;
+        let launcher = launchers.get(&registry_path(state_dir, agent)?).context(
+            "local queue launcher is unavailable; restore host binding before admission",
+        )?;
         let (launch_agent, profile) = launcher.queue_identity()?;
         if launch_agent != agent || profile != wall.spec.profile {
             bail!("local queue launcher identity changed");

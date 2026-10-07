@@ -1660,6 +1660,7 @@ impl RetainedQueueStore {
         job_id: &str,
         cancel_grace_seconds: u64,
     ) -> Result<Option<QueueJobRecord>> {
+        let _admission_guard = admission_guard();
         Self::start_queue_job_in_state_dir_with_policy(
             state_dir,
             message_queue_db_path,
@@ -4861,6 +4862,14 @@ const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
 pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
 const QUEUE_JOB_TYPE_ORDER: [&str; 5] = ["perf", "review", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds through process launch, running-row publication and monitor creation.
+/// Generation shutdown takes the same lock before detaching local launchers.
+pub(crate) fn admission_guard() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Pending job ids in the order admission examines them: perf, tests,
 /// background, service, then by board lane rank and oldest first within a
