@@ -41,7 +41,7 @@ struct Reply {
 /// Host-only runtime interface, independent of opencode. The wall must exclude
 /// `directory` from reads/writes and the control socket from agent connections.
 /// `executable` is the installed sm-server copy, never a Cargo target artifact.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServiceClient {
     directory: PathBuf,
     executable: PathBuf,

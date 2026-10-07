@@ -274,7 +274,19 @@ fn load(state_dir: &Path, agent: &str) -> Result<RegisteredWall> {
 }
 
 #[cfg(target_os = "macos")]
-type Launcher = Arc<crate::local_sockets::launch::LaunchBinding>;
+enum Launcher {
+    Owned(Arc<crate::local_sockets::launch::LaunchBinding>),
+    Durable(crate::local_wall::owner::OwnerClient),
+}
+#[cfg(target_os = "macos")]
+impl Launcher {
+    fn queue_identity(&self) -> std::io::Result<(&str, &Path)> {
+        match self {
+            Self::Owned(binding) => binding.queue_identity(),
+            Self::Durable(owner) => Ok(owner.queue_identity()),
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 fn launchers() -> &'static Mutex<BTreeMap<PathBuf, Launcher>> {
     static LAUNCHERS: OnceLock<Mutex<BTreeMap<PathBuf, Launcher>>> = OnceLock::new();
@@ -283,7 +295,11 @@ fn launchers() -> &'static Mutex<BTreeMap<PathBuf, Launcher>> {
 /// Attach the host's live socket-service binding, after registration or restart.
 /// It must be the submitting agent's service and carry no provider listener.
 #[cfg(target_os = "macos")]
-pub fn attach(state_dir: &Path, agent: &str, launcher: Launcher) -> Result<()> {
+pub fn attach(
+    state_dir: &Path,
+    agent: &str,
+    launcher: Arc<crate::local_sockets::launch::LaunchBinding>,
+) -> Result<()> {
     let wall = load(state_dir, agent)?;
     let (launch_agent, profile) = launcher.queue_identity()?;
     if launch_agent != agent || profile != wall.spec.profile {
@@ -292,7 +308,24 @@ pub fn attach(state_dir: &Path, agent: &str, launcher: Launcher) -> Result<()> {
     launchers()
         .lock()
         .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?
-        .insert(registry_path(state_dir, agent)?, launcher);
+        .insert(registry_path(state_dir, agent)?, Launcher::Owned(launcher));
+    Ok(())
+}
+/// Reconnect to the live host tmux owner without replacing its broker/profile.
+#[cfg(target_os = "macos")]
+pub fn attach_durable(
+    state_dir: &Path,
+    agent: &str,
+    owner: crate::local_wall::owner::OwnerClient,
+) -> Result<()> {
+    owner.ready(state_dir)?;
+    if owner.queue_identity().0 != agent {
+        bail!("durable owner agent differs");
+    }
+    launchers()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?
+        .insert(registry_path(state_dir, agent)?, Launcher::Durable(owner));
     Ok(())
 }
 #[cfg(target_os = "macos")]
@@ -398,6 +431,9 @@ pub(super) fn admission_ready(state_dir: &Path, agent: &str, binding: &str) -> R
         if launch_agent != agent || profile != wall.spec.profile {
             bail!("local queue launcher identity changed");
         }
+        if let Launcher::Durable(owner) = launcher {
+            return Ok(owner.ready(state_dir).is_ok());
+        }
         Ok(true)
     }
     #[cfg(not(target_os = "macos"))]
@@ -428,6 +464,14 @@ pub(super) fn spawn(
         if launch_agent != agent || profile != wall.spec.profile {
             bail!("local queue launcher identity changed");
         }
+        if let Launcher::Durable(owner) = launcher {
+            return Ok(QueueChild::DurableLocal(
+                owner.spawn_queue(binding_json, output)?,
+            ));
+        }
+        let Launcher::Owned(launcher) = launcher else {
+            unreachable!()
+        };
         let environment = wall
             .spec
             .environment
@@ -448,6 +492,41 @@ pub(super) fn spawn(
         let _ = output;
         bail!("local queue walls require macOS");
     }
+}
+
+/// Executed only inside the durable owner. It revalidates the immutable command
+/// instead of accepting executable, cwd or environment from the control caller.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_owned(
+    state_dir: &Path,
+    agent: &str,
+    binding_json: &str,
+    output: (fs::File, fs::File, Option<u64>),
+) -> Result<crate::local_sockets::launch::RegisteredChild> {
+    let (wall, binding) = validated_binding(state_dir, agent, binding_json)?;
+    let launchers = launchers()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?;
+    let Some(Launcher::Owned(launcher)) = launchers.get(&registry_path(state_dir, agent)?) else {
+        bail!("owner's queue binding unavailable");
+    };
+    let (id, profile) = launcher.queue_identity()?;
+    if id != agent || profile != wall.spec.profile {
+        bail!("owner queue identity changed");
+    }
+    let environment = wall
+        .spec
+        .environment
+        .iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect::<Vec<_>>();
+    Ok(launcher.spawn_queue(
+        &wall.spec.shell,
+        &["-df".into(), binding.command.into_os_string()],
+        &environment,
+        &binding.cwd,
+        output,
+    )?)
 }
 
 #[cfg(all(test, target_os = "macos"))]

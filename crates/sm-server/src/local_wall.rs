@@ -31,7 +31,7 @@ use std::{
 };
 
 /// All values come from sm's host configuration, never a tool or queue body.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostConfiguration {
     pub home: PathBuf,
     pub state_root: PathBuf,
@@ -45,13 +45,13 @@ pub struct HostConfiguration {
 }
 
 /// The host selects sources; copies are independently staged and ad-hoc signed.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct StageTool {
     pub name: String,
     pub source: PathBuf,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AgentRegistration {
     pub id: String,
     pub name: String,
@@ -558,6 +558,20 @@ pub struct WallChild {
     wall: Arc<PreparedWall>,
 }
 impl WallChild {
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(RegisteredChild::id)
+    }
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .context("child already reaped")?
+            .try_wait()?;
+        if status.is_some() {
+            self.finish();
+        }
+        Ok(status)
+    }
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.as_mut()?.take_stdout()
     }
@@ -756,4 +770,5 @@ fn install_sources(config: &Path) -> Result<PathBuf> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
+pub mod owner;
 pub mod recovery;

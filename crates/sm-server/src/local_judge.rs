@@ -55,7 +55,7 @@ pub struct JudgeEndpoint {
     pub token: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalJudgeRuntime {
     config: LocalJudgeConfig,
     root: PathBuf,

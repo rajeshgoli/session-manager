@@ -5532,6 +5532,8 @@ enum QueueChild {
     Hosted(Child),
     #[cfg(target_os = "macos")]
     Local(crate::local_sockets::launch::RegisteredChild),
+    #[cfg(target_os = "macos")]
+    DurableLocal(crate::local_wall::owner::RemoteChild),
 }
 impl QueueChild {
     fn id(&self) -> u32 {
@@ -5539,6 +5541,8 @@ impl QueueChild {
             Self::Hosted(c) => c.id(),
             #[cfg(target_os = "macos")]
             Self::Local(c) => c.id(),
+            #[cfg(target_os = "macos")]
+            Self::DurableLocal(c) => c.id(),
         }
     }
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -5546,6 +5550,8 @@ impl QueueChild {
             Self::Hosted(c) => c.try_wait(),
             #[cfg(target_os = "macos")]
             Self::Local(c) => c.try_wait(),
+            #[cfg(target_os = "macos")]
+            Self::DurableLocal(c) => c.try_wait(),
         }
     }
     #[cfg(test)]
@@ -5554,6 +5560,8 @@ impl QueueChild {
             Self::Hosted(c) => c.wait(),
             #[cfg(target_os = "macos")]
             Self::Local(c) => c.wait(),
+            #[cfg(target_os = "macos")]
+            Self::DurableLocal(c) => c.wait(),
         }
     }
 }

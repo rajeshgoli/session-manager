@@ -32,6 +32,7 @@ struct SavedAuthority {
 struct OwnedWalls {
     runtime: Option<LocalWallRuntime>,
     walls: BTreeMap<String, Arc<PreparedWall>>,
+    durable: BTreeMap<String, owner::OwnerClient>,
 }
 
 /// Host-only service shared by startup, queue recovery and future providers.
@@ -69,6 +70,7 @@ impl GenerationWalls {
             owned: Mutex::new(OwnedWalls {
                 runtime: None,
                 walls: BTreeMap::new(),
+                durable: BTreeMap::new(),
             }),
         })
     }
@@ -92,6 +94,9 @@ impl GenerationWalls {
         configuration: HostConfiguration,
         agent: &AgentRegistration,
     ) -> Result<Arc<PreparedWall>> {
+        if owner::OwnerClient::registered(&self.queue_state, &agent.id)?.is_some() {
+            bail!("durable provider owns this wall; reconnect to its host launcher");
+        }
         let mut owned = self
             .owned
             .lock()
@@ -127,6 +132,51 @@ impl GenerationWalls {
         Ok(wall)
     }
 
+    /// Stage the exact command for a host tmux window. Starting that command
+    /// prepares the wall and retains it independently of this server generation.
+    pub fn stage_provider(
+        &self,
+        configuration: HostConfiguration,
+        agent: AgentRegistration,
+        provider: owner::ProviderLaunch,
+        installed_executable: &Path,
+    ) -> Result<owner::HostLaunch> {
+        let _admission = crate::queue::admission_guard();
+        let owned = self
+            .owned
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wall generation lock poisoned"))?;
+        if self.stopped.load(Ordering::Acquire) || owned.walls.contains_key(&agent.id) {
+            bail!("generation stopped or agent already has generation-owned authority");
+        }
+        if configuration.sm_upstream != self.upstream || configuration.model_port != self.model_port
+        {
+            bail!("wall configuration differs from server endpoints");
+        }
+        owner::stage(
+            &self.queue_state,
+            configuration,
+            agent,
+            self.egress.clone(),
+            self.judge.clone(),
+            provider,
+            installed_executable,
+        )
+    }
+
+    pub fn get_durable(&self, id: &str) -> Result<Option<owner::OwnerClient>> {
+        if self.stopped.load(Ordering::Acquire) {
+            bail!("wall generation stopped");
+        }
+        Ok(self
+            .owned
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wall generation lock poisoned"))?
+            .durable
+            .get(id)
+            .cloned())
+    }
+
     /// An unavailable predecessor or incomplete authority is reported per agent.
     /// Reconcile again after old launches/locks finish; no host fallback occurs.
     pub fn reconcile(&self) -> Result<Vec<String>> {
@@ -151,6 +201,18 @@ impl GenerationWalls {
                 continue;
             }
             let result = (|| {
+                if let Some(owner) = owner::OwnerClient::registered(&self.queue_state, id)? {
+                    let mut owned = self
+                        .owned
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("wall generation lock poisoned"))?;
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    crate::queue::local_wall::attach_durable(&self.queue_state, id, owner.clone())?;
+                    owned.durable.insert(id.into(), owner);
+                    return Ok(());
+                }
                 let spec = crate::queue::local_wall::registered_spec(&self.queue_state, id)?
                     .context("missing saved wall")?;
                 if spec.host_authority_sha256.is_none() {
@@ -239,6 +301,10 @@ impl GenerationWalls {
             crate::queue::local_wall::detach(&self.queue_state, id)?;
         }
         owned.walls.clear();
+        for id in owned.durable.keys() {
+            crate::queue::local_wall::detach(&self.queue_state, id)?;
+        }
+        owned.durable.clear();
         owned.runtime = None;
         Ok(())
     }

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static unsigned port(const char *url) {
@@ -39,6 +40,39 @@ static void exchange(unsigned number, const char *request, const char *expected)
 }
 int main(int argc, char **argv) {
     alarm(15);
+    if (argc == 4 && !strcmp(argv[1], "provider-persistent")) {
+        alarm(0);
+        assert(fcntl(198, F_GETFD) >= 0);
+        assert(open(argv[2], O_RDONLY) < 0 && (errno == EPERM || errno == EACCES));
+        struct sockaddr_un host = { .sun_family = AF_UNIX };
+        assert(strlen(argv[3]) < sizeof(host.sun_path));
+        strcpy(host.sun_path, argv[3]);
+        int forbidden = socket(AF_UNIX, SOCK_STREAM, 0); assert(forbidden >= 0);
+        assert(connect(forbidden, (struct sockaddr *)&host, sizeof(host)) < 0);
+        assert(errno == EPERM || errno == EACCES); close(forbidden);
+        int test = socket(AF_INET, SOCK_STREAM, 0); assert(test >= 0);
+        struct sockaddr_in ephemeral = { .sin_len = sizeof(ephemeral), .sin_family = AF_INET,
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        assert(bind(test, (struct sockaddr *)&ephemeral, sizeof(ephemeral)) == 0);
+        assert(listen(test, 1) == 0);
+        socklen_t size = sizeof(ephemeral);
+        assert(getsockname(test, (struct sockaddr *)&ephemeral, &size) == 0);
+        pid_t descendant = fork(); assert(descendant >= 0);
+        if (!descendant) { for (;;) pause(); }
+        printf("owner-provider-ready %u %d\n", ntohs(ephemeral.sin_port), descendant); fflush(stdout);
+        for (;;) {
+            int incoming = accept(198, NULL, NULL); assert(incoming >= 0);
+            /* Ask the broker for a fresh capability after each sm restart. */
+            int fresh = socket(AF_INET, SOCK_STREAM, 0); assert(fresh >= 0);
+            struct sockaddr_in address = { .sin_len = sizeof(address), .sin_family = AF_INET,
+                .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+            assert(bind(fresh, (struct sockaddr *)&address, sizeof(address)) == 0);
+            assert(listen(fresh, 1) == 0); close(fresh);
+            assert(write(incoming, "provider", 8) == 8); close(incoming);
+            incoming = accept(test, NULL, NULL); assert(incoming >= 0);
+            assert(write(incoming, "socket", 6) == 6); close(incoming);
+        }
+    }
     if (argc == 2 && !strcmp(argv[1], "hold")) {
         assert(fcntl(198, F_GETFD) < 0 && errno == EBADF);
         sleep(2); puts("durable-wall-ok"); return 0;
