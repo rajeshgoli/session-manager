@@ -75,7 +75,9 @@ Order by the provider's `time.created` and use recorded replayed-message IDs,
 not an ID comparison with the cursor: a host ID allocated before a failed
 delivery can be accepted after newer turns. Resolve assistant starts to their
 parent user's cached prompt. Completed error responses (including aborted
-responses without `finish`) close a prior turn when a later assistant exists.
+responses without `finish`) close a prior turn when the next assistant has a
+different parent user. Requests sharing a parent remain one turn, including
+when tool-call finish metadata is delayed.
 User submissions have no `time.completed`; metadata or text alone while the
 provider is idle does not prove processing began. Backfill starts a turn only
 on an assistant message or current busy/retry status. An unfinished assistant
@@ -87,8 +89,9 @@ that stop to replay. Live turn starts come from busy/retry status, after user te
 have supplied the prompt; owner-answer effects also work while already busy.
 Owner-reply effects wait for nonempty user text. Pending reply IDs survive a
 checkpoint/reopen and hold the replay cursor until their text arrives. A
-host-generated message retains that classification even if its text arrives
-after a reconnect and its queue row is no longer in the generated-ID input.
+host-generated message retains that classification from either metadata or a
+text part, even if a reconnect happens before the other event arrives and its
+queue row is no longer in the generated-ID input.
 
 `Client::event_stream` authenticates with the same secret and refuses redirects
 and proxies. Each connection is limited to twenty seconds, including healthy

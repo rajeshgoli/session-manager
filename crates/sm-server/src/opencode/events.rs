@@ -119,6 +119,8 @@ pub struct Projection {
     #[serde(default)]
     replayed_messages: BTreeSet<String>,
     #[serde(default)]
+    generated_users: BTreeSet<String>,
+    #[serde(default)]
     tools: BTreeSet<String>,
     #[serde(default)]
     usage: BTreeSet<String>,
@@ -144,6 +146,7 @@ impl Projection {
             users: BTreeSet::new(),
             pending_owner_prompts: BTreeSet::new(),
             replayed_messages: BTreeSet::new(),
+            generated_users: BTreeSet::new(),
             tools: BTreeSet::new(),
             usage: BTreeSet::new(),
             stops: BTreeSet::new(),
@@ -169,6 +172,14 @@ impl Projection {
             .or_else(|| props["info"]["id"].as_str());
         if session != Some(self.conversation_id.as_str()) {
             return Ok(Vec::new());
+        }
+        if let Some(id) = props["part"]["messageID"]
+            .as_str()
+            .or_else(|| props["info"]["id"].as_str())
+        {
+            if generated_user_ids.contains(id) {
+                self.generated_users.insert(id.into());
+            }
         }
         let mut effects = Vec::new();
         match event["type"].as_str() {
@@ -220,9 +231,14 @@ impl Projection {
                         .cmp(&right["info"]["id"].as_str())
                 })
         });
-        let latest_assistant = ordered
-            .iter()
-            .rposition(|message| message["info"]["role"] == "assistant");
+        let mut following_assistants = vec![None; ordered.len()];
+        let mut next = None;
+        for (index, message) in ordered.iter().enumerate().rev() {
+            following_assistants[index] = next;
+            if message["info"]["role"] == "assistant" {
+                next = Some(*message);
+            }
+        }
         let stopped_through = ordered.iter().rposition(|message| {
             message["info"]["id"]
                 .as_str()
@@ -252,6 +268,14 @@ impl Projection {
                 self.cursor = Some(id.into());
             }
             if info["role"] == "assistant" {
+                let parent_id = info["parentID"]
+                    .as_str()
+                    .context("assistant missing parent id")?;
+                validate_id(parent_id, "msg")?;
+                let next_parent = following_assistants[index]
+                    .and_then(|message| message["info"]["parentID"].as_str());
+                let continues = next_parent == Some(parent_id);
+                let next_turn = next_parent.is_some_and(|next| next != parent_id);
                 // A submitted user message can precede processing. Only an
                 // assistant or the final busy/retry status proves a turn
                 // began. A previously applied stop must remain untouched.
@@ -274,10 +298,11 @@ impl Projection {
                     // agent turn. tool-calls completes that request while the
                     // tools and next request still belong to the same turn.
                     if info["finish"] != "tool-calls"
+                        && !continues
                         && (info["finish"].as_str().is_some()
                             || !info["error"].is_null()
                             || activity == Activity::Idle
-                            || latest_assistant.is_some_and(|later| later > index))
+                            || next_turn)
                         && !self.stops.contains(id)
                     {
                         // Persistence can precede the provider's idle status.
@@ -285,9 +310,7 @@ impl Projection {
                         // that proof, wait for idle and keep replaying this row.
                         if already_stopped {
                             self.stops.insert(id.into());
-                        } else if activity == Activity::Idle
-                            || latest_assistant.is_some_and(|later| later > index)
-                        {
+                        } else if activity == Activity::Idle || next_turn {
                             self.stops.insert(id.into());
                             self.activity = Activity::Idle;
                             effects.push(Effect::TurnStop {
@@ -333,6 +356,9 @@ impl Projection {
         let id = info["id"].as_str().context("opencode message missing id")?;
         validate_id(id, "msg")?;
         if info["role"] == "user" {
+            if generated.contains(id) {
+                self.generated_users.insert(id.into());
+            }
             for part in parts.iter().filter(|part| part["type"] == "text") {
                 let part_id = part["id"].as_str().context("user text missing part id")?;
                 validate_id(part_id, "prt")?;
@@ -356,7 +382,7 @@ impl Projection {
             let new_user = self.users.insert(id.into());
             if new_user {
                 self.last_user_id = Some(id.into());
-                if !generated.contains(id) {
+                if !self.generated_users.contains(id) {
                     self.pending_owner_prompts.insert(id.into());
                 }
             }

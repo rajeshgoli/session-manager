@@ -24,7 +24,7 @@ fn assistant(id: &str, completed: bool, finish: &str, parts: Vec<Value>) -> Valu
         .and_then(|suffix| suffix.parse::<u64>().ok())
         .unwrap_or(2)
         * 10;
-    let mut info = json!({"id": id, "sessionID": "ses_test", "role": "assistant", "time": {"created": created}});
+    let mut info = json!({"id": id, "sessionID": "ses_test", "role": "assistant", "parentID":"msg_01", "time": {"created": created}});
     if completed {
         info["time"]["completed"] = json!(created + 1);
         info["finish"] = json!(finish);
@@ -33,6 +33,17 @@ fn assistant(id: &str, completed: bool, finish: &str, parts: Vec<Value>) -> Valu
 }
 fn live_part(part: Value) -> Value {
     json!({"type": "message.part.updated", "properties": {"part": part}})
+}
+fn assistant_for(
+    parent: &str,
+    id: &str,
+    completed: bool,
+    finish: &str,
+    parts: Vec<Value>,
+) -> Value {
+    let mut message = assistant(id, completed, finish, parts);
+    message["info"]["parentID"] = json!(parent);
+    message
 }
 fn starts(effects: &[Effect]) -> usize {
     effects
@@ -142,6 +153,75 @@ fn two_disconnects_during_one_assistant_keep_cursor_and_replay_only_new_parts() 
 }
 
 #[test]
+fn same_parent_requests_with_delayed_finish_remain_one_turn() {
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let mut first = assistant("msg_02", true, "tool-calls", vec![]);
+    first["info"].as_object_mut().unwrap().remove("finish");
+    let mut history = vec![
+        user("msg_01", "one turn"),
+        first,
+        assistant("msg_03", false, "", vec![]),
+    ];
+    let generated = BTreeSet::from(["msg_01".into()]);
+    let effects = projection
+        .backfill(&history, Activity::Busy, &generated)
+        .unwrap();
+    assert_eq!(starts(&effects), 1);
+    assert_eq!(stops(&effects), 0);
+    assert_eq!(projection.cursor.as_deref(), Some("msg_02"));
+    let mut reopened: Projection =
+        serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+    assert!(reopened
+        .backfill(&history, Activity::Busy, &generated)
+        .unwrap()
+        .is_empty());
+    history[1]["info"]["finish"] = json!("tool-calls");
+    history[1]["parts"] = json!([usage_part("prt_usage")]);
+    let effects = reopened
+        .backfill(&history, Activity::Busy, &generated)
+        .unwrap();
+    assert_eq!(usages(&effects), 1);
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(stops(&effects), 0);
+    history[2]["info"]["time"]["completed"] = json!(31);
+    history[2]["info"]["finish"] = json!("stop");
+    assert!(reopened
+        .backfill(&history, Activity::Busy, &generated)
+        .unwrap()
+        .is_empty());
+    let effects = reopened
+        .backfill(&history, Activity::Idle, &generated)
+        .unwrap();
+    assert_eq!(starts(&effects), 0);
+    assert_eq!(stops(&effects), 1);
+    assert!(reopened
+        .backfill(&history, Activity::Idle, &generated)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn idle_snapshot_with_same_parent_continuation_emits_one_completion() {
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let mut first = assistant("msg_02", true, "tool-calls", vec![]);
+    first["info"].as_object_mut().unwrap().remove("finish");
+    let history = vec![
+        user("msg_01", "one turn"),
+        first,
+        assistant("msg_03", true, "stop", vec![]),
+    ];
+    let effects = projection
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert_eq!(starts(&effects), 1);
+    assert_eq!(stops(&effects), 1);
+    assert!(projection
+        .backfill(&history, Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn late_host_message_below_cursor_uses_its_own_prompt_and_parent_id() {
     let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
     let first = vec![
@@ -201,7 +281,7 @@ fn aborted_turn_without_finish_is_separate_from_a_later_busy_turn() {
         user("msg_01", "aborted prompt"),
         aborted,
         user("msg_03", "next prompt"),
-        assistant("msg_04", false, "", vec![]),
+        assistant_for("msg_03", "msg_04", false, "", vec![]),
     ];
     let effects = projection
         .backfill(&history, Activity::Busy, &BTreeSet::new())
@@ -332,7 +412,7 @@ fn later_assistant_proves_an_earlier_turn_ended_while_current_turn_is_busy() {
         user("msg_01", "first"),
         assistant("msg_02", true, "stop", vec![]),
         user("msg_03", "next"),
-        assistant("msg_04", false, "", vec![]),
+        assistant_for("msg_03", "msg_04", false, "", vec![]),
     ];
     let effects = projection
         .backfill(&history, Activity::Busy, &BTreeSet::new())
@@ -628,7 +708,9 @@ fn generated_classification_survives_reopen_and_text_before_metadata_is_supporte
             .unwrap()
             .iter()
             .any(|e| matches!(e, Effect::OwnerPrompt { .. })));
-        let effects = projection.live(&metadata, &ids).unwrap();
+        let mut reopened: Projection =
+            serde_json::from_slice(&serde_json::to_vec(&projection).unwrap()).unwrap();
+        let effects = reopened.live(&metadata, &BTreeSet::new()).unwrap();
         assert_eq!(
             effects
                 .iter()
