@@ -7,7 +7,7 @@ ticket to the right model from whichever subscription has room, and watch the
 plan move on one screen, from your desk or your phone.
 
 ![The Agents page: Claude and Codex agents sorted by what needs attention](docs/assets/agents.png)
-<!-- ASSET: "Try the live demo" link to sm-demo.rajeshgo.li once it is up. -->
+**[Try the live demo →](https://sm-demo.rajeshgo.li)** A recorded ten-minute sprint by a scripted team, replayed in the real web UI.
 
 ---
 
