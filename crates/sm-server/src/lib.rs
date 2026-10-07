@@ -55,6 +55,7 @@ pub mod local_sockets;
 pub mod local_wall;
 pub mod mobile_devices;
 pub mod notes;
+pub mod opencode;
 pub mod owner_doc_render;
 pub mod owner_docs;
 pub mod owner_inbox;

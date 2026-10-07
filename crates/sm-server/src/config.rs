@@ -63,6 +63,7 @@ pub struct AppConfig {
     pub utilization: UtilizationConfig,
     pub local_host: crate::local_model::LocalHostConfig,
     pub local_judge: crate::local_judge::LocalJudgeConfig,
+    pub opencode: crate::opencode::OpencodeConfig,
     pub activity: ActivityConfig,
     /// How sm names the owner in text it writes to agents (sm#1580): the
     /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
@@ -138,6 +139,7 @@ impl Default for AppConfig {
             utilization: UtilizationConfig::default(),
             local_host: crate::local_model::LocalHostConfig::default(),
             local_judge: crate::local_judge::LocalJudgeConfig::default(),
+            opencode: crate::opencode::OpencodeConfig::default(),
             activity: ActivityConfig::default(),
             owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
@@ -209,6 +211,7 @@ impl AppConfig {
         config.validate_queue_runner_capacity()?;
         config.validate_codex_fork_create_startup_timeout()?;
         config.utilization.validate()?;
+        config.opencode.validate()?;
 
         Ok(config)
     }
@@ -2222,6 +2225,8 @@ struct RawConfig {
     #[serde(default)]
     local_judge: crate::local_judge::LocalJudgeConfig,
     #[serde(default)]
+    opencode: crate::opencode::OpencodeConfig,
+    #[serde(default)]
     activity: ActivityConfig,
     #[serde(default)]
     owner_name: Option<String>,
@@ -2345,6 +2350,7 @@ impl From<RawConfig> for AppConfig {
             utilization: raw.utilization,
             local_host: raw.local_host,
             local_judge: raw.local_judge,
+            opencode: raw.opencode,
             activity: raw.activity,
             owner_name: normalize_owner_name(raw.owner_name.as_deref())
                 .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),
