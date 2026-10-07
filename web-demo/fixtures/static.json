@@ -1,75 +1,147 @@
 {
  "responses": {
+  "/apps/session-manager-android/meta.json": {
+   "captured_at": "2026-10-07T21:03:07Z",
+   "content_type": "application/json",
+   "file": "static/settings_apps_session_manager_android_meta_json.json",
+   "status": 200
+  },
   "/client/analytics/spend?range=4w": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_4w.json",
    "status": 200
   },
   "/client/analytics/spend?range=4w&provider=claude": {
-   "captured_at": "2026-10-07T20:18:10Z",
+   "captured_at": "2026-10-07T20:39:43Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_4w_provider_claude.json",
    "status": 200
   },
   "/client/analytics/spend?range=4w&provider=codex": {
-   "captured_at": "2026-10-07T20:18:10Z",
+   "captured_at": "2026-10-07T20:39:43Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_4w_provider_codex.json",
    "status": 200
   },
   "/client/analytics/spend?range=last_week": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_last_week.json",
    "status": 200
   },
   "/client/analytics/spend?range=last_week&provider=claude": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_last_week_provider_claude.json",
    "status": 200
   },
   "/client/analytics/spend?range=last_week&provider=codex": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_last_week_provider_codex.json",
    "status": 200
   },
   "/client/analytics/spend?range=week": {
-   "captured_at": "2026-10-07T20:18:08Z",
+   "captured_at": "2026-10-07T20:39:41Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_week.json",
    "status": 200
   },
   "/client/analytics/spend?range=week&provider=claude": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_week_provider_claude.json",
    "status": 200
   },
   "/client/analytics/spend?range=week&provider=codex": {
-   "captured_at": "2026-10-07T20:18:09Z",
+   "captured_at": "2026-10-07T20:39:42Z",
    "content_type": "application/json",
    "file": "static/client_analytics_spend_range_week_provider_codex.json",
    "status": 200
   },
   "/client/analytics/time?range=24h": {
-   "captured_at": "2026-10-07T20:18:10Z",
+   "captured_at": "2026-10-07T20:39:43Z",
    "content_type": "application/json",
    "file": "static/client_analytics_time_range_24h.json",
    "status": 200
   },
   "/client/analytics/time?range=30d": {
-   "captured_at": "2026-10-07T20:18:11Z",
+   "captured_at": "2026-10-07T20:39:45Z",
    "content_type": "application/json",
    "file": "static/client_analytics_time_range_30d.json",
    "status": 200
   },
   "/client/analytics/time?range=7d": {
-   "captured_at": "2026-10-07T20:18:10Z",
+   "captured_at": "2026-10-07T20:39:44Z",
    "content_type": "application/json",
    "file": "static/client_analytics_time_range_7d.json",
+   "status": 200
+  },
+  "/client/devices": {
+   "captured_at": "2026-10-07T21:03:07Z",
+   "content_type": "application/json",
+   "file": "static/settings_client_devices.json",
+   "status": 200
+  },
+  "/client/push/status": {
+   "captured_at": "2026-10-07T21:03:07Z",
+   "content_type": "application/json",
+   "file": "static/settings_client_push_status.json",
+   "status": 200
+  },
+  "/client/queue/stats?hours=168": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_queue_stats_hours_168.json",
+   "status": 200
+  },
+  "/client/queue/stats?hours=24": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_queue_stats_hours_24.json",
+   "status": 200
+  },
+  "/client/queue/stats?hours=720": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_queue_stats_hours_720.json",
+   "status": 200
+  },
+  "/client/reviews/status": {
+   "captured_at": "2026-10-07T21:03:07Z",
+   "content_type": "application/json",
+   "file": "static/settings_client_reviews_status.json",
+   "status": 200
+  },
+  "/client/utilization/series?hours=1": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_utilization_series_hours_1.json",
+   "status": 200
+  },
+  "/client/utilization/series?hours=168": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_utilization_series_hours_168.json",
+   "status": 200
+  },
+  "/client/utilization/series?hours=24": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_utilization_series_hours_24.json",
+   "status": 200
+  },
+  "/client/utilization/series?hours=720": {
+   "captured_at": "2026-10-07T20:39:46Z",
+   "content_type": "application/json",
+   "file": "static/client_utilization_series_hours_720.json",
+   "status": 200
+  },
+  "/worktrees/leftover": {
+   "captured_at": "2026-10-07T21:03:07Z",
+   "content_type": "application/json",
+   "file": "static/settings_worktrees_leftover.json",
    "status": 200
   }
  },

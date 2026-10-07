@@ -91,16 +91,20 @@ The responses come from a real `sm-server` on fresh state, except where noted.
   review requests and their review jobs, the owner's reply and doc reviews, published doc
   revisions, *Start when ready* rows (that route needs a signed-in owner), ticket and PR state
   after GitHub events, last-turn messages and tool calls.
-- **Synthetic** (a runtime-off server can't answer them, or would answer from the recording
-  machine): `/client/host-status`, the `host` field of `/client/queue`,
-  `/client/utilization/series`, `/client/queue/stats` and `/client/usage/meters`.
+- **Real numbers, moved through the storyline** (a runtime-off server can't answer them):
+  `/client/host-status` and the `host` field of `/client/queue` start from the real host's load
+  in `static/host_status.json` and add the storyline's running jobs; `/client/usage/meters`
+  starts from the real meters in `static/usage_meters.json` and rises a little over the loop.
+  `/client/utilization/series` and `/client/queue/stats` are not recorded; they come from the
+  static layer.
 - **Fake tools on the server's PATH** (`generate/fake-bin/`): `gh` answers from the recorder's
   world file (`gh-world.json`), including the issue, comment, PR and check reads behind the
   ticket panel; `codex` lists models. Nothing reaches GitHub.
 - **Last week's sprint** (`prologue` in `record.py`): before the recording starts, a planner and
   four agents work goal #30 *Cart v1* (#31–#34, PRs #35–#38) through the same CLI calls, plus a
-  `scout` with no ticket; then all of them retire and their times move 2–6 days into the past.
-  They are what History lists and offers to bring back.
+  `scout` with no ticket; each signs the guestbook, then all of them retire and their times
+  (guestbook entries included) move 2–6 days into the past. They are what History lists and
+  offers to bring back, and what the Guestbook shows before the storyline's own signatures.
 - The local-model agent is a Codex session whose model is `qwen3-coder-next`; Codex agents carry
   a tmux session name on a socket no tmux server listens on, because the server drops Codex
   sessions without one.
@@ -124,18 +128,36 @@ never adopts, runs or stops queue jobs, and its config points every database at 
 
 ## The static layer
 
-Two pages are not part of the storyline, so they are not recorded per tick:
+Pages and panels that are not part of the storyline are not recorded per tick. The numbers in
+them are real; every name is invented, and each script refuses to write if an original name
+survives. Rerun them against the live server to refresh, then re-record (record.py reads the
+host and meter snapshots):
 
 - **Analytics.** `generate/analytics.py` snapshots a real server's spend and time reports
   (every range, and each spend provider) into `fixtures/static/`, indexed in
   `fixtures/static.json`. The numbers are real; every repo, ticket, agent and account name is
   invented (the biggest repo becomes `pricing-engine`, tickets get numbers from 101 and made-up
   titles), agent and history links are dropped, and the script refuses to write if any original
-  name survives. Rerun it against the live server to refresh the numbers:
-  `python3 web-demo/generate/analytics.py [--server URL]`.
+  name survives. It also snapshots the Queue page's utilization chart (`/client/utilization/series`,
+  every range) and job-type table (`/client/queue/stats`), which hold only numbers and the
+  server's own words. `python3 web-demo/generate/analytics.py [--server URL]`.
+- **Queue history and host load.** `generate/queue.py` snapshots the last 24 hours of ended
+  jobs, the host's load and the usage meters. Labels keep their shape with invented words
+  (`1978-sum-lane0` becomes `60-reindex-lane0`), agents become `shop-<n>`, paths, ids, argv and
+  lane goals are replaced, and an end summary that is not one of the server's fixed phrasings is
+  dropped. The worker adds these jobs after the storyline's own on the Queue page.
+  `python3 web-demo/generate/queue.py [--server URL]`.
+- **Settings.** `generate/settings.py` writes invented responses for Notifications, Devices,
+  Reviews, Worktrees and About (phone app 0.5.46). Worktrees works for the visit: Delete build
+  output, Delete and Keep change the list as the server would.
 - **Notes.** `fixtures/static/notes.json` holds four invented notes with revisions. The worker
   serves them and lets a visitor create, edit, search, preview and restore notes for the
-  length of the visit; each save shows "Nothing is saved in the demo".
+  length of the visit; each save shows "Nothing is saved in the demo". Notes and Worktrees
+  changes are kept in the worker's cache for the visit, since the browser can stop the worker
+  between requests.
+- **Agent terminals.** `site/terminals.json` scripts each storyline agent's terminal: what
+  arrived as input, the tool calls and their output, and what the agent said, each at its
+  storyline second. See "The terminal" below.
 
 `record.py` carries `static/` and `static.json` over when it replaces `fixtures/`.
 
@@ -156,8 +178,8 @@ python3 web-demo/build.py --serve    # builds, then previews at http://localhost
 |---|---|
 | `index.html`, `board/index.html`, … , `404.html` | the app shell (`http/web.rs` `shell_response`), with the demo banner and worker boot in place of the module load |
 | `sw.js` | the service worker (source `site/sw.js`); it must sit at the root to control every path |
-| `assets/` | a copy of `crates/sm-server/src/web/` |
-| `demo/` | `demo.js` (banner, read-only notice, worker boot) and `demo.css` |
+| `assets/` | a copy of `crates/sm-server/src/web/`, with `build.py`'s `PATCHES`: "Mac" reads "Dev machine", and Settings has no Studio SSH |
+| `demo/` | `demo.js` (banner, read-only notice, worker boot), `demo.css`, `terminal.js` and `terminals.json` (agent terminals) |
 | `fixtures/` | a copy of `fixtures/` |
 
 How it replays:
@@ -175,8 +197,8 @@ How it replays:
   restarts it. Timestamps in each response are shifted so that ages read as they did live.
 - **Nothing writes.** Any non-GET request gets 403 `Demo — read only`, and the page shows a
   notice saying what the real app would have done, with a link to install it. That covers New
-  agent, Start, Send, Retire, Restore, Archive, review submit, terminal attach and `/btw`.
-  Notes are the exception (above), and `POST /client/board/seen`, which the Board sends by
+  agent, Start, Send, Retire, Restore, Archive, review submit and `/btw`.
+  Notes, Worktrees and the terminal are the exceptions (above), and `POST /client/board/seen`, which the Board sends by
   itself, gets a quiet 200.
 - **The first visit** registers the worker and loads the app once the worker controls the
   page, so the app's first request already goes to the worker. Browsers without service
@@ -185,3 +207,19 @@ How it replays:
 For checking: `POST /__demo/seek?t=<seconds>` jumps the clock, and `GET /__demo/misses` lists
 URLs the UI asked for that the current tick did not have. `node web-demo/site/sw.test.js`
 tests the timestamp shift, the lookup key and the notes helpers.
+
+## The terminal
+
+A browser can't hand a WebSocket to a service worker, so the terminal works in the page:
+
+- The worker answers `POST /client/sessions/<id>/browser-attach-ticket` with
+  `ws_url: /__demo/terminal/<id>`. `demo.js` replaces `window.WebSocket` and hands that URL to
+  `SmDemoTerminal` (`site/terminal.js`); every other URL gets a real socket.
+- `SmDemoTerminal` speaks the server's frames (`auth` → `status: attached`, `output`, `ping` →
+  `pong`, `resize`, `input`, `key`, `detach`). Every two seconds it reads `/__demo/clock` and
+  `/watch/state?session=<id>`, appends the steps of `terminals.json` whose `t` has passed, and
+  redraws the input area: a spinner with the agent's status while it works, the input box,
+  and the model and context line. Codex agents get Codex's layout.
+- The visitor can type. Enter shows the prompt, a moment of "Thinking", then a reply that the
+  agent is a recording, and the install notice. When the loop restarts, so does the transcript.
+
