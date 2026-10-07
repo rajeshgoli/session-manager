@@ -242,3 +242,11 @@ test('inbox advances to the next shown row and agent types match exactly', async
   assert.equal(matchType(types, { provider: 'codex-fork', model: 'gpt-6.1-sol', reasoning_effort: 'medium' }), 'Sol/Med');
   assert.equal(matchType(types, { provider: 'codex-fork', model: 'gpt-6.1-sol', reasoning_effort: 'high' }), '');
 });
+
+test('earliest start date offers when-ready and forbids starting anyway', () => {
+  const ticket = {state:'blocked', number:1954, waiting_until:'2026-10-13T00:00:00Z', warnings:[]};
+  assert.equal(canStart(ticket), false);
+  assert.equal(canStartAnyway(ticket), false);
+  assert.equal(canStartWhenReady(ticket), true);
+  assert.match(blockedReasons(ticket)[0], /Waits until/);
+});

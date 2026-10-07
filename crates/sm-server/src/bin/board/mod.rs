@@ -28,6 +28,15 @@ pub(crate) struct BoardArgs {
 
 #[derive(Subcommand)]
 enum BoardCommand {
+    /// Record the earliest start time; does not authorize an automatic start
+    NotBefore {
+        ticket: String,
+        /// RFC 3339 timestamp with timezone (for example 2026-10-13T00:00:00Z)
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        at: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Mark a ticket as waiting for the owner outside sm
     Waiting {
         ticket: String,
@@ -119,6 +128,26 @@ pub(crate) fn run_board(client: &ApiClient, args: BoardArgs) -> Result<()> {
     };
     let session_id = optional_current_session_id();
     match args.command {
+        Some(BoardCommand::NotBefore { ticket, at, clear }) => {
+            let (repo, number) = refs.parse(&ticket).unwrap_or_else(|error| usage(&error));
+            let response = client.request(
+                "PUT",
+                "/board/not-before",
+                Some(json!({"repo":repo,"number":number,"not_before":at,"clear":clear})),
+            )?;
+            let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+            if response.status != 200 {
+                refused(response.status, &body);
+            }
+            if clear {
+                println!("#{number}: earliest start time cleared");
+            } else {
+                println!(
+                    "#{number}: waits until {}",
+                    body["not_before"].as_str().unwrap_or_default()
+                );
+            }
+        }
         Some(BoardCommand::Waiting {
             ticket,
             text,
@@ -331,6 +360,9 @@ fn ticket_line(ticket: &Value, base: &str) -> String {
         _ => {}
     }
     if state != "done" && state != "standing" {
+        if let Some(at) = ticket["waiting_until"].as_str() {
+            detail.push(format!("waits until {at}"));
+        }
         let open: Vec<String> = ticket["waits_on"]
             .as_array()
             .into_iter()

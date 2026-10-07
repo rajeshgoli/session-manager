@@ -14,6 +14,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BoardModelsTest {
+    @Test fun earliestStartTimePreventsManualStart() {
+        val ticket = Json.decodeFromString<BoardTicket>("""{"state":"blocked","waiting_until":"2026-10-13T00:00:00Z"}""")
+        assertEquals("2026-10-13T00:00:00Z", ticket.waitingUntil)
+        assertFalse(boardCanStart(ticket))
+        assertFalse(boardCanStartAnyway(ticket))
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     /** The shape `GET /client/board` returns (sm#1665 appendix F). */

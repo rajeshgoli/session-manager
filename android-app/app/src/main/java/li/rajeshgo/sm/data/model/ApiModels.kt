@@ -1141,6 +1141,8 @@ data class BoardRef(val repo: String = "", val number: Long = 0)
 
 @Serializable
 data class BoardTicket(
+    @SerialName("not_before") val notBefore: String? = null,
+    @SerialName("waiting_until") val waitingUntil: String? = null,
     val repo: String = "",
     val number: Long = 0,
     val title: String = "",

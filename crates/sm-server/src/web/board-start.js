@@ -8,12 +8,13 @@ import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 export const REVIEWER_KINDS = [{ value: '', label: 'Lane default' }, { value: 'github_codex', label: 'GitHub' },
   { value: 'codex', label: 'Codex run' }, { value: 'claude', label: 'Claude run' }, { value: 'paired', label: 'Paired' }];
 
-export const canStartAnyway = (ticket) => ticket.state === 'blocked'
+export const canStartAnyway = (ticket) => ticket.state === 'blocked' && !ticket.waiting_until
   && !(ticket.warnings || []).some((warning) => ['stale', 'cycle', 'merged_not_closed'].includes(warning));
 
 export function blockedReasons(ticket) {
   const blockers = (ticket.waits_on || []).filter((item) => item.state !== 'done').map((item) => `#${item.number}`);
   const reasons = [];
+  if (ticket.waiting_until) reasons.push(`Waits until ${new Date(ticket.waiting_until).toLocaleString()}.`);
   if (blockers.length) reasons.push(`#${ticket.number} waits on ${blockers.join(', ')}, which ${blockers.length === 1 ? 'is' : 'are'} not done.`);
   if ((ticket.warnings || []).includes('stale')) reasons.push('GitHub data is stale. Refresh the Board to check this ticket.');
   if ((ticket.warnings || []).includes('cycle')) reasons.push('This ticket is in a dependency cycle. Fix its ticket links before starting.');

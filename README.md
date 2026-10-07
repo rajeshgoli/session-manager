@@ -208,3 +208,19 @@ command reference are covered in the
 ## License
 
 MIT
+
+### Tickets that must wait for a date
+
+Record an earliest start time with an explicit timezone:
+
+```sh
+sm board not-before fractal-algo-rust#1954 2026-10-13T00:00:00Z
+sm board not-before fractal-algo-rust#1954 --clear
+```
+
+The Board shows “Waits until” and offers **Start when ready** while the time is
+in the future. Setting the date does not authorize a launch. If you authorize
+**Start when ready**, the Board starts the ticket on its next refresh after the
+time arrives and all ticket dependencies finish. The date survives restarts and
+GitHub refreshes. **Start anyway** cannot bypass it; clear or change the date
+explicitly to permit an earlier start. Dates in issue prose are not parsed.
