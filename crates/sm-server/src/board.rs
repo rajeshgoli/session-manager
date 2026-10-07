@@ -168,6 +168,15 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
     {
         conn.execute("ALTER TABLE board_items ADD COLUMN tier TEXT", [])?;
     }
+    if conn
+        .prepare("SELECT waits_on FROM board_members LIMIT 0")
+        .is_err()
+    {
+        conn.execute(
+            "ALTER TABLE board_members ADD COLUMN waits_on TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     launch::schema(conn)?;
     Ok(())
 }
@@ -348,6 +357,9 @@ pub struct Recomputed {
     pub ended: Vec<(Lane, i64)>,
     /// Lanes recomputed for the first time.
     pub first_seen: BTreeSet<i64>,
+    /// Lanes whose comparison snapshot stays unchanged until all their
+    /// current and previous member repos have a complete GitHub read.
+    pub deferred: BTreeSet<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -605,7 +617,8 @@ impl BoardStore {
     }
 
     /// The repos a pass reads (C1): active lanes' goal repos, the configured
-    /// repos, and the repos of open members at the last recompute.
+    /// repos, and the repos of open members at the last recompute. A
+    /// previous member's stale repo stays in the set until it recovers.
     pub fn read_set(&self, outside: &Outside) -> Result<BTreeSet<String>> {
         let mut repos: BTreeSet<String> = outside.config_repos.iter().cloned().collect();
         let Some(conn) = self.open_read()? else {
@@ -618,7 +631,9 @@ impl BoardStore {
             "SELECT DISTINCT m.repo FROM board_members m
              JOIN board_lanes l ON l.id = m.lane_id AND l.ended_at IS NULL
              JOIN board_items i ON i.repo = m.repo AND i.number = m.number
-             WHERE i.state = 'open'",
+             WHERE i.state = 'open' OR EXISTS (
+                 SELECT 1 FROM board_repo_sync s
+                 WHERE s.repo = m.repo AND s.last_error_at IS NOT NULL)",
         )?;
         for repo in statement.query_map([], |row| row.get::<_, String>(0))? {
             repos.insert(repo?);
@@ -991,7 +1006,29 @@ impl BoardStore {
         let input = load_input(&tx, outside)?;
         let board = model::compute(&input, now);
         let mut result = Recomputed::default();
+        for lane in &input.lanes {
+            let keys = std::iter::once(&lane.goal)
+                .chain(
+                    input
+                        .members
+                        .get(&lane.id)
+                        .into_iter()
+                        .flat_map(|m| m.keys()),
+                )
+                .chain(
+                    board
+                        .lane(lane.id)
+                        .into_iter()
+                        .flat_map(|view| view.rows.iter().map(|row| &row.key)),
+                );
+            if keys.into_iter().any(|key| input.stale.contains(&key.0)) {
+                result.deferred.insert(lane.id);
+            }
+        }
         for lane in &board.goal_closed {
+            if result.deferred.contains(&lane.id) {
+                continue;
+            }
             if let Some(event) = end_lane_tx(&tx, lane.id, "goal_closed", &ts)? {
                 result.ended.push((lane.clone(), event));
             }
@@ -1012,6 +1049,9 @@ impl BoardStore {
         };
         for view in &board.lanes {
             let lane_id = view.lane.id;
+            if result.deferred.contains(&lane_id) {
+                continue;
+            }
             let previous = input.members.get(&lane_id);
             if previous.is_none() {
                 result.first_seen.insert(lane_id);
@@ -1119,14 +1159,15 @@ impl BoardStore {
             )?;
             for row in &view.rows {
                 tx.execute(
-                    "INSERT INTO board_members (lane_id, repo, number, state, joined_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO board_members (lane_id, repo, number, state, joined_at, waits_on)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         lane_id,
                         row.key.0,
                         row.key.1,
                         board.facts[&row.key].state.as_str(),
-                        row.joined_at
+                        row.joined_at,
+                        serde_json::to_string(&board.facts[&row.key].waits_on)?
                     ],
                 )?;
             }
@@ -1540,7 +1581,7 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
     input.lanes = active_lanes(conn)?;
     {
         let mut statement = conn.prepare(
-            "SELECT lane_id, repo, number, IFNULL(state, 'blocked'), joined_at
+            "SELECT lane_id, repo, number, IFNULL(state, 'blocked'), joined_at, waits_on
              FROM board_members",
         )?;
         for member in statement.query_map([], |row| {
@@ -1549,14 +1590,16 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
                 (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })? {
-            let (lane_id, key, state, joined_at) = member?;
+            let (lane_id, key, state, joined_at, waits_on) = member?;
             input.members.entry(lane_id).or_default().insert(
                 key,
                 Member {
                     state: TicketState::parse(&state).unwrap_or(TicketState::Blocked),
                     joined_at,
+                    waits_on: serde_json::from_str(&waits_on)?,
                 },
             );
         }
@@ -1725,10 +1768,12 @@ fn read_one(
     for chunk in gone.chunks(crate::work_claims::MAX_ALIASES_PER_QUERY) {
         let states = source.items(repo, chunk)?;
         for number in chunk {
-            // A number the batch left out failed to fetch: keep its row.
-            if let Some(node) = states.get(number) {
-                missing.insert(*number, node.clone());
-            }
+            // A missing alias is an incomplete read, not proof that the
+            // issue closed. Do not apply the rest or clear the stale flag.
+            let node = states
+                .get(number)
+                .ok_or_else(|| format!("incomplete issue read: {repo}#{number}"))?;
+            missing.insert(*number, node.clone());
         }
     }
     store

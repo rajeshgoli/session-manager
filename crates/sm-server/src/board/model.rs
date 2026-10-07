@@ -176,6 +176,8 @@ pub const WARN_STALE: &str = "stale";
 pub struct Member {
     pub state: TicketState,
     pub joined_at: String,
+    /// Blockers at the last confirmed recompute, for alert attribution.
+    pub waits_on: Vec<Key>,
 }
 
 /// Everything the model reads.

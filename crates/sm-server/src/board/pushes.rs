@@ -44,6 +44,7 @@ pub fn decide_excluding(
     for view in &board.lanes {
         let lane_id = view.lane.id;
         if recomputed.first_seen.contains(&lane_id)
+            || recomputed.deferred.contains(&lane_id)
             || recomputed.ended.iter().any(|(lane, _)| lane.id == lane_id)
         {
             continue;
@@ -66,59 +67,74 @@ pub fn decide_excluding(
                     && !facts.warnings.contains(&WARN_MERGED_NOT_CLOSED)
             })
             .collect();
-        let Some(first) = listed.first() else {
+        let base = &view.lane.goal.0;
+        let mut explained = Vec::new();
+        for first in listed {
+            let from = previous[first].state;
+            let cause = match from {
+                TicketState::Done => format!("{} reopened", short_ref(first, base)),
+                TicketState::InProgress | TicketState::NeedsYou => {
+                    let retired = input
+                        .holders
+                        .get(first)
+                        .and_then(|holders| holders.first())
+                        .map(|holder| holder.name.clone());
+                    let prs = &board.facts[first].prs;
+                    let closed_pr = prs
+                        .iter()
+                        .filter(|pr| pr.state == "CLOSED")
+                        .max_by_key(|pr| pr.number)
+                        .filter(|_| !prs.iter().any(|pr| pr.state == "OPEN"));
+                    match (retired, closed_pr) {
+                        (Some(name), _) => format!("{name} let go of it"),
+                        (None, Some(pr)) => format!("PR #{} closed", pr.number),
+                        (None, None) => match last_holder(first) {
+                            Some(name) => format!("{name} let go of it"),
+                            None => "its agent let go of it".to_owned(),
+                        },
+                    }
+                }
+                TicketState::Blocked
+                | TicketState::Ready
+                | TicketState::CloseReady
+                | TicketState::Standing => {
+                    let closed: Vec<String> = board.facts[first]
+                        .waits_on
+                        .iter()
+                        .filter(|blocker| {
+                            board
+                                .facts
+                                .get(*blocker)
+                                .is_some_and(|facts| facts.state == TicketState::Done)
+                                && previous
+                                    .get(*blocker)
+                                    .is_some_and(|member| member.state != TicketState::Done)
+                        })
+                        .map(|blocker| short_ref(blocker, base))
+                        .collect();
+                    if closed.is_empty() {
+                        if previous[first]
+                            .waits_on
+                            .iter()
+                            .any(|blocker| !board.facts[first].waits_on.contains(blocker))
+                        {
+                            "a link was removed".to_owned()
+                        } else {
+                            // Recovery or an unexplained state change is not
+                            // evidence that a dependency link was removed.
+                            continue;
+                        }
+                    } else {
+                        format!("{} closed", closed.join(", "))
+                    }
+                }
+            };
+            explained.push((first, cause));
+        }
+        let Some((_, cause)) = explained.first() else {
             continue;
         };
-        let base = &view.lane.goal.0;
-        let from = previous[*first].state;
-        let cause = match from {
-            TicketState::Done => format!("{} reopened", short_ref(first, base)),
-            TicketState::InProgress | TicketState::NeedsYou => {
-                let retired = input
-                    .holders
-                    .get(*first)
-                    .and_then(|holders| holders.first())
-                    .map(|holder| holder.name.clone());
-                let prs = &board.facts[*first].prs;
-                let closed_pr = prs
-                    .iter()
-                    .filter(|pr| pr.state == "CLOSED")
-                    .max_by_key(|pr| pr.number)
-                    .filter(|_| !prs.iter().any(|pr| pr.state == "OPEN"));
-                match (retired, closed_pr) {
-                    (Some(name), _) => format!("{name} let go of it"),
-                    (None, Some(pr)) => format!("PR #{} closed", pr.number),
-                    (None, None) => match last_holder(first) {
-                        Some(name) => format!("{name} let go of it"),
-                        None => "its agent let go of it".to_owned(),
-                    },
-                }
-            }
-            TicketState::Blocked
-            | TicketState::Ready
-            | TicketState::CloseReady
-            | TicketState::Standing => {
-                let closed: Vec<String> = board.facts[*first]
-                    .waits_on
-                    .iter()
-                    .filter(|blocker| {
-                        board
-                            .facts
-                            .get(*blocker)
-                            .is_some_and(|facts| facts.state == TicketState::Done)
-                            && previous
-                                .get(*blocker)
-                                .is_some_and(|member| member.state != TicketState::Done)
-                    })
-                    .map(|blocker| short_ref(blocker, base))
-                    .collect();
-                if closed.is_empty() {
-                    "a link was removed".to_owned()
-                } else {
-                    format!("{} closed", closed.join(", "))
-                }
-            }
-        };
+        let listed: Vec<&Key> = explained.iter().map(|(key, _)| *key).collect();
         let mut numbers: Vec<String> = listed
             .iter()
             .take(READY_NAMED)
