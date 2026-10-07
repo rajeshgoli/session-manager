@@ -6027,7 +6027,6 @@ pub fn spawn_host_memory_guard(
 ) {
     let shutdown = queue_shutdown();
     thread::spawn(move || {
-        let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
         let mut last_stop: Option<Instant> = None;
         loop {
             thread::sleep(HOST_MEMORY_GUARD_INTERVAL);
@@ -6038,6 +6037,8 @@ pub fn spawn_host_memory_guard(
                 continue;
             }
             let host = host_memory_capacity();
+            // Read each pass: the reserve rises with kernel pressure (sm#2053).
+            let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
             // The model yields above the job-kill reserve. Failed unloads keep
             // this guard from selecting a queue victim until the model is gone.
             match crate::local_model::guard_model(&state_dir, host, reserve) {
