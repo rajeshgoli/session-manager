@@ -38,6 +38,7 @@ struct FakeIssue {
 struct FakeGitHub {
     issues: Mutex<BTreeMap<Key, FakeIssue>>,
     down: Mutex<BTreeSet<String>>,
+    omitted_items: Mutex<BTreeSet<Key>>,
     rate_remaining: Mutex<Option<i64>>,
     /// Nodes per connection page; GitHub's is 50.
     connection_page: Mutex<usize>,
@@ -189,6 +190,13 @@ impl BoardSource for FakeGitHub {
     fn items(&self, repo: &str, numbers: &[i64]) -> Result<BTreeMap<i64, Option<RefNode>>, String> {
         Ok(numbers
             .iter()
+            .filter(|number| {
+                !self
+                    .omitted_items
+                    .lock()
+                    .unwrap()
+                    .contains(&(repo.into(), **number))
+            })
             .map(|number| {
                 let key = (repo.to_owned(), *number);
                 let exists = self.issues.lock().unwrap().contains_key(&key);
@@ -1916,6 +1924,137 @@ fn no_notice_when_repo_stale() {
     // Reads recover: the alert comes then.
     github.down.lock().unwrap().clear();
     assert_eq!(pass_alerts(&store, &github, &push).len(), 1);
+}
+
+#[test]
+fn ready_notice_not_repeated_after_sync_failure_or_cross_repo_partial_pass() {
+    for failing_repo in [REPO, OTHER] {
+        let (store, dir) = temp_store();
+        let push = push_store(&dir);
+        let github = FakeGitHub::new();
+        github.open(k(1));
+        github.open(k(2));
+        github.open(ko(3));
+        // An open cross-repo member keeps that repo in the read set even
+        // after the blocker closes.
+        github.open(ko(4));
+        github.under(&ko(4), &k(1));
+        github.under(&k(2), &k(1));
+        github.after(&k(2), &ko(3));
+        let lane = add_lane(&store, &github, &k(1));
+        github.close(&ko(3), "COMPLETED");
+        assert_eq!(pass_alerts(&store, &github, &push).len(), 1);
+        let notice = board_notices(&push)[0].clone();
+        assert!(store.ready_notice_wanted(&notice.subject_id).unwrap());
+        let ready_events = || {
+            store
+                .events(100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == "became_ready")
+                .count()
+        };
+        let count = ready_events();
+        github.down.lock().unwrap().insert(failing_repo.into());
+        for _ in 0..2 {
+            let pass = run_pass(&store, &github, &outside(), now()).unwrap();
+            assert_eq!(state(&pass.board, &k(2)), TicketState::Blocked);
+            assert!(pass.deferred.contains(&lane));
+            assert!(pass.transitions.is_empty());
+            assert!(pushes::send(&store, &push, "owner", &pass, now())
+                .unwrap()
+                .is_empty());
+            assert_eq!(pass.input.members[&lane][&k(2)].state, TicketState::Ready);
+        }
+        // The durable snapshot survives reopening the store.
+        let reopened = BoardStore::new(store.db_path.clone());
+        github.down.lock().unwrap().clear();
+        assert!(pass_alerts(&reopened, &github, &push).is_empty());
+        assert_eq!(ready_events(), count);
+        assert_eq!(board_notices(&push).len(), 1);
+    }
+}
+
+#[test]
+fn partial_pass_defers_real_transition_but_not_unrelated_lane() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    for key in [k(1), k(2), k(3), ko(4), ko(5), k(10), k(11), k(12)] {
+        github.open(key);
+    }
+    for child in [k(2), k(3)] {
+        github.under(&child, &k(1));
+    }
+    github.after(&k(2), &k(3));
+    github.after(&k(2), &ko(4));
+    github.under(&ko(5), &k(1));
+    for child in [k(11), k(12)] {
+        github.under(&child, &k(10));
+    }
+    github.after(&k(11), &k(12));
+    github.close(&ko(4), "COMPLETED");
+    let deferred = add_lane(&store, &github, &k(1));
+    let healthy = add_lane(&store, &github, &k(10));
+    github.close(&k(3), "COMPLETED");
+    github.close(&k(12), "COMPLETED");
+    github.down.lock().unwrap().insert(OTHER.into());
+    let pass = run_pass(&store, &github, &outside(), now()).unwrap();
+    let alerts = pushes::send(&store, &push, "owner", &pass, now()).unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].lane_id, healthy);
+    assert_eq!(alerts[0].body, "#11 can start — #12 closed");
+    assert!(pass.transitions.iter().all(|t| t.lane_id != deferred));
+    github.down.lock().unwrap().clear();
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].lane_id, deferred);
+    assert_eq!(alerts[0].body, "#2 can start — #3 closed");
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+}
+
+#[test]
+fn ready_notice_requires_evidence_for_link_removal() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    let lane = add_lane(&store, &github, &k(1651));
+    github.with(&k(1654), |issue| issue.blocked_by.clear());
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].body, "#1654 can start — a link was removed");
+    // A legacy snapshot damaged by a failed read has no causal evidence.
+    store
+        .open_write()
+        .unwrap()
+        .execute(
+            "UPDATE board_members SET state = 'blocked', waits_on = '[]'
+         WHERE lane_id = ?1 AND number = 1654",
+            params![lane],
+        )
+        .unwrap();
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    assert_eq!(board_notices(&push).len(), 1);
+}
+
+#[test]
+fn incomplete_missing_issue_read_keeps_repo_stale_and_snapshot() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    add_lane(&store, &github, &k(1651));
+    github.close(&k(1653), "COMPLETED");
+    github.omitted_items.lock().unwrap().insert(k(1653));
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    assert!(store.repo_syncs().unwrap().iter().any(RepoSync::stale));
+    assert!(store.board(&outside(), now()).unwrap().1.items[&k(1653)].is_open());
+    github.omitted_items.lock().unwrap().clear();
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].body.ends_with("#1653 closed"));
+    assert!(pass_alerts(&store, &github, &push).is_empty());
 }
 
 #[test]
