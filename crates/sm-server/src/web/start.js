@@ -11,6 +11,8 @@ export const EFFORTS = {
 };
 const PROVIDERS = [{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }];
 const OTHER = '__other__';
+const MORE = '__more__';
+const TOP_WORKSPACES = ['fractal-algo-rust', 'session-manager', 'codex-fork', 'deskbar', 'finviz', 'backup-manager'];
 
 /** Settings key for a provider's saved defaults (D4). */
 const defaultsKey = (provider) => (provider === 'claude' ? 'claude' : 'codex');
@@ -30,7 +32,8 @@ function workspaceChoices(settings, watch) {
   (settings.new_agent.workspaces || []).forEach(add);
   (settings.workspace_folders || []).forEach(add);
   for (const agent of (watch && watch.sessions) || []) if (agent.state !== 'stopped') add(agent.repo);
-  return out;
+  const preferred = TOP_WORKSPACES.flatMap(name => out.filter(path => path.replace(/\/$/, '').split('/').at(-1) === name));
+  return [...preferred, ...out.filter(path => !preferred.includes(path))];
 }
 
 const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~' || path.startsWith('~/'));
@@ -47,6 +50,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   const [models, setModels] = useState([]);
   const [busy, setBusy] = useState(false);
   const [other, setOther] = useState(false);
+  const [allFolders, setAllFolders] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -122,6 +126,11 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   } else {
     const choices = workspaceChoices(settings, watch);
     if (form.workspace && form.workspace !== OTHER && !choices.includes(form.workspace)) choices.unshift(form.workspace);
+    const visibleChoices = allFolders ? choices : choices.slice(0, 10);
+    // A cloned workspace stays selectable even when it is outside the first ten.
+    if (!allFolders && form.workspace !== OTHER && form.workspace && !visibleChoices.includes(form.workspace)) {
+      visibleChoices.splice(9, 1, form.workspace);
+    }
     const summary = [form.model || providerDefaultModel(form.provider), form.effort || 'default effort', homeRelative(folder) || 'no workspace'];
     const modelOptions = models.includes(form.model) || !form.model ? models : [form.model, ...models];
     const matched = matchType(agentTypes(settings), { ...form, reasoning_effort: form.effort });
@@ -147,8 +156,14 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
       ${expanded
         ? html`
           <div class="fld"><span class="l">Workspace</span>
-            <select class="inp" value=${form.workspace} onChange=${(e) => set({ workspace: e.target.value })}>
-              ${choices.map((path) => html`<option value=${path}>${homeRelative(path)}</option>`)}
+            <select class="inp" value=${form.workspace} onChange=${(e) => {
+                if (e.target.value === MORE) {
+                  e.target.value = form.workspace;
+                  setAllFolders(true);
+                } else set({ workspace: e.target.value });
+              }}>
+              ${visibleChoices.map((path) => html`<option value=${path}>${homeRelative(path)}</option>`)}
+              ${!allFolders && choices.length > visibleChoices.length ? html`<option value=${MORE}>More folders…</option>` : null}
               <option value=${OTHER}>Other…</option>
             </select></div>
           ${form.workspace === OTHER
