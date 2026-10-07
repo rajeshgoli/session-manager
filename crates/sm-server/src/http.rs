@@ -368,6 +368,7 @@ mod github;
 mod guestbook_page;
 mod handoff;
 mod history;
+mod host_restart;
 mod inbox;
 mod local_agent;
 mod local_model;
@@ -669,6 +670,8 @@ pub struct AppState {
     btw_workers: BtwWorkers,
     listen_port: u16,
     server_instance: String,
+    /// The host restart this server's start detected (sm#2054).
+    detected_host_restart: Option<String>,
     session_store: SessionStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     owner_doc_source: Arc<dyn OwnerDocSource>,
@@ -801,8 +804,7 @@ impl AppState {
         session_store
             .reconcile_reparent_requests()
             .context("reparent authority recovery failed")?;
-        session_store
-            .reconcile_missing_session_runtimes()
+        let detected_host_restart = host_restart::startup(&config, &session_store)
             .context("missing session runtime reconciliation failed")?;
         if let Err(error) = session_store.reconcile_reparent_notifications() {
             eprintln!("reparent notification recovery failed: {error:#}");
@@ -857,6 +859,7 @@ impl AppState {
             btw_workers: BtwWorkers::default(),
             listen_port: 8420,
             server_instance: random_urlsafe_token(24),
+            detected_host_restart,
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             owner_doc_source: Arc::new(docs::GhCliDocSource),
@@ -2220,6 +2223,15 @@ pub fn router(state: AppState) -> Router {
         // Compatibility for clients deployed before the retire terminology migration.
         .route("/sessions/{session_id}/kill", post(retire_session_legacy))
         .route("/sessions/{session_id}/restore", post(restore_session))
+        .route("/host-restarts/latest", get(host_restart::get_latest))
+        .route(
+            "/host-restarts/{restart_id}/restore",
+            post(host_restart::post_restore),
+        )
+        .route(
+            "/host-restarts/{restart_id}/members/{session_id}/leave",
+            post(host_restart::post_leave),
+        )
         .route("/sessions/{session_id}/clear", post(clear_session))
         .route(
             "/sessions/{session_id}/handoff",
@@ -17087,6 +17099,7 @@ fn queue_job_response_with_names(
             | "displaced"
             | "memory_exceeded"
             | "process_limit_exceeded"
+            | "host_restart"
     ) {
         "missing_partial_output"
     } else {

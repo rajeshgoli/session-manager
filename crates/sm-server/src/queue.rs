@@ -278,6 +278,7 @@ pub struct QueueRecoverySummary {
     pub finished_timed_out: usize,
     pub finished_cancelled: usize,
     pub finished_displaced: usize,
+    pub finished_host_restart: usize,
     pub revived_failed: usize,
 }
 
@@ -2010,6 +2011,25 @@ impl RetainedQueueStore {
         cancel_grace_seconds: u64,
         admission_policy: QueueAdmissionPolicy,
     ) -> Result<QueueRecoverySummary> {
+        Self::recover_queue_jobs_in_state_dir_after_boot(
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+            None,
+        )
+    }
+
+    /// Startup recovery. A job running since before `boot_time` died with the
+    /// host, so it finishes as `host_restart` without a liveness probe: its
+    /// pid may already belong to an unrelated process (sm#2054).
+    pub fn recover_queue_jobs_in_state_dir_after_boot(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        boot_time: Option<OffsetDateTime>,
+    ) -> Result<QueueRecoverySummary> {
         let db_path = state_dir.join("queue_runner.db");
         if !db_path.exists() {
             return Ok(QueueRecoverySummary::default());
@@ -2049,8 +2069,12 @@ impl RetainedQueueStore {
                     &job,
                     cancel_grace_seconds,
                     admission_policy,
+                    boot_time,
                 )? {
                     RecoveredQueueJobAction::Polling => summary.polling_running += 1,
+                    RecoveredQueueJobAction::Finished("host_restart") => {
+                        summary.finished_host_restart += 1
+                    }
                     RecoveredQueueJobAction::Finished("succeeded") => {
                         summary.finished_succeeded += 1
                     }
@@ -4936,6 +4960,10 @@ pub fn queue_job_ended_reason(job: &QueueJobRecord) -> Option<(&'static str, Str
             "displaced",
             "Stopped to make room for a perf run; not restarted".to_owned(),
         ),
+        "host_restart" => (
+            "host_restart",
+            "Stopped: the Mac restarted while it ran; not restarted".to_owned(),
+        ),
         "wait_expired" => (
             "gave_up",
             elapsed().map_or_else(
@@ -6079,6 +6107,7 @@ pub fn queue_job_termination_reason(
             .and_then(JsonValue::as_str)
             .unwrap_or(MEMORY_GUARD_CAUSE_UNRECORDED),
         "process_limit_exceeded" => PROCESS_GUARD_CAUSE,
+        "host_restart" => "host_restart",
         _ => return None,
     };
     Some(reason.to_owned())
@@ -6515,6 +6544,7 @@ fn recover_running_queue_job_conn(
     job: &QueueJobRuntimeRecord,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
+    boot_time: Option<OffsetDateTime>,
 ) -> Result<RecoveredQueueJobAction> {
     if let Some(final_state) =
         forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
@@ -6545,6 +6575,13 @@ fn recover_running_queue_job_conn(
         };
         finish_queue_job_conn(conn, job, state, exit_code, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished(state));
+    }
+    let started_before_boot = boot_time
+        .zip(job.started_at.as_deref().and_then(parse_queue_datetime))
+        .is_some_and(|(boot, started)| started < boot);
+    if started_before_boot {
+        finish_queue_job_conn(conn, job, "host_restart", None, Some(message_queue_db_path))?;
+        return Ok(RecoveredQueueJobAction::Finished("host_restart"));
     }
     if queue_job_timed_out(job) {
         if let Some(pgid) = job.process_group_id.or(job.pid) {
@@ -7058,7 +7095,7 @@ fn finish_queue_job_conn_with_policy(
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
-        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')
+        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')
         "#,
         params![job.id, state, finished_at, exit_code],
     )?;
@@ -7086,7 +7123,7 @@ fn retry_unnotified_queue_job_completions_conn(
         r#"
         SELECT id
         FROM queue_jobs
-        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')
           AND completion_notification_required = 1
           AND completion_notified_at IS NULL
         ORDER BY finished_at, id
@@ -7660,6 +7697,14 @@ fn queue_job_completion_text_with_policy(
             .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
             .map(|detail| queue_cancel_text(&detail))
             .unwrap_or_default()
+    } else if state == "host_restart" {
+        format!(
+            " The Mac restarted{} while this job ran and killed it; sm does not resubmit it. \
+             If it used a lot of memory it may have caused the restart: give it a memory budget before resubmitting.",
+            crate::host_restart::system_boot_time()
+                .map(|boot| format!(" at {}", crate::host_restart::clock_text(boot)))
+                .unwrap_or_default()
+        )
     } else {
         String::new()
     };
@@ -7833,6 +7878,7 @@ pub(crate) fn is_terminal_queue_state(state: &str) -> bool {
             | "displaced"
             | "memory_exceeded"
             | "process_limit_exceeded"
+            | "host_restart"
     )
 }
 
@@ -8194,7 +8240,7 @@ fn list_queue_jobs_conn(
     if let Some(value) = filters.state {
         if value == "done" {
             where_clauses
-                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')");
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')");
         } else if value == "active" {
             where_clauses.push("state IN ('pending', 'running')");
         } else {
@@ -9508,6 +9554,7 @@ mod tests {
                 &runtime,
                 0,
                 QueueAdmissionPolicy::default(),
+                None,
             )
             .unwrap(),
             RecoveredQueueJobAction::Finished("memory_exceeded")
@@ -10237,6 +10284,54 @@ mod tests {
     }
 
     #[test]
+    fn a_job_running_since_before_the_boot_finishes_as_host_restart_even_if_its_pid_lives() {
+        let state_dir = unique_temp_path("host-restart-recovery");
+        let message_queue_db = state_dir.join("messages.db");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        // After a reboot the old pid can belong to an unrelated live process.
+        let pid = i64::from(std::process::id());
+        conn.execute(
+            "UPDATE queue_jobs SET pid = ?2, process_group_id = ?2 WHERE id = ?1",
+            params![job.id, pid],
+        )
+        .unwrap();
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        let boot = OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        assert_eq!(
+            recover_running_queue_job_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db,
+                &runtime,
+                0,
+                QueueAdmissionPolicy::default(),
+                Some(boot),
+            )
+            .unwrap(),
+            RecoveredQueueJobAction::Finished("host_restart")
+        );
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "host_restart");
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, None).as_deref(),
+            Some("host_restart")
+        );
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        let text = &notifications[0].text;
+        assert!(
+            text.contains("completed: host_restart termination=host_restart"),
+            "{text}"
+        );
+        assert!(text.contains("The Mac restarted"), "{text}");
+        assert!(text.contains("sm does not resubmit it"), "{text}");
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn process_limit_termination_is_persisted_before_kill_and_named_in_the_completion() {
         let state_dir = unique_temp_path("process-guard-trip");
         let message_queue_db = state_dir.join("messages.db");
@@ -10269,6 +10364,7 @@ mod tests {
                 &runtime,
                 0,
                 QueueAdmissionPolicy::default(),
+                None,
             )
             .unwrap(),
             RecoveredQueueJobAction::Finished("process_limit_exceeded")
@@ -10571,6 +10667,7 @@ mod tests {
             &runtime,
             0,
             QueueAdmissionPolicy::default(),
+            None,
         )
         .unwrap();
         let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
@@ -10599,6 +10696,7 @@ mod tests {
                 &runtime,
                 0,
                 QueueAdmissionPolicy::default(),
+                None,
             )
             .unwrap(),
             RecoveredQueueJobAction::Finished("memory_exceeded")

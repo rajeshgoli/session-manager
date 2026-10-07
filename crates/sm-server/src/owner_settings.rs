@@ -21,12 +21,13 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 5] = [
+const KEYS: [&str; 6] = [
     "new_agent",
     "queue_limits",
     "terminal_limits",
     "reviews",
     "auto_retire",
+    "host_restart",
 ];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
 const WHOLE_VALUES: [&str; 3] = ["repo_short", "reviewer", "agent_types"];
@@ -116,6 +117,9 @@ pub fn defaults() -> Value {
         "auto_retire": {
             "enabled": true,
             "idle_minutes": 60,
+        },
+        "host_restart": {
+            "restore_agents": true,
         },
     })
 }
@@ -268,6 +272,12 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
                 .is_some_and(|minutes| (min..=max).contains(&minutes))
             {
                 return Err(format!("auto_retire.idle_minutes must be {min}–{max}"));
+            }
+            Ok(())
+        }
+        "host_restart" => {
+            if !value["restore_agents"].is_boolean() {
+                return Err("host_restart.restore_agents must be a boolean".to_owned());
             }
             Ok(())
         }
@@ -500,6 +510,14 @@ pub fn auto_retire_minutes(settings: &Value) -> Option<u64> {
         .as_bool()
         .filter(|enabled| *enabled)
         .and_then(|_| auto_retire["idle_minutes"].as_u64())
+}
+
+/// Whether sm restores the agents a host restart interrupted on its own
+/// (sm#2054). From an object `effective` returned; on by default.
+pub fn restore_after_host_restart(settings: &Value) -> bool {
+    settings["host_restart"]["restore_agents"]
+        .as_bool()
+        .unwrap_or(true)
 }
 
 /// The first ticket body line beginning `Tier:` names an agent type.
@@ -901,6 +919,17 @@ mod tests {
         ] {
             assert_eq!(apply_patch(None, &patch).unwrap_err(), error, "{patch}");
         }
+    }
+
+    #[test]
+    fn host_restart_restore_is_on_by_default_and_the_owner_can_turn_it_off() {
+        assert!(restore_after_host_restart(&effective(None)));
+        let off = stored(
+            None,
+            apply_patch(None, &json!({"host_restart": {"restore_agents": false}})).unwrap(),
+        );
+        assert!(!restore_after_host_restart(&effective(Some(&off))));
+        assert!(apply_patch(None, &json!({"host_restart": {"restore_agents": "no"}})).is_err());
     }
 
     #[test]

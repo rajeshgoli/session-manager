@@ -298,6 +298,45 @@ function NoteEditor({ agent, onSaved }) {
 
 const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 
+/**
+ * After a host restart (sm#2054): who it interrupted, why, and one button
+ * that restores them all. Each row restores or retires one agent.
+ */
+function HostRestartBanner() {
+  const [doc, , reload] = usePoll(() => api('/host-restarts/latest'), 60000);
+  const [busy, setBusy] = useState(false);
+  const restart = doc && doc.restart;
+  if (!restart || !restart.open_count) return null;
+  const open = (restart.members || []).filter((member) => member.open);
+  const act = async (path, body, done) => {
+    setBusy(true);
+    try {
+      const result = await api(path, { method: 'POST', body });
+      const failed = (result.results || []).filter((item) => item.outcome !== 'restored');
+      toast(failed.length ? `${failed.length} could not be restored: ${failed[0].error}` : done);
+    } catch (error) {
+      toast(error.message);
+    }
+    setBusy(false);
+    reload();
+  };
+  const base = `/host-restarts/${encodeURIComponent(restart.id)}`;
+  return html`<div class="review-banner restart-banner" role="status">
+    <span class="chip amber">Restart</span>
+    <span><b>The Mac restarted at ${restart.restarted_at_text}</b> — ${open.length} agent${open.length === 1 ? ' was' : 's were'} interrupted.
+      <span class="muted"> ${restart.cause_summary}</span></span>
+    <button type="button" class="btn pri" disabled=${busy}
+      onClick=${() => act(`${base}/restore`, {}, `Restored ${open.length} agents`)}>Restore all</button>
+    <div class="restart-members">${open.map((member) => html`<div key=${member.session_id}>
+      <b>${member.name}</b> <span class="muted">${member.mid_turn ? 'mid-turn' : 'idle'}${member.decision === 'failed' ? ` · restore failed: ${member.error}` : ''}${(member.killed_jobs || []).length ? ` · killed: ${member.killed_jobs.map((job) => job.label).join(', ')}` : ''}</span>
+      <button type="button" class="btn sm" disabled=${busy}
+        onClick=${() => act(`${base}/restore`, { session_ids: [member.session_id] }, `Restored ${member.name}`)}>Restore</button>
+      <button type="button" class="btn sm" disabled=${busy}
+        onClick=${() => act(`${base}/members/${encodeURIComponent(member.session_id)}/leave`, undefined, `Left ${member.name} retired`)}>Leave retired</button>
+    </div>`)}</div>
+  </div>`;
+}
+
 export function AgentsPage({ openRef }) {
   const [filter, setFilter] = useState(() => stored('sm-agents-filter', 'live'));
   const [view, setView] = useState(() => (stored('sm-agents-view', 'attention') === 'repo' ? 'repo' : 'attention'));
@@ -367,6 +406,7 @@ export function AgentsPage({ openRef }) {
   keys.current = { order, cursor };
 
   return html`<div class="content">
+    <${HostRestartBanner} />
     <div class="toolbar">
       <div class="sum">
         ${summaryCounts(doc.counts).map(({ section, n, label }, index) => html`${index ? html`<span class="dot">·</span>` : null}

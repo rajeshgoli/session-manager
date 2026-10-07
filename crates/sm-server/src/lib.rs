@@ -86,6 +86,7 @@ pub mod work_attribution;
 pub mod work_claims;
 pub mod work_history;
 
+pub mod host_restart;
 pub mod host_status;
 
 #[cfg(test)]

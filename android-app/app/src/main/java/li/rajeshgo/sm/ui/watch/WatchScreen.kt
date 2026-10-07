@@ -370,6 +370,10 @@ fun WatchScreen(
                 )
             }
 
+            item {
+                HostRestartBanner(refreshKey = state.lastSync, onChanged = { viewModel.refresh() })
+            }
+
             updateState.availableUpdate?.let { update ->
                 item {
                     UpdateReadyBanner(

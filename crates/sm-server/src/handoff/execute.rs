@@ -252,6 +252,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     ("bug_reports", "selected_session_id", "history"),
     ("guestbook_entries", "session_id", "history"),
+    (
+        "host_restart_members",
+        "session_id",
+        "history of a restart; only stopped agents are members, and they cannot hand off",
+    ),
     ("owner_doc_publishes", "session_id", "history"),
     (
         "owner_doc_reader_sessions",

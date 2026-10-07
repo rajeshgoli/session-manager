@@ -141,7 +141,7 @@ export function SettingsPage() {
           ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
           : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
-          : html`<${NewAgents} data=${data.new_agent} retire=${data.auto_retire} write=${write} />`}</${Resource}>`}
+          : html`<${NewAgents} data=${data.new_agent} retire=${data.auto_retire} restart=${data.host_restart} write=${write} />`}</${Resource}>`}
     </div>
   </div>`;
 }
@@ -180,7 +180,7 @@ export function retireMinutes(value) {
   return n;
 }
 
-function NewAgents({ data, retire, write }) {
+function NewAgents({ data, retire, restart, write }) {
   const [draft, setDraft] = useState({});
   const [board] = useResource('/client/board');
   const [claude] = useResource('/client/session-models?provider=claude');
@@ -218,6 +218,9 @@ function NewAgents({ data, retire, write }) {
     <${Field} label="After (minutes idle)" type="number" min=${String(RETIRE_MINUTES[0])} max=${String(RETIRE_MINUTES[1])} initial=${retire.idle_minutes}
       hint="An hour is past the provider's prompt cache, so retiring then costs no extra tokens."
       save=${value => write('/client/settings', { auto_retire: { idle_minutes: retireMinutes(value) } })} />` : null}
+    ${restart ? html`<${Field} label="Restore interrupted agents after a restart" type="checkbox" initial=${restart.restore_agents}
+      hint="When the Mac restarts, sm brings back every agent it interrupted and tells each what it lost. Queue jobs are never resubmitted."
+      save=${value => write('/client/settings', { host_restart: { restore_agents: value } })} />` : null}
     <h2>First message when starting a ticket</h2>
     <${Field} label="Template" type="textarea" initial=${data.message_template} onDraft=${value => patch('message_template', value)}
       hint="Placeholders: {ticket} {number} {repo} {repo_name} {repo_short} {title} {url}"
