@@ -195,6 +195,8 @@ pub struct ModelInput {
     pub waiting: Vec<WaitingRecord>,
     /// Durable ticket marks, independent of any agent.
     pub elsewhere: BTreeMap<Key, WaitingRecord>,
+    /// Explicit earliest start times, stored as RFC 3339 timestamps.
+    pub not_before: BTreeMap<Key, String>,
     /// Repos whose reads are failing (C4).
     pub stale: BTreeSet<String>,
     /// `board_members` per lane id.
@@ -218,6 +220,9 @@ pub struct NeedsYou {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketFacts {
     pub item: Item,
+    pub not_before: Option<String>,
+    /// Set only while the earliest start time is in the future.
+    pub waiting_until: Option<String>,
     pub state: TicketState,
     pub needs_you: Option<NeedsYou>,
     pub holder: Option<Holder>,
@@ -368,7 +373,7 @@ pub fn compute(input: &ModelInput, now: OffsetDateTime) -> Board {
     for key in &shown {
         facts.insert(
             key.clone(),
-            ticket_facts(input, key, &waits_on, &sub_issues, &cycle_of, &waiting),
+            ticket_facts(input, key, &waits_on, &sub_issues, &cycle_of, &waiting, now),
         );
     }
 
@@ -586,6 +591,7 @@ fn ticket_facts(
     sub_issues: &BTreeMap<Key, BTreeSet<Key>>,
     cycle_of: &BTreeMap<Key, Vec<Key>>,
     waiting: &BTreeMap<Key, &WaitingRecord>,
+    now: OffsetDateTime,
 ) -> TicketFacts {
     let item = input
         .items
@@ -624,6 +630,14 @@ fn ticket_facts(
     });
     let sub_issues_done = children
         .is_some_and(|children| !children.is_empty() && sub_issues_closed == children.len());
+    let not_before = input.not_before.get(key).cloned();
+    let waiting_until = not_before
+        .as_ref()
+        .filter(|at| {
+            // Invalid persisted data must never authorize an early start.
+            crate::owner_push::parse_ts(at).is_none_or(|at| at > now)
+        })
+        .cloned();
     let state = if !item.is_open() {
         TicketState::Done
     } else if input.bugs_goal.as_ref() == Some(key) {
@@ -632,6 +646,8 @@ fn ticket_facts(
         TicketState::NeedsYou
     } else if holder.is_some() || open_pr {
         TicketState::InProgress
+    } else if waiting_until.is_some() {
+        TicketState::Blocked
     } else if sub_issues_done && !open_blocker && !any_stale && !in_cycle {
         TicketState::CloseReady
     } else if !open_blocker && !any_stale && !in_cycle {
@@ -664,6 +680,8 @@ fn ticket_facts(
 
     TicketFacts {
         item,
+        not_before,
+        waiting_until,
         state,
         needs_you: if state == TicketState::NeedsYou {
             needs_you

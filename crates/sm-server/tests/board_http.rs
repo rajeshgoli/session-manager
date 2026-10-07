@@ -2412,3 +2412,63 @@ async fn shared_launch_tier_overrides_lane_default_and_invalidates_old_preview()
         "claude"
     );
 }
+
+#[tokio::test]
+async fn not_before_blocks_manual_override_and_validates_timezone() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    for at in ["tomorrow", "2026-10-13", "2026-10-13T00:00:00"] {
+        let (status, _) = request(
+            &f.app,
+            "PUT",
+            "/board/not-before",
+            Some(json!({"repo":REPO,"number":3,"not_before":at})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, body) = request(
+        &f.app,
+        "PUT",
+        "/board/not-before",
+        Some(json!({"repo":REPO,"number":3,"not_before":"2099-10-13T08:00:00+08:00"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    pass(&f).await;
+    let ticket = f.ticket(3).await;
+    assert_eq!(ticket["state"], "blocked");
+    assert_eq!(ticket["waiting_until"], "2099-10-13T00:00:00Z");
+    for override_blocked in [false, true] {
+        let mut body = start_body(3);
+        body["start_blocked"] = json!(override_blocked);
+        let (status, body) = owner_request(&f, "POST", "/client/board/start", Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("waits until"));
+    }
+    let (status, body) = owner_request(
+        &f,
+        "PUT",
+        "/client/board/auto-start",
+        Some(json!({"repo":REPO,"number":3,"provider":"claude"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/board/not-before",
+        Some(json!({"repo":REPO,"number":3,"clear":true,"not_before":"2099-10-13T00:00:00Z"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/board/not-before",
+        Some(json!({"repo":REPO,"number":3,"clear":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(f.ticket(3).await["not_before"].is_null());
+}

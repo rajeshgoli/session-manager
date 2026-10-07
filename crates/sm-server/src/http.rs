@@ -1968,6 +1968,7 @@ pub fn router(state: AppState) -> Router {
         .route("/merge-holds/release", post(merge_holds::release))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/board", get(board::get_board))
+        .route("/board/not-before", put(board::put_not_before))
         .route("/board/waiting", put(board::put_waiting))
         .route("/notes", get(notes::list).post(notes::create))
         .route("/notes/search", get(notes::search))

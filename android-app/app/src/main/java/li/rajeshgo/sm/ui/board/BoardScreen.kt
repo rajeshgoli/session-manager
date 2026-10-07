@@ -152,7 +152,7 @@ fun boardCanStart(ticket: BoardTicket): Boolean = ticket.state == "ready" && "me
  * A ticket an agent already holds is refused whatever the flag says.
  */
 fun boardCanStartAnyway(ticket: BoardTicket): Boolean =
-    ticket.state == "blocked" && ticket.holder == null &&
+    ticket.state == "blocked" && ticket.holder == null && ticket.waitingUntil == null &&
         ticket.warnings.none { it in setOf("stale", "cycle", "merged_not_closed") }
 
 /** The row's own Inbox thread: the ticket's work thread (sm#1835), else the holder's newest thread. */
@@ -941,6 +941,9 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                         modifier = Modifier.padding(start = 6.dp),
                     )
                 }
+                if (ticket.state == "blocked" && ticket.waitingUntil != null && ticket.holder == null && ticket.autoStart == null) {
+                    RowButton("Start when ready", primary = false) { actions.onStartWhenReady(ticket) }
+                }
                 if (boardCanStart(ticket)) RowButton("Start", primary = true) { actions.onStart(ticket) }
                 if (boardCanStartAnyway(ticket)) RowButton("Start anyway", primary = false) { actions.onStartAnyway(ticket) }
                 if (ticket.state == "close_ready") RowButton("Close", primary = true, enabled = !actions.busy) { actions.onClose(ticket) }
@@ -966,6 +969,9 @@ private fun TicketRow(ticket: BoardTicket, base: String, head: BoardRef?, action
                         }
                     }
                 }
+            }
+            ticket.waitingUntil?.let { at ->
+                Text("Waits until $at", style = MaterialTheme.typography.labelSmall, color = Amber)
             }
             ticket.autoStart?.let { planned ->
                 Text("⏵ when ready · ${planned.agentType ?: "Custom"} · ${planned.model.orEmpty()} ${planned.effort.orEmpty()}" +

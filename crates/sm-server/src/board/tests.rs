@@ -2202,3 +2202,98 @@ fn standing_goal_state() {
     assert_eq!(state(&board(&store), &goal), TicketState::Ready);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn not_before_persists_and_auto_start_waits_for_time_and_dependencies() {
+    let (store, dir) = temp_store();
+    let github = FakeGitHub::new();
+    github.open(k(1));
+    github.open(k(2));
+    github.open(k(3));
+    github.under(&k(2), &k(1));
+    github.after(&k(2), &k(3));
+    add_lane(&store, &github, &k(1));
+    let at = now() + time::Duration::days(1);
+    store
+        .set_not_before(&k(2), Some((&github.node(&k(2)), at)), now())
+        .unwrap();
+    store
+        .authorize_auto_starts(
+            &[auto_start::Choice {
+                repo: REPO.into(),
+                number: 2,
+                agent_type: None,
+                provider: "claude".into(),
+                model: None,
+                reasoning_effort: None,
+                brief: None,
+            }],
+            now(),
+        )
+        .unwrap();
+    // Reopen the store: the date survives process restarts and GitHub refreshes.
+    let store = BoardStore::new(dir.join("message_queue.db"));
+    let before = run_pass(&store, &github, &outside(), now()).unwrap();
+    assert_eq!(state(&before.board, &k(2)), TicketState::Blocked);
+    assert_eq!(before.board.facts[&k(2)].waiting_until, Some(format_ts(at)));
+    assert!(
+        auto_start::plan(&before, store.auto_starts().unwrap(), false)
+            .0
+            .is_empty()
+    );
+    let due = run_pass(&store, &github, &outside(), at).unwrap();
+    assert_eq!(
+        state(&due.board, &k(2)),
+        TicketState::Blocked,
+        "time alone cannot release a dependency"
+    );
+    assert!(due.board.facts[&k(2)].waiting_until.is_none());
+    github.close(&k(3), "COMPLETED");
+    let before = run_pass(&store, &github, &outside(), at - time::Duration::seconds(1)).unwrap();
+    assert_eq!(state(&before.board, &k(2)), TicketState::Blocked);
+    let due = run_pass(&store, &github, &outside(), at).unwrap();
+    assert_eq!(state(&due.board, &k(2)), TicketState::Ready);
+    assert_eq!(
+        auto_start::plan(&due, store.auto_starts().unwrap(), false)
+            .0
+            .len(),
+        1
+    );
+    store.set_not_before(&k(2), None, now()).unwrap();
+    assert!(!store
+        .input(&outside())
+        .unwrap()
+        .not_before
+        .contains_key(&k(2)));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn not_before_preserves_claim_closed_and_owner_wait_precedence() {
+    let mut input = handoff_input();
+    input
+        .not_before
+        .insert(k(1653), format_ts(now() + time::Duration::days(1)));
+    assert_eq!(
+        state(&compute(&input, now()), &k(1653)),
+        TicketState::InProgress
+    );
+    input.items.get_mut(&k(1653)).unwrap().state = "closed".into();
+    assert_eq!(state(&compute(&input, now()), &k(1653)), TicketState::Done);
+    input.items.get_mut(&k(1653)).unwrap().state = "open".into();
+    input.elsewhere.insert(
+        k(1653),
+        WaitingRecord {
+            kind: WaitingKind::Elsewhere,
+            session_id: String::new(),
+            pr: None,
+            text: "Owner decision".into(),
+            url: "https://example.com".into(),
+            created_at: format_ts(now()),
+        },
+    );
+    assert_eq!(
+        state(&compute(&input, now()), &k(1653)),
+        TicketState::NeedsYou
+    );
+}

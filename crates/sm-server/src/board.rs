@@ -152,6 +152,10 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             authorized_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
         );
+        CREATE TABLE IF NOT EXISTS board_not_before (
+            repo TEXT NOT NULL, number INTEGER NOT NULL, not_before TEXT NOT NULL,
+            PRIMARY KEY(repo, number)
+        );
         CREATE TABLE IF NOT EXISTS board_waiting (
             repo TEXT NOT NULL, number INTEGER NOT NULL, text TEXT NOT NULL,
             url TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(repo, number)
@@ -404,6 +408,28 @@ impl BoardStore {
 
     pub fn ensure_schema(&self) -> Result<()> {
         self.open_write().map(|_| ())
+    }
+
+    /// Earliest start time, independent of automatic-start authorization.
+    pub fn set_not_before(
+        &self,
+        key: &Key,
+        mark: Option<(&RefNode, OffsetDateTime)>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction()?;
+        if let Some((node, at)) = mark {
+            upsert_ref(&tx, node, &format_ts(now))?;
+            tx.execute("INSERT OR REPLACE INTO board_not_before(repo, number, not_before) VALUES (?1, ?2, ?3)", params![key.0, key.1, at.to_offset(time::UtcOffset::UTC).format(&time::format_description::well_known::Rfc3339)?])?;
+        } else {
+            tx.execute(
+                "DELETE FROM board_not_before WHERE repo = ?1 AND number = ?2",
+                params![key.0, key.1],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Set or clear a durable mark. The route resolves the ticket before setting it.
@@ -1650,6 +1676,18 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
     if table_exists(conn, "board_settings")? {
         input.bugs_goal = bugs_goal(conn)?;
     }
+    if table_exists(conn, "board_not_before")? {
+        let mut stmt = conn.prepare("SELECT repo, number, not_before FROM board_not_before")?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, i64>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (key, at) = row?;
+            input.not_before.insert(key, at);
+        }
+    }
     input.waiting = outside.waiting.clone();
     if table_exists(conn, "board_waiting")? {
         let mut statement =
@@ -1983,6 +2021,8 @@ fn ticket_json(
         "url": facts.item.url,
         "state": facts.state.as_str(),
         "done_reason": done_reason(&facts.item),
+        "not_before": facts.not_before,
+        "waiting_until": facts.waiting_until,
         "needs_you": facts.needs_you,
         "waits_on": waits_on,
         "holder": facts.holder.as_ref().map(|holder| json!({

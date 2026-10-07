@@ -807,6 +807,79 @@ pub(super) struct PostLinkRequest {
 }
 
 #[derive(Deserialize)]
+pub(super) struct NotBeforeRequest {
+    repo: String,
+    number: i64,
+    not_before: Option<String>,
+    #[serde(default)]
+    clear: bool,
+}
+
+pub(super) async fn put_not_before(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<NotBeforeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/board/not-before",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let key = ticket_key(&payload.repo, payload.number)?;
+    let at = match (payload.clear, payload.not_before.as_deref()) {
+        (true, None) => None,
+        (false, Some(value)) => Some(
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| {
+                    bad_request("not_before must be an RFC 3339 timestamp with a timezone")
+                })?,
+        ),
+        _ => return Err(bad_request("provide not_before or clear, exclusively")),
+    };
+    blocking(&state, move |state| {
+        let node = if payload.clear {
+            None
+        } else {
+            let resolved = state
+                .board_source
+                .resolve(std::slice::from_ref(&key))
+                .map_err(|error| ApiError::Status {
+                    status: StatusCode::BAD_GATEWAY,
+                    detail: error,
+                })?;
+            let issue = resolved
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| ApiError::Status {
+                    status: StatusCode::NOT_FOUND,
+                    detail: "Ticket not found".into(),
+                })?;
+            if issue.node.state != "open" {
+                return Err(bad_request("Ticket is closed"));
+            }
+            Some(issue.node)
+        };
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        board_store(state).set_not_before(
+            &key,
+            node.as_ref().zip(at),
+            time::OffsetDateTime::now_utc(),
+        )?;
+        request_recompute(state);
+        Ok(json!({"cleared": payload.clear, "not_before": at.map(crate::owner_push::format_ts)}))
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
 pub(super) struct WaitingRequest {
     repo: String,
     number: i64,
@@ -1827,6 +1900,15 @@ pub(super) fn validate_start(
         .facts
         .get(key)
         .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if let Some(at) = &facts.waiting_until {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!(
+                "#{} waits until {at}; clear its earliest start time to start earlier",
+                key.1
+            ),
+        });
+    }
     let startable = matches!(
         facts.state,
         crate::board::model::TicketState::Ready | crate::board::model::TicketState::CloseReady
