@@ -10,6 +10,7 @@ use crate::opencode::{
 pub enum OpencodeEventInput<'a> {
     Live(&'a Value),
     Backfill {
+        conversation: &'a str,
         messages: &'a [Value],
         activity: Activity,
     },
@@ -51,7 +52,68 @@ struct PendingEffect {
     tool_db: PathBuf,
 }
 
+struct OwnerWakeAfterUnlock {
+    wake: Option<OwnerAnsweredWake>,
+    needed: bool,
+}
+
+impl Drop for OwnerWakeAfterUnlock {
+    fn drop(&mut self) {
+        if self.needed {
+            if let Some(wake) = &self.wake {
+                (wake.0)();
+            }
+        }
+    }
+}
+
 impl SessionStore {
+    /// Read the cached registry once without its exclusive writer lock. The
+    /// supervisor recovers only unfinished effects, not all retired sessions.
+    pub fn opencode_pending_effect_session_ids(&self) -> Result<BTreeSet<String>> {
+        let state = self.load_parsed_state()?;
+        Ok(state
+            .raw
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|session| {
+                session["provider"] == "opencode"
+                    && session
+                        .get("opencode_pending_effects")
+                        .is_some_and(|effects| {
+                            !effects.is_null()
+                                && effects.as_array().is_none_or(|effects| !effects.is_empty())
+                        })
+            })
+            .filter_map(|session| session["id"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    pub fn opencode_generated_message_ids(
+        &self,
+        session_id: &str,
+        conversation: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut ids = self
+            .queue_store
+            .as_ref()
+            .context("opencode events require retained queue")?
+            .opencode_generated_message_ids(session_id, conversation)?;
+        let state = self.load_parsed_state()?;
+        for launch in session_runtime_launch_records(&state.raw)? {
+            if launch.provider == "opencode"
+                && launch.session_id == session_id
+                && launch.provider_resume_id.as_deref() == Some(conversation)
+            {
+                if let Some(id) = launch.brief_message_id {
+                    ids.insert(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
     /// Apply a live frame or reconnect snapshot. Callers supply all persisted
     /// host-generated message IDs, including the brief, before decoding owner
     /// input. A true result requests the same handoff check as an applied Stop;
@@ -65,20 +127,33 @@ impl SessionStore {
         tool_db: &Path,
     ) -> Result<bool> {
         config.validate()?;
+        // Declared before the write guard so errors unlock before waking.
+        let mut owner_wake = OwnerWakeAfterUnlock {
+            wake: self.owner_answered_wake.clone(),
+            needed: false,
+        };
         let guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let (mut stop_applied, mut owner_wake) =
-            self.drain_opencode_effects(&mut state, session_id)?;
+        let mut stop_applied =
+            self.drain_opencode_effects(&mut state, session_id, &mut owner_wake.needed)?;
         let session = raw_session_object(&state, session_id).context("unknown opencode session")?;
         if json_text(session.get("provider")).as_deref() != Some("opencode")
             || raw_session_is_stopped(session)
         {
             drop(guard);
-            self.wake_opencode_owner(owner_wake);
             return Ok(stop_applied);
         }
         let conversation = json_text(session.get("provider_resume_id"))
             .context("opencode session missing conversation")?;
+        if let OpencodeEventInput::Backfill {
+            conversation: expected,
+            ..
+        } = &input
+        {
+            if *expected != conversation {
+                return Ok(stop_applied);
+            }
+        }
         let binding: crate::opencode::RuntimeBinding = serde_json::from_value(
             session
                 .get("opencode")
@@ -95,9 +170,9 @@ impl SessionStore {
             .unwrap_or(Projection::new(&conversation, Activity::Idle)?);
         let effects = match input {
             OpencodeEventInput::Live(event) => projection.live(event, generated)?,
-            OpencodeEventInput::Backfill { messages, activity } => {
-                projection.backfill(messages, activity, generated)?
-            }
+            OpencodeEventInput::Backfill {
+                messages, activity, ..
+            } => projection.backfill(messages, activity, generated)?,
         };
         // Even a replay producing no effects can advance a completed cursor.
         let now = OffsetDateTime::now_utc();
@@ -202,22 +277,23 @@ impl SessionStore {
             serde_json::to_value(pending)?,
         );
         self.write_raw_json_value(&state)?;
-        let (stop, wake) = self.drain_opencode_effects(&mut state, session_id)?;
+        let stop = self.drain_opencode_effects(&mut state, session_id, &mut owner_wake.needed)?;
         stop_applied |= stop;
-        owner_wake |= wake;
         drop(guard);
-        self.wake_opencode_owner(owner_wake);
         Ok(stop_applied)
     }
 
     /// Run at reader startup, including for a session retired after its final
     /// frame. History/usage still commit; old-conversation context never does.
     pub fn recover_opencode_effects(&self, session_id: &str) -> Result<bool> {
+        let mut owner_wake = OwnerWakeAfterUnlock {
+            wake: self.owner_answered_wake.clone(),
+            needed: false,
+        };
         let guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let (stop, wake) = self.drain_opencode_effects(&mut state, session_id)?;
+        let stop = self.drain_opencode_effects(&mut state, session_id, &mut owner_wake.needed)?;
         drop(guard);
-        self.wake_opencode_owner(wake);
         Ok(stop)
     }
 
@@ -256,21 +332,17 @@ impl SessionStore {
         Ok(true)
     }
 
-    fn wake_opencode_owner(&self, needed: bool) {
-        if needed {
-            if let Some(wake) = &self.owner_answered_wake {
-                (wake.0)();
-            }
-        }
-    }
-
-    fn drain_opencode_effects(&self, state: &mut Value, session_id: &str) -> Result<(bool, bool)> {
+    fn drain_opencode_effects(
+        &self,
+        state: &mut Value,
+        session_id: &str,
+        owner_wake: &mut bool,
+    ) -> Result<bool> {
         let mut stop = raw_session_object(state, session_id)
             .map(pending_stop)
             .transpose()?
             .flatten()
             .is_some();
-        let mut owner_wake = false;
         while let Some(session) = raw_session_object(state, session_id) {
             let Some(raw) = session
                 .get("opencode_pending_effects")
@@ -322,7 +394,7 @@ impl SessionStore {
                         )?;
                     // Repeating this wake is harmless, including after a crash
                     // between the SQL commit and the registry acknowledgement.
-                    owner_wake = true;
+                    *owner_wake = true;
                 }
                 Effect::Tool {
                     part_id,
@@ -403,7 +475,7 @@ impl SessionStore {
                 .remove(0);
             self.write_raw_json_value(state)?;
         }
-        Ok((stop, owner_wake))
+        Ok(stop)
     }
 }
 

@@ -61,6 +61,7 @@ impl Fixture {
         let stopped = self.store.apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &self.messages,
                 activity: Activity::Idle,
             },
@@ -141,6 +142,7 @@ fn disconnected_turn_commits_activity_history_tools_usage_and_cursor_once() {
         .apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &fixture.messages,
                 activity: Activity::Idle
             },
@@ -166,6 +168,43 @@ fn disconnected_turn_commits_activity_history_tools_usage_and_cursor_once() {
         .query_row("SELECT COUNT(*) FROM tool_usage", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn owner_answer_wakes_after_unlock_even_when_a_later_tool_write_fails() {
+    let mut fixture = Fixture::new();
+    fixture.question("question", fixture.started - 1);
+    let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = wakes.clone();
+    let write_lock = fixture.store.write_lock.clone();
+    fixture.store = fixture.store.with_owner_answered_wake(Arc::new(move || {
+        assert!(
+            write_lock.try_lock().is_ok(),
+            "owner wake runs outside the registry lock"
+        );
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }));
+    fixture.tool_db = fixture.root.join("blocked-tools");
+    fs::create_dir(&fixture.tool_db).unwrap();
+    assert!(fixture
+        .store
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Backfill {
+                conversation: "ses_test",
+                messages: &fixture.messages,
+                activity: Activity::Idle,
+            },
+            &OpencodeConfig::default(),
+            &BTreeSet::new(),
+            &fixture.tool_db
+        )
+        .is_err());
+    assert!(fixture.handled("question"));
+    assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    fs::remove_dir(&fixture.tool_db).unwrap();
+    fixture.store.recover_opencode_effects("agent").unwrap();
+    assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -227,6 +266,50 @@ fn failed_tool_write_retains_ordered_effects_and_recovery_does_not_count_twice()
 }
 
 #[test]
+fn stopped_session_recovery_scan_skips_completed_history_without_taking_writer_lock() {
+    let mut fixture = Fixture::new();
+    fixture.tool_db = fixture.root.join("blocked-tools");
+    fs::create_dir(&fixture.tool_db).unwrap();
+    assert!(fixture.apply().is_err());
+    let mut state = fixture.raw();
+    state["sessions"][0]["status"] = json!("stopped");
+    for index in 0..100 {
+        let mut historical = state["sessions"][0].clone();
+        historical["id"] = json!(format!("historical-{index}"));
+        historical["opencode_pending_effects"] = json!([]);
+        state["sessions"].as_array_mut().unwrap().push(historical);
+    }
+    fixture.save(&state);
+    {
+        let _writer = fixture.store.write_lock.lock().unwrap();
+        assert_eq!(
+            fixture.store.opencode_pending_effect_session_ids().unwrap(),
+            BTreeSet::from(["agent".into()])
+        );
+        assert_eq!(fixture.raw(), state);
+    }
+    // Failed recovery remains selected; successful recovery disappears from
+    // the next scan while its history and usage still commit after retirement.
+    assert!(fixture.store.recover_opencode_effects("agent").is_err());
+    assert_eq!(
+        fixture
+            .store
+            .opencode_pending_effect_session_ids()
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir(&fixture.tool_db).unwrap();
+    fixture.store.recover_opencode_effects("agent").unwrap();
+    assert!(fixture
+        .store
+        .opencode_pending_effect_session_ids()
+        .unwrap()
+        .is_empty());
+    assert!(fixture.root.join("usage.jsonl").exists());
+}
+
+#[test]
 fn replayed_owner_input_answers_only_questions_existing_when_it_was_typed() {
     let fixture = Fixture::new();
     fixture.question("earlier", fixture.started - 1000);
@@ -236,6 +319,7 @@ fn replayed_owner_input_answers_only_questions_existing_when_it_was_typed() {
         .apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &fixture.messages[..1],
                 activity: Activity::Idle,
             },
@@ -347,6 +431,41 @@ fn pending_old_usage_commits_journal_after_clear_without_overwriting_new_context
 }
 
 #[test]
+fn snapshot_from_before_clear_cannot_apply_old_busy_status_to_new_conversation() {
+    let fixture = Fixture::new();
+    let mut state = fixture.raw();
+    state["sessions"][0]["provider_resume_id"] = json!("ses_new");
+    state["sessions"][0]["status"] = json!("idle");
+    fixture.save(&state);
+    assert!(!fixture
+        .store
+        .apply_opencode_events(
+            "agent",
+            OpencodeEventInput::Backfill {
+                conversation: "ses_test",
+                messages: &fixture.messages,
+                activity: Activity::Busy,
+            },
+            &OpencodeConfig::default(),
+            &BTreeSet::new(),
+            &fixture.tool_db
+        )
+        .unwrap());
+    let after = fixture.raw();
+    assert_eq!(after["sessions"][0]["status"], "idle");
+    assert!(after["sessions"][0]["opencode_event_projection"].is_null());
+    assert_eq!(
+        fixture
+            .store
+            .get_session("agent")
+            .unwrap()
+            .unwrap()
+            .turns_completed,
+        0
+    );
+}
+
+#[test]
 fn local_context_window_is_explicit_even_when_model_name_has_claude_suffix() {
     let fixture = Fixture::new();
     let config = OpencodeConfig {
@@ -358,6 +477,7 @@ fn local_context_window_is_explicit_even_when_model_name_has_claude_suffix() {
         .apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &fixture.messages,
                 activity: Activity::Idle,
             },
@@ -432,6 +552,7 @@ fn applied_stop_survives_a_later_tool_failure_restart_and_stale_acknowledgement(
         .apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &fixture.messages,
                 activity: Activity::Busy
             },
@@ -502,6 +623,7 @@ fn stop_without_completion_metadata_uses_observation_time_to_fill_finished_row()
         .apply_opencode_events(
             "agent",
             OpencodeEventInput::Backfill {
+                conversation: "ses_test",
                 messages: &fixture.messages,
                 activity: Activity::Busy
             },

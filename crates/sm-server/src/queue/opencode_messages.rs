@@ -3,6 +3,20 @@ use super::*;
 use crate::opencode::MessageBinding;
 
 impl RetainedQueueStore {
+    /// Include delivered rows: a reconnect may replay the host's earlier input.
+    pub fn opencode_generated_message_ids(
+        &self,
+        target: &str,
+        conversation: &str,
+    ) -> Result<BTreeSet<String>> {
+        crate::opencode::validate_id(conversation, "ses")?;
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare("SELECT provider_message_id FROM message_queue WHERE target_session_id=?1 AND provider_conversation_id=?2 AND provider_message_id IS NOT NULL")?;
+            let rows = statement.query_map(params![target, conversation], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<BTreeSet<_>>>()?)
+        })
+    }
+
     /// Atomically assign all three identities, or return the existing binding.
     /// The caller holds the runtime's input lock and calls this immediately
     /// before its first delivery attempt, so IDs reflect submission order.
@@ -106,6 +120,43 @@ fn read_binding(conn: &Connection, target: &str, id: &str) -> Result<Option<Mess
 mod tests {
     use super::*;
     use crate::opencode::tests::ScratchDir;
+
+    #[test]
+    fn opencode_generated_ids_include_delivered_rows_and_isolate_target_and_conversation() {
+        let tmp = ScratchDir::new();
+        let path = tmp.path().join("queue.db");
+        let store = RetainedQueueStore::new(path.clone());
+        let message = store
+            .enqueue_message("agent", "hello", "sequential", None)
+            .unwrap();
+        let binding = store
+            .bind_pending_provider_message("agent", &message, "ses_test")
+            .unwrap();
+        store
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE message_queue SET delivered_at='2026-10-07T00:00:00Z' WHERE id=?1",
+                    [&message],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let reopened = RetainedQueueStore::new(path);
+        assert_eq!(
+            reopened
+                .opencode_generated_message_ids("agent", "ses_test")
+                .unwrap(),
+            BTreeSet::from([binding.message_id])
+        );
+        assert!(reopened
+            .opencode_generated_message_ids("other", "ses_test")
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .opencode_generated_message_ids("agent", "ses_new")
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn opencode_binding_survives_reopen_and_compare_clear_preserves_replacement() {
