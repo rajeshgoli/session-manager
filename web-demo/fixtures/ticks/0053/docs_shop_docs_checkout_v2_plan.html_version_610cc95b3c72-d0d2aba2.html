@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout v2 plan</title>
+<style>
+  body { font: 16px/1.55 Georgia, serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
+  h1, h2 { font-family: -apple-system, system-ui, sans-serif; }
+  .author { color: #57606a; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  th, td { border-bottom: 1px solid #d0d7de; padding: .4rem .5rem; text-align: left; }
+</style>
+</head>
+<body>
+<h1 data-sm-line="16">Checkout v2 plan</h1>
+<p data-sm-line="17" class="author">Author: lead <code>a0000001</code> · acme/shop goal #40</p>
+
+<h2 data-sm-line="19">Recommendation</h2>
+<p data-sm-line="20">Ship the new checkout as six tickets run by five agents. Three tickets have no prerequisites and start
+now; the other three start on their own when their prerequisites merge. Expected wall time is one
+afternoon.</p>
+
+<h2 data-sm-line="24">Tickets</h2>
+<table>
+  <tr data-sm-line="26"><th data-sm-line="26">Ticket</th><th data-sm-line="26">Work</th><th data-sm-line="26">Starts after</th><th data-sm-line="26">Seat</th></tr>
+  <tr data-sm-line="27"><td data-sm-line="27">#41</td><td data-sm-line="27">Cart totals with tax and discounts</td><td data-sm-line="27">—</td><td data-sm-line="27">Claude, mid tier</td></tr>
+  <tr data-sm-line="28"><td data-sm-line="28">#42</td><td data-sm-line="28">Coupon rules engine</td><td data-sm-line="28">—</td><td data-sm-line="28">Codex</td></tr>
+  <tr data-sm-line="29"><td data-sm-line="29">#43</td><td data-sm-line="29">Product search index</td><td data-sm-line="29">—</td><td data-sm-line="29">Local model</td></tr>
+  <tr data-sm-line="30"><td data-sm-line="30">#44</td><td data-sm-line="30">Payment provider adapter</td><td data-sm-line="30">#41</td><td data-sm-line="30">Claude, mid tier</td></tr>
+  <tr data-sm-line="31"><td data-sm-line="31">#45</td><td data-sm-line="31">Order confirmation emails</td><td data-sm-line="31">#42</td><td data-sm-line="31">Codex</td></tr>
+  <tr data-sm-line="32"><td data-sm-line="32">#46</td><td data-sm-line="32">Checkout page</td><td data-sm-line="32">#44, #45</td><td data-sm-line="32">Claude, low tier</td></tr>
+</table>
+
+<h2 data-sm-line="35">Risks</h2>
+<p data-sm-line="36">Discount and tax ordering is the one place a bug costs money. Every pricing PR gets a Codex review before
+merge.</p>
+<style id="sm-doc-style">html.sm-doc-bar-open{padding-top:var(--sm-doc-bar,0px)!important;scroll-padding-top:var(--sm-doc-bar,0px)}
+[data-sm-selected]{outline:2px solid #f59e0b!important;outline-offset:2px;background-color:rgba(245,158,11,.1)!important}
+@media print{#sm-doc-ui{display:none!important}html.sm-doc-bar-open{padding-top:0!important;scroll-padding-top:0!important}[data-sm-selected]{outline:none!important;background:transparent!important}}
+</style><script id="sm-doc-client">(function (CONFIG) {
+  'use strict';
+  // sm owner-doc review client (sm#1451). Everything lives under
+  // window.__smDoc and a shadow root so the doc's own scripts and styles
+  // are untouched.
+  if (window.__smDoc) return;
+  // Mode "review" (docs, the default), "reply" (a message with an agent to
+  // answer) or "read" (a message nobody is left to answer) (sm#1580).
+  var MODE = CONFIG.mode || 'review';
+  var framed = window.top !== window;
+  var MSG = MODE !== 'review';
+  var S = window.__smDoc = {
+    config: CONFIG,
+    drafts: (CONFIG.drafts || []).slice(),
+    replies: (CONFIG.replies || []).slice(),
+    head: null,
+    agent: CONFIG.agent || null,
+    mergeHold: CONFIG.mergeHold || null,
+    canComment: MSG ? MODE === 'reply' : !!CONFIG.canComment,
+    prState: CONFIG.prState,
+    // A reloaded page resumes the server's unfinished submission.
+    attempt: CONFIG.unfinishedReview || null,
+    docState: CONFIG.docState,
+    // A posted review no agent received (sm#1580): offer Assign.
+    undelivered: CONFIG.undeliveredReview || null,
+    assigned: ''
+  };
+  var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  var BLOCK = '[data-sm-line]';
+  var INTERACTIVE = 'a,button,input,select,textarea,label,summary,video,audio,[contenteditable],[onclick],[role=button]';
+
+  function sha7(s) { return (s || '').slice(0, 7); }
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    for (var k in attrs || {}) {
+      if (k === 'text') e.textContent = attrs[k];
+      else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), attrs[k]);
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) { if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+    return e;
+  }
+  function clear(e) { while (e.firstChild) e.removeChild(e.firstChild); return e; }
+  function collapse(text) { return (text || '').replace(/\s+/g, ' ').trim(); }
+  function store(key, value) {
+    try { if (value === undefined) return localStorage.getItem(key); localStorage.setItem(key, value); } catch (e) { return null; }
+  }
+  function newId() {
+    if (window.crypto && crypto.randomUUID) { try { return crypto.randomUUID(); } catch (e) { /* insecure context */ } }
+    var bytes = new Uint8Array(16);
+    (window.crypto || { getRandomValues: function (b) { for (var i = 0; i < b.length; i++) b[i] = Math.random() * 256; return b; } }).getRandomValues(bytes);
+    return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  }
+  function api(method, suffix, body) {
+    var headers = { Accept: 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (CONFIG.token) headers['X-SM-Doc-Token'] = CONFIG.token;
+    return fetch((CONFIG.apiBase || '/docs/' + CONFIG.docId) + suffix, {
+      method: method, headers: headers, credentials: 'same-origin',
+      body: body === undefined ? undefined : JSON.stringify(body)
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        var j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+        if (!r.ok) { var err = new Error((j && j.detail) || ('HTTP ' + r.status)); err.status = r.status; err.body = j; throw err; }
+        return j;
+      });
+    });
+  }
+  function revision(sha) {
+    return (CONFIG.revisions || []).filter(function (r) { return r.sha === sha; })[0];
+  }
+  function pathFor(sha) {
+    var r = revision(sha);
+    if (r) return r.path;
+    if (S.head && S.head.pr_head_sha === sha) return S.head.pr_head_reader_path;
+    return null;
+  }
+  function currentDrafts() { return MSG ? S.drafts : S.drafts.filter(function (d) { return d.commit_sha === CONFIG.sha; }); }
+
+  // ---- shadow UI -------------------------------------------------------
+  var host = el('div', { id: 'sm-doc-ui' });
+  host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647';
+  var root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+  root.appendChild(el('style', { text: [
+    ':host{all:initial}',
+    '[hidden]{display:none!important}',
+    '.bar,.pill,.ban,.chip,.sheet,.reply{pointer-events:auto}',
+    '.reply{position:fixed;left:0;right:0;bottom:0;background:#fff;color:#111827;box-shadow:0 -2px 12px rgba(0,0,0,.3);padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
+    '.reply textarea{min-height:0;resize:none;overflow-y:auto}',
+    '*{box-sizing:border-box;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+    '.bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:nowrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
+    '.bar .t{min-width:0;flex:0 1 auto;font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.bar a{color:#93c5fd;text-decoration:none}',
+    '.bar select{background:#1f2937;color:#f9fafb;border:1px solid #374151;border-radius:4px;padding:2px 4px;max-width:46vw}',
+    '.muted{color:#9ca3af}.ro{color:#fbbf24}.sp{flex:1}',
+    'button{cursor:pointer;border:0;border-radius:6px;padding:6px 12px;background:#e5e7eb;color:#111827}',
+    'button.p{background:#2563eb;color:#fff}button.d{background:#fee2e2;color:#991b1b}button:disabled{opacity:.5;cursor:default}',
+    '.bar button{padding:3px 10px}',
+    '.bar>button,.bar>a{flex-shrink:0;white-space:nowrap}.bar .agent{display:flex;gap:4px;align-items:center;min-width:28px;flex:0 1 auto;max-width:180px}.agent .name{overflow:hidden;text-overflow:ellipsis;min-width:1ch;white-space:nowrap}.agent.done{outline:1px solid #16a34a}.agent .mark{flex-shrink:0}.agent-panel{position:fixed;width:min(310px,calc(100vw - 16px));padding:12px;background:#fff;color:#111827;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 3px 15px #0004;display:flex;flex-direction:column;gap:8px;pointer-events:auto;max-height:80vh;overflow:auto}.agent-panel .row{justify-content:space-between}',
+    '@media(max-width:480px){.bar{gap:4px;padding:6px 4px}.bar *{font-size:12px}.bar .t{max-width:0}.bar select{max-width:64px;min-width:0}.bar .state{max-width:50px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar .agent{max-width:75px}.bar button{padding:4px}.bar .sp{min-width:0}}',
+
+    '.pill{position:fixed;top:6px;right:8px;padding:4px 10px;border-radius:14px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
+    '.ban{position:fixed;left:0;right:0;padding:6px 10px;background:#fef3c7;color:#78350f;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}',
+    '.ban a,.ban .lk{color:#1d4ed8;text-decoration:underline;cursor:pointer;background:none;padding:0}',
+    '.chip{position:fixed;background:#2563eb;color:#fff;border-radius:16px;padding:6px 14px;box-shadow:0 2px 8px rgba(0,0,0,.35)}',
+    '.sheet{position:fixed;bottom:0;right:0;width:min(440px,100%);max-height:85%;overflow:auto;background:#fff;color:#111827;border-radius:10px 10px 0 0;box-shadow:0 -2px 16px rgba(0,0,0,.35);padding:12px;display:flex;flex-direction:column;gap:8px}',
+    '.q{border-left:3px solid #d1d5db;padding-left:8px;color:#4b5563;max-height:6em;overflow:auto;white-space:pre-wrap}',
+    'textarea{width:100%;min-height:6em;padding:8px;border:1px solid #d1d5db;border-radius:6px;resize:vertical}',
+    '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
+    '.item{border:1px solid #e5e7eb;border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:4px}',
+    '.err{color:#b91c1c}.ok{color:#15803d}h3{margin:0;font-weight:600;font-size:15px}',
+    'label{display:flex;gap:6px;align-items:center}',
+    // Touch: 16px text (no zoom on focus) and finger-sized controls.
+    '.touch .sheet,.touch .sheet *{font-size:16px}',
+    '.touch .sheet{width:100%;border-radius:12px 12px 0 0;padding:14px}',
+    '.touch .sheet button{padding:10px 16px}',
+    '.touch textarea{min-height:9em}',
+    '.touch .chip{font-size:16px;padding:10px 18px}',
+    '.touch .reply,.touch .reply *{font-size:16px}',
+    '.touch .reply textarea{min-height:0}',
+    '.touch .reply button{padding:10px 16px}'
+  ].join('\n') }));
+  var ui = el('div', { class: coarse ? 'touch' : '' });
+  root.appendChild(ui);
+  (document.body || document.documentElement).appendChild(host);
+
+  var collapsed = store('sm-doc-bar-collapsed') === '1';
+  var bar = el('div', { class: 'bar' });
+  var pill = el('button', { class: 'pill', text: 'sm ▾', onclick: function () { setCollapsed(false); } });
+  var banner = el('div', { class: 'ban' });
+  var chip = el('button', { class: 'chip' });
+  var sheet = el('div', { class: 'sheet' });
+  [bar, pill, banner, chip, sheet].forEach(function (e) { ui.appendChild(e); });
+  banner.hidden = chip.hidden = sheet.hidden = true;
+
+  function setCollapsed(value) {
+    collapsed = value;
+    store('sm-doc-bar-collapsed', value ? '1' : '0');
+    layout();
+  }
+  function layout() {
+    bar.hidden = collapsed;
+    pill.hidden = !collapsed;
+    // offsetHeight: the bar's size before the zoom compensation below.
+    var h = collapsed ? 0 : bar.offsetHeight;
+    document.documentElement.style.setProperty('--sm-doc-bar', h + 'px');
+    document.documentElement.classList.toggle('sm-doc-bar-open', !collapsed);
+    banner.style.top = (collapsed ? 40 : h) + 'px';
+  }
+
+  // Fixed elements are placed against the layout viewport. On a phone that
+  // is often not what is on screen: a page wider than the screen widens it
+  // (so "bottom" and "centre" land off-screen until you zoom out), pinch
+  // zoom shows only part of it, and the keyboard covers its bottom. So every
+  // floating control lives in `ui`, which tracks the visual viewport: it sits
+  // at the visible area's offset, spans it, and undoes the zoom so controls
+  // keep their size. Its fixed children are then placed within it.
+  var vv = window.visualViewport;
+  var uiWidth = null;
+  function syncViewport() {
+    var width;
+    if (!vv) {
+      ui.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;pointer-events:none';
+      width = window.innerWidth;
+    } else {
+      var scale = vv.scale || 1;
+      width = vv.width * scale;
+      ui.style.cssText = 'position:fixed;left:' + vv.offsetLeft + 'px;top:' + vv.offsetTop + 'px;' +
+        'width:' + width + 'px;height:' + vv.height * scale + 'px;' +
+        'transform:scale(' + 1 / scale + ');transform-origin:0 0;pointer-events:none';
+    }
+    // A new width can wrap or unwrap the bar: measure it again once `ui`
+    // has that width, so the page offset and banner match its height.
+    if (width !== uiWidth) { uiWidth = width; layout(); }
+  }
+  var syncQueued = false;
+  function queueSync() {
+    if (syncQueued) return;
+    syncQueued = true;
+    requestAnimationFrame(function () { syncQueued = false; syncViewport(); });
+  }
+  function placeSheet() { syncViewport(); }
+  if (vv) { vv.addEventListener('resize', queueSync); vv.addEventListener('scroll', queueSync); }
+  window.addEventListener('scroll', queueSync, { passive: true });
+  window.addEventListener('resize', queueSync);
+  syncViewport();
+
+  var STATE_LABELS = { new: 'New', read: 'Read', needs_you: 'Needs you', replied: 'Replied', handled: 'Handled' };
+  function stateText() {
+    if (MSG) return MODE === 'read' ? ['No agent is left to reply to', 'ro'] : [STATE_LABELS[S.state] || '', S.state === 'needs_you' ? 'ro' : 'muted'];
+    if (!CONFIG.prNumber) return ['No PR — commenting sends your review to one', 'muted'];
+    if (S.prState === 'open') return [S.canComment ? 'PR open' : 'Read-only', S.canComment ? 'muted' : 'ro'];
+    if (S.prState === 'unknown' || !S.prState) return ['Read-only: PR state unknown', 'ro'];
+    return [S.prState === 'merged' ? 'PR merged — commenting opens a new PR' : 'PR closed — commenting reopens it', 'muted'];
+  }
+
+  S.openReview = openReview;
+  function renderBar() {
+    clear(bar);
+    if (MSG) {
+      var ms = stateText();
+      [el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
+        el('span', { class: ms[1], text: ms[0] }),
+        el('span', { class: 'sp' }),
+        el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
+      ].forEach(function (c) { bar.appendChild(c); });
+      layout();
+      return;
+    }
+    var picker = el('select', { 'aria-label': 'Revision', onchange: function () { if (picker.value && picker.value !== CONFIG.sha) { var p = pathFor(picker.value); if (p) location.href = p; } } });
+    var shas = {};
+    (CONFIG.revisions || []).forEach(function (r, i) {
+      shas[r.sha] = 1;
+      picker.appendChild(el('option', { value: r.sha, text: (r.prNumber && CONFIG.revisions.some(function (other) {return other.prNumber !== r.prNumber;}) ? '#' + r.prNumber + ' · ' : '') + sha7(r.sha) + ' · ' + (r.publishedAt || '').slice(0, 16).replace('T', ' ') + (i === 0 ? ' (latest)' : '') }));
+    });
+    var head = S.head;
+    if (head && head.pr_head_sha && !shas[head.pr_head_sha] && head.pr_head_blob_sha &&
+        !(CONFIG.revisions || []).some(function (r) { return r.blobSha === head.pr_head_blob_sha; })) {
+      shas[head.pr_head_sha] = 1;
+      picker.appendChild(el('option', { value: head.pr_head_sha, text: 'PR head ' + sha7(head.pr_head_sha) + ' (unpublished)' }));
+    }
+    if (!shas[CONFIG.sha]) picker.appendChild(el('option', { value: CONFIG.sha, text: sha7(CONFIG.sha) }));
+    picker.value = CONFIG.sha;
+    var st = stateText();
+    var n = currentDrafts().length;
+    [
+      framed ? null : el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
+      framed ? null : picker,
+      CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
+      el('span', { class: st[1] + ' state', text: st[0] + (S.mergeHold ? ' · ⏸' : ''), title: S.mergeHold ? 'merge hold by ' + S.mergeHold.placed_by : '' }),
+      MSG ? null : agentChip(),
+      el('span', { class: 'sp' }),
+      S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
+        var b = e.currentTarget; b.disabled = true;
+        api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
+          function (err) { b.disabled = false; alertBar(err.message); });
+      } }) : null,
+      (S.canComment || n) ? el('button', { class: 'p', text: 'Review (' + n + ')', onclick: openReview }) : null,
+      el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
+    ].forEach(function (c) { if (c) bar.appendChild(c); });
+    layout();
+  }
+
+  // The panel targets the same session as review delivery.
+  var agentPanel = el('div', { class: 'agent-panel' });
+  agentPanel.hidden = true; ui.appendChild(agentPanel);
+  var retireUntil = 0;
+  function agentChip() {
+    var a = S.agent;
+    var mark = a && a.task_completed_at ? '✓' : '●';
+    var button = el('button', { class: 'agent' + (a && a.task_completed_at ? ' done' : ''),
+      title: a ? a.name + ' · ' + a.state + ' · ' + (a.turns == null ? '—' : a.turns) + ' turns · ctx ' + (a.context_percent == null ? '—' : a.context_percent + '%') : 'No agent',
+      onclick: function () { agentPanel.hidden = !agentPanel.hidden; retireUntil = 0; if (!agentPanel.hidden) renderAgentPanel(); }
+    }, [a ? el('span', { class: 'mark ' + (a.task_completed_at || a.state === 'working' ? 'ok' : 'muted'), text: mark }) : null,
+      el('span', { class: 'name', text: a ? a.name : 'No agent' })]);
+    return button;
+  }
+  function renderAgentPanel(error) {
+    clear(agentPanel);
+    var a = S.agent;
+    function row(k, v) { agentPanel.appendChild(el('div', { class: 'row' }, [el('span', {text:k}), el('span', {text:v})])); }
+    row(a ? a.name : 'No agent', a ? a.state : '');
+    if (a) {
+      row('Turns', a.turns == null ? '—' : String(a.turns));
+      if (a.context_percent != null) row('Context', Math.round(a.context_percent) + '%');
+      if (a.task_completed_at) row('Task', '✓ complete ' + Math.max(0, Math.floor((Date.now() - Date.parse(a.task_completed_at)) / 60000)) + 'm ago');
+    }
+    row('Merge', S.mergeHold ? '⏸ held by ' + S.mergeHold.placed_by : 'not held');
+    if (S.mergeHold && S.mergeHold.reason) agentPanel.appendChild(el('div', {text:S.mergeHold.reason}));
+    function action(method, path, body) {
+      api(method,path,body).then(function (res) { if (res && res.error) throw new Error(res.error); agentPanel.hidden = true; pollHead(); })
+        .catch(function (err) { renderAgentPanel(err.message); if (err.status === 409) pollHead(); });
+    }
+    var actions = [];
+    if (a) actions.push(el('button', {class:a.task_completed_at ? 'p' : '',text:Date.now() < retireUntil ? 'Tap again to retire' : 'Retire',onclick:function () {
+      if (Date.now() < retireUntil) { retireUntil = 0; action('POST','/agent/retire',{session_id:a.session_id}); }
+      else { retireUntil = Date.now() + 4000; renderAgentPanel(); setTimeout(function () { retireUntil = 0; if (!agentPanel.hidden) renderAgentPanel(); },4000); }
+    }}));
+    if (S.prState === 'open') actions.push(el('button', {text:S.mergeHold ? 'Release hold' : 'Hold merge',onclick:function () {action(S.mergeHold ? 'DELETE' : 'POST','/merge-hold',{});} }));
+    agentPanel.appendChild(el('div', {class:'row'},actions));
+    if (error) agentPanel.appendChild(el('div',{class:'err',text:error}));
+    var top=bar.offsetHeight + 8;
+    agentPanel.style.top=top+'px'; agentPanel.style.right='8px';
+  }
+  document.addEventListener('pointerdown',function (event) {
+    var path=event.composedPath ? event.composedPath() : [];
+    if (path.indexOf(agentPanel)<0 && !path.some(function (e) {return e.classList && e.classList.contains('agent');})) agentPanel.hidden=true;
+  });
+  document.addEventListener('keydown',function (event) {if (event.key==='Escape') agentPanel.hidden=true;});
+
+  // ---- banners ---------------------------------------------------------
+  var discardArmed = {};
+  var discardError = {};
+  function renderBanner() {
+    clear(banner);
+    var head = S.head;
+    var lines = [];
+    if (head) {
+      var isPublished = !!revision(CONFIG.sha);
+      if (head.latest_published_sha && (head.latest_published_sha !== CONFIG.latestSha ||
+          (isPublished && head.latest_published_sha !== CONFIG.sha))) {
+        lines.push([el('span', { text: 'A newer revision was published.' }), el('a', { href: head.latest_reader_path, text: 'Load it.' })]);
+      } else if (head.pr_head_blob_differs && head.pr_head_sha && head.pr_head_sha !== CONFIG.sha && head.pr_head_reader_path) {
+        lines.push([el('span', { text: 'The PR has newer unpublished changes to this doc.' }), el('a', { href: head.pr_head_reader_path, text: 'View the PR head' })]);
+      }
+    }
+    if (!MSG && S.undelivered) {
+      var parts = [el('span', { text: 'Review posted to PR #' + CONFIG.prNumber + ', but no agent is left to wake.' })];
+      if (S.assigned) parts.push(el('span', { text: S.assigned }));
+      else parts.push(el('button', { class: 'lk', text: 'Assign to a new agent', onclick: function (e) {
+        var b = e.currentTarget; b.disabled = true;
+        api('POST', '/assign', { review_id: S.undelivered.id }).then(function (res) {
+          S.assigned = 'Assigned to ' + (res.name || res.session_id);
+          if (res.agent) { S.agent = res.agent; renderBar(); }
+          pollHead();
+          renderBanner();
+        }, function (err) { S.assigned = err.message; renderBanner(); });
+      } }));
+      lines.push(parts);
+    }
+    var other = {};
+    if (!MSG) S.drafts.forEach(function (d) { if (d.commit_sha !== CONFIG.sha) (other[d.commit_sha] = other[d.commit_sha] || []).push(d); });
+    Object.keys(other).forEach(function (sha) {
+      var list = other[sha];
+      var path = pathFor(sha);
+      var parts = [el('span', { text: list.length + ' draft comment' + (list.length === 1 ? '' : 's') + ' on ' + sha7(sha) + (discardError[sha] ? ' (' + discardError[sha] + ')' : '') })];
+      if (path) parts.push(el('a', { href: path, text: 'Submit them against ' + sha7(sha) }));
+      parts.push(el('button', { class: 'lk', text: discardArmed[sha] ? 'Tap again to discard' : 'Discard', onclick: function () {
+        if (!discardArmed[sha]) { discardArmed[sha] = 1; renderBanner(); return; }
+        // Only drafts the server deleted leave the list; a failed delete
+        // keeps its draft (and would still be submitted), so say so.
+        var gone = {};
+        var failures = 0;
+        Promise.all(list.map(function (d) {
+          return api('DELETE', '/drafts/' + d.id).then(function () { gone[d.id] = 1; }, function () { failures++; });
+        })).then(function () {
+          S.drafts = S.drafts.filter(function (d) { return !gone[d.id]; });
+          delete discardArmed[sha];
+          discardError[sha] = failures ? failures + ' could not be discarded; try again.' : '';
+          markers(); renderBar(); renderBanner();
+        });
+      } }));
+      lines.push(parts);
+    });
+    lines.forEach(function (parts) { var row = el('div', {}, parts); row.style.cssText = 'display:flex;gap:6px 12px;flex-wrap:wrap;width:100%'; banner.appendChild(row); });
+    banner.hidden = !lines.length;
+    layout();
+  }
+
+  function pollHead() {
+    if (MSG || document.visibilityState === 'hidden') return;
+    api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
+      S.head = head;
+      if (head.pr_number) {CONFIG.prNumber = head.pr_number; CONFIG.prUrl = head.pr_url;}
+      if (head.revisions) CONFIG.revisions = head.revisions;
+      if (head.pr_state === 'open') S.reopenTarget = null;
+      S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
+      if (!agentPanel.hidden) renderAgentPanel();
+      if (head.pr_state) {
+        S.prState = head.pr_state;
+        if (head.pr_state !== 'unknown') S.canComment = ['open','merged','closed'].indexOf(head.pr_state) >= 0;
+      }
+      renderBar();
+      renderBanner();
+    }).catch(function () { /* offline or signed out: keep what we have */ });
+  }
+
+  // ---- inline bubbles ---------------------------------------------------
+  // Like a GitHub review: the composer and each pending draft sit in the
+  // page, right under the paragraph they are about. Being in the flow, the
+  // composer scrolls into view above the on-screen keyboard. Each bubble is
+  // a host element with its own shadow root, so the doc's styles and text
+  // (textContent, selections) are untouched.
+  var BUBBLE = 'sm-doc-bubble';
+  var BUBBLE_CSS = [
+    ':host{all:initial;display:block;margin:10px 0}',
+    '[hidden]{display:none!important}',
+    '*{box-sizing:border-box;font:' + (coarse ? '16px' : '14px') + '/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+    '.card{border:1px solid #d0d7de;border-left:4px solid #2563eb;border-radius:8px;background:#fff;color:#1f2328;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 1px 3px rgba(0,0,0,.12)}',
+    '.tag{font-size:12px;font-weight:600;color:#9a6700;background:#fff8c5;border-radius:10px;padding:1px 8px;align-self:flex-start}',
+    '.q{border-left:3px solid #d0d7de;padding-left:8px;color:#59636e;max-height:4.5em;overflow:hidden}',
+    '.b{white-space:pre-wrap;word-break:break-word}',
+    'textarea{width:100%;min-height:' + (coarse ? '7em' : '5em') + ';padding:8px;border:1px solid #d0d7de;border-radius:6px;resize:vertical;background:#fff;color:#1f2328}',
+    '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
+    'button{cursor:pointer;border:1px solid #d0d7de;border-radius:6px;padding:' + (coarse ? '9px 16px' : '5px 12px') + ';background:#f6f8fa;color:#1f2328}',
+    'button.p{background:#1f883d;border-color:#1f883d;color:#fff}button.d{color:#cf222e}button:disabled{opacity:.5}',
+    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}'
+  ].join('\n');
+  function blocksFor(line) { return document.querySelectorAll('[data-sm-line="' + line + '"]'); }
+  function blockForDraft(d) {
+    if (d.line == null) return null;
+    var blocks = blocksFor(d.line);
+    var probe = collapse(d.quote).slice(0, 40);
+    for (var i = blocks.length - 1; i >= 0; i--) if (probe && collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
+    return blocks[0] || null;
+  }
+  function inBubble(node) {
+    var e = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(e && e.closest && e.closest(BUBBLE));
+  }
+  function bubble(block, kind) {
+    var h = document.createElement(BUBBLE);
+    h.setAttribute('data-kind', kind);
+    h.style.cssText = 'all:initial;display:block;margin:10px 0';
+    // A bubble can't sit between table rows, and one cell is too narrow for
+    // it: anything in a table row puts its bubble in the row's last cell.
+    var row = block.closest('tr');
+    var into = row ? (row.lastElementChild || row) : block;
+    into.appendChild(h);
+    var r = h.attachShadow ? h.attachShadow({ mode: 'open' }) : h;
+    r.appendChild(el('style', { text: BUBBLE_CSS }));
+    return { host: h, root: r };
+  }
+  function removeBubbles(kind) {
+    Array.prototype.forEach.call(document.querySelectorAll(BUBBLE + '[data-kind="' + kind + '"]'), function (h) { h.remove(); });
+  }
+  // Keeps a bubble inside what is visible, below the bar and above the keyboard.
+  function ensureVisible(h) {
+    if (!h || !h.isConnected) return;
+    var r = h.getBoundingClientRect();
+    // Page coordinates of the visible area, below the bar.
+    var top = (collapsed ? (vv ? vv.offsetTop : 0) : bar.getBoundingClientRect().bottom) + 8;
+    var bottom = (vv ? vv.height + vv.offsetTop : window.innerHeight) - 8;
+    // The buttons are at the bottom: if the bubble is taller than the
+    // visible space, keep its bottom in view and let the quote go under the bar.
+    if (r.bottom > bottom) window.scrollBy(0, r.bottom - bottom);
+    else if (r.top < top) window.scrollBy(0, Math.max(r.top - top, r.bottom - bottom));
+  }
+  var composer = null; // {host, draftId, block}
+  function keepComposerVisible() { if (composer) ensureVisible(composer.host); }
+  window.addEventListener('resize', keepComposerVisible);
+  if (vv) vv.addEventListener('resize', keepComposerVisible);
+
+  var deleteArmed = null;
+  function markers() {
+    removeBubbles('draft');
+    var byBlock = new Map();
+    currentDrafts().forEach(function (d) {
+      if (composer && composer.draftId === d.id) return;
+      var b = blockForDraft(d);
+      if (!b) return;
+      if (!byBlock.has(b)) byBlock.set(b, []);
+      byBlock.get(b).push(d);
+    });
+    byBlock.forEach(function (list, block) {
+      var r = bubble(block, 'draft').root;
+      list.forEach(function (d) {
+        r.appendChild(el('div', { class: 'card' }, [
+          el('span', { class: 'tag', text: 'Pending' }),
+          el('div', { class: 'b', text: d.body }),
+          el('div', { class: 'row' }, [
+            el('button', { class: 'd', text: deleteArmed === d.id ? 'Tap again to delete' : 'Delete', onclick: function () {
+              if (deleteArmed !== d.id) { deleteArmed = d.id; markers(); return; }
+              deleteArmed = null;
+              api('DELETE', '/drafts/' + d.id).then(function () {
+                S.drafts = S.drafts.filter(function (x) { return x.id !== d.id; });
+                markers(); renderBar(); if (MSG) renderReply();
+              }, function (err) { alertBar(err.message); });
+            } }),
+            el('button', { text: 'Edit', onclick: function () { compose({ line: d.line, quote: d.quote, block: block }, d); } })
+          ])
+        ]));
+      });
+    });
+  }
+
+  // ---- selecting what to comment on -------------------------------------
+  var anchor = null; // {line, quote, rect()}
+  var selected = null;
+  function unselect() { if (selected) selected.removeAttribute('data-sm-selected'); selected = null; }
+  function hideChip() { chip.hidden = true; anchor = null; unselect(); }
+  function lineOf(node) {
+    var e = node && (node.nodeType === 1 ? node : node.parentElement);
+    var b = e && e.closest && e.closest(BLOCK);
+    return b ? parseInt(b.getAttribute('data-sm-line'), 10) : null;
+  }
+  function placeChip() {
+    if (!anchor) return;
+    var r = anchor.rect();
+    if (coarse) { chip.style.left = '50%'; chip.style.transform = 'translateX(-50%)'; chip.style.top = ''; chip.style.bottom = ((MSG && replyPanel.isConnected ? replyPanel.offsetHeight : 0) + 16) + 'px'; }
+    else {
+      // Page coordinates to `ui` coordinates (visible area, unzoomed).
+      var scale = vv ? vv.scale || 1 : 1;
+      var ox = vv ? vv.offsetLeft : 0, oy = vv ? vv.offsetTop : 0;
+      var width = vv ? vv.width * scale : window.innerWidth, height = vv ? vv.height * scale : window.innerHeight;
+      chip.style.transform = ''; chip.style.bottom = '';
+      chip.style.top = Math.max(8, Math.min(height - 44, (r.bottom - oy) * scale + 6)) + 'px';
+      chip.style.left = Math.max(8, Math.min(width - 120, (r.right - ox) * scale - 60)) + 'px';
+    }
+    chip.hidden = false;
+  }
+  function offer(a, label) {
+    if (!S.canComment) return;
+    anchor = a;
+    chip.textContent = label;
+    chip.onclick = function (e) {
+      e.stopPropagation();
+      var a2 = anchor;
+      var keep = selected;
+      chip.hidden = true; anchor = null; selected = null;
+      compose(a2, null, keep);
+    };
+    placeChip();
+  }
+  function fromSelection() {
+    var sel = window.getSelection && window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    var range = sel.getRangeAt(0);
+    var text = sel.toString().trim();
+    if (!text || host.contains(range.commonAncestorContainer) || inBubble(range.commonAncestorContainer)) return false;
+    unselect();
+    var start = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+    offer({ line: lineOf(range.startContainer), quote: text, block: start && start.closest ? start.closest(BLOCK) : null,
+      rect: function () { return range.getBoundingClientRect(); } }, 'Comment');
+    return true;
+  }
+  document.addEventListener('mouseup', function (e) {
+    if (e.target === host || inBubble(e.target)) return;
+    setTimeout(function () { if (!fromSelection() && !coarse) hideChip(); }, 0);
+  });
+  var selTimer = null;
+  document.addEventListener('selectionchange', function () {
+    if (!coarse) return;
+    clearTimeout(selTimer);
+    selTimer = setTimeout(fromSelection, 350);
+  });
+  document.addEventListener('click', function (e) {
+    if (!coarse || e.target === host || inBubble(e.target)) return;
+    var sel = window.getSelection && window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    var t = e.target;
+    if (!t.closest || t.closest(INTERACTIVE)) return;
+    var block = t.closest(BLOCK);
+    if (!block || block === selected || (composer && composer.block === block)) { hideChip(); return; }
+    unselect();
+    selected = block;
+    block.setAttribute('data-sm-selected', '');
+    offer({
+      line: parseInt(block.getAttribute('data-sm-line'), 10),
+      quote: collapse(block.textContent).slice(0, 300),
+      block: block,
+      rect: function () { return block.getBoundingClientRect(); }
+    }, 'Comment on this');
+  });
+  window.addEventListener('scroll', function () { if (!coarse && anchor) placeChip(); }, { passive: true });
+
+  // ---- composer ----------------------------------------------------------
+  function closeSheet() { sheet.hidden = true; clear(sheet); }
+  function closeComposer() {
+    if (!composer) return;
+    composer.host.remove();
+    if (composer.highlight) composer.highlight.removeAttribute('data-sm-selected');
+    composer = null;
+    markers();
+  }
+  function saveDraft(a, draft, body) {
+    return draft
+      ? api('PATCH', '/drafts/' + draft.id, { body: body }).then(function (d) { S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; }); })
+      : api('POST', '/drafts', MSG ? { line: a.line, quote: a.quote, body: body } : { sha: CONFIG.sha, line: a.line, quote: a.quote, body: body })
+        .then(function (d) { S.drafts.push(d); if (MSG) renderReply(); });
+  }
+  // New comment (a = {line, quote, block}) or edit (draft). Inline under the
+  // block when there is one; a comment with no line uses the sheet.
+  function compose(a, draft, highlight) {
+    closeComposer();
+    closeSheet();
+    var block = (a && a.block) || (draft && blockForDraft(draft));
+    if (!block) return composeSheet(a, draft);
+    var quote = draft ? draft.quote : a.quote;
+    composer = { draftId: draft ? draft.id : null, block: block, highlight: highlight || null };
+    markers();
+    var b = bubble(block, 'composer');
+    composer.host = b.host;
+    var box = el('textarea', { placeholder: draft ? '' : 'Leave a comment' });
+    if (draft) box.value = draft.body;
+    var msg = el('div', { class: 'err' });
+    var save = el('button', { class: 'p', text: draft ? 'Update comment' : 'Add draft', onclick: function () {
+      var body = box.value.trim();
+      if (!body) { msg.textContent = 'Write a comment first.'; return; }
+      save.disabled = true;
+      saveDraft(a, draft, body).then(function () { closeComposer(); renderBar(); })
+        .catch(function (err) { save.disabled = false; msg.textContent = err.message; });
+    } });
+    b.root.appendChild(el('div', { class: 'card' }, [
+      quote ? el('div', { class: 'q', text: quote.length > 160 ? quote.slice(0, 160) + '…' : quote }) : null,
+      box,
+      msg,
+      el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeComposer }), save])
+    ]));
+    box.focus({ preventScroll: true });
+    ensureVisible(b.host);
+    // Again once the keyboard has finished opening.
+    setTimeout(keepComposerVisible, 350);
+  }
+  function composeSheet(a, draft) {
+    clear(sheet);
+    var box = el('textarea', { placeholder: 'Comment' });
+    if (draft) box.value = draft.body;
+    var msg = el('div', { class: 'err' });
+    var save = el('button', { class: 'p', text: draft ? 'Save' : 'Add draft', onclick: function () {
+      var body = box.value.trim();
+      if (!body) { msg.textContent = 'Write a comment first.'; return; }
+      save.disabled = true;
+      saveDraft(a, draft, body).then(function () { closeSheet(); markers(); renderBar(); })
+        .catch(function (err) { save.disabled = false; msg.textContent = err.message; });
+    } });
+    var quote = draft ? draft.quote : a.quote;
+    // Buttons first: on a phone the keyboard takes the bottom of the screen.
+    [
+      el('h3', { text: draft ? 'Edit comment' : 'New comment' }),
+      el('div', { class: 'row' }, [
+        draft ? el('button', { class: 'd', text: 'Delete', onclick: function () {
+          api('DELETE', '/drafts/' + draft.id).then(function () {
+            S.drafts = S.drafts.filter(function (x) { return x.id !== draft.id; });
+            closeSheet(); markers(); renderBar(); if (MSG) renderReply();
+          }).catch(function (err) { msg.textContent = err.message; });
+        } }) : null,
+        el('button', { text: 'Cancel', onclick: closeSheet }),
+        save
+      ]),
+      msg,
+      quote ? el('div', { class: 'q', text: quote }) : null,
+      el('div', { class: 'muted', text: MSG ? 'Not tied to a line.' : 'Not tied to a line: posts as a comment on the file.' }),
+      box
+    ].forEach(function (c) { if (c) sheet.appendChild(c); });
+    sheet.hidden = false;
+    placeSheet();
+    box.focus();
+  }
+  function alertBar(text) {
+    banner.hidden = false;
+    banner.appendChild(el('div', { class: 'err', text: text }));
+  }
+
+  // ---- review panel ------------------------------------------------------
+  // The server posts every stored draft for this revision, so the panel
+  // always shows the stored list: it reloads drafts when it opens and
+  // checks them again right before submitting.
+  function draftKey(list) {
+    return list.map(function (d) { return d.id + '\u0000' + d.body; }).sort().join('\u0001');
+  }
+  function refreshDrafts() {
+    return api('GET', '/drafts').then(function (res) {
+      S.drafts = (res && res.drafts) || [];
+      markers(); renderBar(); renderBanner();
+    });
+  }
+  function openReview() {
+    hideChip();
+    Promise.all([refreshDrafts(), (!MSG && S.prState !== 'open') ? api('GET','/reopen-target').then(function(t){S.reopenTarget=t;}) : Promise.resolve()]).then(function () { renderReview(''); }, function (err) {
+      renderReview('Could not reload drafts: ' + err.message);
+    });
+  }
+  function renderReview(notice) {
+    clear(sheet);
+    var drafts = currentDrafts();
+    var shownKey = draftKey(drafts);
+    sheet.appendChild(el('h3', { text: 'Review ' + sha7(CONFIG.sha) + ' (' + drafts.length + ' comment' + (drafts.length === 1 ? '' : 's') + ')' }));
+    drafts.forEach(function (d) {
+      sheet.appendChild(el('div', { class: 'item' }, [
+        d.quote ? el('div', { class: 'q', text: d.quote.length > 160 ? d.quote.slice(0, 160) + '…' : d.quote }) : null,
+        el('div', { text: d.body }),
+        el('div', { class: 'row' }, [
+          d.line != null ? el('button', { text: 'Show', onclick: function () { var b = blockForDraft(d); if (b) { closeSheet(); b.scrollIntoView({ block: 'center' }); } } }) : null,
+          el('button', { text: 'Edit', onclick: function () { closeSheet(); compose(null, d); } })
+        ])
+      ]));
+    });
+    var msg = el('div', { class: notice ? 'err' : '', text: notice });
+    if (!S.canComment) {
+      sheet.appendChild(el('div', { class: 'ro', text: S.reopenTarget && S.reopenTarget.reason || stateText()[0] + '. These drafts cannot be submitted.' }));
+      sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+      sheet.hidden = false;
+      return;
+    }
+    // A retry reuses the earlier attempt's id, and the server keeps that
+    // attempt's verdict and text, so the panel shows them and locks them.
+    var attempt = S.attempt;
+    var verdicts = [['approve', 'Approve'], ['changes_requested', 'Request changes'], ['comment', 'Comment']];
+    var radios = verdicts.map(function (v) {
+      var r = el('input', { type: 'radio', name: 'sm-verdict', value: v[0] });
+      r.checked = v[0] === (attempt ? attempt.verdict : 'comment');
+      r.disabled = !!attempt;
+      return el('label', {}, [r, v[1]]);
+    });
+    var holdCheck = el('input', {type:'checkbox'});
+    holdCheck.checked = !!S.mergeHold; holdCheck.disabled = !!S.mergeHold;
+    var body = el('textarea', { placeholder: 'Overall comment (optional)' });
+    if (attempt) { body.value = attempt.body; body.disabled = true; }
+    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : S.reopenTarget && S.reopenTarget.kind === 'new_pr' ? 'Open PR from ' + S.reopenTarget.base + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'reopen' ? 'Reopen PR #' + S.reopenTarget.pr + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'attach' ? 'Submit to PR #' + S.reopenTarget.pr : 'Submit review', onclick: function () {
+      var picked = root.querySelector ? root.querySelector('input[name=sm-verdict]:checked') : null;
+      submit.disabled = true;
+      msg.className = 'muted';
+      msg.textContent = 'Submitting…';
+      refreshDrafts().then(function () {
+        if (draftKey(currentDrafts()) !== shownKey) {
+          renderReview('The drafts changed on another device. Check them, then submit.');
+          return;
+        }
+        if (!S.attempt) S.attempt = { id: newId(), verdict: picked ? picked.value : 'comment', body: body.value, hold: holdCheck.checked };
+        return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body, hold: !!S.attempt.hold })
+          .then(function (res) {
+            S.attempt = null;
+            S.docState = 'reviewed'; pollHead();
+            if (res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
+            S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
+            markers(); renderBar();
+            clear(sheet);
+            sheet.appendChild(el('h3', { class: 'ok', text: 'Review posted' }));
+            sheet.appendChild(el('a', { href: res.github_review_url, target: '_blank', rel: 'noopener', text: 'Open it on GitHub' }));
+            sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+          });
+      }).catch(function (err) {
+        // Another device's submission of this revision takes over: resume
+        // that one (shown, locked) or, once it is done, start afresh.
+        if (err.status === 409 && err.body && 'unfinished_review' in err.body) {
+          S.attempt = err.body.unfinished_review;
+          renderReview(err.message);
+          return;
+        }
+        // Keep the attempt: the server reconciles a retry against GitHub,
+        // so resubmitting can never post the review twice. A 4xx says what
+        // must change first, so a bare retry is not offered.
+        var refused = err.status >= 400 && err.status < 500;
+        renderReview(err.message + (refused ? '' : ' Submitting again is safe.'));
+      });
+    } });
+    if (S.reopenTarget && S.reopenTarget.kind === 'refused') {submit.disabled = true; msg.className = 'err'; msg.textContent = S.reopenTarget.reason;}
+    // Actions above the overall comment, clear of the on-screen keyboard.
+    [el('div', { class: 'row' }, radios),
+      el('label', {}, [holdCheck, 'Hold merge until I release it']),
+      el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeSheet }), submit]),
+      msg,
+      attempt ? el('div', { class: 'muted', text: 'Retrying your earlier submission with its verdict and text.' }) : null,
+      body
+    ].forEach(function (c) { if (c) sheet.appendChild(c); });
+    sheet.hidden = false;
+    placeSheet();
+  }
+
+
+  // ---- message reply (sm#1580) ------------------------------------------
+  // Reply mode swaps the review panel for a box fixed to the bottom of the
+  // visible area: overall text plus every passage comment go to the agent
+  // as one message. One submission id is kept until the server confirms,
+  // so a retry after a lost response delivers once.
+  var replyPanel = el('div', { class: 'reply' });
+  var repliesHost = null;
+  var replyAttempt = null;
+  var replyBox = null;
+  var replyNotice = '';
+  S.state = CONFIG.state;
+  function renderReplies() {
+    if (!MSG) return;
+    if (!repliesHost) {
+      repliesHost = document.createElement('section');
+      repliesHost.id = 'sm-replies';
+      (document.querySelector('article') || document.body).insertAdjacentElement('afterend', repliesHost);
+    }
+    clear(repliesHost);
+    repliesHost.appendChild(el('h3', { text: 'Your replies' }));
+    if (!S.replies.length) repliesHost.appendChild(el('p', { class: 'sm-meta', text: 'none yet' }));
+    S.replies.forEach(function (r) {
+      var item = el('div', { class: 'sm-reply' });
+      item.style.cssText = 'border-left:3px solid color-mix(in srgb,currentColor 25%,transparent);padding-left:.75rem;margin:.75rem 0';
+      item.appendChild(el('p', { class: 'sm-meta', text: (r.created_at || '').slice(0, 16).replace('T', ' ') + ' UTC' }));
+      if (r.body) item.appendChild(el('p', { text: r.body }));
+      (r.comments || []).forEach(function (c) {
+        if (c.quote) item.appendChild(el('blockquote', { text: c.quote.length > 300 ? c.quote.slice(0, 300) + '…' : c.quote }));
+        item.appendChild(el('p', { text: c.body }));
+      });
+      repliesHost.appendChild(item);
+    });
+  }
+  function padForPanel() {
+    document.body.style.paddingBottom = MODE === 'review' ? '' : (replyPanel.offsetHeight + 24) + 'px';
+  }
+  function switchToRead() {
+    MODE = 'read';
+    S.canComment = false;
+    hideChip(); closeComposer(); closeSheet();
+    renderBar(); renderReply();
+  }
+  function renderReply() {
+    if (!MSG) return;
+    var draft = replyBox ? replyBox.value : '';
+    clear(replyPanel);
+    if (MODE === 'read') {
+      replyPanel.appendChild(el('div', { class: 'ro', text: 'No agent is left to reply to' }));
+      padForPanel();
+      return;
+    }
+    var n = currentDrafts().length;
+    replyBox = el('textarea', { rows: '1', placeholder: 'Reply to ' + (CONFIG.replyTo || 'the agent') + '…' });
+    replyBox.value = draft;
+    var grow = function () {
+      replyBox.style.height = 'auto';
+      var line = parseFloat(getComputedStyle(replyBox).lineHeight) || 20;
+      replyBox.style.height = Math.min(replyBox.scrollHeight, line * 6 + 16) + 'px';
+      padForPanel();
+    };
+    replyBox.addEventListener('input', grow);
+    var msg = el('div', { class: replyNotice ? 'err' : 'muted', text: replyNotice });
+    var send = el('button', { class: 'p', text: n ? 'Send (' + n + ' comment' + (n === 1 ? '' : 's') + ')' : 'Send', onclick: function () {
+      var shown = draftKey(currentDrafts());
+      send.disabled = true;
+      msg.className = 'muted'; msg.textContent = 'Sending…';
+      refreshDrafts().then(function () {
+        if (draftKey(currentDrafts()) !== shown) {
+          replyNotice = 'The comments changed on another device. Check them, then send.';
+          renderReply();
+          return;
+        }
+        if (!replyBox.value.trim() && !currentDrafts().length) {
+          send.disabled = false; msg.className = 'err'; msg.textContent = 'Write a reply or add a comment first.';
+          return;
+        }
+        if (!replyAttempt) replyAttempt = newId();
+        return api('POST', '/reply', { submission_id: replyAttempt, body: replyBox.value }).then(function (res) {
+          replyAttempt = null;
+          replyNotice = '';
+          S.drafts = [];
+          S.replies.push(res);
+          if (S.state !== 'handled') S.state = 'replied';
+          replyBox.value = '';
+          markers(); renderBar(); renderReplies(); renderReply();
+          var ok = replyPanel.querySelector('.muted');
+          if (ok) { ok.className = 'ok'; ok.textContent = 'Sent to ' + (res.delivered_to_session_name || CONFIG.replyTo || 'the agent'); }
+        });
+      }).catch(function (err) {
+        if (err.status === 409 && /No agent is left/.test(err.message)) { switchToRead(); return; }
+        send.disabled = false;
+        msg.className = 'err';
+        msg.textContent = err.message + (replyAttempt ? ' Sending again is safe.' : '');
+      });
+    } });
+    var handled = S.state === 'needs_you' ? el('button', { text: 'Handled', onclick: function () {
+      handled.disabled = true;
+      api('POST', '/handled').then(function () { S.state = 'handled'; renderBar(); renderReply(); },
+        function (err) { handled.disabled = false; msg.className = 'err'; msg.textContent = err.message; });
+    } }) : null;
+    [replyBox, msg, el('div', { class: 'row' }, [handled, send])].forEach(function (c) { if (c) replyPanel.appendChild(c); });
+    requestAnimationFrame(grow);
+  }
+
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeSheet(); closeComposer(); hideChip(); } });
+  // First in `ui`, so the chip, composer sheet and banners sit above it.
+  if (MSG) { ui.insertBefore(replyPanel, ui.firstChild); renderReplies(); renderReply(); }
+  renderBar();
+  renderBanner();
+  markers();
+  pollHead();
+  setInterval(pollHead, 60000);
+  document.addEventListener('visibilitychange', pollHead);
+})
+({"agent":{"context_percent":10.6,"name":"lead","session_id":"a0000001","state":"working","task_completed_at":null,"turns":0,"via":"author"},"authorAgent":"lead","canComment":true,"docId":"d0c5e7a1","docState":"reviewed","drafts":[],"latestSha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b","mergeHold":null,"name":"shop/docs/checkout_v2_plan.html","prNumber":null,"prState":null,"prUrl":null,"revisions":[{"blobSha":"5036f3c2d26f4bd5845e501d797c57291ccf002e","path":"/docs/shop/docs/checkout_v2_plan.html?version=610cc95b3c72","prNumber":null,"publishedAt":"2026-10-07T00:28:52Z","reviewRequested":true,"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b"}],"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b","title":"Checkout v2 plan","token":null,"undeliveredReview":null,"unfinishedReview":null});</script><script defer src="/assets/reader-bar.js?v=2a68604c2946"></script></body>
+</html>

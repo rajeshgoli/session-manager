@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout v2 plan</title>
+<style>
+  body { font: 16px/1.55 Georgia, serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
+  h1, h2 { font-family: -apple-system, system-ui, sans-serif; }
+  .author { color: #57606a; font-size: .9rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  th, td { border-bottom: 1px solid #d0d7de; padding: .4rem .5rem; text-align: left; }
+</style>
+</head>
+<body>
+<h1>Checkout v2 plan</h1>
+<p class="author">Author: lead <code>a0000001</code> · acme/shop goal #40</p>
+
+<h2>Recommendation</h2>
+<p>Ship the new checkout as six tickets run by five agents. Three tickets have no prerequisites and start
+now; the other three start on their own when their prerequisites merge. Expected wall time is one
+afternoon.</p>
+
+<h2>Tickets</h2>
+<table>
+  <tr><th>Ticket</th><th>Work</th><th>Starts after</th><th>Seat</th></tr>
+  <tr><td>#41</td><td>Cart totals with tax and discounts</td><td>—</td><td>Claude, mid tier</td></tr>
+  <tr><td>#42</td><td>Coupon rules engine</td><td>—</td><td>Codex</td></tr>
+  <tr><td>#43</td><td>Product search index</td><td>—</td><td>Local model</td></tr>
+  <tr><td>#44</td><td>Payment provider adapter</td><td>#41</td><td>Claude, mid tier</td></tr>
+  <tr><td>#45</td><td>Order confirmation emails</td><td>#42</td><td>Codex</td></tr>
+  <tr><td>#46</td><td>Checkout page</td><td>#44, #45</td><td>Claude, low tier</td></tr>
+</table>
+
+<h2>Risks</h2>
+<p>Discount and tax ordering is the one place a bug costs money. Every pricing PR gets a Codex review before
+merge.</p>
+</body>
+</html>
