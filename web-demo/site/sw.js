@@ -10,6 +10,7 @@
 const BUILD = '__SM_DEMO_BUILD__';
 const STATE_CACHE = 'sm-demo-state';
 const CLOCK_KEY = '/__demo/clock-state';
+const NOTES_KEY = '/__demo/notes-state';
 // A visitor who comes back after this long starts the story again.
 const IDLE_RESTART_MS = 15 * 60 * 1000;
 const READ_ONLY = 'Demo — read only';
@@ -55,6 +56,10 @@ async function handle(request, url) {
   const now = await storyNow(timeline);
   let entry = lookup(now.tick, url);
   let recordedAt = now.recordedAt;
+  // History search and repo filter: the recorder captured the unfiltered
+  // lists; filter them here the way the server would.
+  const filter = !entry && historyFilter(url);
+  if (filter) entry = lookup(now.tick, filter.base);
   if (!entry) {
     // Not part of the storyline (Analytics): one snapshot, its ages kept real.
     entry = (await loadStatic()).get(normalize(url.pathname + url.search)) || null;
@@ -68,6 +73,7 @@ async function handle(request, url) {
     return json(404, { detail: 'Not found' });
   }
   let body = shiftTimes(await fileText(entry.file), Date.now() - recordedAt);
+  if (filter) body = JSON.stringify(filter.apply(JSON.parse(body)));
   const html = (entry.content_type || '').includes('text/html');
   if (html) body = injectDemo(body);
   return new Response(request.method === 'HEAD' ? null : body, {
@@ -189,6 +195,28 @@ async function fileText(file) {
   return files.get(file);
 }
 
+// agent_history.rs matches_query and history.rs's repo filter, over one page.
+function historyFilter(url) {
+  const base = new URL(url);
+  if (url.pathname === '/history/agents') {
+    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    if (!q) return null;
+    base.searchParams.set('q', '');
+    const number = /^#?\d+$/.test(q) ? Number(q.replace('#', '')) : null;
+    const matches = (agent) => agent.id.startsWith(q)
+      || [agent.name, agent.role, agent.working_dir].some((text) => (text || '').toLowerCase().includes(q))
+      || (number !== null && Object.values(agent.work || {}).flat().some((item) => item && item.number === number));
+    return { base, apply: (page) => { const agents = page.agents.filter(matches); return { ...page, agents, total: agents.length, next_before: null }; } };
+  }
+  if (url.pathname === '/history') {
+    const repo = (url.searchParams.get('repo') || '').trim();
+    if (!repo) return null;
+    base.searchParams.set('repo', '');
+    return { base, apply: (page) => ({ ...page, rows: page.rows.filter((row) => row.repo === repo), next_before: null }) };
+  }
+  return null;
+}
+
 // ---- responses ----------------------------------------------------------------
 
 function json(status, value) {
@@ -206,23 +234,51 @@ async function readOnly(path) {
 // ---- notes ----------------------------------------------------------------------
 
 // Notes work for real within a visit (new, edit, search, preview, history),
-// starting from fixtures/static/notes.json; nothing outlives the worker.
+// starting from fixtures/static/notes.json. The browser may stop the worker
+// between requests, so changes are kept in the state cache for the visit (one
+// story clock); a new visit starts from the seed again.
 let notesPromise = null;
+let notesVisit = null;
 let lastSaveNotice = 0;
 
-function loadNotes() {
-  if (!notesPromise) {
-    notesPromise = fetch(`/fixtures/static/notes.json?b=${BUILD}`).then((response) => {
-      if (!response.ok) throw new Error(`notes.json: HTTP ${response.status}`);
-      return response.text();
-    }).then((text) => {
-      const seed = JSON.parse(text);
-      const notes = JSON.parse(shiftTimes(text, Date.now() - parseTime(seed.captured_at))).notes;
-      return new Map(notes.map((note) => [note.id, { ...note, title: noteTitle(note.body) }]));
-    });
-    notesPromise.catch(() => { notesPromise = null; });
-  }
+async function visitId() {
+  const current = await loadClock();
+  return current ? `${current.build}:${current.start}` : null;
+}
+
+async function loadNotes() {
+  const visit = await visitId();
+  if (notesPromise && visit !== notesVisit) notesPromise = null;
+  notesVisit = visit;
+  if (!notesPromise) notesPromise = storedNotes(visit).then((stored) => stored || seedNotes());
+  notesPromise.catch(() => { notesPromise = null; });
   return notesPromise;
+}
+
+async function storedNotes(visit) {
+  try {
+    const stored = await (await caches.open(STATE_CACHE)).match(NOTES_KEY);
+    const state = stored ? await stored.json() : null;
+    return state && visit && state.visit === visit ? new Map(state.notes.map((note) => [note.id, note])) : null;
+  } catch (_) { return null; }
+}
+
+async function saveNotes(notes) {
+  try {
+    const state = { visit: notesVisit, notes: [...notes.values()] };
+    await (await caches.open(STATE_CACHE)).put(NOTES_KEY, new Response(JSON.stringify(state)));
+  } catch (_) { /* Notes still work from memory. */ }
+}
+
+function seedNotes() {
+  return fetch(`/fixtures/static/notes.json?b=${BUILD}`).then((response) => {
+    if (!response.ok) throw new Error(`notes.json: HTTP ${response.status}`);
+    return response.text();
+  }).then((text) => {
+    const seed = JSON.parse(text);
+    const notes = JSON.parse(shiftTimes(text, Date.now() - parseTime(seed.captured_at))).notes;
+    return new Map(notes.map((note) => [note.id, { ...note, title: noteTitle(note.body) }]));
+  });
 }
 
 // notes.rs note_title: the first line without leading #s, 80 characters.
@@ -257,6 +313,12 @@ function saveNote(note, body) {
 
 async function notesRoute(request, url) {
   const notes = await loadNotes();
+  const response = await notesResponse(notes, request, url);
+  if (request.method !== 'GET' && response.ok) await saveNotes(notes);
+  return response;
+}
+
+async function notesResponse(notes, request, url) {
   const method = request.method;
   const input = method === 'POST' || method === 'PUT' ? await request.json().catch(() => ({})) : {};
   const parts = url.pathname.split('/').slice(2).map(decodeURIComponent);
@@ -271,7 +333,7 @@ async function notesRoute(request, url) {
   if (parts.length === 0 && method === 'POST') {
     const at = new Date().toISOString();
     const id = `demo-${notes.size + 1}-${Date.now().toString(36)}`;
-    const note = { id, title: '', body: input.body || '', version: 1, updated_at: at, revisions: [{ version: 1, at, body: input.body || '' }] };
+    const note = { id, title: noteTitle(input.body || ''), body: input.body || '', version: 1, updated_at: at, revisions: [{ version: 1, at, body: input.body || '' }] };
     notes.set(id, note);
     readOnly('/notes');
     lastSaveNotice = Date.now();
@@ -385,4 +447,4 @@ function shiftTimes(text, deltaMs) {
 }
 
 // For the unit test (node); the worker global has no `module`.
-if (typeof module !== 'undefined') module.exports = { shiftTimes, parseTime, normalize, recordedAt, markdown, noteTitle, snippet };
+if (typeof module !== 'undefined') module.exports = { shiftTimes, parseTime, normalize, recordedAt, markdown, noteTitle, snippet, historyFilter };
