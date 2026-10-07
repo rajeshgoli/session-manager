@@ -42,20 +42,20 @@ pub(super) fn startup(
     sessions: &SessionStore,
 ) -> anyhow::Result<Option<String>> {
     let store = store_for(config);
-    let detected = config
+    let boot = config
         .rust_core
         .runtime_enabled
         .then(restarts::current_boot)
-        .flatten()
-        .and_then(
-            |boot| match store.detect(&boot, OffsetDateTime::now_utc()) {
+        .flatten();
+    let detected =
+        boot.as_ref()
+            .and_then(|boot| match store.detect(boot, OffsetDateTime::now_utc()) {
                 Ok(restart) => restart,
                 Err(error) => {
                     eprintln!("host restart detection failed: {error:#}");
                     None
                 }
-            },
-        );
+            });
     let message = detected.as_ref().map(|restart| {
         format!(
             "Interrupted when the Mac restarted at {}; `sm recover` restores it",
@@ -67,12 +67,42 @@ pub(super) fn startup(
         return Ok(None);
     };
     let claims = WorkClaimStore::new(expand_home(&config.sm_send.db_path));
-    let members = stopped
+    let mut members = stopped
         .iter()
         .map(|session| cohort_member(session, &claims))
         .collect::<Vec<_>>();
-    if let Err(error) = store.add_members(&restart.id, &members) {
-        eprintln!("recording the {} cohort failed: {error:#}", restart.id);
+    // An earlier start on this boot may have stopped agents and died before
+    // recording them: anything stopped since the boot and not retired joins,
+    // its prior state unknown. Members already recorded are kept as they are.
+    if let Some(boot) = restart.booted_at_time() {
+        for session in sessions.list_sessions(true)? {
+            let stopped_since_boot = session
+                .stopped_at
+                .as_deref()
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .is_some_and(|at| at >= boot);
+            if session.is_stopped()
+                && !session.is_retired()
+                && stopped_since_boot
+                && !members.iter().any(|member| member.session_id == session.id)
+            {
+                let mut member = cohort_member(&session, &claims);
+                member.prior_status = "unknown".to_owned();
+                members.push(member);
+            }
+        }
+    }
+    // The boot counts as handled only once its cohort is durable, so a
+    // failure here leaves the next start to detect it again.
+    match store.add_members(&restart.id, &members) {
+        Ok(()) => {
+            if let Some(boot) = &boot {
+                if let Err(error) = store.commit_boot(boot, OffsetDateTime::now_utc()) {
+                    eprintln!("recording boot {} failed: {error:#}", boot.id);
+                }
+            }
+        }
+        Err(error) => eprintln!("recording the {} cohort failed: {error:#}", restart.id),
     }
     eprintln!(
         "host restart {}: {} agents interrupted",
@@ -210,11 +240,17 @@ pub(super) fn after_restore(state: &AppState, session_id: &str) {
     let Some((restart, member)) = membership else {
         return;
     };
+    // The member stays open until its notice is queued, so a failed enqueue
+    // is retried by the next restore of the cohort.
     let now = OffsetDateTime::now_utc();
-    if let Err(error) = store.decide(&restart.id, session_id, DECISION_RESTORED, None, now) {
-        eprintln!("recording the restore of {session_id} failed: {error:#}");
-    }
+    let restart_id = restart.id.clone();
+    let close = || {
+        if let Err(error) = store.decide(&restart_id, session_id, DECISION_RESTORED, None, now) {
+            eprintln!("recording the restore of {session_id} failed: {error:#}");
+        }
+    };
     if member.noticed_at.is_some() {
+        close();
         return;
     }
     let restart = match latest(state) {
@@ -238,6 +274,7 @@ pub(super) fn after_restore(state: &AppState, session_id: &str) {
             if let Err(error) = store.mark_noticed(&restart.id, session_id, now) {
                 eprintln!("recording the restart notice to {session_id} failed: {error:#}");
             }
+            close();
         }
         Err(error) => eprintln!("sending the restart notice to {session_id} failed: {error:#}"),
     }

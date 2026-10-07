@@ -280,6 +280,8 @@ impl CohortMember {
         }
     }
 
+    /// `unknown` when sm found the agent already stopped by an earlier,
+    /// unfinished start on the same boot.
     pub fn was_mid_turn(&self) -> bool {
         self.prior_status == "running"
     }
@@ -355,7 +357,9 @@ impl HostRestartStore {
 
     /// Compare `current` with the boot sm last ran on. On a new boot, record a
     /// restart and return it; the first boot sm sees only records itself.
-    /// Idempotent per boot, so a handover or second start finds nothing.
+    /// The boot counts as handled only after [`Self::commit_boot`], once the
+    /// cohort is durable: until then every start on it returns the restart
+    /// again, and after it a handover or second start finds nothing.
     pub fn detect(
         &self,
         current: &BootIdentity,
@@ -372,17 +376,9 @@ impl HostRestartStore {
             .optional()?;
         let booted_at = rfc3339(current.booted_at);
         let now = rfc3339(now);
-        tx.execute(
-            r#"
-            INSERT INTO host_boot (singleton, boot_id, booted_at, recorded_at)
-            VALUES (1, ?1, ?2, ?3)
-            ON CONFLICT(singleton) DO UPDATE SET
-                boot_id = excluded.boot_id,
-                booted_at = excluded.booted_at,
-                recorded_at = excluded.recorded_at
-            "#,
-            params![current.id, booted_at, now],
-        )?;
+        if previous.is_none() {
+            record_boot(&tx, current, &now)?;
+        }
         let restart = match previous {
             Some((previous_id, previous_booted_at)) if previous_id != current.id => {
                 let restart = HostRestart {
@@ -394,6 +390,18 @@ impl HostRestartStore {
                     detected_at: now,
                     cause: RestartCause::default(),
                     cause_scanned: false,
+                };
+                // A start that died before committing the boot left this row.
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT detected_at FROM host_restarts WHERE boot_id = ?1",
+                        params![restart.boot_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let restart = HostRestart {
+                    detected_at: existing.unwrap_or(restart.detected_at),
+                    ..restart
                 };
                 tx.execute(
                     r#"
@@ -416,6 +424,12 @@ impl HostRestartStore {
         };
         tx.commit()?;
         Ok(restart)
+    }
+
+    /// Mark `current` handled: later starts on it detect nothing.
+    pub fn commit_boot(&self, current: &BootIdentity, now: OffsetDateTime) -> Result<()> {
+        let conn = self.open()?;
+        record_boot(&conn, current, &rfc3339(now))
     }
 
     pub fn add_members(&self, restart_id: &str, members: &[CohortMember]) -> Result<()> {
@@ -458,7 +472,14 @@ impl HostRestartStore {
         let conn = self.open()?;
         let id: Option<String> = conn
             .query_row(
-                "SELECT id FROM host_restarts ORDER BY booted_at DESC, detected_at DESC LIMIT 1",
+                r#"
+                SELECT r.id FROM host_restarts r
+                ORDER BY EXISTS (
+                    SELECT 1 FROM host_restart_members m
+                    WHERE m.restart_id = r.id AND m.decision IN ('pending', 'failed')
+                ) DESC, r.booted_at DESC, r.detected_at DESC
+                LIMIT 1
+                "#,
                 [],
                 |row| row.get(0),
             )
@@ -600,6 +621,21 @@ impl HostRestartStore {
         )?;
         Ok(())
     }
+}
+
+fn record_boot(conn: &Connection, current: &BootIdentity, now: &str) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO host_boot (singleton, boot_id, booted_at, recorded_at)
+        VALUES (1, ?1, ?2, ?3)
+        ON CONFLICT(singleton) DO UPDATE SET
+            boot_id = excluded.boot_id,
+            booted_at = excluded.booted_at,
+            recorded_at = excluded.recorded_at
+        "#,
+        params![current.id, rfc3339(current.booted_at), now],
+    )?;
+    Ok(())
 }
 
 fn restart_id(boot_id: &str) -> String {
@@ -857,11 +893,11 @@ pub fn notice_text(restart: &HostRestart, member: &CohortMember, killed: &[Kille
         "[sm] The Mac restarted{when} and interrupted you; sm restored you in the same conversation."
     )];
     lines.push(format!("Cause: {}", restart.cause.summary()));
-    lines.push(if member.was_mid_turn() {
-        "You were mid-turn when it went down, so that turn was cut off: check what it finished before you continue.".to_owned()
-    } else {
-        "You were idle when it went down.".to_owned()
-    });
+    lines.push(match member.prior_status.as_str() {
+        "running" => "You were mid-turn when it went down, so that turn was cut off: check what it finished before you continue.",
+        "idle" => "You were idle when it went down.",
+        _ => "sm could not tell whether you were mid-turn: check what your last turn finished before you continue.",
+    }.to_owned());
     let mine: Vec<&KilledJob> = killed
         .iter()
         .filter(|job| job.session_id.as_deref() == Some(member.session_id.as_str()))
@@ -969,6 +1005,15 @@ mod tests {
         assert_eq!(restart.id, "restart-bbbb2222");
         assert_eq!(restart.previous_boot_id, "AAAA-1111");
         assert_eq!(restart.booted_at, "2026-10-07T18:49:00Z");
+        // Until its cohort is committed, a start on the same boot finds it again.
+        let again = store
+            .detect(&second, datetime!(2026-10-07 19:15 UTC))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, restart);
+        store
+            .commit_boot(&second, datetime!(2026-10-07 19:15 UTC))
+            .unwrap();
         // A handover onto the same boot finds nothing new.
         assert_eq!(
             store
@@ -1026,6 +1071,19 @@ mod tests {
         assert_eq!(members[0].decision, DECISION_RESTORED);
         assert_eq!(members[0].claims, vec!["ticket a/b#1".to_owned()]);
         assert!(members[1].is_open());
+        // A later restart with nobody waiting does not hide this one.
+        store
+            .commit_boot(&boot("B", datetime!(2026-10-07 18:49 UTC)), now)
+            .unwrap();
+        let later = store
+            .detect(&boot("C", datetime!(2026-10-09 08:00 UTC)), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.latest().unwrap().unwrap().0.id, restart.id);
+        store
+            .decide(&restart.id, "s2", DECISION_LEFT, None, now)
+            .unwrap();
+        assert_eq!(store.latest().unwrap().unwrap().0.id, later.id);
     }
 
     const PANIC: &str = concat!(

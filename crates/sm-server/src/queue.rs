@@ -6546,6 +6546,25 @@ fn recover_running_queue_job_conn(
     admission_policy: QueueAdmissionPolicy,
     boot_time: Option<OffsetDateTime>,
 ) -> Result<RecoveredQueueJobAction> {
+    // A job running since before the boot died with the host. Decide that
+    // before any branch probes or signals its stored process group, whose id
+    // may now belong to an unrelated process. An exit receipt written before
+    // the restart still says how it ended.
+    let started_before_boot = boot_time
+        .zip(job.started_at.as_deref().and_then(parse_queue_datetime))
+        .is_some_and(|(boot, started)| started < boot);
+    if started_before_boot {
+        let exit_code = queue_job_exit_code_path_exists(job)
+            .then(|| read_exit_code(job.exit_code_path.as_deref()))
+            .flatten();
+        let state = match exit_code {
+            Some(0) => "succeeded",
+            Some(_) => "failed",
+            None => "host_restart",
+        };
+        finish_queue_job_conn(conn, job, state, exit_code, Some(message_queue_db_path))?;
+        return Ok(RecoveredQueueJobAction::Finished(state));
+    }
     if let Some(final_state) =
         forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
     {
@@ -6575,13 +6594,6 @@ fn recover_running_queue_job_conn(
         };
         finish_queue_job_conn(conn, job, state, exit_code, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished(state));
-    }
-    let started_before_boot = boot_time
-        .zip(job.started_at.as_deref().and_then(parse_queue_datetime))
-        .is_some_and(|(boot, started)| started < boot);
-    if started_before_boot {
-        finish_queue_job_conn(conn, job, "host_restart", None, Some(message_queue_db_path))?;
-        return Ok(RecoveredQueueJobAction::Finished("host_restart"));
     }
     if queue_job_timed_out(job) {
         if let Some(pgid) = job.process_group_id.or(job.pid) {
@@ -10288,10 +10300,11 @@ mod tests {
         let state_dir = unique_temp_path("host-restart-recovery");
         let message_queue_db = state_dir.join("messages.db");
         let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
-        // After a reboot the old pid can belong to an unrelated live process.
+        // After a reboot the old pid can belong to an unrelated live process,
+        // here this test's own; a cancel in progress must not signal it.
         let pid = i64::from(std::process::id());
         conn.execute(
-            "UPDATE queue_jobs SET pid = ?2, process_group_id = ?2 WHERE id = ?1",
+            "UPDATE queue_jobs SET pid = ?2, process_group_id = ?2, holding_reason = 'cancelling' WHERE id = ?1",
             params![job.id, pid],
         )
         .unwrap();
