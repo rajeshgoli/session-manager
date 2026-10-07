@@ -1660,6 +1660,7 @@ impl RetainedQueueStore {
         job_id: &str,
         cancel_grace_seconds: u64,
     ) -> Result<Option<QueueJobRecord>> {
+        let _admission_guard = admission_guard();
         Self::start_queue_job_in_state_dir_with_policy(
             state_dir,
             message_queue_db_path,
@@ -1683,6 +1684,17 @@ impl RetainedQueueStore {
             return Ok(None);
         };
         if job.state != "pending" {
+            return get_queue_job_conn(&conn, job_id);
+        }
+        if local_wall_waits_for_restoration(&job, state_dir) {
+            mark_pending_queue_jobs_holding_conn(&conn, Some(job_id), "local_wall")?;
+            schedule_queue_admission_retry(
+                state_dir.to_path_buf(),
+                message_queue_db_path.to_path_buf(),
+                cancel_grace_seconds,
+                admission_policy,
+                5,
+            );
             return get_queue_job_conn(&conn, job_id);
         }
         // Includes owner-forced starts: a perf run never shares the model.
@@ -4345,11 +4357,26 @@ fn admit_pending_queue_jobs_conn(
     // Read once per pass: reordering lanes applies at the next pass.
     let ticket_ranks = queue_ticket_ranks(message_queue_db_path);
     loop {
-        let jobs = ranked_queue_job_runtime_records_conn(conn, &ticket_ranks)?;
+        let mut jobs = ranked_queue_job_runtime_records_conn(conn, &ticket_ranks)?;
         if expire_pending_queue_jobs_conn(conn, &jobs, message_queue_db_path, admission_policy)? > 0
         {
             continue;
         }
+        for job in &jobs {
+            if job.state == "pending" && local_wall_waits_for_restoration(job, state_dir) {
+                summary.held +=
+                    mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "local_wall")?;
+                summary.retry_after_seconds = Some(
+                    summary
+                        .retry_after_seconds
+                        .map_or(5, |current| current.min(5)),
+                );
+            }
+        }
+        // An unavailable local wall must not block unrelated hosted jobs.
+        jobs.retain(|job| {
+            job.state != "pending" || !local_wall_waits_for_restoration(job, state_dir)
+        });
         if !jobs.iter().any(|job| job.state == "pending") {
             break;
         }
@@ -4835,6 +4862,14 @@ const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
 pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
 const QUEUE_JOB_TYPE_ORDER: [&str; 5] = ["perf", "review", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds through process launch, running-row publication and monitor creation.
+/// Generation shutdown takes the same lock before detaching local launchers.
+pub(crate) fn admission_guard() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Pending job ids in the order admission examines them: perf, tests,
 /// background, service, then by board lane rank and oldest first within a
@@ -5462,6 +5497,16 @@ impl QueueChild {
             #[cfg(target_os = "macos")]
             Self::Local(c) => c.wait(),
         }
+    }
+}
+
+fn local_wall_waits_for_restoration(job: &QueueJobRuntimeRecord, state_dir: &Path) -> bool {
+    match (&job.local_agent_id, &job.local_binding_json) {
+        (Some(agent), Some(binding)) => matches!(
+            local_wall::admission_ready(state_dir, agent, binding),
+            Ok(false)
+        ),
+        _ => false,
     }
 }
 
@@ -7354,6 +7399,10 @@ pub fn queue_hold_explanation(
     let mut blockers: Vec<&QueueJobRecord> = Vec::new();
     let mut queued_ahead = 0;
     let (summary, detail) = match reason {
+        "local_wall" => (
+            "waiting for local agent restoration".into(),
+            "The server is restoring this agent's sandbox and host services. The command remains pending and retries automatically; other eligible jobs can run.".into(),
+        ),
         "awaiting_tests" => {
             blockers = running.iter().copied().filter(|j| j.job_type == "tests").collect();
             let detail = if !blockers.is_empty() {

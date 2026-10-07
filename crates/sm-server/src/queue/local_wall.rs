@@ -16,6 +16,9 @@ pub struct WallSpec {
     pub environment: BTreeMap<String, String>,
     pub gateway_port: u16,
     pub egress_port: u16,
+    /// Optional for legacy host primitives; production recovery requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_authority_sha256: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct RegisteredWall {
@@ -254,6 +257,17 @@ fn load(state_dir: &Path, agent: &str) -> Result<RegisteredWall> {
     {
         bail!("local wall registration or launch artifact changed");
     }
+    if let Some(expected) = &wall.spec.host_authority_sha256 {
+        if &hash(&read_file(
+            &wall
+                .spec
+                .agent_state
+                .join("xdg/config/queue-authority.json"),
+        )?) != expected
+        {
+            bail!("local host preparation authority changed");
+        }
+    }
     physical_directory(&wall.spec.agent_state)?;
     physical_directory(&wall.spec.checkout)?;
     Ok(wall)
@@ -350,12 +364,11 @@ impl JobBinding {
     }
 }
 
-pub(super) fn spawn(
+fn validated_binding(
     state_dir: &Path,
     agent: &str,
     binding_json: &str,
-    output: (fs::File, fs::File, Option<u64>),
-) -> Result<QueueChild> {
+) -> Result<(RegisteredWall, JobBinding)> {
     let binding: JobBinding = serde_json::from_str(binding_json)?;
     let wall = load(state_dir, agent)?;
     if binding.agent != agent
@@ -366,16 +379,51 @@ pub(super) fn spawn(
     {
         bail!("local queue binding changed or invalid");
     }
+    Ok((wall, binding))
+}
+
+/// A valid durable command may wait for host restoration, but changed authority
+/// is an error and follows the ordinary failed-start path.
+pub(super) fn admission_ready(state_dir: &Path, agent: &str, binding: &str) -> Result<bool> {
+    let (wall, _) = validated_binding(state_dir, agent, binding)?;
     #[cfg(target_os = "macos")]
     {
-        let launcher = launchers()
+        let launchers = launchers()
             .lock()
-            .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?
-            .get(&registry_path(state_dir, agent)?)
-            .cloned()
-            .context(
-                "local queue launcher is unavailable; restore host binding before admission",
-            )?;
+            .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?;
+        let Some(launcher) = launchers.get(&registry_path(state_dir, agent)?) else {
+            return Ok(false);
+        };
+        let (launch_agent, profile) = launcher.queue_identity()?;
+        if launch_agent != agent || profile != wall.spec.profile {
+            bail!("local queue launcher identity changed");
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = wall;
+        bail!("local queue walls require macOS");
+    }
+}
+
+pub(super) fn spawn(
+    state_dir: &Path,
+    agent: &str,
+    binding_json: &str,
+    output: (fs::File, fs::File, Option<u64>),
+) -> Result<QueueChild> {
+    let (wall, binding) = validated_binding(state_dir, agent, binding_json)?;
+    #[cfg(target_os = "macos")]
+    {
+        // Keep the registry locked through spawn: detachment cannot return
+        // while a previously obtained binding can still launch a child.
+        let launchers = launchers()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("local launch lock poisoned"))?;
+        let launcher = launchers.get(&registry_path(state_dir, agent)?).context(
+            "local queue launcher is unavailable; restore host binding before admission",
+        )?;
         let (launch_agent, profile) = launcher.queue_identity()?;
         if launch_agent != agent || profile != wall.spec.profile {
             bail!("local queue launcher identity changed");
@@ -424,6 +472,7 @@ mod tests {
             .unwrap()
             .success());
         let spec = WallSpec {
+            host_authority_sha256: None,
             agent_state: agent_state.clone(),
             checkout: fixture.path("checkout"),
             profile: profile.clone(),

@@ -208,6 +208,51 @@ async fn main() -> Result<()> {
         }
         let shutdown = Shutdown::default();
         sm_server::queue::set_live_queue_shutdown(shutdown.clone());
+        #[cfg(target_os = "macos")]
+        let local_walls = if config.rust_core.runtime_enabled {
+            let directory = sm_server::config::test_isolation_root_from_environment()?
+                .map(|root| root.join("local-egress"))
+                .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
+            let walls = Arc::new(sm_server::local_wall::recovery::GenerationWalls::new(
+                queue_state_dir.clone(),
+                expand_home(&config.local_judge.python),
+                SocketAddr::from(([127, 0, 0, 1], args.port)),
+                &config.local_host.base_url,
+                sm_server::local_egress::ServiceClient::new(directory, std::env::current_exe()?),
+                sm_server::local_judge::LocalJudgeRuntime::from_config(&config),
+            )?);
+            match walls.reconcile() {
+                Ok(failures) => {
+                    for failure in failures {
+                        eprintln!("local wall restore deferred: {failure}");
+                    }
+                }
+                Err(error) => eprintln!("local wall restore failed: {error:#}"),
+            }
+            let worker = walls.clone();
+            let stopped = shutdown.clone();
+            thread::spawn(move || {
+                while !stopped.is_stopped() {
+                    thread::sleep(Duration::from_secs(5));
+                    if stopped.is_stopped() {
+                        break;
+                    }
+                    match worker.reconcile() {
+                        Ok(failures) => {
+                            for failure in failures {
+                                eprintln!("local wall restore deferred: {failure}");
+                            }
+                        }
+                        Err(error) => eprintln!("local wall restore failed: {error:#}"),
+                    }
+                }
+            });
+            Some(walls)
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let _local_wall_guard = local_walls.as_ref().map(|walls| walls.guard());
         let authority_thread = authority_server.spawn(shutdown.clone())?;
         let (handover_tx, mut handover_rx) = tokio::sync::mpsc::channel(1);
         let handover_acceptor =
@@ -306,6 +351,12 @@ async fn main() -> Result<()> {
             .with_listen_port(args.port)
             .with_shutdown(shutdown.clone())
             .with_btw_workers(btw_workers.clone());
+        #[cfg(target_os = "macos")]
+        let state = if let Some(walls) = &local_walls {
+            state.with_local_walls(walls.clone())
+        } else {
+            state
+        };
         let lan_control = terminal_lan::LanControl::default();
         let expected_lan = inherited_lan.is_some();
         if state.config().terminal_direct.lan.enabled {

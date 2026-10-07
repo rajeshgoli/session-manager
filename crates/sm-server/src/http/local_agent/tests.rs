@@ -601,6 +601,7 @@ async fn queue_identity_survives_storage_and_notify_cannot_cancel() {
     fs::create_dir_all(&queue_dir).unwrap();
     let queue_dir = queue_dir.canonicalize().unwrap();
     let spec = crate::queue::local_wall::WallSpec {
+        host_authority_sha256: None,
         agent_state,
         checkout: checkout.clone(),
         profile: profile.clone(),

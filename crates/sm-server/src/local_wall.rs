@@ -31,7 +31,7 @@ use std::{
 };
 
 /// All values come from sm's host configuration, never a tool or queue body.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HostConfiguration {
     pub home: PathBuf,
     pub state_root: PathBuf,
@@ -323,10 +323,14 @@ impl LocalWallRuntime {
                 &artifacts.supervisor,
             )?);
             if let Some(root) = queue_state {
+                // Persist host authority before publishing a manifest that can
+                // admit commands. An interrupted first prepare can then retry.
+                atomic_write(&authority_path, &authority)?;
                 crate::queue::local_wall::register(
                     root,
                     &agent.id,
                     crate::queue::local_wall::WallSpec {
+                        host_authority_sha256: Some(format!("{:x}", Sha256::digest(&authority))),
                         agent_state: state,
                         checkout: agent.checkout.clone(),
                         profile: artifacts.profile.clone(),
@@ -336,7 +340,6 @@ impl LocalWallRuntime {
                         egress_port: egress.port,
                     },
                 )?;
-                atomic_write(&authority_path, &authority)?;
                 crate::queue::local_wall::attach(root, &agent.id, queue.clone())?;
             }
             Ok(Arc::new(PreparedWall {
@@ -345,6 +348,7 @@ impl LocalWallRuntime {
                 provider,
                 queue,
                 queue_state: queue_state.map(Path::to_path_buf),
+                broker_peer: service.peer_token(),
                 checkout: agent.checkout.clone(),
                 id: agent.id.clone(),
                 egress: self.egress.clone(),
@@ -380,6 +384,7 @@ pub struct PreparedWall {
     provider: LaunchBinding,
     queue: Arc<LaunchBinding>,
     queue_state: Option<PathBuf>,
+    broker_peer: crate::local_sockets::identity::PeerToken,
     checkout: PathBuf,
     id: String,
     egress: ServiceClient,
@@ -389,6 +394,16 @@ pub struct PreparedWall {
 }
 
 impl PreparedWall {
+    pub(crate) fn stop_admission(&self) -> Result<()> {
+        self.life
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wall lifecycle lock poisoned"))?
+            .active = false;
+        Ok(())
+    }
+    pub fn broker_peer_token(&self) -> crate::local_sockets::identity::PeerToken {
+        self.broker_peer
+    }
     /// After suspension and all pending/running queue work ends, permit a new
     /// configuration. The caller still owns immutable command-file cleanup.
     pub fn retire_queue(&self) -> Result<()> {
@@ -610,6 +625,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        File::open(path.parent().context("host artifact has no parent")?)?.sync_all()?;
         Ok(())
     })();
     let _ = fs::remove_file(temporary);
@@ -685,3 +701,5 @@ fn install_sources(config: &Path) -> Result<PathBuf> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+
+pub mod recovery;
