@@ -26,8 +26,10 @@ html.sm-demo .term-panel { top: calc(40px + var(--sm-demo-bar)); }
   z-index: 1001; padding: 8px 14px; border-radius: 6px; background: #111827; color: #f9fafb;
   font: 13px/1.3 system-ui, -apple-system, sans-serif; box-shadow: 0 4px 14px rgba(0, 0, 0, .3);
   opacity: 0; pointer-events: none; transition: opacity .15s;
+  max-width: min(560px, calc(100vw - 32px)); border: 1px solid #f59e0b;
 }
-.sm-demo-toast.show { opacity: 1; }
+.sm-demo-toast.show { opacity: 1; pointer-events: auto; }
+.sm-demo-toast a { color: #fbbf24; font-weight: 600; white-space: nowrap; }
 .sm-demo-fail { padding: 24px; font: 15px/1.4 system-ui, sans-serif; }
 
 /* A doc opened full screen: reader-bar.js puts its bar, and the doc's own

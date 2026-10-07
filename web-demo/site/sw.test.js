@@ -2,7 +2,7 @@
 'use strict';
 const assert = require('assert');
 globalThis.self = { addEventListener() {}, location: { origin: 'http://demo' } };
-const { shiftTimes, parseTime, normalize } = require('./sw.js');
+const { shiftTimes, parseTime, normalize, markdown, noteTitle, snippet } = require('./sw.js');
 
 const hour = 3600 * 1000;
 assert.strictEqual(shiftTimes('"2026-10-07T01:46:17.685293Z"', hour), '"2026-10-07T02:46:17.685293Z"');
@@ -16,4 +16,9 @@ assert.strictEqual(parseTime('2026-10-07T01:46:17.685293Z'), Date.UTC(2026, 9, 7
 assert.strictEqual(normalize('/inbox?format=json&filter=open'), normalize('/inbox?filter=open&format=json'));
 assert.strictEqual(normalize('/docs/a.html?version=abc&from=%2Finbox'), '/docs/a.html?version=abc');
 assert.strictEqual(normalize('/guestbook?format=json&repo=&before='), '/guestbook?before=&format=json&repo=');
+// Notes: title and search snippet as notes.rs makes them; the preview's Markdown.
+assert.strictEqual(noteTitle('## Plan  \nbody'), 'Plan');
+assert.deepStrictEqual(snippet('Coupons do not stack', 'STACK'), { snippet: 'Coupons do not stack', matches: [{ start: 15, end: 20 }] });
+assert.strictEqual(markdown('# Hi\n\n- [x] **done**\n- `code`\n\n<b>x</b>'),
+  '<h1>Hi</h1>\n<ul>\n<li><input type="checkbox" disabled checked> <strong>done</strong></li>\n<li><code>code</code></li>\n</ul>\n<p>&lt;b&gt;x&lt;/b&gt;</p>');
 console.log('ok');
