@@ -28,6 +28,15 @@ pub struct ToolUsageEvent<'a> {
 }
 
 pub fn log_tool_usage_to_path(db_path: &Path, event: ToolUsageEvent<'_>) -> Result<()> {
+    log_tool_usage_with_receipt(db_path, event, None)
+}
+
+/// The receipt and tool row commit together; retries cannot duplicate a tool.
+pub(crate) fn log_tool_usage_with_receipt(
+    db_path: &Path,
+    event: ToolUsageEvent<'_>,
+    receipt: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -36,11 +45,22 @@ pub fn log_tool_usage_to_path(db_path: &Path, event: ToolUsageEvent<'_>) -> Resu
             )
         })?;
     }
-    let conn = Connection::open(db_path)
+    let mut conn = Connection::open(db_path)
         .with_context(|| format!("failed to open tool usage db {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000_i64)?;
     ensure_tool_usage_schema(&conn)?;
+    let tx = conn.transaction()?;
+    if let Some(receipt) = receipt {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS tool_usage_receipts (key TEXT PRIMARY KEY)")?;
+        if tx.execute(
+            "INSERT OR IGNORE INTO tool_usage_receipts (key) VALUES (?1)",
+            [receipt],
+        )? == 0
+        {
+            return Ok(());
+        }
+    }
 
     let (is_destructive, destructive_type) = detect_destructive(event.tool_name, event.tool_input);
     let (is_sensitive_file, mut target_file) =
@@ -59,7 +79,7 @@ pub fn log_tool_usage_to_path(db_path: &Path, event: ToolUsageEvent<'_>) -> Resu
     let tool_input_json = non_empty_json_payload(event.tool_input);
     let tool_response_json = non_empty_json_payload(event.tool_response);
 
-    conn.execute(
+    tx.execute(
         r#"
         INSERT INTO tool_usage (
             session_id, claude_session_id, session_name, parent_session_id,
@@ -90,6 +110,7 @@ pub fn log_tool_usage_to_path(db_path: &Path, event: ToolUsageEvent<'_>) -> Resu
             exit_code,
         ],
     )?;
+    tx.commit()?;
     Ok(())
 }
 

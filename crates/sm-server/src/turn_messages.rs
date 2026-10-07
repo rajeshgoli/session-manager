@@ -232,6 +232,20 @@ impl TurnMessageStore {
         timing: ReplyTiming,
         text: &str,
     ) -> Result<()> {
+        self.record_turn_with_receipt(session_id, provider, at, timing, text, None)
+    }
+
+    /// The receipt commits with the history write, making an interrupted
+    /// provider-effect dispatch safe to retry without touching later rows.
+    pub(crate) fn record_turn_with_receipt(
+        &self,
+        session_id: &str,
+        provider: &str,
+        at: OffsetDateTime,
+        timing: ReplyTiming,
+        text: &str,
+        receipt: Option<&str>,
+    ) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(());
@@ -241,6 +255,18 @@ impl TurnMessageStore {
         let at = stamp(at);
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
+        if let Some(receipt) = receipt {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS turn_message_receipts (key TEXT PRIMARY KEY)",
+            )?;
+            if tx.execute(
+                "INSERT OR IGNORE INTO turn_message_receipts (key) VALUES (?1)",
+                [receipt],
+            )? == 0
+            {
+                return Ok(());
+            }
+        }
         let since = tx
             .query_row(
                 "SELECT value FROM turn_message_meta WHERE key = 'replies_since'",

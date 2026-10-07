@@ -615,6 +615,39 @@ impl OwnerMessageStore {
         )?)
     }
 
+    /// A replayed provider prompt can answer only questions already present
+    /// when it was typed. Its receipt and answers share one SQL transaction.
+    pub(crate) fn answer_session_with_receipt(
+        &self,
+        session_id: &str,
+        via: &str,
+        at: &str,
+        receipt: &str,
+    ) -> Result<usize> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS owner_prompt_receipts (key TEXT PRIMARY KEY)",
+        )?;
+        if tx.execute(
+            "INSERT OR IGNORE INTO owner_prompt_receipts (key) VALUES (?1)",
+            [receipt],
+        )? == 0
+        {
+            return Ok(0);
+        }
+        let changed = tx.execute(
+            "UPDATE owner_messages SET handled_at = ?2, first_viewed_at = \
+             IFNULL(first_viewed_at, ?2), handled_via = ?3 \
+             WHERE sender_session_id = ?1 AND blocking = 1 AND handled_at IS NULL \
+             AND julianday(created_at) <= julianday(?2) \
+             AND NOT EXISTS (SELECT 1 FROM owner_message_replies r WHERE r.message_id = owner_messages.id)",
+            params![session_id, at, via],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Clear a blocking review notice when its request receives a reviewer.
     pub fn mark_handled_by_delivery_key(&self, key: &str) -> Result<()> {
         let conn = self.open_write()?;

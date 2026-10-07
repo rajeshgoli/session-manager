@@ -6644,11 +6644,12 @@ impl SessionStore {
             // Claude Code's status line reports a 200k `context_window_size`
             // for 1M models, so a `[1m]` model decides first: the sampled
             // model id, else (an older hook sends none) the session's model.
-            let one_million = event
-                .model_id
-                .as_deref()
-                .or_else(|| session.get("model").and_then(Value::as_str))
-                .is_some_and(|id| id.ends_with("[1m]"));
+            let one_million = session.get("provider").and_then(Value::as_str) != Some("opencode")
+                && event
+                    .model_id
+                    .as_deref()
+                    .or_else(|| session.get("model").and_then(Value::as_str))
+                    .is_some_and(|id| id.ends_with("[1m]"));
             let context_window_tokens = if one_million {
                 1_000_000
             } else {
@@ -10443,6 +10444,10 @@ fn normalize_opencode_runtime_record(value: &mut Value) {
 #[cfg(test)]
 #[path = "opencode/records_tests.rs"]
 mod opencode_records_tests;
+
+#[path = "opencode/events_store.rs"]
+mod opencode_events_store;
+pub use opencode_events_store::OpencodeEventInput;
 
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
