@@ -1,0 +1,31 @@
+/* The demo banner and read-only notice. Loaded only by the demo build; the
+   live UI never sees it. The app's full-height layout gives up the banner's
+   height. */
+:root { --sm-demo-bar: 26px; }
+html.sm-demo body { box-sizing: border-box; padding-top: var(--sm-demo-bar); }
+.sm-demo-bar {
+  position: fixed; top: 0; left: 0; right: 0; height: var(--sm-demo-bar); z-index: 1000;
+  display: flex; align-items: center; gap: 6px; padding: 0 12px; box-sizing: border-box;
+  font: 12px/1 system-ui, -apple-system, sans-serif; white-space: nowrap; overflow: hidden;
+  background: #1f2937; color: #e5e7eb; border-bottom: 1px solid #111827;
+}
+.sm-demo-bar a { color: #93c5fd; }
+.sm-demo-chapter { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #9ca3af; }
+.sm-demo-restart { background: none; border: 0; color: #9ca3af; cursor: pointer; font-size: 14px; padding: 0 2px; }
+.sm-demo-restart:hover { color: #e5e7eb; }
+@media (max-width: 700px) { .sm-demo-chapter { display: none; } .sm-demo-restart { margin-left: auto; } }
+
+/* The web app's layout: full height minus the banner, and fixed panels below it. */
+html.sm-demo .app { height: calc(100vh - var(--sm-demo-bar)); height: calc(100dvh - var(--sm-demo-bar)); }
+html.sm-demo .app.wide .panel, html.sm-demo .term-page { top: var(--sm-demo-bar); }
+html.sm-demo .term-panel { top: calc(40px + var(--sm-demo-bar)); }
+@media (max-width: 720px) { html.sm-demo .panel { top: var(--sm-demo-bar); } }
+
+.sm-demo-toast {
+  position: fixed; top: calc(var(--sm-demo-bar) + 10px); left: 50%; transform: translateX(-50%);
+  z-index: 1001; padding: 8px 14px; border-radius: 6px; background: #111827; color: #f9fafb;
+  font: 13px/1.3 system-ui, -apple-system, sans-serif; box-shadow: 0 4px 14px rgba(0, 0, 0, .3);
+  opacity: 0; pointer-events: none; transition: opacity .15s;
+}
+.sm-demo-toast.show { opacity: 1; }
+.sm-demo-fail { padding: 24px; font: 15px/1.4 system-ui, sans-serif; }
