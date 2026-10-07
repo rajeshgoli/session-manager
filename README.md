@@ -188,6 +188,7 @@ cd session-manager
 cargo build -p sm-server --release
 ./scripts/install-sm-cli.sh                    # installs sm to .local/bin
 export PATH="$PWD/.local/bin:$PATH"
+./scripts/install_notify_server_hook.sh        # lets sm see when Claude agents go idle
 
 cp config.yaml.example config.yaml
 target/release/sm-server --host 127.0.0.1 --port 8420 --config config.yaml

@@ -5,13 +5,15 @@
 # [sm review] wakes, "Waiting for <name>". Default: Owner.
 # owner_name: "Rajesh"
 
-server:
-  host: "127.0.0.1"
-  port: 8420
+# The listen address comes from sm-server's --host and --port flags, not this file.
 
 paths:
-  log_dir: "/tmp/claude-sessions"
-  state_file: "/tmp/claude-sessions/sessions.json"
+  state_file: "~/.local/share/claude-sessions/sessions.json"
+
+# Launch agents in tmux. Off by default: without it the server records new
+# agents but never starts them.
+rust_core:
+  runtime_enabled: true
 
 monitor:
   # Seconds of inactivity before sending idle notification
@@ -261,7 +263,8 @@ claude:
   command: "claude"
   # Command-line arguments (user-controlled, agents cannot override)
   args:
-    - "--bypass-permissions"
+    - "--permission-mode"
+    - "auto"
   # Default model for spawned sessions (agent can override with --model flag)
   default_model: "sonnet"
   # Optional Claude transcript project root; environment and default roots are
