@@ -29,3 +29,13 @@ html.sm-demo .term-panel { top: calc(40px + var(--sm-demo-bar)); }
 }
 .sm-demo-toast.show { opacity: 1; }
 .sm-demo-fail { padding: 24px; font: 15px/1.4 system-ui, sans-serif; }
+
+/* A doc opened full screen: reader-bar.js puts its bar, and the doc's own
+   review bar, at the top; both move below the banner. */
+html.sm-demo #sm-reader-bar { top: var(--sm-demo-bar) !important; }
+html.sm-demo body.sm-reader-bar-open { padding-top: calc(36px + var(--sm-demo-bar)) !important; }
+html.sm-demo body.sm-reader-bar-open .bar { top: calc(36px + var(--sm-demo-bar)); }
+@media print {
+  .sm-demo-bar, .sm-demo-toast { display: none; }
+  html.sm-demo body, html.sm-demo body.sm-reader-bar-open { padding-top: 0 !important; }
+}

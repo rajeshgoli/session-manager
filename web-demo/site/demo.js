@@ -71,10 +71,20 @@
     document.head.append(script);
   }
 
+  // A doc page's own review bar lives in a shadow root the stylesheet can't
+  // reach; move it below the banner (and reader-bar.js's bar, when present).
+  function offsetDocBar() {
+    const review = document.getElementById('sm-doc-ui')?.shadowRoot;
+    if (!review) return;
+    const readerBar = document.getElementById('sm-reader-bar') ? ' + 36px' : '';
+    review.append(el('style', { textContent: `.bar{top:calc(var(--sm-demo-bar, 26px)${readerBar})!important}@media print{.bar{top:0!important}}` }));
+  }
+
   function start() {
     // A doc page inside the reader's iframe sits under the app's banner.
     if (!appModule && !topLevel) return;
     banner();
+    if (!appModule) window.addEventListener('load', offsetDocBar, { once: true });
     if (!('serviceWorker' in navigator)) return;
     navigator.serviceWorker.addEventListener('message', (event) => {
       if (event.data && event.data.type === 'sm-demo-read-only') toast(event.data.text);
@@ -82,7 +92,10 @@
     if (!appModule) return;
     if (navigator.serviceWorker.controller) { loadApp(); return; }
     // First visit: the app's first request must already go to the worker.
-    navigator.serviceWorker.addEventListener('controllerchange', loadApp, { once: true });
+    // A first visit to a reader path got the shell (the host's 404.html);
+    // reload so the worker answers it with the recorded page.
+    const reader = /^\/(docs|messages|t)\//.test(location.pathname);
+    navigator.serviceWorker.addEventListener('controllerchange', () => (reader ? location.reload() : loadApp()), { once: true });
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((error) => fail(`The demo could not start: ${error.message}`));
   }
 
