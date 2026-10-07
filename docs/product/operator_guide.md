@@ -492,6 +492,16 @@ certificate sign-in and terminal input on the maintainer's machines.
 and notes browsers can cache the old advertisement for up to 24 hours. Turning
 HTTP/3 off for the zone is the broader fallback.
 
+The `Alt-Svc` rule is not enough on its own: Chrome also learns HTTP/3 from the
+zone's DNS HTTPS record, and Chrome on macOS sends no client certificate over
+HTTP/3, so sign-in falls back to email whenever Chrome picks HTTP/3. On each
+enrolled Mac, run `sudo scripts/browser-http2-pin.sh install <browser
+hostname>` once, then quit and reopen Chrome. It installs a LaunchDaemon that
+re-resolves the hostname every 5 minutes and blocks outbound UDP 443 to those
+addresses only, so Chrome uses HTTP/2 for them; other hostnames on the same
+Cloudflare addresses also use HTTP/2 on that Mac. `status` shows the loaded
+rule, and `sudo scripts/browser-http2-pin.sh uninstall` removes it.
+
 `repair-key-access` changes only the existing key's signing permissions and
 its prompt name; it keeps the key, its certificate and other permissions.
 macOS asks you to authorize the change.
