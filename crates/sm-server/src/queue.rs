@@ -3829,9 +3829,16 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             ON queue_jobs(notify_session_id, state);
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_finished
             ON queue_jobs(finished_at);
-        -- Never written since 2026-06; utilization.db records host memory
-        -- every 5 s instead (sm#2053).
-        DROP TABLE IF EXISTS queue_resource_samples;
+        CREATE TABLE IF NOT EXISTS queue_resource_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sampled_at TEXT NOT NULL,
+            pending_by_type_json TEXT NOT NULL,
+            running_by_type_json TEXT NOT NULL,
+            total_running INTEGER NOT NULL,
+            memory_json TEXT NOT NULL,
+            cpu_json TEXT NOT NULL,
+            gpu_json TEXT
+        );
         "#,
     )?;
     ensure_column(conn, "queue_jobs", "local_agent_id", "TEXT")?;
