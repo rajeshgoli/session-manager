@@ -24,7 +24,7 @@ for (const width of [390, 1440]) test(`New agent offers project folders and subm
       if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: shell });
       if (url.pathname === '/client/settings') return json({
         new_agent: { provider: 'claude', claude: {}, codex: {}, workspaces: ['/Users/r/projects/saved'], agent_types: [] },
-        workspace_folders: ['/Users/r/projects/another', '/Users/r/projects/saved'],
+        workspace_folders: ['another', 'saved', 'backup-manager', 'finviz', 'deskbar', 'codex-fork', 'session-manager', 'fractal-algo-rust', ...Array.from({length: 12}, (_, i) => `extra-${i}`)].map(name => `/Users/r/projects/${name}`),
       });
       if (url.pathname === '/watch/state') return json({ sessions: [
         { state: 'idle', repo: '/Users/r/worktrees/live' },
@@ -42,8 +42,22 @@ for (const width of [390, 1440]) test(`New agent offers project folders and subm
     await page.getByRole('button', { name: 'Change', exact: true }).click();
     const workspace = page.locator('select').filter({ has: page.locator('option[value="__other__"]') });
     assert.deepEqual(await workspace.locator('option').evaluateAll(options => options.map(o => o.value)), [
-      '/Users/r/projects/saved', '/Users/r/projects/another', '/Users/r/worktrees/live', '__other__',
+      ...['fractal-algo-rust', 'session-manager', 'codex-fork', 'deskbar', 'finviz', 'backup-manager', 'saved', 'another', 'extra-0', 'extra-1'].map(name => `/Users/r/projects/${name}`),
+      '__more__', '__other__',
     ]);
+    await workspace.selectOption('__more__');
+    assert.equal(await workspace.inputValue(), '/Users/r/projects/saved');
+    const all = await workspace.locator('option').evaluateAll(options => options.map(o => o.value));
+    assert.equal(all.length, 22);
+    assert.equal(new Set(all).size, all.length);
+    assert.ok(all.includes('/Users/r/projects/extra-11'));
+    assert.ok(all.includes('/Users/r/worktrees/live'));
+    assert.ok(!all.includes('/Users/r/worktrees/stopped'));
+    assert.ok(!all.includes('__more__'));
+    const moreResponse = page.waitForResponse(r => new URL(r.url()).searchParams.get('working_dir') === '/Users/r/projects/extra-11');
+    await workspace.selectOption('/Users/r/projects/extra-11');
+    await moreResponse;
+    assert.equal(await workspace.inputValue(), '/Users/r/projects/extra-11');
     await workspace.selectOption('/Users/r/projects/another');
     await page.waitForFunction(() => document.body.textContent.includes('Workspace'));
     await workspace.selectOption('__other__');
