@@ -105,7 +105,7 @@ fun HostRestartBanner(refreshKey: Any?, onChanged: () -> Unit) {
                 onSuccess = { body ->
                     val failed = (body["results"] as? JsonArray).orEmpty()
                         .mapNotNull { it as? JsonObject }
-                        .filter { it.text("outcome") != "restored" }
+                        .filter { it.text("outcome") == "failed" }
                     if (failed.isEmpty()) done else "${failed.size} not restored: ${failed.first().text("error")}"
                 },
                 onFailure = { it.message ?: "Couldn't reach sm" },

@@ -4875,13 +4875,14 @@ fn recover(client: &ApiClient, args: RecoverArgs) -> Result<()> {
         let id = result["session_id"].as_str().unwrap_or_default();
         match result["outcome"].as_str() {
             Some("restored") => println!("Restored {name} ({id}); it gets the restart notice."),
+            Some("left") => println!("Skipped {name} ({id}): it was retired since the restart."),
             _ => println!(
                 "Failed {name} ({id}): {}",
                 result["error"].as_str().unwrap_or("unknown error")
             ),
         }
     }
-    if results.iter().any(|result| result["outcome"] != "restored") {
+    if results.iter().any(|result| result["outcome"] == "failed") {
         bail!("some agents were not restored; `sm recover` lists them");
     }
     Ok(())

@@ -312,7 +312,7 @@ function HostRestartBanner() {
     setBusy(true);
     try {
       const result = await api(path, { method: 'POST', body });
-      const failed = (result.results || []).filter((item) => item.outcome !== 'restored');
+      const failed = (result.results || []).filter((item) => item.outcome === 'failed');
       toast(failed.length ? `${failed.length} could not be restored: ${failed[0].error}` : done);
     } catch (error) {
       toast(error.message);

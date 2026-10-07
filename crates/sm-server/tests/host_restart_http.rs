@@ -259,6 +259,30 @@ async fn leaving_a_member_retires_it_and_takes_it_out_of_the_cohort() {
         "{session}"
     );
     assert!(notices(&f, "far01936").is_empty());
+    // One retired the ordinary way is not brought back by restore all.
+    let (status, body) =
+        request(&f.app, "POST", "/sessions/far01978/retire", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = request(
+        &f.app,
+        "POST",
+        &format!("/host-restarts/{}/restore", f.restart_id),
+        Some(json!({})),
+    )
+    .await;
+    let outcome = |id: &str| {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["session_id"] == id)
+            .unwrap()["outcome"]
+            .clone()
+    };
+    assert_eq!(outcome("far01978"), "left", "{body}");
+    assert_eq!(outcome("sm020200"), "restored", "{body}");
+    let (_, session) = request(&f.app, "GET", "/sessions/far01978", None).await;
+    assert_eq!(session["status"], "stopped", "{session}");
     // Leaving it twice is refused.
     let (status, _) = request(
         &f.app,

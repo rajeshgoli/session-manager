@@ -308,10 +308,22 @@ pub(super) fn restore_cohort(
         if only.is_some_and(|only| !only.contains(&member.session_id)) {
             continue;
         }
-        let already_running = state
-            .session_store
-            .get_session(&member.session_id)?
-            .is_some_and(|session| !session.is_stopped());
+        let session = state.session_store.get_session(&member.session_id)?;
+        // Retired some other way since: the owner decided, so it stays retired.
+        if session.as_ref().is_some_and(SessionRecord::is_retired) {
+            store.decide(
+                restart_id,
+                &member.session_id,
+                DECISION_LEFT,
+                None,
+                OffsetDateTime::now_utc(),
+            )?;
+            outcomes.push(
+                json!({"session_id": member.session_id, "name": member.name, "outcome": "left"}),
+            );
+            continue;
+        }
+        let already_running = session.is_some_and(|session| !session.is_stopped());
         let result = if already_running {
             // Restored some other way since; it still needs its notice.
             after_restore(state, &member.session_id);
