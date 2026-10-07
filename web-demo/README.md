@@ -116,3 +116,47 @@ with compressed real time); `--out DIR` writes elsewhere (via `DIR.partial`, swa
 The scratch server runs from `/tmp/smdemo-rec` with `rust_core.runtime_enabled: false`, so it
 never adopts, runs or stops queue jobs, and its config points every database at that directory.
 `record.log`, `server.log` and `fake-gh.log` there explain a failed run.
+
+## The static site
+
+`build.py` turns the recording into the demo site: the real web UI from
+`crates/sm-server/src/web/`, unchanged, plus a service worker that stands in for the server.
+
+```
+python3 web-demo/build.py            # writes web-demo/dist/ (git-ignored)
+python3 web-demo/build.py --serve    # builds, then previews at http://localhost:8440/
+```
+
+`dist/` is self-contained; upload it to any static host that serves files at their paths and
+`404.html` for unknown ones. Its layout:
+
+| Path | What it is |
+|---|---|
+| `index.html`, `board/index.html`, … , `404.html` | the app shell (`http/web.rs` `shell_response`), with the demo banner and worker boot in place of the module load |
+| `sw.js` | the service worker (source `site/sw.js`); it must sit at the root to control every path |
+| `assets/` | a copy of `crates/sm-server/src/web/` |
+| `demo/` | `demo.js` (banner, read-only notice, worker boot) and `demo.css` |
+| `fixtures/` | a copy of `fixtures/` |
+
+How it replays:
+
+- **The worker answers every same-origin request** except `assets/`, `fixtures/` and `demo/`,
+  which the host serves. A page navigation gets the shell; a `/docs/…` navigation (the
+  reader's iframe, or a doc opened full screen) gets the recorded doc page. Every other GET is
+  looked up in the current tick by path and query (query order and the reader's `from` are
+  ignored) and answered with the recorded status and body; a URL the tick lacks is a 404.
+  Doc review drafts and the reopen target are not recorded; the worker answers them as a doc
+  with no drafts that cannot be reopened, which shows the review sheet with Submit disabled.
+- **The clock** starts on a visitor's first request and loops every `duration_seconds`; a
+  visitor back after 15 minutes idle, or a new build, starts from the beginning. The banner's ↺
+  restarts it. Timestamps in each response are shifted so that ages read as they did live.
+- **Nothing writes.** Any non-GET request gets 403 `Demo — read only`, and the page shows that
+  as a notice. That covers New agent, Start, Send, Retire, Archive, review submit, terminal
+  attach and `/btw`.
+- **The first visit** registers the worker and loads the app once the worker controls the
+  page, so the app's first request already goes to the worker. Browsers without service
+  workers get a one-line explanation.
+
+For checking: `POST /__demo/seek?t=<seconds>` jumps the clock, and `GET /__demo/misses` lists
+URLs the UI asked for that the current tick did not have. `node web-demo/site/sw.test.js`
+tests the timestamp shift and the lookup key.
