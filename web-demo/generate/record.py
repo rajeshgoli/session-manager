@@ -634,8 +634,9 @@ GLOBAL = [
     "/client/board", "/client/board?clock_hours=3", "/client/board?clock_hours=6", "/client/board?clock_hours=24",
     "/client/board/badge",
     "/client/queue", "/client/queue?ended_hours=24",
-    "/client/queue/stats?hours=24", "/client/queue/stats?hours=168",
-    "/client/utilization/series?hours=24",
+    "/client/queue/stats?hours=24", "/client/queue/stats?hours=168", "/client/queue/stats?hours=720",
+    "/client/utilization/series?hours=1", "/client/utilization/series?hours=24",
+    "/client/utilization/series?hours=168", "/client/utilization/series?hours=720",
     "/client/host-status", "/client/usage/meters", "/client/follows",
     "/inbox?format=json", "/inbox?format=json&filter=open", "/inbox?format=json&filter=docs",
     "/inbox?format=json&filter=done",
@@ -678,16 +679,19 @@ def synthetic(url, t, w):
              "pace": {"kind": "on_pace", "percent": 37.0}, "percent": round(29 + t / 150, 1),
              "provider": "codex", "resets_at": resets(90), "scope": None, "window": "week"}]}
     if url.startswith("/client/utilization/series"):
-        end = now_utc().replace(second=0, microsecond=0)
-        end -= datetime.timedelta(minutes=end.minute % 5)
+        hours = int(url.split("hours=")[1])
+        # The server's bucket size and count for each range (series_bucket_seconds).
+        seconds, count = {1: (15, 240), 24: (300, 288), 168: (1800, 336), 720: (7200, 360)}[hours]
+        epoch = int(now_utc().timestamp())
+        end = datetime.datetime.fromtimestamp(epoch - epoch % seconds, datetime.timezone.utc)
         buckets = []
-        for i in range(288):
-            start = end - datetime.timedelta(minutes=5 * (287 - i))
+        for i in range(count):
+            start = end - datetime.timedelta(seconds=seconds * (count - 1 - i))
             hour = start.hour + start.minute / 60
             busy = 1 if 9 <= (hour + 7) % 24 <= 19 else 0  # a working day, in the viewer's past
             wave = (hash((i * 7919) % 104729) % 100) / 100
             buckets.append({
-                "start": iso_s(start), "samples": 60,
+                "start": iso_s(start), "samples": max(1, seconds // 5),
                 "cpu_avg": round(12 + busy * (30 + 25 * wave), 1), "cpu_max": round(min(100, 20 + busy * (55 + 40 * wave)), 1),
                 "gpu_avg": round(busy * 6 * wave, 1), "gpu_max": round(busy * 15 * wave, 1),
                 "local_model_memory_avg": busy * 18 * 1024 ** 3, "local_model_memory_max": busy * 18 * 1024 ** 3,
@@ -701,9 +705,9 @@ def synthetic(url, t, w):
                             "tests": round(busy * 1.5 * wave, 2)}})
         buckets[-1].update(pending_max=pending, running={"background": 0.0, "perf": 0.0, "service": 0.0,
                                                          "tests": float(running)})
-        return {"available": True, "bucket_seconds": 300, "buckets": buckets, "end": iso_s(end),
-                "hours": 24, "memory_total_bytes": MEMORY_TOTAL, "start": buckets[0]["start"],
-                "summary": {"covered_seconds": 86400, "cpu_avg": 31.4, "cpu_busy_seconds": 9200,
+        return {"available": True, "bucket_seconds": seconds, "buckets": buckets, "end": iso_s(end),
+                "hours": hours, "memory_total_bytes": MEMORY_TOTAL, "start": buckets[0]["start"],
+                "summary": {"covered_seconds": hours * 3600, "cpu_avg": 31.4, "cpu_busy_seconds": 9200,
                             "gpu_avg": 2.1, "headroom_seconds": 71000,
                             "mem_used_max": 70 * 1024 ** 3, "pressure_elevated_seconds": 0,
                             "unknown_seconds": 0}}
@@ -776,7 +780,7 @@ def doc_pages(base, captured):
         for publish in detail.get("publishes", []):
             path = doc["reader_path"].split("?")[0]
             pages.append(f"{path}?version={publish['commit_sha'][:12]}")
-        pages.append(doc["reader_path"])
+        pages.append(doc["reader_path"].split("?")[0])  # the bare path: newest revision
     return pages
 
 

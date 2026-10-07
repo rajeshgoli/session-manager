@@ -1,1 +1,1 @@
-{"available": true, "cpu_percent": 40, "gpu_percent": 4.0, "host": "demo-mac", "memory_available_bytes": 86973087744, "memory_pressure": "Normal", "memory_total_bytes": 137438953472, "memory_used_bytes": 50465865728, "sampled_at": "2026-10-07T01:20:24.093617Z", "source": "live"}
+{"available": true, "cpu_percent": 40, "gpu_percent": 4.0, "host": "demo-mac", "memory_available_bytes": 86973087744, "memory_pressure": "Normal", "memory_total_bytes": 137438953472, "memory_used_bytes": 50465865728, "sampled_at": "2026-10-07T01:47:19.806841Z", "source": "live"}
