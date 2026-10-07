@@ -12,10 +12,23 @@ case "${TMPDIR:-/tmp}" in
   *) TMPDIR="$(cd -- "./$TMPDIR" && pwd)"; export TMPDIR ;;
 esac
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sm-rust-test.XXXXXX")"
+# Keep Unix socket paths short enough for macOS, regardless of TMPDIR length.
+# All tmux -L fixtures inherit this private namespace, including partial setup
+# failures that never construct their Rust cleanup guard.
+tmux_root=""
 cleanup() {
+  if [[ -n "$tmux_root" ]]; then
+    for socket in "$tmux_root"/tmux-*/*; do
+      [[ -S "$socket" ]] || continue
+      tmux -S "$socket" kill-server >/dev/null 2>&1 || true
+    done
+    rm -rf -- "$tmux_root"
+  fi
   rm -rf -- "$test_root"
 }
 trap cleanup EXIT
+tmux_root="$(mktemp -d /tmp/sm-rust-tmux.XXXXXX)"
+export TMUX_TMPDIR="$tmux_root"
 
 # Jobs started by `sm queue run` inherit launchd's 256-descriptor soft limit,
 # which the parallel HTTP suite can exhaust ("Too many open files"). Raise the
