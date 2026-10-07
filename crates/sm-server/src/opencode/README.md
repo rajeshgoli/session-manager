@@ -59,6 +59,36 @@ The fixed brief addendum is `docs/product/local_agent_addendum.md`.
 
 ## Verification
 
+`events` (#2057) supplies conversation-scoped decoding, replay checkpoints and a
+host-owned usage journal. It does not start a reader thread or mutate the
+session store. #2044 supplies that integration and the durable runtime binding.
+
+The adapter must read the session's current conversation on every event and
+replace `Projection` after clear. Work on a clone, apply the returned effects,
+then save the checkpoint. Discard the clone on error. Store effects must be
+idempotent across a crash before checkpoint persistence; `UsageJournal` already
+deduplicates usage across reopen. Supply all host-generated user message IDs
+(including the launch brief), so those messages cannot count as owner answers.
+
+On connection, backfill message history before reconciling current activity.
+User submissions have no `time.completed`; an unfinished assistant holds the
+cursor, so subsequent reconnects revisit its growing parts. A completed model
+request ending in `tool-calls` continues the same agent turn. It does not emit
+a turn stop. Live turn starts come from busy/retry status, after user text parts
+have supplied the prompt; owner-answer effects also work while already busy.
+
+`Client::event_stream` authenticates with the same secret and refuses redirects
+and proxies. Each connection is limited to twenty seconds, including healthy
+streams: the caller reconnects with the specified backoff and backfills again.
+This bounds a stalled read before checking whether the session has stopped.
+`read_event` limits a frame to two MiB and discards incomplete frames on EOF.
+
+Open one `UsageJournal` writer per sm session, shared across conversation
+changes. It synchronizes compact Claude-format JSON lines before returning,
+adds reasoning to output tokens, and repairs an interrupted final line on
+reopen. A malformed complete line is an error. The adapter still supplies the
+usage file's seat association and applies context measurements.
+
 - `scripts/test-rust-isolated.sh opencode -- --test-threads=1`: native-shaped
   IDs, approved config fixture, config loading, duplicate-append stub and
   lost-reply recovery, status/authentication errors, busy input, persistence,
@@ -66,6 +96,12 @@ The fixed brief addendum is `docs/product/local_agent_addendum.md`.
   judge's relative/traversal/symlink/move checks.
 - `node --test scripts/opencode/sm_judge.test.mjs`: all tool translations,
   credentials, deny/error paths, patch endpoint checks and decision logs.
+- Event tests cover missed complete turns, two disconnects during a growing
+  assistant, repeated checkpoints, owner input while busy, live prompt text,
+  conversation replacement, stream framing and interrupted usage writes. A
+  permanent fixture preserves the native history from the #1966 proof.
+
+`bash scripts/opencode/check.sh` runs both suites, Clippy and formatting.
 
 The full historical adversarial suite, launch/runtime immutability, usage
 attribution and live acceptance remain attached to #1956's subsequent tickets.

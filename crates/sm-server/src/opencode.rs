@@ -1,5 +1,6 @@
 //! HTTP and persisted-delivery primitives for the pinned local harness.
 //! Production admission and outbox completion remain owned by the session store.
+pub mod events;
 use std::{
     sync::Mutex,
     thread,
