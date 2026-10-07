@@ -386,3 +386,18 @@ The tests use temporary fake credentials and loopback listeners. On macOS they
 invoke the real `sandbox-exec`; other operating systems skip that enforcement
 test and can only validate profile construction. The full launched-agent,
 authenticated GitHub and queue-job checks belong to #1974 and #1956.
+Host provider code may call `PreparedWall::spawn_provider_with_environment` with
+additional settings such as its HTTP authentication password and behavior flags.
+The API validates environment names/values and reserves existing wall settings
+case-insensitively, proxy names, loader settings, Git/GitHub/Cargo configuration,
+private state, identity and remote-model credential prefixes. `SM_SESSION_CREDENTIAL`
+and `SM_JUDGE_PLUGIN_LOG` are permitted host additions for managed session delivery
+and logging. No request handler or durable queue submission accepts these settings;
+queue launches continue to use the registered wall environment exclusively.
+
+Preparation writes the trusted agent name and `<id>@local-agent.invalid` into an
+independent checkout's local Git configuration without reading global/system
+configuration or expanding includes. Existing repository settings are preserved.
+Shared or aliased Git metadata/configuration and an existing configuration lock
+are refused. Filesystem-only fixtures may omit `.git`; production providers supply
+an independent checkout.

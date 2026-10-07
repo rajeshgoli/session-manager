@@ -144,6 +144,19 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     let registration = |id: &str, port: u16| {
         let checkout = home.join(id);
         private_directory(&checkout).unwrap();
+        assert!(Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .arg(&checkout)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["config", "--local", "fixture.preserved", "yes"])
+            .status()
+            .unwrap()
+            .success());
         AgentRegistration {
             id: id.into(),
             name: format!("sm-{id}"),
@@ -167,6 +180,32 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     let b_request = registration("wall-b", 18501);
     let a = host.prepare(&a_request).unwrap();
     let b = host.prepare(&b_request).unwrap();
+    for request in [&a_request, &b_request] {
+        for (key, expected) in [
+            ("user.name", request.name.clone()),
+            ("user.email", format!("{}@local-agent.invalid", request.id)),
+            ("fixture.preserved", "yes".into()),
+        ] {
+            let result = Command::new("/usr/bin/git")
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .arg("-C")
+                .arg(&request.checkout)
+                .args(["config", "--local", "--no-includes", "--get", key])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            assert_eq!(String::from_utf8(result.stdout).unwrap().trim(), expected);
+        }
+    }
+    let aliased = registration("wall-git-alias", 18506);
+    let alias_target = root.join("host-git-config");
+    fs::write(&alias_target, b"[user]\nname = host\n").unwrap();
+    fs::remove_file(aliased.checkout.join(".git/config")).unwrap();
+    std::os::unix::fs::symlink(&alias_target, aliased.checkout.join(".git/config")).unwrap();
+    assert!(host.prepare(&aliased).is_err());
+    assert_eq!(fs::read(alias_target).unwrap(), b"[user]\nname = host\n");
     eprintln!("host fixture: both agents prepared");
     assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, a_request.control_port)).is_err());
     assert!(
@@ -207,7 +246,49 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
             thread::sleep(Duration::from_millis(10));
         }
     };
-    let mut provider = a.spawn_provider("probe", &["provider".into()]).unwrap();
+    for key in [
+        "LOCAL_AGENT_ID",
+        "local_agent_id",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "DYLD_INSERT_LIBRARIES",
+        "GIT_CONFIG_COUNT",
+        "XDG_CONFIG_HOME",
+        "CARGO_HOME",
+        "GH_TOKEN",
+        "SM_API_URL",
+        "SESSION_MANAGER_ID",
+        "OPENAI_API_KEY",
+        "bad=name",
+    ] {
+        assert!(
+            a.spawn_provider_with_environment(
+                "probe",
+                &["provider".into()],
+                &BTreeMap::from([(key.into(), "override".into())])
+            )
+            .is_err(),
+            "accepted reserved {key}"
+        );
+    }
+    assert!(a
+        .spawn_provider_with_environment(
+            "probe",
+            &["provider".into()],
+            &BTreeMap::from([("HOST_SETTING".into(), "contains\0nul".into())])
+        )
+        .is_err());
+    let mut provider = a
+        .spawn_provider_with_environment(
+            "probe",
+            &["provider-extra".into()],
+            &BTreeMap::from([(
+                "HOST_PROVIDER_PASSWORD".into(),
+                "host-selected-password".into(),
+            )]),
+        )
+        .unwrap();
     eprintln!("host fixture: provider spawned");
     let mut ready = String::new();
     use std::io::BufRead;

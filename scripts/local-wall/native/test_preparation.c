@@ -43,7 +43,11 @@ int main(int argc, char **argv) {
         assert(fcntl(198, F_GETFD) < 0 && errno == EBADF);
         sleep(2); puts("durable-wall-ok"); return 0;
     }
-    if (argc == 2 && !strcmp(argv[1], "provider")) {
+    if (argc == 2 && (!strcmp(argv[1], "provider") || !strcmp(argv[1], "provider-extra"))) {
+        if (!strcmp(argv[1], "provider-extra")) {
+            assert(!strcmp(getenv("HOST_PROVIDER_PASSWORD"), "host-selected-password"));
+            assert(!strcmp(getenv("LOCAL_AGENT_ID"), "wall-a"));
+        }
         assert(fcntl(198, F_GETFD) >= 0);
         struct sockaddr_in address;
         socklen_t size = sizeof(address);
