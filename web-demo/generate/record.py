@@ -8,8 +8,8 @@ where it works with the server's runtime off; the rest is written straight
 into the server's state files. See ../README.md for the output format.
 
 Run it through the queue (it takes about ten minutes):
-    sm queue run --type background --label demo-record --cwd <repo> -- \
-        python3 web-demo/generate/record.py
+    sm queue run --type background --max-wait 2h --timeout 30m --label demo-record \
+        --cwd <repo> -- python3 web-demo/generate/record.py
 """
 import argparse
 import datetime
@@ -631,7 +631,7 @@ def storyline(w):
 
 GLOBAL = [
     "/watch/state", "/watch/state?stopped=1",
-    "/client/board?clock_hours=3", "/client/board?clock_hours=6", "/client/board?clock_hours=24",
+    "/client/board", "/client/board?clock_hours=3", "/client/board?clock_hours=6", "/client/board?clock_hours=24",
     "/client/board/badge",
     "/client/queue", "/client/queue?ended_hours=24",
     "/client/queue/stats?hours=24", "/client/queue/stats?hours=168",
@@ -977,6 +977,8 @@ def main():
     start_server(w, args)
     # The lead was already planning when the recording starts.
     w.spawn("a0000001", minutes_ago=18)
+    # Record beside the destination and swap it in only after the leak scan.
+    final_out, args.out = args.out, args.out.rstrip("/") + ".partial"
     shutil.rmtree(args.out, ignore_errors=True)
     os.makedirs(args.out)
     events = storyline(w)
@@ -1021,8 +1023,11 @@ def main():
             text = open(os.path.join(folder, name), "rb").read().decode(errors="replace").lower()
             leaks += [f"{os.path.join(folder, name)}: {word}" for word in words if word in text]
     if leaks:
-        sys.exit("fixtures contain real names:\n" + "\n".join(leaks[:40]))
-    print(f"recorded {len(ticks)} ticks into {args.out}")
+        shutil.rmtree(args.out)
+        sys.exit(f"fixtures contain real names; {final_out} is unchanged:\n" + "\n".join(leaks[:40]))
+    shutil.rmtree(final_out, ignore_errors=True)
+    os.replace(args.out, final_out)
+    print(f"recorded {len(ticks)} ticks into {final_out}")
 
 
 if __name__ == "__main__":

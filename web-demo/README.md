@@ -105,12 +105,12 @@ The responses come from a real `sm-server` on fresh state, except where noted.
 The recording plays in real time, so it takes about ten minutes. Run it through the queue:
 
 ```
-sm queue run --type service --label demo-record --timeout 1800 --cwd <repo> -- \
-    python3 web-demo/generate/record.py
+sm queue run --type background --max-wait 2h --timeout 30m --label demo-record \
+    --cwd <repo> -- python3 web-demo/generate/record.py
 ```
 
 Options: `--tick 0.3` plays fast for a smoke test (the fixtures then cover the same storyline,
-with compressed real time); `--out DIR` writes elsewhere; `--server` and `--sm` pick binaries
+with compressed real time); `--out DIR` writes elsewhere (via `DIR.partial`, swapped in only after the leak scan passes); `--server` and `--sm` pick binaries
 (default: `sm-server` and `sm` on PATH); `--port` (default 8431).
 
 The scratch server runs from `/tmp/smdemo-rec` with `rust_core.runtime_enabled: false`, so it
