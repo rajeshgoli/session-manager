@@ -140,5 +140,29 @@ usage file's seat association and applies context measurements.
 
 `bash scripts/opencode/check.sh` runs both suites, Clippy and formatting.
 
+## Host launch driver
+
+`launch` (#2079, macOS) prepares private config, the judge plugin, an independent
+plugin SDK copy and the persistent server password. It stages opencode through
+the production durable wall owner; tmux runs that owner rather than a provider
+outside the wall. The host serve script restarts at most five times within ten
+minutes, and handles termination by stopping the owner. `serve.pid` identifies
+that owner, which controls the provider and queued process trees.
+
+The driver exposes separate server start and attach steps so the store can
+commit the conversation and start its event reader between them. Authenticated
+health/status polling bounds startup. Initial-brief retries use the persisted
+binding and GET-before-POST contract. The caller supplies the configured brief
+acknowledgement timeout.
+
+Admission uses the shipped model host's `ready` record and loaded identifier;
+rendered configuration uses its endpoint and context. The store must serialize
+admission and include provisional launches when reserving seats and ports.
+Only its authorized handoff path supplies the predecessor-seat exemption.
+Wall host configuration, staged tools and credentials come from the host.
+Preparation/restore must prove any previous provider exited before replacing
+config or library files. Public creation routes remain disabled until their
+session-store integration is complete.
+
 The full historical adversarial suite, launch/runtime immutability, usage
 attribution and live acceptance remain attached to #1956's subsequent tickets.

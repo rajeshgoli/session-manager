@@ -2,6 +2,8 @@
 //! Production admission and outbox completion remain owned by the session store.
 mod binding;
 pub mod events;
+#[cfg(target_os = "macos")]
+pub mod launch;
 pub use binding::RuntimeBinding;
 use std::{
     sync::Mutex,
