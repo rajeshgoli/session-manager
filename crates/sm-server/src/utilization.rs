@@ -351,6 +351,19 @@ pub struct VmPages {
     pub compressor_stored: i64,
 }
 
+/// Activity Monitor's "Memory Used": app memory, wired and compressed,
+/// leaving out the file cache the kernel frees on demand (sm#1714). The
+/// queue's memory guard and admission read physical memory less this
+/// (sm#2053).
+pub fn memory_used_bytes(total: i64, pages: &VmPages) -> Option<i64> {
+    let app = pages.internal.saturating_sub(pages.purgeable).max(0);
+    let used = app
+        .checked_add(pages.wired)?
+        .checked_add(pages.compressed)?
+        .checked_mul(pages.page_size)?;
+    Some(used.clamp(0, total))
+}
+
 /// Fill the memory fields: `used` counts as Activity Monitor does (app
 /// memory, wired and compressed, leaving out the file cache the kernel frees
 /// on demand; sm#1714), `available` is the kernel's own free percentage.
@@ -369,14 +382,7 @@ pub fn apply_memory(
         sample.mem_inactive_bytes = bytes(pages.inactive);
         sample.mem_wired_bytes = bytes(pages.wired);
         sample.mem_compressed_bytes = bytes(pages.compressed);
-        sample.mem_used_bytes = total.and_then(|total| {
-            let app = pages.internal.saturating_sub(pages.purgeable).max(0);
-            let used = bytes(
-                app.checked_add(pages.wired)?
-                    .checked_add(pages.compressed)?,
-            )?;
-            Some(used.clamp(0, total))
-        });
+        sample.mem_used_bytes = total.and_then(|total| memory_used_bytes(total, &pages));
         sample.mem_app_uncompressed_bytes = pages
             .internal
             .checked_add(pages.compressor_stored)

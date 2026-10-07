@@ -3829,16 +3829,9 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             ON queue_jobs(notify_session_id, state);
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_finished
             ON queue_jobs(finished_at);
-        CREATE TABLE IF NOT EXISTS queue_resource_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sampled_at TEXT NOT NULL,
-            pending_by_type_json TEXT NOT NULL,
-            running_by_type_json TEXT NOT NULL,
-            total_running INTEGER NOT NULL,
-            memory_json TEXT NOT NULL,
-            cpu_json TEXT NOT NULL,
-            gpu_json TEXT
-        );
+        -- Never written since 2026-06; utilization.db records host memory
+        -- every 5 s instead (sm#2053).
+        DROP TABLE IF EXISTS queue_resource_samples;
         "#,
     )?;
     ensure_column(conn, "queue_jobs", "local_agent_id", "TEXT")?;
@@ -5056,6 +5049,16 @@ pub fn active_queue_jobs_for_sampling(db_path: &Path) -> Result<Vec<ActiveQueueJ
 const PERF_MEMORY_SAMPLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
 #[cfg(target_os = "macos")]
 const MACOS_MEMORY_RESERVE_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+/// `kern.memorystatus_vm_pressure_level` at warn; critical is 4.
+const MACOS_PRESSURE_WARN: i64 = 2;
+#[cfg(any(target_os = "macos", test))]
+/// Under warn or critical pressure the reserve rises to this share of
+/// physical memory (sm#2053). The kernel kills processes when its compressor
+/// fills, which on 2026-10-07 happened with 32 GiB still outside "Memory
+/// Used", and warn can linger for hours after the load is gone with over
+/// 90 GiB outside it; a quarter of memory separates the two.
+const MACOS_PRESSURE_RESERVE_DIVISOR: i64 = 4;
 
 fn next_admissible_queue_job_id_conn(
     conn: &Connection,
@@ -5154,6 +5157,8 @@ fn perf_resource_hold_reason(
 thread_local! {
     /// Stands in for the host's (total, available) memory in this test thread.
     static TEST_HOST_MEMORY: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+    /// Stands in for the host's (pressure level, total memory) in this test thread.
+    static TEST_HOST_PRESSURE: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
@@ -5161,16 +5166,15 @@ pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
     if let Some(capacity) = TEST_HOST_MEMORY.with(std::cell::Cell::get) {
         return Some(capacity);
     }
+    // Physical memory less Activity Monitor's "Memory Used". The kernel's
+    // free percentage counts inactive app pages as free, and read over a third free
+    // while the kernel was killing processes on 2026-10-07 (sm#2053).
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/bin/memory_pressure")
-            .arg("-Q")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        return parse_macos_memory_pressure(&String::from_utf8_lossy(&output.stdout));
+        use crate::utilization::{mac, memory_used_bytes};
+        let total = mac::sysctl_i64("hw.memsize")?;
+        let used = memory_used_bytes(total, &mac::vm_pages()?)?;
+        return Some((total, total - used));
     }
     #[cfg(target_os = "linux")]
     {
@@ -5200,7 +5204,10 @@ fn perf_memory_headroom_is_safe(
 pub(crate) fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
     #[cfg(target_os = "macos")]
     {
-        configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES)
+        pressure_memory_reserve_bytes(
+            configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES),
+            host_memory_pressure(),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5208,25 +5215,33 @@ pub(crate) fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
     }
 }
 
+/// The kernel's (pressure level, physical memory), when it reports them.
 #[cfg(any(target_os = "macos", test))]
-fn parse_macos_memory_pressure(text: &str) -> Option<(i64, i64)> {
-    let total = text
-        .lines()
-        .find(|line| line.starts_with("The system has "))?
-        .split_whitespace()
-        .nth(3)?
-        .parse::<i64>()
-        .ok()?;
-    let free_percent = text
-        .lines()
-        .find(|line| line.contains("memory free percentage:"))?
-        .split(':')
-        .nth(1)?
-        .trim()
-        .trim_end_matches('%')
-        .parse::<i64>()
-        .ok()?;
-    Some((total, total.checked_mul(free_percent)?.checked_div(100)?))
+fn host_memory_pressure() -> Option<(i64, i64)> {
+    #[cfg(test)]
+    {
+        TEST_HOST_PRESSURE.with(std::cell::Cell::get)
+    }
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use crate::utilization::mac::sysctl_i64;
+        Some((
+            sysctl_i64("kern.memorystatus_vm_pressure_level")?,
+            sysctl_i64("hw.memsize")?,
+        ))
+    }
+}
+
+/// `reserve`, raised to a share of physical memory while the kernel reports
+/// warn or critical pressure.
+#[cfg(any(target_os = "macos", test))]
+fn pressure_memory_reserve_bytes(reserve: i64, pressure: Option<(i64, i64)>) -> i64 {
+    match pressure {
+        Some((level, total)) if level >= MACOS_PRESSURE_WARN => {
+            reserve.max(total / MACOS_PRESSURE_RESERVE_DIVISOR)
+        }
+        _ => reserve,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -8752,12 +8767,51 @@ mod tests {
     }
 
     #[test]
-    fn macos_memory_pressure_reports_reclaimable_capacity() {
-        let sample = "The system has 274877906944 (16777216 pages with a page size of 16384).\nSystem-wide memory free percentage: 66%\n";
+    fn host_memory_reads_below_reserve_at_both_jetsam_kills_and_not_when_healthy() {
+        // The Mac Studio's Jetsam reports of 2026-10-07 (sm#2053), with the
+        // pressure level utilization.db recorded beside each.
+        const GIB: i64 = 1024 * 1024 * 1024;
+        const TOTAL: i64 = 274_877_906_944;
+        let below = |pages: crate::utilization::VmPages, level: i64| {
+            let used = crate::utilization::memory_used_bytes(TOTAL, &pages).unwrap();
+            let reserve = pressure_memory_reserve_bytes(8 * GIB, Some((level, TOTAL)));
+            (TOTAL - used < reserve, (TOTAL - used) / GIB)
+        };
+        let jetsam = |anonymous, wired, compressor| crate::utilization::VmPages {
+            page_size: 16384,
+            internal: anonymous,
+            wired,
+            compressed: compressor,
+            ..Default::default()
+        };
+        // 11:18:38, compressor space shortage: 32 GiB outside "Memory Used",
+        // more than the 8 GiB reserve, but the kernel was at warn.
         assert_eq!(
-            parse_macos_memory_pressure(sample),
-            Some((274_877_906_944, 181_419_418_583))
+            below(jetsam(4_344_582, 1_158_369, 9_176_238), 2),
+            (true, 32)
         );
+        // 11:39:11, compressor space shortage, kernel at critical.
+        assert_eq!(
+            below(jetsam(3_846_978, 1_840_304, 8_850_227), 4),
+            (true, 34)
+        );
+        // Idle on 2026-10-07 after the restore.
+        let idle = crate::utilization::VmPages {
+            purgeable: 31_446,
+            ..jetsam(3_246_333, 438_121, 13_113)
+        };
+        assert_eq!(below(idle, 1), (false, 200));
+        // Warn lingering after the load ended (2026-10-02 20:21): 97 GiB
+        // outside "Memory Used" keeps every job.
+        assert!(
+            TOTAL - 170_046_717_952 >= pressure_memory_reserve_bytes(8 * GIB, Some((2, TOTAL)))
+        );
+        // At normal pressure only the reserve itself counts.
+        assert_eq!(
+            pressure_memory_reserve_bytes(8 * GIB, Some((1, TOTAL))),
+            8 * GIB
+        );
+        assert_eq!(pressure_memory_reserve_bytes(8 * GIB, None), 8 * GIB);
         #[cfg(target_os = "macos")]
         assert_eq!(
             effective_memory_reserve_bytes(2 * 1024 * 1024 * 1024),
@@ -9621,6 +9675,38 @@ mod tests {
                 .holding_reason,
             None
         );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn host_memory_guard_stops_a_job_under_kernel_warn_with_32_gib_free() {
+        // 2026-10-07 11:18: 32 GiB outside "Memory Used" and the kernel at
+        // warn, 48 s before it killed the largest process (sm#2053).
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-warn");
+        let job = running_job_with_pgid(&state_dir, "background", "summaries", 101);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let rss: HashMap<i64, i64> = [(101, 140 * GIB)].into_iter().collect();
+        let host = Some((256 * GIB, 32 * GIB));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            None
+        );
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(Some((2, 256 * GIB))));
+        assert_eq!(effective_memory_reserve_bytes(8 * GIB), 64 * GIB);
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((job.id.clone(), 101))
+        );
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(None));
+        let detail = get_queue_job_conn(&conn, &job.id)
+            .unwrap()
+            .unwrap()
+            .termination_detail
+            .unwrap();
+        assert_eq!(detail["cause"], "host_memory_pressure");
+        assert_eq!(detail["effective_reserve_bytes"], 64 * GIB);
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
     }

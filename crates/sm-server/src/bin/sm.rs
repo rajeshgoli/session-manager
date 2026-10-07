@@ -666,7 +666,7 @@ struct QueueRunArgs {
     #[arg(
         long,
         value_name = "BYTES",
-        help = "Peak memory budget, for example 8G or 512M; required for perf"
+        help = "Peak memory budget, for example 8G or 512M; required for perf, optional for other types. The job is stopped as memory_exceeded if its processes exceed it"
     )]
     memory: Option<String>,
     #[arg(
@@ -1711,8 +1711,8 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
                 "perf jobs require explicit --cpu PERCENT, --memory SIZE, and --timeout DURATION budgets (for example: --cpu 100 --memory 32G --timeout 45m)"
             );
         }
-    } else if cpu_percent.is_some() || gpu_percent.is_some() || memory_bytes.is_some() {
-        bail!("--cpu, --gpu, and --memory resource allocations are only valid for --type perf");
+    } else if cpu_percent.is_some() || gpu_percent.is_some() {
+        bail!("--cpu and --gpu resource allocations are only valid for --type perf");
     }
     let notify_target = args
         .notify
