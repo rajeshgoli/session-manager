@@ -44,7 +44,6 @@ fn fixture() -> (ModelHost, Arc<FakeServer>, PathBuf) {
         state_file: root.join("sessions.json"),
         queue_dir: root.clone(),
         queue_policy: crate::queue::QueueAdmissionPolicy::default(),
-        reserve: 8 * 1024 * 1024 * 1024,
         operation: Mutex::new(()),
         yield_worker: AtomicBool::new(false),
         force_unload: AtomicBool::new(false),
@@ -253,14 +252,24 @@ fn perf_and_memory_guard_wait_for_confirmed_model_stop_before_a_job_is_selected(
         [&job.id],
     )
     .unwrap();
-    assert!(!guard_model(&root, Some((275 * GB, 40 * GB)), host.reserve).unwrap());
+    assert!(!guard_model(
+        &root,
+        Some((275 * GB, 40 * GB)),
+        host.queue_policy.memory_min_free_bytes
+    )
+    .unwrap());
     assert!(hold_perf(&root, "measured run").unwrap());
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(host.record().unwrap().unwrap().state, "draining");
     let rss = std::collections::HashMap::from([(101, 30 * GB)]);
     assert_eq!(
-        crate::queue::host_memory_guard_pass(&conn, Some((275 * GB, GB)), host.reserve, &rss)
-            .unwrap(),
+        crate::queue::host_memory_guard_pass(
+            &conn,
+            Some((275 * GB, GB)),
+            host.queue_policy.memory_min_free_bytes,
+            &rss
+        )
+        .unwrap(),
         None
     );
     let state: String = conn
@@ -277,8 +286,13 @@ fn perf_and_memory_guard_wait_for_confirmed_model_stop_before_a_job_is_selected(
     assert!(!hold_perf(&root, "measured run").unwrap());
     assert_eq!(host.record().unwrap().unwrap().state, "yielded");
     assert_eq!(
-        crate::queue::host_memory_guard_pass(&conn, Some((275 * GB, GB)), host.reserve, &rss)
-            .unwrap(),
+        crate::queue::host_memory_guard_pass(
+            &conn,
+            Some((275 * GB, GB)),
+            host.queue_policy.memory_min_free_bytes,
+            &rss
+        )
+        .unwrap(),
         Some((job.id, 101))
     );
     hosts()

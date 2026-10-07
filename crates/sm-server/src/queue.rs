@@ -5056,6 +5056,16 @@ pub fn active_queue_jobs_for_sampling(db_path: &Path) -> Result<Vec<ActiveQueueJ
 const PERF_MEMORY_SAMPLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
 #[cfg(target_os = "macos")]
 const MACOS_MEMORY_RESERVE_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+/// `kern.memorystatus_vm_pressure_level` at warn; critical is 4.
+const MACOS_PRESSURE_WARN: i64 = 2;
+#[cfg(any(target_os = "macos", test))]
+/// Under warn or critical pressure the reserve rises to this share of
+/// physical memory (sm#2053). The kernel kills processes when its compressor
+/// fills, which on 2026-10-07 happened with 32 GiB still outside "Memory
+/// Used", and warn can linger for hours after the load is gone with over
+/// 90 GiB outside it; a quarter of memory separates the two.
+const MACOS_PRESSURE_RESERVE_DIVISOR: i64 = 4;
 
 fn next_admissible_queue_job_id_conn(
     conn: &Connection,
@@ -5154,6 +5164,8 @@ fn perf_resource_hold_reason(
 thread_local! {
     /// Stands in for the host's (total, available) memory in this test thread.
     static TEST_HOST_MEMORY: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+    /// Stands in for the host's (pressure level, total memory) in this test thread.
+    static TEST_HOST_PRESSURE: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
@@ -5161,16 +5173,15 @@ pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
     if let Some(capacity) = TEST_HOST_MEMORY.with(std::cell::Cell::get) {
         return Some(capacity);
     }
+    // Physical memory less Activity Monitor's "Memory Used". The kernel's
+    // free percentage counts inactive app pages as free, and read over a third free
+    // while the kernel was killing processes on 2026-10-07 (sm#2053).
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/bin/memory_pressure")
-            .arg("-Q")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        return parse_macos_memory_pressure(&String::from_utf8_lossy(&output.stdout));
+        use crate::utilization::{mac, memory_used_bytes};
+        let total = mac::sysctl_i64("hw.memsize")?;
+        let used = memory_used_bytes(total, &mac::vm_pages()?)?;
+        return Some((total, total - used));
     }
     #[cfg(target_os = "linux")]
     {
@@ -5200,7 +5211,10 @@ fn perf_memory_headroom_is_safe(
 pub(crate) fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
     #[cfg(target_os = "macos")]
     {
-        configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES)
+        pressure_memory_reserve_bytes(
+            configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES),
+            host_memory_pressure(),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5208,25 +5222,33 @@ pub(crate) fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
     }
 }
 
+/// The kernel's (pressure level, physical memory), when it reports them.
 #[cfg(any(target_os = "macos", test))]
-fn parse_macos_memory_pressure(text: &str) -> Option<(i64, i64)> {
-    let total = text
-        .lines()
-        .find(|line| line.starts_with("The system has "))?
-        .split_whitespace()
-        .nth(3)?
-        .parse::<i64>()
-        .ok()?;
-    let free_percent = text
-        .lines()
-        .find(|line| line.contains("memory free percentage:"))?
-        .split(':')
-        .nth(1)?
-        .trim()
-        .trim_end_matches('%')
-        .parse::<i64>()
-        .ok()?;
-    Some((total, total.checked_mul(free_percent)?.checked_div(100)?))
+fn host_memory_pressure() -> Option<(i64, i64)> {
+    #[cfg(test)]
+    {
+        TEST_HOST_PRESSURE.with(std::cell::Cell::get)
+    }
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use crate::utilization::mac::sysctl_i64;
+        Some((
+            sysctl_i64("kern.memorystatus_vm_pressure_level")?,
+            sysctl_i64("hw.memsize")?,
+        ))
+    }
+}
+
+/// `reserve`, raised to a share of physical memory while the kernel reports
+/// warn or critical pressure.
+#[cfg(any(target_os = "macos", test))]
+fn pressure_memory_reserve_bytes(reserve: i64, pressure: Option<(i64, i64)>) -> i64 {
+    match pressure {
+        Some((level, total)) if level >= MACOS_PRESSURE_WARN => {
+            reserve.max(total / MACOS_PRESSURE_RESERVE_DIVISOR)
+        }
+        _ => reserve,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5767,12 +5789,16 @@ fn finish_live_queue_job_until_recorded(
 }
 
 fn process_group_rss_bytes(pgid: i64) -> Option<i64> {
-    parse_process_group_rss_bytes(&process_group_rss_listing()?, pgid)
+    job_memory_by_process_group(&process_listing()?, &[pgid], job_process_footprint)
+        .get(&pgid)
+        .copied()
+        .or(Some(0))
 }
 
-fn process_group_rss_listing() -> Option<String> {
+/// Every process: pid, parent pid, process group, resident KiB.
+fn process_listing() -> Option<String> {
     let output = Command::new("ps")
-        .args(["-axo", "pgid=,rss="])
+        .args(["-axo", "pid=,ppid=,pgid=,rss="])
         .output()
         .ok()?;
     output
@@ -5781,33 +5807,114 @@ fn process_group_rss_listing() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let row_pgid = fields.next()?.parse::<i64>().ok()?;
-            let rss_kib = fields.next()?.parse::<i64>().ok()?;
-            (row_pgid == pgid).then_some(rss_kib)
-        })
-        .try_fold(0i64, |total, rss_kib| total.checked_add(rss_kib))?
-        .checked_mul(1024)
+/// Physical footprint of one process on macOS: Activity Monitor's Memory
+/// column. It counts Metal buffers such as MLX's cache, which RSS misses,
+/// and leaves out shared file mappings, which RSS counts in full (sm#2053).
+fn job_process_footprint(pid: i32) -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::utilization::mac::phys_footprint(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
-/// Resident bytes per process group, from one `ps` listing.
-fn parse_rss_bytes_by_process_group(text: &str) -> HashMap<i64, i64> {
+/// Memory of each job in `pgids`, from one [`process_listing`]: the job's
+/// process group plus descendants that left it with `setsid`. Each process
+/// counts `footprint`, or its resident bytes when that is unavailable.
+fn job_memory_by_process_group(
+    listing: &str,
+    pgids: &[i64],
+    footprint: impl Fn(i32) -> Option<i64>,
+) -> HashMap<i64, i64> {
+    let rows = parse_process_listing(listing);
     let mut totals = HashMap::new();
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(Ok(pgid)), Some(Ok(rss_kib))) = (
-            fields.next().map(str::parse::<i64>),
-            fields.next().map(str::parse::<i64>),
-        ) else {
+    for &pgid in pgids {
+        let tree = job_process_tree(&rows, pgid);
+        if tree.is_empty() {
             continue;
-        };
-        let total: &mut i64 = totals.entry(pgid).or_default();
-        *total = total.saturating_add(rss_kib.saturating_mul(1024));
+        }
+        let total = tree
+            .iter()
+            .map(|(pid, _, _, rss_kib)| {
+                footprint(*pid).unwrap_or_else(|| rss_kib.saturating_mul(1024))
+            })
+            .fold(0i64, i64::saturating_add);
+        totals.insert(pgid, total);
     }
     totals
+}
+
+/// (pid, parent pid, process group, resident KiB) rows of a [`process_listing`].
+fn parse_process_listing(listing: &str) -> Vec<(i32, i32, i64, i64)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+                fields.next()?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// The rows of a job's processes: its process group, plus descendants that
+/// left it with `setsid`.
+fn job_process_tree(rows: &[(i32, i32, i64, i64)], pgid: i64) -> Vec<(i32, i32, i64, i64)> {
+    let mut members: Vec<i32> = rows
+        .iter()
+        .filter(|(_, _, group, _)| *group == pgid)
+        .map(|(pid, ..)| *pid)
+        .collect();
+    let mut next = 0;
+    while next < members.len() {
+        let parent = members[next];
+        next += 1;
+        for (pid, ppid, ..) in rows {
+            if *ppid == parent && !members.contains(pid) {
+                members.push(*pid);
+            }
+        }
+    }
+    rows.iter()
+        .filter(|(pid, ..)| members.contains(pid))
+        .copied()
+        .collect()
+}
+
+/// Descendants of a job that left its process group with `setsid`. Taken
+/// before the first signal: once their parent dies they are reparented and
+/// can no longer be traced to the job (sm#2060).
+fn escaped_job_processes(pgid: i64) -> Vec<i64> {
+    let Some(listing) = process_listing() else {
+        return Vec::new();
+    };
+    job_process_tree(&parse_process_listing(&listing), pgid)
+        .into_iter()
+        .filter(|(_, _, group, _)| *group != pgid)
+        .map(|(pid, ..)| i64::from(pid))
+        .collect()
+}
+
+fn signal_processes(pids: &[i64], force: bool) {
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    for pid in pids {
+        if let Ok(pid) = i32::try_from(*pid) {
+            if pid > 0 {
+                let _ = kill(Pid::from_raw(pid), signal);
+            }
+        }
+    }
 }
 
 /// The sample that made the perf memory guard stop a job. It is persisted
@@ -5961,6 +6068,14 @@ fn host_pressure_victim<'a>(
         })
 }
 
+fn running_job_process_groups(conn: &Connection) -> Result<Vec<i64>> {
+    Ok(list_queue_job_runtime_records_conn(conn)?
+        .iter()
+        .filter(|job| job.state == "running")
+        .filter_map(|job| job.process_group_id.or(job.pid))
+        .collect())
+}
+
 /// One host memory guard check. When available memory is below the reserve,
 /// records the chosen job as `memory_terminating` with cause
 /// `host_memory_pressure` and returns it with its process group to stop.
@@ -6012,7 +6127,6 @@ pub fn spawn_host_memory_guard(
 ) {
     let shutdown = queue_shutdown();
     thread::spawn(move || {
-        let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
         let mut last_stop: Option<Instant> = None;
         loop {
             thread::sleep(HOST_MEMORY_GUARD_INTERVAL);
@@ -6023,6 +6137,8 @@ pub fn spawn_host_memory_guard(
                 continue;
             }
             let host = host_memory_capacity();
+            // Read each pass: the reserve rises with kernel pressure (sm#2053).
+            let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
             // The model yields above the job-kill reserve. Failed unloads keep
             // this guard from selecting a queue victim until the model is gone.
             match crate::local_model::guard_model(&state_dir, host, reserve) {
@@ -6036,12 +6152,16 @@ pub fn spawn_host_memory_guard(
             if host.is_none_or(|(_, available)| available >= reserve) {
                 continue;
             }
-            let Some(listing) = process_group_rss_listing() else {
+            let Some(listing) = process_listing() else {
                 continue;
             };
-            let rss_by_pgid = parse_rss_bytes_by_process_group(&listing);
             let outcome =
                 open_queue_jobs_connection(&state_dir.join("queue_runner.db")).and_then(|conn| {
+                    let rss_by_pgid = job_memory_by_process_group(
+                        &listing,
+                        &running_job_process_groups(&conn)?,
+                        job_process_footprint,
+                    );
                     host_memory_guard_pass(
                         &conn,
                         host,
@@ -7765,31 +7885,40 @@ fn terminate_process_group(pgid: i64, force: bool) {
 }
 
 fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
+    let escaped = escaped_job_processes(pgid);
+    let alive = |escaped: &[i64]| {
+        process_group_exists(pgid) || escaped.iter().any(|pid| process_exists(*pid))
+    };
     terminate_process_group(pgid, false);
+    signal_processes(&escaped, false);
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
-    while process_group_exists(pgid) {
+    while alive(&escaped) {
         if Instant::now() >= deadline {
             terminate_process_group(pgid, true);
+            signal_processes(&escaped, true);
             break;
         }
         thread::sleep(StdDuration::from_millis(100));
     }
-    while process_group_exists(pgid) {
+    while alive(&escaped) {
         thread::sleep(StdDuration::from_millis(100));
     }
 }
 
 fn terminate_child_process_group_with_grace(child: &mut QueueChild, pgid: i64, grace_seconds: u64) {
+    let escaped = escaped_job_processes(pgid);
     terminate_process_group(pgid, false);
+    signal_processes(&escaped, false);
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
     let mut force_sent = false;
     loop {
         let _ = child.try_wait();
-        if !process_group_exists(pgid) {
+        if !process_group_exists(pgid) && !escaped.iter().any(|pid| process_exists(*pid)) {
             return;
         }
         if !force_sent && Instant::now() >= deadline {
             terminate_process_group(pgid, true);
+            signal_processes(&escaped, true);
             force_sent = true;
         }
         thread::sleep(StdDuration::from_millis(100));
@@ -8752,12 +8881,51 @@ mod tests {
     }
 
     #[test]
-    fn macos_memory_pressure_reports_reclaimable_capacity() {
-        let sample = "The system has 274877906944 (16777216 pages with a page size of 16384).\nSystem-wide memory free percentage: 66%\n";
+    fn host_memory_reads_below_reserve_at_both_jetsam_kills_and_not_when_healthy() {
+        // The Mac Studio's Jetsam reports of 2026-10-07 (sm#2053), with the
+        // pressure level utilization.db recorded beside each.
+        const GIB: i64 = 1024 * 1024 * 1024;
+        const TOTAL: i64 = 274_877_906_944;
+        let below = |pages: crate::utilization::VmPages, level: i64| {
+            let used = crate::utilization::memory_used_bytes(TOTAL, &pages).unwrap();
+            let reserve = pressure_memory_reserve_bytes(8 * GIB, Some((level, TOTAL)));
+            (TOTAL - used < reserve, (TOTAL - used) / GIB)
+        };
+        let jetsam = |anonymous, wired, compressor| crate::utilization::VmPages {
+            page_size: 16384,
+            internal: anonymous,
+            wired,
+            compressed: compressor,
+            ..Default::default()
+        };
+        // 11:18:38, compressor space shortage: 32 GiB outside "Memory Used",
+        // more than the 8 GiB reserve, but the kernel was at warn.
         assert_eq!(
-            parse_macos_memory_pressure(sample),
-            Some((274_877_906_944, 181_419_418_583))
+            below(jetsam(4_344_582, 1_158_369, 9_176_238), 2),
+            (true, 32)
         );
+        // 11:39:11, compressor space shortage, kernel at critical.
+        assert_eq!(
+            below(jetsam(3_846_978, 1_840_304, 8_850_227), 4),
+            (true, 34)
+        );
+        // Idle on 2026-10-07 after the restore.
+        let idle = crate::utilization::VmPages {
+            purgeable: 31_446,
+            ..jetsam(3_246_333, 438_121, 13_113)
+        };
+        assert_eq!(below(idle, 1), (false, 200));
+        // Warn lingering after the load ended (2026-10-02 20:21): 97 GiB
+        // outside "Memory Used" keeps every job.
+        assert!(
+            TOTAL - 170_046_717_952 >= pressure_memory_reserve_bytes(8 * GIB, Some((2, TOTAL)))
+        );
+        // At normal pressure only the reserve itself counts.
+        assert_eq!(
+            pressure_memory_reserve_bytes(8 * GIB, Some((1, TOTAL))),
+            8 * GIB
+        );
+        assert_eq!(pressure_memory_reserve_bytes(8 * GIB, None), 8 * GIB);
         #[cfg(target_os = "macos")]
         assert_eq!(
             effective_memory_reserve_bytes(2 * 1024 * 1024 * 1024),
@@ -8773,10 +8941,6 @@ mod tests {
             2 * 1024 * 1024 * 1024,
             (256 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
         ));
-        assert_eq!(
-            parse_process_group_rss_bytes(" 42 1024\n 7 9000\n 42 2048\n", 42),
-            Some(3 * 1024 * 1024)
-        );
     }
 
     #[test]
@@ -9626,6 +9790,38 @@ mod tests {
     }
 
     #[test]
+    fn host_memory_guard_stops_a_job_under_kernel_warn_with_32_gib_free() {
+        // 2026-10-07 11:18: 32 GiB outside "Memory Used" and the kernel at
+        // warn, 48 s before it killed the largest process (sm#2053).
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-warn");
+        let job = running_job_with_pgid(&state_dir, "background", "summaries", 101);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let rss: HashMap<i64, i64> = [(101, 140 * GIB)].into_iter().collect();
+        let host = Some((256 * GIB, 32 * GIB));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            None
+        );
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(Some((2, 256 * GIB))));
+        assert_eq!(effective_memory_reserve_bytes(8 * GIB), 64 * GIB);
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((job.id.clone(), 101))
+        );
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(None));
+        let detail = get_queue_job_conn(&conn, &job.id)
+            .unwrap()
+            .unwrap()
+            .termination_detail
+            .unwrap();
+        assert_eq!(detail["cause"], "host_memory_pressure");
+        assert_eq!(detail["effective_reserve_bytes"], 64 * GIB);
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn host_memory_guard_leaves_a_job_that_is_already_being_cancelled() {
         const GIB: i64 = 1024 * 1024 * 1024;
         let state_dir = unique_temp_path("host-memory-guard-cancel-race");
@@ -9744,7 +9940,11 @@ mod tests {
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
         let deadline = Instant::now() + StdDuration::from_secs(30);
         let (job_id, pgid) = loop {
-            let rss = parse_rss_bytes_by_process_group(&process_group_rss_listing().unwrap());
+            let rss = job_memory_by_process_group(
+                &process_listing().unwrap(),
+                &running_job_process_groups(&conn).unwrap(),
+                job_process_footprint,
+            );
             if let Some(victim) =
                 host_memory_guard_pass(&conn, Some((256 * GIB, 0)), 8 * GIB, &rss).unwrap()
             {
@@ -10229,10 +10429,53 @@ mod tests {
     }
 
     #[test]
-    fn rss_listing_sums_each_process_group() {
-        let totals = parse_rss_bytes_by_process_group("  10 100\n 10 50\n 11 7\nbad line\n");
-        assert_eq!(totals.get(&10), Some(&(150 * 1024)));
-        assert_eq!(totals.get(&11), Some(&(7 * 1024)));
+    fn stopping_a_job_also_stops_children_that_left_its_process_group() {
+        use std::os::unix::process::CommandExt;
+        let dir = unique_temp_path("escaped-child");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!(
+            "python3 -c 'import os,time; os.setsid(); open(\"{}\",\"w\").write(str(os.getpid())); time.sleep(300)' & wait",
+            pid_file.display()
+        );
+        let mut job = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = i64::from(job.id());
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        let escaped = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.parse::<i64>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "child never detached");
+            thread::sleep(StdDuration::from_millis(50));
+        };
+        assert_eq!(escaped_job_processes(pgid), [escaped]);
+        terminate_process_group_with_grace(pgid, 2);
+        let _ = job.wait();
+        assert!(!process_exists(escaped), "setsid child survived the stop");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn job_memory_counts_footprints_of_the_group_and_its_setsid_descendants() {
+        // pgid 10: 10 and 11, plus 12, which left with setsid, and its child 13.
+        // 20 is another job; 30 is not a job.
+        let listing = " 10 1 10 100\n 11 10 10 50\n 12 11 12 4\n 13 12 12 2\n 20 1 20 7\n 30 1 30 9\nbad line\n";
+        // An MLX process: 1 GiB footprint behind 4 KiB of RSS. 13 has exited.
+        let footprint = |pid: i32| match pid {
+            12 => Some(1 << 30),
+            13 => None,
+            pid => Some(i64::from(pid)),
+        };
+        let totals = job_memory_by_process_group(listing, &[10, 20, 40], footprint);
+        assert_eq!(totals.get(&10), Some(&(10 + 11 + (1 << 30) + 2 * 1024)));
+        assert_eq!(totals.get(&20), Some(&20));
         assert_eq!(totals.len(), 2);
     }
 

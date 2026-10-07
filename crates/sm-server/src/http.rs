@@ -8096,15 +8096,10 @@ async fn create_queue_job(
                     .to_owned(),
         });
     }
-    if job_type != "perf"
-        && (payload.cpu_percent.is_some()
-            || payload.gpu_percent.is_some()
-            || payload.memory_bytes.is_some())
-    {
+    if job_type != "perf" && (payload.cpu_percent.is_some() || payload.gpu_percent.is_some()) {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
-            detail: "cpu_percent, gpu_percent, and memory_bytes are only valid for perf jobs"
-                .to_owned(),
+            detail: "cpu_percent and gpu_percent are only valid for perf jobs".to_owned(),
         });
     }
     if payload
@@ -8115,9 +8110,8 @@ async fn create_queue_job(
     {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
-            detail:
-                "perf budgets require cpu_percent=1..100, gpu_percent=0..100, and memory_bytes > 0"
-                    .to_owned(),
+            detail: "budgets require cpu_percent=1..100, gpu_percent=0..100, and memory_bytes > 0"
+                .to_owned(),
         });
     }
     let timeout_seconds = payload.timeout_seconds.unwrap_or(default_timeout);

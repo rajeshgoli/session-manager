@@ -123,7 +123,6 @@ pub struct ModelHost {
     state_file: PathBuf,
     queue_dir: PathBuf,
     queue_policy: crate::queue::QueueAdmissionPolicy,
-    reserve: i64,
     operation: Mutex<()>,
     yield_worker: AtomicBool,
     force_unload: AtomicBool,
@@ -372,7 +371,8 @@ impl ModelHost {
         Ok(())
     }
     fn yield_line(&self) -> i64 {
-        self.reserve
+        // Read each time: the reserve rises with kernel pressure (sm#2053).
+        crate::queue::effective_memory_reserve_bytes(self.queue_policy.memory_min_free_bytes)
             .saturating_add(self.config.yield_margin_bytes.max(0))
     }
     pub fn unload(&self, force: bool, reason: Option<&str>) -> Result<()> {
@@ -971,9 +971,6 @@ pub fn register_live(config: &AppConfig) -> Result<Arc<ModelHost>> {
         state_file: expand_home(&config.paths.state_file),
         queue_dir: queue_dir.clone(),
         queue_policy: config.queue_admission_policy(),
-        reserve: crate::queue::effective_memory_reserve_bytes(
-            config.queue_runner.memory.min_free_bytes,
-        ),
         operation: Mutex::new(()),
         yield_worker: AtomicBool::new(false),
         force_unload: AtomicBool::new(false),

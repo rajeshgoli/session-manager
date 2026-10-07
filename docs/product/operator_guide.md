@@ -627,7 +627,7 @@ EOF
 
 | Command | What it does |
 |---|---|
-| `sm queue run [--type T] --label L --cwd D -- <command>` | Queue a job; the submitter is woken with `[sm queue]` when it finishes. Types: `tests` (default), `perf` (machine to itself; needs `--cpu`, `--memory`, `--timeout`), `background` (a perf job may stop it), `service` (long-running). `--timeout 90s`/`2h`, `--max-wait` (default 5m), `--env K=V`, `--script-file`. From a plain shell, name who to wake with `--notify <id>`. |
+| `sm queue run [--type T] --label L --cwd D -- <command>` | Queue a job; the submitter is woken with `[sm queue]` when it finishes. Types: `tests` (default), `perf` (machine to itself; needs `--cpu`, `--memory`, `--timeout`), `background` (a perf job may stop it), `service` (long-running). `--memory 64G` on any type stops the job as `memory_exceeded` if its processes exceed it, `--timeout 90s`/`2h`, `--max-wait` (default 5m), `--env K=V`, `--script-file`. From a plain shell, name who to wake with `--notify <id>`. |
 | `sm queue list` | Active jobs; `--all` adds finished ones and every submitter, `--state`, `--type`, `--json`. **op** |
 | `sm queue status <label-or-id>` | One job and what it is waiting on, naming the jobs ahead of it. **op** |
 | `sm queue log <label-or-id>` | The job's output; `--lines` (default 200). **op** |
