@@ -38,15 +38,15 @@ struct StubState {
     rename_error: bool,
 }
 
-struct Stub {
-    port: u16,
+pub(crate) struct Stub {
+    pub(crate) port: u16,
     state: Arc<Mutex<StubState>>,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Stub {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(StubState::default()));
@@ -72,7 +72,7 @@ impl Stub {
         Client::new(self.port, "secret", Duration::from_secs(1)).unwrap()
     }
 
-    fn posts(&self) -> usize {
+    pub(crate) fn posts(&self) -> usize {
         self.state
             .lock()
             .unwrap()
@@ -80,6 +80,10 @@ impl Stub {
             .iter()
             .filter(|(verb, path, _)| verb == "POST" && path.ends_with("/prompt_async"))
             .count()
+    }
+
+    pub(crate) fn lose_post_reply(&self) {
+        self.state.lock().unwrap().lose_post_reply = true;
     }
 }
 

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
@@ -519,6 +521,80 @@ impl TmuxRuntime {
             event_stream_path,
             control_socket_path,
         }))
+    }
+
+    /// Host launcher only: the command owns the wall and must never be replaced
+    /// with a provider command executed directly by tmux.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_opencode_serve_window(
+        &self,
+        spec: &TmuxSessionSpec,
+        script: &Path,
+        log: &Path,
+    ) -> Result<()> {
+        if spec.provider != "opencode" || self.session_exists(&spec.tmux_session)? {
+            bail!("opencode host launch needs an absent opencode tmux session");
+        }
+        if !Path::new(&spec.working_dir).is_dir() {
+            bail!("working dir does not exist: {}", spec.working_dir);
+        }
+        self.ensure_server_anchor()?;
+        let command = format!("exec /bin/bash {}", shell_quote_path(script));
+        self.create_session_with_bootstrap(spec, &command)?;
+        let main = format!("{}:main", spec.tmux_session);
+        let result = (|| {
+            self.run_tmux(["rename-window", "-t", &main, "serve"])?;
+            self.pipe_host_window(&format!("{}:serve", spec.tmux_session), log)
+        })();
+        if result.is_err() {
+            let _ = self.kill_session(&spec.tmux_session);
+        }
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_opencode_attach_window(
+        &self,
+        spec: &TmuxSessionSpec,
+        script: &Path,
+    ) -> Result<()> {
+        let target = format!("{}:agent", spec.tmux_session);
+        let command = format!("exec /bin/bash {}", shell_quote_path(script));
+        self.run_tmux([
+            "new-window",
+            "-d",
+            "-t",
+            &spec.tmux_session,
+            "-n",
+            "agent",
+            "-c",
+            &spec.working_dir,
+            &command,
+        ])?;
+        self.pipe_host_window(&target, &spec.log_file)?;
+        self.run_tmux(["select-window", "-t", &target])
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pipe_host_window(&self, target: &str, log: &Path) -> Result<()> {
+        if let Some(parent) = log.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(log)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            bail!("opencode window log must be an independent host file");
+        }
+        let command = format!("cat >> {}", shell_quote_path(log));
+        self.run_tmux(["pipe-pane", "-t", target, &command])
     }
 
     pub fn create_session(&self, spec: &TmuxSessionSpec) -> Result<()> {
@@ -2612,7 +2688,7 @@ fn resolve_launch_command(command: &str, working_dir: &Path) -> Result<PathBuf> 
     })
 }
 
-fn command_output_with_timeout(
+pub(crate) fn command_output_with_timeout(
     mut command: Command,
     timeout: Duration,
 ) -> Result<std::process::Output> {
@@ -5011,6 +5087,47 @@ esac
         assert!(escape < interrupt_wait);
         assert!(interrupt_wait < payload);
         assert!(payload < enter);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opencode_host_windows_keep_server_and_view_logs_separate() {
+        let (binary, log, directory) = fake_tmux_binary_with_has_session(false);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some("opencode-fixture".into()),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = binary.display().to_string();
+        let spec = TmuxSessionSpec {
+            session_id: "fixture".into(),
+            session_credential: None,
+            tmux_session: "sm-opencode-test".into(),
+            working_dir: directory.display().to_string(),
+            log_file: directory.join("view.log"),
+            provider: "opencode".into(),
+            initial_message: None,
+            force_initial_prompt_stdin: false,
+            claude_session_id: None,
+            model: None,
+            reasoning_effort: None,
+        };
+        let serve = directory.join("launch-serve.sh");
+        let attach = directory.join("launch-attach.sh");
+        runtime
+            .create_opencode_serve_window(&spec, &serve, &directory.join("serve.log"))
+            .unwrap();
+        runtime
+            .create_opencode_attach_window(&spec, &attach)
+            .unwrap();
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("rename-window -t sm-opencode-test:main serve"));
+        assert!(commands.contains("pipe-pane -t sm-opencode-test:serve cat >>"));
+        assert!(commands.contains("new-window -d -t sm-opencode-test -n agent"));
+        assert!(commands.contains("pipe-pane -t sm-opencode-test:agent cat >>"));
+        assert!(commands.contains("select-window -t sm-opencode-test:agent"));
+        assert!(!commands.contains("SM_SESSION_CREDENTIAL="));
+        assert!(!commands.contains("opencode serve"));
+        let _ = fs::remove_dir_all(directory);
     }
 
     fn fake_tmux_binary() -> (PathBuf, PathBuf, PathBuf) {
