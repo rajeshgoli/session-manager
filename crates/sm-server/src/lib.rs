@@ -51,6 +51,8 @@ pub mod local_identity;
 pub mod local_judge;
 pub mod local_model;
 pub mod local_sockets;
+#[cfg(target_os = "macos")]
+pub mod local_wall;
 pub mod mobile_devices;
 pub mod notes;
 pub mod owner_doc_render;

@@ -8,6 +8,37 @@ This is the profile primitive for #1974, implemented in #1976; it does not launc
 agents or services. #1974 supplies runtime registration and #1956 supplies the
 opencode provider.
 
+`local_wall::LocalWallRuntime` composes the host preparation steps. Its Rust
+configuration and agent registration come only from the host; they are not
+deserializable tool or queue requests. `prepare` registers the agent with the
+judge, the logged network proxy and the socket broker, then stages independent
+ad-hoc signed tool copies, the adapter, the supervisor and the immutable profile
+under its private configuration directory. Sources are embedded in the server
+binary, so preparation does not depend on a developer checkout. The checkout
+must have independent Git metadata; linked worktrees and shared object stores
+are refused. Git identity is supplied through the cleared, host-controlled
+environment alongside the private GitHub and Cargo configuration.
+
+The returned `PreparedWall` exposes `spawn_provider` and `spawn_queue`. Both
+accept only a registered tool name and command arguments. They use the prepared
+environment and profile. Only the provider receives descriptor 198, the host's
+already listening control socket. Providers use ordinary `socket`, `bind` and
+`listen` calls on their assigned control port; the adapter duplicates that
+socket. Queue children receive no provider descriptor. Drain child stdout and
+stderr while waiting for commands with substantial output. Waiting or dropping
+`WallChild` kills remaining children before releasing its launch authority.
+
+Call `suspend` after all launched children have finished, cancel pending queue
+work, and only then release durable network port registrations. Suspension
+disables the judge and network registrations but preserves their assigned ports
+for restoration. Before preparing a restored agent, finish every previous
+launch and drop its old `PreparedWall`; a held host lock or live broker socket
+causes refusal. A new preparation regenerates artifacts against the current
+broker identity. A short private directory below `/private/tmp` holds only
+host-owned broker aliases, allowing long production state paths without granting
+agents general temporary-directory access. Runtime preparation is a library
+primitive; provider activation and durable queue admission remain caller work.
+
 The input state layout is:
 
 ```text

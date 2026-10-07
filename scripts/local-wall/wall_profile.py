@@ -198,6 +198,12 @@ def generate(args, listeners, minimum_tmp_length):
         if tmp == broker or below(tmp, broker):
             raise ValueError("application TMPDIR must not be inside the broker directory")
         protected_writes.append(broker)
+    if args.broker_endpoint:
+        endpoint = Path(args.broker_endpoint)
+        if (not args.broker_dir or not endpoint.is_absolute() or physical(endpoint.parent) != broker
+                or endpoint.is_symlink() or not endpoint.is_socket()
+                or len(bytes(endpoint)) >= 104):
+            raise ValueError("broker endpoint must resolve inside the protected broker directory")
 
     agent_ports = port_range(args.agent_port_range)
     gateways = port_range(args.gateway_port_range)
@@ -338,6 +344,8 @@ def generate(args, listeners, minimum_tmp_length):
             f'(remote ip "localhost:{number}")' for number in sorted(admitted)) + ' '
         f'(remote unix-socket (subpath {quoted(state / "tmp")})))',
     ])
+    if args.broker_endpoint:
+        lines.append(f"(allow network-outbound (remote unix-socket (literal {quoted(args.broker_endpoint)})))")
     for number in sorted(forbidden):
         lines.append(f'(deny network-outbound (remote ip "localhost:{number}"))')
     return "\n".join(lines) + "\n"
@@ -357,6 +365,7 @@ def parser():
     result.add_argument("--read-only-dir", action="append", default=[],
                         help="host-approved credential-free toolchain or dedicated log directory")
     result.add_argument("--broker-dir", help="host-owned endpoint directory inside private state/tmp")
+    result.add_argument("--broker-endpoint", help="exact host-owned short endpoint alias resolving inside broker-dir")
     result.add_argument("--contained-processes", action="store_true",
                         help="require fork/exec adapter spawns; prevent descendants leaving the host process group")
     result.add_argument("--immutable-exec-dir", action="append", default=[],

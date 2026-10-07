@@ -180,7 +180,9 @@ impl SocketPool {
         if !self.policy.permits_control(port) {
             return Err(error(libc::EACCES));
         }
-        let listener = bound_socket(ip, port, false)?;
+        // Restore must survive closed connections in TIME_WAIT. Exact loopback
+        // binding without SO_REUSEPORT still excludes another active listener.
+        let listener = bound_socket(ip, port, true)?;
         activate(&listener, 128)?;
         Ok(listener)
     }
@@ -338,6 +340,35 @@ mod tests {
     }
     fn pool() -> SocketPool {
         SocketPool::new(Arc::new(PortPolicy::new(configuration()).unwrap()))
+    }
+
+    #[test]
+    fn control_restore_reuses_closed_connections_but_excludes_live_listeners() {
+        let pool = pool();
+        let listener = pool.control_listener(IpVersion::V4, 21000).unwrap();
+        assert!(pool.control_listener(IpVersion::V4, 21000).is_err());
+        let mut client = TcpStream::connect(address(IpVersion::V4, 21000)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        drop(server);
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        drop(client);
+        drop(listener);
+        // EOF precedes completion of the TCP close handshake. Rebinding is
+        // allowed once it settles, without waiting for TIME_WAIT to expire.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let restored = loop {
+            match pool.control_listener(IpVersion::V4, 21000) {
+                Ok(listener) => break listener,
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+                    assert!(std::time::Instant::now() < deadline, "{error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert!(pool.control_listener(IpVersion::V4, 21000).is_err());
+        drop(restored);
     }
 
     #[test]
