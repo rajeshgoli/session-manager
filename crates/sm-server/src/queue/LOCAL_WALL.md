@@ -36,6 +36,17 @@ operations is exposed through HTTP. The host is responsible for generating the
 correct profile; registration verifies identity, paths and artifact integrity,
 not the semantics of arbitrary sandbox profile text.
 
+`local_wall::LocalWallRuntime::prepare_for_queue` supplies this composition:
+it stages the signed shell, generates or validates the profile, registers the
+host environment and attaches the shared socket service. Its host caller pauses
+admission during preparation and restoration. `PreparedWall::detach_queue`
+checks that no queue rows are running and removes the live launcher while
+preserving pending command registrations. It does not cancel pending work.
+The saved host authority pins agent metadata, source hashes, service assignments
+and profile generator. Matching restores keep the original profile and saved
+judge credential, while compiling a fresh adapter against the live broker.
+Changed authority fails closed instead of changing an admitted job's fingerprint.
+
 ## Submission, execution, and restart
 
 Submission requires a physical working directory inside the registered checkout.

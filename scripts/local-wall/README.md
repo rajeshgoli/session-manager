@@ -41,6 +41,29 @@ primitive; provider activation and durable queue admission remain caller work.
 Preparation rebuilds the staged executable directory from the current tool
 registration, removing withdrawn tools and interrupted copies before launch.
 
+Use `prepare_for_queue(agent, queue_state)` when the agent may submit queue work.
+It stages and signs the host's zsh, excludes the queue service directory from the
+wall, saves the host registration, and attaches a queue-only launcher sharing
+the provider's socket service. Pause queue admission before preparing, detaching
+or restoring these bindings. Preparation and `detach_queue` refuse running queue
+rows; callers must also finish provider and direct launches before replacing
+artifacts. `detach_queue` leaves pending commands and registrations intact.
+
+On restore, the host validates the saved profile and shell hashes and compares
+the current agent metadata, service ports, paths, tool source hashes and profile
+generator against its saved preparation authority. A mismatch fails launch;
+configuration changes require finishing/cancelling old work, suspending the wall
+and calling `retire_queue` rather than rewriting pending commands. Retirement
+refuses pending or running work and removes the saved registration; the host
+removes immutable command inputs when retiring the agent. A matching restore retains
+the original profile, including its launch-time listening-port deny list, and
+regenerates the adapter for the live broker. The judge restores the credential
+from the validated host registration through its private control socket, so
+suspension or failed preparation does not invalidate the saved queue environment.
+Missing or replaced artifacts fail before launch, with no host execution fallback.
+An uncertain egress registration result triggers deactivation while preserving
+its durable port assignments.
+
 The input state layout is:
 
 ```text

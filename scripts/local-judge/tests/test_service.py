@@ -436,6 +436,18 @@ class JudgeTests(unittest.TestCase):
                 self.assertIn('dynamic shell expansion', record['judge_why'])
                 self.assertEqual(record['judge_raw'], 'DENY: recorded proof ruling')
 
+    def test_host_restores_only_valid_nonconflicting_credentials(self):
+        registration = self.control('registrations')['a']
+        token = self.endpoints['a']['token']
+        for invalid in ['malformed', 'f' * 64]:
+            with self.assertRaises(ValueError):
+                self.control('register', session_id='a', agent=registration, restore_token=invalid)
+        self.control('unregister', session_id='a')
+        self.assertEqual(self.ruling('Read', {}), 'deny')
+        restored = self.control('register', session_id='a', agent=registration, restore_token=token)
+        self.assertEqual(restored['token'], token)
+        self.assertEqual(self.ruling('Read', {}), 'allow')
+
     def test_private_controls_and_identity(self):
         self.assertEqual(len(self.control('registrations')), 2)
         self.assertNotEqual(self.endpoints['a']['token'], self.endpoints['b']['token'])

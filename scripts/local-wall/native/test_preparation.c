@@ -39,6 +39,10 @@ static void exchange(unsigned number, const char *request, const char *expected)
 }
 int main(int argc, char **argv) {
     alarm(15);
+    if (argc == 2 && !strcmp(argv[1], "hold")) {
+        assert(fcntl(198, F_GETFD) < 0 && errno == EBADF);
+        sleep(2); puts("durable-wall-ok"); return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "provider")) {
         assert(fcntl(198, F_GETFD) >= 0);
         struct sockaddr_in address;

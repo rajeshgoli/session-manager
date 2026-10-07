@@ -198,6 +198,53 @@ pub fn register(state_dir: &Path, agent: &str, mut spec: WallSpec) -> Result<Str
 pub fn validate(state_dir: &Path, agent: &str) -> Result<()> {
     load(state_dir, agent).map(|_| ())
 }
+/// Host-only restoration snapshot; existing artifacts must still match.
+pub fn registered_spec(state_dir: &Path, agent: &str) -> Result<Option<WallSpec>> {
+    let path = registry_path(state_dir, agent)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => Ok(Some(load(state_dir, agent)?.spec)),
+    }
+}
+
+/// Stop new admission first. Pending jobs may survive a host restart; running
+/// jobs must finish before their launcher and immutable artifacts are replaced.
+pub fn ensure_no_running_jobs(state_dir: &Path, agent: &str) -> Result<()> {
+    let connection = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&connection)?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM queue_jobs WHERE local_agent_id = ? AND state = 'running'",
+        [agent],
+        |row| row.get(0),
+    )?;
+    if count != 0 {
+        bail!("local agent still has running queue work");
+    }
+    Ok(())
+}
+
+/// Host-only retirement after admission stops and all pending/running work ends.
+pub fn retire_registration(state_dir: &Path, agent: &str) -> Result<()> {
+    valid_id(agent)?;
+    let connection = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&connection)?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM queue_jobs WHERE local_agent_id = ? AND state IN ('pending', 'running')",
+        [agent], |row| row.get(0),
+    )?;
+    if count != 0 {
+        bail!("local agent still has pending or running queue work");
+    }
+    #[cfg(target_os = "macos")]
+    detach(state_dir, agent)?;
+    if registered_spec(state_dir, agent)?.is_some() {
+        let path = registry_path(state_dir, agent)?;
+        fs::remove_file(&path)?;
+        fs::File::open(path.parent().unwrap())?.sync_all()?;
+    }
+    Ok(())
+}
 fn load(state_dir: &Path, agent: &str) -> Result<RegisteredWall> {
     let path = registry_path(state_dir, agent)?;
     let wall: RegisteredWall = serde_json::from_slice(&read_file(&path)?)?;

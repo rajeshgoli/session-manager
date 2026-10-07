@@ -333,6 +333,20 @@ impl LocalJudgeRuntime {
         .context("judge endpoint")
     }
 
+    /// Host-only restoration of the credential in a validated durable wall.
+    pub fn register_restored(
+        &self,
+        session_id: &str,
+        agent: &Registration,
+        token: &str,
+    ) -> Result<JudgeEndpoint> {
+        serde_json::from_value(self.ensure_and_control(json!({
+            "op": "register", "session_id": session_id, "agent": agent,
+            "restore_token": token,
+        }))?)
+        .context("restored judge endpoint")
+    }
+
     pub fn unregister(&self, session_id: &str) -> Result<()> {
         self.ensure_and_control(json!({"op": "unregister", "session_id": session_id}))?;
         Ok(())
