@@ -334,8 +334,9 @@ root=Path(__file__).parent
 if sys.argv[1]=='--version':
     print('mtplx 2.12.0'); sys.exit(0)
 if sys.argv[1]=='stop':
-    os.kill(int((root/'pid').read_text()),signal.SIGTERM)
-    sys.exit(0)
+    (root/'stop-called').write_text('unauthenticated public CLI')
+    print('Port is in use, but not by an MTPLX server. Not touching it.')
+    sys.exit(1)
 (root/'pid').write_text(str(os.getpid()))
 (root/'launch.json').write_text(json.dumps({'argv':sys.argv[1:],'bank':os.environ['MTPLX_SESSION_BANK_MAX_BYTES']}))
 class Handler(BaseHTTPRequestHandler):
@@ -393,11 +394,21 @@ HTTPServer(('127.0.0.1',port),Handler).serve_forever()
     // Persisted recovery remains unloadable after another controller restart.
     host.recover().unwrap();
     assert_eq!(host.record().unwrap().unwrap().pid, pid);
-    // The fixture's stop returns before the process necessarily exits. The
-    // backend must wait for the owned pane to die, not trust command success.
+    // A changed private pane binding must not signal the running model.
+    let mut wrong = recovered.clone();
+    wrong.pid = Some(pid.unwrap() + 1);
+    assert!(backend
+        .stop(&wrong)
+        .unwrap_err()
+        .to_string()
+        .contains("ownership changed"));
+    assert!(backend.ready(&recovered).unwrap());
+    // The authenticated server's public CLI refuses an unauthenticated probe.
+    // Stop must use the verified pane, not that CLI or a health-reported PID.
     host.unload(true, None).unwrap();
     assert_eq!(host.record().unwrap().unwrap().state, "unloaded");
     assert!(backend.pane().unwrap().is_none());
+    assert!(!root.join("stop-called").exists());
     let _ = backend.tmux(&["kill-server"]);
     fs::remove_dir_all(root).unwrap();
 }
@@ -451,9 +462,34 @@ fn model_load_cannot_race_running_perf_or_cooldown() {
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn stop_cli_watchdog_is_independent_and_bounded() {
+fn graceful_model_stop_is_bounded_without_forced_kill() {
+    use std::io::{BufRead, BufReader};
+    let mut child = Command::new("python3")
+        .args(["-c", "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); time.sleep(30)"])
+        .stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
     let start = Instant::now();
-    assert!(bounded_stop(Path::new("/bin/sleep"), &["30"], 1).is_err());
-    assert!(start.elapsed() < Duration::from_secs(5));
-    bounded_stop(Path::new("/usr/bin/true"), &[], 1).unwrap();
+    let result = terminate_owned_model(child.id() as i32, Duration::from_millis(150));
+    let still_running = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("admission stays blocked"));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(still_running, "graceful timeout force-killed the model");
+}
+
+#[test]
+fn model_command_failure_preserves_stdout_reason() {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf 'fixture shutdown refused'; exit 1"]);
+    let error = command_output(command, Duration::from_secs(2)).unwrap_err();
+    assert!(error.to_string().contains("fixture shutdown refused"));
+    assert!(error.to_string().contains("exit status: 1"));
 }

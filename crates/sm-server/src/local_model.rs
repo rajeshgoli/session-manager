@@ -790,19 +790,10 @@ impl ModelServer for CliServer {
             if m.pid != Some(pid) {
                 bail!("model pane ownership changed; unload refused");
             }
-            // This independent timer survives an sm restart. It kills only
-            // the stop CLI before MTPLX's 300s model-kill escalation.
-            bounded_stop(
-                &expand_home(&self.config.mtplx_path),
-                &[
-                    "stop",
-                    "--port",
-                    &self.port.to_string(),
-                    "--grace-seconds",
-                    "300",
-                ],
-                180,
-            )?;
+            // MTPLX's public stop CLI probes unauthenticated health and trusts
+            // its reported PID. Signal only our verified private pane instead.
+            // A graceful timeout keeps admission blocked; never escalate to KILL.
+            terminate_owned_model(pid, Duration::from_secs(180))?;
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.pane()?.is_some() {
@@ -872,38 +863,60 @@ fn command_output(command: Command, timeout: Duration) -> Result<String> {
     let output =
         crate::child_output::output_with_timeout(command, timeout).map_err(anyhow::Error::msg)?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "model command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "model command failed ({}): {}",
+            output.status,
+            if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            }
         );
     }
     Ok(String::from_utf8(output.stdout)?)
 }
-fn bounded_stop(program: &Path, args: &[&str], seconds: u64) -> Result<()> {
-    let invocation = std::iter::once(program.to_string_lossy().into_owned())
-        .chain(args.iter().map(|s| s.to_string()))
-        .map(|s| quote(&s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    // The timer's TERM trap also reaps sleep when the CLI exits normally.
-    let script = format!(
-        r#"
-{invocation} & stop_pid=$!
-(
-  sleep {seconds} & sleep_pid=$!
-  trap 'kill "$sleep_pid" 2>/dev/null; wait "$sleep_pid" 2>/dev/null; exit 0' TERM
-  wait "$sleep_pid"
-  kill -KILL "$stop_pid" 2>/dev/null
-) & timer_pid=$!
-wait "$stop_pid"; result=$?
-kill "$timer_pid" 2>/dev/null
-wait "$timer_pid" 2>/dev/null
-exit "$result"
-"#
-    );
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", &script]);
-    command_output(command, Duration::from_secs(seconds + 10))?;
+fn terminate_owned_model(pid: i32, timeout: Duration) -> Result<()> {
+    if pid <= 0 {
+        bail!("invalid owned model pid");
+    }
+    #[cfg(target_os = "macos")]
+    let identity = crate::local_sockets::identity::ProcessIdentity::capture(pid as u32)
+        .context("cannot verify owned model kernel identity")?;
+    let alive = || {
+        #[cfg(target_os = "macos")]
+        {
+            identity.is_live()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // The caller has already matched this PID against its private pane.
+            // SAFETY: signal 0 only checks the positive PID's existence.
+            unsafe {
+                libc::kill(pid, 0) == 0
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            }
+        }
+    };
+    if !alive() {
+        return Ok(());
+    }
+    // SAFETY: the caller verified the private pane PID, and the macOS kernel
+    // identity was rechecked immediately above. Never signal a process group.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("cannot gracefully stop owned model");
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    while alive() {
+        if Instant::now() >= deadline {
+            bail!("owned model did not exit after graceful stop; admission stays blocked");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
 fn descendants(listing: &str, mut roots: Vec<i32>) -> Vec<i32> {
