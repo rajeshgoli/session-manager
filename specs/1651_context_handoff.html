@@ -209,7 +209,7 @@
 <tr><td>1. Fresh agent, or clear the same agent in place?</td><td><b>Fresh agent. Delete the <code>/clear</code>-and-reinject path.</b> <code>sm handoff FILE</code> keeps working and means <code>--path FILE</code>.</td><td>One id per context window, no terminal typing, and it works for codex-app too.</td></tr>
 <tr><td>2. Starting values of the default policy</td><td><b>On for Claude agents only. Threshold 35%. Both review triggers on, with a 20% floor. Reminder at 50%.</b> You can change each one later from any surface.</td><td>Your stated starting point. Codex agents opt in per agent until we see Claude's results.</td></tr>
 <tr><td>3. Review requests as tipping points</td><td><b>Both <code>sm request-codex-review</code> and <code>sm doc publish --review</code> ask, when context usage is at or above the 20% floor.</b></td><td>An agent that just asked for a review is at a natural stop. A successor picks up the review when it lands. Below 20%, re-reading costs more than it saves.</td></tr>
-<tr><td>4. Agent ignores the ask</td><td><b>One reminder: at 50%, or ten points after an ask at or past 50%, no later than 90%. After that, sm watch and the app show it as “handoff overdue”. sm never force-retires it.</b></td><td>Forcing a stop mid-work loses more than a long context costs.</td></tr>
+<tr><td>4. Agent ignores the ask</td><td><b>One reminder: at 50%, or, for an ask at or past 50%, ten points after the ask, capped at 90%. After that, sm watch and the app show it as “handoff overdue”. sm never force-retires it.</b></td><td>Forcing a stop mid-work loses more than a long context costs.</td></tr>
 <tr><td>5. What moves to the successor</td><td><b>Every obligation in the vocabulary box, moved in place.</b> The retired agent also keeps a pointer to its successor, and anything that still reaches the old id is forwarded.</td><td>Moving in place means no <code>[sm claim]</code> collisions. The pointer catches anything added to sm later.</td></tr>
 <tr><td>6. Successor's identity</td><td><b>Same provider, model, effort, worktree, machine and parent. Name gets <code>-h2</code>, <code>-h3</code>, … appended.</b></td><td>“Similar agent” means you can't tell the seat changed except by the suffix.</td></tr>
 <tr><td>7. Who can change the policy</td><td><b>Only you, from sm.rajeshgo.li, the sm app, or sm watch. There is no agent command for it.</b></td><td>An agent must not be able to switch off its own handoff, and no agent needs to change it.</td></tr>
@@ -231,7 +231,7 @@
 <tr><td>Ask on Codex review request</td><td>on</td><td><code>sm request-codex-review</code> asks when usage ≥ the review floor.</td><td>No</td></tr>
 <tr><td>Ask on doc review request</td><td>on</td><td><code>sm doc publish --review</code> asks when usage ≥ the review floor. Your review then wakes the successor.</td><td>No</td></tr>
 <tr><td>Review floor</td><td>20%</td><td>See decision 3.</td><td>No</td></tr>
-<tr><td>Reminder at</td><td>50%</td><td>The single reminder, then “overdue”. An ask at or past it is reminded ten points later, no later than 90%.</td><td>No</td></tr>
+<tr><td>Reminder at</td><td>50%</td><td>The single reminder, then “overdue”. An ask at or past it is reminded ten points later, capped at 90%.</td><td>No</td></tr>
 </tbody>
 </table>
 
@@ -276,6 +276,7 @@
 <p>When ticket 2 ships I will ask you to try one thing: on a scratch Claude agent, press Hand off now in the app and watch sm watch show it pass through the states in Figure 1.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 4 fixes a missed ask (#2110): an agent asked when it requested a review is still asked at its threshold, and every threshold ask gets one reminder.</b> An agent with a 50% threshold requested a review at 26% and was asked then, so sm never asked again at 50%. Its threshold equalled the 50% reminder, so it was never reminded either. Now a review-request ask is only a suggestion: the threshold ask still comes, with its own reminder. The reminder comes at the stored reminder when that is above the ask. Otherwise it comes ten points after the ask, capped at 90%: ask at 50% → reminder at 60%; ask at 85% → 90%; ask at 90% or later → none (decision 4, Appendix C.1–C.2).</p>
 <p><b>Revision 3 records the owner-approved Android interface shipped in PR #1700 and APK 0.5.42.</b> Context is a rounded circular gauge. Per-agent controls live inside the three-dot menu, with the threshold hidden when off. Handoff defaults moves below App updates, omits codex-app, and hides shared controls while all displayed providers are off. The web and terminal retain the full provider policy controls. All four build tickets (#1653, #1654, #1656, #1657) are closed; this specification lives in <code>specs/</code> so it survives lane cleanup.</p>
 <p><b>Revision 2</b> answers your three comments on revision 1.</p>
 <ul>
