@@ -367,6 +367,34 @@ class WallTests(unittest.TestCase):
             outsider.wait(timeout=5)
 
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
+    def test_cargo_starts_with_read_only_system_ssl_configuration(self):
+        resolved = subprocess.run(["rustup", "which", "cargo"], capture_output=True,
+                                  text=True, timeout=15, check=True)
+        cargo = Path(resolved.stdout.strip()).resolve(strict=True)
+        self.args.read_only_dir.append(str(cargo.parent.parent))
+        self.profile = self.state / "cargo-wall.sb"
+        profile = wall.generate(self.args, set(), 65)
+        self.profile.write_text(profile)
+        self.assertNotIn('(subpath "/private/etc/ssl")', profile)
+        self.assertIn('(literal "/private/etc/ssl/openssl.cnf")', profile)
+        self.sandbox("import subprocess; "
+                     f"output = subprocess.check_output([{str(cargo)!r}, '--version'], text=True); "
+                     "assert output.startswith('cargo ')",
+                     True, "Cargo startup with system SSL configuration")
+        (self.checkout / "Cargo.toml").write_text(
+            '[package]\nname = "wall-cargo-fixture"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[lib]\npath = "lib.rs"\n')
+        (self.checkout / "lib.rs").write_text(
+            '#[test]\nfn fixture_runs() { assert_eq!(2 + 2, 4); }\n')
+        compiler = cargo.with_name("rustc")
+        cache = self.checkout / "cargo-home"
+        self.sandbox("import os, subprocess; "
+                     f"environment = dict(os.environ, RUSTC={str(compiler)!r}, CARGO_HOME={str(cache)!r}); "
+                     f"output = subprocess.check_output([{str(cargo)!r}, 'test', '--offline', '--lib'], "
+                     "env=environment, text=True); assert '1 passed' in output",
+                     True, "offline Cargo compile and test with private writable cache")
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_rust_toolchain_builds_from_explicit_read_access(self):
         # Resolve the host's installed compiler outside the wall, then admit
         # only that immutable toolchain. No host rustup config or cache grant.

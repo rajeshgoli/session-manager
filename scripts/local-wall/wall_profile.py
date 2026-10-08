@@ -280,6 +280,9 @@ def generate(args, listeners, minimum_tmp_length):
     )]
     lines.append("(allow file-read-data " + " ".join(
         f"(subpath {quoted(p)})" for p in [checkout, state, *runtime, *read_only]) + ")")
+    # System libcurl initializes LibreSSL before Cargo can parse any command.
+    # Admit this public configuration file, not other SSL files or directories.
+    lines.append('(allow file-read-data (literal "/private/etc/ssl/openssl.cnf"))')
     lines.append(f"(allow file-read-data (literal {quoted(gh_hosts)}))")
     # Do not allow the whole Darwin temp directory or the entire state folder.
     # Profile, plugin, launch scripts, password and usage ledger are host-owned.
