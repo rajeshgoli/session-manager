@@ -429,6 +429,35 @@ fn approved_agent_config_matches_fixture_and_owner_web_ruling() {
 }
 
 #[test]
+fn rendered_limits_keep_pinned_compaction_above_the_reminder_threshold() {
+    for (context, output, expected_trigger) in [
+        (200_000, 32_000, 180_000),
+        (262_144, 32_000, 235_930),
+        (20_000, 4_000, 18_000),
+        (200_000, 8_000, 192_000),
+    ] {
+        let config = OpencodeConfig {
+            context_window: context,
+            output_limit: output,
+            ..OpencodeConfig::default()
+        };
+        let rendered: Value = serde_json::from_str(&config.render_agent_config().unwrap()).unwrap();
+        let limits = &rendered["provider"]["local"]["models"][&config.model_id]["limit"];
+        assert_eq!(limits["context"], context);
+        assert_eq!(limits["output"], output);
+        // This is the pinned harness's input-limit branch, not sm's formula.
+        // Without limit.input, Opencode ignores reserved and subtracts output.
+        let input = limits["input"].as_u64().expect("explicit input limit");
+        let reserved = rendered["compaction"]["reserved"].as_u64().unwrap();
+        let trigger = input.saturating_sub(reserved);
+        assert_eq!(trigger, expected_trigger);
+        assert!(u128::from(trigger) * 100 > u128::from(context) * 85);
+        assert!(trigger < context);
+        assert!(reserved <= output);
+    }
+}
+
+#[test]
 fn app_config_loads_opencode_overrides_and_refuses_invalid_settings() {
     let tmp = ScratchDir::new();
     let path = tmp.path().join("config.yaml");
