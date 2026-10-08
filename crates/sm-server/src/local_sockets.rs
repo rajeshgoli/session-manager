@@ -7,6 +7,16 @@
 
 use std::io::{self, ErrorKind};
 
+/// Both host-generated launch profiles deny creating sessions and bypassing
+/// the fork/exec adapter. The Opencode profile separately restricts group
+/// changes to its immutable runtime image; all launches stay in a private SID.
+pub(crate) fn has_launch_session_confinement(profile: &[u8]) -> bool {
+    profile.split(|byte| *byte == b'\n').any(|line| {
+        line == b"(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))"
+            || line == b"(deny syscall-unix (syscall-number SYS_setsid SYS_posix_spawn))"
+    })
+}
+
 #[cfg(target_os = "macos")]
 pub mod identity;
 
