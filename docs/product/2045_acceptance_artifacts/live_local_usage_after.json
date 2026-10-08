@@ -1,0 +1,34 @@
+{
+  "journal_rows_verified": 106,
+  "account_key": "local",
+  "provider": "local",
+  "exact_token_totals": {
+    "input": 811542,
+    "output_including_reasoning": 68985,
+    "cache_read": 7977875,
+    "cache_write": 0
+  },
+  "hosted_window_memberships": 0,
+  "local_timeline_rows": 0,
+  "claude_weekly_meters_unchanged": true,
+  "claude_weekly_meters_before": [
+    {
+      "account_digest": "2bb0583ae1ad",
+      "window": "weekly_all",
+      "scope": "",
+      "percent": 26.0,
+      "resets_at": "2026-10-11T16:00:00.000000000Z"
+    }
+  ],
+  "claude_weekly_meters_after": [
+    {
+      "account_digest": "2bb0583ae1ad",
+      "window": "weekly_all",
+      "scope": "",
+      "percent": 26.0,
+      "resets_at": "2026-10-11T16:00:00.000000000Z"
+    }
+  ],
+  "isolated_mixed_provider_regression": "passed in job_ba29288d95e5",
+  "zero_quota_rate": 0
+}

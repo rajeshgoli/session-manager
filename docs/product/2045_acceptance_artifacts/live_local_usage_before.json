@@ -1,0 +1,17 @@
+{
+  "sessions": [
+    "fb0062bf",
+    "54644ad1"
+  ],
+  "journal_rows": 106,
+  "already_booked_rows": 0,
+  "claude_weekly_meters": [
+    {
+      "account_digest": "2bb0583ae1ad",
+      "window": "weekly_all",
+      "scope": "",
+      "percent": 26.0,
+      "resets_at": "2026-10-11T16:00:00.000000000Z"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "agent_commit": "2dbaf93ba88c7b619a1e87c7a5f6dfd38a79accf",
+  "independent_checkout": "/Users/rajesh/worktrees/sm-2045-independent-1855",
+  "merged_regression_source": "2100e916:crates/sm-server/tests/retired_review_name.rs",
+  "implementation_rescue": false,
+  "exit_codes": {
+    "own-positive": 0,
+    "clippy": 0,
+    "own-negative": 101,
+    "formatting": 0,
+    "original-merged-negative": 101,
+    "original-merged-positive": 0
+  }
+}
