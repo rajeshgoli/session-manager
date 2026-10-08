@@ -17,8 +17,7 @@ impl HostDriver {
         }
     }
     fn queue(&self) -> Result<PathBuf> {
-        self.config
-            .queue_runner_state_dir()
+        expand_home(&self.config.queue_runner_state_dir().to_string_lossy())
             .canonicalize()
             .context("opencode queue authority unavailable")
     }
