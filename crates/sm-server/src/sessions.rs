@@ -7567,6 +7567,16 @@ impl SessionStore {
         if_finished_idle: bool,
         live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
     ) -> Result<CoreRetireOutcome> {
+        if self.is_opencode_session(session_id)? {
+            return self.retire_opencode_session(
+                session_id,
+                authority,
+                session_credential,
+                runtime,
+                if_finished_idle,
+                live_activity_blocks_retire,
+            );
+        }
         let _submission_guard = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -10531,6 +10541,9 @@ mod opencode_outbox;
 
 #[path = "opencode/clear.rs"]
 mod opencode_clear;
+
+#[path = "opencode/retire.rs"]
+mod opencode_retire;
 
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

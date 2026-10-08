@@ -128,6 +128,11 @@ impl SessionStore {
                 "session is not running".to_owned(),
             ));
         }
+        if opencode_lifecycle_pending(session) {
+            return Ok(HandoffAcceptOutcome::Conflict(
+                "Opencode lifecycle change is still completing".into(),
+            ));
+        }
         let now = now_rfc3339();
         let record = match raw_handoff_record(session) {
             Some(record)
@@ -177,7 +182,10 @@ impl SessionStore {
         let Some(mut record) = raw_handoff_record(session) else {
             return Ok(None);
         };
-        if record.state != HandoffPhase::Accepted || !raw_session_is_idle(session) {
+        if record.state != HandoffPhase::Accepted
+            || !raw_session_is_idle(session)
+            || opencode_lifecycle_pending(session)
+        {
             return Ok(None);
         }
         record.state = HandoffPhase::Spawning;
@@ -676,6 +684,22 @@ impl SessionStore {
         }
         Ok(None)
     }
+}
+
+fn opencode_lifecycle_pending(session: &Map<String, Value>) -> bool {
+    json_text(session.get("provider")).as_deref() == Some("opencode")
+        && [
+            "opencode_pending_clear",
+            "opencode_clear_view_paused",
+            "opencode_pending_retire",
+            "retirement_intent",
+        ]
+        .iter()
+        .any(|key| {
+            session
+                .get(*key)
+                .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+        })
 }
 
 /// F.4 "Original brief": the spawn-brief artifact of the first session in the

@@ -358,6 +358,12 @@ fn opencode_delivery_target(
             || raw
                 .get("opencode_pending_clear")
                 .is_some_and(|v| !v.is_null())
+            || raw
+                .get("opencode_clear_view_paused")
+                .is_some_and(|v| v == &Value::Bool(true))
+            || raw
+                .get("opencode_pending_retire")
+                .is_some_and(|v| !v.is_null())
             || raw.get("retirement_intent").is_some_and(|v| !v.is_null())
             || session_runtime_launch_records(state)?.iter().any(|launch| {
                 launch.session_id == id

@@ -207,6 +207,11 @@ impl OpencodeLaunchDriver for HostDriver {
                 .context("opencode conversation missing")?,
         )
     }
+    fn pause_attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()> {
+        runtime
+            .for_socket_name(record.tmux_socket_name.as_deref())
+            .pause_opencode_attach_window(&Self::spec(record)?)
+    }
     fn present(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<bool> {
         let runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
         match runtime.probe_session_for_restore(&record.tmux_session) {

@@ -7,6 +7,8 @@ type Hook = Box<dyn FnOnce(&SessionRecord) + Send>;
 mod clear_tests;
 #[path = "outbox_tests.rs"]
 mod outbox_tests;
+#[path = "retire_tests.rs"]
+mod retire_tests;
 struct Driver {
     config: OpencodeConfig,
     path: PathBuf,
@@ -22,6 +24,9 @@ struct Driver {
     fail_stop: AtomicBool,
     uncertain_present: AtomicBool,
     lost_reply: AtomicBool,
+    pauses: AtomicUsize,
+    stops: AtomicUsize,
+    pause_hook: Mutex<Option<Hook>>,
     start_hook: Mutex<Option<Hook>>,
     attach_hook: Mutex<Option<Hook>>,
     stop_hook: Mutex<Option<Hook>>,
@@ -137,6 +142,13 @@ impl OpencodeLaunchDriver for Driver {
         }
         Ok(())
     }
+    fn pause_attach(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
+        self.pauses.fetch_add(1, Ordering::AcqRel);
+        if let Some(hook) = self.pause_hook.lock().unwrap().take() {
+            hook(record);
+        }
+        Ok(())
+    }
     fn present(&self, _: &SessionRecord, _: &TmuxRuntime) -> Result<bool> {
         if self.uncertain_present.load(Ordering::Acquire) {
             anyhow::bail!("injected tmux transport uncertainty")
@@ -144,6 +156,7 @@ impl OpencodeLaunchDriver for Driver {
         Ok(self.server.lock().unwrap().is_some())
     }
     fn stop(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
+        self.stops.fetch_add(1, Ordering::AcqRel);
         if self.fail_stop.load(Ordering::Acquire) {
             anyhow::bail!("teardown not proved")
         }
@@ -192,6 +205,9 @@ impl Fixture {
             fail_stop: AtomicBool::new(false),
             uncertain_present: AtomicBool::new(false),
             lost_reply: AtomicBool::new(false),
+            pauses: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+            pause_hook: Mutex::new(None),
             start_hook: Mutex::new(None),
             attach_hook: Mutex::new(None),
             stop_hook: Mutex::new(None),

@@ -323,6 +323,15 @@ fn opencode_clear_retains_switch_until_usage_mapping_can_commit() {
         Some("ses_clear2")
     );
     assert!(!send(&f, "later input").delivered);
+    let note = crate::handoff::execute::HandoffNote::parse(
+        &json!({"kind":"path", "value":"/tmp/note.md"}),
+    )
+    .unwrap();
+    assert!(matches!(
+        f.store.accept_handoff("local1", "local1", &note).unwrap(),
+        HandoffAcceptOutcome::Conflict(_)
+    ));
+    assert!(f.store.claim_handoff_start("local1").unwrap().is_none());
     db.execute_batch("DROP TRIGGER reject_new_mapping").unwrap();
     f.store.recover_opencode_clears(&f.runtime).unwrap();
     let prompts: Vec<_> = requests(&f)
@@ -332,6 +341,68 @@ fn opencode_clear_retains_switch_until_usage_mapping_can_commit() {
     assert_eq!(prompts.len(), 2);
     assert_eq!(prompts[0].2["parts"][0]["text"], "after mapping");
     assert_eq!(prompts[1].2["parts"][0]["text"], "later input");
+}
+
+#[test]
+fn opencode_clear_pauses_native_input_before_any_idle_observation_and_recovers_pre_switch_crash() {
+    let f = Fixture::new();
+    create(&f);
+    f.driver.server.lock().unwrap().as_ref().unwrap().set_idle();
+    let status_reads = requests(&f)
+        .iter()
+        .filter(|(_, p, _)| p == "/session/status")
+        .count();
+    let driver = f.driver.clone();
+    *f.driver.pause_hook.lock().unwrap() = Some(Box::new(move |_| {
+        let log = driver
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request_log();
+        assert!(!log.iter().any(|(_, p, _)| p.ends_with("/abort")));
+        assert_eq!(
+            log.iter()
+                .filter(|(_, p, _)| p == "/session/status")
+                .count(),
+            status_reads
+        );
+        // Simulate a native submission just before the viewer is removed:
+        // the subsequent status observation must still see and abort it.
+        driver.server.lock().unwrap().as_ref().unwrap().set_busy();
+    }));
+    assert!(matches!(clear(&f, None), CoreClearOutcome::Cleared(_)));
+    assert_eq!(f.driver.pauses.load(Ordering::Acquire), 1);
+    assert!(requests(&f).iter().any(|(_, p, _)| p.ends_with("/abort")));
+    let before = f
+        .store
+        .get_session("local1")
+        .unwrap()
+        .unwrap()
+        .provider_resume_id;
+    f.change("local1", "opencode_clear_view_paused", Value::Bool(true));
+    let attachments = f.driver.attachments.load(Ordering::Acquire);
+    f.store.recover_opencode_clears(&f.runtime).unwrap();
+    assert_eq!(
+        f.driver.attachments.load(Ordering::Acquire),
+        attachments + 1
+    );
+    assert_eq!(
+        f.store
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .provider_resume_id,
+        before
+    );
+    assert_eq!(f.driver.conversations(), 2);
+    assert!(
+        raw_session_object(&f.store.load_raw_json_value().unwrap(), "local1")
+            .unwrap()
+            .get("opencode_clear_view_paused")
+            .is_none()
+    );
 }
 
 #[test]
