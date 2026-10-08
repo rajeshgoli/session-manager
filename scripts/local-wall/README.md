@@ -377,17 +377,25 @@ For the exact host-staged `opencode` executable, preparation compiles an
 attached-spawn compatibility setting into the immutable adapter. Opencode
 1.17.9 requests detached execution for ordinary Git and Bash commands; the
 adapter removes those session/group flags and runs the command in the existing
-launch group. Upstream cancellation falls back to signalling the child when
-its separate group does not exist. This setting is selected by the physical
+launch group. The adapter maps the provider's SIGTERM/SIGKILL cancellation of
+that command to its descendants, binding the command PID to its kernel start
+time. It stops each parent before discovering and signalling its children;
+both group-first and direct-child cancellation use this path. Unrelated tools
+keep running. Traversal errors fail cancellation instead of reporting success
+for only the immediate child. This setting is selected by the physical
 executable path, never argv, environment or a queue request. Other executables
 retain the EPERM refusal. Kernel denials still prevent detachment through raw
 syscalls or an adapter bypass, and verified shutdown still kills the entire
 original launch group.
+Contained launches allow listing integer process IDs for this traversal;
+per-process metadata stays restricted to the same sandbox, outside process
+environments remain denied, and signals cannot cross the sandbox boundary.
 The provider config selects the wall's immutable, ad-hoc signed `queue-zsh`
 shell. Platform shells can discard loader settings; the staged shell retains
 the adapter across tool execution and into staged programs. The native fixture
 checks actual Git/project initialization, conversation creation, shell execution,
-direct-child cancellation fallback, and the unchanged refusal in another image.
+group-first and direct-child cancellation of children and grandchildren while
+the provider remains alive, and the unchanged refusal in another image.
 Actual provider launch and stamped queue dispatch integration remains #1974.
 
 Run fixture validation through the durable queue:

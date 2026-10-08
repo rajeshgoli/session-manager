@@ -9,6 +9,7 @@ static int attached_spawn_caller(void) {
     return !_NSGetExecutablePath(image, &size) && realpath(image, canonical) &&
         !strcmp(canonical, wall_attached_spawn_executable);
 }
+#include "spawn_cancellation.c"
 struct future_descriptor { int fd, source, keep; };
 #define FUTURE_LIMIT (TRACKED_LIMIT + ACTION_LIMIT + 1)
 static struct future_descriptor *future_find(struct future_descriptor *future, int fd) {
@@ -56,9 +57,13 @@ static int spawn_process(pid_t *pid, const char *path,
     // Pinned Opencode asks to detach ordinary Git and Bash commands. For that
     // exact host-staged image, keep them in the verified launch group instead.
     // Other images still reject these flags; raw detachment stays kernel-denied.
-    // Opencode falls back to signalling the child when no child group exists.
-    if (wall_contained_spawns && attached_spawn_caller())
+    int attached_slot = -1;
+    if (wall_contained_spawns && attached_spawn_caller() &&
+        (spawn_flags & (POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP))) {
+        attached_slot = attached_command_slot();
+        if (attached_slot < 0) { result = EAGAIN; goto done; }
         spawn_flags &= ~(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP);
+    }
     struct action_list *list = action_list(actions);
     if (wall_contained_spawns && actions && !list) { result = EACCES; goto done; }
     int tracked = 0, minimum = 3;
@@ -178,6 +183,10 @@ static int spawn_process(pid_t *pid, const char *path,
             while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
             result = EACCES;
         }
+    }
+    if (!result && attached_slot >= 0) {
+        struct proc_bsdinfo identity;
+        if (command_info(child, &identity)) attached_commands[attached_slot].identity = identity;
     }
     if (!result && pid) *pid = child;
 done:

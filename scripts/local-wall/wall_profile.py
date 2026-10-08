@@ -294,6 +294,10 @@ def generate(args, listeners, minimum_tmp_length):
     # does not block that legacy numeric query on this Mac.
     lines.extend(["(deny process-info*)",
                   "(allow process-info* (target same-sandbox))"])
+    if args.contained_processes:
+        # Listing returns only integer PIDs; per-PID metadata and environments
+        # retain the same-sandbox restriction. Cancellation needs child IDs.
+        lines.append("(allow process-info-listpids)")
     system_queries = (
         "hw.activecpu", "hw.byteorder", "hw.cacheconfig", "hw.cachelinesize_compat",
         "hw.cpufamily", "hw.cpufrequency_compat", "hw.cputype", "hw.cpusubtype",

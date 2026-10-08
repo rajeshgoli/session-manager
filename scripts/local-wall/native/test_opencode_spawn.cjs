@@ -18,24 +18,53 @@ async function main() {
   await run(process.env.SM_TEST_SHELL, ["-c",
     'exec "$SM_TEST_PYTHON" -c \'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); c=socket.create_connection(s.getsockname()); c.sendall(b"x"); a,_=s.accept(); assert a.recv(1)==b"x"; a.close(); c.close(); s.close()\'',
   ])
-  const child = spawn(process.env.SM_TEST_SHELL, ["-c", "sleep 60"], {
+  const sibling = spawn(process.env.SM_TEST_SHELL, ["-c", "sleep 60"], {
     detached: true, stdio: "ignore",
   })
-  child.on("error", (error) => { throw error })
-  fs.writeFileSync("native-cancel-pid.txt", String(child.pid))
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("cancelled child did not exit")), 3000)
-    child.on("exit", (code, signal) => {
-      clearTimeout(timeout)
-      assert.equal(signal, "SIGTERM")
-      resolve()
+  for (const [signal, group] of [["SIGTERM", true], ["SIGKILL", false]]) {
+    const prefix = signal.toLowerCase()
+    const child = spawn(process.env.SM_TEST_SHELL, ["-c",
+      `sleep 60 & echo $! > ${prefix}-background.txt; ` +
+      `(sleep 60 & echo $! > ${prefix}-grandchild.txt; wait) & ` +
+      `echo $! > ${prefix}-child.txt; wait`,
+    ], { detached: true, stdio: "ignore" })
+    child.on("error", (error) => { throw error })
+    fs.writeFileSync("native-cancel-pid.txt", String(child.pid))
+    const files = ["background", "grandchild", "child"].map(x => `${prefix}-${x}.txt`)
+    const readyBy = Date.now() + 3000
+    while (!files.every(file => fs.existsSync(file) && fs.readFileSync(file, "utf8").trim())) {
+      assert(Date.now() < readyBy, "command descendants did not start")
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const pids = files.map(file => Number(fs.readFileSync(file, "utf8").trim()))
+    assert.equal(new Set(pids).size, 3)
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("cancelled child did not exit")), 3000)
+      child.on("exit", (code, actual) => {
+        clearTimeout(timeout)
+        assert.equal(actual, signal)
+        resolve()
+      })
+      // Exercise both Opencode's group-first call and its direct-child path.
+      if (group) process.kill(-child.pid, signal)
+      else assert.equal(child.kill(signal), true)
     })
-    // Match Opencode's group-first cancellation and direct-child fallback.
-    setTimeout(() => {
-      assert.throws(() => process.kill(-child.pid, "SIGTERM"), { code: "ESRCH" })
-      assert.equal(child.kill("SIGTERM"), true)
-    }, 100)
+    const goneBy = Date.now() + 3000
+    const alive = pid => {
+      try { process.kill(pid, 0); return true }
+      catch (error) { assert.equal(error.code, "ESRCH"); return false }
+    }
+    while (pids.some(alive)) {
+      assert(Date.now() < goneBy, `cancelled descendants survived: ${pids.filter(alive)}`)
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.equal(process.kill(sibling.pid, 0), true, "cancellation affected an unrelated tool")
+    await run("git", ["status", "--porcelain"])
+  }
+  await new Promise(resolve => {
+    sibling.on("exit", resolve)
+    process.kill(-sibling.pid, "SIGTERM")
   })
 }
 
-main().catch((error) => { console.error(error); process.exitCode = 1 })
+main().catch((error) => { console.error(error); process.exit(1) })

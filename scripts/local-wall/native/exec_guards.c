@@ -203,3 +203,4 @@ INTERPOSE(wrapped_execlp, execlp);
 INTERPOSE(wrapped_execle, execle);
 INTERPOSE(wrapped_posix_spawn, posix_spawn);
 INTERPOSE(wrapped_posix_spawnp, posix_spawnp);
+INTERPOSE(wrapped_kill, kill);

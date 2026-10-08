@@ -764,6 +764,7 @@ fn install_sources(config: &Path) -> Result<PathBuf> {
     source!("native/spawn_directory.c");
     source!("native/spawn_lifecycle.c");
     source!("native/spawn_contained.c");
+    source!("native/spawn_cancellation.c");
     Ok(root)
 }
 

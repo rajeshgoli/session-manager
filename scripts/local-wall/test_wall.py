@@ -13,7 +13,10 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-PYTHON = str(Path(sys._base_executable).resolve())
+# Framework launchers spawn the runtime image and are therefore unsuitable for
+# tests of a wall that deliberately denies raw posix_spawn.
+_python_runtime = Path(sys.base_prefix) / "Resources/Python.app/Contents/MacOS/Python"
+PYTHON = str((_python_runtime if _python_runtime.is_file() else Path(sys._base_executable)).resolve())
 MODULE = importlib.util.spec_from_file_location("wall_profile", Path(__file__).with_name("wall_profile.py"))
 wall = importlib.util.module_from_spec(MODULE)
 MODULE.loader.exec_module(wall)
@@ -288,6 +291,20 @@ class WallTests(unittest.TestCase):
                          "assert int(subprocess.check_output(['/usr/sbin/sysctl', '-n', 'hw.ncpu'])) > 0; "
                          "assert subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.osrelease']).strip()",
                          True, "admitted CPU and OS kernel queries")
+            self.args.contained_processes = True
+            self.profile.write_text(wall.generate(self.args, set(), 65))
+            self.sandbox(script, False, "contained launch still denies outside environment")
+            self.sandbox("import ctypes; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True); "
+                         "buf=ctypes.create_string_buffer(1024); "
+                         f"assert lib.proc_pidinfo({outsider.pid},3,0,buf,len(buf)) == 0; "
+                         "assert ctypes.get_errno() == 1",
+                         True, "PID listing does not admit outside process metadata")
+            self.sandbox("import ctypes,os; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
+                         "pids=(ctypes.c_int*65536)(); "
+                         "assert lib.proc_listallpids(pids,ctypes.sizeof(pids)) > 0; "
+                         f"assert {outsider.pid} in pids; "
+                         f"assert lib.kill({outsider.pid},0) == -1",
+                         True, "PID listing does not admit outside signals")
         finally:
             outsider.terminate()
             outsider.wait(timeout=5)
