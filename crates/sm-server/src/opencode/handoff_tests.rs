@@ -26,6 +26,151 @@ fn note_requests(f: &Fixture) -> usize {
         .count()
 }
 
+fn failed_with_successor(f: &Fixture) {
+    f.create("local1", None).unwrap();
+    f.change("local1", "status", json!("idle"));
+    accept(f);
+    f.store.claim_handoff_start("local1").unwrap().unwrap();
+    f.store
+        .create_opencode_handoff_successor(
+            Fixture::request("succ", None),
+            None,
+            &f.runtime,
+            "local1",
+        )
+        .unwrap();
+    f.store
+        .record_opencode_handoff_successor("local1", "succ")
+        .unwrap();
+    f.driver.fail_client.store(true, Ordering::Release);
+    f.change(
+        "local1",
+        "opencode_handoff_delivery_blocked_at",
+        json!((OffsetDateTime::now_utc() - time::Duration::minutes(11))
+            .format(&Rfc3339)
+            .unwrap()),
+    );
+    assert!(!f
+        .store
+        .opencode_handoff_ready("local1", &f.runtime)
+        .unwrap());
+    assert_eq!(
+        f.store
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .handoff
+            .unwrap()["state"],
+        "failed"
+    );
+    f.driver.fail_client.store(false, Ordering::Release);
+}
+
+#[test]
+fn failed_opencode_handoff_recovers_empty_successor_teardown_before_a_fresh_ask() {
+    let f = Fixture::with_ports(2);
+    failed_with_successor(&f);
+    let message = queue(&f)
+        .enqueue_message("local1", "retained work", "sequential", None)
+        .unwrap();
+    let reopened =
+        SessionStore::new_with_queue(f.driver.path.clone(), f._scratch.path().join("queue.db"))
+            .with_opencode_launch_driver(f.driver.clone());
+    assert_eq!(
+        reopened.pending_handoff_work().unwrap(),
+        vec![HandoffWork::Resume {
+            predecessor_id: "local1".into(),
+            successor_id: "succ".into(),
+        }]
+    );
+    let note = crate::handoff::execute::HandoffNote::parse(
+        &json!({"kind":"path","value":"/tmp/again.md"}),
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.accept_handoff("local1", "local1", &note).unwrap(),
+        HandoffAcceptOutcome::Conflict(_)
+    ));
+    f.driver.fail_stop.store(true, Ordering::Release);
+    assert!(reopened
+        .cleanup_failed_opencode_handoff("local1", "succ", &f.runtime)
+        .is_err());
+    assert_eq!(reopened.pending_handoff_work().unwrap().len(), 1);
+    assert!(!reopened.get_session("succ").unwrap().unwrap().is_stopped());
+    f.driver.fail_stop.store(false, Ordering::Release);
+    reopened
+        .cleanup_failed_opencode_handoff("local1", "succ", &f.runtime)
+        .unwrap();
+    let successor = reopened.get_session("succ").unwrap().unwrap();
+    assert_eq!(successor.completion_status.as_deref(), Some("retired"));
+    assert!(!f.driver.present(&successor, &f.runtime).unwrap());
+    assert!(reopened.pending_handoff_work().unwrap().is_empty());
+    assert!(!reopened
+        .get_session("local1")
+        .unwrap()
+        .unwrap()
+        .is_stopped());
+    assert!(!queue(&f).message_delivered(&message).unwrap());
+    assert_eq!(
+        queue(&f)
+            .pending_messages_for_target("local1", 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(matches!(
+        reopened.accept_handoff("local1", "local1", &note).unwrap(),
+        HandoffAcceptOutcome::Accepted { .. }
+    ));
+    assert!(reopened
+        .get_session("local1")
+        .unwrap()
+        .unwrap()
+        .handoff
+        .unwrap()["successor_session_id"]
+        .is_null());
+}
+
+#[test]
+fn failed_opencode_handoff_resumes_cleanup_after_verified_retire_before_marker_removal() {
+    let f = Fixture::with_ports(2);
+    failed_with_successor(&f);
+    f.store
+        .retire_core_session_with_runtime_authorized(
+            "succ",
+            RetireAuthority::handoff("local1"),
+            None,
+            &f.runtime,
+        )
+        .unwrap();
+    let stops = f.driver.stops.load(Ordering::Acquire);
+    assert_eq!(f.store.pending_handoff_work().unwrap().len(), 1);
+    f.store
+        .cleanup_failed_opencode_handoff("local1", "succ", &f.runtime)
+        .unwrap();
+    assert!(f.store.pending_handoff_work().unwrap().is_empty());
+    assert_eq!(f.driver.stops.load(Ordering::Acquire), stops);
+}
+
+#[test]
+fn failed_opencode_handoff_never_retires_a_transferred_successor() {
+    let f = Fixture::with_ports(2);
+    failed_with_successor(&f);
+    f.store.transfer_handoff_json("local1", "succ").unwrap();
+    assert!(f.store.pending_handoff_work().unwrap().is_empty());
+    f.store
+        .cleanup_failed_opencode_handoff("local1", "succ", &f.runtime)
+        .unwrap();
+    assert_eq!(f.driver.stops.load(Ordering::Acquire), 0);
+    f.change("local1", "successor_session_id", Value::Null);
+    assert!(f
+        .store
+        .cleanup_failed_opencode_handoff("local1", "succ", &f.runtime)
+        .is_err());
+    assert_eq!(f.driver.stops.load(Ordering::Acquire), 0);
+    assert!(!f.store.get_session("succ").unwrap().unwrap().is_stopped());
+}
+
 #[test]
 fn opencode_handoff_unreachable_rows_defer_at_five_seconds_and_fail_after_ten_minutes_without_moves(
 ) {

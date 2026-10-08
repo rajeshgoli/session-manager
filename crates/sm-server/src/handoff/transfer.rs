@@ -119,6 +119,17 @@ impl SessionStore {
         let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        if raw_session_object(&state, session_id).is_some_and(|session| {
+            json_text(session.get("provider")).as_deref() == Some("opencode")
+                && json_text(session.get("successor_session_id")).is_none()
+                && raw_handoff_record(session).is_some_and(|record| {
+                    record.state == HandoffPhase::Failed && record.successor_session_id.is_some()
+                })
+        }) {
+            return Ok(HandoffAcceptOutcome::Conflict(
+                "failed Opencode handoff successor cleanup is still completing".into(),
+            ));
+        }
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(HandoffAcceptOutcome::NotFound);
@@ -630,6 +641,17 @@ impl SessionStore {
                         .successor_session_id
                         .or_else(|| json_text(session.get("successor_session_id")))
                     {
+                        work.push(HandoffWork::Resume {
+                            predecessor_id: id,
+                            successor_id,
+                        });
+                    }
+                }
+                HandoffPhase::Failed
+                    if json_text(session.get("provider")).as_deref() == Some("opencode")
+                        && json_text(session.get("successor_session_id")).is_none() =>
+                {
+                    if let Some(successor_id) = record.successor_session_id {
                         work.push(HandoffWork::Resume {
                             predecessor_id: id,
                             successor_id,
