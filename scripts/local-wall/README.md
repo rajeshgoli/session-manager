@@ -353,9 +353,15 @@ Unrelated host descriptors and environment are not inherited.
 
 The trusted supervisor waits for host registration before forking the sandboxed
 application and remains its ancestry root across exec. A private completion
-socket returns the application's exit status. Completion or cancellation kills
-the private process group and revokes registration. The supervisor's PID stays
-reserved until cleanup. Drop the service at shutdown and create a new service
+socket returns the application's exit status. The host creates a private kernel
+session before applying the wall. Completion or cancellation removes every live
+process in that session, including orphaned workers and separate command groups,
+then reaps the supervisor and revokes registration. The supervisor's PID remains
+reserved as the session ID throughout cleanup. Kernel membership and process
+identity select cleanup targets; outside processes are never selected. Failed
+cleanup retains registration. The trusted supervisor also cleans its session
+when the host disconnects, even while the application is still running.
+Drop the service at shutdown and create a new service
 after host restart. Queue jobs share the agent's binding with fresh process
 registrations; requester environment never selects socket authority. Pass `Some`
 control listener only for the provider and `None` for queue commands. The latter
@@ -364,8 +370,9 @@ The application starts with the normal default SIGPIPE disposition.
 
 Production launch requires a profile generated with `--contained-processes`
 and an adapter built with `--contained-spawns`. `LaunchBinding` rejects a profile
-without the required syscall denial. The kernel denies `setsid`, `setpgid` and
-raw `posix_spawn`, including calls that bypass the adapter. The adapter implements
+without the required syscall denial. The kernel denies `setsid` and raw
+`posix_spawn`, including calls that bypass the adapter. Profiles without
+`--command-groups` also deny `setpgid`. The adapter implements
 supported `posix_spawn` calls using kernel fork followed by ordered file actions
 and exec. It supports signal defaults/masks, reset IDs, close-on-exec defaults
 and process replacement. Requests for a new process group or session fail with
@@ -376,26 +383,25 @@ with `LaunchBinding`.
 For the exact host-staged `opencode` executable, preparation compiles an
 attached-spawn compatibility setting into the immutable adapter. Opencode
 1.17.9 requests detached execution for ordinary Git and Bash commands; the
-adapter removes those session/group flags and runs the command in the existing
-launch group. The adapter maps the provider's SIGTERM/SIGKILL cancellation of
-that command to its descendants, binding the command PID to its kernel start
-time. It stops each parent before discovering and signalling its children;
-both group-first and direct-child cancellation use this path. Unrelated tools
-keep running. Traversal errors fail cancellation instead of reporting success
-for only the immediate child. This setting is selected by the physical
+adapter replaces a new session with a new command group inside the host-created
+private session. Host preparation selects `--command-groups` for Opencode.
+Ordinary kernel group cancellation reaches children, grandchildren and workers
+whose parents have already exited; unrelated commands keep running.
+This setting is selected by the physical
 executable path, never argv, environment or a queue request. Other executables
-retain the EPERM refusal. Kernel denials still prevent detachment through raw
-syscalls or an adapter bypass, and verified shutdown still kills the entire
-original launch group.
-Contained launches allow listing integer process IDs for this traversal;
-per-process metadata stays restricted to the same sandbox, outside process
-environments remain denied, and signals cannot cross the sandbox boundary.
+retain the adapter's EPERM refusal. Raw `setpgid`, where admitted, cannot move a
+process out of the private session. Kernel denials prevent a new session through
+raw syscalls or an adapter bypass. Verified shutdown removes the whole private
+session. PID enumeration happens only in trusted host cleanup; the guest wall
+still denies PID listing, outside process metadata, environment reads and signals.
 The provider config selects the wall's immutable, ad-hoc signed `queue-zsh`
 shell. Platform shells can discard loader settings; the staged shell retains
 the adapter across tool execution and into staged programs. The native fixture
 checks actual Git/project initialization, conversation creation, shell execution,
-group-first and direct-child cancellation of children and grandchildren while
-the provider remains alive, and the unchanged refusal in another image.
+group cancellation of children, grandchildren and already-reparented workers
+while the native runtime remains alive. It also checks separate-group cleanup
+on completion, drop, supervisor loss and host disconnection; outside sentinels
+survive, and another image retains the adapter's session/group refusal.
 Actual provider launch and stamped queue dispatch integration remains #1974.
 
 Run fixture validation through the durable queue:

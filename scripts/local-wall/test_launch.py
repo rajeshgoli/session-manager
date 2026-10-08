@@ -68,6 +68,7 @@ def prepare(args):
         "--immutable-exec-dir", str(python_root), "--read-only-dir", str(python_root),
     ])
     profile = state / "wall.sb"
+    profile_args.command_groups = bool(args.opencode_binary)
     profile.write_text(wall.generate(profile_args, wall.listening_ports(), len(wall.user_temp())))
     text_command = Path(tmp) / "text-command"
     text_command.write_text("exit 37\n")
@@ -79,6 +80,7 @@ def prepare(args):
         "SM_TEST_ISOLATION_ROOT": str(Path(tmp) / "isolation"),
         "SM_TEST_RUST_APPLICATION": str(executables / "rust-application"),
         "SM_TEST_PYTHON": str(python), "SM_TEST_MUTABLE": tmp,
+        "SM_TEST_COMMAND_GROUPS": "1" if args.opencode_binary else "",
         "SM_TEST_FD_PROBE": str(executables / "descriptor-probe"),
         "SM_TEST_CONTAINED": "1",
         "SM_TEST_SHELL": str(shell),

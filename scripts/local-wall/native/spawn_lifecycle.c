@@ -9,7 +9,6 @@ static int attached_spawn_caller(void) {
     return !_NSGetExecutablePath(image, &size) && realpath(image, canonical) &&
         !strcmp(canonical, wall_attached_spawn_executable);
 }
-#include "spawn_cancellation.c"
 struct future_descriptor { int fd, source, keep; };
 #define FUTURE_LIMIT (TRACKED_LIMIT + ACTION_LIMIT + 1)
 static struct future_descriptor *future_find(struct future_descriptor *future, int fd) {
@@ -55,14 +54,13 @@ static int spawn_process(pid_t *pid, const char *path,
     short spawn_flags = 0;
     if (attributes && (result = posix_spawnattr_getflags(attributes, &spawn_flags))) goto done;
     // Pinned Opencode asks to detach ordinary Git and Bash commands. For that
-    // exact host-staged image, keep them in the verified launch group instead.
-    // Other images still reject these flags; raw detachment stays kernel-denied.
-    int attached_slot = -1;
+    // exact host-staged image, create a command group inside the host's private
+    // session. Other images still reject session/group requests.
+    int command_group = 0;
     if (wall_contained_spawns && attached_spawn_caller() &&
         (spawn_flags & (POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP))) {
-        attached_slot = attached_command_slot();
-        if (attached_slot < 0) { result = EAGAIN; goto done; }
-        spawn_flags &= ~(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP);
+        command_group = 1;
+        spawn_flags = (spawn_flags & ~POSIX_SPAWN_SETSID) | POSIX_SPAWN_SETPGROUP;
     }
     struct action_list *list = action_list(actions);
     if (wall_contained_spawns && actions && !list) { result = EACCES; goto done; }
@@ -168,7 +166,7 @@ static int spawn_process(pid_t *pid, const char *path,
     prepared = exec_environment(environment, insert, notification[1]);
     if (!prepared) { result = errno; goto done; }
     pid_t child;
-    result = wall_contained_spawns ? contained_spawn(&child, resolved, list, attributes, spawn_flags,
+    result = wall_contained_spawns ? contained_spawn(&child, resolved, list, attributes, spawn_flags, command_group,
         argv, prepared, holds, hold_count, notification[1], minimum) :
         posix_spawn(&child, resolved, actions && !list ? actions : &clone, attributes, argv, prepared);
     if (!result && insert && !replaces_current) {
@@ -183,10 +181,6 @@ static int spawn_process(pid_t *pid, const char *path,
             while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
             result = EACCES;
         }
-    }
-    if (!result && attached_slot >= 0) {
-        struct proc_bsdinfo identity;
-        if (command_info(child, &identity)) attached_commands[attached_slot].identity = identity;
     }
     if (!result && pid) *pid = child;
 done:

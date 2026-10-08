@@ -384,31 +384,35 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let pending = RetainedQueueStore::create_queue_job_in_state_dir(
-            &queue,
-            crate::queue::CreateQueueJob {
-                local_submitter: Some(
-                    crate::local_egress::gateway::VerifiedLocalAgent::test_identity("wall-c"),
-                ),
-                job_type: "tests".into(),
-                label: "generation-shutdown".into(),
-                requester_session_id: None,
-                notify_session_id: "wall-c".into(),
-                cwd: wall.checkout.display().to_string(),
-                argv: None,
-                script: Some("print must-not-launch-after-stop".into()),
-                env: BTreeMap::new(),
-                timeout_seconds: 10,
-                cpu_percent: None,
-                gpu_percent: None,
-                memory_bytes: None,
-                rank_tickets: None,
-            },
-        )
-        .unwrap();
+        // Stop must wait for an in-flight admission critical section. Publish
+        // the new job after stop completes, without assuming mutex waiter order.
+        let admission = crate::queue::admission_guard();
+        let pending = || {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &queue,
+                crate::queue::CreateQueueJob {
+                    local_submitter: Some(
+                        crate::local_egress::gateway::VerifiedLocalAgent::test_identity("wall-c"),
+                    ),
+                    job_type: "tests".into(),
+                    label: "generation-shutdown".into(),
+                    requester_session_id: None,
+                    notify_session_id: "wall-c".into(),
+                    cwd: wall.checkout.display().to_string(),
+                    argv: None,
+                    script: Some("print must-not-launch-after-stop".into()),
+                    env: BTreeMap::new(),
+                    timeout_seconds: 10,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                    rank_tickets: None,
+                },
+            )
+            .unwrap()
+        };
         // Represent an admission pass still publishing its running row. Stop
         // must wait for that complete critical section before detaching.
-        let admission = crate::queue::admission_guard();
         let stopping = walls.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -428,6 +432,7 @@ mod tests {
             .unwrap()
             .unwrap();
         stopping_thread.join().unwrap();
+        let pending = pending();
         let held = RetainedQueueStore::start_queue_job_in_state_dir(
             &queue,
             &queue.join("messages.db"),

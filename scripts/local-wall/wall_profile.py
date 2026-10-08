@@ -142,6 +142,8 @@ def prepare_github_config(home, state):
 
 
 def generate(args, listeners, minimum_tmp_length):
+    if args.command_groups and not args.contained_processes:
+        raise ValueError("command groups require host session containment")
     checkout = physical(args.checkout)
     state_root = physical(args.state_root)
     state = physical(args.state_dir)
@@ -281,11 +283,12 @@ def generate(args, listeners, minimum_tmp_length):
             [f"(subpath {quoted(p)})" for p in protected_writes]
             + [f"(literal {quoted(p)})" for p in ancestors]) + ")")
     lines.extend(["(deny signal)", "(allow signal (target same-sandbox))"])
-    # Keep every descendant in the host's private launch group. A raw spawn
+    # Keep every descendant in the host's private launch session. A raw spawn
     # syscall can set a new session internally, so it is denied too; the
     # contained adapter implements supported spawns with fork and exec.
     if args.contained_processes:
-        lines.append("(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))")
+        blocked = "SYS_setsid SYS_posix_spawn" if args.command_groups else "SYS_setsid SYS_setpgid SYS_posix_spawn"
+        lines.append(f"(deny syscall-unix (syscall-number {blocked}))")
     # Kernel process-argument queries can expose another process's initial
     # environment without reading its credential files. Admit only runtime
     # hardware/OS facts, never process argument/environment or mutation queries.
@@ -294,10 +297,6 @@ def generate(args, listeners, minimum_tmp_length):
     # does not block that legacy numeric query on this Mac.
     lines.extend(["(deny process-info*)",
                   "(allow process-info* (target same-sandbox))"])
-    if args.contained_processes:
-        # Listing returns only integer PIDs; per-PID metadata and environments
-        # retain the same-sandbox restriction. Cancellation needs child IDs.
-        lines.append("(allow process-info-listpids)")
     system_queries = (
         "hw.activecpu", "hw.byteorder", "hw.cacheconfig", "hw.cachelinesize_compat",
         "hw.cpufamily", "hw.cpufrequency_compat", "hw.cputype", "hw.cpusubtype",
@@ -370,8 +369,10 @@ def parser():
                         help="host-approved credential-free toolchain or dedicated log directory")
     result.add_argument("--broker-dir", help="host-owned endpoint directory inside private state/tmp")
     result.add_argument("--broker-endpoint", help="exact host-owned short endpoint alias resolving inside broker-dir")
+    result.add_argument("--command-groups", action="store_true",
+                        help="allow command groups inside the host-owned private session")
     result.add_argument("--contained-processes", action="store_true",
-                        help="require fork/exec adapter spawns; prevent descendants leaving the host process group")
+                        help="require fork/exec adapter spawns; prevent descendants leaving the host session")
     result.add_argument("--immutable-exec-dir", action="append", default=[],
                         help="host-staged executable root; protect contents and all ancestors")
     return result

@@ -112,6 +112,8 @@ def prepare(request):
                  "--state-root", request["state_root"], "--state-dir", str(state), "--tmp-dir", tmp,
                  "--broker-dir", request["broker_dir"], "--broker-endpoint", request["endpoint"],
                  "--contained-processes"]
+    if "opencode" in staged:
+        arguments.append("--command-groups")
     for name in ("agent", "gateway", "egress", "model", "judge"):
         arguments.extend(["--" + name + "-port", str(ports[name])])
     for name in ("agent", "gateway", "egress"):

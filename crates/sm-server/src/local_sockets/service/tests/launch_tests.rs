@@ -1,6 +1,10 @@
 use super::*;
 use crate::local_sockets::launch::LaunchBinding;
-use std::{ffi::OsString, process::Command};
+use std::{
+    ffi::OsString,
+    io::{BufRead, BufReader},
+    process::Command,
+};
 
 pub(crate) struct PreparedLaunch {
     _directory: TestDirectory,
@@ -432,7 +436,84 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
         ProcessIdentity::capture(cancelled).is_err(),
         "cancelled native child survived"
     );
-    // The same adapter still refuses new groups from other executable images.
+    struct OutsideProcess(std::process::Child);
+    impl Drop for OutsideProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut outside = OutsideProcess(Command::new("/bin/sleep").arg("120").spawn().unwrap());
+    for mode in ["complete", "drop", "supervisor-loss", "host-disconnect"] {
+        // The worker changes groups and, on normal completion, is reparented.
+        // Entire-launch cleanup must remove it without touching the sentinel.
+        let script = format!(
+            "import os,socket,time\nr,w=os.pipe(); p=os.fork()\nif p:\n os.close(w); assert os.read(r,1)==b'R'; os.close(r)\n if {mode:?} == 'complete': os._exit(0)\n time.sleep(60)\nelse:\n os.close(r); os.setpgid(0,0)\n s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\n print(os.getpid(),os.getppid(),os.getpgrp(),os.getsid(0),s.getsockname()[1],flush=True)\n os.write(w,b'R'); os.close(w); time.sleep(60)"
+        );
+        let mut launch = prepared
+            .queue_binding()
+            .spawn(
+                &prepared.path("python"),
+                &["-c".into(), script.into()],
+                &prepared.environment,
+                &checkout,
+            )
+            .unwrap();
+        let supervisor = launch.id();
+        let stdout = launch.take_stdout().unwrap();
+        let mut stderr = launch.take_stderr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send((result, line));
+        });
+        let line = match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok((Ok(size), line)) if size > 0 => line,
+            result => {
+                drop(launch);
+                reader.join().unwrap();
+                let mut errors = String::new();
+                stderr.read_to_string(&mut errors).unwrap();
+                panic!("{mode}: worker startup failed: {result:?}; {errors}");
+            }
+        };
+        reader.join().unwrap();
+        let fields: Vec<u32> = line
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(fields.len(), 5, "{mode}: {line}");
+        assert_eq!(fields[0], fields[2], "worker did not enter its own group");
+        assert_eq!(fields[3], supervisor, "worker escaped the launch session");
+        match mode {
+            "complete" => assert!(launch.wait().unwrap().success()),
+            "drop" => drop(launch),
+            "supervisor-loss" => {
+                // SAFETY: this unreaped supervisor belongs to the fixture handle.
+                assert_eq!(unsafe { libc::kill(supervisor as i32, libc::SIGKILL) }, 0);
+                assert!(!launch.wait().unwrap().success());
+            }
+            "host-disconnect" => {
+                assert!(!launch.disconnect_host_for_test().unwrap().success());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !ProcessIdentity::capture(fields[0]).is_ok_and(|p| p.is_live()),
+            "{mode}: worker survived session cleanup"
+        );
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, fields[4] as u16)).is_ok(),
+            "{mode}: worker retained its listener"
+        );
+        assert!(
+            outside.0.try_wait().unwrap().is_none(),
+            "{mode}: outside process was killed"
+        );
+    }
+    // Other images still refuse adapter requests for a new session or group;
+    // raw group changes, when admitted, remain inside the private session.
     prepared.run(&prepared.path("application"), &[], &prepared.environment);
 }
 

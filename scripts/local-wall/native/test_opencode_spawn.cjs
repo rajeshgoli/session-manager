@@ -21,23 +21,27 @@ async function main() {
   const sibling = spawn(process.env.SM_TEST_SHELL, ["-c", "sleep 60"], {
     detached: true, stdio: "ignore",
   })
-  for (const [signal, group] of [["SIGTERM", true], ["SIGKILL", false]]) {
+  for (const signal of ["SIGTERM", "SIGKILL"]) {
     const prefix = signal.toLowerCase()
     const child = spawn(process.env.SM_TEST_SHELL, ["-c",
       `sleep 60 & echo $! > ${prefix}-background.txt; ` +
       `(sleep 60 & echo $! > ${prefix}-grandchild.txt; wait) & ` +
-      `echo $! > ${prefix}-child.txt; wait`,
+      `echo $! > ${prefix}-child.txt; ` +
+      `"$SM_TEST_PYTHON" -c 'import os,time; p=os.fork(); ` +
+      `os._exit(0) if p else None; ` +
+      `exec("while os.getppid() != 1: time.sleep(0.01)"); ` +
+      `open("${prefix}-orphan.txt","w").write(str(os.getpid())); time.sleep(60)'; wait`,
     ], { detached: true, stdio: "ignore" })
     child.on("error", (error) => { throw error })
     fs.writeFileSync("native-cancel-pid.txt", String(child.pid))
-    const files = ["background", "grandchild", "child"].map(x => `${prefix}-${x}.txt`)
+    const files = ["background", "grandchild", "child", "orphan"].map(x => `${prefix}-${x}.txt`)
     const readyBy = Date.now() + 3000
     while (!files.every(file => fs.existsSync(file) && fs.readFileSync(file, "utf8").trim())) {
       assert(Date.now() < readyBy, "command descendants did not start")
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     const pids = files.map(file => Number(fs.readFileSync(file, "utf8").trim()))
-    assert.equal(new Set(pids).size, 3)
+    assert.equal(new Set(pids).size, 4)
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("cancelled child did not exit")), 3000)
       child.on("exit", (code, actual) => {
@@ -45,9 +49,8 @@ async function main() {
         assert.equal(actual, signal)
         resolve()
       })
-      // Exercise both Opencode's group-first call and its direct-child path.
-      if (group) process.kill(-child.pid, signal)
-      else assert.equal(child.kill(signal), true)
+      // Match Opencode's kernel group cancellation, including reparented workers.
+      process.kill(-child.pid, signal)
     })
     const goneBy = Date.now() + 3000
     const alive = pid => {
