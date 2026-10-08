@@ -310,6 +310,75 @@ impl Fixture {
 }
 
 #[test]
+fn opencode_launch_restore_and_startup_register_real_usage_without_clear() {
+    let mut f = Fixture::new();
+    let db = f.driver.path.with_extension("usage.db");
+    f.store = f
+        .store
+        .clone()
+        .with_usage_identity_store(UsageIdentityStore::new(&db).unwrap())
+        .with_usage_ledger_store(UsageLedgerStore::new(&db).unwrap());
+    let created = f.create("local1", Some("first brief")).unwrap();
+    assert!(created.transcript_path.is_none());
+    let conversation = created.provider_resume_id.clone().unwrap();
+    let journal = PathBuf::from(&created.opencode.as_ref().unwrap().state_dir).join("usage.jsonl");
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(&journal, format!("{}\n", json!({
+        "type": "assistant", "timestamp": now_rfc3339(),
+        "sessionId": conversation, "requestId": "part-one",
+        "message": {"id": "part-one", "model": "local/qwen", "role": "assistant", "content": [],
+            "usage": {"input_tokens": 120, "output_tokens": 7,
+                "cache_read_input_tokens": 900, "cache_creation_input_tokens": 0}}
+    }))).unwrap();
+    let assert_mapping = || {
+        let mapping: (String, String) = rusqlite::Connection::open(&db).unwrap().query_row(
+            "SELECT provider_session_id, artifact_path FROM seat_sessions WHERE seat_id = 'local1' AND provider = 'opencode'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            mapping,
+            (conversation.clone(), journal.display().to_string())
+        );
+    };
+    assert_mapping();
+    assert_eq!(f.store.scan_usage_ledger().unwrap().messages_inserted, 1);
+    assert_eq!(
+        f.store
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .account_key
+            .as_deref(),
+        Some("local")
+    );
+    let usage: (String, i64, i64, i64) = rusqlite::Connection::open(&db).unwrap().query_row(
+        "SELECT account_key, input_tokens, output_tokens, cache_read_tokens FROM message_ledger WHERE message_id = 'part-one'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(usage, ("local".to_owned(), 120, 7, 900));
+    // Restore recreates a missing mapping before accepting the same conversation.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM seat_sessions", [])
+        .unwrap();
+    f.change("local1", "status", json!("stopped"));
+    f.store
+        .restore_core_session_with_runtime("local1", &f.runtime)
+        .unwrap();
+    assert_mapping();
+    // Existing records without transcript_path recover their journal after server restart,
+    // including already retired sessions whose historic usage still needs booking.
+    f.change("local1", "status", json!("stopped"));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM seat_sessions", [])
+        .unwrap();
+    let reopened = SessionStore::new(f.driver.path.clone());
+    reopened.reconcile_current_seat_sessions().unwrap();
+    assert_mapping();
+}
+
+#[test]
 fn opencode_creation_capacity_conflicts_are_typed_before_any_extra_launch() {
     let f = Fixture::new();
     f.create("local1", None).unwrap();

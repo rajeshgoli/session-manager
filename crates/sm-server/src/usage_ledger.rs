@@ -30,6 +30,7 @@ const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const INHERITED_CODEX_TURN_FLOOR: i64 = 1_000_000;
 const INHERITED_CODEX_TURN_REPAIR: &str = "1409-inherited-codex-turns";
 const NESTED_NULL_CLAUDE_RESCAN_REPAIR: &str = "1658-nested-null-claude-rescan";
+const OPENCODE_USAGE_RESCAN_REPAIR: &str = "2122-opencode-usage-rescan";
 const INHERITED_BY_REPAIR: &str = "repair";
 const INHERITED_BY_SCAN: &str = "scan";
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
@@ -581,6 +582,7 @@ impl UsageLedgerStore {
         let bindings = self.artifact_bindings()?;
         self.extend_with_persisted_bound_seats(&mut seats, &bindings)?;
         self.rescan_nested_null_claude_artifacts(&bindings)?;
+        self.rescan_previously_skipped_opencode_artifacts(&bindings)?;
         let seat_by_source = bindings
             .iter()
             .map(|binding| {
@@ -698,6 +700,46 @@ impl UsageLedgerStore {
         Ok(())
     }
 
+    /// Older scanners saved offsets for Opencode files without booking their rows.
+    fn rescan_previously_skipped_opencode_artifacts(
+        &self,
+        bindings: &[ArtifactBinding],
+    ) -> Result<()> {
+        let mut connection = self.open()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx
+            .query_row(
+                "SELECT 1 FROM usage_repairs WHERE name = ?1",
+                [OPENCODE_USAGE_RESCAN_REPAIR],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut reset = 0;
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.provider == "opencode")
+        {
+            reset += tx.execute(
+                "DELETE FROM scan_offsets WHERE artifact_path = ?1",
+                [binding.artifact_path.to_string_lossy().as_ref()],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO usage_repairs (name, applied_at, rows, tokens) VALUES (?1, ?2, ?3, 0)",
+            params![
+                OPENCODE_USAGE_RESCAN_REPAIR,
+                format_timestamp(OffsetDateTime::now_utc())?,
+                reset
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn resolve_seat_models(&self, seats: &[UsageSeatMetadata]) -> Result<Vec<UsageSeatMetadata>> {
         let connection = self.open()?;
         seats
@@ -787,6 +829,7 @@ impl UsageLedgerStore {
             let account_prefix = match binding.provider.as_str() {
                 "claude" => "claude:%",
                 "codex" | "codex-fork" => "codex:%",
+                "opencode" => "local",
                 _ => continue,
             };
             let msg_ids = tx
@@ -1071,13 +1114,14 @@ impl UsageLedgerStore {
             line_offset = line_offset.saturating_add(read as u64);
             batch_lines += 1;
             let outcome = match artifact.provider.as_str() {
-                "claude" => parse_claude_line(&line, &artifact.path)
+                "claude" | "opencode" => parse_claude_line(&line, &artifact.path)
                     .and_then(|parsed| {
                         parsed
                             .map(|parsed| {
-                                self.resolve_claude_contribution(
+                                self.resolve_claude_format_contribution(
                                     &tx,
                                     windows,
+                                    &artifact.provider,
                                     parsed,
                                     seat_by_source,
                                     seat_meta,
@@ -1194,6 +1238,11 @@ impl UsageLedgerStore {
     }
 
     fn ensure_bootstrap_for_artifact(&self, artifact: &Artifact, offset: u64) -> Result<()> {
+        if artifact.provider == "opencode" {
+            self.identity_store
+                .account_at(Provider::Local, OffsetDateTime::now_utc())?;
+            return Ok(());
+        }
         let provider = match artifact.provider.as_str() {
             "claude" => Provider::Claude,
             "codex" | "codex-fork" => Provider::Codex,
@@ -1222,16 +1271,23 @@ impl UsageLedgerStore {
         Ok(())
     }
 
-    fn resolve_claude_contribution(
+    #[allow(clippy::too_many_arguments)] // Retain the artifact's provider through the shared parser.
+    fn resolve_claude_format_contribution(
         &self,
         tx: &Transaction<'_>,
         windows: &mut BurnWindows,
+        raw_provider: &str,
         parsed: ParsedMessage,
         seat_by_source: &BTreeMap<(String, String), String>,
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
     ) -> Result<Option<IngestOutcome>> {
-        let Some(account_key) = account_at(tx, Provider::Claude, parsed.timestamp)? else {
-            if predates_first_account_interval(tx, Provider::Claude, parsed.timestamp)? {
+        let provider = if raw_provider == "opencode" {
+            Provider::Local
+        } else {
+            Provider::Claude
+        };
+        let Some(account_key) = account_at(tx, provider, parsed.timestamp)? else {
+            if predates_first_account_interval(tx, provider, parsed.timestamp)? {
                 return Ok(None);
             }
             bail!(
@@ -1240,15 +1296,15 @@ impl UsageLedgerStore {
             );
         };
         let seat_id = seat_by_source
-            .get(&("claude".to_owned(), parsed.source_ref.clone()))
+            .get(&(raw_provider.to_owned(), parsed.source_ref.clone()))
             .cloned()
             .unwrap_or_else(|| "unassigned".to_owned());
         let project_key = seat_meta
             .get(&seat_id)
             .map(|seat| seat.project_key.clone())
             .unwrap_or_else(|| UsageSeatMetadata::resolve_project_key(&parsed.cwd));
-        let credit_metered =
-            credit_metered(tx, windows, &account_key, &parsed.model, parsed.timestamp)?;
+        let credit_metered = provider != Provider::Local
+            && credit_metered(tx, windows, &account_key, &parsed.model, parsed.timestamp)?;
         let contribution = Contribution {
             message_id: parsed.message_id,
             request_id: parsed.request_id,
@@ -2980,6 +3036,9 @@ fn account_at(
     provider: Provider,
     timestamp: OffsetDateTime,
 ) -> Result<Option<String>> {
+    if provider == Provider::Local {
+        return Ok(Some("local".to_owned()));
+    }
     let timestamp = format_timestamp(timestamp)?;
     tx.query_row(
         r#"
@@ -5339,6 +5398,166 @@ mod tests {
             UsageSeatMetadata::resolve_project_key(repository.to_str().unwrap()),
             UsageSeatMetadata::resolve_project_key(worktree.to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn opencode_usage_is_exact_replayed_once_and_leaves_claude_quota_unchanged() {
+        use crate::usage_report::{UsageReportOptions, UsageReportStore};
+
+        let dir = TestDir::new("local-accounting");
+        let now = OffsetDateTime::now_utc();
+        let message_at = now - time::Duration::hours(1);
+        let line = |session: &str, id: &str, model: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type": "assistant", "timestamp": message_at.format(&Rfc3339).unwrap(),
+                    "sessionId": session, "requestId": id, "cwd": "/repo",
+                    "message": {"id": id, "model": model, "role": "assistant", "content": [],
+                        "usage": {"input_tokens": 120, "output_tokens": 7,
+                            "cache_read_input_tokens": 900, "cache_creation_input_tokens": 30}}
+                })
+            )
+        };
+        let claude_file = dir.0.join("claude.jsonl");
+        let local_file = dir.0.join("usage.jsonl");
+        fs::write(
+            &claude_file,
+            line("hosted", "hosted-part", "claude-sonnet-5"),
+        )
+        .unwrap();
+        let local_one = line("before-clear", "local-part-one", "local/claude-opus-5");
+        fs::write(
+            &local_file,
+            format!(
+                "{}{}",
+                local_one,
+                line("after-clear", "local-part-two", "local/qwen")
+            ),
+        )
+        .unwrap();
+        let mut hosted_reports = Vec::new();
+        for include_local in [false, true] {
+            let db = dir.0.join(if include_local {
+                "mixed.db"
+            } else {
+                "hosted.db"
+            });
+            let identities = UsageIdentityStore::new(&db).unwrap();
+            let account = identity(Provider::Claude, "account-one", "max");
+            identities
+                .record_observation(
+                    Provider::Claude,
+                    Some(&account),
+                    now - time::Duration::hours(2),
+                    None,
+                    None,
+                )
+                .unwrap();
+            UsageBurnStore::new(&db)
+                .unwrap()
+                .record_for_account(
+                    &account.account_key(),
+                    &[BurnWindowSample {
+                        window_kind: "weekly_all".to_owned(),
+                        window_scope: None,
+                        duration_minutes: 10_080,
+                        percent: 10.0,
+                        resets_at: now + time::Duration::days(5),
+                        severity: None,
+                        is_active: Some(true),
+                    }],
+                    "test",
+                    now,
+                )
+                .unwrap();
+            let store = UsageLedgerStore::new(&db).unwrap();
+            let bindings = SeatSessionStore::new(&db);
+            bindings
+                .append("hosted-seat", "claude", "hosted", claude_file.to_str())
+                .unwrap();
+            if include_local {
+                bindings
+                    .append(
+                        "local-seat",
+                        "opencode",
+                        "before-clear",
+                        local_file.to_str(),
+                    )
+                    .unwrap();
+                bindings
+                    .append("local-seat", "opencode", "after-clear", local_file.to_str())
+                    .unwrap();
+                // Simulate the old scanner having advanced past every skipped local row.
+                let metadata = fs::metadata(&local_file).unwrap();
+                Connection::open(&db).unwrap().execute(
+                    "INSERT INTO scan_offsets (artifact_path, byte_offset, mtime_ns, scanned_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![local_file.to_str(), metadata.len(), file_mtime_ns(&metadata), format_timestamp(now).unwrap()],
+                ).unwrap();
+            }
+            let summary = store.scan(&[]).unwrap();
+            assert_eq!(summary.messages_inserted, if include_local { 3 } else { 1 });
+            if include_local {
+                assert_eq!(store.scan(&[]).unwrap().messages_inserted, 0);
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&local_file)
+                    .unwrap()
+                    .write_all(local_one.as_bytes())
+                    .unwrap();
+                assert_eq!(store.scan(&[]).unwrap().messages_ignored, 1);
+                let connection = Connection::open(&db).unwrap();
+                let exact: (i64, i64, i64, i64, i64) = connection.query_row(
+                    "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_5m) FROM message_ledger WHERE account_key = 'local' AND seat_id = 'local-seat'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).unwrap();
+                assert_eq!(exact, (2, 240, 14, 1800, 60));
+                let provider: String = connection
+                    .query_row(
+                        "SELECT provider FROM accounts WHERE account_key = 'local'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(provider, "local");
+                let timelines: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM account_timeline WHERE provider = 'local'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(timelines, 0);
+                let local_windows: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM message_window JOIN message_ledger USING (msg_id) WHERE account_key = 'local'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(local_windows, 0);
+                let attribution = identities
+                    .account_at(Provider::Local, OffsetDateTime::UNIX_EPOCH)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(attribution.account_key, "local");
+                assert!(!attribution.is_assumed && !attribution.is_uncertain);
+            }
+            let report = UsageReportStore::new(&db)
+                .report(None, UsageReportOptions::default())
+                .unwrap();
+            assert_eq!(report.accounts.len(), 1);
+            assert_eq!(report.accounts[0].provider, "claude");
+            let weekly = report.accounts[0]
+                .windows
+                .iter()
+                .find(|window| window.window_kind == "weekly_all")
+                .unwrap();
+            hosted_reports.push((
+                weekly.account_percent,
+                weekly.total_percent,
+                weekly.residual,
+            ));
+        }
+        assert_eq!(hosted_reports[0], hosted_reports[1]);
+        assert_eq!(hosted_reports[0].0, Some(10.0));
     }
 
     #[test]

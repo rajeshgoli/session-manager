@@ -27,6 +27,7 @@ const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = ti
 pub enum Provider {
     Claude,
     Codex,
+    Local,
 }
 
 impl Provider {
@@ -34,6 +35,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Local => "local",
         }
     }
 }
@@ -49,12 +51,18 @@ pub struct AccountIdentity {
 
 impl AccountIdentity {
     pub fn account_key(&self) -> String {
+        if self.provider == Provider::Local {
+            return "local".to_owned();
+        }
         format!("{}:{}", self.provider.as_str(), self.external_id)
     }
 
     fn validate(&self) -> Result<()> {
         if self.external_id.trim().is_empty() {
             bail!("{} account identity is empty", self.provider.as_str());
+        }
+        if self.provider == Provider::Local && self.external_id != "local" {
+            bail!("local account identity must use the fixed key local");
         }
         Ok(())
     }
@@ -191,6 +199,13 @@ impl UsageIdentityStore {
             identity.validate()?;
         }
 
+        if provider == Provider::Local {
+            self.ensure_local_account(observed_at)?;
+            return Ok(ObservationOutcome::Unchanged {
+                account_key: "local".to_owned(),
+            });
+        }
+
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let observed_ts = format_timestamp(observed_at)?;
@@ -260,6 +275,20 @@ impl UsageIdentityStore {
         Ok(outcome)
     }
 
+    /// Local usage has one fixed account and never opens an identity timeline.
+    fn ensure_local_account(&self, observed_at: OffsetDateTime) -> Result<()> {
+        self.ensure_account(
+            &AccountIdentity {
+                provider: Provider::Local,
+                external_id: "local".to_owned(),
+                label: Some("Local".to_owned()),
+                plan_tier: None,
+                extra_usage_enabled: None,
+            },
+            observed_at,
+        )
+    }
+
     /// Register account metadata without changing the provider's active timeline.
     ///
     /// Cached usage can carry the final sample for an account that was replaced
@@ -310,6 +339,10 @@ impl UsageIdentityStore {
         provider: Provider,
         earliest_message_at: OffsetDateTime,
     ) -> Result<bool> {
+        if provider == Provider::Local {
+            self.ensure_local_account(OffsetDateTime::now_utc())?;
+            return Ok(false);
+        }
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = ensure_bootstrap_interval_tx(&tx, provider, earliest_message_at)?;
@@ -322,6 +355,14 @@ impl UsageIdentityStore {
         provider: Provider,
         message_at: OffsetDateTime,
     ) -> Result<Option<TimelineAttribution>> {
+        if provider == Provider::Local {
+            self.ensure_local_account(OffsetDateTime::now_utc())?;
+            return Ok(Some(TimelineAttribution {
+                account_key: "local".to_owned(),
+                is_assumed: false,
+                is_uncertain: false,
+            }));
+        }
         let conn = self.open()?;
         let message_ts = format_timestamp(message_at)?;
         let covering = conn
