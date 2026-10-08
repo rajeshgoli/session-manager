@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 type Hook = Box<dyn FnOnce(&SessionRecord) + Send>;
 #[path = "clear_tests.rs"]
 mod clear_tests;
+#[path = "handoff_tests.rs"]
+mod handoff_tests;
 #[path = "outbox_tests.rs"]
 mod outbox_tests;
 #[path = "retire_tests.rs"]
@@ -13,6 +15,7 @@ struct Driver {
     config: OpencodeConfig,
     path: PathBuf,
     server: Mutex<Option<Stub>>,
+    other_servers: Mutex<BTreeMap<u16, Stub>>,
     starts: AtomicUsize,
     attachments: AtomicUsize,
     old_posts: AtomicUsize,
@@ -35,9 +38,23 @@ impl Driver {
     fn posts(&self) -> usize {
         self.old_posts.load(Ordering::Acquire)
             + self.server.lock().unwrap().as_ref().map_or(0, Stub::posts)
+            + self
+                .other_servers
+                .lock()
+                .unwrap()
+                .values()
+                .map(Stub::posts)
+                .sum::<usize>()
     }
     fn conversations(&self) -> usize {
         self.old_conversations.load(Ordering::Acquire)
+            + self
+                .other_servers
+                .lock()
+                .unwrap()
+                .values()
+                .map(Stub::conversation_creations)
+                .sum::<usize>()
             + self
                 .server
                 .lock()
@@ -90,7 +107,12 @@ impl OpencodeLaunchDriver for Driver {
         if self.lost_reply.swap(false, Ordering::AcqRel) {
             server.lose_post_reply();
         }
-        *self.server.lock().unwrap() = Some(server);
+        if let Some(previous) = self.server.lock().unwrap().replace(server) {
+            self.other_servers
+                .lock()
+                .unwrap()
+                .insert(previous.port, previous);
+        }
         if let Some(hook) = self.start_hook.lock().unwrap().take() {
             hook(record);
         }
@@ -149,18 +171,33 @@ impl OpencodeLaunchDriver for Driver {
         }
         Ok(())
     }
-    fn present(&self, _: &SessionRecord, _: &TmuxRuntime) -> Result<bool> {
+    fn present(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<bool> {
         if self.uncertain_present.load(Ordering::Acquire) {
             anyhow::bail!("injected tmux transport uncertainty")
         }
-        Ok(self.server.lock().unwrap().is_some())
+        let port = record.opencode.as_ref().unwrap().port;
+        Ok(self
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.port == port)
+            || self.other_servers.lock().unwrap().contains_key(&port))
     }
     fn stop(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
         self.stops.fetch_add(1, Ordering::AcqRel);
         if self.fail_stop.load(Ordering::Acquire) {
             anyhow::bail!("teardown not proved")
         }
-        if let Some(server) = self.server.lock().unwrap().take() {
+        let port = record.opencode.as_ref().unwrap().port;
+        let mut current = self.server.lock().unwrap();
+        let server = if current.as_ref().is_some_and(|s| s.port == port) {
+            current.take()
+        } else {
+            self.other_servers.lock().unwrap().remove(&port)
+        };
+        drop(current);
+        if let Some(server) = server {
             self.old_posts.fetch_add(server.posts(), Ordering::AcqRel);
             self.old_conversations
                 .fetch_add(server.conversation_creations(), Ordering::AcqRel);
@@ -179,6 +216,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_ports(1)
+    }
+    fn with_ports(ports: u16) -> Self {
         let scratch = ScratchDir::new();
         let path = scratch.path().join("sessions.json");
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -188,12 +228,13 @@ impl Fixture {
             .port();
         let driver = Arc::new(Driver {
             config: OpencodeConfig {
-                port_range: [port, port],
+                port_range: [port, port + ports - 1],
                 state_root: scratch.path().join("opencode").display().to_string(),
                 ..OpencodeConfig::default()
             },
             path: path.clone(),
             server: Mutex::new(None),
+            other_servers: Mutex::new(BTreeMap::new()),
             starts: AtomicUsize::new(0),
             attachments: AtomicUsize::new(0),
             old_posts: AtomicUsize::new(0),

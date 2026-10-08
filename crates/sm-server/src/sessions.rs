@@ -10545,6 +10545,9 @@ mod opencode_clear;
 #[path = "opencode/retire.rs"]
 mod opencode_retire;
 
+#[path = "opencode/handoff.rs"]
+mod opencode_handoff;
+
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StateFileStamp {

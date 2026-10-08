@@ -1,5 +1,6 @@
 pub mod local_wall;
 mod opencode_messages;
+use opencode_messages::ensure_handoff_provider_bindings_resolved;
 pub mod quiet;
 
 #[cfg(unix)]
@@ -3013,6 +3014,7 @@ impl RetainedQueueStore {
     pub fn hand_off_rows(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {
         self.with_connection(|conn| {
             with_immediate_transaction(conn, |conn| {
+                ensure_handoff_provider_bindings_resolved(conn, predecessor_id)?;
                 let ids = params![predecessor_id, successor_id];
                 conn.execute(
                     "DELETE FROM message_queue WHERE target_session_id = ?1
@@ -3068,6 +3070,7 @@ impl RetainedQueueStore {
     pub fn hand_off_messages(&self, predecessor_id: &str, successor_id: &str) -> Result<usize> {
         self.with_connection(|conn| {
             with_immediate_transaction(conn, |conn| {
+                ensure_handoff_provider_bindings_resolved(conn, predecessor_id)?;
                 conn.execute(
                     "DELETE FROM message_queue WHERE target_session_id = ?1
                        AND delivered_at IS NULL

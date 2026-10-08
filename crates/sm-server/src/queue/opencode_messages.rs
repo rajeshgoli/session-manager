@@ -2,6 +2,17 @@
 use super::*;
 use crate::opencode::MessageBinding;
 
+pub(super) fn ensure_handoff_provider_bindings_resolved(
+    conn: &Connection,
+    predecessor: &str,
+) -> Result<()> {
+    let unresolved: i64 = conn.query_row("SELECT COUNT(*) FROM message_queue WHERE target_session_id=?1 AND delivered_at IS NULL AND (provider_conversation_id IS NOT NULL OR provider_message_id IS NOT NULL OR provider_part_id IS NOT NULL)", [predecessor], |row| row.get(0))?;
+    if unresolved != 0 {
+        bail!("handoff blocked by unresolved provider deliveries")
+    }
+    Ok(())
+}
+
 impl RetainedQueueStore {
     /// Include delivered rows: a reconnect may replay the host's earlier input.
     pub fn opencode_generated_message_ids(

@@ -134,6 +134,10 @@ impl SessionStore {
             ));
         }
         let now = now_rfc3339();
+        if raw_handoff_record(session).is_none_or(|r| r.state == HandoffPhase::Failed) {
+            session.remove("opencode_handoff_delivery_blocked_at");
+            session.remove("opencode_handoff_delivery_last_attempt_at");
+        }
         let record = match raw_handoff_record(session) {
             Some(record)
                 if matches!(
