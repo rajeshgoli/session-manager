@@ -375,6 +375,14 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     let Some(_running) = RunningHandoff::take(predecessor_id) else {
         return Ok(());
     };
+    let (store, runtime, id) = (
+        state.session_store.clone(),
+        state.runtime(),
+        predecessor_id.to_owned(),
+    );
+    if !tokio::task::spawn_blocking(move || store.opencode_handoff_ready(&id, &runtime)).await?? {
+        return Ok(());
+    }
     let Some(plan) = state.session_store.claim_handoff_start(predecessor_id)? else {
         return Ok(());
     };
@@ -385,6 +393,11 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
             return Ok(());
         }
     };
+    if successor.provider == "opencode" {
+        state
+            .session_store
+            .record_opencode_handoff_successor(predecessor_id, &successor.id)?;
+    }
     if state.config.rust_core.runtime_enabled {
         // Claude takes seconds to show its composer, and a brief typed before
         // then is lost (#1927). Handoff notices are delivered ready-fenced as
@@ -393,8 +406,18 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
             .runtime()
             .for_socket_name(successor.tmux_socket_name.as_deref());
         let (tmux_session, provider) = (successor.tmux_session.clone(), successor.provider.clone());
+        let store = state.session_store.clone();
+        let successor_id = successor.id.clone();
         let ready = tokio::task::spawn_blocking(move || {
-            runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
+            if provider == "opencode" {
+                if store.opencode_http_ready(&successor_id)? {
+                    Ok(())
+                } else {
+                    anyhow::bail!("Opencode successor is not ready")
+                }
+            } else {
+                runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
+            }
         })
         .await?;
         if let Err(error) = ready {
@@ -431,6 +454,21 @@ async fn create_successor(
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let created = if state.config.rust_core.runtime_enabled {
+        if plan.provider == "opencode" {
+            ensure_core_runtime_request_node_supported(state, &payload)
+                .map_err(|e| api_error_reason(&e))?;
+            let (store, runtime, predecessor) = (
+                state.session_store.clone(),
+                state.runtime(),
+                plan.predecessor_id.clone(),
+            );
+            return tokio::task::spawn_blocking(move || {
+                store.create_opencode_handoff_successor(payload, log_dir, &runtime, &predecessor)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"));
+        }
         match ensure_core_runtime_provider_supported(&payload)
             .and_then(|()| ensure_core_runtime_request_node_supported(state, &payload))
         {
@@ -462,11 +500,35 @@ async fn complete_handoff(
     predecessor_id: &str,
     successor_id: &str,
 ) -> anyhow::Result<()> {
+    let (store, runtime, id) = (
+        state.session_store.clone(),
+        state.runtime(),
+        predecessor_id.to_owned(),
+    );
+    if !tokio::task::spawn_blocking(move || store.opencode_handoff_ready(&id, &runtime)).await?? {
+        if let Some(predecessor) = state.session_store.get_session(predecessor_id)? {
+            let failed_before_move = predecessor.successor_session_id.is_none()
+                && predecessor.handoff.as_ref().is_some_and(|h| {
+                    h["state"] == "failed"
+                        && h["successor_session_id"].as_str() == Some(successor_id)
+                });
+            if failed_before_move {
+                // The empty successor holds no inherited work. The predecessor
+                // and its rows remain intact when the resolution timeout fails.
+                retire_predecessor(state, successor_id, predecessor_id).await?;
+            }
+        }
+        return Ok(());
+    }
     let store = state.session_store.clone();
     let (pred, succ) = (predecessor_id.to_owned(), successor_id.to_owned());
     let task_state = state.clone();
-    let brief =
-        tokio::task::spawn_blocking(move || move_work(&task_state, &store, &pred, &succ)).await??;
+    let brief = tokio::task::spawn_blocking(move || {
+        store.with_opencode_handoff_transfer(&pred, &task_state.runtime(), || {
+            move_work(&task_state, &store, &pred, &succ)
+        })
+    })
+    .await??;
     // Step 3: the successor never acts before it holds the work, and reads
     // the brief before any message it inherits.
     state.session_store.queue_handoff_notice(
