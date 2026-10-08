@@ -46,7 +46,7 @@ impl SessionStore {
         });
         self
     }
-    fn opencode_driver(&self) -> Result<Arc<dyn OpencodeLaunchDriver>> {
+    pub(super) fn opencode_driver(&self) -> Result<Arc<dyn OpencodeLaunchDriver>> {
         self.opencode_launch
             .as_ref()
             .map(|context| context.driver.clone())

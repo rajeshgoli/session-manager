@@ -94,6 +94,15 @@ impl Stub {
     pub(crate) fn fail_history(&self) {
         self.state.lock().unwrap().history_error = true;
     }
+    pub(crate) fn lookup_error(&self, error: Option<u16>) {
+        self.state.lock().unwrap().lookup_error = error;
+    }
+    pub(crate) fn rename_error(&self, error: bool) {
+        self.state.lock().unwrap().rename_error = error;
+    }
+    pub(crate) fn request_log(&self) -> Vec<(String, String, Value)> {
+        self.state.lock().unwrap().requests.clone()
+    }
 
     pub(crate) fn before_lookup(&self, hook: Box<dyn FnOnce() + Send>) {
         self.state.lock().unwrap().before_lookup = Some(hook);

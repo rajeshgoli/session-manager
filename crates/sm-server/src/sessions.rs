@@ -5015,6 +5015,9 @@ impl SessionStore {
         request: SendCoreInputRequest,
         runtime: &TmuxRuntime,
     ) -> Result<Option<CoreInputResult>> {
+        if self.is_opencode_session(session_id)? {
+            return self.send_opencode_input(session_id, request, runtime);
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
 
@@ -5150,6 +5153,9 @@ impl SessionStore {
         runtime: &TmuxRuntime,
         message_category: Option<&str>,
     ) -> Result<()> {
+        if self.is_opencode_session(session_id)? {
+            return self.drain_opencode_outbox(session_id, runtime);
+        }
         if message_category == Some("reparent") {
             return self.drain_reparent_runtime_messages(session_id, runtime);
         }
@@ -5282,6 +5288,10 @@ impl SessionStore {
         session_id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<bool> {
+        if self.is_opencode_session(session_id)? {
+            self.drain_opencode_outbox(session_id, runtime)?;
+            return Ok(true);
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let Some(queue) = &self.queue_store else {
@@ -5301,6 +5311,14 @@ impl SessionStore {
         &self,
         message_category: &str,
     ) -> Result<usize> {
+        self.drain_runtime_pending_targets_by_category(message_category, false)
+    }
+
+    fn drain_runtime_pending_targets_by_category(
+        &self,
+        message_category: &str,
+        skip_opencode: bool,
+    ) -> Result<usize> {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(0);
         };
@@ -5309,7 +5327,14 @@ impl SessionStore {
         };
         let targets = queue.pending_target_session_ids_by_category(message_category)?;
         let mut failures = Vec::new();
+        let mut attempted = 0;
         for target_session_id in &targets {
+            // The same retry sweep already gives each Opencode target one
+            // ordered pass across every category, including ordinary sends.
+            if skip_opencode && self.is_opencode_session(target_session_id)? {
+                continue;
+            }
+            attempted += 1;
             if let Err(error) =
                 self.drain_runtime_pending_messages_for_writable_session(target_session_id, runtime)
             {
@@ -5317,7 +5342,7 @@ impl SessionStore {
             }
         }
         if failures.is_empty() {
-            Ok(targets.len())
+            Ok(attempted)
         } else {
             Err(anyhow::anyhow!(
                 "failed to drain {message_category} messages for {}",
@@ -5333,8 +5358,12 @@ impl SessionStore {
     pub fn drain_runtime_background_retry_messages(&self) -> Result<usize> {
         let mut drained = 0;
         let mut failures = Vec::new();
+        match self.retry_opencode_outboxes() {
+            Ok(targets) => drained += targets,
+            Err(error) => failures.push(format!("{error:#}")),
+        }
         for message_category in BACKGROUND_RETRY_MESSAGE_CATEGORIES {
-            match self.drain_runtime_pending_message_targets_by_category(message_category) {
+            match self.drain_runtime_pending_targets_by_category(message_category, true) {
                 Ok(targets) => drained += targets,
                 Err(error) => failures.push(format!("{error:#}")),
             }
@@ -7196,7 +7225,10 @@ impl SessionStore {
     ) -> Result<bool> {
         if !is_safe_provider_native_rename_name(friendly_name)
             || session.is_stopped()
-            || !matches!(session.provider.as_str(), "claude" | "codex-fork")
+            || !matches!(
+                session.provider.as_str(),
+                "claude" | "codex-fork" | "opencode"
+            )
             || session.tmux_session.trim().is_empty()
         {
             return Ok(false);
@@ -7207,9 +7239,11 @@ impl SessionStore {
             }
             return Ok(false);
         };
-        queue.cancel_pending_messages_for_target_category(&session.id, "native_rename")?;
-        if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
-            return Ok(true);
+        if session.provider != "opencode" {
+            queue.cancel_pending_messages_for_target_category(&session.id, "native_rename")?;
+            if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
+                return Ok(true);
+            }
         }
         queue.enqueue_message(
             &session.id,
@@ -10488,6 +10522,9 @@ pub use opencode_events_store::{OpencodeEventInput, OpencodeStopSignal};
 mod opencode_session_launch;
 pub use opencode_session_launch::{OpencodeLaunchContext, OpencodeLaunchDriver};
 
+#[path = "opencode/outbox.rs"]
+mod opencode_outbox;
+
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StateFileStamp {
@@ -11868,6 +11905,15 @@ fn drain_pending_runtime_messages_raw(
 ) -> Result<QueueDrainResult> {
     let mut status =
         runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
+    // Callers already holding the registry guard must defer Opencode to the
+    // unlocked HTTP drain. The five-second sweep covers every pending row.
+    if raw_session_provider(state, session_id).as_deref() == Some("opencode") {
+        store.schedule_runtime_outbox(session_id, runtime)?;
+        return Ok(QueueDrainResult {
+            status,
+            delivered_message_ids: Vec::new(),
+        });
+    }
     let mut delivered_message_ids = Vec::new();
     loop {
         let messages = match (delivery_mode_filter, message_category_filter) {
@@ -11963,6 +12009,19 @@ fn complete_runtime_message_delivery_raw(
     queue: &RetainedQueueStore,
     message: &PendingMessage,
 ) -> Result<()> {
+    complete_runtime_message_delivery_with_sender_drain_raw(
+        store, state, runtime, queue, message, true,
+    )
+}
+
+fn complete_runtime_message_delivery_with_sender_drain_raw(
+    store: &SessionStore,
+    state: &mut Value,
+    runtime: &TmuxRuntime,
+    queue: &RetainedQueueStore,
+    message: &PendingMessage,
+    drain_sender: bool,
+) -> Result<()> {
     let sanitized_message;
     let message = if message
         .sender_session_id
@@ -12042,7 +12101,7 @@ fn complete_runtime_message_delivery_raw(
         }
     }
 
-    if message.notify_on_delivery {
+    if drain_sender && message.notify_on_delivery {
         if let Some(sender_session_id) = message.sender_session_id.as_deref() {
             drain_pending_runtime_messages_raw(
                 store,
