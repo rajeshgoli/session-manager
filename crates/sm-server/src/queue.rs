@@ -7977,8 +7977,15 @@ fn terminate_child_process_group_with_grace(child: &mut QueueChild, pgid: i64, g
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
     let mut force_sent = false;
     loop {
-        let _ = child.try_wait();
-        if !process_group_exists(pgid) && !escaped.iter().any(|pid| process_exists(*pid)) {
+        // Local children publish an exit receipt through their supervisor.
+        // Kernel absence alone can precede that receipt and root revocation.
+        // A status transport failure retains the existing kernel-only cleanup
+        // path and unknown exit code; do not wait forever for a dead owner.
+        let awaiting_receipt = matches!(child.try_wait(), Ok(None));
+        if !awaiting_receipt
+            && !process_group_exists(pgid)
+            && !escaped.iter().any(|pid| process_exists(*pid))
+        {
             return;
         }
         if !force_sent && Instant::now() >= deadline {
@@ -9178,6 +9185,66 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn local_wall_restaging_cancels_only_its_pending_jobs_and_preserves_notifications() {
+        let state_dir = unique_temp_path("queue-local-restaging");
+        let waiting = create_test_job(&state_dir, "tests", "waiting");
+        let running = create_test_job(&state_dir, "tests", "running");
+        let other = create_test_job(&state_dir, "tests", "other-agent");
+        let host = create_test_job(&state_dir, "tests", "host");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for (job, agent, state) in [
+            (&waiting, "local1", "pending"),
+            (&running, "local1", "running"),
+            (&other, "local2", "pending"),
+        ] {
+            conn.execute(
+                "UPDATE queue_jobs SET local_agent_id = ?2, state = ?3 WHERE id = ?1",
+                params![job.id, agent, state],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            local_wall::cancel_pending_jobs_for_restaging(&state_dir, "local1").unwrap();
+        }
+        let cancelled = get_queue_job_runtime_conn(&conn, &waiting.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert!(cancelled.finished_at.is_some());
+        assert!(cancelled.completion_notified_at.is_none());
+        let required: i64 = conn
+            .query_row(
+                "SELECT completion_notification_required FROM queue_jobs WHERE id = ?1",
+                [&waiting.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(required, 1);
+        for (job, expected) in [
+            (&running, "running"),
+            (&other, "pending"),
+            (&host, "pending"),
+        ] {
+            assert_eq!(
+                get_queue_job_runtime_conn(&conn, &job.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                expected
+            );
+        }
+        assert!(local_wall::retire_registration(&state_dir, "local1").is_err());
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'cancelled' WHERE id = ?1",
+            [&running.id],
+        )
+        .unwrap();
+        local_wall::retire_registration(&state_dir, "local1").unwrap();
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

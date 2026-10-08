@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     opencode::{
         events::{read_event, Activity},
-        Client, OpencodeConfig,
+        Client, OpencodeConfig, RuntimeBinding,
     },
     sessions::OpencodeEventInput,
 };
@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Default)]
 struct ReaderState {
+    subscribed_binding: Option<RuntimeBinding>,
     connected_at: Option<Instant>,
     conversation: Option<String>,
     activity: Option<&'static str>,
@@ -89,6 +90,11 @@ impl Readers {
                         break;
                     }
                     let result = read_connection(&state, &readers, &handle, &worker_id);
+                    if let Ok(mut workers) = readers.workers.lock() {
+                        if let Some(worker) = workers.get_mut(&worker_id) {
+                            worker.subscribed_binding = None;
+                        }
+                    }
                     if state.shutdown.is_stopped() {
                         break;
                     }
@@ -144,13 +150,60 @@ pub(super) fn start(state: Arc<AppState>) {
     };
     let weak: Weak<AppState> = Arc::downgrade(&state);
     let readers = state.opencode_readers.clone();
+    let launch_state = weak.clone();
+    let launch_readers = readers.clone();
+    let launch_handle = handle.clone();
+    if let Err(error) = state
+        .session_store
+        .register_opencode_reader_start(Arc::new(move |id| {
+            let state = launch_state
+                .upgrade()
+                .context("opencode reader generation ended")?;
+            launch_readers.start_session(&state, &launch_handle, id.into())?;
+            let binding = state
+                .session_store
+                .get_session(id)?
+                .and_then(|session| session.opencode)
+                .context("opencode launch binding disappeared")?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !state.shutdown.is_stopped() && Instant::now() < deadline {
+                if launch_readers
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("reader lock poisoned"))?
+                    .get(id)
+                    .is_some_and(|worker| worker.subscribed_binding.as_ref() == Some(&binding))
+                {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            bail!("opencode event stream did not subscribe before launch")
+        }))
+    {
+        eprintln!("opencode reader launch registration: {error:#}");
+        readers.started.store(false, Ordering::Release);
+        return;
+    }
     let started = readers.started.clone();
     if let Err(error) = thread::Builder::new()
         .name("sm-opencode-readers".into())
         .spawn(move || {
+            if let Some(state) = weak.upgrade() {
+                if let Err(error) = state.session_store.recover_opencode_runtime_launches() {
+                    eprintln!("opencode launch recovery deferred: {error:#}");
+                }
+            }
+            let mut last_teardown_retry = Instant::now();
             while let Some(state) = weak.upgrade() {
                 if state.shutdown.is_stopped() {
                     break;
+                }
+                if last_teardown_retry.elapsed() >= Duration::from_secs(5) {
+                    if let Err(error) = state.session_store.recover_opencode_teardowns() {
+                        eprintln!("opencode teardown recovery: {error:#}");
+                    }
+                    last_teardown_retry = Instant::now();
                 }
                 match state
                     .session_store
@@ -162,10 +215,11 @@ pub(super) fn start(state: Arc<AppState>) {
                         ))
                     }) {
                     Ok((sessions, pending)) => {
-                        for session in sessions
-                            .into_iter()
-                            .filter(|s| s.provider == "opencode" && is_primary_node(&s.node))
-                        {
+                        for session in sessions.into_iter().filter(|s| {
+                            s.provider == "opencode"
+                                && is_primary_node(&s.node)
+                                && s.provider_resume_id.is_some()
+                        }) {
                             if session.is_stopped() {
                                 if pending.contains(&session.id) {
                                     if let Err(error) =
@@ -374,6 +428,10 @@ fn read_connection(
     if !continue_reading(state, id)? {
         return Ok(());
     }
+    state.session_store.reconcile_opencode_runtime(id)?;
+    if !continue_reading(state, id)? {
+        return Ok(());
+    }
     state.session_store.recover_opencode_effects(id)?;
     dispatch_stop(state, handle, id)?;
     let session = state
@@ -382,6 +440,19 @@ fn read_connection(
         .context("opencode session disappeared")?;
     let (client, config) = client_and_config(state, &session)?;
     let mut stream = client.event_stream()?;
+    if let Some(worker) = readers
+        .workers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("reader lock poisoned"))?
+        .get_mut(id)
+    {
+        worker.subscribed_binding = session.opencode.clone();
+    }
+    // Subscribe before waiting for a creator's launch lock. Its brief is then
+    // covered by this stream even while the creator commits acknowledgement.
+    state
+        .session_store
+        .recover_opencode_launch_for_session(id)?;
     let connected = Instant::now();
     let mut conversation = resync(state, handle, id, &client, &config)?;
     readers.update(&state.session_store, id)?;

@@ -1,6 +1,7 @@
 //! Host-only launch driver. The session store owns admission serialization,
 //! durable launch/conversation/brief commits and event-reader startup.
 use super::{Client, DeliveryOutcome, MessageBinding, OpencodeConfig, RuntimeBinding};
+pub mod host;
 use crate::{
     local_model::ModelRecord,
     local_wall::{
@@ -186,6 +187,47 @@ impl LaunchFiles {
             })
         })();
         result.with_context(|| format!("opencode launch state retained at {}", state.display()))
+    }
+
+    /// Reuse immutable launch files during crash recovery; never prepare or
+    /// rewrite a live wall's configuration merely to reconnect or attach.
+    pub fn reopen(config: &OpencodeConfig, binding: &RuntimeBinding) -> Result<Self> {
+        config.validate()?;
+        binding.validate()?;
+        let root = expand_home(&config.state_root).canonicalize()?;
+        let state = Path::new(&binding.state_dir);
+        if state.parent() != Some(root.as_path()) || state.canonicalize()? != state {
+            bail!("opencode launch state is outside its physical root")
+        }
+        let secret = read_secret(&state.join("server.secret"))?;
+        let native: serde_json::Value = serde_json::from_reader(private_file(
+            &state.join("xdg/config/opencode/opencode.json"),
+        )?)?;
+        let model = native["model"]
+            .as_str()
+            .and_then(|model| model.strip_prefix("local/"))
+            .context("opencode persisted model missing")?;
+        let limits = &native["provider"]["local"]["models"][model]["limit"];
+        let effective = OpencodeConfig {
+            model_id: model.into(),
+            model_base_url: binding.model_base_url.clone(),
+            context_window: limits["context"]
+                .as_u64()
+                .context("persisted context limit missing")?,
+            output_limit: limits["output"]
+                .as_u64()
+                .context("persisted output limit missing")?,
+            ..config.clone()
+        };
+        effective.validate()?;
+        Ok(Self {
+            binding: binding.clone(),
+            serve_script: state.join("launch-serve.sh"),
+            attach_script: state.join("launch-attach.sh"),
+            serve_log: state.join("serve.log"),
+            config: effective,
+            password: secret,
+        })
     }
 
     pub fn client(&self, timeout: Duration) -> Result<Client> {
@@ -480,6 +522,10 @@ fn password(path: &Path) -> Result<String> {
         file.write_all(secret.as_bytes())?;
         file.sync_all()?;
     }
+    read_secret(path)
+}
+
+fn read_secret(path: &Path) -> Result<String> {
     let mut secret = String::new();
     private_file(path)?.take(65).read_to_string(&mut secret)?;
     if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {

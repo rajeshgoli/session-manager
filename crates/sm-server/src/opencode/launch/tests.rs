@@ -176,6 +176,28 @@ fn preparation_writes_private_artifacts_and_reuses_the_password() {
 }
 
 #[test]
+fn recovery_reopens_saved_model_and_secret_without_repreparing_or_creating_secret() {
+    let fixture = Fixture::new();
+    let files = fixture.files();
+    let native = Path::new(&files.binding.state_dir).join("xdg/config/opencode/opencode.json");
+    let before = fs::read(&native).unwrap();
+    let changed = OpencodeConfig {
+        model_id: "new-default".into(),
+        context_window: 100000,
+        ..fixture.config.clone()
+    };
+    let recovered = LaunchFiles::reopen(&changed, &files.binding).unwrap();
+    assert_eq!(recovered.config.model_id, files.config.model_id);
+    assert_eq!(recovered.config.context_window, files.config.context_window);
+    assert_eq!(recovered.password, files.password);
+    assert_eq!(fs::read(&native).unwrap(), before);
+    let secret = Path::new(&files.binding.state_dir).join("server.secret");
+    fs::remove_file(&secret).unwrap();
+    assert!(LaunchFiles::reopen(&changed, &files.binding).is_err());
+    assert!(!secret.exists());
+}
+
+#[test]
 fn wrong_version_and_bad_id_fail_before_creating_agent_state() {
     let mut fixture = Fixture::new();
     fixture.config.version = "1.17.8".into();
