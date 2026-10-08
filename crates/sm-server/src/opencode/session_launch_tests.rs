@@ -18,6 +18,7 @@ struct Driver {
     lost_reply: AtomicBool,
     start_hook: Mutex<Option<Hook>>,
     attach_hook: Mutex<Option<Hook>>,
+    stop_hook: Mutex<Option<Hook>>,
 }
 impl Driver {
     fn posts(&self) -> usize {
@@ -115,7 +116,7 @@ impl OpencodeLaunchDriver for Driver {
         }
         Ok(self.server.lock().unwrap().is_some())
     }
-    fn stop(&self, _: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
+    fn stop(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
         if self.fail_stop.load(Ordering::Acquire) {
             anyhow::bail!("teardown not proved")
         }
@@ -123,6 +124,9 @@ impl OpencodeLaunchDriver for Driver {
             self.old_posts.fetch_add(server.posts(), Ordering::AcqRel);
             self.old_conversations
                 .fetch_add(server.conversation_creations(), Ordering::AcqRel);
+        }
+        if let Some(hook) = self.stop_hook.lock().unwrap().take() {
+            hook(record);
         }
         Ok(())
     }
@@ -161,6 +165,7 @@ impl Fixture {
             lost_reply: AtomicBool::new(false),
             start_hook: Mutex::new(None),
             attach_hook: Mutex::new(None),
+            stop_hook: Mutex::new(None),
         });
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
         let store = SessionStore::new(path)
@@ -285,6 +290,78 @@ fn opencode_restore_reuses_conversation_rotates_credential_and_preserves_checkpo
     assert_eq!(f.driver.starts.load(Ordering::Acquire), 2);
     assert_eq!(f.launches()[1].operation_kind, "restore");
     assert!(f.launches()[1].initial_message.is_none());
+}
+
+#[test]
+fn opencode_retirement_during_restore_teardown_wins_without_new_launch_or_credential() {
+    let f = Fixture::new();
+    let original = f.create("local1", Some("first brief")).unwrap();
+    f.change("local1", "status", json!("stopped"));
+    let store = f.store.clone();
+    *f.driver.stop_hook.lock().unwrap() = Some(Box::new(move |record| {
+        assert!(matches!(
+            store.retire_core_session(&record.id, None).unwrap(),
+            CoreRetireOutcome::Retired(_)
+        ));
+    }));
+    let error = f
+        .store
+        .restore_core_session_with_runtime("local1", &f.runtime)
+        .unwrap_err();
+    assert!(error.to_string().contains("lifecycle changed"));
+    let retired = f.store.get_session("local1").unwrap().unwrap();
+    assert_eq!(retired.completion_status.as_deref(), Some("retired"));
+    assert_eq!(
+        retired.session_credential_sha256,
+        original.session_credential_sha256
+    );
+    assert!(retired.is_stopped());
+    assert_eq!(f.launches().len(), 1);
+    assert_eq!(f.driver.starts.load(Ordering::Acquire), 1);
+    assert_eq!((f.driver.posts(), f.driver.conversations()), (1, 1));
+}
+
+#[test]
+fn opencode_restore_clears_old_terminal_metadata_and_preserves_conversation() {
+    let f = Fixture::new();
+    let original = f.create("local1", None).unwrap();
+    f.change("local1", "status", json!("stopped"));
+    assert!(matches!(
+        f.store.retire_core_session("local1", None).unwrap(),
+        CoreRetireOutcome::Retired(_)
+    ));
+    f.change("local1", "completion_message", json!("old result"));
+    f.change("local1", "completed_at", json!("2026-10-07T00:00:00Z"));
+    f.change(
+        "local1",
+        "agent_task_completed_at",
+        json!("2026-10-07T00:00:00Z"),
+    );
+    f.change("local1", "retirement_intent", json!({"old": true}));
+    let CoreRestoreOutcome::Restored(restored) = f
+        .store
+        .restore_core_session_with_runtime("local1", &f.runtime)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("restore refused")
+    };
+    assert_eq!(restored.provider_resume_id, original.provider_resume_id);
+    assert_eq!(restored.status, "idle");
+    for field in [
+        "completion_status",
+        "completion_message",
+        "completed_at",
+        "stopped_at",
+        "terminal_provenance",
+        "retirement_intent",
+        "agent_task_completed_at",
+    ] {
+        assert!(
+            f.store.load_parsed_state().unwrap().raw["sessions"][0][field].is_null(),
+            "{field} retained"
+        );
+    }
 }
 
 #[test]

@@ -207,8 +207,14 @@ impl SessionStore {
     ) -> Result<Option<CoreRestoreOutcome>> {
         let _launch_guard = self.lock_clear_operation(id)?;
         let driver = self.opencode_driver()?;
-        let Some(original) = self.get_session(id)? else {
-            return Ok(None);
+        let (original, expected_authority) = {
+            let _guard = self.write_guard()?;
+            let Some(original) = self.get_session(id)? else {
+                return Ok(None);
+            };
+            let state = self.load_parsed_state()?;
+            let authority = opencode_restore_authority(&state.raw, &original.id)?;
+            (original, authority)
         };
         if !is_primary_node(&original.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(original.node)));
@@ -257,6 +263,11 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
             ensure_session_not_reparent_fenced(&state, id)?;
+            // Retirement does not take the clear lock. Its terminal write
+            // while host teardown waits must win over this older restore.
+            if opencode_restore_authority(&state, id)? != expected_authority {
+                anyhow::bail!("session lifecycle changed during opencode restore; relaunch refused")
+            }
             let occupied = occupied_opencode_sessions(&state, Some(id))?;
             check_opencode_capacity(&config, &occupied, None)?;
             let port = reserve_opencode_port(&config, &occupied)?;
@@ -273,6 +284,9 @@ impl SessionStore {
             record.status = "starting".into();
             record.stopped_at = None;
             record.completion_status = None;
+            record.completion_message = None;
+            record.completed_at = None;
+            record.terminal_provenance = None;
             record.agent_task_completed_at = None;
             record.session_credential_sha256 = Some(sha256_text(&credential));
             let request = CreateCoreSessionRequest {
@@ -297,6 +311,7 @@ impl SessionStore {
                 session.insert(key.clone(), value.clone());
             }
             session.remove("error_message");
+            session.insert("retirement_intent".into(), Value::Null);
             store_session_runtime_launch_records(&mut state, &launches)?;
             self.write_raw_json_value(&state)?;
             (record, launch)
@@ -676,6 +691,37 @@ impl SessionStore {
         self.finish_opencode_launch(&launch.id, &runtime, driver.as_ref())
             .map(|_| ())
     }
+}
+
+fn opencode_restore_authority(state: &Value, id: &str) -> Result<Value> {
+    let session = raw_session_object(state, id).context("restore session disappeared")?;
+    Ok(Value::Object(
+        [
+            "provider",
+            "node",
+            "parent_session_id",
+            "tmux_session",
+            "tmux_socket_name",
+            "opencode",
+            "provider_resume_id",
+            "session_credential_sha256",
+            "completion_status",
+            "completion_message",
+            "completed_at",
+            "stopped_at",
+            "terminal_provenance",
+            "retirement_intent",
+            "agent_task_completed_at",
+        ]
+        .into_iter()
+        .map(|field| {
+            (
+                field.into(),
+                session.get(field).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect(),
+    ))
 }
 
 fn occupied_opencode_sessions(state: &Value, exclude: Option<&str>) -> Result<Vec<SessionRecord>> {
