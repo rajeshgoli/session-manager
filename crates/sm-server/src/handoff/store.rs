@@ -470,7 +470,24 @@ impl SessionStore {
             return Ok(false);
         }
         match context.record {
+            // A review-request ask is only a suggestion; it does not stand in
+            // for the threshold ask (#2110).
             None if used_percentage >= context.policy.threshold_percent => {
+                self.ask_handoff(
+                    state,
+                    session_id,
+                    &AskReason::Context {
+                        percent: used_percentage,
+                    },
+                    runtime,
+                )?;
+                Ok(true)
+            }
+            Some(Ok(record))
+                if record.state == HandoffPhase::Asked
+                    && record.trigger.is_review()
+                    && used_percentage >= context.policy.threshold_percent =>
+            {
                 self.ask_handoff(
                     state,
                     session_id,
@@ -483,10 +500,15 @@ impl SessionStore {
             }
             Some(Ok(mut record))
                 if record.state == HandoffPhase::Asked
+                    && !record.trigger.is_review()
                     && record.reminded_at.is_none()
                     && context
                         .policy
-                        .reminder_percent
+                        .reminder_at(
+                            record
+                                .asked_percent
+                                .unwrap_or(context.policy.threshold_percent),
+                        )
                         .is_some_and(|reminder| used_percentage >= reminder) =>
             {
                 record.reminded_at = Some(now_rfc3339());
@@ -539,7 +561,25 @@ impl SessionStore {
                         .is_some_and(|used| used < context.policy.threshold_percent);
                 let switched_off = was_enabled && !context.policy.enabled;
                 if !switched_off && !below_threshold {
-                    return Ok(false);
+                    // A lowered threshold turns a review-request ask into the
+                    // threshold ask, as a new sample would (#2110).
+                    return match context.used_percentage {
+                        Some(used)
+                            if record.trigger.is_review()
+                                && context.policy.enabled
+                                && context.policy.has_gauge
+                                && used >= context.policy.threshold_percent =>
+                        {
+                            self.ask_handoff(
+                                state,
+                                session_id,
+                                &AskReason::Context { percent: used },
+                                runtime,
+                            )?;
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    };
                 }
                 if let Some(queue) = &self.queue_store {
                     queue.cancel_pending_messages_from_sender_category(
@@ -883,12 +923,83 @@ mod tests {
     }
 
     #[test]
-    fn no_reminder_when_threshold_is_at_or_above_it() {
-        let store = store("noreminder");
+    fn reminder_comes_ten_points_after_an_ask_at_or_past_the_stored_reminder() {
+        let store = store("lateremind");
         update(&store, "agent001", json!({"threshold_percent": 55}));
         sample(&store, "agent001", 56.0);
-        sample(&store, "agent001", 80.0);
+        sample(&store, "agent001", 65.0);
         assert_eq!(queued(&store, "agent001").len(), 1);
+        sample(&store, "agent001", 66.0);
+        let messages = queued(&store, "agent001");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].contains("your context is at 66% and sm asked you to hand off at 56%"));
+
+        // An ask at or past 90% has no reminder.
+        let capped = super::tests::store("noreminder");
+        update(&capped, "agent001", json!({"threshold_percent": 90}));
+        sample(&capped, "agent001", 91.0);
+        sample(&capped, "agent001", 99.0);
+        assert_eq!(queued(&capped, "agent001").len(), 1);
+    }
+
+    /// #2110: a review-request ask at 26% left an agent with a 50% threshold
+    /// unasked at 51%, and with no reminder.
+    #[test]
+    fn threshold_asks_after_a_review_request_ask_and_reminds_ten_points_later() {
+        let store = store("review-then-threshold");
+        update(&store, "agent001", json!({"threshold_percent": 50}));
+        sample(&store, "agent001", 26.0);
+        let codex = ReviewAsk::Codex { pr_number: 1991 };
+        assert!(store
+            .review_handoff_ask("agent001", codex)
+            .unwrap()
+            .is_some());
+        // The review ask has no reminder of its own, even past the stored 50%.
+        sample(&store, "agent001", 49.0);
+        assert!(queued(&store, "agent001").is_empty());
+
+        sample(&store, "agent001", 51.0);
+        assert_eq!(
+            queued(&store, "agent001"),
+            vec![format!(
+                "[sm context management] Your context is at 51%.{ASK_TAIL}"
+            )]
+        );
+        let asked = record(&store, "agent001").unwrap();
+        assert_eq!(asked.trigger, HandoffTrigger::Context);
+        assert_eq!(asked.asked_percent, Some(51.0));
+
+        sample(&store, "agent001", 60.0);
+        assert_eq!(queued(&store, "agent001").len(), 1);
+        sample(&store, "agent001", 61.0);
+        let messages = queued(&store, "agent001");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].contains("your context is at 61% and sm asked you to hand off at 51%"));
+        sample(&store, "agent001", 75.0);
+        assert_eq!(queued(&store, "agent001").len(), 2);
+    }
+
+    #[test]
+    fn lowering_the_threshold_below_usage_supersedes_a_review_request_ask() {
+        let store = store("review-then-lower");
+        update(&store, "agent001", json!({"threshold_percent": 60}));
+        sample(&store, "agent001", 40.0);
+        let codex = ReviewAsk::Codex { pr_number: 1991 };
+        assert!(store
+            .review_handoff_ask("agent001", codex)
+            .unwrap()
+            .is_some());
+        update(&store, "agent001", json!({"threshold_percent": 38}));
+        assert_eq!(
+            queued(&store, "agent001"),
+            vec![format!(
+                "[sm context management] Your context is at 40%.{ASK_TAIL}"
+            )]
+        );
+        assert_eq!(
+            record(&store, "agent001").unwrap().trigger,
+            HandoffTrigger::Context
+        );
     }
 
     #[test]

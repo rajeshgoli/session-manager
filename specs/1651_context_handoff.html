@@ -160,7 +160,7 @@
 
 <!-- reminder loop on Asked -->
 <path class="ar" d="M170,70 C160,30 224,30 214,68"/>
-<text class="lo" x="192" y="22" text-anchor="middle">one reminder at 50%</text>
+<text class="lo" x="192" y="22" text-anchor="middle">one reminder</text>
 
 <!-- failure back to Asked -->
 <path class="ad" d="M404,128 L404,212 L200,212 L200,136"/>
@@ -209,7 +209,7 @@
 <tr><td>1. Fresh agent, or clear the same agent in place?</td><td><b>Fresh agent. Delete the <code>/clear</code>-and-reinject path.</b> <code>sm handoff FILE</code> keeps working and means <code>--path FILE</code>.</td><td>One id per context window, no terminal typing, and it works for codex-app too.</td></tr>
 <tr><td>2. Starting values of the default policy</td><td><b>On for Claude agents only. Threshold 35%. Both review triggers on, with a 20% floor. Reminder at 50%.</b> You can change each one later from any surface.</td><td>Your stated starting point. Codex agents opt in per agent until we see Claude's results.</td></tr>
 <tr><td>3. Review requests as tipping points</td><td><b>Both <code>sm request-codex-review</code> and <code>sm doc publish --review</code> ask, when context usage is at or above the 20% floor.</b></td><td>An agent that just asked for a review is at a natural stop. A successor picks up the review when it lands. Below 20%, re-reading costs more than it saves.</td></tr>
-<tr><td>4. Agent ignores the ask</td><td><b>One reminder at 50%. After that, sm watch and the app show it as “handoff overdue”. sm never force-retires it.</b></td><td>Forcing a stop mid-work loses more than a long context costs.</td></tr>
+<tr><td>4. Agent ignores the ask</td><td><b>One reminder: at 50%, or ten points after an ask at or past 50%, no later than 90%. After that, sm watch and the app show it as “handoff overdue”. sm never force-retires it.</b></td><td>Forcing a stop mid-work loses more than a long context costs.</td></tr>
 <tr><td>5. What moves to the successor</td><td><b>Every obligation in the vocabulary box, moved in place.</b> The retired agent also keeps a pointer to its successor, and anything that still reaches the old id is forwarded.</td><td>Moving in place means no <code>[sm claim]</code> collisions. The pointer catches anything added to sm later.</td></tr>
 <tr><td>6. Successor's identity</td><td><b>Same provider, model, effort, worktree, machine and parent. Name gets <code>-h2</code>, <code>-h3</code>, … appended.</b></td><td>“Similar agent” means you can't tell the seat changed except by the suffix.</td></tr>
 <tr><td>7. Who can change the policy</td><td><b>Only you, from sm.rajeshgo.li, the sm app, or sm watch. There is no agent command for it.</b></td><td>An agent must not be able to switch off its own handoff, and no agent needs to change it.</td></tr>
@@ -231,7 +231,7 @@
 <tr><td>Ask on Codex review request</td><td>on</td><td><code>sm request-codex-review</code> asks when usage ≥ the review floor.</td><td>No</td></tr>
 <tr><td>Ask on doc review request</td><td>on</td><td><code>sm doc publish --review</code> asks when usage ≥ the review floor. Your review then wakes the successor.</td><td>No</td></tr>
 <tr><td>Review floor</td><td>20%</td><td>See decision 3.</td><td>No</td></tr>
-<tr><td>Reminder at</td><td>50%</td><td>The single reminder, then “overdue”.</td><td>No</td></tr>
+<tr><td>Reminder at</td><td>50%</td><td>The single reminder, then “overdue”. An ask at or past it is reminded ten points later, no later than 90%.</td><td>No</td></tr>
 </tbody>
 </table>
 
@@ -352,7 +352,7 @@
   "ask_on_codex_review": true,
   "ask_on_doc_review": true,
   "review_floor_percent": 20,     // [0,100]
-  "reminder_percent": 50,         // (0,100]; not &gt; effective threshold = no reminder
+  "reminder_percent": 50,         // (0,100]; see C.2 for an ask at or past it
   "updated_at": "..."
 }</code></pre>
 
@@ -362,7 +362,7 @@
 <ul>
 <li><code>enabled</code> = override <code>enabled</code> if not null. Otherwise it is <code>providers[S.provider]</code>, false when absent.</li>
 <li><code>threshold</code> = override <code>threshold_percent</code> if not null. Otherwise the default <code>threshold_percent</code>.</li>
-<li><code>reminder</code> = the default <code>reminder_percent</code> when it is greater than the effective threshold. Otherwise there is no reminder. Example: you override the threshold to 55. The reminder at 50 then does not apply, and there is none.</li>
+<li><code>reminder</code> = the default <code>reminder_percent</code>. Where an ask is at or past it, C.2 moves the reminder ten points after the ask.</li>
 <li><code>source</code> = <code>"override"</code> if any override field is non-null, else <code>"default"</code>.</li>
 <li><code>has_gauge</code> = the provider reports context usage (<code>claude</code>, <code>codex-fork</code>)<sup>[4]</sup>.</li>
 </ul>
@@ -381,15 +381,15 @@
 
 <h3 id="c">C. Tipping points: exact rules</h3>
 
-<p><b>C.1 Context threshold.</b> The rule is evaluated after sm stores each accepted context-usage sample. For Claude that is the <code>/hooks/context-usage</code> path. For codex-fork it is the event-stream reader. Both write <code>context_used_percentage</code> before the context-monitor enrolment check<sup>[5]</sup>, so handoff does not depend on <code>sm context-monitor</code> enrolment. The ask fires when all of these hold: the effective policy is on; the <code>handoff</code> key is absent; the session is not stopped; and the sample is ≥ the effective threshold. A sample that jumps from 30% to 41% asks once, and the message says 41%. Stale samples, which today's code already rejects<sup>[6]</sup>, never ask.</p>
+<p><b>C.1 Context threshold.</b> The rule is evaluated after sm stores each accepted context-usage sample. For Claude that is the <code>/hooks/context-usage</code> path. For codex-fork it is the event-stream reader. Both write <code>context_used_percentage</code> before the context-monitor enrolment check<sup>[5]</sup>, so handoff does not depend on <code>sm context-monitor</code> enrolment. The ask fires when all of these hold: the effective policy is on; the <code>handoff</code> key is absent, or holds state <code>asked</code> with trigger <code>review_request</code> or <code>doc_review</code>; the session is not stopped; and the sample is ≥ the effective threshold. A review-request ask is a suggestion and never stands in for the threshold ask: when the threshold ask fires over one, it replaces the record, with trigger <code>context</code> and the sample as <code>asked_percent</code>. Example: threshold 50; the agent requests a review at 26% and is asked then; at 51% sm asks again, and at 61% it reminds. A sample that jumps from 30% to 41% asks once, and the message says 41%. Stale samples, which today's code already rejects<sup>[6]</sup>, never ask.</p>
 
-<p><b>C.2 Reminder.</b> In state <code>asked</code> with <code>reminded_at</code> null, the first sample ≥ the effective reminder percent queues D.2 and sets <code>reminded_at</code>. There is never a second reminder. From then on the surfaces show <code>overdue</code> (Appendix I.2). A compaction or context reset does not clear <code>asked</code>. The ask stands until the agent hands off or the ask is withdrawn.</p>
+<p><b>C.2 Reminder.</b> In state <code>asked</code> with trigger <code>context</code> or <code>owner</code> and <code>reminded_at</code> null, the first sample ≥ the reminder point queues D.2 and sets <code>reminded_at</code>. The reminder point is the effective <code>reminder</code> when it is above <code>asked_percent</code> (the effective threshold when <code>asked_percent</code> is null). Otherwise it is <code>asked_percent</code> + 10, capped at 90; an ask at 90% or later has no reminder. Examples with the Claude reminder at 50: ask at 35 → reminder at 50; ask at 50 → 60; ask at 85 → 90; ask at 92 → none. A review-request ask has no reminder; the threshold ask (C.1) follows it. There is never a second reminder. From then on the surfaces show <code>overdue</code> (Appendix I.2). A compaction or context reset does not clear <code>asked</code>. The ask stands until the agent hands off or the ask is withdrawn.</p>
 
 <p><b>C.3 Review requests.</b> Two commands trigger this rule with the same logic. <b>Codex review:</b> the rule is evaluated in <code>create_codex_review_request</code><sup>[7]</sup> after the request is registered successfully, for the <code>requester_session_id</code> (not <code>--notify</code>), with trigger <code>review_request</code> and switch <code>ask_on_codex_review</code>. <b>Doc review:</b> it is evaluated in <code>publish_owner_doc</code><sup>[22]</sup> after a publish with <code>"review": true</code> succeeds, for the body's <code>session_id</code>, with trigger <code>doc_review</code> and switch <code>ask_on_doc_review</code>. A publish without <code>--review</code> never asks. The rule fires when the effective policy is on; the command's switch is true; the <code>handoff</code> key is absent; and either <code>has_gauge</code> is false or the latest <code>context_used_percentage</code> is ≥ <code>review_floor_percent</code>. A gauge provider with no reading yet does not ask. When it fires, the response JSON carries <code>"handoff_ask": "&lt;D.1 text&gt;"</code> and state becomes <code>asked</code>. Each CLI (<code>sm request-codex-review</code>, <code>sm doc publish</code>) prints the text on stdout after its existing lines. sm does <i>not</i> also queue it as a message, so the agent never sees it twice. A later review request of either kind, in state <code>asked</code>, does nothing new.</p>
 
 <p><b>C.4 Hand off now.</b> You call the policy API with <code>"ask_now": true</code> (Appendix I.1). If the <code>handoff</code> key is absent, sm queues D.1 with trigger <code>owner</code> regardless of policy or gauge. Otherwise it returns 409 with the current state.</p>
 
-<p><b>C.5 Withdrawal.</b> After any change to an override or to the default policy, sm re-checks every session in state <code>asked</code> whose trigger is <code>context</code>. If the policy is now off, or its current usage is below the new threshold, sm removes the <code>handoff</code> key and queues D.3. It cancels any undelivered ask or reminder first, using the same category-cancel that context alerts use<sup>[8]</sup>. Asks with trigger <code>review_request</code>, <code>doc_review</code> or <code>owner</code> are withdrawn only when the policy is turned off. Setting the policy to off always withdraws an <code>asked</code> state, whatever the trigger. The states <code>accepted</code> and later are never withdrawn: the agent has already committed.</p>
+<p><b>C.5 Withdrawal.</b> After any change to an override or to the default policy, sm re-checks every session in state <code>asked</code> whose trigger is <code>context</code>. If the policy is now off, or its current usage is below the new threshold, sm removes the <code>handoff</code> key and queues D.3. It cancels any undelivered ask or reminder first, using the same category-cancel that context alerts use<sup>[8]</sup>. Asks with trigger <code>review_request</code>, <code>doc_review</code> or <code>owner</code> are withdrawn only when the policy is turned off. Setting the policy to off always withdraws an <code>asked</code> state, whatever the trigger. A change that leaves the policy on, for a session asked with trigger <code>review_request</code> or <code>doc_review</code> whose latest reading is ≥ the new threshold, fires the C.1 ask. The states <code>accepted</code> and later are never withdrawn: the agent has already committed.</p>
 
 <p><b>Delivery.</b> Asks, reminders and withdrawals are queued with delivery mode <code>important</code> and message category <code>context_handoff</code>. Sender is the session itself, as with context alerts, so a completed handoff can cancel leftovers by category.</p>
 
@@ -557,7 +557,7 @@ Read the handoff note first, then continue the work.</code></pre>
 <tr><td>B resolution table, every row</td><td>unit, <code>handoff::policy</code></td></tr>
 <tr><td><code>/handoff-defaults</code>: starting values when absent, partial merge, range errors, a change re-runs C.1 and C.5</td><td>http test</td></tr>
 <tr><td>C.1 asks once at threshold; jump reports actual; stale ignored; not enrolled in context-monitor still asks</td><td>unit, sessions: synthetic samples</td></tr>
-<tr><td>C.2 single reminder; none when threshold ≥ reminder</td><td>unit</td></tr>
+<tr><td>C.1 threshold ask over a review-request ask, from a sample and from a lowered threshold; C.2 single reminder at the stored reminder, ten points after a later ask, none at 90% or later, none for a review-request ask</td><td>unit: <code>handoff/policy.rs</code> <code>reminder_ten_points_after_*</code>; <code>handoff/store.rs</code> <code>threshold_asks_after_a_review_request_ask_*</code>, <code>lowering_the_threshold_below_usage_supersedes_*</code>, <code>reminder_comes_ten_points_after_*</code></td></tr>
 <tr><td>C.3 review asks, for both commands: above floor, below floor, switch off, codex-app no gauge, gauge with no reading, second request no-op, publish without <code>--review</code> no ask, each CLI prints <code>handoff_ask</code></td><td>http tests on <code>/codex-review-requests</code> and <code>/docs</code> + CLI output tests</td></tr>
 <tr><td>C.4 ask_now in each state</td><td>http test</td></tr>
 <tr><td>C.5 withdrawal rules per trigger; undelivered ask cancelled</td><td>unit</td></tr>

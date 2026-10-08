@@ -32,6 +32,10 @@ const DEFAULT_REMINDER_PERCENT: f64 = 50.0;
 const CODEX_THRESHOLD_PERCENT: f64 = 80.0;
 const CODEX_REMINDER_PERCENT: f64 = 90.0;
 const CODEX_REVIEW_FLOOR_PERCENT: f64 = 50.0;
+/// When the stored reminder is not above the ask, the reminder comes this many
+/// points after the ask, never later than the cap (spec Appendix C.2).
+const REMINDER_STEP_PERCENT: f64 = 10.0;
+const REMINDER_CAP_PERCENT: f64 = 90.0;
 const DEFAULT_FIELDS: [&str; 7] = [
     "providers",
     "threshold_percent",
@@ -416,8 +420,8 @@ impl PolicyUpdate {
 pub struct EffectivePolicy {
     pub enabled: bool,
     pub threshold_percent: f64,
-    /// `None` when the default reminder is not above the effective threshold.
-    pub reminder_percent: Option<f64>,
+    /// The stored reminder percent for the provider; see [`Self::reminder_at`].
+    pub reminder_percent: f64,
     pub source: &'static str,
     pub has_gauge: bool,
 }
@@ -447,8 +451,7 @@ pub fn effective_policy_with_ticket(
         .and_then(|value| value.threshold_percent)
         .or_else(|| ticket.and_then(|value| value.threshold_percent))
         .unwrap_or(thresholds.threshold_percent);
-    let reminder_percent =
-        (thresholds.reminder_percent > threshold_percent).then_some(thresholds.reminder_percent);
+    let reminder_percent = thresholds.reminder_percent;
     let source = if override_.is_some_and(HandoffOverride::is_active) {
         "override"
     } else if ticket.is_some_and(HandoffOverride::is_active) {
@@ -462,6 +465,21 @@ pub fn effective_policy_with_ticket(
         reminder_percent,
         source,
         has_gauge,
+    }
+}
+
+impl EffectivePolicy {
+    /// The usage at which an agent asked at `asked_percent` is reminded: the
+    /// stored reminder when it is above the ask, otherwise ten points after
+    /// the ask capped at 90. `None` only for an ask at or past the cap.
+    pub fn reminder_at(&self, asked_percent: f64) -> Option<f64> {
+        if self.reminder_percent > asked_percent {
+            Some(self.reminder_percent)
+        } else if asked_percent < REMINDER_CAP_PERCENT {
+            Some((asked_percent + REMINDER_STEP_PERCENT).min(REMINDER_CAP_PERCENT))
+        } else {
+            None
+        }
     }
 }
 
@@ -497,6 +515,14 @@ pub enum HandoffTrigger {
     DocReview,
     Owner,
     Voluntary,
+}
+
+impl HandoffTrigger {
+    /// Asks made when the agent requests a review: suggestions that the
+    /// threshold ask supersedes, with no reminder of their own.
+    pub fn is_review(self) -> bool {
+        matches!(self, Self::ReviewRequest | Self::DocReview)
+    }
 }
 
 /// The `handoff` key of a session record (Appendix A). Absent means the
@@ -781,14 +807,14 @@ mod tests {
         let claude = effective_policy(&defaults, "claude", None, true);
         assert!(claude.enabled);
         assert_eq!(claude.threshold_percent, 35.0);
-        assert_eq!(claude.reminder_percent, Some(50.0));
+        assert_eq!(claude.reminder_at(35.0), Some(50.0));
         assert_eq!(claude.source, "default");
 
         let o = over(None, Some(45.0));
         let claude45 = effective_policy(&defaults, "claude", Some(&o), true);
         assert!(claude45.enabled);
         assert_eq!(claude45.threshold_percent, 45.0);
-        assert_eq!(claude45.reminder_percent, Some(50.0));
+        assert_eq!(claude45.reminder_at(45.0), Some(50.0));
         assert_eq!(claude45.source, "override");
 
         let o = over(Some(false), None);
@@ -800,7 +826,7 @@ mod tests {
         let fork_on = effective_policy(&defaults, "codex-fork", Some(&o), true);
         assert!(fork_on.enabled);
         assert_eq!(fork_on.threshold_percent, 80.0);
-        assert_eq!(fork_on.reminder_percent, Some(90.0));
+        assert_eq!(fork_on.reminder_at(80.0), Some(90.0));
 
         let app_on = effective_policy(&defaults, "codex-app", Some(&o), false);
         assert!(app_on.enabled);
@@ -810,18 +836,19 @@ mod tests {
     }
 
     #[test]
-    fn reminder_absent_when_threshold_at_or_above_it() {
+    fn reminder_ten_points_after_an_ask_at_or_past_the_stored_reminder() {
         let defaults = HandoffDefaults::default();
-        let o = over(None, Some(55.0));
-        assert_eq!(
-            effective_policy(&defaults, "claude", Some(&o), true).reminder_percent,
-            None
-        );
-        let o = over(None, Some(50.0));
-        assert_eq!(
-            effective_policy(&defaults, "claude", Some(&o), true).reminder_percent,
-            None
-        );
+        let claude = effective_policy(&defaults, "claude", None, true);
+        assert_eq!(claude.reminder_at(26.0), Some(50.0));
+        assert_eq!(claude.reminder_at(50.0), Some(60.0));
+        assert_eq!(claude.reminder_at(55.0), Some(65.0));
+        assert_eq!(claude.reminder_at(85.0), Some(90.0));
+        assert_eq!(claude.reminder_at(90.0), None);
+        assert_eq!(claude.reminder_at(97.0), None);
+        let o = over(Some(true), None);
+        let fork = effective_policy(&defaults, "codex-fork", Some(&o), true);
+        assert_eq!(fork.reminder_at(80.0), Some(90.0));
+        assert_eq!(fork.reminder_at(92.0), None);
     }
 
     #[test]
