@@ -197,6 +197,16 @@ impl OpencodeLaunchDriver for HostDriver {
                 .context("opencode conversation missing")?,
         )
     }
+    fn replace_attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()> {
+        self.files(record)?.replace_attach(
+            &runtime.for_socket_name(record.tmux_socket_name.as_deref()),
+            &Self::spec(record)?,
+            record
+                .provider_resume_id
+                .as_deref()
+                .context("opencode conversation missing")?,
+        )
+    }
     fn present(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<bool> {
         let runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
         match runtime.probe_session_for_restore(&record.tmux_session) {

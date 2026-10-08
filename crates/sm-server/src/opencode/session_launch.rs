@@ -18,6 +18,9 @@ pub trait OpencodeLaunchDriver: Send + Sync {
     ) -> Result<()>;
     fn client(&self, binding: &RuntimeBinding) -> Result<Client>;
     fn attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()>;
+    fn replace_attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()> {
+        self.attach(record, runtime)
+    }
     fn present(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<bool>;
     fn stop(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()>;
 }

@@ -203,6 +203,12 @@ pub(super) fn start(state: Arc<AppState>) {
                     if let Err(error) = state.session_store.recover_opencode_teardowns() {
                         eprintln!("opencode teardown recovery: {error:#}");
                     }
+                    if let Err(error) = state
+                        .session_store
+                        .recover_opencode_clears(&TmuxRuntime::from_app_config(&state.config))
+                    {
+                        eprintln!("opencode clear recovery: {error:#}");
+                    }
                     last_teardown_retry = Instant::now();
                 }
                 match state

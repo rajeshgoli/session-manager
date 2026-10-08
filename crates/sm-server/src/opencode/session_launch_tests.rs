@@ -3,6 +3,8 @@ use crate::opencode::tests::{ScratchDir, Stub};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 type Hook = Box<dyn FnOnce(&SessionRecord) + Send>;
+#[path = "clear_tests.rs"]
+mod clear_tests;
 #[path = "outbox_tests.rs"]
 mod outbox_tests;
 struct Driver {
@@ -112,6 +114,21 @@ impl OpencodeLaunchDriver for Driver {
         {
             assert!(saved.brief_message_id.is_some() && saved.brief_part_id.is_some());
         }
+        if let Some(hook) = self.attach_hook.lock().unwrap().take() {
+            hook(record);
+        }
+        if self.fail_attach.load(Ordering::Acquire) {
+            anyhow::bail!("injected attachment failure")
+        }
+        Ok(())
+    }
+    fn replace_attach(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
+        self.attachments.fetch_add(1, Ordering::AcqRel);
+        let raw: Value = serde_json::from_slice(&fs::read(&self.path)?)?;
+        assert_eq!(
+            raw_session_object(&raw, &record.id).unwrap()["provider_resume_id"],
+            json!(record.provider_resume_id)
+        );
         if let Some(hook) = self.attach_hook.lock().unwrap().take() {
             hook(record);
         }

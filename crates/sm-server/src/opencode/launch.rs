@@ -393,6 +393,21 @@ impl LaunchFiles {
         runtime.create_opencode_attach_window(spec, &self.attach_script)
     }
 
+    pub fn replace_attach(
+        &self,
+        runtime: &TmuxRuntime,
+        spec: &TmuxSessionSpec,
+        conversation: &str,
+    ) -> Result<()> {
+        super::validate_id(conversation, "ses")?;
+        host_write(
+            &self.attach_script,
+            attach_script(&self.config, &self.binding, conversation).as_bytes(),
+            0o700,
+        )?;
+        runtime.replace_opencode_attach_window(spec, &self.attach_script)
+    }
+
     /// Binding must already be committed in the launch record. Every retry GETs
     /// it before POSTing, so accepted briefs are not appended a second time.
     pub fn deliver_brief(
