@@ -931,7 +931,7 @@ fn check_opencode_capacity(
         anyhow::bail!("local handoff predecessor does not hold a seat")
     }
     if occupied.len() >= config.max_agents {
-        anyhow::bail!(
+        return Err(crate::opencode::launch::AdmissionError(format!(
             "no local seat free ({}/{} used by {})",
             occupied.len(),
             config.max_agents,
@@ -940,7 +940,8 @@ fn check_opencode_capacity(
                 .map(|record| record.friendly_name.as_deref().unwrap_or(&record.name))
                 .collect::<Vec<_>>()
                 .join(", ")
-        )
+        ))
+        .into());
     }
     Ok(())
 }
@@ -956,7 +957,7 @@ fn reserve_opencode_port(config: &OpencodeConfig, occupied: &[SessionRecord]) ->
             return Ok(port);
         }
     }
-    anyhow::bail!("no local port free")
+    Err(crate::opencode::launch::AdmissionError("no local port free".into()).into())
 }
 fn opencode_launch_record(
     record: &SessionRecord,

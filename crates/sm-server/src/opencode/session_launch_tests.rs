@@ -310,6 +310,49 @@ impl Fixture {
 }
 
 #[test]
+fn opencode_creation_capacity_conflicts_are_typed_before_any_extra_launch() {
+    let f = Fixture::new();
+    f.create("local1", None).unwrap();
+    let error = f.create("local2", Some("must not run")).unwrap_err();
+    let refusal = error
+        .downcast_ref::<crate::opencode::launch::AdmissionError>()
+        .unwrap();
+    assert!(refusal
+        .to_string()
+        .contains("no local seat free (1/1 used by"));
+    assert_eq!(f.store.list_sessions(true).unwrap().len(), 1);
+    assert_eq!(f.driver.starts.load(Ordering::Acquire), 1);
+    assert_eq!(f.driver.conversations(), 1);
+    assert_eq!(
+        session_runtime_launch_records(&f.store.load_raw_json_value().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn opencode_creation_port_conflicts_are_typed_before_identity_or_brief_persistence() {
+    let f = Fixture::new();
+    let _listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, f.driver.config.port_range[0]))
+            .unwrap();
+    let error = f.create("local1", Some("must not run")).unwrap_err();
+    let refusal = error
+        .downcast_ref::<crate::opencode::launch::AdmissionError>()
+        .unwrap();
+    assert_eq!(refusal.to_string(), "no local port free");
+    assert!(f.store.list_sessions(true).unwrap().is_empty());
+    assert_eq!(f.driver.starts.load(Ordering::Acquire), 0);
+    assert_eq!(f.driver.conversations(), 0);
+    assert!(
+        session_runtime_launch_records(&f.store.load_raw_json_value().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn opencode_create_persists_authority_and_brief_before_http() {
     let f = Fixture::new();
     let subscribed = Arc::new(AtomicBool::new(false));
