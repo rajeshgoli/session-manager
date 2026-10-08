@@ -606,6 +606,21 @@ impl TmuxRuntime {
         self.run_tmux(["select-window", "-t", &target])
     }
 
+    /// Replace only the human viewer; the provider server remains alive.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn pause_opencode_attach_window(&self, spec: &TmuxSessionSpec) -> Result<()> {
+        let target = format!("{}:agent", spec.tmux_session);
+        self.run_tmux([
+            "respawn-window",
+            "-k",
+            "-t",
+            &target,
+            "-c",
+            &spec.working_dir,
+            "exec /bin/sleep 86400",
+        ])
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn opencode_serve_alive(&self, session: &str) -> Result<bool> {
         Ok(self.opencode_window_alive(session, "serve")? == Some(true))
@@ -5305,6 +5320,13 @@ if [ "$1" = 'list-panes' ]; then cat '{}'; else exit 0; fi
             .create_opencode_attach_window(&spec, &directory.join("attach.sh"))
             .unwrap();
         assert!(!fs::read_to_string(&log).unwrap().contains("new-window"));
+        runtime.pause_opencode_attach_window(&spec).unwrap();
+        assert!(fs::read_to_string(&log)
+            .unwrap()
+            .contains("respawn-window -k -t sm-view:agent -c"));
+        assert!(fs::read_to_string(&log)
+            .unwrap()
+            .contains("exec /bin/sleep 86400"));
         runtime
             .replace_opencode_attach_window(&spec, &directory.join("attach.sh"))
             .unwrap();

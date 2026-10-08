@@ -118,6 +118,9 @@ impl Stub {
     pub(crate) fn set_idle(&self) {
         self.state.lock().unwrap().idle = true;
     }
+    pub(crate) fn set_busy(&self) {
+        self.state.lock().unwrap().idle = false;
+    }
 
     pub(crate) fn conversation_creations(&self) -> usize {
         self.state

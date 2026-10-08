@@ -57,6 +57,7 @@ impl SessionStore {
             if raw
                 .get("opencode_pending_clear")
                 .is_some_and(|v| !v.is_null())
+                || raw.get("opencode_clear_view_paused") == Some(&Value::Bool(true))
             {
                 return Ok(CoreClearOutcome::Conflict(
                     "Previous Opencode clear is still completing; retry shortly".into(),
@@ -75,6 +76,20 @@ impl SessionStore {
             .provider_resume_id
             .as_deref()
             .context("missing conversation")?;
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
+                .context("session disappeared")?
+                .insert("opencode_clear_view_paused".into(), Value::Bool(true));
+            self.write_raw_json_value(&state)?;
+        }
+        // Human tmux input bypasses the sm input lock. Stop that viewer before
+        // observing idle; a crash before the switch restores the old viewer.
+        if let Err(error) = driver.pause_attach(&record, runtime) {
+            self.restore_opencode_clear_view_while_locked(id, runtime)?;
+            return Err(error);
+        }
         let idle = || -> Result<bool> {
             Ok(client
                 .status()?
@@ -99,6 +114,7 @@ impl SessionStore {
             Ok(())
         })();
         if stopped.is_err() {
+            self.restore_opencode_clear_view_while_locked(id, runtime)?;
             return Ok(CoreClearOutcome::Conflict(
                 "opencode conversation did not stop; clear not applied".into(),
             ));
@@ -107,12 +123,19 @@ impl SessionStore {
             .resolve_opencode_pending_bindings_while_locked(&record, runtime)
             .is_err()
         {
+            self.restore_opencode_clear_view_while_locked(id, runtime)?;
             return Ok(CoreClearOutcome::Conflict(
                 "opencode server unreachable; pending messages unresolved".into(),
             ));
         }
         let conversation =
-            client.create_conversation(record.friendly_name.as_deref().unwrap_or(id))?;
+            match client.create_conversation(record.friendly_name.as_deref().unwrap_or(id)) {
+                Ok(id) => id,
+                Err(error) => {
+                    self.restore_opencode_clear_view_while_locked(id, runtime)?;
+                    return Err(error);
+                }
+            };
         let pending = PendingClear {
             token: generate_session_id(),
             old_conversation: old.into(),
@@ -226,6 +249,27 @@ impl SessionStore {
             anyhow::bail!("Opencode clear changed before completion")
         }
         raw.remove("opencode_pending_clear");
+        raw.remove("opencode_clear_view_paused");
+        self.write_raw_json_value(&state)
+    }
+
+    fn restore_opencode_clear_view_while_locked(
+        &self,
+        id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let record = self
+            .get_session(id)?
+            .context("Opencode session disappeared")?;
+        if record.is_stopped() {
+            anyhow::bail!("Opencode stopped while its clear view was paused")
+        }
+        self.opencode_driver()?.replace_attach(&record, runtime)?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
+            .context("session disappeared")?;
+        raw.remove("opencode_clear_view_paused");
         self.write_raw_json_value(&state)
     }
 
@@ -240,6 +284,7 @@ impl SessionStore {
                     raw_session_object(&state, &s.id).is_some_and(|raw| {
                         raw.get("opencode_pending_clear")
                             .is_some_and(|v| !v.is_null())
+                            || raw.get("opencode_clear_view_paused") == Some(&Value::Bool(true))
                     })
                 })
                 .map(|s| s.id)
@@ -253,7 +298,25 @@ impl SessionStore {
             let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
             let _input = session_runtime.lock_session_input(&record.tmux_session)?;
             let _submission = self.lock_opencode_submission(&id)?;
-            if let Err(error) = self.finish_opencode_clear_while_locked(&id, runtime) {
+            let state = self.load_raw_json_value()?;
+            let Some(raw) = raw_session_object(&state, &id) else {
+                continue;
+            };
+            if raw
+                .get("opencode_pending_retire")
+                .is_some_and(|v| !v.is_null())
+            {
+                continue;
+            }
+            let result = if raw
+                .get("opencode_pending_clear")
+                .is_some_and(|v| !v.is_null())
+            {
+                self.finish_opencode_clear_while_locked(&id, runtime)
+            } else {
+                self.restore_opencode_clear_view_while_locked(&id, runtime)
+            };
+            if let Err(error) = result {
                 eprintln!("opencode clear recovery {id} deferred: {error:#}");
                 continue;
             }

@@ -190,6 +190,12 @@ pub(super) fn start(state: Arc<AppState>) {
         .name("sm-opencode-readers".into())
         .spawn(move || {
             if let Some(state) = weak.upgrade() {
+                if let Err(error) = state
+                    .session_store
+                    .recover_opencode_retirements(&TmuxRuntime::from_app_config(&state.config))
+                {
+                    eprintln!("opencode retirement recovery deferred: {error:#}");
+                }
                 if let Err(error) = state.session_store.recover_opencode_runtime_launches() {
                     eprintln!("opencode launch recovery deferred: {error:#}");
                 }
@@ -200,6 +206,12 @@ pub(super) fn start(state: Arc<AppState>) {
                     break;
                 }
                 if last_teardown_retry.elapsed() >= Duration::from_secs(5) {
+                    if let Err(error) = state
+                        .session_store
+                        .recover_opencode_retirements(&TmuxRuntime::from_app_config(&state.config))
+                    {
+                        eprintln!("opencode retirement recovery: {error:#}");
+                    }
                     if let Err(error) = state.session_store.recover_opencode_teardowns() {
                         eprintln!("opencode teardown recovery: {error:#}");
                     }

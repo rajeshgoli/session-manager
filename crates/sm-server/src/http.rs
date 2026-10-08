@@ -11298,18 +11298,23 @@ async fn retire_session_after_auth(
     };
     let outcome = if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .retire_core_session_with_runtime_authorized_if_finished_idle(
-                &session_id,
-                authority,
-                session_credential.as_deref(),
-                &runtime,
-                payload.if_finished_idle,
-                &|session| {
-                    live_activity_state(&state, session).is_some_and(|state| state != "idle")
-                },
-            )?
+        let work = state.clone();
+        let id = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            work.session_store
+                .retire_core_session_with_runtime_authorized_if_finished_idle(
+                    &id,
+                    authority,
+                    session_credential.as_deref(),
+                    &runtime,
+                    payload.if_finished_idle,
+                    &|session| {
+                        live_activity_state(&work, session).is_some_and(|state| state != "idle")
+                    },
+                )
+        })
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??
     } else {
         state
             .session_store

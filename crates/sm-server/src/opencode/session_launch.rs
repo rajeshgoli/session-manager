@@ -21,6 +21,7 @@ pub trait OpencodeLaunchDriver: Send + Sync {
     fn replace_attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()> {
         self.attach(record, runtime)
     }
+    fn pause_attach(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()>;
     fn present(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<bool>;
     fn stop(&self, record: &SessionRecord, runtime: &TmuxRuntime) -> Result<()>;
 }
@@ -245,6 +246,12 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let state = self.load_parsed_state()?;
             ensure_session_not_reparent_fenced(&state.raw, id)?;
+            if raw_session_object(&state.raw, id).is_some_and(|r| {
+                r.get("opencode_pending_retire")
+                    .is_some_and(|v| !v.is_null())
+            }) {
+                anyhow::bail!("opencode retirement is awaiting verified teardown; restore refused")
+            }
             if session_runtime_launch_records(&state.raw)?
                 .iter()
                 .any(|launch| launch.session_id == id && opencode_launch_pending(&launch.status))
@@ -612,6 +619,12 @@ impl SessionStore {
         if self.opencode_launch.is_none() {
             return Ok(());
         }
+        if raw_session_object(&self.load_parsed_state()?.raw, id).is_some_and(|r| {
+            r.get("opencode_pending_retire")
+                .is_some_and(|v| !v.is_null())
+        }) {
+            return Ok(());
+        }
         let launch = session_runtime_launch_records(&self.load_parsed_state()?.raw)?
             .into_iter()
             .find(|launch| {
@@ -697,6 +710,12 @@ impl SessionStore {
             return Ok(());
         };
         if session
+            .get("opencode_pending_retire")
+            .is_some_and(|v| !v.is_null())
+        {
+            return Ok(());
+        }
+        if session
             .get("session_credential_sha256")
             .and_then(Value::as_str)
             != record.session_credential_sha256.as_deref()
@@ -752,6 +771,12 @@ impl SessionStore {
             )?;
             return self.write_raw_json_value(&state);
         };
+        if raw_session_object(&self.load_parsed_state()?.raw, &record.id).is_some_and(|r| {
+            r.get("opencode_pending_retire")
+                .is_some_and(|v| !v.is_null())
+        }) {
+            return Ok(());
+        }
         if launch.status == "teardown_pending" {
             let stopped = driver.stop(&record, &runtime);
             self.record_opencode_teardown_result(
@@ -882,7 +907,12 @@ fn occupied_opencode_sessions(state: &Value, exclude: Option<&str>) -> Result<Ve
         .filter(|record| {
             record.provider == "opencode"
                 && Some(record.id.as_str()) != exclude
-                && (!record.is_stopped() || pending.contains(&record.id))
+                && (!record.is_stopped()
+                    || pending.contains(&record.id)
+                    || raw_session_object(state, &record.id).is_some_and(|r| {
+                        r.get("opencode_pending_retire")
+                            .is_some_and(|v| !v.is_null())
+                    }))
         })
         .collect())
 }
