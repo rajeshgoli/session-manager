@@ -244,10 +244,7 @@ impl SessionStore {
             ensure_session_not_reparent_fenced(&state.raw, id)?;
             if session_runtime_launch_records(&state.raw)?
                 .iter()
-                .any(|launch| {
-                    launch.session_id == id
-                        && matches!(launch.status.as_str(), "prepared" | "launching")
-                })
+                .any(|launch| launch.session_id == id && opencode_launch_pending(&launch.status))
             {
                 anyhow::bail!(
                     "opencode launch is still pending; recover its saved brief before restore"
@@ -519,15 +516,45 @@ impl SessionStore {
             Err(error) if error.chain().any(|cause| matches!(cause.downcast_ref::<InitialBriefDeliveryError>(), Some(InitialBriefDeliveryError::ProviderAcceptanceTimedOut { .. }))) => Err(error.context("opencode brief acceptance remains unknown; saved identities retained for recovery")),
             Err(error) => {
                 let stopped = driver.stop(record, runtime);
-                let _guard = self.write_guard()?;
-                let mut state = self.load_raw_json_value()?;
-                let reason = format!("{error:#}; state {}{}", record.opencode.as_ref().map(|binding| binding.state_dir.as_str()).unwrap_or("unavailable"), stopped.as_ref().err().map(|error| format!("; teardown not confirmed: {error:#}")).unwrap_or_default());
-                let remove = launch.operation_kind == "create" && stopped.is_ok() && remove_failed_provisional_runtime_session(&state, &record.id);
-                mark_runtime_launch_failed(&mut state, &launch.id, &record.id, remove, &reason)?;
-                self.write_raw_json_value(&state)?;
+                let reason = format!("{error:#}; state {}", record.opencode.as_ref().map(|binding| binding.state_dir.as_str()).unwrap_or("unavailable"));
+                self.record_opencode_teardown_result(launch, record, &stopped, &reason)?;
                 Err(error.context(reason))
             }
         }
+    }
+    fn record_opencode_teardown_result(
+        &self,
+        launch: &SessionRuntimeLaunchRecord,
+        record: &SessionRecord,
+        stopped: &Result<()>,
+        reason: &str,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if let Err(error) = stopped {
+            let mut launches = session_runtime_launch_records(&state)?;
+            let current = launches
+                .iter_mut()
+                .find(|current| current.id == launch.id)
+                .context("launch disappeared during teardown")?;
+            current.status = "teardown_pending".into();
+            current.updated_at = now_rfc3339();
+            current.failure_reason = Some(reason.into());
+            store_session_runtime_launch_records(&mut state, &launches)?;
+            if let Some(session) =
+                session_object_mut(ensure_sessions_array_mut(&mut state)?, &record.id)
+            {
+                session.insert(
+                    "error_message".into(),
+                    json!(format!("{reason}; teardown not confirmed: {error:#}")),
+                );
+            }
+        } else {
+            let remove = launch.operation_kind == "create"
+                && remove_failed_provisional_runtime_session(&state, &record.id);
+            mark_runtime_launch_failed(&mut state, &launch.id, &record.id, remove, reason)?;
+        }
+        self.write_raw_json_value(&state)
     }
     pub fn recover_opencode_launch_for_session(&self, id: &str) -> Result<()> {
         if self.opencode_launch.is_none() {
@@ -538,7 +565,7 @@ impl SessionStore {
             .find(|launch| {
                 launch.session_id == id
                     && launch.provider == "opencode"
-                    && matches!(launch.status.as_str(), "prepared" | "launching")
+                    && opencode_launch_pending(&launch.status)
             });
         if let Some(launch) = launch {
             self.recover_opencode_runtime_launch(&launch)?;
@@ -552,8 +579,7 @@ impl SessionStore {
         let pending = session_runtime_launch_records(&self.load_parsed_state()?.raw)?;
         let mut first_error = None;
         for launch in pending.iter().filter(|launch| {
-            launch.provider == "opencode"
-                && matches!(launch.status.as_str(), "prepared" | "launching")
+            launch.provider == "opencode" && opencode_launch_pending(&launch.status)
         }) {
             if let Err(error) = self.recover_opencode_runtime_launch(launch) {
                 eprintln!("opencode launch {}: {error:#}", launch.id);
@@ -564,6 +590,21 @@ impl SessionStore {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn recover_opencode_teardowns(&self) -> Result<()> {
+        if self.opencode_launch.is_none() {
+            return Ok(());
+        }
+        for launch in session_runtime_launch_records(&self.load_parsed_state()?.raw)?
+            .iter()
+            .filter(|launch| launch.provider == "opencode" && launch.status == "teardown_pending")
+        {
+            if let Err(error) = self.recover_opencode_runtime_launch(launch) {
+                eprintln!("opencode teardown {} deferred: {error:#}", launch.id);
+            }
+        }
+        Ok(())
     }
 
     pub fn reconcile_opencode_runtime(&self, id: &str) -> Result<()> {
@@ -580,10 +621,7 @@ impl SessionStore {
         // server. The reader must not turn that reservation into a false exit.
         if session_runtime_launch_records(&self.load_parsed_state()?.raw)?
             .iter()
-            .any(|launch| {
-                launch.session_id == id
-                    && matches!(launch.status.as_str(), "prepared" | "launching")
-            })
+            .any(|launch| launch.session_id == id && opencode_launch_pending(&launch.status))
         {
             return Ok(());
         }
@@ -599,10 +637,7 @@ impl SessionStore {
         ensure_session_not_reparent_fenced(&state, id)?;
         if session_runtime_launch_records(&state)?
             .iter()
-            .any(|launch| {
-                launch.session_id == id
-                    && matches!(launch.status.as_str(), "prepared" | "launching")
-            })
+            .any(|launch| launch.session_id == id && opencode_launch_pending(&launch.status))
         {
             return Ok(());
         }
@@ -643,10 +678,7 @@ impl SessionStore {
         let _launch_guard = self.lock_clear_operation(&launch.session_id)?;
         let Some(launch) = session_runtime_launch_records(&self.load_parsed_state()?.raw)?
             .into_iter()
-            .find(|launch| {
-                launch.id == pending.id
-                    && matches!(launch.status.as_str(), "prepared" | "launching")
-            })
+            .find(|launch| launch.id == pending.id && opencode_launch_pending(&launch.status))
         else {
             return Ok(());
         };
@@ -668,6 +700,19 @@ impl SessionStore {
             )?;
             return self.write_raw_json_value(&state);
         };
+        if launch.status == "teardown_pending" {
+            let stopped = driver.stop(&record, &runtime);
+            self.record_opencode_teardown_result(
+                &launch,
+                &record,
+                &stopped,
+                launch
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("opencode launch failed"),
+            )?;
+            return stopped;
+        }
         let preflight = (|| {
             if launch.provider_resume_id.is_none()
                 || record.provider_resume_id != launch.provider_resume_id
@@ -715,6 +760,10 @@ impl SessionStore {
     }
 }
 
+fn opencode_launch_pending(status: &str) -> bool {
+    matches!(status, "prepared" | "launching" | "teardown_pending")
+}
+
 fn opencode_restore_authority(state: &Value, id: &str) -> Result<Value> {
     let session = raw_session_object(state, id).context("restore session disappeared")?;
     Ok(Value::Object(
@@ -749,10 +798,7 @@ fn opencode_restore_authority(state: &Value, id: &str) -> Result<Value> {
 fn occupied_opencode_sessions(state: &Value, exclude: Option<&str>) -> Result<Vec<SessionRecord>> {
     let pending: BTreeSet<_> = session_runtime_launch_records(state)?
         .into_iter()
-        .filter(|launch| {
-            launch.provider == "opencode"
-                && matches!(launch.status.as_str(), "prepared" | "launching")
-        })
+        .filter(|launch| launch.provider == "opencode" && opencode_launch_pending(&launch.status))
         .map(|launch| launch.session_id)
         .collect();
     Ok(snapshot_from_raw_value(state)?

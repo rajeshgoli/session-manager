@@ -227,6 +227,30 @@ pub fn ensure_no_running_jobs(state_dir: &Path, agent: &str) -> Result<()> {
     Ok(())
 }
 
+/// Host-only cleanup after owner admission stops. Preserve running jobs until
+/// their process teardown is proved; cancel only this agent's waiting work.
+pub(crate) fn cancel_pending_jobs_for_restaging(state_dir: &Path, agent: &str) -> Result<()> {
+    valid_id(agent)?;
+    let _admission = admission_guard();
+    let connection = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&connection)?;
+    let transaction = connection.unchecked_transaction()?;
+    for job in list_queue_job_runtime_records_conn(&transaction)?
+        .into_iter()
+        .filter(|job| job.local_agent_id.as_deref() == Some(agent) && job.state == "pending")
+    {
+        transaction.execute(
+            "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1 AND state = 'pending'",
+            params![job.id, r#"{"kind":"cancel","note":"Local agent launch settings are being replaced."}"#],
+        )?;
+        // The normal completion path retains a durable notification for the
+        // queue's next delivery pass, without starting any replacement work.
+        finish_queue_job_conn(&transaction, &job, "cancelled", None, None)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Host-only retirement after admission stops and all pending/running work ends.
 pub fn retire_registration(state_dir: &Path, agent: &str) -> Result<()> {
     valid_id(agent)?;

@@ -217,6 +217,11 @@ IDs are committed before delivery. The event reader subscribes to the current
 runtime binding before the attach view or brief starts. Restore preserves the
 conversation, checkpoint and state folder and never creates another conversation
 or replays the brief. Uncertain brief acceptance keeps the original IDs pending.
+Failed launches with unconfirmed teardown retain a `teardown_pending` record
+that reserves their seat and port until cleanup succeeds. Startup recovery and
+the reader supervisor retry teardown without creating a conversation or sending
+the brief. Restaging cancels that agent's waiting queue jobs and retains their
+completion notifications; running jobs still block replacement until stopped.
 
 Boot and reader recovery preserve transport uncertainty. Only a confirmed
 missing session or exhausted serve window marks the runtime stopped; a pending

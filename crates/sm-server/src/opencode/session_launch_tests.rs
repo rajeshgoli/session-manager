@@ -393,13 +393,56 @@ fn opencode_failed_creation_removes_only_confirmed_teardown() {
         f.driver.fail_stop.store(uncertain, Ordering::Release);
         assert!(f.create("local1", None).is_err());
         assert_eq!(f.store.get_session("local1").unwrap().is_some(), uncertain);
-        assert_eq!(f.launches()[0].status, "failed");
+        assert_eq!(
+            f.launches()[0].status,
+            if uncertain {
+                "teardown_pending"
+            } else {
+                "failed"
+            }
+        );
         assert!(f.launches()[0]
             .failure_reason
             .as_deref()
             .unwrap()
             .contains(&f.driver.config.state_root));
         assert_eq!(f.driver.conversations(), 0);
+    }
+}
+
+#[test]
+fn opencode_unconfirmed_teardown_reserves_capacity_until_recovery_proves_stop() {
+    for retired in [false, true] {
+        let f = Fixture::new();
+        f.driver.fail_start.store(true, Ordering::Release);
+        f.driver.fail_stop.store(true, Ordering::Release);
+        assert!(f.create("local1", None).is_err());
+        assert!(!f.store.get_session("local1").unwrap().unwrap().is_stopped());
+        if retired {
+            f.store.retire_core_session("local1", None).unwrap();
+        }
+        // Exercise durable recovery using a reopened store, including a
+        // retired record and a failure before any conversation is committed.
+        let store = SessionStore::new(f.driver.path.clone())
+            .with_delivery_runtime(Some(f.runtime.clone()))
+            .with_opencode_launch_driver(f.driver.clone());
+        store.recover_opencode_teardowns().unwrap();
+        assert_eq!(f.launches()[0].status, "teardown_pending");
+        f.store.reconcile_opencode_runtime("local1").unwrap();
+        let error = f.create("local2", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no local seat free"),
+            "{error:#}"
+        );
+        assert_eq!(f.driver.starts.load(Ordering::Acquire), 1);
+        f.driver.fail_stop.store(false, Ordering::Release);
+        store.recover_opencode_teardowns().unwrap();
+        assert_eq!(f.launches()[0].status, "failed");
+        assert_eq!(f.store.get_session("local1").unwrap().is_some(), retired);
+        assert_eq!((f.driver.posts(), f.driver.conversations()), (0, 0));
+        f.driver.fail_start.store(false, Ordering::Release);
+        f.create("local2", None).unwrap();
+        assert_eq!(f.driver.starts.load(Ordering::Acquire), 2);
     }
 }
 

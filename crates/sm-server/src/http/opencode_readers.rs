@@ -194,9 +194,16 @@ pub(super) fn start(state: Arc<AppState>) {
                     eprintln!("opencode launch recovery deferred: {error:#}");
                 }
             }
+            let mut last_teardown_retry = Instant::now();
             while let Some(state) = weak.upgrade() {
                 if state.shutdown.is_stopped() {
                     break;
+                }
+                if last_teardown_retry.elapsed() >= Duration::from_secs(5) {
+                    if let Err(error) = state.session_store.recover_opencode_teardowns() {
+                        eprintln!("opencode teardown recovery: {error:#}");
+                    }
+                    last_teardown_retry = Instant::now();
                 }
                 match state
                     .session_store

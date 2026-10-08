@@ -234,6 +234,7 @@ impl OpencodeLaunchDriver for HostDriver {
         ) {
             bail!("opencode tmux launcher is not confirmed stopped")
         }
+        crate::queue::local_wall::cancel_pending_jobs_for_restaging(&queue, &record.id)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match crate::local_wall::owner::retire_for_restaging(&queue, &record.id) {
