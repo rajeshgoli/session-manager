@@ -83,6 +83,10 @@ impl OpencodeConfig {
     /// under the owner's #1978 ruling; task/question cannot block or delegate.
     pub fn render_agent_config(&self) -> Result<String> {
         self.validate()?;
+        // Pinned 1.17.9 applies compaction.reserved only with limit.input:
+        // packages/opencode/src/session/overflow.ts. Keep compaction at 90%
+        // or later when the configured output allowance is smaller.
+        let compaction_reserved = self.output_limit.min((self.context_window / 10).max(1));
         Ok(serde_json::to_string_pretty(&json!({
             "$schema": "https://opencode.ai/config.json",
             "autoupdate": false, "share": "disabled", "snapshot": false,
@@ -91,11 +95,12 @@ impl OpencodeConfig {
                 "npm": "@ai-sdk/openai-compatible", "name": "Local model",
                 "options": {"baseURL": self.model_base_url, "apiKey": "local", "timeout": 3000000},
                 "models": {&self.model_id: {"name": self.model_id,
-                    "limit": {"context": self.context_window, "output": self.output_limit}}}
+                    "limit": {"context": self.context_window, "input": self.context_window,
+                        "output": self.output_limit}}}
             }},
             "model": format!("local/{}", self.model_id),
             "small_model": format!("local/{}", self.model_id),
-            "enabled_providers": ["local"], "compaction": {"auto": true},
+            "enabled_providers": ["local"], "compaction": {"auto": true, "reserved": compaction_reserved},
             "permission": {"*": "allow", "question": "deny", "task": "deny",
                 "webfetch": "allow", "websearch": "allow", "doom_loop": "allow",
                 "external_directory": "allow"}

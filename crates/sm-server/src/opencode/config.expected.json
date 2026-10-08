@@ -10,12 +10,12 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Local model",
       "options": {"baseURL": "http://127.0.0.1:8000/v1", "apiKey": "local", "timeout": 3000000},
-      "models": {"qwen3.8-flash-next": {"name": "qwen3.8-flash-next", "limit": {"context": 200000, "output": 32000}}}
+      "models": {"qwen3.8-flash-next": {"name": "qwen3.8-flash-next", "limit": {"context": 200000, "input": 200000, "output": 32000}}}
     }
   },
   "model": "local/qwen3.8-flash-next",
   "small_model": "local/qwen3.8-flash-next",
   "enabled_providers": ["local"],
-  "compaction": {"auto": true},
+  "compaction": {"auto": true, "reserved": 20000},
   "permission": {"*": "allow", "question": "deny", "task": "deny", "webfetch": "allow", "websearch": "allow", "doom_loop": "allow", "external_directory": "allow"}
 }
