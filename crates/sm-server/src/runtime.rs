@@ -46,6 +46,10 @@ const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_ANCHOR_SESSION: &str = "__sm_server_anchor";
 const DEFAULT_TMUX_BINARY: &str = "tmux";
+
+#[cfg(test)]
+#[path = "runtime_opencode_tests.rs"]
+mod opencode_tests;
 const SERVER_ANCHOR_COMMAND: &str = "sleep 315360000";
 static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
     OnceLock::new();
@@ -72,6 +76,7 @@ impl Drop for SessionInputGuard {
 
 #[derive(Debug, Clone)]
 pub struct TmuxRuntime {
+    opencode: Option<OpencodeRuntime>,
     socket_name: Option<String>,
     tmux_binary: String,
     custom_runtime_command: bool,
@@ -98,6 +103,13 @@ pub struct TmuxRuntime {
     send_keys_max_chunk_bytes: usize,
     send_keys_chunk_gap_ms: f64,
     claude_projects_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct OpencodeRuntime {
+    config: crate::opencode::OpencodeConfig,
+    state_file: PathBuf,
+    queue_dir: PathBuf,
 }
 
 /// Result of the conservative tmux teardown used by Codex-fork restore.
@@ -335,11 +347,19 @@ impl TmuxRuntime {
                 DEFAULT_SEND_KEYS_CHUNK_GAP_MS,
             ),
             claude_projects_roots: Vec::new(),
+            opencode: None,
         }
     }
 
     pub fn from_app_config(config: &AppConfig) -> Self {
         let mut runtime = Self::from_config(&config.rust_core);
+        runtime.opencode = Some(OpencodeRuntime {
+            config: config.opencode.clone(),
+            state_file: crate::sessions::expand_home(&config.paths.state_file),
+            queue_dir: crate::sessions::expand_home(
+                &config.queue_runner_state_dir().to_string_lossy(),
+            ),
+        });
         if config.rust_core.tmux_native_scrollback.is_none() {
             runtime.tmux_native_scrollback = config.tmux.native_scrollback;
         }
@@ -424,6 +444,19 @@ impl TmuxRuntime {
         working_dir: &Path,
         timeout: Duration,
     ) -> Result<Vec<String>> {
+        if provider == "opencode" {
+            let record = self
+                .opencode
+                .as_ref()
+                .and_then(|config| crate::local_model::live(&config.queue_dir))
+                .map(|host| host.record())
+                .transpose()?
+                .flatten();
+            return Ok(record
+                .filter(|record| record.state == "ready")
+                .map(|record| vec![record.identifier])
+                .unwrap_or_default());
+        }
         if provider == "claude" {
             return Ok(vec![
                 "fable".into(),
@@ -1418,8 +1451,39 @@ impl TmuxRuntime {
     pub fn session_input_ready(&self, tmux_session: &str, provider: &str) -> bool {
         match provider {
             "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
-            _ => self.claude_empty_composer_pane(tmux_session).is_some(),
+            "claude" => self.claude_empty_composer_pane(tmux_session).is_some(),
+            "opencode" => self.opencode_input_ready(tmux_session).unwrap_or(false),
+            _ => false,
         }
+    }
+
+    fn opencode_input_ready(&self, tmux_session: &str) -> Result<bool> {
+        let Some(config) = &self.opencode else {
+            return Ok(false);
+        };
+        let sessions =
+            crate::sessions::SessionStore::new(config.state_file.clone()).list_sessions(false)?;
+        let mut matches = sessions.iter().filter(|record| {
+            record.provider == "opencode"
+                && record.tmux_session == tmux_session
+                && record.tmux_socket_name == self.socket_name
+                && record.provider_resume_id.is_some()
+        });
+        let Some(record) = matches.next() else {
+            return Ok(false);
+        };
+        if matches.next().is_some() {
+            return Ok(false);
+        }
+        crate::opencode::launch::LaunchFiles::reopen(
+            &config.config,
+            record
+                .opencode
+                .as_ref()
+                .context("Opencode binding missing")?,
+        )?
+        .client(Duration::from_secs(5))?
+        .ready()
     }
 
     pub fn session_has_attached_clients(&self, tmux_session: &str) -> Result<bool> {
@@ -1890,7 +1954,7 @@ impl TmuxRuntime {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
         loop {
-            if !self.session_exists(tmux_session)? {
+            if provider != "opencode" && !self.session_exists(tmux_session)? {
                 return Err(InitialBriefDeliveryError::SessionExited {
                     provider: provider.to_owned(),
                 }

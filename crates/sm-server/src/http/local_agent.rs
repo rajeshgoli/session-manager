@@ -205,8 +205,17 @@ async fn authenticate_request(
         .get::<MatchedPath>()
         .map(|p| p.as_str())
         .unwrap_or("");
-    let selected = policy(request.method().as_str(), route)
-        .ok_or_else(|| denied("route is not available to local agents"))?;
+    let selected = policy(request.method().as_str(), route).ok_or_else(|| {
+        denied(
+            if request.method() == "POST"
+                && matches!(route, "/sessions" | "/sessions/spawn" | "/client/sessions")
+            {
+                "local agents cannot spawn agents"
+            } else {
+                "route is not available to local agents"
+            },
+        )
+    })?;
     let body = to_bytes(
         std::mem::replace(request.body_mut(), Body::empty()),
         8 * 1024 * 1024,

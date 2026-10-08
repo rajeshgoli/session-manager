@@ -13802,7 +13802,7 @@ fn generated_session_name(
 ) -> Option<String> {
     let list = match provider {
         "claude" => POEM_NAMES,
-        "codex" | "codex-fork" | "codex-app" => STAR_NAMES,
+        "codex" | "codex-fork" | "codex-app" | "opencode" => STAR_NAMES,
         _ => return None,
     };
     let names = list.split_whitespace().collect::<Vec<_>>();
@@ -16594,7 +16594,7 @@ impl SessionRecord {
         let native_title = self.native_title.as_deref().filter(|value| {
             matches!(
                 self.provider.as_str(),
-                "claude" | "codex" | "codex-app" | "codex-fork"
+                "claude" | "codex" | "codex-app" | "codex-fork" | "opencode"
             ) && !value.trim().is_empty()
         });
         let friendly_name = self
@@ -17211,7 +17211,7 @@ fn default_context_monitor_notify_source() -> String {
 /// Codex compaction is deliberately not a reason to enroll an unmeasurable
 /// session, nor does enrollment authorize any rotation.
 fn provider_has_measured_context_gauge(provider: &str) -> bool {
-    matches!(provider.trim(), "claude" | "codex-fork")
+    matches!(provider.trim(), "claude" | "codex-fork" | "opencode")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17417,7 +17417,11 @@ mod tests {
     #[test]
     fn generated_names_follow_provider_and_keep_explicit_names() {
         let store = SessionStore::new(unique_temp_path("generated-names"));
-        for (provider, list) in [("claude", POEM_NAMES), ("codex-fork", STAR_NAMES)] {
+        for (provider, list) in [
+            ("claude", POEM_NAMES),
+            ("codex-fork", STAR_NAMES),
+            ("opencode", STAR_NAMES),
+        ] {
             let record = store
                 .build_core_session_record(&[], &naming_request(provider, None), None, false, None)
                 .unwrap();
@@ -20084,17 +20088,19 @@ sleep 30
 
     #[test]
     fn cached_display_name_prefers_newer_native_title() {
-        let mut session = session_record("running");
-        session.friendly_name = Some("stale-friendly-name".to_owned());
-        session.friendly_name_updated_at_ns = Some(10);
-        session.native_title = Some("cached-native-title".to_owned());
-        session.native_title_updated_at_ns = Some(20);
-        let response = SessionResponse::from(session);
-
-        assert_eq!(
-            response.friendly_name.as_deref(),
-            Some("cached-native-title")
-        );
+        for provider in ["claude", "opencode"] {
+            let mut session = session_record("running");
+            session.provider = provider.into();
+            session.friendly_name = Some("stale-friendly-name".to_owned());
+            session.friendly_name_updated_at_ns = Some(10);
+            session.native_title = Some("cached-native-title".to_owned());
+            session.native_title_updated_at_ns = Some(20);
+            let response = SessionResponse::from(session);
+            assert_eq!(
+                response.friendly_name.as_deref(),
+                Some("cached-native-title")
+            );
+        }
     }
 
     #[test]
@@ -25279,6 +25285,7 @@ sleep 30
     fn measured_context_gauge_capability_is_explicit_per_provider() {
         assert!(provider_has_measured_context_gauge("claude"));
         assert!(provider_has_measured_context_gauge("codex-fork"));
+        assert!(provider_has_measured_context_gauge("opencode"));
         assert!(!provider_has_measured_context_gauge("codex"));
         assert!(!provider_has_measured_context_gauge("codex-app"));
         assert!(!provider_has_measured_context_gauge("unknown"));

@@ -33,6 +33,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A launch refusal whose prerequisites can be corrected before retrying.
+#[derive(Debug)]
+pub struct AdmissionError(pub String);
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AdmissionError {}
+
 /// Include live seats and provisional launches. Hold the store's admission
 /// lock through reservation persistence; a stopped provisional record alone
 /// does not reserve capacity or a port. Only server-authorized handoff supplies
@@ -58,11 +68,12 @@ pub fn check_seat(
             .map(|seat| seat.friendly_name.as_deref().unwrap_or(&seat.name))
             .collect::<Vec<_>>()
             .join(", ");
-        bail!(
+        return Err(AdmissionError(format!(
             "no local seat free ({}/{} used by {names})",
             seats.len(),
             config.max_agents
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -76,13 +87,14 @@ pub fn loaded_config(
 ) -> Result<OpencodeConfig> {
     let model = model
         .filter(|m| m.state == "ready")
-        .context("no local model loaded")?;
+        .ok_or_else(|| AdmissionError("no local model loaded".into()))?;
     if let Some(requested) = requested.map(str::trim).filter(|m| !m.is_empty()) {
         if requested != model.identifier {
-            bail!(
+            return Err(AdmissionError(format!(
                 "model {requested} is not loaded; loaded: {}",
                 model.identifier
-            );
+            ))
+            .into());
         }
     }
     let mut effective = config.clone();
@@ -105,7 +117,7 @@ pub fn lowest_port(config: &OpencodeConfig, occupied: &BTreeSet<u16>) -> Result<
             return Ok(port);
         }
     }
-    bail!("no local port free")
+    Err(AdmissionError("no local port free".into()).into())
 }
 
 pub fn verify_version(config: &OpencodeConfig) -> Result<()> {
@@ -114,10 +126,11 @@ pub fn verify_version(config: &OpencodeConfig) -> Result<()> {
     let output = command_output_with_timeout(command, Duration::from_secs(5))?;
     let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !output.status.success() || found != config.version {
-        bail!(
+        return Err(AdmissionError(format!(
             "opencode {found} is installed; sm is pinned to {}",
             config.version
-        );
+        ))
+        .into());
     }
     Ok(())
 }

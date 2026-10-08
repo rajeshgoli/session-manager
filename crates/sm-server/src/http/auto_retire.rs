@@ -13,7 +13,7 @@ use crate::work_claims::worktrees::{rebuild_worktree, WorktreeRebuild};
 
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// Providers History can restore; others are never auto-retired.
-const RESTORABLE_PROVIDERS: [&str; 3] = ["claude", "codex", "codex-fork"];
+const RESTORABLE_PROVIDERS: [&str; 4] = ["claude", "codex", "codex-fork", "opencode"];
 
 /// The sweep, on the server that runs the runtime.
 pub(super) fn spawn_auto_retire_sweeper(state: Arc<AppState>) {

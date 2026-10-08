@@ -60,7 +60,8 @@ impl OpencodeLaunchDriver for HostDriver {
         self.config.opencode.clone()
     }
     fn config(&self, requested: Option<&str>) -> Result<OpencodeConfig> {
-        let host = crate::local_model::live(&self.queue()?).context("no local model loaded")?;
+        let host = crate::local_model::live(&self.queue()?)
+            .ok_or_else(|| AdmissionError("no local model loaded".into()))?;
         let config = loaded_config(&self.config.opencode, host.record()?.as_ref(), requested)?;
         verify_version(&config)?;
         Ok(config)

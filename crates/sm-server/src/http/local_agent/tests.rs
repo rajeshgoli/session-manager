@@ -423,15 +423,24 @@ async fn real_router_confines_reminders_and_closes_queue_until_wall_binding_exis
         "/hooks/claude",
         "/client/board/start",
     ] {
-        assert_eq!(
-            app.clone()
-                .oneshot(signed_request("agent-a", "POST", route, json!({})))
+        for parent in [Value::Null, json!("agent-b")] {
+            let response = app
+                .clone()
+                .oneshot(signed_request(
+                    "agent-a",
+                    "POST",
+                    route,
+                    json!({"parent_session_id":parent}),
+                ))
                 .await
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN,
-            "{route}"
-        );
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+            if matches!(route, "/sessions" | "/sessions/spawn" | "/client/sessions") {
+                let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["detail"], "local agents cannot spawn agents");
+            }
+        }
     }
     assert_eq!(
         app.clone()

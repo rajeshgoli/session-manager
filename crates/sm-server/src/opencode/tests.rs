@@ -30,6 +30,7 @@ use std::{
 
 #[derive(Default)]
 struct StubState {
+    authorization: Option<String>,
     messages: BTreeMap<String, String>,
     requests: Vec<(String, String, Value)>,
     lookup_error: Option<u16>,
@@ -51,6 +52,13 @@ pub(crate) struct Stub {
 }
 
 impl Stub {
+    pub(crate) fn set_password(&self, password: &str) {
+        use base64::Engine;
+        self.state.lock().unwrap().authorization = Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"))
+        ));
+    }
     pub(crate) fn new() -> Self {
         Self::new_on_port(0)
     }
@@ -181,13 +189,17 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
     } else {
         serde_json::from_slice(&bytes[offset..offset + size]).unwrap()
     };
+    let mut state = state.lock().unwrap();
     let authorized = headers.lines().any(|line| {
         line.split_once(':').is_some_and(|(key, value)| {
             key.eq_ignore_ascii_case("authorization")
-                && value.trim() == "Basic b3BlbmNvZGU6c2VjcmV0"
+                && value.trim()
+                    == state
+                        .authorization
+                        .as_deref()
+                        .unwrap_or("Basic b3BlbmNvZGU6c2VjcmV0")
         })
     });
-    let mut state = state.lock().unwrap();
     state
         .requests
         .push((method.into(), path.into(), body.clone()));
