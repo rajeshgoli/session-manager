@@ -15,6 +15,9 @@ use std::{
     time::Duration,
 };
 
+mod retirement;
+pub use retirement::retire_for_restaging;
+
 #[derive(Serialize, Deserialize)]
 pub struct ProviderLaunch {
     pub tool: String,
@@ -138,18 +141,7 @@ pub fn stage(
     }
     // Serialize staging across old/new server processes without changing the
     // preparation lock that the live owner holds for its entire lifetime.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(root.join("stage.lock"))?;
-    if lock.metadata()?.nlink() != 1 || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0
-    {
-        bail!("invalid durable owner staging lock");
-    }
+    let _stage = retirement::stage_lock(&root, libc::LOCK_EX | libc::LOCK_NB)?;
     let bytes = serde_json::to_vec(&config)?;
     let path = root.join("launch.json");
     if path.exists() {
@@ -158,6 +150,7 @@ pub fn stage(
             bail!("durable provider launch is immutable");
         }
     } else {
+        retirement::record_staged(&config)?;
         atomic_write(&path, &bytes)?;
     }
     let contents = fs::read(&source)?;
@@ -433,6 +426,7 @@ impl Lifetime<'_> {
         let egress = self.config.egress.unregister_agent(&self.config.agent.id);
         judge?;
         egress?;
+        retirement::record_retired(self.config)?;
         Ok(())
     }
 }
@@ -458,6 +452,11 @@ pub async fn run(path: PathBuf) -> Result<()> {
 }
 fn run_inner(path: &Path, stopping: Arc<AtomicBool>) -> Result<()> {
     use std::os::unix::process::ExitStatusExt;
+    let _lifetime = retirement::stage_lock(
+        path.parent()
+            .context("owner configuration missing directory")?,
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
     let config = read_configuration(path)?;
     let runtime = LocalWallRuntime::new(
         config.host.clone(),
@@ -471,6 +470,7 @@ fn run_inner(path: &Path, stopping: Arc<AtomicBool>) -> Result<()> {
         provider: None,
         children: BTreeMap::new(),
     };
+    retirement::record_started(&config)?;
     let mut provider = wall.spawn_provider_with_environment(
         &config.provider.tool,
         &config.provider.arguments,
