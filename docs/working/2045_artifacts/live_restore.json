@@ -1,0 +1,12 @@
+{
+  "session_id": "fb0062bf",
+  "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+  "restored_native_pid": 64710,
+  "marker": "SM2045-RESTORE-MEMORY-1791449865",
+  "question_id": "msg_11ac01fe8001U8PMZb0FjaciJJ",
+  "answer": "\nFrom the initial probe: I wrote `SM2045-MEMORY-MARKER: the heron waits by the river` into `sm2045-probe.txt`. I'll answer both values without using tools.\n\nMarker: SM2045-MEMORY-MARKER: the heron waits by the river \u2014 file: sm2045-probe.txt\n",
+  "same_conversation": true,
+  "history_preserved": true,
+  "brief_occurrences": 1,
+  "remembered_without_tools": true
+}

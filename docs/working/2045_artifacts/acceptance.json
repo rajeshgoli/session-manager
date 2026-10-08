@@ -1,0 +1,17 @@
+{
+  "ticket": 2045,
+  "author_session": "de7aa837",
+  "implementation_commit": "c4b55507a215a4b53afa3213c8341fdb6547cb31",
+  "complete": false,
+  "checks": [
+    {"check": "launch, activity, measured context and authenticated native endpoint", "status": "passed", "evidence": "live_launch.json", "job": "job_98000ab6e782"},
+    {"check": "send, reminder and queue completion delivery while idle and busy", "status": "passed", "evidence": "live_messages.json", "job": "job_bc1ecfd3d3e9"},
+    {"check": "native-process restart and exactly-once pending delivery", "status": "passed", "evidence": "live_restart.json", "job": "job_fe55f9fc5170"},
+    {"check": "retire and restore the same conversation with remembered work", "status": "passed", "evidence": "live_restore.json", "job": "job_fe55f9fc5170"},
+    {"check": "automatic compaction above 85 percent with the real model", "status": "repeat_pending", "default_evidence": "live_compaction_default.json", "default_measurement_job": "job_386ffd3c682d", "correction_pr": 2118},
+    {"check": "hands-off past-ticket 1855 through PR and sm request-review", "status": "pending", "start_commit": "4a3a060d6c37"},
+    {"check": "local token accounting and unchanged Claude quota", "status": "waiting_for_prerequisite", "prerequisite_ticket": 1975}
+  ],
+  "resource_blocker": {"model_required_gb_including_headroom": 183, "last_available_gb": 180, "refused_job": "job_fa2c962e5b2c"},
+  "probe": {"session_id": "fb0062bf", "conversation": "ses_ee54b44afffe2fvou8T85FvWx7", "status": "retired", "history_preserved": true}
+}

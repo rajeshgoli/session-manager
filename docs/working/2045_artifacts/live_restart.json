@@ -1,0 +1,20 @@
+{
+  "session_id": "fb0062bf",
+  "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+  "old_native_pid": 48647,
+  "new_native_pid": 52901,
+  "queued_at_ms": 1791449865000,
+  "marker": "SM2045-RESTART-MESSAGE-1791449865",
+  "message_id": "msg_11abb9d35001fXKDHEPIuZXhwK",
+  "arrivals": 1,
+  "history_preserved": true,
+  "preserved_delivery_ids": [
+    "msg_11ab7ae7a001nrxVTDiwCGuh7F",
+    "msg_11ab7b655001dkU3qv4Ea9ejS8",
+    "msg_11ab7b6d9001PziVg5hJja0QIE",
+    "msg_11ab7eac8001BzE9kAKAoxCgpY",
+    "msg_11ab7f104001E5VauSPMY2Neja",
+    "msg_11ab7f191001coaSuRdpHtTBaB"
+  ],
+  "brief_occurrences": 1
+}
