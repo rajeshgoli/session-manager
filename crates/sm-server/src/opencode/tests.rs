@@ -38,6 +38,9 @@ struct StubState {
     rename_error: bool,
     history_error: bool,
     before_lookup: Option<Box<dyn FnOnce() + Send>>,
+    conversations: usize,
+    idle: bool,
+    abort_stays_busy: bool,
 }
 
 pub(crate) struct Stub {
@@ -106,6 +109,14 @@ impl Stub {
 
     pub(crate) fn before_lookup(&self, hook: Box<dyn FnOnce() + Send>) {
         self.state.lock().unwrap().before_lookup = Some(hook);
+    }
+
+    pub(crate) fn abort_stays_busy(&self) {
+        self.state.lock().unwrap().abort_stays_busy = true;
+    }
+
+    pub(crate) fn set_idle(&self) {
+        self.state.lock().unwrap().idle = true;
     }
 
     pub(crate) fn conversation_creations(&self) -> usize {
@@ -214,12 +225,28 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
     } else if method == "GET" && path == "/global/health" {
         (200, json!({"healthy": true}))
     } else if method == "GET" && path == "/session/status" {
-        (200, json!({"ses_test": {"type": "busy"}}))
+        (
+            200,
+            if state.idle {
+                json!({})
+            } else {
+                json!({"ses_test": {"type": "busy"}})
+            },
+        )
     } else if method == "POST" && path == "/session" {
-        (200, json!({"id": "ses_test"}))
+        state.conversations += 1;
+        (
+            200,
+            json!({"id": if state.conversations == 1 { "ses_test".into() } else { format!("ses_clear{}", state.conversations) }}),
+        )
     } else if method == "PATCH" && state.rename_error {
         (503, Value::Null)
-    } else if method == "PATCH" || path.ends_with("/abort") {
+    } else if path.ends_with("/abort") {
+        if !state.abort_stays_busy {
+            state.idle = true;
+        }
+        (200, json!({}))
+    } else if method == "PATCH" {
         (200, json!({}))
     } else {
         (404, Value::Null)

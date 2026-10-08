@@ -5444,6 +5444,9 @@ impl SessionStore {
         request: ClearSessionRequest,
         runtime: &TmuxRuntime,
     ) -> Result<CoreClearOutcome> {
+        if self.is_opencode_session(session_id)? {
+            return self.clear_opencode_session(session_id, request, runtime);
+        }
         let clear_guard = self.lock_clear_operation(session_id)?;
         let prompt = request
             .prompt
@@ -10219,6 +10222,7 @@ pub enum CoreClearOutcome {
     NotFound,
     NotRunning,
     Unauthorized(String),
+    Conflict(String),
 }
 
 #[derive(Debug, Clone)]
@@ -10524,6 +10528,9 @@ pub use opencode_session_launch::{OpencodeLaunchContext, OpencodeLaunchDriver};
 
 #[path = "opencode/outbox.rs"]
 mod opencode_outbox;
+
+#[path = "opencode/clear.rs"]
+mod opencode_clear;
 
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

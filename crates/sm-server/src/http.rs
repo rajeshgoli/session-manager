@@ -11415,9 +11415,13 @@ async fn clear_session(
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
         let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .clear_core_session_with_runtime(&session_id, payload, &runtime)?
+        let store = state.session_store.clone();
+        let id = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            store.clear_core_session_with_runtime(&id, payload, &runtime)
+        })
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??
     } else {
         state
             .session_store
@@ -11432,6 +11436,10 @@ async fn clear_session(
         }),
         CoreClearOutcome::Unauthorized(detail) => Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
+            detail,
+        }),
+        CoreClearOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
             detail,
         }),
     }

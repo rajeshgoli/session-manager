@@ -43,6 +43,13 @@ impl SessionStore {
             .queue_store
             .as_ref()
             .context("opencode delivery requires the retained queue")?;
+        let _clear = self.lock_clear_operation(id)?;
+        let Some(record) = self.get_session(id)? else {
+            return Ok(None);
+        };
+        let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+        let _input = session_runtime.lock_session_input(&record.tmux_session)?;
+        let _submission = self.lock_opencode_submission(id)?;
         let message_id = {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
@@ -52,6 +59,21 @@ impl SessionStore {
             ensure_runtime_local_node(
                 &json_text(session.get("node")).unwrap_or_else(default_node),
             )?;
+            if raw_session_is_stopped(session)
+                || session
+                    .get("retirement_intent")
+                    .is_some_and(|v| !v.is_null())
+            {
+                return Ok(Some(CoreInputResult {
+                    ok: true,
+                    session_id: id.into(),
+                    delivered: false,
+                    delivery_mode: request.delivery_mode,
+                    notify_after_seconds: request.notify_after_seconds,
+                    status: json_text(session.get("status")).unwrap_or_else(|| "stopped".into()),
+                }));
+            }
+            super::opencode_clear::ensure_pending_clear_prompt(session, id, queue)?;
             let (text, sender) = format_send_input_text_raw(&state, &request);
             let metadata = queue_metadata_for_send_request(&state, id, &request, sender);
             let mode = normalized_delivery_mode(&request.delivery_mode);
@@ -79,7 +101,7 @@ impl SessionStore {
             }
             queue.enqueue_message_with_metadata(id, &text, &mode, metadata)?
         };
-        self.drain_opencode_outbox(id, runtime)?;
+        self.drain_opencode_outbox_while_locked(id, runtime)?;
         Ok(Some(CoreInputResult {
             ok: true,
             session_id: id.into(),
@@ -93,9 +115,6 @@ impl SessionStore {
     /// Clear and restore use the same outer lock; retirement and handoff
     /// admission use the submission lock. Input locks also exclude native input.
     pub(crate) fn drain_opencode_outbox(&self, id: &str, runtime: &TmuxRuntime) -> Result<()> {
-        let Some(queue) = self.queue_store.as_ref() else {
-            return Ok(());
-        };
         let _clear = self.lock_clear_operation(id)?;
         let Some(record) = self.get_session(id)? else {
             return Ok(());
@@ -103,6 +122,17 @@ impl SessionStore {
         let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
         let _input = session_runtime.lock_session_input(&record.tmux_session)?;
         let _submission = self.lock_opencode_submission(id)?;
+        self.drain_opencode_outbox_while_locked(id, runtime)
+    }
+
+    pub(super) fn drain_opencode_outbox_while_locked(
+        &self,
+        id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let Some(queue) = self.queue_store.as_ref() else {
+            return Ok(());
+        };
         loop {
             let Some(message) = queue.pending_messages_for_target(id, 1)?.into_iter().next() else {
                 break;
@@ -325,6 +355,10 @@ fn opencode_delivery_target(
     if require_active
         && (record.is_stopped()
             || handoff_fences_delivery_raw(raw)
+            || raw
+                .get("opencode_pending_clear")
+                .is_some_and(|v| !v.is_null())
+            || raw.get("retirement_intent").is_some_and(|v| !v.is_null())
             || session_runtime_launch_records(state)?.iter().any(|launch| {
                 launch.session_id == id
                     && matches!(

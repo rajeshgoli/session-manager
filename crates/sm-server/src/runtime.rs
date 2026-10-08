@@ -558,11 +558,30 @@ impl TmuxRuntime {
         spec: &TmuxSessionSpec,
         script: &Path,
     ) -> Result<()> {
+        self.opencode_attach_window(spec, script, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn replace_opencode_attach_window(
+        &self,
+        spec: &TmuxSessionSpec,
+        script: &Path,
+    ) -> Result<()> {
+        self.opencode_attach_window(spec, script, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn opencode_attach_window(
+        &self,
+        spec: &TmuxSessionSpec,
+        script: &Path,
+        replace: bool,
+    ) -> Result<()> {
         let target = format!("{}:agent", spec.tmux_session);
         let command = format!("exec /bin/bash {}", shell_quote_path(script));
         match self.opencode_window_alive(&spec.tmux_session, "agent")? {
-            Some(true) => return Ok(()),
-            Some(false) => self.run_tmux([
+            Some(true) if !replace => return Ok(()),
+            Some(_) => self.run_tmux([
                 "respawn-window",
                 "-k",
                 "-t",
@@ -5286,6 +5305,12 @@ if [ "$1" = 'list-panes' ]; then cat '{}'; else exit 0; fi
             .create_opencode_attach_window(&spec, &directory.join("attach.sh"))
             .unwrap();
         assert!(!fs::read_to_string(&log).unwrap().contains("new-window"));
+        runtime
+            .replace_opencode_attach_window(&spec, &directory.join("attach.sh"))
+            .unwrap();
+        assert!(fs::read_to_string(&log)
+            .unwrap()
+            .contains("respawn-window -k -t sm-view:agent"));
         fs::write(&windows, "serve:0\nagent:1\n").unwrap();
         runtime
             .create_opencode_attach_window(&spec, &directory.join("attach.sh"))
