@@ -66,7 +66,10 @@ def prepare(request):
                                 "GIT_CONFIG_GLOBAL": "/dev/null"})
     names = {"supervisor"}
     staged = {}
-    for tool in request["tools"]:
+    # The immutable entry image sets loader state after sandbox-exec has
+    # discarded it. Guest tools cannot re-execute this privileged entry.
+    tools = [{"name": "launch-env", "source": "/usr/bin/env"}, *request["tools"]]
+    for tool in tools:
         name = tool["name"]
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in names:
             raise ValueError("invalid or duplicate staged tool name")
@@ -112,6 +115,8 @@ def prepare(request):
                  "--state-root", request["state_root"], "--state-dir", str(state), "--tmp-dir", tmp,
                  "--broker-dir", request["broker_dir"], "--broker-endpoint", request["endpoint"],
                  "--contained-processes"]
+    if "opencode" in staged:
+        arguments.extend(["--command-groups", staged["opencode"]])
     for name in ("agent", "gateway", "egress", "model", "judge"):
         arguments.extend(["--" + name + "-port", str(ports[name])])
     for name in ("agent", "gateway", "egress"):
@@ -146,6 +151,8 @@ def prepare(request):
                "--output", str(adapter)]
     for root in roots:
         command.extend(["--immutable-exec-dir", root])
+    if "opencode" in staged:
+        command.extend(["--attached-spawn-executable", staged["opencode"]])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     return {"profile": str(profile), "adapter": str(adapter), "supervisor": str(executables / "supervisor"),
             "tmp": tmp, "gh": str(gh), "cargo": str(cargo), "executables": str(executables), "tools": staged}

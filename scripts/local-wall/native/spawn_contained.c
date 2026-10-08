@@ -8,6 +8,7 @@ extern const int wall_contained_spawns;
 static int apply_spawn_actions(const struct action_list *list, short flags,
         const sigset_t *defaults, const sigset_t *mask,
         const int *holds, int count, int notification) {
+    if ((flags & POSIX_SPAWN_SETPGROUP) && setpgid(0, 0) < 0) return errno;
     if (flags & POSIX_SPAWN_CLOEXEC_DEFAULT) {
         int limit = getdtablesize();
         for (int fd = 0; fd < limit; ++fd) {
@@ -21,7 +22,10 @@ static int apply_spawn_actions(const struct action_list *list, short flags,
         struct sigaction action = { .sa_handler = SIG_DFL };
         sigemptyset(&action.sa_mask);
         for (int signal = 1; signal < NSIG; ++signal)
-            if (sigismember(defaults, signal) == 1 && sigaction(signal, &action, NULL) < 0) return errno;
+            // Native spawn accepts a full default set. These two dispositions
+            // are permanently default and cannot be changed with sigaction.
+            if (signal != SIGKILL && signal != SIGSTOP &&
+                sigismember(defaults, signal) == 1 && sigaction(signal, &action, NULL) < 0) return errno;
     }
     if (flags & POSIX_SPAWN_RESETIDS)
         if (setegid(getgid()) < 0 || seteuid(getuid()) < 0) return errno;
@@ -54,11 +58,11 @@ static int apply_spawn_actions(const struct action_list *list, short flags,
 }
 
 static int contained_spawn(pid_t *pid, const char *path, const struct action_list *list,
-        const posix_spawnattr_t *attributes, short flags, char *const argv[], char *const environment[],
+        const posix_spawnattr_t *attributes, short flags, int command_group, char *const argv[], char *const environment[],
         const int *holds, int count, int notification, int minimum) {
-    if (flags & (POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP)) return EPERM;
+    if ((flags & POSIX_SPAWN_SETSID) || ((flags & POSIX_SPAWN_SETPGROUP) && !command_group)) return EPERM;
     const short supported = POSIX_SPAWN_RESETIDS | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
-        POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT;
+        POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT | (command_group ? POSIX_SPAWN_SETPGROUP : 0);
     if (flags & ~supported) return ENOTSUP;
     sigset_t defaults, mask;
     int error;

@@ -1,6 +1,10 @@
 use super::*;
 use crate::local_sockets::launch::LaunchBinding;
-use std::{ffi::OsString, process::Command};
+use std::{
+    ffi::OsString,
+    io::{BufRead, BufReader},
+    process::Command,
+};
 
 pub(crate) struct PreparedLaunch {
     _directory: TestDirectory,
@@ -16,6 +20,15 @@ pub(crate) fn prepare_launch() -> PreparedLaunch {
 }
 
 pub(crate) fn prepare_launch_for(agent: &str, gateway: u16, egress: u16) -> PreparedLaunch {
+    prepare_launch_for_inner(agent, gateway, egress, None)
+}
+
+fn prepare_launch_for_inner(
+    agent: &str,
+    gateway: u16,
+    egress: u16,
+    opencode: Option<&Path>,
+) -> PreparedLaunch {
     let directory = TestDirectory::new();
     let broker = directory.path().join("h/s/a/tmp/b");
     fs::create_dir_all(&broker).unwrap();
@@ -43,8 +56,12 @@ pub(crate) fn prepare_launch_for(agent: &str, gateway: u16, egress: u16) -> Prep
         .unwrap()
         .push(control.try_clone().unwrap());
     let scripts = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/local-wall");
-    let preparation = Command::new("python3")
-        .arg(scripts.join("test_launch.py"))
+    let mut preparation = Command::new("python3");
+    preparation.arg(scripts.join("test_launch.py"));
+    if let Some(source) = opencode {
+        preparation.arg("--opencode-binary").arg(source);
+    }
+    let preparation = preparation
         .arg("--root")
         .arg(directory.path())
         .arg("--control-port")
@@ -246,23 +263,39 @@ fn production_wall_launch_registers_before_socket_use_and_restores() {
 #[ignore = "requires installed pinned opencode 1.17.9"]
 fn production_wall_pinned_opencode_serves_authenticated_health() {
     use std::io::{Read, Write};
-    let prepared = prepare_launch();
     let source = Path::new("/opt/homebrew/bin/opencode")
         .canonicalize()
         .unwrap();
     let version = Command::new(&source).arg("--version").output().unwrap();
     assert!(version.status.success());
     assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), "1.17.9");
-    // A copy breaks the installed package's hard links into immutable state.
-    let executable = prepared.path("application").with_file_name("opencode");
-    fs::copy(source, &executable).unwrap();
+    let prepared = prepare_launch_for_inner("launch", 18600, 18700, Some(&source));
+    let checkout = prepared.path("checkout");
+    let git = Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&checkout)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    let executable = prepared.path("opencode");
     let config = prepared.paths["environment"]["XDG_CONFIG_HOME"]
         .as_str()
         .unwrap();
     fs::create_dir_all(Path::new(config).join("opencode")).unwrap();
     fs::write(
+        Path::new(config).join("opencode/.gitignore"),
+        "node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore\n",
+    )
+    .unwrap();
+    fs::write(
         Path::new(config).join("opencode/opencode.json"),
-        r#"{"autoupdate":false,"snapshot":false,"share":"disabled","plugin":[]}"#,
+        serde_json::to_vec(&serde_json::json!({
+            "autoupdate": false, "snapshot": false, "share": "disabled", "plugin": [],
+            "shell": prepared.path("shell")
+        }))
+        .unwrap(),
     )
     .unwrap();
     let mut environment = prepared.environment.clone();
@@ -282,18 +315,27 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
                 "127.0.0.1".into(),
                 "--port".into(),
                 prepared.control_port.to_string().into(),
+                "--print-logs".into(),
+                "--log-level".into(),
+                "INFO".into(),
             ],
             &environment,
             &prepared.path("checkout"),
         )
         .unwrap();
+    let mut stdout = child.take_stdout().unwrap();
+    let out = thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).unwrap();
+        text
+    });
     let mut stderr = child.take_stderr().unwrap();
     let err = thread::spawn(move || {
         let mut text = String::new();
         stderr.read_to_string(&mut text).unwrap();
         text
     });
-    let request = |authenticated: bool| -> io::Result<String> {
+    let request = |authenticated: bool, path: &str| -> io::Result<String> {
         let mut connection = TcpStream::connect((Ipv4Addr::LOCALHOST, prepared.control_port))?;
         connection.set_read_timeout(Some(Duration::from_secs(1)))?;
         let authorization = if authenticated {
@@ -301,14 +343,14 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
         } else {
             ""
         };
-        connection.write_all(format!("GET /global/health HTTP/1.1\r\nHost: localhost\r\n{authorization}Connection: close\r\n\r\n").as_bytes())?;
+        connection.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}Connection: close\r\n\r\n").as_bytes())?;
         let mut response = String::new();
         connection.read_to_string(&mut response)?;
         Ok(response)
     };
     let deadline = Instant::now() + Duration::from_secs(25);
     let response = loop {
-        if let Ok(response) = request(true) {
+        if let Ok(response) = request(true, "/global/health") {
             break response;
         }
         if child.try_wait().unwrap().is_some() || Instant::now() > deadline {
@@ -322,10 +364,159 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
         response.contains(r#""healthy":true"#) && response.contains("1.17.9"),
         "{response}"
     );
-    let rejected = request(false).unwrap();
+    let rejected = request(false, "/global/health").unwrap();
     assert!(rejected.starts_with("HTTP/1.1 401"), "{rejected}");
+    // Health bypasses project initialization. Production readiness also reads
+    // conversation status, which runs native Git subprocesses in the checkout.
+    let client = crate::opencode::Client::new(
+        prepared.control_port,
+        "fixture-password",
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let readiness = client.ready();
+    let project_status = (|| -> anyhow::Result<String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .into();
+        let mut response = agent
+            .get(&format!(
+                "http://127.0.0.1:{}/session/status",
+                prepared.control_port
+            ))
+            .header(
+                "Authorization",
+                "Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==",
+            )
+            .call()?;
+        Ok(format!(
+            "{}; {}",
+            response.status(),
+            response.body_mut().read_to_string()?
+        ))
+    })();
+    let conversation = if matches!(readiness, Ok(true)) {
+        Some(client.create_conversation("contained native project"))
+    } else {
+        None
+    };
     drop(child);
-    let _ = err.join().unwrap();
+    let stdout = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert!(
+        matches!(readiness, Ok(true)),
+        "{readiness:?}; {project_status:?}; {stdout}; {stderr}"
+    );
+    assert!(
+        matches!(conversation, Some(Ok(_))),
+        "{conversation:?}; {stderr}"
+    );
+    let mut environment = prepared.environment.clone();
+    environment.push(("BUN_BE_BUN".into(), "1".into()));
+    prepared.run(
+        &executable,
+        &[
+            "-e".into(),
+            include_str!("../../../../../../scripts/local-wall/native/test_opencode_spawn.cjs")
+                .into(),
+        ],
+        &environment,
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.join("native-tool.txt")).unwrap(),
+        "native-tool"
+    );
+    let cancelled: u32 = fs::read_to_string(checkout.join("native-cancel-pid.txt"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        ProcessIdentity::capture(cancelled).is_err(),
+        "cancelled native child survived"
+    );
+    struct OutsideProcess(std::process::Child);
+    impl Drop for OutsideProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut outside = OutsideProcess(Command::new("/bin/sleep").arg("120").spawn().unwrap());
+    for mode in ["complete", "drop", "supervisor-loss", "host-disconnect"] {
+        // The trusted runtime creates a separate command group before exec.
+        // On normal completion the worker is reparented.
+        // Entire-launch cleanup must remove it without touching the sentinel.
+        let worker = "import os,socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(os.getpid(),os.getppid(),os.getpgrp(),os.getsid(0),s.getsockname()[1],flush=True); time.sleep(60)";
+        let script = format!(
+            "const child = require('node:child_process').spawn(process.env.SM_TEST_PYTHON, ['-c', {worker:?}], {{detached:true, stdio:['ignore','pipe','inherit']}}); child.on('error', e => {{throw e}}); child.stdout.once('data', data => process.stdout.write(data, () => {{if ({mode:?} === 'complete') process.exit(0)}}));"
+        );
+        let mut launch = prepared
+            .queue_binding()
+            .spawn(
+                &executable,
+                &["-e".into(), script.into()],
+                &environment,
+                &checkout,
+            )
+            .unwrap();
+        let supervisor = launch.id();
+        let stdout = launch.take_stdout().unwrap();
+        let mut stderr = launch.take_stderr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send((result, line));
+        });
+        let line = match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok((Ok(size), line)) if size > 0 => line,
+            result => {
+                drop(launch);
+                reader.join().unwrap();
+                let mut errors = String::new();
+                stderr.read_to_string(&mut errors).unwrap();
+                panic!("{mode}: worker startup failed: {result:?}; {errors}");
+            }
+        };
+        reader.join().unwrap();
+        let fields: Vec<u32> = line
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(fields.len(), 5, "{mode}: {line}");
+        assert_eq!(fields[0], fields[2], "worker did not enter its own group");
+        assert_eq!(fields[3], supervisor, "worker escaped the launch session");
+        match mode {
+            "complete" => assert!(launch.wait().unwrap().success()),
+            "drop" => drop(launch),
+            "supervisor-loss" => {
+                // SAFETY: this unreaped supervisor belongs to the fixture handle.
+                assert_eq!(unsafe { libc::kill(supervisor as i32, libc::SIGKILL) }, 0);
+                assert!(!launch.wait().unwrap().success());
+            }
+            "host-disconnect" => {
+                assert!(!launch.disconnect_host_for_test().unwrap().success());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !ProcessIdentity::capture(fields[0]).is_ok_and(|p| p.is_live()),
+            "{mode}: worker survived session cleanup"
+        );
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, fields[4] as u16)).is_ok(),
+            "{mode}: worker retained its listener"
+        );
+        assert!(
+            outside.0.try_wait().unwrap().is_none(),
+            "{mode}: outside process was killed"
+        );
+    }
+    // Other images still refuse adapter requests for a new session or group;
+    // raw group changes from command helpers also fail at the kernel boundary.
+    prepared.run(&prepared.path("application"), &[], &prepared.environment);
 }
 
 #[test]

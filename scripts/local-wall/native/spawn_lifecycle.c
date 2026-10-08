@@ -1,5 +1,14 @@
 #include "spawn_directory.c"
 #include "spawn_contained.c"
+#include <mach-o/dyld.h>
+extern const char wall_attached_spawn_executable[];
+static int attached_spawn_caller(void) {
+    if (!wall_attached_spawn_executable[0]) return 0;
+    char image[PATH_MAX], canonical[PATH_MAX];
+    uint32_t size = sizeof(image);
+    return !_NSGetExecutablePath(image, &size) && realpath(image, canonical) &&
+        !strcmp(canonical, wall_attached_spawn_executable);
+}
 struct future_descriptor { int fd, source, keep; };
 #define FUTURE_LIMIT (TRACKED_LIMIT + ACTION_LIMIT + 1)
 static struct future_descriptor *future_find(struct future_descriptor *future, int fd) {
@@ -44,6 +53,15 @@ static int spawn_process(pid_t *pid, const char *path,
     for (unsigned i = 0; i < TRACKED_LIMIT; ++i) original_flags[i] = -1;
     short spawn_flags = 0;
     if (attributes && (result = posix_spawnattr_getflags(attributes, &spawn_flags))) goto done;
+    // Pinned Opencode asks to detach ordinary Git and Bash commands. For that
+    // exact host-staged image, create a command group inside the host's private
+    // session. Other images still reject session/group requests.
+    int command_group = 0;
+    if (wall_contained_spawns && attached_spawn_caller() &&
+        (spawn_flags & (POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP))) {
+        command_group = 1;
+        spawn_flags = (spawn_flags & ~POSIX_SPAWN_SETSID) | POSIX_SPAWN_SETPGROUP;
+    }
     struct action_list *list = action_list(actions);
     if (wall_contained_spawns && actions && !list) { result = EACCES; goto done; }
     int tracked = 0, minimum = 3;
@@ -148,7 +166,7 @@ static int spawn_process(pid_t *pid, const char *path,
     prepared = exec_environment(environment, insert, notification[1]);
     if (!prepared) { result = errno; goto done; }
     pid_t child;
-    result = wall_contained_spawns ? contained_spawn(&child, resolved, list, attributes, spawn_flags,
+    result = wall_contained_spawns ? contained_spawn(&child, resolved, list, attributes, spawn_flags, command_group,
         argv, prepared, holds, hold_count, notification[1], minimum) :
         posix_spawn(&child, resolved, actions && !list ? actions : &clone, attributes, argv, prepared);
     if (!result && insert && !replaces_current) {

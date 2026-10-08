@@ -222,7 +222,7 @@ static void inherited_exec(const char *application, int method) {
 }
 
 static void inherited_spawn(const char *application) {
-    for (int defaults = 0; defaults < 4; ++defaults) {
+    for (int defaults = 0; defaults < 5; ++defaults) {
         int fd = listening(AF_INET);
         posix_spawn_file_actions_t actions;
         assert(posix_spawn_file_actions_init(&actions) == 0);
@@ -234,8 +234,17 @@ static void inherited_spawn(const char *application) {
         posix_spawnattr_t attributes;
         assert(posix_spawnattr_init(&attributes) == 0);
         if (defaults == 1 || defaults == 2) assert(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT) == 0);
+        if (defaults == 4) {
+            sigset_t reset, mask;
+            assert(!sigfillset(&reset) && !sigemptyset(&mask));
+            assert(!sigaddset(&mask, SIGUSR1));
+            assert(!posix_spawnattr_setsigdefault(&attributes, &reset));
+            assert(!posix_spawnattr_setsigmask(&attributes, &mask));
+            assert(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK));
+        }
         char *arguments[] = { (char *)application, "inherited-exec", "101", "102", "2", NULL };
-        char *environment[] = { "SM_WALL_RECOVERY_FD=0", NULL };
+        char *environment[] = { "SM_WALL_RECOVERY_FD=0",
+            defaults == 4 ? "SM_TEST_SIGNAL_DEFAULTS=1" : "SM_TEST_SIGNAL_DEFAULTS=0", NULL };
         pid_t child;
         assert(posix_spawn(&child, "/nonexistent-sm-adapter-test", &actions, &attributes, arguments, environment) == ENOENT);
         assert(fcntl(fd, F_GETFD) & FD_CLOEXEC);
@@ -290,7 +299,10 @@ static void inherited_tools(void) {
         assert(result == 0);
         close(fd);
         int status;
-        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+        pid_t waited = waitpid(child, &status, 0);
+        if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status))
+            fprintf(stderr, "tool %s wait=%d status=%x\n", programs[tool], waited, status);
+        assert(waited == child && WIFEXITED(status) && !WEXITSTATUS(status));
     }
 }
 
@@ -409,6 +421,12 @@ int main(int argc, char **argv) {
         return 37;
     }
     if (argc == 5 && !strcmp(argv[1], "inherited-exec")) {
+        if (getenv("SM_TEST_SIGNAL_DEFAULTS") && !strcmp(getenv("SM_TEST_SIGNAL_DEFAULTS"), "1")) {
+            sigset_t mask;
+            struct sigaction disposition;
+            assert(!sigprocmask(SIG_BLOCK, NULL, &mask) && sigismember(&mask, SIGUSR1) == 1);
+            assert(!sigaction(SIGUSR2, NULL, &disposition) && disposition.sa_handler == SIG_DFL);
+        }
         int first = atoi(argv[2]), second = atoi(argv[3]);
         int family = atoi(argv[4]);
         assert(listen(first, 8) == 0);

@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--control-fd", type=int, default=-1)
     parser.add_argument("--immutable-exec-dir", type=Path, action="append", default=[])
     parser.add_argument("--contained-spawns", action="store_true")
+    parser.add_argument("--attached-spawn-executable", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     endpoint = os.fsencode(args.endpoint)
@@ -38,6 +39,14 @@ def main():
     executable_roots = [root.resolve(strict=True) for root in args.immutable_exec_dir]
     if any(not root.is_dir() or root == Path("/") for root in executable_roots):
         parser.error("immutable executable roots must be narrow physical directories")
+    attached_executable = b""
+    if args.attached_spawn_executable:
+        target = args.attached_spawn_executable.resolve(strict=True)
+        if (not args.contained_spawns or not target.is_file()
+                or target.stat().st_nlink != 1
+                or not any(target.is_relative_to(root) for root in executable_roots)):
+            parser.error("attached spawns require an independent executable in an immutable root")
+        attached_executable = os.fsencode(target)
     source = Path(__file__).resolve().parent / "native"
     # Only numeric byte initializers enter generated C: no input can inject
     # source or options. The host stages the output in write-denied own state.
@@ -58,6 +67,8 @@ def main():
             + f"const uint16_t wall_control_port = {args.control_port};\n"
             + f"const int wall_control_fd = {args.control_fd};\n"
             + f"const int wall_contained_spawns = {int(args.contained_spawns)};\n"
+            + "const char wall_attached_spawn_executable[] = {"
+            + ",".join(map(str, attached_executable + b"\0")) + "};\n"
             + "const char wall_image_path[] = {"
             + ",".join(map(str, os.fsencode(output) + b"\0")) + "};\n"
             + root_definitions

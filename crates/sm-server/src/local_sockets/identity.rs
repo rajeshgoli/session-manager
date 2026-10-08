@@ -33,6 +33,7 @@ impl ProcessIdentity {
 pub(crate) struct ProcessSnapshot {
     pub identity: ProcessIdentity,
     pub exited: bool,
+    pub stopped: bool,
     pub parent_pid: u32,
     pub parent_unique_id: u64,
 }
@@ -58,6 +59,14 @@ struct CombinedInfo {
 const _: () = assert!(size_of::<UniqueInfo>() == 56);
 
 pub(crate) fn snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
+    process_snapshot(pid, false)
+}
+
+pub(crate) fn snapshot_for_cleanup(pid: u32) -> io::Result<ProcessSnapshot> {
+    process_snapshot(pid, true)
+}
+
+fn process_snapshot(pid: u32, include_exited: bool) -> io::Result<ProcessSnapshot> {
     let pid_signed = i32::try_from(pid).map_err(|_| denied())?;
     if pid_signed <= 0 {
         return Err(denied());
@@ -68,8 +77,8 @@ pub(crate) fn snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
     let copied = unsafe {
         libc::proc_pidinfo(
             pid_signed,
-            18, // PROC_PIDT_BSDINFOWITHUNIQID
-            0,
+            18,                        // PROC_PIDT_BSDINFOWITHUNIQID
+            u64::from(include_exited), // XNU: nonzero arg includes unreaped exited processes.
             info.as_mut_ptr().cast(),
             size_of::<CombinedInfo>() as i32,
         )
@@ -84,6 +93,7 @@ pub(crate) fn snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
     }
     Ok(ProcessSnapshot {
         exited: info.bsd.pbi_status == 5, // Darwin SZOMB: exited but not reaped.
+        stopped: info.bsd.pbi_status == 4, // Darwin SSTOP.
         identity: ProcessIdentity {
             pid,
             unique_id: info.unique.unique_id,

@@ -173,9 +173,22 @@ impl LaunchFiles {
                 private_directory(&state.join(path))?;
             }
             let folder = state.join("xdg/config/opencode");
+            let mut agent_config: serde_json::Value =
+                serde_json::from_str(&config.render_agent_config()?)?;
+            // Platform shells discard the injected adapter. Use the immutable
+            // ad-hoc signed shell already staged by the production wall.
+            agent_config["shell"] =
+                serde_json::json!(state.join("xdg/config/executables/queue-zsh"));
             host_write(
                 &folder.join("opencode.json"),
-                config.render_agent_config()?.as_bytes(),
+                serde_json::to_string_pretty(&agent_config)?.as_bytes(),
+                0o600,
+            )?;
+            // Config initialization creates this file even with no plugins.
+            // Pre-stage it before the wall makes configuration write-denied.
+            host_write(
+                &folder.join(".gitignore"),
+                b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore\n",
                 0o600,
             )?;
             host_write(

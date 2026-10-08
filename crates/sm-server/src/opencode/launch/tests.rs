@@ -144,6 +144,7 @@ fn preparation_writes_private_artifacts_and_reuses_the_password() {
     for name in [
         "server.secret",
         "xdg/config/opencode/opencode.json",
+        "xdg/config/opencode/.gitignore",
         "xdg/config/opencode/plugins/sm_judge.js",
         "xdg/config/opencode/node_modules/@opencode-ai/plugin/index.js",
         "xdg/config/opencode/package.json",
@@ -158,6 +159,10 @@ fn preparation_writes_private_artifacts_and_reuses_the_password() {
         serde_json::from_slice(&fs::read(state.join("xdg/config/opencode/opencode.json")).unwrap())
             .unwrap();
     assert_eq!(rendered["model"], "local/qwen3.8-flash-next");
+    assert_eq!(
+        rendered["shell"],
+        json!(state.join("xdg/config/executables/queue-zsh"))
+    );
     assert_eq!(rendered["permission"]["webfetch"], "allow");
     let sdk = expand_home(&fixture.config.state_root).join("plugin-sdk/1.17.9");
     assert_eq!(
