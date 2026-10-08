@@ -1,0 +1,13 @@
+{
+  "session_id": "54644ad1",
+  "conversation": "ses_ee4cf6f5fffehq7w5Eq1UopMys",
+  "checkout": "/Users/rajesh/worktrees/sm-2045-1855-live",
+  "branch": "2045-1855-local-fix",
+  "start_commit": "4a3a060d6c37b1ae03a7969c73098c811050f54a",
+  "provider": "opencode",
+  "tier": "Local",
+  "requested_effort": "high",
+  "effort_ignored": true,
+  "parent_publication_only": true,
+  "probe_retired": true
+}
