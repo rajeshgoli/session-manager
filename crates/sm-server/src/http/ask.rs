@@ -116,7 +116,7 @@ pub(super) async fn target(
             "live": !session.is_stopped(),
             "restorable": session.is_stopped() &&
                 is_primary_node(&session.node) &&
-                matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork"),
+                matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork" | "opencode"),
             "context_tokens": session.context_total_input_tokens,
         })),
         "default": choose_default(author.as_ref().is_some_and(|s| !s.is_stopped())),

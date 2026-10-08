@@ -129,7 +129,10 @@ fn unrestorable_reason(record: &SessionRecord) -> Option<String> {
             record.node
         ));
     }
-    if !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork") {
+    if !matches!(
+        record.provider.as_str(),
+        "claude" | "codex" | "codex-fork" | "opencode"
+    ) {
         return Some(format!("Provider {} cannot be restored", record.provider));
     }
     None

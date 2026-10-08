@@ -3162,12 +3162,16 @@ async fn client_session_models(
             detail: "Missing peer address".into(),
         })?;
     board::owner_guard(&state, request.headers(), peer, "GET", request.uri(), false)?;
-    if !matches!(query.provider.as_str(), "claude" | "codex" | "codex-fork") {
+    if !matches!(
+        query.provider.as_str(),
+        "claude" | "codex" | "codex-fork" | "opencode"
+    ) {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail: "Unsupported provider".into(),
         });
     }
+    let local = query.provider == "opencode";
     let runtime = TmuxRuntime::from_app_config(&state.config);
     let models = tokio::task::spawn_blocking(move || {
         let working_dir = match query.working_dir {
@@ -3178,7 +3182,12 @@ async fn client_session_models(
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
-    Ok(Json(json!({ "models": models })))
+    let empty_local = local && models.is_empty();
+    let mut response = json!({ "models": models });
+    if empty_local {
+        response["reason"] = json!("no local model loaded");
+    }
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4548,6 +4557,7 @@ async fn create_session_from_request(
     state: Arc<AppState>,
     mut payload: CreateCoreSessionRequest,
 ) -> Result<SessionRecord, ApiError> {
+    ensure_parent_can_create(&state, payload.parent_session_id.as_deref())?;
     if let Some(source) = payload.spawn_prompt_source.take() {
         let accepted = accept_spawn_brief(
             &state,
@@ -4638,6 +4648,7 @@ async fn spawn_session(
     else {
         return Ok(Json(json!({ "error": "Parent session not found" })));
     };
+    ensure_parent_can_create(&state, Some(&parent.id))?;
     if payload.track_seconds.is_some() {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -10276,6 +10287,12 @@ async fn create_btw_request(
     let Some(target) = resolve_session_or_registry_role(&state, &target_identifier)? else {
         return Err(ApiError::NotFound("Target session not found"));
     };
+    if target.provider == "opencode" {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "provider opencode does not support sm what".into(),
+        });
+    }
     ensure_btw_session_live(&target, "Target")?;
     ensure_core_runtime_session_node_supported(&state, &target.id)?;
 
@@ -15663,6 +15680,12 @@ enum ApiError {
 }
 
 fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
+    if let Some(refusal) = error.downcast_ref::<crate::opencode::launch::AdmissionError>() {
+        return ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: refusal.to_string(),
+        };
+    }
     if let Some(unknown) = error.downcast_ref::<crate::sessions::SpawnAcceptanceUnknown>() {
         return ApiError::StatusBody {
             status: StatusCode::CONFLICT,
@@ -15749,6 +15772,21 @@ fn ensure_core_writes_enabled(state: &AppState) -> Result<(), ApiError> {
     })
 }
 
+fn ensure_parent_can_create(state: &AppState, parent_id: Option<&str>) -> Result<(), ApiError> {
+    if parent_id
+        .map(|id| state.session_store.get_session(id))
+        .transpose()?
+        .flatten()
+        .is_some_and(|parent| parent.provider == "opencode")
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "local agents cannot spawn agents".into(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_core_runtime_provider_supported(
     payload: &CreateCoreSessionRequest,
 ) -> Result<(), ApiError> {
@@ -15758,7 +15796,7 @@ fn ensure_core_runtime_provider_supported(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("claude");
-    if matches!(provider, "claude" | "codex" | "codex-fork") {
+    if matches!(provider, "claude" | "codex" | "codex-fork" | "opencode") {
         return Ok(());
     }
     Err(ApiError::Status {
@@ -24217,6 +24255,126 @@ mod tests {
                 assert_eq!(job["requester_name"], Value::Null);
                 assert!(job["notify_name"].is_string());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_public_model_catalog_tracks_only_the_ready_loaded_model() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.sm_send.db_path = PathBuf::from(&config.paths.state_file)
+            .with_file_name("local-model.db")
+            .display()
+            .to_string();
+        let host = crate::local_model::register_live(&config).unwrap();
+        let app = router(AppState::new(config.clone()));
+        let db = Connection::open(&config.sm_send.db_path).unwrap();
+        for (model_state, expected) in [
+            (None, json!([])),
+            (Some("ready"), json!(["loaded-model"])),
+            (Some("draining"), json!([])),
+            (Some("loading"), json!([])),
+        ] {
+            db.execute("DELETE FROM local_model", []).unwrap();
+            if let Some(model_state) = model_state {
+                db.execute("INSERT INTO local_model (singleton,key,server,identifier,seats,context,reservation_bytes,measured_peak_bytes,state,desired,state_since,endpoint) VALUES (1,'test','mtplx','loaded-model',1,200000,0,0,?1,1,'now','http://127.0.0.1:8000')", [model_state]).unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/client/session-models?provider=opencode",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["models"], expected);
+            assert_eq!(
+                body["reason"],
+                if expected == json!([]) {
+                    json!("no local model loaded")
+                } else {
+                    Value::Null
+                }
+            );
+        }
+        assert!(host.record().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn opencode_public_creation_refuses_local_parents_and_what_before_work_is_queued() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.rust_core.fixture_writes_enabled = true;
+        let mut data: Value =
+            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        let parent = data["sessions"][0].as_object_mut().unwrap();
+        parent.insert("provider".into(), json!("opencode"));
+        parent.insert("opencode".into(), json!({"port":18500,"state_dir":"/private/tmp/opencode-test/local","version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"}));
+        parent.insert("provider_resume_id".into(), json!("ses_local"));
+        let parent_id = parent["id"].as_str().unwrap().to_owned();
+        fs::write(&config.paths.state_file, serde_json::to_vec(&data).unwrap()).unwrap();
+        let state_file = config.paths.state_file.clone();
+        let state = AppState::new(config);
+        let app = router(state.clone());
+        for (uri, payload) in [
+            (
+                "/sessions".to_owned(),
+                json!({"provider":"claude","parent_session_id":parent_id,"initial_message":"must not launch","spawn_prompt_source":{"kind":"positional"}}),
+            ),
+            (
+                "/sessions/spawn".to_owned(),
+                json!({"provider":"codex-fork","parent_session_id":parent_id,"prompt":"must not launch","ticket":1956,"ticket_repo":"rajeshgoli/session-manager"}),
+            ),
+            (
+                format!("/sessions/{parent_id}/what"),
+                json!({"prompt":"must not ask"}),
+            ),
+        ] {
+            let mut request = local_request(Method::POST, &uri, Body::from(payload.to_string()));
+            request
+                .headers_mut()
+                .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            let (status, body) = response_json(response).await;
+            if uri.ends_with("/what") {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(body["detail"], "provider opencode does not support sm what");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            }
+        }
+        assert_eq!(state.session_store.list_sessions(true).unwrap().len(), 1);
+        let data: Value = serde_json::from_slice(&fs::read(state_file).unwrap()).unwrap();
+        assert!(data["session_runtime_launches"]
+            .as_array()
+            .is_none_or(Vec::is_empty));
+        assert!(btw_store(&state)
+            .unwrap()
+            .active_for_target(&parent_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn opencode_public_creation_gate_and_admission_conflicts() {
+        let payload: CreateCoreSessionRequest =
+            serde_json::from_value(json!({"provider":"opencode"})).unwrap();
+        ensure_core_runtime_provider_supported(&payload).unwrap();
+        for detail in [
+            "no local model loaded",
+            "no local seat free (1/1 used by local)",
+            "model wrong is not loaded; loaded: actual",
+            "no local port free",
+        ] {
+            let error = core_session_create_api_error(
+                crate::opencode::launch::AdmissionError(detail.into()).into(),
+            );
+            let (status, message) = api_error_status_detail(error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(message, detail);
         }
     }
 

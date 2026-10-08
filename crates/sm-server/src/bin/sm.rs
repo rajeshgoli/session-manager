@@ -106,6 +106,8 @@ enum Command {
     SubagentStop(EmptyArgs),
     Subagents(SessionIdArgs),
     Claude(ProviderLaunchArgs),
+    #[command(alias = "opencode")]
+    Local(ProviderLaunchArgs),
     Codex(ProviderLaunchArgs),
     #[command(name = "codex-original", alias = "codex-stock")]
     CodexOriginal(ProviderLaunchArgs),
@@ -1067,6 +1069,9 @@ fn run() -> Result<()> {
                         .or_else(|| payload["id"].as_str())
                         .ok_or_else(|| anyhow!("spawn response missing id"))?
                 );
+                if provider == "opencode" && args.effort.is_some() {
+                    println!("(effort ignored: local)");
+                }
             }
         }
         Command::New(args) => launch_provider_session(
@@ -1085,6 +1090,12 @@ fn run() -> Result<()> {
         Command::Codex(args) => launch_provider_session(
             &client,
             launch_provider_for_alias("codex")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::Local(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("local")?,
             args.working_dir,
             args.node,
         )?,
@@ -3963,6 +3974,7 @@ fn launch_provider_for_alias(alias: &str) -> Result<&'static str> {
         "codex-original" | "codex-stock" => Ok("codex"),
         "codex" | "codex-fork" | "codex_fork" | "codex-2" => Ok("codex-fork"),
         "codex-app" => Ok("codex-app"),
+        "local" | "opencode" => Ok("opencode"),
         _ => bail!("unsupported launch alias {alias}"),
     }
 }
@@ -7819,6 +7831,8 @@ mod tests {
         );
         assert_eq!(launch_provider_for_alias("codex-2").unwrap(), "codex-fork");
         assert_eq!(launch_provider_for_alias("codex-app").unwrap(), "codex-app");
+        assert_eq!(launch_provider_for_alias("local").unwrap(), "opencode");
+        assert_eq!(launch_provider_for_alias("opencode").unwrap(), "opencode");
         assert!(launch_provider_for_alias("codex-legacy").is_err());
     }
 
@@ -7840,6 +7854,18 @@ mod tests {
 
     #[test]
     fn spawn_cli_provider_aliases_match_launch_aliases() {
+        for alias in ["local", "opencode"] {
+            let cli = Cli::try_parse_from(["sm", alias, "/repo"]).unwrap();
+            assert!(matches!(cli.command, Command::Local(_)));
+            let cli = Cli::try_parse_from(["sm", "spawn", alias, "brief"]).unwrap();
+            let Command::Spawn(args) = cli.command else {
+                panic!("expected spawn");
+            };
+            assert_eq!(
+                launch_provider_for_alias(&args.provider).unwrap(),
+                "opencode"
+            );
+        }
         let cli = Cli::try_parse_from([
             "sm",
             "spawn",

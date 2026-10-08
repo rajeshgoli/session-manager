@@ -69,6 +69,15 @@ fn legacy_spawns_and_handoff_successors_count_as_started_by_sm() {
 
 #[test]
 fn each_exclusion_keeps_it() {
+    let mut local = agent();
+    local.provider = "opencode".into();
+    local.opencode = Some(crate::opencode::RuntimeBinding {
+        port: 18500,
+        state_dir: "/private/tmp/auto-retire-local".into(),
+        version: "1.17.9".into(),
+        model_base_url: "http://127.0.0.1:8000/v1".into(),
+    });
+    assert_eq!(check(&local, &context()), None);
     let context_with = |edit: &dyn Fn(&mut Context)| {
         let mut context = context();
         edit(&mut context);
