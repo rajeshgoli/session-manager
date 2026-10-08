@@ -198,6 +198,9 @@ impl UsageReportStore {
         let mut accounts = BTreeMap::<String, UsageAccountReport>::new();
 
         for window in selected {
+            if window.account_key == "local" {
+                continue;
+            }
             let metadata = account_meta
                 .get(&window.account_key)
                 .cloned()
@@ -386,6 +389,7 @@ fn load_account_metadata(connection: &Connection) -> Result<BTreeMap<String, Acc
                    AND account_timeline.to_ts IS NULL
                )
         FROM accounts
+        WHERE accounts.provider IN ('claude', 'codex')
         ORDER BY accounts.account_key
         "#,
     )?;

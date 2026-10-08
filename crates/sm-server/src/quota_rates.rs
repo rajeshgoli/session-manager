@@ -97,6 +97,13 @@ pub fn family_label(family: &str) -> &'static str {
 }
 
 pub fn pricing(provider: &str, model: &str) -> Pricing {
+    if matches!(provider, "local" | "opencode") {
+        return Pricing {
+            family: "local",
+            rate: 0.0,
+            needs_note: false,
+        };
+    }
     let lower = model.to_ascii_lowercase();
     let matched = FAMILIES
         .iter()
@@ -144,6 +151,29 @@ mod tests {
 
     fn close(left: f64, right: f64) -> bool {
         (left - right).abs() < 1e-9
+    }
+
+    #[test]
+    fn local_models_have_zero_quota_weight_without_unknown_model_notes() {
+        for provider in ["local", "opencode"] {
+            for model in ["local/qwen", "claude-opus-5", "gpt-6-sol", "unknown"] {
+                let price = pricing(provider, model);
+                assert_eq!(price.rate, 0.0);
+                assert!(!price.needs_note);
+                assert_eq!(
+                    fitted_percent(
+                        provider,
+                        model,
+                        &Tokens {
+                            input: 1_000_000,
+                            output: 100_000,
+                            ..Tokens::default()
+                        }
+                    ),
+                    0.0
+                );
+            }
+        }
     }
 
     #[test]

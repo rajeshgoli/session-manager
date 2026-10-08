@@ -195,6 +195,7 @@ fn prune(conn: &Connection, cutoff_ms: i64) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
     Claude,
+    Opencode,
     CodexRollout,
     CodexFork,
 }
@@ -203,6 +204,7 @@ impl Provider {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "claude" => Some(Self::Claude),
+            "opencode" => Some(Self::Opencode),
             "codex" => Some(Self::CodexRollout),
             "codex-fork" => Some(Self::CodexFork),
             _ => None,
@@ -212,6 +214,7 @@ impl Provider {
     fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::Opencode => "opencode",
             Self::CodexRollout => "codex",
             Self::CodexFork => "codex-fork",
         }
@@ -673,7 +676,7 @@ impl Parser {
             return;
         };
         match self.provider {
-            Provider::Claude => self.claude_line(&value),
+            Provider::Claude | Provider::Opencode => self.claude_line(&value),
             Provider::CodexRollout => self.rollout_line(&value),
             Provider::CodexFork => self.fork_line(&value),
         }
@@ -685,7 +688,7 @@ impl Parser {
     fn wanted(&self, bytes: &[u8]) -> bool {
         let head = &bytes[..bytes.len().min(LINE_HEAD_BYTES)];
         let needles: &[&[u8]] = match self.provider {
-            Provider::Claude => &[
+            Provider::Claude | Provider::Opencode => &[
                 b"\"type\":\"user\"",
                 b"\"role\":\"assistant\"",
                 b"\"turn_duration\"",

@@ -512,6 +512,7 @@ impl SessionStore {
             let provider = match record.provider.as_str() {
                 "claude" => UsageProvider::Claude,
                 "codex" | "codex-fork" => UsageProvider::Codex,
+                "opencode" => UsageProvider::Local,
                 _ => continue,
             };
             self.record_session_account_key(&record.id, provider, observed_at)?;
