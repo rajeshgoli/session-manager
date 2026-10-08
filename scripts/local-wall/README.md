@@ -384,13 +384,19 @@ For the exact host-staged `opencode` executable, preparation compiles an
 attached-spawn compatibility setting into the immutable adapter. Opencode
 1.17.9 requests detached execution for ordinary Git and Bash commands; the
 adapter replaces a new session with a new command group inside the host-created
-private session. Host preparation selects `--command-groups` for Opencode.
+private session. Host preparation selects `--command-groups PATH` with the
+exact immutable Opencode path. A kernel process-path filter admits `setpgid`
+only while the adapter's fork still runs that runtime image before exec.
+Executed tools cannot change groups, even after their parents exit. The profile
+also denies re-executing the privileged runtime from within the wall. Only the
+host's immutable `launch-env` copy can execute it, and only sandbox-exec can
+enter that copy. This entry sets the adapter loader setting after sandbox-exec
+discards inherited loader settings; ordinary `/usr/bin/env` stays usable.
 Ordinary kernel group cancellation reaches children, grandchildren and workers
 whose parents have already exited; unrelated commands keep running.
 This setting is selected by the physical
 executable path, never argv, environment or a queue request. Other executables
-retain the adapter's EPERM refusal. Raw `setpgid`, where admitted, cannot move a
-process out of the private session. Kernel denials prevent a new session through
+retain the adapter's EPERM refusal. Kernel denials prevent a new session through
 raw syscalls or an adapter bypass. Verified shutdown removes the whole private
 session. PID enumeration happens only in trusted host cleanup; the guest wall
 still denies PID listing, outside process metadata, environment reads and signals.

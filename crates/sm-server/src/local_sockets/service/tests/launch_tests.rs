@@ -445,17 +445,19 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
     }
     let mut outside = OutsideProcess(Command::new("/bin/sleep").arg("120").spawn().unwrap());
     for mode in ["complete", "drop", "supervisor-loss", "host-disconnect"] {
-        // The worker changes groups and, on normal completion, is reparented.
+        // The trusted runtime creates a separate command group before exec.
+        // On normal completion the worker is reparented.
         // Entire-launch cleanup must remove it without touching the sentinel.
+        let worker = "import os,socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(os.getpid(),os.getppid(),os.getpgrp(),os.getsid(0),s.getsockname()[1],flush=True); time.sleep(60)";
         let script = format!(
-            "import os,socket,time\nr,w=os.pipe(); p=os.fork()\nif p:\n os.close(w); assert os.read(r,1)==b'R'; os.close(r)\n if {mode:?} == 'complete': os._exit(0)\n time.sleep(60)\nelse:\n os.close(r); os.setpgid(0,0)\n s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\n print(os.getpid(),os.getppid(),os.getpgrp(),os.getsid(0),s.getsockname()[1],flush=True)\n os.write(w,b'R'); os.close(w); time.sleep(60)"
+            "const child = require('node:child_process').spawn(process.env.SM_TEST_PYTHON, ['-c', {worker:?}], {{detached:true, stdio:['ignore','pipe','inherit']}}); child.on('error', e => {{throw e}}); child.stdout.once('data', data => process.stdout.write(data, () => {{if ({mode:?} === 'complete') process.exit(0)}}));"
         );
         let mut launch = prepared
             .queue_binding()
             .spawn(
-                &prepared.path("python"),
-                &["-c".into(), script.into()],
-                &prepared.environment,
+                &executable,
+                &["-e".into(), script.into()],
+                &environment,
                 &checkout,
             )
             .unwrap();
@@ -513,7 +515,7 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
         );
     }
     // Other images still refuse adapter requests for a new session or group;
-    // raw group changes, when admitted, remain inside the private session.
+    // raw group changes from command helpers also fail at the kernel boundary.
     prepared.run(&prepared.path("application"), &[], &prepared.environment);
 }
 

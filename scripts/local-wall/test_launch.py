@@ -29,6 +29,10 @@ def prepare(args):
     python_root = Path(os.path.commonpath([python, Path(sys.base_prefix).resolve()]))
     library = state / "xdg/config/adapter.dylib"
     opencode = executables / "opencode"
+    entry = executables / "launch-env"
+    shutil.copyfile("/usr/bin/env", entry)
+    entry.chmod(0o500)
+    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(entry)], check=True)
     attached_arguments = []
     if args.opencode_binary:
         shutil.copyfile(args.opencode_binary.resolve(strict=True), opencode)
@@ -68,7 +72,7 @@ def prepare(args):
         "--immutable-exec-dir", str(python_root), "--read-only-dir", str(python_root),
     ])
     profile = state / "wall.sb"
-    profile_args.command_groups = bool(args.opencode_binary)
+    profile_args.command_groups = opencode if args.opencode_binary else None
     profile.write_text(wall.generate(profile_args, wall.listening_ports(), len(wall.user_temp())))
     text_command = Path(tmp) / "text-command"
     text_command.write_text("exit 37\n")
@@ -80,7 +84,6 @@ def prepare(args):
         "SM_TEST_ISOLATION_ROOT": str(Path(tmp) / "isolation"),
         "SM_TEST_RUST_APPLICATION": str(executables / "rust-application"),
         "SM_TEST_PYTHON": str(python), "SM_TEST_MUTABLE": tmp,
-        "SM_TEST_COMMAND_GROUPS": "1" if args.opencode_binary else "",
         "SM_TEST_FD_PROBE": str(executables / "descriptor-probe"),
         "SM_TEST_CONTAINED": "1",
         "SM_TEST_SHELL": str(shell),

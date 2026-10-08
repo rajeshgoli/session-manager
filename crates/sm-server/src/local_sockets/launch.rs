@@ -144,7 +144,7 @@ impl LaunchBinding {
             })
             .args([OsStr::new("sandbox-exec"), OsStr::new("-f")])
             .arg(&self.profile)
-            .arg("/usr/bin/env")
+            .arg(host_file(&self.supervisor.with_file_name("launch-env"))?)
             .arg(loader)
             .arg(executable)
             .args(arguments)

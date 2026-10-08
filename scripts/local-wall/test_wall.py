@@ -292,8 +292,17 @@ class WallTests(unittest.TestCase):
                          "assert subprocess.check_output(['/usr/sbin/sysctl', '-n', 'kern.osrelease']).strip()",
                          True, "admitted CPU and OS kernel queries")
             self.args.contained_processes = True
-            self.args.command_groups = True
+            executable_root = self.state / "xdg/config/executables"
+            executable_root.mkdir()
+            command_image = executable_root / "opencode"
+            command_image.write_text("immutable runtime fixture")
+            (executable_root / "launch-env").write_text("immutable launch entry fixture")
+            self.args.immutable_exec_dir = [str(executable_root)]
+            self.args.command_groups = command_image
             self.profile.write_text(wall.generate(self.args, set(), 65))
+            self.sandbox("import ctypes; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True); "
+                         "assert lib.setpgid(0,0) == -1; assert ctypes.get_errno() == 1",
+                         True, "command helpers cannot leave their cancellation group")
             self.sandbox(script, False, "contained launch still denies outside environment")
             self.sandbox("import ctypes; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True); "
                          "buf=ctypes.create_string_buffer(1024); "

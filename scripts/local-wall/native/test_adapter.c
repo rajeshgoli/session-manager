@@ -442,9 +442,7 @@ int main(int argc, char **argv) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         assert(syscall(SYS_setsid) == -1 && errno == EPERM);
-        if (getenv("SM_TEST_COMMAND_GROUPS") && getenv("SM_TEST_COMMAND_GROUPS")[0])
-            assert(syscall(SYS_setpgid, 0, 0) == 0);
-        else assert(syscall(SYS_setpgid, 0, 0) == -1 && errno == EPERM);
+        assert(syscall(SYS_setpgid, 0, 0) == -1 && errno == EPERM);
 #pragma clang diagnostic pop
         posix_spawnattr_t attributes;
         assert(!posix_spawnattr_init(&attributes));

@@ -193,6 +193,16 @@ def generate(args, listeners, minimum_tmp_length):
             raise ValueError("immutable executables must not overlap the checkout")
         if any(path == p or below(path, p) or below(p, path) for p in mutable):
             raise ValueError("immutable executables must not overlap mutable state")
+    command_image = None
+    if args.command_groups:
+        command_image = physical(args.command_groups)
+        if (not command_image.is_file() or command_image.stat().st_nlink != 1
+                or not any(below(command_image, root) for root in protected_writes)):
+            raise ValueError("command groups require an independent immutable executable")
+        entry_image = physical(command_image.with_name("launch-env"))
+        if (not entry_image.is_file() or entry_image.stat().st_nlink != 1
+                or entry_image.parent != command_image.parent):
+            raise ValueError("command groups require an independent immutable launch entry")
     if args.broker_dir:
         broker = physical(args.broker_dir)
         if not broker.is_dir() or not below(broker, state / "tmp"):
@@ -289,6 +299,18 @@ def generate(args, listeners, minimum_tmp_length):
     if args.contained_processes:
         blocked = "SYS_setsid SYS_posix_spawn" if args.command_groups else "SYS_setsid SYS_setpgid SYS_posix_spawn"
         lines.append(f"(deny syscall-unix (syscall-number {blocked}))")
+        if command_image:
+            # Only the trusted runtime's pre-exec fork can create a command
+            # group. Executed helpers cannot regroup, including after reparenting.
+            lines.append("(deny syscall-unix (require-all (syscall-number SYS_setpgid) "
+                         f"(require-not (process-path {quoted(command_image)}))))")
+            # A helper must not regain that privilege by executing the runtime.
+            # The host enters through a private copy of env. Only sandbox-exec
+            # can enter that image; nested sandbox entry fails.
+            lines.append(f"(deny process-exec (require-all (literal {quoted(command_image)}) "
+                         f"(require-not (process-path {quoted(entry_image)}))))")
+            lines.append(f"(deny process-exec (require-all (literal {quoted(entry_image)}) "
+                         '(require-not (process-path "/usr/bin/sandbox-exec"))))')
     # Kernel process-argument queries can expose another process's initial
     # environment without reading its credential files. Admit only runtime
     # hardware/OS facts, never process argument/environment or mutation queries.
@@ -369,8 +391,8 @@ def parser():
                         help="host-approved credential-free toolchain or dedicated log directory")
     result.add_argument("--broker-dir", help="host-owned endpoint directory inside private state/tmp")
     result.add_argument("--broker-endpoint", help="exact host-owned short endpoint alias resolving inside broker-dir")
-    result.add_argument("--command-groups", action="store_true",
-                        help="allow command groups inside the host-owned private session")
+    result.add_argument("--command-groups", type=Path,
+                        help="immutable runtime allowed to create command groups before exec")
     result.add_argument("--contained-processes", action="store_true",
                         help="require fork/exec adapter spawns; prevent descendants leaving the host session")
     result.add_argument("--immutable-exec-dir", action="append", default=[],

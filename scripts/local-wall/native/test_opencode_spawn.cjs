@@ -30,6 +30,7 @@ async function main() {
       `"$SM_TEST_PYTHON" -c 'import os,time; p=os.fork(); ` +
       `os._exit(0) if p else None; ` +
       `exec("while os.getppid() != 1: time.sleep(0.01)"); ` +
+      `exec("try: os.setpgid(0,0)\\nexcept PermissionError: pass\\nelse: raise AssertionError(\\\"helper escaped command group\\\")"); ` +
       `open("${prefix}-orphan.txt","w").write(str(os.getpid())); time.sleep(60)'; wait`,
     ], { detached: true, stdio: "ignore" })
     child.on("error", (error) => { throw error })
@@ -68,6 +69,17 @@ async function main() {
     sibling.on("exit", resolve)
     process.kill(-sibling.pid, "SIGTERM")
   })
+  // Re-executing the privileged runtime must not let a helper regroup.
+  for (const image of [process.execPath, require("node:path").join(require("node:path").dirname(process.execPath), "launch-env")]) {
+    await new Promise((resolve, reject) => {
+      try {
+        const helper = spawn(image, ["-e", "process.exit(0)"], { stdio: "ignore" })
+        helper.on("error", error => error.code === "EPERM" ? resolve() : reject(error))
+        helper.on("exit", () => reject(new Error("command helper re-executed privileged image")))
+      } catch (error) { error.code === "EPERM" ? resolve() : reject(error) }
+    })
+  }
+  await assert.rejects(run("/usr/bin/env", [process.execPath, "-e", "process.exit(0)"]), /exit (126|127)/)
 }
 
 main().catch((error) => { console.error(error); process.exit(1) })
