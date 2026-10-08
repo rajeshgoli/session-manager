@@ -48,6 +48,10 @@ fn existing_provider_records_omit_new_optional_fields_and_keep_raw_state() {
             .as_object()
             .unwrap()
             .contains_key("brief_part_id"));
+        assert!(!serialized
+            .as_object()
+            .unwrap()
+            .contains_key("opencode_restore_terminal_metadata"));
     }
 }
 

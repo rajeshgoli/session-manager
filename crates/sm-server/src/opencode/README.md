@@ -222,6 +222,11 @@ that reserves their seat and port until cleanup succeeds. Startup recovery and
 the reader supervisor retry teardown without creating a conversation or sending
 the brief. Restaging cancels that agent's waiting queue jobs and retains their
 completion notifications; running jobs still block replacement until stopped.
+Restore launch records retain the prior terminal metadata until the attempt
+finishes. Confirmed failure reinstates it only if the same credential and
+conversation remain authoritative and no newer terminal decision exists. This
+preserves automatic restore-on-send after a failed attempt, including cleanup
+recovered after restart. Successful restore clears obsolete terminal metadata.
 
 Boot and reader recovery preserve transport uncertainty. Only a confirmed
 missing session or exhausted serve window marks the runtime stopped; a pending

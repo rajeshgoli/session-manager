@@ -36,6 +36,7 @@ struct StubState {
     hidden: usize,
     lose_post_reply: bool,
     rename_error: bool,
+    history_error: bool,
     before_lookup: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -89,6 +90,9 @@ impl Stub {
 
     pub(crate) fn lose_post_reply(&self) {
         self.state.lock().unwrap().lose_post_reply = true;
+    }
+    pub(crate) fn fail_history(&self) {
+        self.state.lock().unwrap().history_error = true;
     }
 
     pub(crate) fn before_lookup(&self, hook: Box<dyn FnOnce() + Send>) {
@@ -181,7 +185,11 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
             (404, Value::Null)
         }
     } else if method == "GET" && path.starts_with("/session/") && path.ends_with("/message") {
-        (200, json!([]))
+        if state.history_error {
+            (503, Value::Null)
+        } else {
+            (200, json!([]))
+        }
     } else if method == "POST" && path.ends_with("/prompt_async") {
         // Real opencode appends on duplicate message IDs. A naive retry fails.
         state
