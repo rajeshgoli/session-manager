@@ -1693,6 +1693,7 @@ impl SessionStore {
             brief_message_id: None,
             brief_part_id: None,
             credential_rotation_id: Some(rotation.id.clone()),
+            opencode_restore_terminal_metadata: None,
             restore_authorized: false,
             initial_message: None,
             model: session.model.clone(),
@@ -4708,6 +4709,7 @@ impl SessionStore {
             brief_part_id: None,
             credential_rotation_id: None,
             restore_authorized: false,
+            opencode_restore_terminal_metadata: None,
             initial_message: runtime_initial_message,
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
@@ -5939,6 +5941,7 @@ impl SessionStore {
             // clears a retired/killed completion marker. Startup recovery may
             // continue only this authorized transition.
             restore_authorized: true,
+            opencode_restore_terminal_metadata: None,
             initial_message: None,
             model: record.model.clone(),
             reasoning_effort: record.reasoning_effort.clone(),
@@ -16046,6 +16049,10 @@ pub struct SessionRuntimeLaunchRecord {
     /// terminal-fenced when their session has a retired/killed marker.
     #[serde(default)]
     pub restore_authorized: bool,
+    /// Prior terminal state, retained until an Opencode restore is applied or
+    /// confirmed failed. Cleanup must not replace a newer lifecycle decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_restore_terminal_metadata: Option<Value>,
     #[serde(default)]
     pub initial_message: Option<String>,
     #[serde(default)]

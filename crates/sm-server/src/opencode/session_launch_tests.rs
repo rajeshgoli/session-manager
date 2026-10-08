@@ -13,6 +13,8 @@ struct Driver {
     old_conversations: AtomicUsize,
     ready: AtomicBool,
     fail_start: AtomicBool,
+    fail_history: AtomicBool,
+    fail_attach: AtomicBool,
     fail_stop: AtomicBool,
     uncertain_present: AtomicBool,
     lost_reply: AtomicBool,
@@ -73,6 +75,9 @@ impl OpencodeLaunchDriver for Driver {
             .any(|launch| launch.session_id == record.id && launch.status == "launching"));
         self.starts.fetch_add(1, Ordering::AcqRel);
         let server = Stub::new_on_port(record.opencode.as_ref().unwrap().port);
+        if self.fail_history.load(Ordering::Acquire) {
+            server.fail_history();
+        }
         if self.lost_reply.swap(false, Ordering::AcqRel) {
             server.lose_post_reply();
         }
@@ -107,6 +112,9 @@ impl OpencodeLaunchDriver for Driver {
         }
         if let Some(hook) = self.attach_hook.lock().unwrap().take() {
             hook(record);
+        }
+        if self.fail_attach.load(Ordering::Acquire) {
+            anyhow::bail!("injected attachment failure")
         }
         Ok(())
     }
@@ -160,6 +168,8 @@ impl Fixture {
             old_conversations: AtomicUsize::new(0),
             ready: AtomicBool::new(true),
             fail_start: AtomicBool::new(false),
+            fail_history: AtomicBool::new(false),
+            fail_attach: AtomicBool::new(false),
             fail_stop: AtomicBool::new(false),
             uncertain_present: AtomicBool::new(false),
             lost_reply: AtomicBool::new(false),
@@ -200,6 +210,21 @@ impl Fixture {
     }
     fn launches(&self) -> Vec<SessionRuntimeLaunchRecord> {
         session_runtime_launch_records(&self.store.load_parsed_state().unwrap().raw).unwrap()
+    }
+    fn auto_retire(&self) -> Value {
+        assert!(matches!(
+            self.store
+                .retire_core_session_authorized("local1", RetireAuthority::auto_retire(60), None)
+                .unwrap(),
+            CoreRetireOutcome::Retired(_)
+        ));
+        assert!(self
+            .store
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .auto_retired());
+        opencode_terminal_metadata(&self.store.load_parsed_state().unwrap().raw, "local1").unwrap()
     }
 }
 
@@ -360,6 +385,115 @@ fn opencode_restore_clears_old_terminal_metadata_and_preserves_conversation() {
         assert!(
             f.store.load_parsed_state().unwrap().raw["sessions"][0][field].is_null(),
             "{field} retained"
+        );
+    }
+}
+
+#[test]
+fn opencode_failed_restore_preserves_auto_retirement_and_can_retry_after_reopen() {
+    for stage in ["start", "history", "reader", "attach"] {
+        let f = Fixture::new();
+        let original = f.create("local1", Some("brief")).unwrap();
+        let terminal = f.auto_retire();
+        f.driver
+            .fail_start
+            .store(stage == "start", Ordering::Release);
+        f.driver
+            .fail_history
+            .store(stage == "history", Ordering::Release);
+        f.driver
+            .fail_attach
+            .store(stage == "attach", Ordering::Release);
+        if stage == "reader" {
+            f.store
+                .register_opencode_reader_start(Arc::new(|_| {
+                    anyhow::bail!("injected reader failure")
+                }))
+                .unwrap();
+        }
+        assert!(
+            f.store
+                .restore_core_session_with_runtime("local1", &f.runtime)
+                .is_err(),
+            "{stage}"
+        );
+        let reopened = SessionStore::new(f.driver.path.clone())
+            .with_delivery_runtime(Some(f.runtime.clone()))
+            .with_opencode_launch_driver(f.driver.clone());
+        let failed = reopened.get_session("local1").unwrap().unwrap();
+        assert!(failed.is_stopped() && failed.auto_retired(), "{stage}");
+        assert_eq!(
+            opencode_terminal_metadata(&reopened.load_parsed_state().unwrap().raw, "local1")
+                .unwrap(),
+            terminal
+        );
+        assert_eq!(
+            f.launches()[1].opencode_restore_terminal_metadata.as_ref(),
+            Some(&terminal)
+        );
+        assert_eq!(f.launches()[1].status, "failed");
+        f.driver.fail_start.store(false, Ordering::Release);
+        f.driver.fail_history.store(false, Ordering::Release);
+        f.driver.fail_attach.store(false, Ordering::Release);
+        let CoreRestoreOutcome::Restored(restored) = reopened
+            .restore_core_session_with_runtime("local1", &f.runtime)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("retry refused: {stage}")
+        };
+        assert!(!restored.auto_retired());
+        assert_eq!(restored.provider_resume_id, original.provider_resume_id);
+        assert_eq!((f.driver.posts(), f.driver.conversations()), (1, 1));
+    }
+}
+
+#[test]
+fn opencode_restore_failure_retains_terminal_snapshot_until_uncertain_teardown_resolves() {
+    for newer_retirement in [false, true] {
+        let f = Fixture::new();
+        f.create("local1", None).unwrap();
+        let terminal = f.auto_retire();
+        let driver = f.driver.clone();
+        *f.driver.start_hook.lock().unwrap() = Some(Box::new(move |_| {
+            driver.fail_stop.store(true, Ordering::Release);
+        }));
+        f.driver.fail_start.store(true, Ordering::Release);
+        assert!(f
+            .store
+            .restore_core_session_with_runtime("local1", &f.runtime)
+            .is_err());
+        assert_eq!(f.launches()[1].status, "teardown_pending");
+        let reopened = SessionStore::new(f.driver.path.clone())
+            .with_delivery_runtime(Some(f.runtime.clone()))
+            .with_opencode_launch_driver(f.driver.clone());
+        assert!(!reopened
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+        let expected = if newer_retirement {
+            reopened.retire_core_session("local1", None).unwrap();
+            opencode_terminal_metadata(&reopened.load_parsed_state().unwrap().raw, "local1")
+                .unwrap()
+        } else {
+            terminal
+        };
+        f.driver.fail_stop.store(false, Ordering::Release);
+        reopened.recover_opencode_teardowns().unwrap();
+        assert_eq!(f.launches()[1].status, "failed");
+        assert_eq!(
+            opencode_terminal_metadata(&reopened.load_parsed_state().unwrap().raw, "local1")
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened
+                .get_session("local1")
+                .unwrap()
+                .unwrap()
+                .auto_retired(),
+            !newer_retirement
         );
     }
 }

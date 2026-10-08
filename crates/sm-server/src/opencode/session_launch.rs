@@ -310,12 +310,14 @@ impl SessionStore {
                 ..CreateCoreSessionRequest::default()
             };
             let mut launches = session_runtime_launch_records(&state)?;
-            let launch = opencode_launch_record(
+            let mut launch = opencode_launch_record(
                 &record,
                 &request,
                 generate_unique_runtime_launch_id(&launches)?,
                 "restore",
             );
+            launch.opencode_restore_terminal_metadata =
+                Some(opencode_terminal_metadata(&state, id)?);
             launches.push(launch.clone());
             let session = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
                 .context("restore session disappeared")?;
@@ -550,9 +552,56 @@ impl SessionStore {
                 );
             }
         } else {
+            let mut restore_metadata = launch
+                .opencode_restore_terminal_metadata
+                .as_ref()
+                .filter(|_| launch.operation_kind == "restore")
+                .filter(|_| {
+                    raw_session_object(&state, &record.id).is_some_and(|session| {
+                        session
+                            .get("session_credential_sha256")
+                            .and_then(Value::as_str)
+                            == Some(launch.credential_sha256.as_str())
+                            && session.get("provider_resume_id").and_then(Value::as_str)
+                                == launch.provider_resume_id.as_deref()
+                            && [
+                                "completion_status",
+                                "completion_message",
+                                "completed_at",
+                                "terminal_provenance",
+                                "retirement_intent",
+                                "agent_task_completed_at",
+                            ]
+                            .iter()
+                            .all(|field| session.get(*field).is_none_or(Value::is_null))
+                    })
+                })
+                .cloned();
+            // The generic launch failure helper updates stopped_at. Preserve
+            // the entire newer terminal decision, including its timestamp.
+            if restore_metadata.is_none()
+                && raw_session_object(&state, &record.id).is_some_and(|session| {
+                    ["completion_status", "terminal_provenance"]
+                        .iter()
+                        .any(|field| session.get(*field).is_some_and(|value| !value.is_null()))
+                })
+            {
+                restore_metadata = Some(opencode_terminal_metadata(&state, &record.id)?);
+            }
             let remove = launch.operation_kind == "create"
                 && remove_failed_provisional_runtime_session(&state, &record.id);
             mark_runtime_launch_failed(&mut state, &launch.id, &record.id, remove, reason)?;
+            if let Some(metadata) = restore_metadata {
+                let session =
+                    session_object_mut(ensure_sessions_array_mut(&mut state)?, &record.id)
+                        .context("restore session disappeared during teardown")?;
+                for (field, value) in metadata
+                    .as_object()
+                    .context("invalid restore terminal metadata")?
+                {
+                    session.insert(field.clone(), value.clone());
+                }
+            }
         }
         self.write_raw_json_value(&state)
     }
@@ -764,6 +813,29 @@ fn opencode_launch_pending(status: &str) -> bool {
     matches!(status, "prepared" | "launching" | "teardown_pending")
 }
 
+fn opencode_terminal_metadata(state: &Value, id: &str) -> Result<Value> {
+    let session = raw_session_object(state, id).context("restore session disappeared")?;
+    Ok(Value::Object(
+        [
+            "completion_status",
+            "completion_message",
+            "completed_at",
+            "stopped_at",
+            "terminal_provenance",
+            "retirement_intent",
+            "agent_task_completed_at",
+        ]
+        .into_iter()
+        .map(|field| {
+            (
+                field.into(),
+                session.get(field).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect(),
+    ))
+}
+
 fn opencode_restore_authority(state: &Value, id: &str) -> Result<Value> {
     let session = raw_session_object(state, id).context("restore session disappeared")?;
     Ok(Value::Object(
@@ -874,6 +946,7 @@ fn opencode_launch_record(
         brief_part_id: None,
         credential_rotation_id: None,
         restore_authorized: operation == "restore",
+        opencode_restore_terminal_metadata: None,
         initial_message: request.initial_message.clone(),
         model: record.model.clone(),
         reasoning_effort: None,
