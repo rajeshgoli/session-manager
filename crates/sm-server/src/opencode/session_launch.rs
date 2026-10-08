@@ -449,6 +449,23 @@ impl SessionStore {
                 anyhow::bail!("opencode launch lost lifecycle authority")
             }
         }
+        let journal = PathBuf::from(
+            &record
+                .opencode
+                .as_ref()
+                .context("missing opencode binding")?
+                .state_dir,
+        )
+        .join("usage.jsonl");
+        self.seat_session_store.append(
+            &record.id,
+            "opencode",
+            record
+                .provider_resume_id
+                .as_deref()
+                .context("missing opencode conversation")?,
+            Some(&journal.to_string_lossy()),
+        )?;
         if let Some(text) = launch
             .initial_message
             .as_deref()

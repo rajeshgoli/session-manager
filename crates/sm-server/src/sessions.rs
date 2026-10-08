@@ -880,6 +880,18 @@ impl SessionStore {
                                 .flatten()
                                 .map(|path| resolve_path_lossy(path.clone()))
                         })
+                        .or_else(|| {
+                            session
+                                .opencode
+                                .as_ref()
+                                .filter(|_| session.provider == "opencode")
+                                .map(|binding| {
+                                    PathBuf::from(&binding.state_dir)
+                                        .join("usage.jsonl")
+                                        .display()
+                                        .to_string()
+                                })
+                        })
                         .or_else(|| session.transcript_path.clone());
                     SeatSessionIdentity {
                         seat_id: session.id.clone(),
