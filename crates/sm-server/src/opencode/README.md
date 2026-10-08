@@ -160,8 +160,31 @@ Owner answers wake the board after unlocking even when a later effect fails.
 The supervisor scans the cached registry once for unfinished effects; stopped
 sessions with completed recovery do not take the writer lock on every scan.
 Tool-call history reads opencode's receipt-backed tool log independently of the
-hosted usage setting. HTTP outbox delivery and public entry points remain on
+hosted usage setting. Public entry points and lifecycle acceptance remain on
 #2045.
+
+## Ordered outbox delivery
+
+Every Opencode send mode and queue category uses the same ordered retained
+queue. HTTP attempts hold the per-session clear, input and submission locks,
+but release the registry guard over provider waits. IDs are committed before
+the first attempt and checked before every POST. Rename rows PATCH the native
+title in queue order. Urgent input and messages to busy sessions use ordinary
+prompts without terminal keys or abort. A failed provider request leaves the
+row pending and cannot mark the runtime stopped.
+
+The event reader drains after reconnecting. The five-second retry sweep covers
+all pending Opencode rows. Producers holding the registry guard schedule one
+unlocked delivery worker per target; durable retry covers a missed wake.
+Handoff acceptance waits for in-flight submission, then holds new delivery for
+the successor. Notification and reminder effects use the existing completion
+transaction; acknowledgements use independent delivery workers, including when
+accepted IDs are resolved before a lifecycle change.
+
+`resolve_opencode_pending_bindings` confirms existing IDs without submitting
+prompts: accepted rows complete, missing rows lose their binding, and provider
+uncertainty blocks the caller. Lifecycle code uses the locked helper and retains
+all session locks through the subsequent conversation or recipient change.
 
 - `scripts/test-rust-isolated.sh opencode -- --test-threads=1`: native-shaped
   IDs, approved config fixture, config loading, duplicate-append stub and

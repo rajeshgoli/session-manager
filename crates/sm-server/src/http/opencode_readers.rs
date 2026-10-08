@@ -455,6 +455,9 @@ fn read_connection(
         .recover_opencode_launch_for_session(id)?;
     let connected = Instant::now();
     let mut conversation = resync(state, handle, id, &client, &config)?;
+    state
+        .session_store
+        .drain_opencode_outbox(id, &TmuxRuntime::from_app_config(&state.config))?;
     readers.update(&state.session_store, id)?;
     loop {
         let event = match read_event(&mut stream) {

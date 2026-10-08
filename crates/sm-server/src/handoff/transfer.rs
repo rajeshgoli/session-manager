@@ -116,6 +116,7 @@ impl SessionStore {
         if requester_session_id.trim() != session_id {
             return Ok(HandoffAcceptOutcome::Forbidden);
         }
+        let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -166,6 +167,7 @@ impl SessionStore {
     /// Move an accepted handoff whose agent is idle to `spawning` and return
     /// what to create. Only one caller wins; the rest get `None` (F.1).
     pub fn claim_handoff_start(&self, session_id: &str) -> Result<Option<SuccessorPlan>> {
+        let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;

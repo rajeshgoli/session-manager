@@ -3,6 +3,8 @@ use crate::opencode::tests::{ScratchDir, Stub};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 type Hook = Box<dyn FnOnce(&SessionRecord) + Send>;
+#[path = "outbox_tests.rs"]
+mod outbox_tests;
 struct Driver {
     config: OpencodeConfig,
     path: PathBuf,
@@ -178,7 +180,7 @@ impl Fixture {
             stop_hook: Mutex::new(None),
         });
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
-        let store = SessionStore::new(path)
+        let store = SessionStore::new_with_queue(path, scratch.path().join("queue.db"))
             .with_delivery_runtime(Some(runtime.clone()))
             .with_opencode_launch_driver(driver.clone());
         Self {
