@@ -57,10 +57,7 @@ impl LaunchBinding {
         let profile = host_file(profile)?;
         // Reject accidental composition with a standalone file/network wall.
         // The immutable host-generated profile must also confine descendants.
-        if !std::fs::read_to_string(&profile)?.lines().any(|line| {
-            line == "(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))"
-                || line == "(deny syscall-unix (syscall-number SYS_setsid SYS_posix_spawn))"
-        }) {
+        if !super::has_launch_session_confinement(&std::fs::read(&profile)?) {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         Ok(Self {

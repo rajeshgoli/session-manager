@@ -270,6 +270,36 @@ fn production_wall_pinned_opencode_serves_authenticated_health() {
     assert!(version.status.success());
     assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), "1.17.9");
     let prepared = prepare_launch_for_inner("launch", 18600, 18700, Some(&source));
+    // Production registers the generated wall before starting its native
+    // runtime. Exercise that path as well as LaunchBinding's validation.
+    let queue_state = prepared._directory.path().join("queue-service");
+    let profile = prepared.path("profile");
+    let spec = crate::queue::local_wall::WallSpec {
+        host_authority_sha256: None,
+        agent_state: profile.parent().unwrap().to_path_buf(),
+        checkout: prepared.path("checkout"),
+        profile: profile.clone(),
+        shell: prepared.path("shell"),
+        environment: prepared
+            .environment
+            .iter()
+            .map(|(k, v)| (k.to_str().unwrap().into(), v.to_str().unwrap().into()))
+            .collect(),
+        gateway_port: 18600,
+        egress_port: 18700,
+    };
+    let standalone = profile.with_file_name("standalone.sb");
+    fs::write(&standalone, "(version 1)\n(allow default)\n").unwrap();
+    let mut unconfined = spec.clone();
+    unconfined.profile = standalone;
+    assert!(
+        crate::queue::local_wall::register(&queue_state, "unconfined", unconfined)
+            .unwrap_err()
+            .to_string()
+            .contains("profile lacks descendant confinement")
+    );
+    crate::queue::local_wall::register(&queue_state, "launch", spec).unwrap();
+    crate::queue::local_wall::validate(&queue_state, "launch").unwrap();
     let checkout = prepared.path("checkout");
     let git = Command::new("/usr/bin/git")
         .args(["init", "--quiet"])

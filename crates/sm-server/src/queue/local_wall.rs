@@ -149,14 +149,7 @@ pub fn register(state_dir: &Path, agent: &str, mut spec: WallSpec) -> Result<Str
     spec.environment.remove("SM_WALL_RECOVERY_FD");
     spec.environment.remove("DYLD_INSERT_LIBRARIES"); // supplied by the trusted launcher
     let profile = read_file(&spec.profile)?;
-    if !profile
-        .windows(
-            b"(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))".len(),
-        )
-        .any(|w| {
-            w == b"(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_posix_spawn))"
-        })
-    {
+    if !crate::local_sockets::has_launch_session_confinement(&profile) {
         bail!("profile lacks descendant confinement");
     }
     let wall = RegisteredWall {
