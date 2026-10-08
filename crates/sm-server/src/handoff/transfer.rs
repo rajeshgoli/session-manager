@@ -211,6 +211,43 @@ impl SessionStore {
         Ok(Some(plan))
     }
 
+    /// The successor exists but no work has moved yet. Persist recovery before
+    /// any wait or delivery-resolution gate can defer the driver.
+    pub(crate) fn record_opencode_handoff_successor(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) -> Result<()> {
+        let _submission = self.lock_opencode_submission(predecessor_id)?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let successor =
+            raw_session_object(&state, successor_id).context("handoff successor disappeared")?;
+        if json_text(successor.get("provider")).as_deref() != Some("opencode")
+            || raw_session_is_stopped(successor)
+        {
+            anyhow::bail!("Opencode handoff successor is not running")
+        }
+        let predecessor =
+            session_object_mut(ensure_sessions_array_mut(&mut state)?, predecessor_id)
+                .context("handoff predecessor disappeared")?;
+        let mut record = raw_handoff_record(predecessor).context("handoff disappeared")?;
+        if !matches!(
+            record.state,
+            HandoffPhase::Spawning | HandoffPhase::Transferring
+        ) || record
+            .successor_session_id
+            .as_deref()
+            .is_some_and(|existing| existing != successor_id)
+        {
+            anyhow::bail!("handoff changed before its successor could be recorded")
+        }
+        record.state = HandoffPhase::Transferring;
+        record.successor_session_id = Some(successor_id.into());
+        write_handoff_record(predecessor, &record);
+        self.write_raw_json_value(&state)
+    }
+
     /// F.5: the successor could not be created. Nothing moved; the agent is
     /// told and keeps its work.
     pub fn fail_handoff(&self, session_id: &str, error: &str) -> Result<()> {

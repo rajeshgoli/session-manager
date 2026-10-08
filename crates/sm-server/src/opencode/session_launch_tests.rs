@@ -23,6 +23,7 @@ struct Driver {
     ready: AtomicBool,
     fail_start: AtomicBool,
     fail_history: AtomicBool,
+    fail_client: AtomicBool,
     fail_attach: AtomicBool,
     fail_stop: AtomicBool,
     uncertain_present: AtomicBool,
@@ -122,6 +123,9 @@ impl OpencodeLaunchDriver for Driver {
         Ok(())
     }
     fn client(&self, binding: &RuntimeBinding) -> Result<Client> {
+        if self.fail_client.load(Ordering::Acquire) {
+            anyhow::bail!("injected client binding failure")
+        }
         Client::new(binding.port, "secret", Duration::from_secs(1))
     }
     fn attach(&self, record: &SessionRecord, _: &TmuxRuntime) -> Result<()> {
@@ -242,6 +246,7 @@ impl Fixture {
             ready: AtomicBool::new(true),
             fail_start: AtomicBool::new(false),
             fail_history: AtomicBool::new(false),
+            fail_client: AtomicBool::new(false),
             fail_attach: AtomicBool::new(false),
             fail_stop: AtomicBool::new(false),
             uncertain_present: AtomicBool::new(false),

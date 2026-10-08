@@ -264,3 +264,70 @@ fn opencode_handoff_restore_resolves_retained_ids_before_retrying_transfer() {
             .is_none()
     );
 }
+
+#[test]
+fn opencode_handoff_created_successor_is_resumable_when_the_second_gate_defers() {
+    let f = Fixture::with_ports(2);
+    f.create("local1", None).unwrap();
+    f.change("local1", "status", json!("idle"));
+    accept(&f);
+    assert!(f
+        .store
+        .opencode_handoff_ready("local1", &f.runtime)
+        .unwrap());
+    f.store.claim_handoff_start("local1").unwrap().unwrap();
+    f.store
+        .create_opencode_handoff_successor(
+            Fixture::request("succ", None),
+            None,
+            &f.runtime,
+            "local1",
+        )
+        .unwrap();
+    f.store
+        .record_opencode_handoff_successor("local1", "succ")
+        .unwrap();
+    f.driver.fail_client.store(true, Ordering::Release);
+    assert!(!f
+        .store
+        .opencode_handoff_ready("local1", &f.runtime)
+        .unwrap());
+    let reopened =
+        SessionStore::new_with_queue(f.driver.path.clone(), f._scratch.path().join("queue.db"))
+            .with_opencode_launch_driver(f.driver.clone());
+    assert_eq!(
+        reopened.pending_handoff_work().unwrap(),
+        vec![HandoffWork::Resume {
+            predecessor_id: "local1".into(),
+            successor_id: "succ".into(),
+        }]
+    );
+    assert_eq!(reopened.recover_interrupted_handoff_starts().unwrap(), 0);
+    assert!(!reopened
+        .opencode_handoff_ready("local1", &f.runtime)
+        .unwrap());
+    f.driver.fail_client.store(false, Ordering::Release);
+    f.change(
+        "local1",
+        "opencode_handoff_delivery_last_attempt_at",
+        Value::Null,
+    );
+    assert!(reopened
+        .opencode_handoff_ready("local1", &f.runtime)
+        .unwrap());
+    reopened
+        .with_opencode_handoff_transfer("local1", &f.runtime, || {
+            reopened.transfer_handoff_json("local1", "succ")
+        })
+        .unwrap();
+    assert_eq!(f.driver.starts.load(Ordering::Acquire), 2);
+    assert_eq!(
+        reopened
+            .get_session("local1")
+            .unwrap()
+            .unwrap()
+            .successor_session_id
+            .as_deref(),
+        Some("succ")
+    );
+}

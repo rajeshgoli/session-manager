@@ -393,6 +393,11 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
             return Ok(());
         }
     };
+    if successor.provider == "opencode" {
+        state
+            .session_store
+            .record_opencode_handoff_successor(predecessor_id, &successor.id)?;
+    }
     if state.config.rust_core.runtime_enabled {
         // Claude takes seconds to show its composer, and a brief typed before
         // then is lost (#1927). Handoff notices are delivered ready-fenced as
@@ -501,6 +506,18 @@ async fn complete_handoff(
         predecessor_id.to_owned(),
     );
     if !tokio::task::spawn_blocking(move || store.opencode_handoff_ready(&id, &runtime)).await?? {
+        if let Some(predecessor) = state.session_store.get_session(predecessor_id)? {
+            let failed_before_move = predecessor.successor_session_id.is_none()
+                && predecessor.handoff.as_ref().is_some_and(|h| {
+                    h["state"] == "failed"
+                        && h["successor_session_id"].as_str() == Some(successor_id)
+                });
+            if failed_before_move {
+                // The empty successor holds no inherited work. The predecessor
+                // and its rows remain intact when the resolution timeout fails.
+                retire_predecessor(state, successor_id, predecessor_id).await?;
+            }
+        }
         return Ok(());
     }
     let store = state.session_store.clone();
