@@ -87,7 +87,7 @@ enum Command {
     ListDevices(ListDevicesArgs),
     #[command(name = "remove-device")]
     RemoveDevice(RemoveDeviceArgs),
-    #[command(name = "request-review")]
+    #[command(name = "request-review", alias = "request-codex-review")]
     RequestReview(RequestReviewArgs),
     /// Paired reviewers: return your review to sm
     Review(ReviewArgs),
@@ -853,11 +853,6 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let removed_command = concat!("request-codex-", "review");
-    if std::env::args().nth(1).as_deref() == Some(removed_command) {
-        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
-        process::exit(2);
-    }
     let cli = Cli::parse();
     let command = cli.command;
     let command = match command {
@@ -7406,6 +7401,45 @@ mod tests {
             panic!("expected cancel subcommand");
         };
         assert_eq!(request_id.as_deref(), Some("req456"));
+    }
+
+    #[test]
+    fn request_codex_review_is_a_hidden_alias_of_request_review() {
+        use clap::CommandFactory;
+
+        let alias_cli = Cli::try_parse_from(["sm", "request-codex-review", "967"]).unwrap();
+        let Command::RequestReview(alias_args) = alias_cli.command else {
+            panic!("expected request-review command from the request-codex-review alias");
+        };
+        assert_eq!(alias_args.action_or_pr.as_deref(), Some("967"));
+
+        let list_cli = Cli::try_parse_from([
+            "sm",
+            "request-codex-review",
+            "list",
+            "--notify",
+            "notify123",
+            "--repo",
+            "rajeshgoli/session-manager",
+            "--pr",
+            "964",
+            "--inactive",
+            "--json",
+        ])
+        .unwrap();
+        let Command::RequestReview(list_args) = list_cli.command else {
+            panic!("expected request-review command from the request-codex-review alias");
+        };
+        assert_eq!(list_args.notify.as_deref(), Some("notify123"));
+        assert!(matches!(
+            list_args.command,
+            Some(RequestReviewCommand::List)
+        ));
+
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("request-review"));
+        assert!(!help.contains("request-codex-review"));
     }
 
     #[test]
