@@ -1,0 +1,13 @@
+{
+  "commit": "fdd79b53703fb158c4f521c3ce1b022358a040d6",
+  "pr": 2125,
+  "job": "job_402bb64d960f",
+  "healthy": true,
+  "stable_pid": 49929,
+  "session_count_before": 8,
+  "session_count_after": 8,
+  "accounting_build_cleanup_gib": 5.4,
+  "independent_grader_cleanup_gib": 3.1,
+  "model_status": "unloaded",
+  "agent_status": "stopped"
+}

@@ -1,0 +1,12 @@
+{
+  "session_id": "fb0062bf",
+  "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+  "brief_occurrences": 1,
+  "unauthenticated_status": 401,
+  "observed_working": true,
+  "final_activity": "idle",
+  "last_tool_name": "bash",
+  "context_tokens": 7863,
+  "context_percent": 3.9315,
+  "checkout": "/Users/rajesh/worktrees/sm-2045-live-probe"
+}

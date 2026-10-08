@@ -1,0 +1,75 @@
+{
+  "ticket": 2045,
+  "author_session": "de7aa837",
+  "implementation_commit": "fdd79b53703fb158c4f521c3ce1b022358a040d6",
+  "complete": true,
+  "checks": [
+    {
+      "check": "launch, activity, measured context and authenticated native endpoint",
+      "status": "passed",
+      "evidence": "live_launch.json",
+      "job": "job_98000ab6e782"
+    },
+    {
+      "check": "send, reminder and queue completion delivery while idle and busy",
+      "status": "passed",
+      "evidence": "live_messages.json",
+      "job": "job_bc1ecfd3d3e9"
+    },
+    {
+      "check": "native-process restart and exactly-once pending delivery",
+      "status": "passed",
+      "evidence": "live_restart.json",
+      "job": "job_fe55f9fc5170"
+    },
+    {
+      "check": "retire and restore the same conversation with remembered work",
+      "status": "passed",
+      "evidence": "live_restore.json",
+      "job": "job_fe55f9fc5170"
+    },
+    {
+      "check": "automatic compaction above 85 percent with the real model",
+      "status": "passed",
+      "evidence": "live_compaction_fixed.json",
+      "job": "job_52383224265b",
+      "default_evidence": "live_compaction_default.json",
+      "default_measurement_job": "job_386ffd3c682d",
+      "correction_pr": 2118,
+      "trigger_tokens": 181046,
+      "trigger_percent": 90.523
+    },
+    {
+      "check": "hands-off past-ticket 1855 through PR and sm request-review",
+      "status": "passed",
+      "start_commit": "4a3a060d6c37",
+      "session_id": "54644ad1",
+      "evidence": "live_1855_completion.json",
+      "pr": 2124
+    },
+    {
+      "check": "local token accounting and unchanged Claude quota",
+      "status": "passed",
+      "prerequisite_ticket": 2122,
+      "accounting_pr": 2125,
+      "evidence": "live_local_usage_after.json",
+      "baseline_evidence": "live_local_usage_before.json",
+      "journal_rows_verified": 106,
+      "claude_weekly_percent_before": 26.0,
+      "claude_weekly_percent_after": 26.0,
+      "job": "job_402bb64d960f"
+    }
+  ],
+  "resource_blocker": null,
+  "probe": {
+    "session_id": "fb0062bf",
+    "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+    "status": "retired",
+    "history_preserved": true
+  },
+  "local_model_status_at_completion": "unloaded",
+  "acceptance_agent_status_at_completion": "stopped",
+  "known_follow_up_ticket": 2123,
+  "known_follow_up": "Agent-side toolchain validation remains blocked; the approved past-ticket acceptance regression was independently verified without changing the agent implementation.",
+  "evidence_archive": "docs/product/2045_acceptance_artifacts"
+}

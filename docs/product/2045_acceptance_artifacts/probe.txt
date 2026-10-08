@@ -1,0 +1,9 @@
+PROBE-TOOLS You are sm-2045-live-probe, a local agent probing the opencode lifecycle. Run the scripted tools, then stop.
+
+This is a lifecycle acceptance probe, not a repository implementation ticket. Use the bash tool to run exactly these diagnostic commands in your checkout:
+
+printf 'SM2045-MEMORY-MARKER: the heron waits by the river\n' > sm2045-probe.txt
+pwd
+git status --short
+
+Remember the memory marker and the file you created. Reply SM2045-PROBE-READY once you finish, then stay idle. Do not change source code, claim tickets, open PRs, send messages or spawn agents. Later test messages will supply the next diagnostic action.

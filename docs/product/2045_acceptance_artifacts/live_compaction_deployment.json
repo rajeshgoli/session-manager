@@ -1,0 +1,18 @@
+{
+  "session_id": "fb0062bf",
+  "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+  "production_commit": "c4b55507a215a4b53afa3213c8341fdb6547cb31",
+  "history_preserved": true,
+  "brief_occurrences": 1,
+  "configuration": {
+    "limit": {
+      "context": 200000,
+      "input": 200000,
+      "output": 32000
+    },
+    "compaction": {
+      "auto": true,
+      "reserved": 20000
+    }
+  }
+}

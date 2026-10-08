@@ -1,0 +1,59 @@
+{
+  "session_id": "fb0062bf",
+  "conversation": "ses_ee54b44afffe2fvou8T85FvWx7",
+  "run": "1791449607",
+  "phases": {
+    "idle": {
+      "markers": {
+        "send": "SM2045-IDLE-SEND-1791449607",
+        "reminder": "SM2045-IDLE-REMINDER-1791449607",
+        "queue": "SM2045-IDLE-QUEUE-1791449607"
+      },
+      "message_ids": {
+        "send": [
+          "msg_11ab7ae7a001nrxVTDiwCGuh7F"
+        ],
+        "reminder": [
+          "msg_11ab7b6d9001PziVg5hJja0QIE"
+        ],
+        "queue": [
+          "msg_11ab7b655001dkU3qv4Ea9ejS8"
+        ]
+      },
+      "new_user_messages": 3,
+      "received_at_ms": {
+        "send": 1791449607823,
+        "reminder": 1791449609963,
+        "queue": 1791449609833
+      }
+    },
+    "busy": {
+      "markers": {
+        "send": "SM2045-BUSY-SEND-1791449607",
+        "reminder": "SM2045-BUSY-REMINDER-1791449607",
+        "queue": "SM2045-BUSY-QUEUE-1791449607"
+      },
+      "message_ids": {
+        "send": [
+          "msg_11ab7eac8001BzE9kAKAoxCgpY"
+        ],
+        "reminder": [
+          "msg_11ab7f191001coaSuRdpHtTBaB"
+        ],
+        "queue": [
+          "msg_11ab7f104001E5VauSPMY2Neja"
+        ]
+      },
+      "new_user_messages": 3,
+      "received_at_ms": {
+        "send": 1791449623306,
+        "reminder": 1791449625082,
+        "queue": 1791449624856
+      }
+    }
+  },
+  "busy_command_seconds": 20,
+  "busy_tool_status": "completed",
+  "urgent_did_not_interrupt": true,
+  "final_activity": "idle"
+}
