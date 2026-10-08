@@ -21,7 +21,10 @@ static int apply_spawn_actions(const struct action_list *list, short flags,
         struct sigaction action = { .sa_handler = SIG_DFL };
         sigemptyset(&action.sa_mask);
         for (int signal = 1; signal < NSIG; ++signal)
-            if (sigismember(defaults, signal) == 1 && sigaction(signal, &action, NULL) < 0) return errno;
+            // Native spawn accepts a full default set. These two dispositions
+            // are permanently default and cannot be changed with sigaction.
+            if (signal != SIGKILL && signal != SIGSTOP &&
+                sigismember(defaults, signal) == 1 && sigaction(signal, &action, NULL) < 0) return errno;
     }
     if (flags & POSIX_SPAWN_RESETIDS)
         if (setegid(getgid()) < 0 || seteuid(getuid()) < 0) return errno;

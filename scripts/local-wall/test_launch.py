@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -27,13 +28,26 @@ def prepare(args):
     python = Path(sys._base_executable).resolve()
     python_root = Path(os.path.commonpath([python, Path(sys.base_prefix).resolve()]))
     library = state / "xdg/config/adapter.dylib"
+    opencode = executables / "opencode"
+    attached_arguments = []
+    if args.opencode_binary:
+        shutil.copyfile(args.opencode_binary.resolve(strict=True), opencode)
+        opencode.chmod(0o500)
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(opencode)], check=True)
+        attached_arguments = ["--attached-spawn-executable", str(opencode)]
+    shell = executables / "queue-zsh"
+    if args.opencode_binary:
+        shutil.copyfile("/bin/zsh", shell)
+        shell.chmod(0o500)
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(shell)], check=True)
     subprocess.run([str(python), str(scripts / "build_adapter.py"),
                     "--endpoint", str(broker / "s"), "--peer-token", *map(str, args.peer_token),
                     "--direct-ports", str(args.gateway_port), str(args.egress_port), "24000", "24001",
                     "--control-port", str(args.control_port), "--control-fd", "198",
                     "--contained-spawns",
                     "--immutable-exec-dir", str(executables),
-                    "--immutable-exec-dir", str(python_root), "--output", str(library)],
+                    "--immutable-exec-dir", str(python_root), "--output", str(library),
+                    *attached_arguments],
                    check=True, stdout=subprocess.DEVNULL)
     for source, name, extra in [("launch_supervisor.c", "supervisor", []),
                                 ("test_adapter.c", "application", ["-pthread"]),
@@ -67,10 +81,13 @@ def prepare(args):
         "SM_TEST_PYTHON": str(python), "SM_TEST_MUTABLE": tmp,
         "SM_TEST_FD_PROBE": str(executables / "descriptor-probe"),
         "SM_TEST_CONTAINED": "1",
+        "SM_TEST_SHELL": str(shell),
     }
     environment.update({f"XDG_{name.upper()}_HOME": str(state / "xdg" / name)
                         for name in ("config", "data", "cache", "state")})
     print(json.dumps({"profile": str(profile), "adapter": str(library),
+                      "opencode": str(opencode),
+                      "shell": str(shell),
                       "supervisor": str(executables / "supervisor"),
                       "application": str(executables / "application"),
                       "checkout": str(checkout), "python": str(python), "environment": environment}))
@@ -79,6 +96,7 @@ def prepare(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--opencode-binary", type=Path)
     parser.add_argument("--control-port", type=int, required=True)
     parser.add_argument("--gateway-port", type=int, default=18600)
     parser.add_argument("--egress-port", type=int, default=18700)

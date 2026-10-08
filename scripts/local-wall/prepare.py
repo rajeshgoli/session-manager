@@ -146,6 +146,8 @@ def prepare(request):
                "--output", str(adapter)]
     for root in roots:
         command.extend(["--immutable-exec-dir", root])
+    if "opencode" in staged:
+        command.extend(["--attached-spawn-executable", staged["opencode"]])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     return {"profile": str(profile), "adapter": str(adapter), "supervisor": str(executables / "supervisor"),
             "tmp": tmp, "gh": str(gh), "cargo": str(cargo), "executables": str(executables), "tools": staged}
