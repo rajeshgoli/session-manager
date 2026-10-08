@@ -480,12 +480,10 @@ fn opencode_terminal_fence_prevents_initial_brief_submission() {
     let f = Fixture::new();
     let store = f.store.clone();
     *f.driver.attach_hook.lock().unwrap() = Some(Box::new(move |record| {
-        let _guard = store.write_guard().unwrap();
-        let mut raw = store.load_raw_json_value().unwrap();
-        session_object_mut(ensure_sessions_array_mut(&mut raw).unwrap(), &record.id)
-            .unwrap()
-            .insert("completion_status".into(), json!("retired"));
-        store.write_raw_json_value(&raw).unwrap();
+        assert!(matches!(
+            store.retire_core_session(&record.id, None).unwrap(),
+            CoreRetireOutcome::Retired(_)
+        ));
     }));
     assert!(f.create("local1", Some("must not submit")).is_err());
     assert_eq!(f.driver.posts(), 0);
@@ -498,6 +496,91 @@ fn opencode_terminal_fence_prevents_initial_brief_submission() {
             .as_deref(),
         Some("retired")
     );
+}
+
+#[test]
+fn opencode_retirement_waits_for_in_flight_brief_without_holding_registry_lock() {
+    let f = Fixture::new();
+    let (paused, pause) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let driver = f.driver.clone();
+    *f.driver.start_hook.lock().unwrap() = Some(Box::new(move |_| {
+        driver
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .before_lookup(Box::new(move || {
+                paused.send(()).unwrap();
+                released.recv().unwrap();
+            }));
+    }));
+    let store = f.store.clone();
+    let runtime = f.runtime.clone();
+    let creator = std::thread::spawn(move || {
+        store.create_core_session_with_runtime(
+            Fixture::request("local1", Some("brief")),
+            None,
+            &runtime,
+        )
+    });
+    pause.recv_timeout(Duration::from_secs(5)).unwrap();
+    let store = f.store.clone();
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (done, completion) = std::sync::mpsc::channel();
+    let retirement = std::thread::spawn(move || {
+        entered.send(()).unwrap();
+        let result = store.retire_core_session("local1", None);
+        done.send(result).unwrap();
+    });
+    entry.recv_timeout(Duration::from_secs(5)).unwrap();
+    let prematurely_finished = completion.recv_timeout(Duration::from_millis(200)).is_ok();
+    // This takes the registry lock while retirement is waiting on submission.
+    f.change(
+        "local1",
+        "last_provider_error",
+        json!("unrelated registry write"),
+    );
+    release.send(()).unwrap();
+    creator.join().unwrap().unwrap();
+    retirement.join().unwrap();
+    assert!(
+        !prematurely_finished,
+        "retirement committed before provider submission completed"
+    );
+    assert_eq!(f.driver.posts(), 1);
+    assert!(f.store.get_session("local1").unwrap().unwrap().is_retired());
+    assert_eq!(f.launches()[0].status, "applied");
+}
+
+#[test]
+fn opencode_restore_uses_free_name_when_live_session_reused_original() {
+    let f = Fixture::new();
+    let mut request = Fixture::request("local1", None);
+    request.name = Some("vega".into());
+    f.store
+        .create_core_session_with_runtime(request, None, &f.runtime)
+        .unwrap();
+    f.change("local1", "status", json!("stopped"));
+    f.change("local1", "stopped_at", json!("2026-01-01T00:00:00Z"));
+    let mut other = Fixture::request("hosted2", None);
+    other.provider = Some("claude".into());
+    other.name = Some("vega".into());
+    f.store.create_core_session(other, None).unwrap();
+    let CoreRestoreOutcome::Restored(restored) = f
+        .store
+        .restore_core_session_with_runtime("local1", &f.runtime)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("restore refused")
+    };
+    assert_eq!(restored.name, "vega-2");
+    assert_eq!(restored.friendly_name.as_deref(), Some("vega-2"));
+    assert_eq!(f.store.get_session("vega").unwrap().unwrap().id, "hosted2");
+    assert_eq!(f.store.get_session("vega-2").unwrap().unwrap().id, "local1");
+    assert_eq!(f.driver.conversations(), 1);
 }
 
 #[test]

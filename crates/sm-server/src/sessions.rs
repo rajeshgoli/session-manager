@@ -7433,6 +7433,7 @@ impl SessionStore {
         if_finished_idle: bool,
         live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
     ) -> Result<CoreRetireOutcome> {
+        let _submission_guard = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
@@ -7526,6 +7527,7 @@ impl SessionStore {
         if_finished_idle: bool,
         live_activity_blocks_retire: &dyn Fn(&SessionRecord) -> bool,
     ) -> Result<CoreRetireOutcome> {
+        let _submission_guard = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;

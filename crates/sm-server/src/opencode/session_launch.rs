@@ -82,6 +82,12 @@ impl SessionStore {
         }
     }
 
+    /// Both submission and retirement acquire this before the registry lock.
+    /// Provider waits may hold it without preventing unrelated registry work.
+    pub(super) fn lock_opencode_submission(&self, id: &str) -> Result<SessionClearGuard> {
+        self.lock_named_clear_operation(&format!("opencode-submission:{id}"))
+    }
+
     pub fn create_opencode_session_with_runtime(
         &self,
         request: CreateCoreSessionRequest,
@@ -277,6 +283,19 @@ impl SessionStore {
             if record.provider_resume_id.as_deref() != Some(&conversation) {
                 anyhow::bail!("conversation changed during restore")
             }
+            let new_name = record
+                .friendly_name
+                .as_deref()
+                .or(Some(record.name.as_str()))
+                .and_then(|name| {
+                    restored_name(&sessions_with_registered_aliases(&state), id, name)
+                });
+            let mut renamed = serde_json::to_value(&record)?;
+            apply_restored_name(
+                renamed.as_object_mut().context("invalid restore session")?,
+                new_name,
+            );
+            record = serde_json::from_value(renamed)?;
             record.opencode = Some(driver.binding(&config, id, port)?);
             record.model = Some(config.model_id.clone());
             record.reasoning_effort = None;
@@ -396,6 +415,9 @@ impl SessionStore {
         if !client.ready()? {
             anyhow::bail!("opencode server is not ready")
         }
+        // Hold through acceptance and the applied commit. A terminal transition
+        // either precedes the authority check or follows the completed send.
+        let _submission_guard = self.lock_opencode_submission(&record.id)?;
         {
             let _guard = self.write_guard()?;
             let state = self.load_parsed_state()?;

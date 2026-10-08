@@ -36,6 +36,7 @@ struct StubState {
     hidden: usize,
     lose_post_reply: bool,
     rename_error: bool,
+    before_lookup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 pub(crate) struct Stub {
@@ -88,6 +89,10 @@ impl Stub {
 
     pub(crate) fn lose_post_reply(&self) {
         self.state.lock().unwrap().lose_post_reply = true;
+    }
+
+    pub(crate) fn before_lookup(&self, hook: Box<dyn FnOnce() + Send>) {
+        self.state.lock().unwrap().before_lookup = Some(hook);
     }
 
     pub(crate) fn conversation_creations(&self) -> usize {
@@ -162,6 +167,9 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
     let (status, reply) = if !authorized {
         (401, json!({"error": "unauthorized"}))
     } else if method == "GET" && path.contains("/message/") {
+        if let Some(hook) = state.before_lookup.take() {
+            hook();
+        }
         if let Some(error) = state.lookup_error {
             (error, json!({"error": "unavailable"}))
         } else if state.hidden > 0 {
