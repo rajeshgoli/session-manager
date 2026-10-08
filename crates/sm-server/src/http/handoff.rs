@@ -506,18 +506,16 @@ async fn complete_handoff(
         predecessor_id.to_owned(),
     );
     if !tokio::task::spawn_blocking(move || store.opencode_handoff_ready(&id, &runtime)).await?? {
-        if let Some(predecessor) = state.session_store.get_session(predecessor_id)? {
-            let failed_before_move = predecessor.successor_session_id.is_none()
-                && predecessor.handoff.as_ref().is_some_and(|h| {
-                    h["state"] == "failed"
-                        && h["successor_session_id"].as_str() == Some(successor_id)
-                });
-            if failed_before_move {
-                // The empty successor holds no inherited work. The predecessor
-                // and its rows remain intact when the resolution timeout fails.
-                retire_predecessor(state, successor_id, predecessor_id).await?;
-            }
-        }
+        let (store, runtime, pred, succ) = (
+            state.session_store.clone(),
+            state.runtime(),
+            predecessor_id.to_owned(),
+            successor_id.to_owned(),
+        );
+        tokio::task::spawn_blocking(move || {
+            store.cleanup_failed_opencode_handoff(&pred, &succ, &runtime)
+        })
+        .await??;
         return Ok(());
     }
     let store = state.session_store.clone();

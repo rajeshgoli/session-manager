@@ -190,7 +190,15 @@ async fn start(
                 .map_err(|e| e.to_string())?;
                 return Ok(false);
             }
-            Some(session) => retire_reviewer(state, db, &session.id, &existing.session_id),
+            Some(session) => {
+                let (state, db, row_id) =
+                    (state.clone(), db.to_path_buf(), existing.session_id.clone());
+                tokio::task::spawn_blocking(move || {
+                    retire_reviewer(&state, &db, &session.id, &row_id)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            }
             None => {
                 paired::retire(db, &existing.session_id, &now_rfc3339())
                     .map_err(|e| e.to_string())?;

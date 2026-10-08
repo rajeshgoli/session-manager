@@ -6,6 +6,54 @@ const BLOCKED: &str = "handoff blocked: unresolved deliveries to an unreachable 
 const DEFERRED: &str = "handoff deferred: unresolved Opencode deliveries";
 
 impl SessionStore {
+    /// A failed transfer can leave an empty successor after a crash. Keep its
+    /// durable ID until verified teardown, and serialize against a fresh ask.
+    pub(crate) fn cleanup_failed_opencode_handoff(
+        &self,
+        id: &str,
+        successor_id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let _clear = self.lock_clear_operation(id)?;
+        let _submission = self.lock_opencode_submission(id)?;
+        let state = self.load_raw_json_value()?;
+        let Some(raw) = raw_session_object(&state, id) else {
+            return Ok(());
+        };
+        let Some(mut handoff) = HandoffRecord::from_session(raw).and_then(Result::ok) else {
+            return Ok(());
+        };
+        if json_text(raw.get("provider")).as_deref() != Some("opencode")
+            || json_text(raw.get("successor_session_id")).is_some()
+            || handoff.state != HandoffPhase::Failed
+            || handoff.successor_session_id.as_deref() != Some(successor_id)
+            || id == successor_id
+        {
+            return Ok(());
+        }
+        if let Some(successor) = self.get_session(successor_id)? {
+            if successor.provider != "opencode" || successor.predecessor_session_id.is_some() {
+                anyhow::bail!("failed handoff successor has acquired transfer lineage")
+            }
+            match self.retire_core_session_with_runtime_authorized(
+                successor_id,
+                RetireAuthority::handoff(id),
+                None,
+                runtime,
+            )? {
+                CoreRetireOutcome::Retired(_) | CoreRetireOutcome::NotFound => {}
+                other => anyhow::bail!("retiring failed handoff successor: {other:?}"),
+            }
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
+            .context("handoff predecessor disappeared")?;
+        handoff.successor_session_id = None;
+        raw.insert("handoff".into(), handoff.to_json());
+        self.write_raw_json_value(&state)
+    }
+
     pub(crate) fn opencode_handoff_ready(&self, id: &str, runtime: &TmuxRuntime) -> Result<bool> {
         if !self.is_opencode_session(id)? {
             return Ok(true);
