@@ -47,7 +47,11 @@ pub(crate) struct Stub {
 
 impl Stub {
     pub(crate) fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::new_on_port(0)
+    }
+
+    pub(crate) fn new_on_port(port: u16) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(StubState::default()));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -84,6 +88,16 @@ impl Stub {
 
     pub(crate) fn lose_post_reply(&self) {
         self.state.lock().unwrap().lose_post_reply = true;
+    }
+
+    pub(crate) fn conversation_creations(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(verb, path, _)| verb == "POST" && path == "/session")
+            .count()
     }
 }
 
@@ -158,6 +172,8 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
         } else {
             (404, Value::Null)
         }
+    } else if method == "GET" && path.starts_with("/session/") && path.ends_with("/message") {
+        (200, json!([]))
     } else if method == "POST" && path.ends_with("/prompt_async") {
         // Real opencode appends on duplicate message IDs. A naive retry fails.
         state

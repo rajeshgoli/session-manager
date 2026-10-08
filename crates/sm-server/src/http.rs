@@ -917,6 +917,14 @@ impl AppState {
         mut self,
         walls: Arc<crate::local_wall::recovery::GenerationWalls>,
     ) -> Self {
+        let driver = crate::opencode::launch::host::HostDriver::new(
+            self.config.clone(),
+            walls.clone(),
+            self.listen_port,
+        );
+        self.session_store = self
+            .session_store
+            .with_opencode_launch_driver(Arc::new(driver));
         self.local_walls = Some(walls);
         self
     }
@@ -3548,10 +3556,7 @@ async fn inbound_email_webhook(
     let mut restored = false;
     if session.is_stopped() {
         let outcome = if state.config.rust_core.runtime_enabled {
-            let runtime = TmuxRuntime::from_app_config(&state.config);
-            state
-                .session_store
-                .restore_core_session_with_runtime(&session_id, &runtime)?
+            restore_runtime_core_session(state.clone(), session_id.clone()).await?
         } else {
             state.session_store.restore_core_session(&session_id)?
         };
@@ -4939,6 +4944,22 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
     });
 }
 
+/// Restore waits for native server health and immutable wall retirement.
+/// Run those waits on a blocking worker just like runtime creation.
+async fn restore_runtime_core_session(
+    state: Arc<AppState>,
+    id: String,
+) -> Result<Option<CoreRestoreOutcome>, ApiError> {
+    let runtime = state.runtime();
+    let store = state.session_store.clone();
+    tokio::task::spawn_blocking(move || store.restore_core_session_with_runtime(&id, &runtime))
+        .await
+        .map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!("runtime restore worker failed: {error}"))
+        })?
+        .map_err(ApiError::Internal)
+}
+
 fn runtime_child_session_exited(state: &AppState, child: &SessionRecord) -> bool {
     if !state.config.rust_core.runtime_enabled {
         return false;
@@ -5118,10 +5139,7 @@ async fn restore_node_restore_candidate(
         });
     }
     let outcome = if state.config.rust_core.runtime_enabled {
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .restore_core_session_with_runtime(&session_id, &runtime)?
+        restore_runtime_core_session(state.clone(), session_id.clone()).await?
     } else {
         state.session_store.restore_core_session(&session_id)?
     };

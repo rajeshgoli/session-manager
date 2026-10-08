@@ -1,8 +1,8 @@
-# Opencode transport foundation
+# Opencode runtime integration
 
-This module supplies the HTTP, replay and persistence foundations for #1956.
-It does not admit opencode session creation. #2044 owns wall-backed launch and
-event projection; #2045 owns session-store delivery and lifecycle integration.
+This module supplies HTTP delivery primitives, wall-backed launch/restore and
+durable event projection for #1956. Public creation remains disabled until
+#2045 supplies queued delivery, lifecycle operations and live acceptance.
 
 ## Caller contract
 
@@ -160,8 +160,8 @@ Owner answers wake the board after unlocking even when a later effect fails.
 The supervisor scans the cached registry once for unfinished effects; stopped
 sessions with completed recovery do not take the writer lock on every scan.
 Tool-call history reads opencode's receipt-backed tool log independently of the
-hosted usage setting. Launch/restore integration remains on #2044; HTTP outbox
-delivery and public entry points remain on #2045.
+hosted usage setting. HTTP outbox delivery and public entry points remain on
+#2045.
 
 - `scripts/test-rust-isolated.sh opencode -- --test-threads=1`: native-shaped
   IDs, approved config fixture, config loading, duplicate-append stub and
@@ -198,17 +198,33 @@ that owner, which controls the provider and queued process trees.
 The driver exposes separate server start and attach steps so the store can
 commit the conversation and start its event reader between them. Authenticated
 health/status polling bounds startup. Initial-brief retries use the persisted
-binding and GET-before-POST contract. The caller supplies the configured brief
-acknowledgement timeout.
+binding and GET-before-POST contract, using the configured confirmation timeout.
 
 Admission uses the shipped model host's `ready` record and loaded identifier;
-rendered configuration uses its endpoint and context. The store must serialize
+rendered configuration uses its endpoint and context. The store serializes
 admission and include provisional launches when reserving seats and ports.
 Only its authorized handoff path supplies the predecessor-seat exemption.
 Wall host configuration, staged tools and credentials come from the host.
-Preparation/restore must prove any previous provider exited before replacing
-config or library files. Public creation routes remain disabled until their
-session-store integration is complete.
+Restore proves the old owner and tmux launcher retired before rotating the
+credential or replacing config and library files. Public creation routes remain
+disabled until #2045 is complete.
 
-The full historical adversarial suite, launch/runtime immutability, usage
-attribution and live acceptance remain attached to #1956's subsequent tickets.
+`sessions::opencode_session_launch` commits a provisional local seat and its
+port before native preparation, without holding the registry lock over provider
+waits. Creation and crash recovery share the per-session clear lock, acquired
+before publishing the provisional record. The conversation and initial brief
+IDs are committed before delivery. The event reader subscribes to the current
+runtime binding before the attach view or brief starts. Restore preserves the
+conversation, checkpoint and state folder and never creates another conversation
+or replays the brief. Uncertain brief acceptance keeps the original IDs pending.
+
+Boot and reader recovery preserve transport uncertainty. Only a confirmed
+missing session or exhausted serve window marks the runtime stopped; a pending
+launch is excluded from that probe while its server starts. An attach view is
+reused if live and respawned if dead. `launch::host::HostDriver` obtains wall
+settings, model authority and staged tools from trusted host state.
+
+The launch integration fixtures cover model refusal, provisional-seat races,
+lost replies across reopening, absent conversations, confirmed teardown,
+credential rotation, same-conversation restore and terminal fences. Native
+end-to-end acceptance remains on #2045; usage attribution remains on #1975.

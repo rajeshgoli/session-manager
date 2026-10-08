@@ -560,19 +560,70 @@ impl TmuxRuntime {
     ) -> Result<()> {
         let target = format!("{}:agent", spec.tmux_session);
         let command = format!("exec /bin/bash {}", shell_quote_path(script));
-        self.run_tmux([
-            "new-window",
-            "-d",
-            "-t",
-            &spec.tmux_session,
-            "-n",
-            "agent",
-            "-c",
-            &spec.working_dir,
-            &command,
-        ])?;
+        match self.opencode_window_alive(&spec.tmux_session, "agent")? {
+            Some(true) => return Ok(()),
+            Some(false) => self.run_tmux([
+                "respawn-window",
+                "-k",
+                "-t",
+                &target,
+                "-c",
+                &spec.working_dir,
+                &command,
+            ])?,
+            None => self.run_tmux([
+                "new-window",
+                "-d",
+                "-t",
+                &spec.tmux_session,
+                "-n",
+                "agent",
+                "-c",
+                &spec.working_dir,
+                &command,
+            ])?,
+        }
         self.pipe_host_window(&target, &spec.log_file)?;
         self.run_tmux(["select-window", "-t", &target])
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn opencode_serve_alive(&self, session: &str) -> Result<bool> {
+        Ok(self.opencode_window_alive(session, "serve")? == Some(true))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn opencode_window_alive(&self, session: &str, window: &str) -> Result<Option<bool>> {
+        let output = self
+            .tmux_command([
+                "list-panes",
+                "-s",
+                "-t",
+                session,
+                "-F",
+                "#{window_name}:#{pane_dead}",
+            ])?
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "opencode window probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some((name, dead)) = line.split_once(':') {
+                if name == window {
+                    return match dead {
+                        "0" => Ok(Some(true)),
+                        "1" => Ok(Some(false)),
+                        _ => bail!("invalid tmux pane liveness"),
+                    };
+                }
+            }
+        }
+        Ok(None)
     }
 
     #[cfg(target_os = "macos")]
@@ -5191,6 +5242,62 @@ esac
         permissions.set_mode(0o755);
         fs::set_permissions(&tmux_binary, permissions).unwrap();
         (tmux_binary, log_path, temp_dir)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opencode_attach_reuses_live_view_respawns_dead_view_and_preserves_probe_errors() {
+        let (binary, log, directory) = fake_tmux_binary_with_has_session(true);
+        let windows = directory.join("windows");
+        fs::write(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$1" = '-L' ]; then shift 2; fi
+if [ "$1" = 'list-panes' ]; then cat '{}'; else exit 0; fi
+"#,
+                log.display(),
+                windows.display()
+            ),
+        )
+        .unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some("opencode-view-test".into()),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = binary.display().to_string();
+        let spec = TmuxSessionSpec {
+            session_id: "view".into(),
+            session_credential: None,
+            tmux_session: "sm-view".into(),
+            working_dir: directory.display().to_string(),
+            log_file: directory.join("view.log"),
+            provider: "opencode".into(),
+            initial_message: None,
+            force_initial_prompt_stdin: false,
+            claude_session_id: None,
+            model: None,
+            reasoning_effort: None,
+        };
+        fs::write(&windows, "serve:0\nagent:0\n").unwrap();
+        assert!(runtime.opencode_serve_alive(&spec.tmux_session).unwrap());
+        runtime
+            .create_opencode_attach_window(&spec, &directory.join("attach.sh"))
+            .unwrap();
+        assert!(!fs::read_to_string(&log).unwrap().contains("new-window"));
+        fs::write(&windows, "serve:0\nagent:1\n").unwrap();
+        runtime
+            .create_opencode_attach_window(&spec, &directory.join("attach.sh"))
+            .unwrap();
+        assert!(fs::read_to_string(&log)
+            .unwrap()
+            .contains("respawn-window -k -t sm-view:agent"));
+        fs::write(&windows, "serve:1\nagent:0\n").unwrap();
+        assert!(!runtime.opencode_serve_alive(&spec.tmux_session).unwrap());
+        fs::remove_file(&windows).unwrap();
+        assert!(runtime.opencode_serve_alive(&spec.tmux_session).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn position_after(lines: &[&str], needle: &str, start: usize) -> usize {

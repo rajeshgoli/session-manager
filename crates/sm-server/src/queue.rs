@@ -7977,8 +7977,15 @@ fn terminate_child_process_group_with_grace(child: &mut QueueChild, pgid: i64, g
     let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
     let mut force_sent = false;
     loop {
-        let _ = child.try_wait();
-        if !process_group_exists(pgid) && !escaped.iter().any(|pid| process_exists(*pid)) {
+        // Local children publish an exit receipt through their supervisor.
+        // Kernel absence alone can precede that receipt and root revocation.
+        // A status transport failure retains the existing kernel-only cleanup
+        // path and unknown exit code; do not wait forever for a dead owner.
+        let awaiting_receipt = matches!(child.try_wait(), Ok(None));
+        if !awaiting_receipt
+            && !process_group_exists(pgid)
+            && !escaped.iter().any(|pid| process_exists(*pid))
+        {
             return;
         }
         if !force_sent && Instant::now() >= deadline {

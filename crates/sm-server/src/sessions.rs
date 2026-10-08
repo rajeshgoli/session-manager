@@ -120,6 +120,7 @@ pub struct SessionStore {
     reparent_apply_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     owner_answered_wake: Option<OwnerAnsweredWake>,
+    opencode_launch: Option<OpencodeLaunchContext>,
     /// Carried on the store rather than read per-request because the codex-fork
     /// event monitor threads evaluate the same thresholds and have no access to
     /// the HTTP layer's `AppConfig`.
@@ -263,6 +264,7 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             owner_answered_wake: None,
+            opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
@@ -1011,7 +1013,10 @@ impl SessionStore {
         for record in snapshot.sessions {
             if record.is_stopped()
                 || !is_primary_node(&record.node)
-                || !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork")
+                || !matches!(
+                    record.provider.as_str(),
+                    "claude" | "codex" | "codex-fork" | "opencode"
+                )
                 || record.tmux_session.trim().is_empty()
             {
                 continue;
@@ -1029,10 +1034,17 @@ impl SessionStore {
                     continue;
                 }
             }
-            if !matches!(
-                session_runtime.probe_session_for_restore(&record.tmux_session),
-                RestoreTmuxLivenessOutcome::Absent
-            ) {
+            let absent = match session_runtime.probe_session_for_restore(&record.tmux_session) {
+                RestoreTmuxLivenessOutcome::Absent => true,
+                #[cfg(target_os = "macos")]
+                RestoreTmuxLivenessOutcome::Live if record.provider == "opencode" => {
+                    session_runtime
+                        .opencode_serve_alive(&record.tmux_session)
+                        .is_ok_and(|alive| !alive)
+                }
+                _ => false,
+            };
+            if !absent {
                 continue;
             }
             if ensure_session_not_reparent_fenced(&state, &record.id).is_err() {
@@ -1066,7 +1078,10 @@ impl SessionStore {
                 let state = &parsed_state.raw;
                 session_runtime_launch_records(state)?
                     .into_iter()
-                    .find(|record| matches!(record.status.as_str(), "prepared" | "launching"))
+                    .find(|record| {
+                        matches!(record.status.as_str(), "prepared" | "launching")
+                            && (record.provider != "opencode" || self.opencode_launch.is_some())
+                    })
                     .map(|record| record.id)
             };
             let Some(launch_id) = launch_id else {
@@ -1085,6 +1100,12 @@ impl SessionStore {
                 .into_iter()
                 .find(|record| record.id == launch_id)
         };
+        if let Some(launch) = pending_launch
+            .as_ref()
+            .filter(|launch| launch.provider == "opencode")
+        {
+            return self.recover_opencode_runtime_launch(launch);
+        }
         let codex_cli_binding_guard = pending_launch
             .as_ref()
             .filter(|launch| launch.operation_kind == "create" && launch.provider == "codex")
@@ -1842,6 +1863,7 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             owner_answered_wake: None,
+            opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
@@ -4581,6 +4603,9 @@ impl SessionStore {
                 .unwrap_or_default();
             core_session_provider_and_working_dir(sessions, &request)
         };
+        if provider == "opencode" {
+            return self.create_opencode_session_with_runtime(request, log_dir, runtime);
+        }
         if provider == "codex-fork" {
             if let Some(model) = request
                 .model
@@ -5800,6 +5825,10 @@ impl SessionStore {
         };
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
+        }
+        if record.provider == "opencode" {
+            drop(_guard);
+            return self.restore_opencode_session_with_runtime(session_id, runtime);
         }
         if !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork") {
             return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
@@ -8636,6 +8665,7 @@ impl SessionStore {
             },
             tmux_socket_name: tmux_socket_name.map(ToOwned::to_owned),
             node,
+            host: None,
             provider,
             model: optional_trimmed(request.model.as_deref()),
             reasoning_effort: optional_trimmed(request.reasoning_effort.as_deref()),
@@ -9614,7 +9644,7 @@ fn normalize_codex_fork_event_type(event_type: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateCoreSessionRequest {
     #[serde(default)]
     pub id: Option<String>,
@@ -10448,6 +10478,10 @@ mod opencode_records_tests;
 #[path = "opencode/events_store.rs"]
 mod opencode_events_store;
 pub use opencode_events_store::{OpencodeEventInput, OpencodeStopSignal};
+
+#[path = "opencode/session_launch.rs"]
+mod opencode_session_launch;
+pub use opencode_session_launch::{OpencodeLaunchContext, OpencodeLaunchDriver};
 
 /// Identity and change stamps of one version of the state file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16173,6 +16207,8 @@ pub struct SessionRecord {
     pub tmux_socket_name: Option<String>,
     #[serde(default = "default_node")]
     pub node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
@@ -19794,6 +19830,7 @@ sleep 30
             tmux_session: "claude-abc12345".to_owned(),
             tmux_socket_name: None,
             node: "primary".to_owned(),
+            host: None,
             provider: "claude".to_owned(),
             model: None,
             reasoning_effort: None,
