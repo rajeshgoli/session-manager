@@ -473,7 +473,29 @@ impl ModelHost {
         }
         Ok(())
     }
+    /// Sampling repairs a timed-out shutdown only after the backend confirms
+    /// absence. Never race a load/unload worker or interrupt an active drain.
+    fn reconcile_draining(&self) -> Result<()> {
+        let _lock = match self.operation.try_lock() {
+            Ok(lock) => lock,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                bail!("model operation lock poisoned");
+            }
+        };
+        if let Some(mut m) = self.record()?.filter(|m| m.state == "draining") {
+            if !self.backend.running(&m)? {
+                m.pid = None;
+                m.last_error = None;
+                let state = if m.desired { "yielded" } else { "unloaded" };
+                self.transition(&mut m, state)?;
+                self.force_unload.store(false, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
     fn sample(&self) -> Result<Option<i64>> {
+        self.reconcile_draining()?;
         let Some(m) = self.record()?.filter(ModelRecord::resident) else {
             return Ok(Some(0));
         };
@@ -606,13 +628,7 @@ impl CliServer {
             "#{pane_dead} #{pane_pid}",
         ]);
         match text {
-            Ok(text) => {
-                let mut parts = text.split_whitespace();
-                if parts.next() == Some("0") {
-                    return Ok(Some(parts.next().context("missing model pid")?.parse()?));
-                }
-                Ok(None)
-            }
+            Ok(text) => live_pane_pid(&text),
             Err(error) => {
                 let detail = format!("{error:#}");
                 if detail.contains("can't find")
@@ -811,7 +827,9 @@ impl ModelServer for CliServer {
         if m.server == "lmstudio" {
             self.lms_has(&m.identifier)
         } else {
-            Ok(self.pane()?.is_some())
+            // An endpoint still answering after pane exit keeps admission
+            // blocked, just as it does in stop().
+            Ok(self.pane()?.is_some() || self.models().is_ok())
         }
     }
     fn owned_pid(&self, m: &ModelRecord) -> Result<Option<i32>> {
@@ -854,6 +872,28 @@ impl ModelServer for CliServer {
             let _ = pids;
             Ok(None)
         }
+    }
+}
+fn live_pane_pid(text: &str) -> Result<Option<i32>> {
+    let mut parts = text.split_whitespace();
+    match parts.next() {
+        Some("1") => Ok(None),
+        Some("0") => {
+            let pid: i32 = parts.next().context("missing model pid")?.parse()?;
+            if pid <= 0 {
+                bail!("invalid owned model pid");
+            }
+            // tmux can lag the kernel exit. Only ESRCH proves absence; other
+            // errors (including permission errors) keep admission blocked.
+            // SAFETY: signal 0 observes a positive PID without signaling it.
+            if unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return Ok(None);
+            }
+            Ok(Some(pid))
+        }
+        _ => bail!("invalid model pane status"),
     }
 }
 fn quote(s: &str) -> String {

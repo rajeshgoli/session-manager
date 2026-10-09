@@ -5,6 +5,8 @@ struct FakeServer {
     started: AtomicUsize,
     stopped: AtomicUsize,
     fail_stop: AtomicBool,
+    running: AtomicBool,
+    fail_probe: AtomicBool,
     footprint: i64,
 }
 impl ModelServer for FakeServer {
@@ -22,6 +24,12 @@ impl ModelServer for FakeServer {
         }
         Ok(())
     }
+    fn running(&self, _: &ModelRecord) -> Result<bool> {
+        if self.fail_probe.load(Ordering::SeqCst) {
+            bail!("probe unavailable");
+        }
+        Ok(self.running.load(Ordering::SeqCst))
+    }
     fn footprint(&self, _: &ModelRecord) -> Result<Option<i64>> {
         Ok(Some(self.footprint))
     }
@@ -36,6 +44,8 @@ fn fixture() -> (ModelHost, Arc<FakeServer>, PathBuf) {
         started: AtomicUsize::new(0),
         stopped: AtomicUsize::new(0),
         fail_stop: AtomicBool::new(false),
+        running: AtomicBool::new(true),
+        fail_probe: AtomicBool::new(false),
         footprint: 150 * GB,
     });
     let host = ModelHost {
@@ -492,4 +502,61 @@ fn model_command_failure_preserves_stdout_reason() {
     let error = command_output(command, Duration::from_secs(2)).unwrap_err();
     assert!(error.to_string().contains("fixture shutdown refused"));
     assert!(error.to_string().contains("exit status: 1"));
+}
+
+#[test]
+fn sampling_reconciles_late_exit_after_failed_unload_without_retry() {
+    for reason in [None, Some("perf benchmark")] {
+        let (host, server, root) = fixture();
+        ready(&host);
+        server.fail_stop.store(true, Ordering::SeqCst);
+        assert!(host.unload(true, reason).is_err());
+        host.sample().unwrap();
+        assert_eq!(host.record().unwrap().unwrap().state, "draining");
+        server.fail_probe.store(true, Ordering::SeqCst);
+        assert!(host.sample().is_err());
+        assert_eq!(host.record().unwrap().unwrap().state, "draining");
+        server.fail_probe.store(false, Ordering::SeqCst);
+        server.running.store(false, Ordering::SeqCst);
+        // Reconciliation must not change state during an active operation.
+        let lock = host.operation.lock().unwrap();
+        host.sample().unwrap();
+        assert_eq!(host.record().unwrap().unwrap().state, "draining");
+        drop(lock);
+        assert_eq!(host.sample().unwrap(), Some(0));
+        let m = host.record().unwrap().unwrap();
+        assert_eq!(
+            m.state,
+            if reason.is_some() {
+                "yielded"
+            } else {
+                "unloaded"
+            }
+        );
+        assert_eq!(m.desired, reason.is_some());
+        assert_eq!(m.last_yield_reason.as_deref(), reason);
+        assert!(m.last_error.is_none());
+        assert!(m.pid.is_none());
+        assert!(!m.resident());
+        assert!(!host.force_unload.load(Ordering::SeqCst));
+        assert_eq!(server.stopped.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn stale_live_pane_does_not_keep_an_exited_process_resident() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    assert_eq!(live_pane_pid(&format!("0 {pid}")).unwrap(), None);
+    let pid = std::process::id() as i32;
+    assert_eq!(live_pane_pid(&format!("0 {pid}")).unwrap(), Some(pid));
+    assert_eq!(live_pane_pid(&format!("1 {pid}")).unwrap(), None);
+    for invalid in ["", "unexpected 123", "0", "0 -1", "0 0"] {
+        assert!(live_pane_pid(invalid).is_err());
+    }
 }
