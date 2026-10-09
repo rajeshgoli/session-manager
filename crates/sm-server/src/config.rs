@@ -1590,6 +1590,17 @@ pub struct QueueRunnerMemoryConfig {
     pub min_free_bytes: i64,
     #[serde(default = "default_queue_runner_memory_retry_interval_seconds")]
     pub retry_interval_seconds: u64,
+    /// Memory one process an agent runs from its own shell may use before sm
+    /// kills it and tells the agent to use the queue (#2137). 0 disables.
+    #[serde(default = "default_agent_process_max_bytes")]
+    pub agent_process_max_bytes: i64,
+    /// Executable names that limit never applies to, besides agent harnesses.
+    #[serde(default)]
+    pub agent_process_exempt_commands: Vec<String>,
+}
+
+fn default_agent_process_max_bytes() -> i64 {
+    1024 * 1024 * 1024
 }
 
 impl Default for QueueRunnerMemoryConfig {
@@ -1597,6 +1608,8 @@ impl Default for QueueRunnerMemoryConfig {
         Self {
             min_free_bytes: default_queue_runner_memory_min_free_bytes(),
             retry_interval_seconds: default_queue_runner_memory_retry_interval_seconds(),
+            agent_process_max_bytes: default_agent_process_max_bytes(),
+            agent_process_exempt_commands: Vec::new(),
         }
     }
 }

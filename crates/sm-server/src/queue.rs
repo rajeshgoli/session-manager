@@ -43,7 +43,7 @@ pub fn set_live_queue_shutdown(shutdown: crate::handover::Shutdown) {
     *queue_shutdown_cell().write().unwrap() = shutdown;
 }
 
-fn queue_shutdown() -> crate::handover::Shutdown {
+pub(crate) fn queue_shutdown() -> crate::handover::Shutdown {
     queue_shutdown_cell().read().unwrap().clone()
 }
 
@@ -4178,7 +4178,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn open_queue_jobs_connection(db_path: &Path) -> Result<Connection> {
+pub(crate) fn open_queue_jobs_connection(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -7732,7 +7732,7 @@ fn queue_job_remaining_seconds(job: &QueueJobRecord) -> Option<i64> {
     Some(job.timeout_seconds.saturating_sub(elapsed).max(0))
 }
 
-fn memory_amount_text(bytes: i64) -> String {
+pub(crate) fn memory_amount_text(bytes: i64) -> String {
     const GIB: f64 = (1024_u64 * 1024 * 1024) as f64;
     format!("{:.1} GiB", bytes as f64 / GIB)
 }
