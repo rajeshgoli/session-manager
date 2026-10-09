@@ -74,6 +74,7 @@ pub struct WallArtifacts {
     pub cargo: PathBuf,
     pub executables: PathBuf,
     pub tools: BTreeMap<String, PathBuf>,
+    pub sdk: Option<PathBuf>,
 }
 
 pub struct LocalWallRuntime {
@@ -610,6 +611,9 @@ fn environment(
     judge: &JudgeEndpoint,
 ) -> BTreeMap<String, String> {
     let mut values = egress.environment();
+    if let Some(sdk) = &artifacts.sdk {
+        values.insert("SDKROOT".into(), sdk.display().to_string());
+    }
     for (key, value) in [
         ("HOME", config.home.display().to_string()),
         (

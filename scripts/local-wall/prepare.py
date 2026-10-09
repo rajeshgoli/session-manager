@@ -13,16 +13,28 @@ sys.dont_write_bytecode = True
 import wall_profile as wall
 
 
-def independent_tree(root):
+def independent_tree(root, allow_internal_links=False):
     """Reject pre-existing aliases before granting a mutable tree to an agent."""
     def traversal_error(error):
         raise error
 
+    links = {}
     for directory, folders, files in os.walk(root, followlinks=False, onerror=traversal_error):
         for name in [*folders, *files]:
             path = Path(directory) / name
-            if not path.is_symlink() and path.is_file() and path.stat().st_nlink != 1:
-                raise ValueError(f"hard-link alias in agent tree: {path}")
+            if not path.is_symlink() and path.is_file():
+                metadata = path.stat()
+                if metadata.st_nlink != 1:
+                    if not allow_internal_links:
+                        raise ValueError(f"hard-link alias in agent tree: {path}")
+                    key = (metadata.st_dev, metadata.st_ino)
+                    count, _, _ = links.get(key, (0, metadata.st_nlink, path))
+                    links[key] = (count + 1, metadata.st_nlink, path)
+    # Cargo's incremental cache links files within the writable checkout. All
+    # names of each inode must be accounted for here; a host alias still fails.
+    for count, expected, path in links.values():
+        if count != expected:
+            raise ValueError(f"hard-link alias outside agent tree: {path}")
 
 
 def prepare(request):
@@ -36,8 +48,8 @@ def prepare(request):
         raise ValueError("agent configuration must be a physical directory")
     if executables.is_symlink():
         raise ValueError("staged executables must not be a symlink")
-    for root in [checkout, state]:
-        independent_tree(root)
+    independent_tree(checkout, allow_internal_links=True)
+    independent_tree(state)
     # The host holds the preparation lock and has finished every old launch.
     # Rebuild the entire admitted root: withdrawn tools and interrupted copies
     # must not survive into a new registration.
@@ -71,7 +83,7 @@ def prepare(request):
     tools = [{"name": "launch-env", "source": "/usr/bin/env"}, *request["tools"]]
     for tool in tools:
         name = tool["name"]
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_+-]*", name) or name in names:
             raise ValueError("invalid or duplicate staged tool name")
         names.add(name)
         source = wall.physical(tool["source"])
@@ -80,9 +92,24 @@ def prepare(request):
         if source == checkout or wall.below(source, checkout) or wall.below(source, state):
             raise ValueError("staged tool source must be outside mutable agent trees")
         target = executables / name
+        rust_tool = name in ("cargo", "rustc", "cargo-fmt", "rustfmt", "cargo-clippy", "clippy-driver")
+        apple_tool = name in ("cc", "clang", "c++", "clang++", "ld", "ar", "ranlib")
+        if rust_tool or apple_tool:
+            # Rust discovers its sysroot and driver dylib relative to the image.
+            # Keep bin/../lib intact while using independently signed binaries.
+            library = wall.physical(source.parent.parent / "lib")
+            toolchain = executables / ("rust-toolchain" if rust_tool else "apple-toolchain")
+            (toolchain / "bin").mkdir(parents=True, exist_ok=True)
+            link = toolchain / "lib"
+            if link.is_symlink():
+                if link.resolve(strict=True) != library:
+                    raise ValueError("staged build tools must share one toolchain")
+            else:
+                link.symlink_to(library, target_is_directory=True)
+            target = toolchain / "bin" / name
         if target.is_symlink() or (target.exists() and target.stat().st_nlink != 1):
             raise ValueError("staged tool output must not have aliases")
-        temporary = executables / ("." + name + ".new")
+        temporary = target.with_name("." + name + ".new")
         if temporary.exists() or temporary.is_symlink():
             raise ValueError("unexpected staged tool temporary file")
         try:
@@ -92,6 +119,8 @@ def prepare(request):
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
+        if target.parent != executables:
+            (executables / name).symlink_to(target)
         staged[name] = str(target)
     supervisor = executables / ".supervisor.new"
     if supervisor.exists() or supervisor.is_symlink():
@@ -154,7 +183,10 @@ def prepare(request):
     if "opencode" in staged:
         command.extend(["--attached-spawn-executable", staged["opencode"]])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-    return {"profile": str(profile), "adapter": str(adapter), "supervisor": str(executables / "supervisor"),
+    sdk = None
+    if "cc" in staged:
+        sdk = str(wall.physical(subprocess.check_output(["/usr/bin/xcrun", "--show-sdk-path"], text=True).strip()))
+    return {"profile": str(profile), "adapter": str(adapter), "supervisor": str(executables / "supervisor"), "sdk": sdk,
             "tmp": tmp, "gh": str(gh), "cargo": str(cargo), "executables": str(executables), "tools": staged}
 
 
