@@ -31,7 +31,7 @@ class SpendViewModel(application: Application) : AndroidViewModel(application) {
         request = viewModelScope.launch {
             if (!initialized) {
                 val (provider, range) = settings.loadSpendChoices()
-                _state.update { it.copy(provider = provider?.takeIf { p -> p in listOf("claude", "codex") }, range = SpendRange.fromKey(range)) }
+                _state.update { it.copy(provider = provider?.takeIf { p -> p in listOf("claude", "codex", "local") }, range = SpendRange.fromKey(range)) }
                 initialized = true
             }
             val selection = _state.value
