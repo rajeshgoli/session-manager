@@ -233,6 +233,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ("work_claims", "parent_session_id", "the parent is the same"),
     ("work_claims", "ended_by_session_id", "history"),
     ("events", "session_id", "history"),
+    (
+        "agent_process_kills",
+        "session_id",
+        "history of who ran the killed process",
+    ),
     ("merge_holds", "placed_by_session_id", "history"),
     ("merge_holds", "ended_by_session_id", "history"),
     (
