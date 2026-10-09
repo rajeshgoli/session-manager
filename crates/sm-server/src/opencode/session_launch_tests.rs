@@ -21,6 +21,8 @@ struct Driver {
     old_posts: AtomicUsize,
     old_conversations: AtomicUsize,
     ready: AtomicBool,
+    seat_override: AtomicUsize,
+    seat_reads: AtomicUsize,
     fail_start: AtomicBool,
     fail_history: AtomicBool,
     fail_client: AtomicBool,
@@ -75,7 +77,20 @@ impl OpencodeLaunchDriver for Driver {
         if requested.is_some_and(|model| model != self.config.model_id) {
             anyhow::bail!("requested model is not loaded")
         }
-        Ok(self.config.clone())
+        let mut config = self.config.clone();
+        config.max_agents = self.seat_limit()?;
+        Ok(config)
+    }
+    fn seat_limit(&self) -> Result<usize> {
+        self.seat_reads.fetch_add(1, Ordering::SeqCst);
+        let seats = self.seat_override.load(Ordering::SeqCst);
+        Ok(if !self.ready.load(Ordering::Acquire) {
+            0
+        } else if seats == 0 {
+            self.config.max_agents
+        } else {
+            seats
+        })
     }
     fn binding(&self, config: &OpencodeConfig, id: &str, port: u16) -> Result<RuntimeBinding> {
         Ok(RuntimeBinding {
@@ -244,6 +259,8 @@ impl Fixture {
             old_posts: AtomicUsize::new(0),
             old_conversations: AtomicUsize::new(0),
             ready: AtomicBool::new(true),
+            seat_override: AtomicUsize::new(0),
+            seat_reads: AtomicUsize::new(0),
             fail_start: AtomicBool::new(false),
             fail_history: AtomicBool::new(false),
             fail_client: AtomicBool::new(false),
@@ -1037,4 +1054,25 @@ fn local_spawn_waits_for_retirement_without_holding_the_registry() {
         .unwrap();
     assert_eq!(creator.join().unwrap().unwrap().id, "local2");
     assert_eq!(f.driver.starts.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn waiting_spawn_observes_a_model_seat_increase_without_retiring_the_first_agent() {
+    let f = Fixture::with_ports(2);
+    f.create("local1", None).unwrap();
+    let before = f.driver.seat_reads.load(Ordering::SeqCst);
+    let (store, runtime) = (f.store.clone(), f.runtime.clone());
+    let creator = thread::spawn(move || {
+        let mut request = Fixture::request("local2", None);
+        request.max_wait_seconds = Some(5);
+        store.create_core_session_with_runtime(request, None, &runtime)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while f.driver.seat_reads.load(Ordering::SeqCst) < before + 2 {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    f.driver.seat_override.store(2, Ordering::SeqCst);
+    assert_eq!(creator.join().unwrap().unwrap().id, "local2");
+    assert_eq!(f.store.list_sessions(false).unwrap().len(), 2);
 }

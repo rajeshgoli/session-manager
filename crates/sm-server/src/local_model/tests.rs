@@ -5,6 +5,8 @@ struct FakeServer {
     started: AtomicUsize,
     stopped: AtomicUsize,
     fail_stop: AtomicBool,
+    fail_start: AtomicBool,
+    fail_ready: AtomicBool,
     running: AtomicBool,
     fail_probe: AtomicBool,
     footprint: i64,
@@ -12,9 +14,15 @@ struct FakeServer {
 impl ModelServer for FakeServer {
     fn start(&self, _: &ModelRecord) -> Result<Option<i32>> {
         self.started.fetch_add(1, Ordering::SeqCst);
+        if self.fail_start.load(Ordering::SeqCst) {
+            bail!("temporary startup failure");
+        }
         Ok(Some(123))
     }
     fn ready(&self, _: &ModelRecord) -> Result<bool> {
+        if self.fail_ready.load(Ordering::SeqCst) {
+            bail!("temporary readiness failure");
+        }
         Ok(true)
     }
     fn stop(&self, _: &ModelRecord) -> Result<()> {
@@ -46,6 +54,8 @@ fn fixture() -> (ModelHost, Arc<FakeServer>, PathBuf) {
         started: AtomicUsize::new(0),
         stopped: AtomicUsize::new(0),
         fail_stop: AtomicBool::new(false),
+        fail_start: AtomicBool::new(false),
+        fail_ready: AtomicBool::new(false),
         running: AtomicBool::new(true),
         fail_probe: AtomicBool::new(false),
         footprint: 150 * GB,
@@ -715,4 +725,68 @@ pub(super) fn register_outbox_fixture(
 
 fn root_path(host: &ModelHost) -> String {
     host.queue_dir.display().to_string()
+}
+
+#[test]
+fn automatic_reload_retries_transient_failures_after_confirmed_cleanup_and_new_hold() {
+    for (fail_start, fail_stop) in [(true, false), (false, false), (false, true)] {
+        let (host, server, root) = fixture();
+        ready(&host);
+        local_session(&host, "running");
+        host.unload(true, Some("memory pressure")).unwrap();
+        server.fail_start.store(fail_start, Ordering::SeqCst);
+        server.fail_ready.store(!fail_start, Ordering::SeqCst);
+        server.fail_stop.store(fail_stop, Ordering::SeqCst);
+        host.set_reload_hold_for_test(601);
+        assert!(host.reload_pass(Some(275 * GB), false).is_err());
+        let failed = host.record().unwrap().unwrap();
+        assert!(failed.desired);
+        assert_eq!(failed.state, if fail_stop { "draining" } else { "yielded" });
+        assert!(host
+            .sessions
+            .get_session("local-seat")
+            .unwrap()
+            .unwrap()
+            .local_parked_reason
+            .is_some());
+        if fail_stop {
+            server.running.store(false, Ordering::SeqCst);
+            host.reconcile_draining().unwrap();
+            assert_eq!(host.record().unwrap().unwrap().state, "yielded");
+        }
+        server.fail_start.store(false, Ordering::SeqCst);
+        server.fail_ready.store(false, Ordering::SeqCst);
+        server.fail_stop.store(false, Ordering::SeqCst);
+        let attempts = server.started.load(Ordering::SeqCst);
+        host.reload_pass(Some(275 * GB), false).unwrap();
+        assert_eq!(
+            server.started.load(Ordering::SeqCst),
+            attempts,
+            "retry must earn a fresh hold"
+        );
+        host.set_reload_hold_for_test(601);
+        host.reload_pass(Some(275 * GB), false).unwrap();
+        assert_eq!(host.record().unwrap().unwrap().state, "ready");
+        assert_eq!(server.started.load(Ordering::SeqCst), attempts + 1);
+        assert!(host
+            .sessions
+            .get_session("local-seat")
+            .unwrap()
+            .unwrap()
+            .local_parked_reason
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn failed_manual_load_still_requires_an_explicit_new_load() {
+    let (host, server, root) = fixture();
+    let mut model = host.prepare(request(FLASH_KEY, None, None, None)).unwrap();
+    server.fail_start.store(true, Ordering::SeqCst);
+    assert!(host.load_prepared(&mut model, 275 * GB).is_err());
+    let failed = host.record().unwrap().unwrap();
+    assert!(!failed.desired);
+    assert_eq!(failed.state, "unloaded");
+    fs::remove_dir_all(root).unwrap();
 }

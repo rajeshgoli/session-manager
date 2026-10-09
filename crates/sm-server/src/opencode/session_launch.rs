@@ -8,6 +8,10 @@ pub trait OpencodeLaunchDriver: Send + Sync {
     }
     fn base_config(&self) -> OpencodeConfig;
     fn config(&self, requested: Option<&str>) -> Result<OpencodeConfig>;
+    /// Cheap current capacity read; zero while the model is unavailable.
+    fn seat_limit(&self) -> Result<usize> {
+        Ok(self.base_config().max_agents)
+    }
     fn binding(&self, config: &OpencodeConfig, id: &str, port: u16) -> Result<RuntimeBinding>;
     fn start(
         &self,
@@ -134,9 +138,10 @@ impl SessionStore {
         let deadline = std::time::Instant::now()
             .checked_add(Duration::from_secs(max_wait))
             .context("max_wait_seconds is too large")?;
-        let waiting_config = driver.config(request.model.as_deref())?;
+        let mut waiting_config = driver.config(request.model.as_deref())?;
         let (config, _admission) = loop {
             let admission = self.lock_named_clear_operation("local-seat-admission")?;
+            waiting_config.max_agents = driver.seat_limit()?;
             let config = &waiting_config;
             let capacity = {
                 let _guard = self.write_guard()?;

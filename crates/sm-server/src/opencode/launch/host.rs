@@ -65,6 +65,14 @@ impl OpencodeLaunchDriver for HostDriver {
         verify_version(&config)?;
         Ok(config)
     }
+    fn seat_limit(&self) -> Result<usize> {
+        let host = crate::local_model::live(&self.queue()?)
+            .ok_or_else(|| AdmissionError("no local model loaded".into()))?;
+        Ok(host
+            .record()?
+            .filter(|m| m.state == "ready")
+            .map_or(0, |m| m.seats as usize))
+    }
     fn binding(&self, config: &OpencodeConfig, id: &str, port: u16) -> Result<RuntimeBinding> {
         validate_component(id)?;
         let root = expand_home(&config.state_root);

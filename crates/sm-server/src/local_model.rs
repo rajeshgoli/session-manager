@@ -325,6 +325,14 @@ impl ModelHost {
         })
     }
     fn load_prepared(&self, m: &mut ModelRecord, available: i64) -> Result<()> {
+        self.load_prepared_with_retry(m, available, false)
+    }
+    fn load_prepared_with_retry(
+        &self,
+        m: &mut ModelRecord,
+        available: i64,
+        retry: bool,
+    ) -> Result<()> {
         let required = m
             .reservation_bytes
             .checked_add(self.yield_line())
@@ -359,12 +367,14 @@ impl ModelHost {
         })();
         if let Err(error) = result {
             m.last_error = Some(format!("{error:#}"));
-            m.desired = false;
+            // A failed automatic attempt does not revoke the owner's load
+            // intent. Cleanup must still prove absence before retrying.
+            m.desired &= retry;
             self.transition(m, "draining")?;
             match self.backend.stop(m) {
                 Ok(()) => {
                     m.pid = None;
-                    self.transition(m, "unloaded")?;
+                    self.transition(m, if m.desired { "yielded" } else { "unloaded" })?;
                 }
                 Err(stop) => {
                     m.last_error = Some(format!("{error:#}; unload failed: {stop:#}"));
@@ -1151,7 +1161,7 @@ impl ModelHost {
         *since = None;
         drop(since);
         // load_prepared rechecks perf admission under the queue's shared lock.
-        self.load_prepared(&mut model, available.unwrap())
+        self.load_prepared_with_retry(&mut model, available.unwrap(), true)
     }
 }
 pub fn retry_reload(state_dir: &Path) -> Result<()> {
