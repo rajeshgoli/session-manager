@@ -106,6 +106,17 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
         .output()
         .unwrap();
     let python = PathBuf::from(String::from_utf8(python_output.stdout).unwrap().trim());
+    let validation_tools = crate::opencode::launch::host::validation_tools().unwrap();
+    let rust_root = validation_tools
+        .iter()
+        .find(|tool| tool.name == "rustc")
+        .unwrap()
+        .source
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let tool_source = root.join("probe");
     let compilation = Command::new("clang")
         .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
@@ -131,8 +142,8 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
             state_root,
             alias_root: root.join("a"),
             python,
-            read_only_roots: vec![],
-            executable_roots: vec![],
+            read_only_roots: vec![rust_root.clone(), PathBuf::from("/opt/homebrew")],
+            executable_roots: vec![rust_root, PathBuf::from("/opt/homebrew")],
             control_ports: 18500..=18599,
             model_port,
             sm_upstream: upstream_address,
@@ -173,6 +184,11 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
         }
     };
     let mut a_request = registration("wall-a", 18500);
+    a_request.tools.extend(validation_tools);
+    a_request.tools.push(StageTool {
+        name: "validation-shell".into(),
+        source: "/bin/zsh".into(),
+    });
     a_request.tools.push(StageTool {
         name: "wall-withdrawn".into(),
         source: tool_source.clone(),
@@ -180,6 +196,34 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     let b_request = registration("wall-b", 18501);
     let a = host.prepare(&a_request).unwrap();
     let b = host.prepare(&b_request).unwrap();
+    fs::write(a_request.checkout.join("Cargo.toml"), "[package]\nname = \"staged-validation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    fs::write(
+        a_request.checkout.join("lib.rs"),
+        "#[test]\nfn staged_test() {\n    assert_eq!(2 + 2, 4);\n}\n",
+    )
+    .unwrap();
+    let mut validation = a.spawn_queue("validation-shell", &["-c".into(), "set -e; python3 -c 'import pathlib; pathlib.Path(\"python-ran\").write_text(\"ok\")'; rustc -vV; cargo test --offline --lib; cargo fmt --check; cargo clippy --offline --all-targets -- -D warnings".into()]).unwrap();
+    let mut validation_stdout = validation.take_stdout().unwrap();
+    let mut validation_stderr = validation.take_stderr().unwrap();
+    let validation_status = validation.wait().unwrap();
+    let mut validation_output = String::new();
+    let mut validation_errors = String::new();
+    validation_stdout
+        .read_to_string(&mut validation_output)
+        .unwrap();
+    validation_stderr
+        .read_to_string(&mut validation_errors)
+        .unwrap();
+    drop(validation);
+    assert!(
+        validation_status.success(),
+        "staged validation: {validation_output}\n{validation_errors}"
+    );
+    assert!(validation_output.contains("1 passed"));
+    assert_eq!(
+        fs::read_to_string(a_request.checkout.join("python-ran")).unwrap(),
+        "ok"
+    );
     for request in [&a_request, &b_request] {
         for (key, expected) in [
             ("user.name", request.name.clone()),
@@ -664,7 +708,17 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     drop(unrelated);
     // A host tmux launcher outlives two sm generations, retaining the actual
     // provider root, control listener, test lease and immutable queue manifest.
-    let durable = registration("wall-durable", 18504);
+    let mut durable = registration("wall-durable", 18504);
+    durable.tools.push(StageTool {
+        name: "python3".into(),
+        source: a_request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "python3")
+            .unwrap()
+            .source
+            .clone(),
+    });
     let launch_path = queue_state.join("local-wall-owners/wall-durable/launch.json");
     let hash = format!("{:x}", Sha256::digest(durable.id.as_bytes()));
     let control_socket = host.config.alias_root.join(format!("{}.host", &hash[..16]));
@@ -790,7 +844,7 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
         local_submitter: Some(crate::local_egress::gateway::VerifiedLocalAgent::test_identity("wall-durable")),
         job_type: "tests".into(), label: "owner-recovery".into(), requester_session_id: None,
         notify_session_id: "wall-durable".into(), cwd: spec.checkout.display().to_string(), argv: None,
-        script: Some(format!("'{}' -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(); c=socket.create_connection(s.getsockname()); a,_=s.accept(); c.sendall(b\"ok\"); assert a.recv(2)==b\"ok\"' || exit 1\nprint owner-queue-ok", host.config.python.display())),
+        script: Some("python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(); c=socket.create_connection(s.getsockname()); a,_=s.accept(); c.sendall(b\"ok\"); assert a.recv(2)==b\"ok\"' || exit 1\nprint owner-queue-ok".into()),
         env: BTreeMap::new(), timeout_seconds: 20, cpu_percent: None, gpu_percent: None, memory_bytes: None, rank_tickets: None,
     };
     let job =
@@ -819,10 +873,7 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
     assert_eq!(fs::read(&spec.profile).unwrap(), profile);
     assert_eq!(fs::read(&adapter_path).unwrap(), adapter);
-    queue_request.script = Some(format!(
-        "'{}' -c 'import time; time.sleep(60)'",
-        host.config.python.display()
-    ));
+    queue_request.script = Some("python3 -c 'import time; time.sleep(60)'".into());
     let abandoned =
         RetainedQueueStore::create_queue_job_in_state_dir(&queue_state, queue_request).unwrap();
     let crashed = Command::new(std::env::current_exe().unwrap())

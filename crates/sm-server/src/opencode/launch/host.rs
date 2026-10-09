@@ -117,7 +117,7 @@ impl OpencodeLaunchDriver for HostDriver {
                 .join("sm")
                 .canonicalize()?,
         }];
-        for name in ["gh", "node", "cargo", "rustc"] {
+        for name in ["gh", "node"] {
             if let Some(source) = host_tool(name)? {
                 tools.push(StageTool {
                     name: name.into(),
@@ -125,6 +125,7 @@ impl OpencodeLaunchDriver for HostDriver {
                 });
             }
         }
+        tools.extend(validation_tools()?);
         let checkout = expand_home(&record.working_dir).canonicalize()?;
         let mut git = Command::new("/usr/bin/git");
         git.args([
@@ -260,8 +261,63 @@ impl OpencodeLaunchDriver for HostDriver {
         }
     }
 }
+pub(crate) fn validation_tools() -> Result<Vec<StageTool>> {
+    let mut tools = Vec::new();
+    for (name, executable) in [
+        ("cc", "clang"),
+        ("clang", "clang"),
+        ("c++", "clang++"),
+        ("clang++", "clang++"),
+        ("ld", "ld"),
+        ("ar", "ar"),
+        ("ranlib", "ranlib"),
+    ] {
+        let mut command = Command::new("/usr/bin/xcrun");
+        command.args(["--find", executable]);
+        let output = command_output_with_timeout(command, Duration::from_secs(5))?;
+        if !output.status.success() {
+            bail!("cannot resolve Apple build tool {executable}")
+        }
+        tools.push(StageTool {
+            name: name.into(),
+            source: PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?,
+        });
+    }
+    for name in [
+        "cargo",
+        "rustc",
+        "cargo-fmt",
+        "rustfmt",
+        "cargo-clippy",
+        "clippy-driver",
+    ] {
+        if let Some(source) = host_tool(name)? {
+            tools.push(StageTool {
+                name: name.into(),
+                source,
+            });
+        }
+    }
+    // Homebrew's framework launcher uses a raw spawn before the adapter can
+    // intercept it. Stage the actual runtime image instead.
+    let mut command = Command::new("python3");
+    command.args(["-c", "import sys; from pathlib import Path; p = Path(sys.base_prefix) / 'Resources/Python.app/Contents/MacOS/Python'; print((p if p.is_file() else Path(sys._base_executable)).resolve())"]);
+    let output = command_output_with_timeout(command, Duration::from_secs(5))?;
+    if !output.status.success() {
+        bail!("cannot resolve Python runtime")
+    }
+    tools.push(StageTool {
+        name: "python3".into(),
+        source: PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?,
+    });
+    Ok(tools)
+}
+
 fn host_tool(name: &str) -> Result<Option<PathBuf>> {
-    if matches!(name, "cargo" | "rustc") {
+    if matches!(
+        name,
+        "cargo" | "rustc" | "cargo-fmt" | "rustfmt" | "cargo-clippy" | "clippy-driver"
+    ) {
         let mut command = Command::new("rustup");
         command.args(["which", name]);
         if let Ok(output) = command_output_with_timeout(command, Duration::from_secs(5)) {
