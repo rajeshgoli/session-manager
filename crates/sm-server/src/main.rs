@@ -365,6 +365,19 @@ async fn main() -> Result<()> {
                 cancel_grace_seconds,
                 admission_policy,
             );
+            sm_server::agent_memory_guard::spawn_agent_memory_guard(
+                sm_server::agent_memory_guard::AgentMemoryGuardConfig {
+                    session_state_file: expand_home(&config.paths.state_file),
+                    queue_state_dir: queue_state_dir.clone(),
+                    message_queue_db_path: message_queue_db_path.clone(),
+                    limit_bytes: config.queue_runner.memory.agent_process_max_bytes,
+                    exempt_commands: config
+                        .queue_runner
+                        .memory
+                        .agent_process_exempt_commands
+                        .clone(),
+                },
+            );
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_after_boot(
                 &queue_state_dir,
                 &message_queue_db_path,

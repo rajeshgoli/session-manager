@@ -25,6 +25,7 @@ pub fn write_stderr_line(args: std::fmt::Arguments<'_>) {
 }
 
 pub mod activity_ledger;
+pub mod agent_memory_guard;
 pub mod agent_notes;
 pub mod analytics_spend;
 pub mod analytics_time;

@@ -7699,7 +7699,7 @@ async fn list_queue_jobs(
     let jobs = RetainedQueueStore::list_queue_jobs_from_path(
         &queue_db_path,
         QueueJobFilters {
-            notify_session_id,
+            notify_session_id: notify_session_id.clone(),
             job_type: query
                 .job_type
                 .as_ref()
@@ -7732,7 +7732,19 @@ async fn list_queue_jobs(
         }
         response_jobs.push(queue_job_response_named(&state, job, &active, &names)?);
     }
-    Ok(Json(json!({ "jobs": response_jobs })))
+    // Processes sm killed in agents' own shells for exceeding the per-process
+    // memory limit (#2137); a read failure must not hide the job listing.
+    let kills = crate::agent_memory_guard::recent_agent_process_kills(
+        &queue_db_path,
+        notify_session_id.as_deref(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("queue listing could not read agent process kills: {error:#}");
+        Vec::new()
+    });
+    Ok(Json(
+        json!({ "jobs": response_jobs, "agent_process_kills": kills }),
+    ))
 }
 
 fn queue_job_response_named(

@@ -1951,7 +1951,44 @@ fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
         )
     );
     print_queue_jobs(&jobs);
+    print_agent_process_kills(payload["agent_process_kills"].as_array());
     Ok(())
+}
+
+/// Processes sm killed in agents' own shells over the memory limit (#2137).
+fn print_agent_process_kills(kills: Option<&Vec<Value>>) {
+    let Some(kills) = kills.filter(|kills| !kills.is_empty()) else {
+        return;
+    };
+    println!();
+    println!("Agent-run processes sm killed for memory in the last 24h (rerun them through sm queue run):");
+    let headers = ["Killed at", "Session", "PID", "Memory", "Limit", "Command"];
+    let gib = |bytes: Option<i64>| {
+        bytes.map_or_else(
+            || "-".to_owned(),
+            |bytes| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+        )
+    };
+    let rows = kills
+        .iter()
+        .map(|kill| {
+            vec![
+                json_string(kill, "killed_at"),
+                format!(
+                    "{} ({})",
+                    json_string(kill, "session_name"),
+                    json_string(kill, "session_id")
+                ),
+                kill["pid"]
+                    .as_i64()
+                    .map_or_else(String::new, |pid| pid.to_string()),
+                gib(kill["memory_bytes"].as_i64()),
+                gib(kill["limit_bytes"].as_i64()),
+                json_string(kill, "command"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&headers, &rows);
 }
 
 fn queue_list_scope_text(
