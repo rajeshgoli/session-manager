@@ -259,16 +259,46 @@ fn executable_name(command: &str) -> &str {
 /// [`KILL_GRACE`]. Signalled by PID, never by process group, so nothing
 /// outside the tree is touched.
 fn stop_processes(pids: &[i32]) {
+    // Identities taken before SIGTERM: a PID freed and reused during the
+    // grace period must not receive the SIGKILL.
+    let identities: Vec<_> = pids
+        .iter()
+        .map(|pid| (*pid, process_identity(*pid)))
+        .collect();
     for pid in pids {
         let _ = kill(Pid::from_raw(*pid), Signal::SIGTERM);
     }
-    let pids = pids.to_vec();
     thread::spawn(move || {
         thread::sleep(KILL_GRACE);
-        for pid in pids {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        for (pid, identity) in identities {
+            if identity.is_some() && process_identity(pid) == identity {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+type ProcessIdentity = crate::local_sockets::identity::ProcessIdentity;
+#[cfg(not(target_os = "macos"))]
+type ProcessIdentity = String;
+
+/// The kernel's never-reused identity of a live process.
+fn process_identity(pid: i32) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = u32::try_from(pid).ok()?;
+        crate::local_sockets::identity::snapshot(pid)
+            .ok()
+            .map(|snapshot| snapshot.identity)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Start time in clock ticks, field 22 of /proc/<pid>/stat.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_command = stat.rsplit_once(')')?.1;
+        after_command.split_whitespace().nth(19).map(str::to_owned)
+    }
 }
 
 /// Live sm sessions and their tmux pane process, one `list-panes` per socket.
