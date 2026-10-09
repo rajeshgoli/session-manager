@@ -185,10 +185,16 @@ fn same_parent_requests_with_delayed_finish_remain_one_turn() {
     assert_eq!(stops(&effects), 0);
     history[2]["info"]["time"]["completed"] = json!(31);
     history[2]["info"]["finish"] = json!("stop");
-    assert!(reopened
-        .backfill(&history, Activity::Busy, &generated)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        reopened
+            .backfill(&history, Activity::Busy, &generated)
+            .unwrap(),
+        vec![Effect::ModelRequest {
+            message_id: "msg_03".into(),
+            start_ms: 30,
+            end_ms: 31,
+        }]
+    );
     let effects = reopened
         .backfill(&history, Activity::Idle, &generated)
         .unwrap();
@@ -859,4 +865,25 @@ fn frozen_real_proof_history_emits_one_stop_per_turn_not_one_per_model_request()
             .unwrap(),
         vec![]
     );
+}
+
+#[test]
+fn model_request_uses_native_times_and_replay_emits_it_once() {
+    let mut projection = Projection::new("ses_test", Activity::Idle).unwrap();
+    let row = assistant("msg_02", true, "stop", vec![]);
+    let effects = projection
+        .backfill(std::slice::from_ref(&row), Activity::Idle, &BTreeSet::new())
+        .unwrap();
+    assert!(effects.contains(&Effect::ModelRequest {
+        message_id: "msg_02".into(),
+        start_ms: 20,
+        end_ms: 21
+    }));
+    let mut restored: Projection =
+        serde_json::from_value(serde_json::to_value(projection).unwrap()).unwrap();
+    assert!(!restored
+        .backfill(&[row], Activity::Idle, &BTreeSet::new())
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, Effect::ModelRequest { .. })));
 }

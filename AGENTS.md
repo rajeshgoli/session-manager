@@ -59,6 +59,9 @@ and a reason. "Should we delete this?" is not a question for me; "I recommend de
 | Top | fable, xhigh effort | astra, high effort |
 | Mid | opus 1M, high | terra, high or sol, medium |
 | Low | sonnet 1M, high | luna, high |
+| Local | — | — |
+
+Local: `sm spawn local`; well-specified fixes whose failure a test reproduces inside the checkout, plus inventory, fixture plumbing, narrow docs and triage. Not bugs that need live reproduction against a running sm. Never spec, design, review or maintainer.
 
 **Top tier agents may delegate routine work.** You may use lower-tier subagents for research, lookup, inventory, and well specified fixes as needed. Note that if I assign you a task, and don't explicitly say you are an orchestrator, do not delegate core work. For e.g., Astra/high or Fable/high on a ticket task was chosen because the ticket work is complex. This means you can use research agents of lower tier, but implementation or spec writing or review or whatever the core task was MUST be done inline by the agent. 
 

@@ -84,7 +84,7 @@ pub(super) async fn client_analytics_spend(
             Some(
                 analytics_spend::parse_provider(value).ok_or_else(|| ApiError::Status {
                     status: StatusCode::BAD_REQUEST,
-                    detail: "provider must be claude or codex".into(),
+                    detail: "provider must be claude, codex or local".into(),
                 })?,
             )
         }

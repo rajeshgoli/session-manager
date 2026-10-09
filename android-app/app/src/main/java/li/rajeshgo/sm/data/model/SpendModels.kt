@@ -16,6 +16,7 @@ data class SpendReport(
     @SerialName("parts_legend") val partsLegend: List<AnalyticsLegend> = emptyList(),
     val notes: List<String> = emptyList(),
     val root: SpendNode,
+    val local: LocalSpend? = null,
 )
 
 @Serializable
@@ -69,3 +70,13 @@ data class SpendTokens(
     @SerialName("cache_write") val cacheWrite: Long = 0,
     @SerialName("cache_read") val cacheRead: Long = 0,
 )
+
+@Serializable
+data class LocalSpend(
+    val models: List<SpendModel> = emptyList(),
+    val days: List<LocalSpendDay> = emptyList(),
+    @SerialName("busy_hours") val busyHours: Double = 0.0,
+)
+
+@Serializable
+data class LocalSpendDay(val date: String, @SerialName("busy_hours") val busyHours: Double)

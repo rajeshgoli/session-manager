@@ -69,3 +69,5 @@ fun spendSubtitle(node: SpendNode): String = when (node.kind) {
     "gap" -> "Usage outside the recorded ledger"
     else -> "${spendTokens(node.tokens)} tokens"
 }
+
+fun localBusyHours(value: Double): String = String.format(Locale.US, "%.2f", value)

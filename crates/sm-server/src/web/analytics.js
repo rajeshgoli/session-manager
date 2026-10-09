@@ -45,10 +45,10 @@ function DrillReport({ section }) {
   const enter = (child) => setTrail([...crumbs.slice(1).map((n) => n.id), child.id]);
   return html`<div class="q-heading">
     <${Seg} label="Analytics range" value=${range} onChange=${(v) => { setRange(v); setTrail([]); }} options=${ranges.map(([value, label]) => ({ value, label }))} />
-    ${spend ? html`<${Seg} label="Provider" value=${provider || report?.provider || 'claude'} onChange=${(v) => { setProvider(v); setTrail([]); }} options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex', label: 'Codex' }]} />` : null}
+    ${spend ? html`<${Seg} label="Provider" value=${provider || report?.provider || 'claude'} onChange=${(v) => { setProvider(v); setTrail([]); }} options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex', label: 'Codex' }, { value: 'local', label: 'Local' }]} />` : null}
   </div>
   ${error ? html`<p class="err" role="alert">${error.message}</p>` : null}
-  ${!report ? html`<p class="muted">Loading analytics…</p>` : html`
+  ${!report ? html`<p class="muted">Loading analytics…</p>` : report.provider === 'local' ? html`<${LocalSpend} report=${report} />` : html`
     ${spend ? html`<div class="q-tiles">${report.meters.map((meter) => html`<section class="q-card"><span class="q-label">${meter.label || meter.account_key}</span><strong>${percent(meter.percent)}</strong><p class="sub">Resets ${clock(meter.resets_at)} · observed ${clock(meter.observed_at)}</p>${meter.pace ? html`<p>${meter.pace.kind === 'runs_out' ? `Runs out ${clock(meter.pace.at)}` : `On pace for ${percent(meter.pace.percent)} at reset`}</p>` : null}<p class="sub">${meter.gap >= 0 ? 'Not in the ledger' : 'Ledger above meter'}: ${percent(Math.abs(meter.gap))}</p></section>`)}</div><p class="sub">${number(report.total.tokens)} tokens · estimated ${percent(report.total.percent)} of weekly allowance</p>${report.notes.map((note) => html`<p class="sub">${note}</p>`)}` : html`<p>${duration(report.total.active_seconds)} active · ${duration(report.total.parked_seconds)} parked · ${report.total.agents} agents</p>`}
     <section class="q-card"><nav class="a-crumbs" aria-label="Analytics drill-down">${crumbs.map((crumb, i) => html`<button class="btn sm" onClick=${() => setTrail(crumbs.slice(1, i + 1).map((n) => n.id))}>${i ? '› ' : ''}${crumb.label}</button>`)}</nav>
       <div class="q-heading"><h2>${node.label}</h2><strong>${value(node)}</strong></div><div class="q-legend">${parts(node)}</div>
@@ -59,4 +59,17 @@ function DrillReport({ section }) {
       ${(node.models || []).map((model) => html`<div class="a-row"><span>${model.model} · ${model.effort || 'default effort'}<small>${number(model.turns)} turns · input ${number(model.tokens.input)} · output ${number(model.tokens.output)} · cache write ${number(model.tokens.cache_write)} · cache read ${number(model.tokens.cache_read)}</small></span><strong>${percent(model.percent)}</strong></div>`)}
       ${Object.entries(node.tools || {}).map(([key, seconds]) => html`<div class="a-row"><span>${labels[key] || key}</span><span>${duration(seconds)}</span></div>`)}
     </section>`}`;
+}
+
+function LocalSpend({ report }) {
+  const local = report.local;
+  return html`<section class="q-card"><h2>Local</h2>
+    <p>${number(report.total.tokens)} tokens · ${(local?.busy_hours || 0).toFixed(2)} model-busy hours</p>
+    <h3>Tokens by model</h3>
+    ${(local?.models || []).map((model) => html`<div class="a-row"><span>${model.model}<small>${number(model.turns)} turns · input ${number(model.tokens.input)} · output ${number(model.tokens.output)} · cache write ${number(model.tokens.cache_write)} · cache read ${number(model.tokens.cache_read)}</small></span></div>`)}
+    ${!local?.models?.length ? html`<p class="sub">No local usage in this range.</p>` : null}
+    <h3>Model-busy hours per day (UTC)</h3>
+    ${(local?.days || []).map((day) => html`<div class="a-row"><span>${day.date}</span><strong>${day.busy_hours.toFixed(2)} h</strong></div>`)}
+    ${report.notes.map((note) => html`<p class="sub">${note}</p>`)}
+  </section>`;
 }

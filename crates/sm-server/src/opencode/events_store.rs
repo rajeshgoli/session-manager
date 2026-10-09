@@ -249,6 +249,7 @@ impl SessionStore {
                 Effect::TurnStop { .. }
                     | Effect::OwnerPrompt { .. }
                     | Effect::Tool { .. }
+                    | Effect::ModelRequest { .. }
                     | Effect::Usage(_)
                     | Effect::Compacted
             ) {
@@ -421,6 +422,20 @@ impl SessionStore {
                         },
                         Some(&pending.key),
                     )?;
+                }
+                Effect::ModelRequest {
+                    message_id,
+                    start_ms,
+                    end_ms,
+                } => {
+                    if let Some(store) = &self.usage_ledger_store {
+                        store.record_local_request(
+                            &pending.conversation,
+                            message_id,
+                            *start_ms,
+                            *end_ms,
+                        )?;
+                    }
                 }
                 Effect::Usage(usage) => {
                     UsageJournal::open(&pending.state_dir.join("usage.jsonl"))?.append(

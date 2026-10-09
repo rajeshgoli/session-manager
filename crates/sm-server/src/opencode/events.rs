@@ -98,6 +98,11 @@ pub enum Effect {
         name: String,
         input: Value,
     },
+    ModelRequest {
+        message_id: String,
+        start_ms: i64,
+        end_ms: i64,
+    },
     Usage(Usage),
     Title(String),
     Error(String),
@@ -136,6 +141,8 @@ pub struct Projection {
     #[serde(default)]
     last_assistant: Option<String>,
     #[serde(default)]
+    requests: BTreeSet<String>,
+    #[serde(default)]
     message_times: BTreeMap<String, (Option<i64>, Option<i64>)>,
 }
 
@@ -157,6 +164,7 @@ impl Projection {
             last_user: String::new(),
             last_user_id: None,
             last_assistant: None,
+            requests: BTreeSet::new(),
             message_times: BTreeMap::new(),
         })
     }
@@ -385,6 +393,17 @@ impl Projection {
         let times = self.message_times.entry(id.into()).or_default();
         times.0 = info["time"]["created"].as_i64().or(times.0);
         times.1 = info["time"]["completed"].as_i64().or(times.1);
+        if info["role"] == "assistant" {
+            if let (Some(start_ms), Some(end_ms)) = *times {
+                if end_ms > start_ms && self.requests.insert(id.into()) {
+                    effects.push(Effect::ModelRequest {
+                        message_id: id.into(),
+                        start_ms,
+                        end_ms,
+                    });
+                }
+            }
+        }
         if info["role"] == "user" {
             if generated.contains(id) {
                 self.generated_users.insert(id.into());

@@ -34,6 +34,10 @@ fun LazyListScope.spendSection(
         if (state.loading) item { AnalyticsSkeleton() }
         return
     }
+    if (report.provider == "local") {
+        item { LocalSpendCard(report) }
+        return
+    }
     val nodes = state.nodes
     val node = nodes.last()
     if (nodes.size == 1) item { SpendHeader(report) }
@@ -77,7 +81,7 @@ fun LazyListScope.spendSection(
 private fun SpendControls(state: SpendState, onSelect: (String?, SpendRange) -> Unit) {
     var menu by remember { mutableStateOf(false) }
     Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        listOf("claude" to "Claude", "codex" to "Codex").forEach { (key, label) ->
+        listOf("claude" to "Claude", "codex" to "Codex", "local" to "Local").forEach { (key, label) ->
             FilterChip(selected = state.provider == key, onClick = { onSelect(key, state.range) }, label = { Text(label) })
         }
         Spacer(Modifier.weight(1f))
@@ -168,5 +172,27 @@ private fun SpendAgentCard(node: SpendNode, provider: String, onAgent: (SpendNod
             }
             node.sessionId?.let { TextButton(onClick = { onAgent(node) }, contentPadding = PaddingValues(0.dp)) { Text("Open agent  ↗", color = Cyan) } }
         }
+    }
+}
+
+@Composable
+private fun LocalSpendCard(report: SpendReport) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("Local", style = MaterialTheme.typography.headlineSmall)
+        Text("${spendTokens(report.total.tokens)} tokens · ${localBusyHours(report.local?.busyHours ?: 0.0)} model-busy hours")
+        Text("Tokens by model", style = MaterialTheme.typography.titleMedium)
+        report.local?.models.orEmpty().forEach { model ->
+            Text(model.model, fontWeight = FontWeight.SemiBold)
+            Text("${model.turns} turns · input ${spendTokens(model.tokens.input)} · output ${spendTokens(model.tokens.output)} · cache write ${spendTokens(model.tokens.cacheWrite)} · cache read ${spendTokens(model.tokens.cacheRead)}", color = TextSecondary)
+        }
+        if (report.local?.models.isNullOrEmpty()) Text("No local usage in this range.", color = TextMuted)
+        Text("Model-busy hours per day (UTC)", style = MaterialTheme.typography.titleMedium)
+        report.local?.days.orEmpty().forEach { day ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(day.date)
+                Text("${localBusyHours(day.busyHours)} h")
+            }
+        }
+        report.notes.forEach { Text(it, color = TextMuted, style = MaterialTheme.typography.bodySmall) }
     }
 }

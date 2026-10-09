@@ -66,6 +66,7 @@ pub fn parse_provider(value: &str) -> Option<&'static str> {
     match value {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
+        "local" => Some("local"),
         _ => None,
     }
 }
@@ -92,6 +93,8 @@ pub struct SpendSources<'a> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SpendReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<local::LocalSpend>,
     pub generated_at: String,
     pub provider: &'static str,
     pub range: &'static str,
@@ -268,6 +271,9 @@ pub fn spend_report(
     range: SpendRange,
     now: OffsetDateTime,
 ) -> Result<SpendReport> {
+    if provider == "local" {
+        return local::report(sources, range, now);
+    }
     let generated_at = format_nanos(now.unix_timestamp_nanos());
     let now_ns = now.unix_timestamp_nanos();
     if !sources.usage_db.exists() {
@@ -531,6 +537,7 @@ pub fn spend_report(
         .collect();
     round_node(&mut root);
     Ok(SpendReport {
+        local: None,
         generated_at,
         provider,
         range: range.id(),
@@ -560,6 +567,7 @@ fn empty_report(
     end: String,
 ) -> SpendReport {
     SpendReport {
+        local: None,
         generated_at,
         provider,
         range: range.id(),
@@ -1189,6 +1197,8 @@ pub(crate) fn format_nanos(at: i128) -> String {
         .and_then(|at| at.format(&Rfc3339).ok())
         .unwrap_or_default()
 }
+
+mod local;
 
 #[cfg(test)]
 mod tests;
