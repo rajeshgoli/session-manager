@@ -277,13 +277,18 @@ async fn main() -> Result<()> {
             handover::spawn_acceptor(&handover_listener, shutdown.clone(), handover_tx)?;
 
         if config.rust_core.runtime_enabled {
-            sm_server::local_model::register_live(&config)?;
+            let model = sm_server::local_model::register_live(&config)?;
             let judge = sm_server::local_judge::LocalJudgeRuntime::from_config(&config);
             let judge_shutdown = shutdown.clone();
             thread::spawn(move || loop {
                 if judge_shutdown.is_stopped() {
                     break;
                 }
+                run_background_pass("local model", || {
+                    if let Err(error) = model.reconcile_draining() {
+                        eprintln!("local model reconcile failed: {error:#}");
+                    }
+                });
                 run_background_pass("local judge", || {
                     if let Err(error) = judge.reconcile() {
                         eprintln!("local judge reconcile failed: {error:#}");
