@@ -79,6 +79,8 @@ Local: `sm spawn local`; well-specified fixes whose failure a test reproduces in
 
 **Long-running commands go through Session Manager from the start.** Submit them with `sm queue run --type <tests|perf|background> --label <label> --cwd <worktree> -- <command>`, then go idle. The durable queue automatically sends an `[sm queue]` completion wake to the current managed session (or an explicit `--notify` target); do not add a second watcher, `sleep`, `tail -f`, or poll. A process started outside the queue cannot be registered later with `sm watch-job`. `perf` jobs hold the entire machine. Use it only when you need noise-free machine. You will be asked to wall time budget it and the job will be terminated if it doesn't complete in the window. 
 
+**Anything that compiles or uses real memory goes through `sm queue run`, never your own shell.** sm kills any process you start from your shell once it passes 1 GB, together with its children, and sends you a `[sm memory guard]` message. That includes `cargo build`, `cargo clippy`, `cargo test` and `scripts/test-rust-isolated.sh`: an incremental `sm-server` compile alone reaches about 1.8 GB. Your shell is for light work only: git, `rg`, `gh`, `sm`, `cargo fmt`, small scripts and monitors. If a guard kill reaches you, resubmit the command through `sm queue run` with `--memory` above what it needs; do not rerun it in your shell. Kills from the last 24 hours show in `sm queue list`.
+
 **On `[sm remind]`, run `sm status "what you are doing now"` and carry on.** Not an interrupt, and it is what makes a seat legible to the watchdog.
 
 **Split parallel work across non-overlapping file sets.** A worktree stops agents corrupting each other's git state; it does nothing about two tickets editing one module and colliding at merge. If the file sets overlap, serialize.
@@ -143,7 +145,7 @@ Then:
 
 Session manager is a Rust server (Axum + Tokio, Rust 1.86+) that runs Claude Code and Codex agents in tmux, tracks parent–child agent trees, and carries durable messages, reminders, and queue jobs between them. State is in SQLite. The `sm` CLI is its client.
 
-**Restart the live server only with `scripts/restart-rust-server.sh`.** Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. 
+**Restart the live server only with `scripts/restart-rust-server.sh`, submitted through the queue:** `sm queue run --type background --label restart --timeout 30m --cwd ~/projects/session-manager-prod -- scripts/restart-rust-server.sh --update`. The script compiles the server, so run in your shell it is killed at 1 GB; as a queue job it survives the switch from the old server to the new one and wakes you when done. Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. 
 
 **The live binaries are installed copies in `.local/bin/`, not `target/`.** An ordinary `cargo build` never touches the running server, and `cargo clean` never deletes `sm`. Keep `.local/bin` on `PATH`. To refresh only the CLI, run `scripts/install-sm-cli.sh`.
 
@@ -157,8 +159,8 @@ Session manager is a Rust server (Axum + Tokio, Rust 1.86+) that runs Claude Cod
 
 The restart script uses the installed config and falls back to the in-repo `config.yaml` only when none is installed. The installed config sets `app_artifacts.root_dir`, `bug_reports.db_path`, and the two `mobile_terminal` CA paths explicitly, because their compiled defaults resolve against whichever tree the binary was built in.
 
-**Run tests with `scripts/test-rust-isolated.sh`**, not bare `cargo test`. The launcher isolates and then cleans up test state.
+**Run tests with `sm queue run --type tests --label <label> --cwd <worktree> -- scripts/test-rust-isolated.sh -p sm-server`**, not bare `cargo test`. The launcher isolates and then cleans up test state. Pass test-name filters after `-p sm-server` to run a subset.
 
-**Before opening a PR, run `cargo clippy -p sm-server --all-targets -- -D warnings` and `cargo fmt -p sm-server --check`.** Both pass on main. Fix whatever they report as part of your own ticket, including warnings a toolchain upgrade introduced in code the ticket touches. Suppress a lint only with a targeted `#[allow]` and a one-line reason.
+**Before opening a PR, run `cargo fmt -p sm-server --check` in your shell and `sm queue run --type tests --label <label> --cwd <worktree> -- cargo clippy -p sm-server --all-targets -- -D warnings` through the queue.** Both pass on main. Fix whatever they report as part of your own ticket, including warnings a toolchain upgrade introduced in code the ticket touches. Suppress a lint only with a targeted `#[allow]` and a one-line reason.
 
 Common failures.** Hooks not logging: check the server is up (`curl localhost:8420/health`). `sm` commands failing: check `CLAUDE_SESSION_MANAGER_ID` is set. Session not found: use the full session id or the exact friendly name.
