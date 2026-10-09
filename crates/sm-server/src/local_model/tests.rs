@@ -505,24 +505,25 @@ fn model_command_failure_preserves_stdout_reason() {
 }
 
 #[test]
-fn sampling_reconciles_late_exit_after_failed_unload_without_retry() {
+fn runtime_reconciles_late_exit_after_failed_unload_without_sampling_or_retry() {
     for reason in [None, Some("perf benchmark")] {
         let (host, server, root) = fixture();
         ready(&host);
         server.fail_stop.store(true, Ordering::SeqCst);
         assert!(host.unload(true, reason).is_err());
-        host.sample().unwrap();
+        host.reconcile_draining().unwrap();
         assert_eq!(host.record().unwrap().unwrap().state, "draining");
         server.fail_probe.store(true, Ordering::SeqCst);
-        assert!(host.sample().is_err());
+        assert!(host.reconcile_draining().is_err());
         assert_eq!(host.record().unwrap().unwrap().state, "draining");
         server.fail_probe.store(false, Ordering::SeqCst);
         server.running.store(false, Ordering::SeqCst);
         // Reconciliation must not change state during an active operation.
         let lock = host.operation.lock().unwrap();
-        host.sample().unwrap();
+        host.reconcile_draining().unwrap();
         assert_eq!(host.record().unwrap().unwrap().state, "draining");
         drop(lock);
+        host.reconcile_draining().unwrap();
         assert_eq!(host.sample().unwrap(), Some(0));
         let m = host.record().unwrap().unwrap();
         assert_eq!(

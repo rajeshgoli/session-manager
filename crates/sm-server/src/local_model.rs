@@ -473,9 +473,9 @@ impl ModelHost {
         }
         Ok(())
     }
-    /// Sampling repairs a timed-out shutdown only after the backend confirms
+    /// The runtime repairs a timed-out shutdown only after the backend confirms
     /// absence. Never race a load/unload worker or interrupt an active drain.
-    fn reconcile_draining(&self) -> Result<()> {
+    pub fn reconcile_draining(&self) -> Result<()> {
         let _lock = match self.operation.try_lock() {
             Ok(lock) => lock,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
@@ -495,7 +495,6 @@ impl ModelHost {
         Ok(())
     }
     fn sample(&self) -> Result<Option<i64>> {
-        self.reconcile_draining()?;
         let Some(m) = self.record()?.filter(ModelRecord::resident) else {
             return Ok(Some(0));
         };
