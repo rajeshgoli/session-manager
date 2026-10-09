@@ -21594,7 +21594,8 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 25] = [
+    const OWNER_WEB_READS: [&str; 26] = [
+        "/claims",
         "/claims?session=fork1001&active=false",
         "/client/model",
         "/client/queue",
@@ -21702,6 +21703,8 @@ mod tests {
         }
         // One read per group returns its payload.
         for uri in [
+            "/claims",
+            "/claims?session=fork1001&active=false",
             "/client/queue",
             "/client/analytics/spend",
             "/client/sessions/fork1001",
@@ -22078,16 +22081,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_browser_login_does_not_open_non_doc_routes() {
+    async fn owner_browser_login_does_not_open_session_only_reads() {
         let app = owner_doc_browser_access_app();
         let owner =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
-        for uri in [
-            "/sessions",
-            "/session-obligations",
-            "/queue-jobs",
-            "/claims",
-        ] {
+        for uri in ["/sessions", "/session-obligations", "/queue-jobs"] {
             let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
         }
