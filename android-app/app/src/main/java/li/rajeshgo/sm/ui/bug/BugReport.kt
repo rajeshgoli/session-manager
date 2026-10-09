@@ -217,9 +217,9 @@ class BugReportViewModel(application: Application) : AndroidViewModel(applicatio
         return types
     }
 
-    suspend fun sessionModels(provider: String, workingDir: String): List<String> {
-        val (url, token) = credentials() ?: return emptyList()
-        return repository.fetchSessionModels(url, token, provider, workingDir)
+    suspend fun sessionModels(provider: String, workingDir: String): li.rajeshgo.sm.data.model.SessionModelsResponse {
+        val (url, token) = credentials() ?: return li.rajeshgo.sm.data.model.SessionModelsResponse()
+        return repository.fetchSessionModelCatalog(url, token, provider, workingDir)
     }
 
     /** File, File and start, or — after a filed bug's start failed — Start alone (decision 9). */

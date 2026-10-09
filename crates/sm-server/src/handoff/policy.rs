@@ -83,10 +83,19 @@ impl Default for HandoffDefaults {
         Self {
             providers: BTreeMap::from([
                 ("claude".to_owned(), true),
+                ("opencode".to_owned(), true),
                 ("codex-fork".to_owned(), false),
                 ("codex-app".to_owned(), false),
             ]),
             provider_thresholds: BTreeMap::from([
+                (
+                    "opencode".to_owned(),
+                    ProviderThresholds {
+                        threshold_percent: 75.0,
+                        reminder_percent: 85.0,
+                        review_floor_percent: 50.0,
+                    },
+                ),
                 (
                     "claude".to_owned(),
                     ProviderThresholds {
@@ -106,6 +115,7 @@ impl Default for HandoffDefaults {
             ]),
             window_tokens: BTreeMap::from([
                 ("claude".to_owned(), 1_000_000),
+                ("opencode".to_owned(), 200_000),
                 ("codex-fork".to_owned(), 258_400),
             ]),
             threshold_percent: DEFAULT_THRESHOLD_PERCENT,

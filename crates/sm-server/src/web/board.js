@@ -1,7 +1,7 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
 import { createContext } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, bus, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
+import { html, api, bus, providerLabel, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
 import { TicketStart, LaneWhenReady, blockedReasons, canStartAnyway, chipText, retryBody, laneCandidates } from './board-start.js';
 import { SharedLaunchSetup, LaneLaunchDefault, distinctTickets } from './launch-setup.js';
 import { TypePicker, exactConfig, typeConfig } from './launch-fields.js';
@@ -129,7 +129,7 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, lanePolicy = nu
     <div class="board-agent"><span class="board-column-label">Agent / terminal</span>${holder?html`
       <div class="ticket-agent-links"><button class="link-btn" onClick=${()=>openPanel(`agent:${holder.session_id}`)}>${holder.name}</button><button class="btn sm" aria-label=${`Terminal for ${holder.name}`} onClick=${()=>navigate(`/terminal/${encodeURIComponent(holder.session_id)}`)}>⌨</button></div>
       <span class=${`sub ${holder.state==='working'?'green':''}`}>${holder.state==='working'?'● Working':holder.state==='idle'?'○ Idle':holder.state==='stopped'||holder.state==='retired'?'Stopped':holder.state||'Activity unknown'}${holder.state==='working'?` · ${operationalAge(holder.since,now)}`:''}</span>
-      <span class="sub">${holder.provider?.startsWith('codex')?'Codex':holder.provider==='claude'?'Claude':holder.provider||''}</span>`:html`<span class="sub">No agent assigned</span>`}</div>
+      <span class=${holder.provider === 'opencode' ? 'prov local' : 'sub'}>${holder.provider === 'opencode' ? providerLabel(holder.provider).toUpperCase() : holder.provider?.startsWith('codex')?'Codex':holder.provider==='claude'?'Claude':holder.provider||''}</span>`:html`<span class="sub">No agent assigned</span>`}</div>
     <div class="board-waits"><span class="board-column-label">Work / waits</span>
       ${(ticket.jobs||[]).map(job=>html`<button class=${`board-job ${job.quiet_since?'red':job.state==='running'?'green':'amber'}`} onClick=${()=>{navigate('/queue');openPanel(`job:${job.id}`);}}>
         <b>${job.label||job.id}</b><span>${job.state==='running'?'Running':'Waiting'} · ${operationalAge(job.since||job.started_at||job.queued_at,now)}</span>${job.quiet_since?html`<span>Quiet for ${operationalAge(job.quiet_since,now)}</span>`:null}</button>`)}

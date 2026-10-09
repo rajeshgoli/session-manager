@@ -1,7 +1,7 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
-import { EFFORTS } from './start.js';
+import { EFFORTS, useLocalModel, LocalChoice, localBlocked } from './start.js';
 import { TypePicker, OTHER_TYPE, agentTypes, typeConfig, matchType } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
@@ -122,6 +122,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
   const reporting = mode === 'bug';
   const auto = later && ticket.auto_start;
   const [form, setForm] = useState(null);
+  const local = useLocalModel();
   const [settings, setSettings] = useState(null);
   const [models, setModels] = useState([]);
   const [preview, setPreview] = useState(false);
@@ -216,7 +217,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
   const startable = later || !blocked || canStartAnyway(ticket);
   if (reporting) {
     const locked = !!filed;
-    const ready = report.text.trim() && (!report.startAgent || form);
+    const ready = report.text.trim() && (!report.startAgent || (form && !localBlocked(local, form.provider)));
     return html`<${Popover} onClose=${onClose} className="ticket-start bug-report">
       <h2>Report a bug</h2>
       <${BugText} value=${report.text} disabled=${locked} onInput=${(text) => setReport({ ...report, text })} />
@@ -226,7 +227,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
         <${Toggle} label="Screenshot" checked=${report.screenshot} disabled=${locked || !bug.screenshot} onChange=${(screenshot) => setReport({ ...report, screenshot })} /></div>
       <div class="line"><span>Start an agent</span>
         <${Toggle} label="Start an agent" checked=${report.startAgent} disabled=${locked} onChange=${(startAgent) => setReport({ ...report, startAgent })} /></div>
-      ${report.startAgent ? form ? html`<${AgentFields} form=${form} set=${set} settings=${settings} models=${choices}
+      ${report.startAgent ? form ? html`<${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} local=${later || reporting ? null : local}
         named=${html`<div class="line"><span>Named from the new ticket, as Start does</span></div>`} />` : !error ? html`<p>Loading…</p>` : null : null}
       ${filed ? html`<p>Filed <a href=${filed.issue.url} target="_blank" rel="noopener">#${filed.issue.number}</a>; the agent did not start.</p>` : null}
       ${error ? html`<p class="err" role="alert">${error}</p>` : null}
@@ -242,7 +243,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
       ${settings && settings.new_agent.auto_start_paused ? html`<p class="amber">Auto-start is paused (Settings › New agents).</p>` : null}`
       : blocked ? blockedReasons(ticket).map((reason) => html`<p>${reason}</p>`) : null}
     ${startable && form ? html`
-      <${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} onType=${onType}
+      <${AgentFields} form=${form} set=${set} settings=${settings} models=${choices} local=${later || reporting ? null : local} onType=${onType}
         efforts=${later ? AUTO_EFFORTS : EFFORTS} reviewer=${!later}
         named=${html`<div class="line"><span>Named ${form.name}${later ? ` · first message ${edited ? 'edited' : 'default'}` : ''}</span><span>
           ${later && edited ? html`<button class="link-btn" onClick=${() => { setEdited(false); set({ brief: form.template }); }}>Use default</button> ` : null}
@@ -257,7 +258,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable && !later ? 'Cancel' : 'Close'}</button>
       ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast('Cancelled'))}>Cancel auto-start</button>` : null}
-      ${startable ? html`<button class="btn pri" disabled=${!form || busy} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
+      ${startable ? html`<button class="btn pri" disabled=${!form || busy || localBlocked(local, form?.provider)} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
 }
 
@@ -274,7 +275,7 @@ function BugText({ value, disabled, onInput }) {
  * one click on a configured agent type, or Other for the Provider, Model and Effort
  * fields; then the model · effort · workspace line, `named`, `extra`, and the Reviewer row.
  */
-export function AgentFields({ form, set, settings, models, efforts = EFFORTS, reviewer = true, named = null, extra = null, onType = null }) {
+export function AgentFields({ form, set, settings, models, efforts = EFFORTS, reviewer = true, named = null, extra = null, onType = null, local = null }) {
   const matched = matchType(agentTypes(settings), form);
   const [other, setOther] = useState(!matched);
   const chosen = other || !matched ? CUSTOM : matched;
@@ -286,15 +287,16 @@ export function AgentFields({ form, set, settings, models, efforts = EFFORTS, re
   };
   return html`
     <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
+    <${LocalChoice} local=${local} provider=${form.provider} onPick=${model => { setOther(true); set({ provider: 'opencode', model, reasoning_effort: null }); }} />
     ${chosen === CUSTOM ? html`
       <${Seg} label="Provider" value=${form.provider}
         options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
         onChange=${(provider) => set(providerDefaults(settings, provider))} />
-      <label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
+      ${form.provider !== 'opencode' ? html`<label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
         <option value="">Provider default</option>${models.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
       <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
         options=${[{ value: '', label: 'default' }, ...(efforts[form.provider] || []).map((e) => ({ value: e, label: e }))]}
-        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>` : null}
+        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>` : null}` : null}
     <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span></div>
     ${named}
     ${extra}

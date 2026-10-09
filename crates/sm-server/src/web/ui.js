@@ -338,7 +338,7 @@ export function Links({ ticket, tickets = [], prs = [], agent, jobs = [], thread
 }
 
 export function providerLabel(provider) {
-  return provider && provider.startsWith('codex') ? 'Codex' : 'Claude';
+  return provider === 'opencode' ? 'Local' : provider && provider.startsWith('codex') ? 'Codex' : 'Claude';
 }
 
 // ---- components -------------------------------------------------------------

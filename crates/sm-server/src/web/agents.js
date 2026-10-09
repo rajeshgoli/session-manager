@@ -526,7 +526,7 @@ function AgentCard({ agent, depth, now, showRepo, titles, selected, cursor, onAn
       ${linked ? iconButton('Open in Claude (c)', 'external', () => openInClaude(agent)) : null}
     </span>
     ${title ? html`<span class="ttl" title=${title}>${title}</span>` : null}
-    <span class="ln"><span class=${`prov ${codex ? 'codex' : 'claude'}`}>${codex ? 'CODEX' : 'CLAUDE'}</span>
+    <span class="ln"><span class=${`prov ${agent.provider === 'opencode' ? 'local' : codex ? 'codex' : 'claude'}`}>${providerLabel(agent.provider).toUpperCase()}</span>
       <span class="tk"> ${ticketText(agent)}</span>
       ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
     <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} onRetired=${onRetired} cardSection=${section} />

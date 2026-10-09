@@ -1221,12 +1221,6 @@ private fun jobsToneColor(tone: String?): Color = when (tone) {
     else -> TextSecondary
 }
 
-private fun providerTag(provider: String?): String = when (provider) {
-    null, "", "claude" -> "CLAUDE"
-    "codex", "codex-fork", "codex-app" -> "CODEX"
-    else -> provider.uppercase()
-}
-
 /** What every Watch row reads. */
 private class WatchRowState(
     val sessionsById: Map<String, ClientSession>,
@@ -1485,7 +1479,7 @@ private fun SessionRow(
                     )
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
-                        StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
+                        StatusChip(label = providerTag(session.provider), tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
                     }
                     var actionsExpanded by remember { mutableStateOf(false) }
@@ -2038,7 +2032,7 @@ private fun activityTint(state: String?): Color = when (activityLabel(state)) {
 private fun providerTint(provider: String?): Color = when (provider) {
     "codex-fork" -> Cyan
     "claude" -> Fuchsia
-    "codex-app" -> Violet
+    "codex-app", "opencode" -> Violet
     else -> TextSecondary
 }
 

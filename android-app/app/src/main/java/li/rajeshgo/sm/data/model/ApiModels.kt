@@ -632,7 +632,9 @@ data class SessionJob(
 }
 
 @Serializable
-data class SessionModelsResponse(val models: List<String> = emptyList())
+data class SessionModelsResponse(val models: List<String> = emptyList(), val available: Boolean = true, val reason: String? = null) {
+    val canStartLocal: Boolean get() = available && models.isNotEmpty()
+}
 
 @Serializable
 data class HostStatus(

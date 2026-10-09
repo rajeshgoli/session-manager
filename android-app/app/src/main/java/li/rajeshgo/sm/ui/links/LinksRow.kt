@@ -91,6 +91,7 @@ fun threadChipText(thread: BoardThread): String =
     if (thread.needsYou) "Inbox · question" else "Inbox · ${thread.count}"
 
 fun providerLabel(provider: String): String = when (provider) {
+    "opencode" -> "Local"
     "claude" -> "Claude"
     "" -> ""
     else -> "Codex"

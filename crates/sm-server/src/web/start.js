@@ -9,6 +9,25 @@ export const EFFORTS = {
   claude: ['low', 'medium', 'high', 'max'],
   'codex-fork': ['medium', 'high', 'xhigh'],
 };
+export function useLocalModel() {
+  const [local, setLocal] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => api('/client/session-models?provider=opencode')
+      .then(value => { if (alive) setLocal(value); })
+      .catch(() => { if (alive) setLocal(null); });
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+  return local;
+}
+export const localBlocked = (local, provider) => provider === 'opencode' && (!local?.models?.length || local.available === false);
+export function LocalChoice({ local, provider, onPick }) {
+  return local?.models?.length ? html`<div class="line"><button type="button" class=${`btn ${provider === 'opencode' ? 'pri' : ''}`}
+    disabled=${local.available === false} onClick=${() => onPick(local.models[0])}>${`Local (${local.models[0]})`}</button>
+    ${local.reason ? html`<span class="sub">${local.reason}</span>` : null}</div>` : null;
+}
 const PROVIDERS = [{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }];
 const OTHER = '__other__';
 const MORE = '__more__';
@@ -43,6 +62,7 @@ const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~'
  */
 export function NewAgentPopover({ prefill = {}, onClose }) {
   const [settings, setSettings] = useState(null);
+  const local = useLocalModel();
   const [watch, setWatch] = useState(null);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(false);
@@ -97,6 +117,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   };
 
   const start = async () => {
+    if (localBlocked(local, form.provider)) { setError(local?.reason || 'no local model loaded'); return; }
     if (!validWorkspace(folder)) {
       setError('Choose a workspace: an absolute path or ~/ path.');
       setExpanded(true);
@@ -141,17 +162,18 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     };
     content = html`
       <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
+      <${LocalChoice} local=${local} provider=${form.provider} onPick=${model => { setOther(true); set({ provider: 'opencode', model, effort: null }); }} />
       ${chosen === OTHER_TYPE
         ? html`
           <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${PROVIDERS} />
-          <div class="fld"><span class="l">Model</span>
+          ${form.provider !== 'opencode' ? html`<div class="fld"><span class="l">Model</span>
             <select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
               <option value="">Provider default</option>
               ${modelOptions.map((model) => html`<option value=${model}>${model}</option>`)}
             </select></div>
           <div class="fld"><span class="l">Effort</span>
             <${Seg} label="Effort" value=${form.effort || ''} onChange=${(value) => set({ effort: value || null })}
-              options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>`
+              options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>` : null}`
         : null}
       ${expanded
         ? html`
@@ -183,7 +205,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
       ${error ? html`<p class="err">${error}</p>` : null}
       <div class="row">
         <button type="button" class="btn" onClick=${onClose}>Cancel</button>
-        <button type="button" class="btn pri" disabled=${busy} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button>
+        <button type="button" class="btn pri" disabled=${busy || localBlocked(local, form.provider)} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button>
       </div>`;
   }
   return html`<${Popover} onClose=${onClose} align="right">

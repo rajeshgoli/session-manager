@@ -711,6 +711,7 @@ mod tests {
                     session("agent001", "claude", agent_extra),
                     session("fork0001", "codex-fork", json!({})),
                     session("app00001", "codex-app", json!({})),
+                    session("local001", "opencode", json!({"opencode": json!({"port":18500,"state_dir":"/private/tmp/opencode-test/local","version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"})})),
                 ],
             })
             .to_string(),
@@ -802,6 +803,26 @@ mod tests {
         assert_eq!(asked.trigger, HandoffTrigger::Context);
         assert_eq!(asked.asked_percent, Some(41.2));
         assert!(display(&store, "agent001").starts_with("asked "));
+    }
+
+    #[test]
+    fn local_threshold_and_reminder_leave_claude_defaults_unchanged() {
+        let store = store("local-threshold");
+        sample(&store, "local001", 74.0);
+        assert!(queued(&store, "local001").is_empty());
+        sample(&store, "local001", 75.0);
+        assert_eq!(queued(&store, "local001").len(), 1);
+        sample(&store, "local001", 84.0);
+        assert_eq!(queued(&store, "local001").len(), 1);
+        sample(&store, "local001", 85.0);
+        assert_eq!(queued(&store, "local001").len(), 2);
+        sample(&store, "agent001", 35.0);
+        assert_eq!(queued(&store, "agent001").len(), 1);
+        let defaults = store.handoff_defaults().unwrap();
+        assert_eq!(defaults.thresholds("opencode").review_floor_percent, 50.0);
+        assert_eq!(defaults.window_tokens["opencode"], 200_000);
+        let restored = HandoffDefaults::from_stored(Some(&json!({"threshold_percent": 42})));
+        assert_eq!(restored.thresholds("opencode").threshold_percent, 75.0);
     }
 
     #[test]

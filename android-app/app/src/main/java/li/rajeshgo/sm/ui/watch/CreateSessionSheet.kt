@@ -90,7 +90,7 @@ fun sessionTemplate(source: ClientSession?): CreateSessionRequest = CreateSessio
 fun CreateSessionSheet(
     source: ClientSession?,
     sessions: List<ClientSession>,
-    loadModels: suspend (String, String) -> List<String>,
+    loadModels: suspend (String, String) -> li.rajeshgo.sm.data.model.SessionModelsResponse,
     loadAgentTypes: suspend () -> List<AgentTypeChoice>,
     busy: Boolean,
     error: String?,
@@ -166,12 +166,22 @@ fun CreateSessionSheet(
         modelsError = false
         try {
             kotlinx.coroutines.delay(300)
-            catalog = loadModels(provider, directory.trim())
+            catalog = loadModels(provider, directory.trim()).models
         }
         catch (error: kotlinx.coroutines.CancellationException) { throw error }
         catch (_: Exception) { modelsError = true }
         finally { modelsLoading = false }
     }
+    var local by remember { mutableStateOf<li.rajeshgo.sm.data.model.SessionModelsResponse?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            try { local = loadModels("opencode", "") }
+            catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (_: Exception) { local = null }
+            kotlinx.coroutines.delay(5000)
+        }
+    }
+    val localBlocked = provider == "opencode" && local?.canStartLocal != true
     val models = (if (startLike) catalog + listOf(model) else listOf("") + catalog + sessions.filter { it.provider == provider }.mapNotNull { it.model } + listOf(model)).distinct()
     ModalBottomSheet(sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), onDismissRequest = { if (!busy) onDismiss() }) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -220,22 +230,30 @@ fun CreateSessionSheet(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+                if (ticket?.whenReady != true && bug == null) local?.models?.firstOrNull()?.let { loaded ->
+                    FilterChip(selected = provider == "opencode", onClick = {
+                        otherType = true; provider = "opencode"; model = loaded; effort = ""; customModel = false
+                    }, enabled = !busy && local?.canStartLocal == true, label = { Text("Local ($loaded)") })
+                    local?.reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                }
                 FilterChip(selected = customConfig, onClick = { otherType = true }, enabled = !busy && !typesLoading, label = { Text("Other") })
                 if (typesLoading) Text("Loading agent types…", style = MaterialTheme.typography.bodySmall)
                 if (typesError) TextButton(onClick = { typesAttempt++ }, enabled = !busy) { Text("Couldn't load agent types · Retry") }
                 if (customConfig) {
                     val providers = if (startLike) listOf("claude", "codex-fork") else listOf("claude", "codex")
-                    SessionChoice("Provider", provider, (providers + provider).distinct(), !busy) {
+                    SessionChoice("Provider", provider, (providers + listOf(provider).filter { it != "opencode" }).distinct(), !busy) {
                         provider = it; model = ""; effort = "high"; customModel = false
                     }
-                    SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
-                        if (it == "Other model…") customModel = true else { model = it; customModel = false }
+                    if (provider != "opencode") {
+                        SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
+                            if (it == "Other model…") customModel = true else { model = it; customModel = false }
+                        }
+                        if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
+                        if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
+                        if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                        val efforts = if (startLike) startEfforts(provider) else listOf("medium", "high")
+                        SessionChoice("Effort", effort, (efforts + effort).distinct(), !busy) { effort = it }
                     }
-                    if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
-                    if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
-                    if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                    val efforts = if (startLike) startEfforts(provider) else listOf("medium", "high")
-                    SessionChoice("Effort", effort, (efforts + effort).distinct(), !busy) { effort = it }
                 }
                 if (!startLike) {
                     SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
@@ -264,7 +282,7 @@ fun CreateSessionSheet(
                 )
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            val agentReady = directory.trim().startsWith('/') && !typesLoading
+            val agentReady = directory.trim().startsWith('/') && !typesLoading && !localBlocked
             val enabled = !busy && if (bug != null) {
                 bugText.isNotBlank() && (!bugAgent || (bug.defaults != null && bug.agentNote == null && agentReady))
             } else agentReady

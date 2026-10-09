@@ -170,6 +170,7 @@ fun HandoffDefaultsSection() {
             val providers = handoffProviders(defaults.providers)
             providers.forEach { provider ->
                 val label = when (provider) {
+                    "opencode" -> "Local (opencode)"
                     "claude" -> "Claude"
                     "codex-fork" -> "Codex Fork"
                     "codex" -> "Codex"
@@ -178,19 +179,23 @@ fun HandoffDefaultsSection() {
                 HandoffSwitch(label, defaults.providers[provider] ?: false, enabled) {
                     editor.update(buildJsonObject { put("providers", buildJsonObject { put(provider, it) }) })
                 }
+                if (defaults.providers[provider] == true) {
+                    val thresholds = defaults.providerThresholds[provider]
+                    val fields = listOf(
+                        Triple("threshold_percent", "Hand off at", thresholds?.thresholdPercent ?: defaults.thresholdPercent),
+                        Triple("review_floor_percent", "Review floor", thresholds?.reviewFloorPercent ?: defaults.reviewFloorPercent),
+                        Triple("reminder_percent", "Remind at", thresholds?.reminderPercent ?: defaults.reminderPercent),
+                    )
+                    fields.forEach { (field, title, value) ->
+                        PercentPicker(title, value, defaultPercentOptions(value, field == "review_floor_percent"), enabled) {
+                            editor.update(buildJsonObject {
+                                put("provider_thresholds", buildJsonObject { put(provider, buildJsonObject { put(field, it) }) })
+                            })
+                        }
+                    }
+                }
             }
             if (providers.any { defaults.providers[it] == true }) {
-                PercentPicker("Threshold", defaults.thresholdPercent, defaultPercentOptions(defaults.thresholdPercent, false), enabled) {
-                    editor.update(buildJsonObject { put("threshold_percent", it) })
-                }
-                PercentPicker("Review floor", defaults.reviewFloorPercent, defaultPercentOptions(defaults.reviewFloorPercent, true), enabled) {
-                    editor.update(buildJsonObject { put("review_floor_percent", it) })
-                }
-                Text("Minimum context usage before a review request asks for handoff.", style = MaterialTheme.typography.bodySmall)
-                PercentPicker("Reminder at", defaults.reminderPercent, defaultPercentOptions(defaults.reminderPercent, false), enabled) {
-                    editor.update(buildJsonObject { put("reminder_percent", it) })
-                }
-                Text("One reminder, only when this is above the agent's threshold.", style = MaterialTheme.typography.bodySmall)
                 HandoffSwitch("Ask on Codex review request", defaults.askOnCodexReview, enabled) {
                     editor.update(buildJsonObject { put("ask_on_codex_review", it) })
                 }
