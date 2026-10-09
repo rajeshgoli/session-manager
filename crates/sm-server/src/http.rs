@@ -23751,6 +23751,7 @@ mod tests {
         let app = router(AppState::new(config));
         for (uri, expected) in [
             ("/client/analytics/spend", StatusCode::OK),
+            ("/client/analytics/spend?provider=local", StatusCode::OK),
             (
                 "/client/analytics/spend?provider=codex&range=4w",
                 StatusCode::OK,

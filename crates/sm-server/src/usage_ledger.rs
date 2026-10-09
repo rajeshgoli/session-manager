@@ -245,6 +245,15 @@ impl UsageLedgerStore {
                   PRIMARY KEY (thread_id, source_seq)
                 );
 
+                CREATE TABLE IF NOT EXISTS local_request_intervals (
+                  conversation TEXT NOT NULL,
+                  message_id TEXT NOT NULL,
+                  start_ms INTEGER NOT NULL,
+                  end_ms INTEGER NOT NULL,
+                  PRIMARY KEY (conversation, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS local_request_intervals_end
+                  ON local_request_intervals(end_ms);
                 CREATE TABLE IF NOT EXISTS message_ledger (
                   msg_id       INTEGER PRIMARY KEY AUTOINCREMENT,
                   message_id   TEXT NOT NULL,
@@ -569,6 +578,24 @@ impl UsageLedgerStore {
                 "#,
             )
             .context("failed to create usage ledger views")?;
+        Ok(())
+    }
+
+    pub(crate) fn record_local_request(
+        &self,
+        conversation: &str,
+        message_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<()> {
+        if end_ms > start_ms {
+            self.open()?.execute(
+                "INSERT INTO local_request_intervals VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(conversation, message_id) DO UPDATE SET
+                 start_ms = excluded.start_ms, end_ms = excluded.end_ms",
+                params![conversation, message_id, start_ms, end_ms],
+            )?;
+        }
         Ok(())
     }
 
@@ -5398,6 +5425,34 @@ mod tests {
             UsageSeatMetadata::resolve_project_key(repository.to_str().unwrap()),
             UsageSeatMetadata::resolve_project_key(worktree.to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn local_request_intervals_survive_reopen_without_duplicate_replay() {
+        let dir = TestDir::new("local-request-intervals");
+        let db = dir.0.join("usage.db");
+        let store = UsageLedgerStore::new(&db).unwrap();
+        store
+            .record_local_request("ses_local", "msg_one", 1000, 4000)
+            .unwrap();
+        drop(store);
+        let reopened = UsageLedgerStore::new(&db).unwrap();
+        reopened
+            .record_local_request("ses_local", "msg_one", 1000, 4000)
+            .unwrap();
+        reopened
+            .record_local_request("ses_local", "msg_bad", 5000, 4000)
+            .unwrap();
+        let result: (i64, i64) = reopened
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), SUM(end_ms - start_ms) FROM local_request_intervals",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, (1, 3000));
     }
 
     #[test]

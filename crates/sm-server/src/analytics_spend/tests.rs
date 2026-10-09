@@ -642,3 +642,47 @@ fn unknown_models_add_a_note() {
     );
     assert_eq!(report.parts_legend[0].key, "other");
 }
+
+#[test]
+fn local_tokens_use_calendar_ranges_without_hosted_meters_or_pricing() {
+    let f = fixture();
+    f.usage
+        .execute("INSERT INTO accounts VALUES ('local', 'local', NULL)", [])
+        .unwrap();
+    let current = at("2026-09-29T12:00:00Z");
+    f.turn(
+        "local-seat",
+        "local",
+        current,
+        "local/flash-next",
+        100,
+        20,
+        30,
+        None,
+    );
+    f.turn(
+        "old-seat",
+        "local",
+        current - 7 * DAY,
+        "local/old",
+        400,
+        0,
+        0,
+        None,
+    );
+    f.turn("hosted", CLAUDE, current, OPUS, 9000, 0, 0, None);
+    let report = f.report("local", SpendRange::Week);
+    assert_eq!(parse_provider("local"), Some("local"));
+    assert_eq!(report.start, "2026-09-28T00:00:00Z");
+    assert_eq!(report.total.tokens, 150);
+    assert_eq!(report.total.percent, 0.0);
+    assert!(report.meters.is_empty());
+    assert!(report.parts_legend.is_empty());
+    assert_eq!(
+        report.local.as_ref().unwrap().models[0].model,
+        "local/flash-next"
+    );
+    assert_eq!(report.local.unwrap().days.len(), 2);
+    assert_eq!(f.report("local", SpendRange::LastWeek).total.tokens, 400);
+    assert_eq!(f.report("local", SpendRange::FourWeeks).total.tokens, 550);
+}
