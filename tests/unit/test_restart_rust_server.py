@@ -1463,6 +1463,94 @@ def test_completed_session_retiring_during_build_is_accounted_for(env):
     assert "session count ok (2 -> 1)" in result.stdout
 
 
+@pytest.mark.parametrize("missing", [None, "completed_at", "observed_at", "source"])
+def test_operator_retirement_during_restart(env, missing):
+    retired = {
+        "id": "retiring", "status": "stopped",
+        "agent_task_completed_at": None,
+        "completed_at": "2026-10-07T20:22:52Z",
+        "terminal_provenance": {
+            "cause": "explicit_retire", "authority": "operator",
+            "source": "rajeshgoli@gmail.com", "observed_at": "2026-10-07T20:22:52Z",
+        },
+    }
+    if missing == "completed_at":
+        retired.pop(missing)
+    elif missing:
+        retired["terminal_provenance"].pop(missing)
+    (env["state"] / "before_sessions_json").write_text(json.dumps({
+        "sessions": [{"id": "retiring", "status": "working"}],
+    }))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": [retired]}))
+
+    result = env["run"]()
+
+    if missing:
+        assert result.returncode != 0
+        assert "unaccounted sessions: retiring" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "expected retirements: retiring" in result.stdout
+        assert "Refreshing the installed sm CLI" in result.stdout
+
+
+@pytest.mark.parametrize("defect", [
+    None, "missing_successor", "stopped_successor", "wrong_predecessor",
+    "wrong_actor", "wrong_source", "wrong_authority", "natural_exit",
+    "missing_completed_at", "missing_observed_at", "missing_provenance", "null_provenance",
+])
+def test_handoff_during_restart_requires_durable_reciprocal_live_successor(env, defect):
+    retired = {
+        "id": "predecessor", "status": "stopped",
+        "agent_task_completed_at": None,
+        "completed_at": "2026-10-07T21:16:11Z", "successor_session_id": "successor",
+        "terminal_provenance": {
+            "cause": "explicit_retire", "authority": "server_lifecycle",
+            "source": "handed_off", "observed_at": "2026-10-07T21:16:11Z",
+            "actor_session_id": "successor", "tmux_disposition": "killed",
+        },
+    }
+    successor = {"id": "successor", "status": "working", "predecessor_session_id": "predecessor"}
+    after = [retired, successor]
+    if defect == "missing_successor":
+        after.remove(successor)
+    elif defect == "stopped_successor":
+        successor["status"] = "stopped"
+    elif defect == "wrong_predecessor":
+        successor["predecessor_session_id"] = "other"
+    elif defect in {"wrong_actor", "wrong_source", "wrong_authority", "natural_exit"}:
+        key, value = {
+            "wrong_actor": ("actor_session_id", "other"),
+            "wrong_source": ("source", "auto_retire"),
+            "wrong_authority": ("authority", "authenticated_parent"),
+            "natural_exit": ("cause", "provider_natural_exit"),
+        }[defect]
+        retired["terminal_provenance"][key] = value
+    elif defect == "missing_completed_at":
+        retired.pop("completed_at")
+    elif defect == "missing_observed_at":
+        retired["terminal_provenance"].pop("observed_at")
+    elif defect == "missing_provenance":
+        retired.pop("terminal_provenance")
+    elif defect == "null_provenance":
+        retired["terminal_provenance"] = None
+    (env["state"] / "before_sessions_json").write_text(json.dumps({
+        "sessions": [{"id": "predecessor", "status": "working"}],
+    }))
+    (env["state"] / "after_sessions_json").write_text(json.dumps({"sessions": after}))
+
+    result = env["run"]()
+
+    if defect:
+        assert result.returncode != 0
+        assert "unaccounted sessions: predecessor" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert "expected retirements: predecessor" in result.stdout
+        assert "session count ok (1 -> 1)" in result.stdout
+        assert "Refreshing the installed sm CLI" in result.stdout
+
+
 def test_replacement_does_not_mask_a_lost_session(env):
     before = [{"id": "lost", "status": "working"}]
     after = [{"id": "replacement", "status": "working"}]

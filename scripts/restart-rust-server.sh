@@ -528,11 +528,27 @@ for sid, old in previous.items():
     new = current.get(sid)
     if new is not None and new["status"] != "stopped":
         continue
-    # A task completion and a terminal timestamp are durable evidence that
-    # this identity retired. A mere stopped status may be a crash or lost seat.
+    provenance = (new or {}).get("terminal_provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    explicit_retire = (provenance.get("cause") == "explicit_retire"
+                      and provenance.get("observed_at")
+                      and provenance.get("source"))
+    operator_retire = explicit_retire and provenance.get("authority") == "operator"
+    successor_id = (new or {}).get("successor_session_id")
+    successor = current.get(successor_id) if isinstance(successor_id, str) else None
+    handoff_retire = (explicit_retire
+                      and provenance.get("authority") == "server_lifecycle"
+                      and provenance.get("source") == "handed_off"
+                      and provenance.get("actor_session_id") == successor_id
+                      and successor is not None and successor["status"] != "stopped"
+                      and successor.get("predecessor_session_id") == sid)
+    # Completion, operator retirement, or a handoff to a reciprocal live
+    # successor accounts for this identity. A stopped status alone does not.
     if (new is not None and new["status"] == "stopped"
             and new.get("completed_at")
-            and (old.get("agent_task_completed_at") or new.get("agent_task_completed_at"))):
+            and (old.get("agent_task_completed_at") or new.get("agent_task_completed_at")
+                 or operator_retire or handoff_retire)):
         retired.append(sid)
     else:
         lost.append(sid)
