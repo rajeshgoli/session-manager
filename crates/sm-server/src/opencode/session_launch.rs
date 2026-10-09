@@ -8,6 +8,10 @@ pub trait OpencodeLaunchDriver: Send + Sync {
     }
     fn base_config(&self) -> OpencodeConfig;
     fn config(&self, requested: Option<&str>) -> Result<OpencodeConfig>;
+    /// Cheap current capacity read; zero while the model is unavailable.
+    fn seat_limit(&self) -> Result<usize> {
+        Ok(self.base_config().max_agents)
+    }
     fn binding(&self, config: &OpencodeConfig, id: &str, port: u16) -> Result<RuntimeBinding>;
     fn start(
         &self,
@@ -127,15 +131,42 @@ impl SessionStore {
         predecessor: Option<&str>,
     ) -> Result<SessionRecord> {
         let driver = self.opencode_driver()?;
-        {
-            let _guard = self.write_guard()?;
-            check_opencode_capacity(
-                &driver.base_config(),
-                &occupied_opencode_sessions(&self.load_parsed_state()?.raw, None)?,
-                predecessor,
-            )?;
+        let max_wait = request.max_wait_seconds.unwrap_or(300);
+        if max_wait == 0 {
+            anyhow::bail!("max_wait_seconds must be greater than 0");
         }
-        let config = driver.config(request.model.as_deref())?;
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(max_wait))
+            .context("max_wait_seconds is too large")?;
+        let mut waiting_config = driver.config(request.model.as_deref())?;
+        let (config, _admission) = loop {
+            let admission = self.lock_named_clear_operation("local-seat-admission")?;
+            waiting_config.max_agents = driver.seat_limit()?;
+            let config = &waiting_config;
+            let capacity = {
+                let _guard = self.write_guard()?;
+                check_opencode_capacity(
+                    config,
+                    &occupied_opencode_sessions(&self.load_parsed_state()?.raw, None)?,
+                    predecessor,
+                )
+            };
+            match capacity {
+                // Recheck the model once admission succeeds, without running
+                // the provider version probe on every seat-wait poll.
+                Ok(()) => break (driver.config(request.model.as_deref())?, admission),
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::opencode::launch::AdmissionError>()
+                        .is_some()
+                        && std::time::Instant::now() < deadline =>
+                {
+                    drop(admission);
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         config.validate()?;
         let id = request
             .id
@@ -197,6 +228,7 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
             (record, launch)
         };
+        drop(_admission);
         let result = (|| {
             driver.start(&config, &record, &credential, runtime)?;
             let client = driver.client(

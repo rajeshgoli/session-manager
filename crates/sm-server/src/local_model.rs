@@ -121,12 +121,14 @@ pub struct ModelHost {
     config: LocalHostConfig,
     db_path: PathBuf,
     state_file: PathBuf,
+    sessions: SessionStore,
     queue_dir: PathBuf,
     queue_policy: crate::queue::QueueAdmissionPolicy,
     operation: Mutex<()>,
     yield_worker: AtomicBool,
     force_unload: AtomicBool,
     backend: Arc<dyn ModelServer>,
+    reload_since: Mutex<Option<Instant>>,
 }
 impl ModelHost {
     fn connect(&self) -> Result<Connection> {
@@ -215,6 +217,12 @@ impl ModelHost {
         Ok(())
     }
     fn transition(&self, m: &mut ModelRecord, state: &str) -> Result<()> {
+        if state != "yielded" {
+            *self
+                .reload_since
+                .lock()
+                .map_err(|_| anyhow::anyhow!("reload hold lock poisoned"))? = None;
+        }
         m.state = state.into();
         m.state_since = now();
         self.save(m)
@@ -222,22 +230,19 @@ impl ModelHost {
     pub fn status(&self) -> Result<Value> {
         let model = self.record()?;
         let used = self.local_sessions()?.len();
-        Ok(serde_json::json!({"model":model,"seats_used":used,"judge_seats":usize::from(used>0)}))
+        Ok(
+            serde_json::json!({"model":model,"seats_used":used,"judge_seats":usize::from(used>0),"card":self.queue_card()?}),
+        )
     }
     fn local_sessions(&self) -> Result<Vec<crate::sessions::SessionRecord>> {
         if !self.state_file.exists() {
             return Ok(vec![]);
         }
-        Ok(SessionStore::new(self.state_file.clone())
+        Ok(self
+            .sessions
             .list_sessions(false)?
             .into_iter()
-            .filter(|s| {
-                // #1956 owns the host field. Serializing keeps this component
-                // independent of the chosen harness and sees it once introduced.
-                serde_json::to_value(s)
-                    .ok()
-                    .is_some_and(|v| v["host"] == "local")
-            })
+            .filter(|s| s.host.as_deref() == Some("local"))
             .collect())
     }
     pub fn load(&self, request: LoadRequest) -> Result<ModelRecord> {
@@ -320,6 +325,14 @@ impl ModelHost {
         })
     }
     fn load_prepared(&self, m: &mut ModelRecord, available: i64) -> Result<()> {
+        self.load_prepared_with_retry(m, available, false)
+    }
+    fn load_prepared_with_retry(
+        &self,
+        m: &mut ModelRecord,
+        available: i64,
+        retry: bool,
+    ) -> Result<()> {
         let required = m
             .reservation_bytes
             .checked_add(self.yield_line())
@@ -354,12 +367,14 @@ impl ModelHost {
         })();
         if let Err(error) = result {
             m.last_error = Some(format!("{error:#}"));
-            m.desired = false;
+            // A failed automatic attempt does not revoke the owner's load
+            // intent. Cleanup must still prove absence before retrying.
+            m.desired &= retry;
             self.transition(m, "draining")?;
             match self.backend.stop(m) {
                 Ok(()) => {
                     m.pid = None;
-                    self.transition(m, "unloaded")?;
+                    self.transition(m, if m.desired { "yielded" } else { "unloaded" })?;
                 }
                 Err(stop) => {
                     m.last_error = Some(format!("{error:#}; unload failed: {stop:#}"));
@@ -368,7 +383,8 @@ impl ModelHost {
             }
             return Err(error);
         }
-        Ok(())
+        // The ready worker retries durable resume effects if this write fails.
+        self.session_store().resume_local_sessions()
     }
     fn yield_line(&self) -> i64 {
         // Read each time: the reserve rises with kernel pressure (sm#2053).
@@ -376,13 +392,13 @@ impl ModelHost {
             .saturating_add(self.config.yield_margin_bytes.max(0))
     }
     pub fn unload(&self, force: bool, reason: Option<&str>) -> Result<()> {
+        if force {
+            self.force_unload.store(true, Ordering::SeqCst);
+        }
         let _lock = self
             .operation
             .lock()
             .map_err(|_| anyhow::anyhow!("model operation lock poisoned"))?;
-        if force {
-            self.force_unload.store(true, Ordering::SeqCst);
-        }
         let result = self.unload_locked(force, reason);
         if result.is_ok() {
             self.force_unload.store(false, Ordering::SeqCst);
@@ -410,20 +426,23 @@ impl ModelHost {
         self.transition(&mut m, "draining")?;
         if !force {
             let deadline = Instant::now() + Duration::from_secs(self.config.drain_timeout);
-            while self.local_sessions()?.iter().any(|s| {
-                crate::sessions::claude_hook_gate(s) != crate::sessions::ClaudeHookGate::TurnStopped
-            }) {
+            while self.local_sessions()?.iter().any(|s| !session_idle(s)) {
                 if Instant::now() >= deadline || self.force_unload.load(Ordering::SeqCst) {
                     break;
                 }
                 thread::sleep(Duration::from_secs(1));
             }
         }
+        // Save interrupted turns before stopping, so a restart cannot lose them.
+        self.session_store()
+            .prepare_local_unload(reason.unwrap_or("manual unload"))?;
         if let Err(error) = self.backend.stop(&m) {
             m.last_error = Some(format!("unload failed: {error:#}"));
             self.save(&m)?;
             return Err(error);
         }
+        self.session_store()
+            .park_local_sessions(reason.unwrap_or("manual unload"))?;
         m.pid = None;
         m.last_error = None;
         let state = if m.desired { "yielded" } else { "unloaded" };
@@ -485,6 +504,9 @@ impl ModelHost {
         };
         if let Some(mut m) = self.record()?.filter(|m| m.state == "draining") {
             if !self.backend.running(&m)? {
+                self.session_store().park_local_sessions(
+                    m.last_yield_reason.as_deref().unwrap_or("manual unload"),
+                )?;
                 m.pid = None;
                 m.last_error = None;
                 let state = if m.desired { "yielded" } else { "unloaded" };
@@ -614,7 +636,7 @@ impl CliServer {
     fn tmux(&self, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new("tmux");
         cmd.args(["-L", &self.socket]).args(args);
-        command_output(cmd, Duration::from_secs(5))
+        command_output(cmd, Duration::from_secs(5)).context("local model tmux command")
     }
     fn pane(&self) -> Result<Option<i32>> {
         // A missing tmux session is absent, not proof that an HTTP server at
@@ -708,7 +730,11 @@ impl ModelServer for CliServer {
         } else {
             let mut cmd = Command::new(expand_home(&self.config.mtplx_path));
             cmd.arg("--version");
-            if command_output(cmd, Duration::from_secs(5))?.trim() != "mtplx 2.12.0" {
+            if command_output(cmd, Duration::from_secs(5))
+                .context("MTPLX version probe")?
+                .trim()
+                != "mtplx 2.12.0"
+            {
                 bail!("sm requires MTPLX 2.12.0; upgrade qualification is deliberate");
             }
             if self.pane()?.is_some()
@@ -985,6 +1011,18 @@ fn hosts() -> &'static Mutex<BTreeMap<PathBuf, Arc<ModelHost>>> {
     HOSTS.get_or_init(Mutex::default)
 }
 pub fn register_live(config: &AppConfig) -> Result<Arc<ModelHost>> {
+    register_live_with_store(
+        config,
+        SessionStore::new_with_queue(
+            expand_home(&config.paths.state_file),
+            expand_home(&config.sm_send.db_path),
+        ),
+    )
+}
+pub fn register_live_with_store(
+    config: &AppConfig,
+    sessions: SessionStore,
+) -> Result<Arc<ModelHost>> {
     let db_path = expand_home(&config.sm_send.db_path);
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
@@ -1021,12 +1059,14 @@ pub fn register_live(config: &AppConfig) -> Result<Arc<ModelHost>> {
         config: config.local_host.clone(),
         db_path: db_path.clone(),
         state_file: expand_home(&config.paths.state_file),
+        sessions,
         queue_dir: queue_dir.clone(),
         queue_policy: config.queue_admission_policy(),
         operation: Mutex::new(()),
         yield_worker: AtomicBool::new(false),
         force_unload: AtomicBool::new(false),
         backend: Arc::new(backend),
+        reload_since: Mutex::new(None),
     });
     // Durable ownership survives an sm restart. Do not silently claim a
     // different backend while a model is resident.
@@ -1036,6 +1076,10 @@ pub fn register_live(config: &AppConfig) -> Result<Arc<ModelHost>> {
         }
     }
     host.recover()?;
+    if let Some(model) = host.record()?.filter(|m| m.state == "yielded") {
+        host.session_store()
+            .park_local_sessions(model.last_yield_reason.as_deref().unwrap_or("model yield"))?;
+    }
     hosts.insert(queue_dir, host.clone());
     hosts.insert(fs::canonicalize(db_path)?, host.clone());
     Ok(host)
@@ -1070,3 +1114,141 @@ pub fn sample_model(db_path: &Path) -> Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn session_idle(session: &crate::sessions::SessionRecord) -> bool {
+    if session.provider == "opencode" {
+        session.status == "idle"
+    } else {
+        crate::sessions::claude_hook_gate(session) == crate::sessions::ClaudeHookGate::TurnStopped
+    }
+}
+impl ModelHost {
+    fn session_store(&self) -> &SessionStore {
+        &self.sessions
+    }
+    pub fn delivery_held(&self) -> Result<bool> {
+        Ok(self.record()?.is_none_or(|m| m.state != "ready"))
+    }
+    /// The hold is deliberately monotonic and starts afresh after an sm restart.
+    fn reload_pass(&self, available: Option<i64>, perf_blocked: bool) -> Result<()> {
+        let _lock = self
+            .operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model operation lock poisoned"))?;
+        let Some(mut model) = self.record()? else {
+            return Ok(());
+        };
+        if model.state == "ready" {
+            self.session_store().resume_local_sessions()?;
+        }
+        let eligible = model.state == "yielded"
+            && model.desired
+            && !perf_blocked
+            && available
+                .is_some_and(|a| a >= model.reservation_bytes.saturating_add(self.yield_line()));
+        let mut since = self
+            .reload_since
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reload hold lock poisoned"))?;
+        if !eligible {
+            *since = None;
+            return Ok(());
+        }
+        let started = *since.get_or_insert_with(Instant::now);
+        if started.elapsed() < Duration::from_secs(self.config.reload_hold) {
+            return Ok(());
+        }
+        *since = None;
+        drop(since);
+        // load_prepared rechecks perf admission under the queue's shared lock.
+        self.load_prepared_with_retry(&mut model, available.unwrap(), true)
+    }
+}
+pub fn retry_reload(state_dir: &Path) -> Result<()> {
+    let Some(host) = live(state_dir) else {
+        return Ok(());
+    };
+    // Never block the delivery sweep behind a ten-minute drain or model load.
+    if host.yield_worker.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let blocked = crate::queue::model_reload_blocked(state_dir, host.queue_policy)?;
+    host.reload_pass(
+        crate::queue::host_memory_capacity().map(|(_, a)| a),
+        blocked,
+    )
+}
+
+impl ModelHost {
+    pub fn queue_card(&self) -> Result<Value> {
+        self.card_snapshot(
+            crate::queue::host_memory_capacity().map(|(_, a)| a),
+            crate::queue::model_reload_blocked(&self.queue_dir, self.queue_policy)?,
+        )
+    }
+    fn card_snapshot(&self, available: Option<i64>, perf_blocked: bool) -> Result<Value> {
+        let model = self.record()?;
+        let agents = self.local_sessions()?;
+        let seats = model.as_ref().map_or(0, |m| m.seats);
+        let names = agents
+            .iter()
+            .map(|s| s.friendly_name.as_deref().unwrap_or(&s.name))
+            .collect::<Vec<_>>();
+        let state = model.as_ref().map_or("unloaded", |m| m.state.as_str());
+        let model_text = match model.as_ref() {
+            Some(m) if state == "ready" => format!("loaded ({})", m.identifier),
+            Some(m) if state == "yielded" => format!(
+                "yielded to {}",
+                m.last_yield_reason.as_deref().unwrap_or("model yield")
+            ),
+            _ => state.to_owned(),
+        };
+        let gb = |bytes: i64| format!("{:.1}", bytes as f64 / GB as f64);
+        let memory_text = format!(
+            "{} GB free, yields below {} GB",
+            available.map_or_else(|| "Unknown".into(), gb),
+            gb(self.yield_line())
+        );
+        let required = model
+            .as_ref()
+            .map(|m| m.reservation_bytes.saturating_add(self.yield_line()));
+        let held = self
+            .reload_since
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reload hold lock poisoned"))?
+            .as_ref()
+            .map_or(0, |s| s.elapsed().as_secs());
+        let reload_text = (state == "yielded").then(|| {
+            format!(
+            "Reload needs {} GB free for {}s continuously and no perf run or cooldown; held {}s{}",
+            gb(required.unwrap_or(0)), self.config.reload_hold, held,
+            if perf_blocked { "; waiting for perf run or cooldown" } else { "" })
+        });
+        Ok(serde_json::json!({"state":state,"model_text":model_text,
+            "seats_used":agents.len(),"seats_total":seats,"agents":names,
+            "seats_text":format!("{} of {}{}", agents.len(), seats, if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) }),
+            "available_bytes":available,"yield_line_bytes":self.yield_line(),"memory_text":memory_text,
+            "reload_required_bytes":required,"reload_hold_seconds":self.config.reload_hold,
+            "reload_held_seconds":held,"perf_blocked":perf_blocked,"reload_text":reload_text}))
+    }
+}
+pub fn queue_card(state_dir: &Path) -> Result<Value> {
+    live(state_dir).map_or(Ok(serde_json::json!({"state":"unloaded","model_text":"unloaded",
+        "seats_text":"0 of 0","memory_text":"Local model controller unavailable","reload_text":null})), |host| host.queue_card())
+}
+
+#[cfg(test)]
+pub(crate) fn register_outbox_fixture(
+    db: PathBuf,
+    state: PathBuf,
+    store: SessionStore,
+) -> Arc<ModelHost> {
+    tests::register_outbox_fixture(db, state, store)
+}
+
+#[cfg(test)]
+impl ModelHost {
+    pub(crate) fn set_reload_hold_for_test(&self, seconds: u64) {
+        *self.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(seconds));
+    }
+}

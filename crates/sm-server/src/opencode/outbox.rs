@@ -134,6 +134,11 @@ impl SessionStore {
             return Ok(());
         };
         loop {
+            if let Some(host) = crate::local_model::live(queue.db_path()) {
+                if host.delivery_held()? {
+                    break;
+                }
+            }
             let Some(message) = queue.pending_messages_for_target(id, 1)?.into_iter().next() else {
                 break;
             };

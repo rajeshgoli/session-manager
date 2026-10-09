@@ -448,6 +448,7 @@ async fn create_successor(
         model: plan.model.clone(),
         reasoning_effort: plan.reasoning_effort.clone(),
         wait: None,
+        max_wait_seconds: None,
         spawn_prompt_source: None,
         spawn_brief: None,
         started_by_sm: true,

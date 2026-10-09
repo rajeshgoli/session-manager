@@ -245,6 +245,7 @@ async fn start(
                 parent_session_id: None,
                 node: None,
                 wait: None,
+                max_wait_seconds: None,
                 spawn_prompt_source: None,
                 spawn_brief: None,
                 started_by_sm: true,

@@ -99,6 +99,7 @@ pub fn loaded_config(
     }
     let mut effective = config.clone();
     effective.model_id = model.identifier.clone();
+    effective.max_agents = model.seats as usize;
     effective.context_window = model.context;
     let endpoint = model.endpoint.trim_end_matches('/');
     effective.model_base_url = if endpoint.ends_with("/v1") {

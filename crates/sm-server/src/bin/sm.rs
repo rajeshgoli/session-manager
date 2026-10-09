@@ -294,6 +294,9 @@ struct SpawnArgs {
     name: Option<String>,
     #[arg(long, value_name = "SECONDS")]
     wait: Option<u64>,
+    /// Wait for a local seat (default 5m; same duration syntax as sm queue run).
+    #[arg(long)]
+    max_wait: Option<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long, value_name = "LEVEL")]
@@ -961,6 +964,14 @@ fn run() -> Result<()> {
         }
         Command::Spawn(args) => {
             let (prompt, prompt_source) = read_spawn_prompt(&args)?;
+            let max_wait_seconds = args
+                .max_wait
+                .as_deref()
+                .map(parse_duration_seconds)
+                .transpose()?;
+            if max_wait_seconds.is_some_and(|s| s <= 0) {
+                bail!("max-wait must be greater than 0");
+            }
             let parent_session_id = optional_current_session_id();
             let provider = launch_provider_for_alias(&args.provider)?;
             if args.ticket.is_some() && parent_session_id.is_none() {
@@ -974,6 +985,7 @@ fn run() -> Result<()> {
                     "prompt_source": prompt_source,
                     "name": args.name,
                     "wait": args.wait,
+                    "max_wait_seconds": max_wait_seconds,
                     "model": args.model,
                     "reasoning_effort": args.effort,
                     "working_dir": args.working_dir,
@@ -1049,7 +1061,8 @@ fn run() -> Result<()> {
                         "spawn_prompt_source": prompt_source,
                         "model": args.model,
                         "reasoning_effort": args.effort,
-                        "wait": args.wait
+                        "wait": args.wait,
+                        "max_wait_seconds": max_wait_seconds
                     }),
                 )?
             };
@@ -7934,6 +7947,7 @@ mod tests {
             prompt_stdin: false,
             name: None,
             wait: None,
+            max_wait: None,
             model: None,
             effort: None,
             working_dir: None,
@@ -8069,6 +8083,7 @@ mod tests {
             prompt_stdin: true,
             name: None,
             wait: None,
+            max_wait: None,
             model: None,
             effort: None,
             working_dir: None,

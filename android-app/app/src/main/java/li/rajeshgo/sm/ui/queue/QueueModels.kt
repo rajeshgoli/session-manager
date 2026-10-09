@@ -370,3 +370,7 @@ fun bucketTooltip(
         bucket.pendingMax?.takeIf { it > 0 }?.let { "Up to $it waiting" },
     )
 }
+
+fun localModelCardLines(card: li.rajeshgo.sm.data.model.LocalModelCard): List<Pair<String, String>> =
+    listOfNotNull("Model" to card.modelText, "Seats" to card.seatsText,
+        "Memory headroom" to card.memoryText, card.reloadText?.let { "Reload" to it })

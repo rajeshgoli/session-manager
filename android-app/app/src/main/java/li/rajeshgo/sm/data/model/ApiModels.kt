@@ -681,6 +681,7 @@ data class QueueOverview(
     @SerialName("generated_at") val generatedAt: String? = null,
     @SerialName("owner_name") val ownerName: String? = null,
     val host: HostStatus? = null,
+    @SerialName("local_model") val localModel: LocalModelCard? = null,
     val slots: QueueSlots = QueueSlots(),
     val running: List<SessionJob> = emptyList(),
     val queued: List<SessionJob> = emptyList(),
@@ -1409,4 +1410,14 @@ data class BugReportOptions(
     val repo: String = "",
     @SerialName("working_dir") val workingDir: String? = null,
     @SerialName("review_policy") val reviewPolicy: StartReviewPolicy? = null,
+)
+
+/** Wording comes from the same server snapshot as the web Queue card. */
+@Serializable
+data class LocalModelCard(
+    val state: String = "unloaded",
+    @SerialName("model_text") val modelText: String = "unloaded",
+    @SerialName("seats_text") val seatsText: String = "0 of 0",
+    @SerialName("memory_text") val memoryText: String = "Unknown",
+    @SerialName("reload_text") val reloadText: String? = null,
 )

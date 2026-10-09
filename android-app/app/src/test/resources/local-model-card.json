@@ -1,0 +1,44 @@
+[
+  {
+    "state": "ready",
+    "model_text": "loaded (flash-next)",
+    "seats_text": "0 of 1",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": null
+  },
+  {
+    "state": "ready",
+    "model_text": "loaded (flash-next)",
+    "seats_text": "1 of 1: sm-1234",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": null
+  },
+  {
+    "state": "loading",
+    "model_text": "loading",
+    "seats_text": "0 of 1",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": null
+  },
+  {
+    "state": "draining",
+    "model_text": "draining",
+    "seats_text": "1 of 1: sm-1234",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": null
+  },
+  {
+    "state": "yielded",
+    "model_text": "yielded to perf run",
+    "seats_text": "1 of 1: sm-1234",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": "Reload needs 183.3 GB free for 600s continuously and no perf run or cooldown; held 30s"
+  },
+  {
+    "state": "unloaded",
+    "model_text": "unloaded",
+    "seats_text": "0 of 1",
+    "memory_text": "70.0 GB free, yields below 32.6 GB",
+    "reload_text": null
+  }
+]

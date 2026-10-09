@@ -90,6 +90,7 @@ export function agentFact(agent, now = Date.now()) {
   const fact = (agent.facts && agent.facts.agent) || { state: agent.state === 'stopped' ? 'stopped' : 'idle' };
   const since = age(fact.since, now);
   if (fact.state === 'working') return { text: `● Working ${since}`.trim(), tone: 'green' };
+  if (fact.state === 'parked') return { text: fact.text || 'Parked: model yielded', tone: 'amber' };
   return { text: `○ ${fact.state === 'stopped' ? 'Stopped' : 'Idle'} ${since}`.trim(), tone: 'muted' };
 }
 

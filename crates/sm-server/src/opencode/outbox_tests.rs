@@ -468,3 +468,51 @@ fn opencode_outbox_http_wait_does_not_hold_registry_and_handoff_waits_for_submis
     handoff.join().unwrap();
     assert_eq!(f.driver.posts(), 1);
 }
+
+#[test]
+fn model_drain_holds_all_delivery_modes_and_reload_releases_in_order() {
+    let f = Fixture::new();
+    f.create("local1", None).unwrap();
+    let host = crate::local_model::register_outbox_fixture(
+        f.queue().db_path().to_path_buf(),
+        f.driver.path.clone(),
+        f.store.clone(),
+    );
+    let db = rusqlite::Connection::open(f.queue().db_path()).unwrap();
+    for state in ["draining", "yielded", "loading"] {
+        db.execute("UPDATE local_model SET state=?1", [state])
+            .unwrap();
+        for mode in ["urgent", "sequential", "important", "steer"] {
+            assert!(!f.send(&format!("{state}-{mode}"), mode).delivered);
+        }
+    }
+    assert_eq!(
+        f.queue()
+            .pending_messages_for_target("local1", 100)
+            .unwrap()
+            .len(),
+        12
+    );
+    assert!(!f
+        .requests()
+        .iter()
+        .any(|(_, path, _)| path.ends_with("/prompt_async")));
+    db.execute("UPDATE local_model SET state='ready'", [])
+        .unwrap();
+    assert!(!host.delivery_held().unwrap());
+    f.store.drain_opencode_outbox("local1", &f.runtime).unwrap();
+    assert!(f
+        .queue()
+        .pending_messages_for_target("local1", 100)
+        .unwrap()
+        .is_empty());
+    let texts = f
+        .requests()
+        .iter()
+        .filter(|(_, path, _)| path.ends_with("/prompt_async"))
+        .map(|(_, _, body)| body["parts"][0]["text"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(texts.len(), 12);
+    assert!(texts[0].contains("draining-urgent"));
+    assert!(texts[11].contains("loading-steer"));
+}

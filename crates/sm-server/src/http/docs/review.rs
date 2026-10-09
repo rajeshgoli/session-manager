@@ -871,6 +871,7 @@ pub(super) async fn assign_review(
             .as_ref()
             .and_then(|author| author.reasoning_effort.clone()),
         wait: None,
+        max_wait_seconds: None,
         spawn_prompt_source: Some(SpawnBriefSource {
             kind: "positional".to_owned(),
             path: None,
