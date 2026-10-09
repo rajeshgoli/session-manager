@@ -8731,6 +8731,7 @@ impl SessionStore {
             tmux_socket_name: tmux_socket_name.map(ToOwned::to_owned),
             node,
             host: None,
+            local_parked_reason: None,
             provider,
             model: optional_trimmed(request.model.as_deref()),
             reasoning_effort: optional_trimmed(request.reasoning_effort.as_deref()),
@@ -9731,6 +9732,8 @@ pub struct CreateCoreSessionRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub wait: Option<u64>,
+    #[serde(default)]
+    pub max_wait_seconds: Option<u64>,
     #[serde(default)]
     pub spawn_prompt_source: Option<SpawnBriefSource>,
     #[serde(skip)]
@@ -16313,6 +16316,8 @@ pub struct SessionRecord {
     pub node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_parked_reason: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
@@ -16955,6 +16960,9 @@ fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
     if completion_status_is_retired(session.completion_status.as_deref()) {
         return "stopped".to_owned();
     }
+    if let Some(reason) = &session.local_parked_reason {
+        return format!("parked: model yielded to {reason}");
+    }
     if session.completion_status.is_some() {
         return "waiting_input".to_owned();
     }
@@ -17421,6 +17429,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             wait: None,
+            max_wait_seconds: None,
             spawn_prompt_source: None,
             spawn_brief: None,
             started_by_sm: false,
@@ -18808,6 +18817,7 @@ sleep 30
             model: Some("luna".to_owned()),
             reasoning_effort: None,
             wait: None,
+            max_wait_seconds: None,
             spawn_prompt_source: None,
             spawn_brief: None,
             started_by_sm: false,
@@ -19939,6 +19949,7 @@ sleep 30
             tmux_socket_name: None,
             node: "primary".to_owned(),
             host: None,
+            local_parked_reason: None,
             provider: "claude".to_owned(),
             model: None,
             reasoning_effort: None,
@@ -27514,5 +27525,92 @@ sleep 30
             std::process::id(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn park_local_sessions(&self, reason: &str) -> Result<()> {
+        self.mark_local_unload(reason, true)
+    }
+    pub(crate) fn prepare_local_unload(&self, reason: &str) -> Result<()> {
+        self.mark_local_unload(reason, false)
+    }
+    fn mark_local_unload(&self, reason: &str, confirmed: bool) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        for value in ensure_sessions_array_mut(&mut state)? {
+            if value["host"] != "local"
+                || raw_session_is_stopped(value.as_object().context("invalid session")?)
+            {
+                continue;
+            }
+            let interrupted =
+                !crate::local_model::session_idle(&serde_json::from_value(value.clone())?);
+            let session = value.as_object_mut().context("invalid session")?;
+            if session
+                .get("local_parked_reason")
+                .is_none_or(Value::is_null)
+                && session
+                    .get("local_park_pending_reason")
+                    .is_none_or(Value::is_null)
+            {
+                session.insert("local_resume_reason".into(), json!(reason));
+                session.insert("local_resume_key".into(), json!(generate_session_id()));
+            }
+            if interrupted {
+                session.insert("resume_needed".into(), json!(true));
+            }
+            if confirmed {
+                session.insert("local_parked_reason".into(), json!(reason));
+                session.insert("local_park_pending_reason".into(), Value::Null);
+            } else {
+                session.insert("local_park_pending_reason".into(), json!(reason));
+            }
+        }
+        self.write_raw_json_value(&state)
+    }
+    pub(crate) fn resume_local_sessions(&self) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(queue) = &self.queue_store else {
+            return Ok(());
+        };
+        let before = state.clone();
+        for value in ensure_sessions_array_mut(&mut state)? {
+            if value["host"] != "local"
+                || raw_session_is_stopped(value.as_object().context("invalid session")?)
+            {
+                continue;
+            }
+            let session = value.as_object_mut().context("invalid session")?;
+            // Opencode retries interrupted turns itself. Keep this flag until
+            // idle, so no duplicate continue prompt enters a retrying turn.
+            let id = json_text(session.get("id")).context("missing session id")?;
+            if session.get("resume_needed").and_then(Value::as_bool) == Some(true) {
+                let pending = !queue.pending_messages_for_target(&id, 1)?.is_empty();
+                if pending || session.get("status").and_then(Value::as_str) == Some("idle") {
+                    if !pending {
+                        let reason = json_text(session.get("local_resume_reason"))
+                            .unwrap_or_else(|| "model yield".into());
+                        let key = json_text(session.get("local_resume_key"))
+                            .context("missing resume key")?;
+                        queue.enqueue_message_once_with_metadata(&format!("local-resume:{key}"), &id,
+                            &format!("[sm] The local model was unloaded while you were working ({reason}). Continue where you left off."),
+                            "sequential", QueueMessageMetadata::default())?;
+                    }
+                    session.insert("resume_needed".into(), json!(false));
+                }
+            }
+            if session
+                .get("local_parked_reason")
+                .is_some_and(|v| !v.is_null())
+            {
+                session.insert("local_parked_reason".into(), Value::Null);
+            }
+        }
+        if before != state {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
     }
 }

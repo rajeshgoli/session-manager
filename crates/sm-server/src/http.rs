@@ -1023,6 +1023,10 @@ impl AppState {
         &self.config
     }
 
+    pub fn register_local_model(&self) -> anyhow::Result<()> {
+        crate::local_model::register_live_with_store(&self.config, self.session_store.clone())?;
+        Ok(())
+    }
     pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
         self.session_store.reconcile_current_seat_sessions()
     }
@@ -4550,6 +4554,7 @@ async fn create_client_session(
         model: crate::config::trimmed(&payload.model),
         reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
         wait: None,
+        max_wait_seconds: Some(1),
         spawn_prompt_source: payload.spawn_prompt_source,
         spawn_brief: None,
         started_by_sm: true,
@@ -4858,6 +4863,7 @@ async fn spawn_child_session(
         model: payload.model.clone(),
         reasoning_effort: payload.reasoning_effort.clone(),
         wait: wait_seconds,
+        max_wait_seconds: payload.max_wait_seconds,
         spawn_prompt_source: None,
         spawn_brief: Some(SpawnBriefBinding {
             intent_id: accepted.1,
@@ -7910,6 +7916,7 @@ async fn client_queue(
             .ok(),
         "owner_name": state.config.owner_name,
         "host": host,
+        "local_model": crate::local_model::queue_card(&expand_home(&state.config.queue_runner_state_dir().to_string_lossy()))?,
         "slots": {
             "running": running.len(),
             "max": policy.max_running_jobs,
@@ -13047,7 +13054,7 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.status.trim() == "stopped" || session.completion_status.is_some() {
         return None;
     }
-    if session.tmux_session.trim().is_empty() {
+    if session.local_parked_reason.is_some() || session.tmux_session.trim().is_empty() {
         return None;
     }
     if session.provider == "opencode" {
@@ -16897,6 +16904,8 @@ struct SpawnCoreSessionRequest {
     name: Option<String>,
     #[serde(default)]
     wait: Option<u64>,
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -24262,6 +24271,64 @@ mod tests {
             for job in body["jobs"].as_array().unwrap() {
                 assert_eq!(job["requester_name"], Value::Null);
                 assert!(job["notify_name"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_model_queue_route_reports_free_full_draining_and_reload_progress() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.sm_send.db_path = PathBuf::from(&config.paths.state_file)
+            .with_file_name("queue-card-model.db")
+            .display()
+            .to_string();
+        let host = crate::local_model::register_live(&config).unwrap();
+        let db = Connection::open(&config.sm_send.db_path).unwrap();
+        db.execute("INSERT INTO local_model (singleton,key,server,identifier,seats,context,reservation_bytes,measured_peak_bytes,state,desired,state_since,endpoint,last_yield_reason) VALUES (1,'test','mtplx','flash-next',1,200000,151000000000,137000000000,'ready',1,'now','http://127.0.0.1:8000','perf run')", []).unwrap();
+        let app = router(AppState::new(config.clone()));
+        for (model_state, occupied) in [
+            ("ready", false),
+            ("ready", true),
+            ("draining", true),
+            ("yielded", true),
+        ] {
+            db.execute("UPDATE local_model SET state=?1", [model_state])
+                .unwrap();
+            let mut raw: Value =
+                serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+            raw["sessions"][0]["host"] = if occupied {
+                json!("local")
+            } else {
+                Value::Null
+            };
+            fs::write(&config.paths.state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+            if model_state == "yielded" {
+                host.set_reload_hold_for_test(30);
+            }
+            let response = app
+                .clone()
+                .oneshot(local_request(Method::GET, "/client/queue", Body::empty()))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let card = &body["local_model"];
+            assert_eq!(card["state"], model_state);
+            assert_eq!(card["seats_used"], usize::from(occupied));
+            assert_eq!(card["seats_total"], 1);
+            assert_eq!(
+                card["agents"].as_array().unwrap().len(),
+                usize::from(occupied)
+            );
+            assert!(card["memory_text"]
+                .as_str()
+                .unwrap()
+                .contains("yields below"));
+            if model_state == "yielded" {
+                assert_eq!(card["model_text"], "yielded to perf run");
+                assert!(card["reload_held_seconds"].as_u64().unwrap() >= 30);
+                assert!(card["reload_text"].as_str().unwrap().contains("held 30s"));
             }
         }
     }

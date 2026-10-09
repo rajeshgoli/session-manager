@@ -274,6 +274,7 @@ impl Fixture {
             id: Some(id.into()),
             provider: Some("opencode".into()),
             initial_message: brief.map(str::to_owned),
+            max_wait_seconds: Some(1),
             ..CreateCoreSessionRequest::default()
         }
     }
@@ -1011,4 +1012,29 @@ fn opencode_pending_launch_is_not_stopped_before_its_server_is_started() {
     f.store.reconcile_opencode_runtime("local1").unwrap();
     assert!(!f.store.get_session("local1").unwrap().unwrap().is_stopped());
     assert_eq!(f.launches()[0].status, "launching");
+}
+
+#[test]
+fn local_spawn_waits_for_retirement_without_holding_the_registry() {
+    let f = Fixture::new();
+    f.create("local1", None).unwrap();
+    let store = f.store.clone();
+    let runtime = f.runtime.clone();
+    let creator = std::thread::spawn(move || {
+        let mut request = Fixture::request("local2", None);
+        request.max_wait_seconds = Some(5);
+        store.create_core_session_with_runtime(request, None, &runtime)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    // This lock remains available while the second launch waits for its seat.
+    f.store
+        .retire_core_session_with_runtime_authorized(
+            "local1",
+            RetireAuthority::operator("test"),
+            None,
+            &f.runtime,
+        )
+        .unwrap();
+    assert_eq!(creator.join().unwrap().unwrap().id, "local2");
+    assert_eq!(f.driver.starts.load(Ordering::Acquire), 2);
 }

@@ -149,6 +149,14 @@ fun QueueScreen(
                 if (overview != null) {
                     item {
                         MeterPanel(overview.host, onClick = onOpenUsage)
+                        overview.localModel?.let { card ->
+                            Column(Modifier.padding(vertical = 12.dp)) {
+                                Text("Local model", style = MaterialTheme.typography.titleMedium)
+                                localModelCardLines(card).forEach { (label, value) ->
+                                    Text("$label: $value", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                                }
+                            }
+                        }
                         Text(
                             slotsLine(overview.slots),
                             style = MaterialTheme.typography.bodySmall,

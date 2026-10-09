@@ -446,10 +446,13 @@ fn agent_facts(
     let now = *now;
     let stopped = s(session, "status") == "stopped";
     let working = matches!(s(session, "activity_state"), "working" | "thinking");
+    let parked = s(session, "activity_state").starts_with("parked:");
     let agent_state = if stopped {
         "stopped"
     } else if working {
         "working"
+    } else if parked {
+        "parked"
     } else {
         "idle"
     };
@@ -629,7 +632,7 @@ fn agent_facts(
             |row| json!({"at": row.completed_at, "text": row.text, "read": row.read_at.is_some()}),
         );
     let note = notes.get(s(session, "id"));
-    let facts = json!({"agent": {"state": agent_state, "since": activity_since},
+    let facts = json!({"agent": {"state": agent_state, "since": activity_since, "text": parked.then(|| s(session, "activity_state"))},
         "jobs": job_facts, "you": you, "finished": finished,
         "note": note.map_or(Value::Null, |note| json!({"text": note.text, "at": note.at}))});
     let last = s(session, "last_activity");
@@ -641,6 +644,7 @@ fn agent_facts(
     let review_long = review_since.is_some_and(|at| old_enough(at, now, threshold));
     // A pinned note says why the agent waits, so it is not stalled.
     let idle_with_claim = !working
+        && !parked
         && running.is_empty()
         && pending.is_empty()
         && review.is_none()

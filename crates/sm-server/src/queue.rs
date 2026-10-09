@@ -13221,3 +13221,18 @@ mod review_queue_tests {
         .is_some());
     }
 }
+
+pub(crate) fn model_reload_blocked(
+    state_dir: &Path,
+    captured: QueueAdmissionPolicy,
+) -> Result<bool> {
+    let path = state_dir.join("queue_runner.db");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = open_queue_jobs_connection(&path)?;
+    init_queue_jobs_schema(&conn)?;
+    let jobs = list_queue_job_runtime_records_conn(&conn)?;
+    Ok(running_queue_job_count(&jobs, Some("perf")) > 0
+        || perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)))
+}

@@ -35,10 +35,12 @@ impl ModelServer for FakeServer {
     }
 }
 fn fixture() -> (ModelHost, Arc<FakeServer>, PathBuf) {
+    static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
-        "sm-model-{}-{}",
+        "sm-model-{}-{}-{}",
         std::process::id(),
-        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
     ));
     let server = Arc::new(FakeServer {
         started: AtomicUsize::new(0),
@@ -52,12 +54,17 @@ fn fixture() -> (ModelHost, Arc<FakeServer>, PathBuf) {
         config: LocalHostConfig::default(),
         db_path: root.join("message_queue.db"),
         state_file: root.join("sessions.json"),
+        sessions: SessionStore::new_with_queue(
+            root.join("sessions.json"),
+            root.join("message_queue.db"),
+        ),
         queue_dir: root.clone(),
         queue_policy: crate::queue::QueueAdmissionPolicy::default(),
         operation: Mutex::new(()),
         yield_worker: AtomicBool::new(false),
         force_unload: AtomicBool::new(false),
         backend: server.clone(),
+        reload_since: Mutex::new(None),
     };
     (host, server, root)
 }
@@ -560,4 +567,152 @@ fn stale_live_pane_does_not_keep_an_exited_process_resident() {
     for invalid in ["", "unexpected 123", "0", "0 -1", "0 0"] {
         assert!(live_pane_pid(invalid).is_err());
     }
+}
+
+fn local_session(host: &ModelHost, status: &str) -> SessionStore {
+    let store = host.session_store().clone();
+    store
+        .create_core_session(
+            crate::sessions::CreateCoreSessionRequest {
+                id: Some("local-seat".into()),
+                name: Some("sm-local-seat".into()),
+                working_dir: Some(host.queue_dir.display().to_string()),
+                ..Default::default()
+            },
+            Some(host.queue_dir.join("logs")),
+        )
+        .unwrap();
+    let mut state: Value = serde_json::from_slice(&fs::read(&host.state_file).unwrap()).unwrap();
+    let session = &mut state["sessions"][0];
+    session["host"] = serde_json::json!("local");
+    session["provider"] = serde_json::json!("opencode");
+    session["status"] = serde_json::json!(status);
+    session["opencode"] = serde_json::json!({"port":18500,"state_dir":root_path(host),"version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"});
+    fs::write(&host.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+    store
+}
+#[test]
+fn concurrent_force_unload_shortens_inflight_local_session_drain() {
+    let (mut host, server, root) = fixture();
+    host.config.drain_timeout = 60;
+    ready(&host);
+    let store = local_session(&host, "running");
+    let host = Arc::new(host);
+    let draining = host.clone();
+    let worker = thread::spawn(move || draining.unload(false, Some("perf test")));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.record().unwrap().unwrap().state != "draining" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let start = Instant::now();
+    host.unload(true, None).unwrap();
+    worker.join().unwrap().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(server.stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(host.record().unwrap().unwrap().state, "unloaded");
+    let raw: Value = serde_json::from_slice(&fs::read(&host.state_file).unwrap()).unwrap();
+    assert_eq!(raw["sessions"][0]["resume_needed"], true);
+    assert!(store
+        .get_session("local-seat")
+        .unwrap()
+        .unwrap()
+        .local_parked_reason
+        .is_some());
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn reload_hold_resets_on_pressure_or_perf_and_resumes_without_duplicate_prompt() {
+    let (mut host, server, root) = fixture();
+    host.config.reload_hold = 600;
+    ready(&host);
+    let store = local_session(&host, "running");
+    host.unload(true, Some("host memory pressure")).unwrap();
+    host.reload_pass(Some(275 * GB), false).unwrap();
+    assert!(host.reload_since.lock().unwrap().is_some());
+    host.reload_pass(Some(1), false).unwrap();
+    assert!(host.reload_since.lock().unwrap().is_none());
+    host.reload_pass(Some(275 * GB), false).unwrap();
+    host.reload_pass(Some(275 * GB), true).unwrap();
+    assert!(host.reload_since.lock().unwrap().is_none());
+    *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(601));
+    host.reload_pass(Some(275 * GB), false).unwrap();
+    assert_eq!(host.record().unwrap().unwrap().state, "ready");
+    assert_eq!(server.started.load(Ordering::SeqCst), 1);
+    assert!(store
+        .get_session("local-seat")
+        .unwrap()
+        .unwrap()
+        .local_parked_reason
+        .is_none());
+    // A retrying opencode turn gets no continue prompt.
+    let queue = crate::queue::RetainedQueueStore::new(host.db_path.clone());
+    assert!(queue
+        .pending_messages_for_target("local-seat", 10)
+        .unwrap()
+        .is_empty());
+    let mut raw: Value = serde_json::from_slice(&fs::read(&host.state_file).unwrap()).unwrap();
+    raw["sessions"][0]["status"] = serde_json::json!("idle");
+    fs::write(&host.state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+    host.reload_pass(Some(275 * GB), false).unwrap();
+    host.reload_pass(Some(275 * GB), false).unwrap();
+    let messages = queue.pending_messages_for_target("local-seat", 10).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "[sm] The local model was unloaded while you were working (host memory pressure). Continue where you left off.");
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn queue_card_reports_free_full_draining_and_yielded_reload_hold() {
+    let (host, _, root) = fixture();
+    ready(&host);
+    let card = host.card_snapshot(Some(70 * GB), false).unwrap();
+    assert_eq!(card["model_text"], "loaded (qwen3.8-flash-next)");
+    assert_eq!(card["seats_text"], "0 of 1");
+    assert!(card["memory_text"]
+        .as_str()
+        .unwrap()
+        .starts_with("70.0 GB free, yields below "));
+    local_session(&host, "idle");
+    assert_eq!(
+        host.card_snapshot(Some(70 * GB), false).unwrap()["seats_text"],
+        "1 of 1: sm-local-seat"
+    );
+    let mut model = host.record().unwrap().unwrap();
+    host.transition(&mut model, "draining").unwrap();
+    assert_eq!(
+        host.card_snapshot(Some(70 * GB), false).unwrap()["model_text"],
+        "draining"
+    );
+    host.unload(true, Some("perf run")).unwrap();
+    *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
+    let card = host.card_snapshot(Some(275 * GB), false).unwrap();
+    assert_eq!(card["model_text"], "yielded to perf run");
+    assert!(card["reload_held_seconds"].as_u64().unwrap() >= 30);
+    assert!(card["reload_text"].as_str().unwrap().contains("held 30s"));
+    assert!(host.delivery_held().unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+pub(super) fn register_outbox_fixture(
+    db: PathBuf,
+    state: PathBuf,
+    store: SessionStore,
+) -> Arc<ModelHost> {
+    let (mut host, _, unused_root) = fixture();
+    host.db_path = db.clone();
+    host.state_file = state;
+    host.sessions = store;
+    host.queue_dir = db.parent().unwrap().to_path_buf();
+    ready(&host);
+    let host = Arc::new(host);
+    hosts()
+        .lock()
+        .unwrap()
+        .insert(fs::canonicalize(db).unwrap(), host.clone());
+    let _ = fs::remove_dir_all(unused_root);
+    host
+}
+
+fn root_path(host: &ModelHost) -> String {
+    host.queue_dir.display().to_string()
 }

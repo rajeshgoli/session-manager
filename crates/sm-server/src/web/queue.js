@@ -24,6 +24,7 @@ export function QueuePage() {
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
     })}</div>
     <${MacChart} />
+    <${LocalModelCard} card=${queue.local_model} />
     ${!insightDismissed ? html`<${HeldBack} stats=${stats} insightOnly=${true} onDismiss=${() => { store('queue-limits-insight-dismissed', true); setInsightDismissed(true); }} />` : null}
     <section class="q-card"><div class="q-heading"><h2>Running</h2><span class="muted">Last 3 hours → now</span></div>
       ${queue.running.length ? queue.running.map((job) => html`<${JobRow} key=${job.id} job=${job} now=${now} />`) : html`<p class="muted">No jobs running.</p>`}
@@ -33,6 +34,16 @@ export function QueuePage() {
     </section>
     ${queue.ended.length ? html`<a href="/analytics/queue" onClick=${(e) => { e.preventDefault(); navigate('/analytics/queue'); }}>${queue.ended.length} stopped in the last 24h ›</a>` : null}
   </div>`;
+}
+
+export function LocalModelCard({ card }) {
+  if (!card) return null;
+  return html`<section class="q-card"><h2>Local model</h2><dl class="q-details">
+    <dt>Model</dt><dd>${card.model_text}</dd>
+    <dt>Seats</dt><dd>${card.seats_text}</dd>
+    <dt>Memory headroom</dt><dd>${card.memory_text}</dd>
+    ${card.reload_text ? html`<dt>Reload</dt><dd>${card.reload_text}</dd>` : null}
+  </dl></section>`;
 }
 
 export function MacChart() {

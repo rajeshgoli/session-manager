@@ -276,8 +276,37 @@ async fn main() -> Result<()> {
         let handover_acceptor =
             handover::spawn_acceptor(&handover_listener, shutdown.clone(), handover_tx)?;
 
+        let state = AppState::try_new(config.clone())
+            .context("failed to initialize server state")?
+            .with_listen_port(args.port)
+            .with_shutdown(shutdown.clone())
+            .with_btw_workers(btw_workers.clone());
+        #[cfg(target_os = "macos")]
+        let state = if let Some(walls) = &local_walls {
+            state.with_local_walls(walls.clone())
+        } else {
+            state
+        };
         if config.rust_core.runtime_enabled {
-            let model = sm_server::local_model::register_live(&config)?;
+            state.register_local_model()?;
+            let reload_dir = queue_state_dir.clone();
+            let reload_shutdown = shutdown.clone();
+            thread::spawn(move || loop {
+                if reload_shutdown.is_stopped() {
+                    break;
+                }
+                run_background_pass("local model reload", || {
+                    if let Err(error) = sm_server::local_model::retry_reload(&reload_dir) {
+                        eprintln!("local model reload failed: {error:#}");
+                    }
+                });
+                thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
+            });
+        }
+
+        if config.rust_core.runtime_enabled {
+            let model = sm_server::local_model::live(&queue_state_dir)
+                .context("local model registration missing")?;
             let judge = sm_server::local_judge::LocalJudgeRuntime::from_config(&config);
             let judge_shutdown = shutdown.clone();
             thread::spawn(move || loop {
@@ -370,17 +399,6 @@ async fn main() -> Result<()> {
             });
         }
 
-        let state = AppState::try_new(config.clone())
-            .context("failed to initialize server state")?
-            .with_listen_port(args.port)
-            .with_shutdown(shutdown.clone())
-            .with_btw_workers(btw_workers.clone());
-        #[cfg(target_os = "macos")]
-        let state = if let Some(walls) = &local_walls {
-            state.with_local_walls(walls.clone())
-        } else {
-            state
-        };
         if state.detected_host_restart().is_some() {
             // Restored agents' hooks call back into this server, so give it a
             // moment to start serving first (sm#2054).
