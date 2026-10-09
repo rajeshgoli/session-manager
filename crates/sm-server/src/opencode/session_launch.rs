@@ -43,6 +43,14 @@ impl std::fmt::Debug for OpencodeLaunchContext {
 }
 
 impl SessionStore {
+    /// Read-only admission hint; creation repeats the check under its reservation lock.
+    pub fn opencode_capacity_reason(&self, config: &OpencodeConfig) -> Result<Option<String>> {
+        let occupied = occupied_opencode_sessions(&self.load_parsed_state()?.raw, None)?;
+        Ok(check_opencode_capacity(config, &occupied, None)
+            .err()
+            .map(|error| error.to_string()))
+    }
+
     pub fn with_opencode_launch_driver(mut self, driver: Arc<dyn OpencodeLaunchDriver>) -> Self {
         self.opencode_launch = Some(OpencodeLaunchContext {
             driver,

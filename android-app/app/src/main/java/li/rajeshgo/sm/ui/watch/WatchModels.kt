@@ -651,3 +651,10 @@ fun finishedLine(session: ClientSession): String? {
     val text = finished.text?.lineSequence()?.map { it.trim() }?.firstOrNull { it.isNotEmpty() }
     return "✔ ${text ?: "Finishing…"}"
 }
+
+internal fun providerTag(provider: String?): String = when (provider) {
+    null, "", "claude" -> "CLAUDE"
+    "opencode" -> "LOCAL"
+    "codex", "codex-fork", "codex-app" -> "CODEX"
+    else -> provider.uppercase()
+}

@@ -141,6 +141,7 @@ select.inp { padding: 3px 6px; }
 .ball { font-weight: 550; }
 .ball::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: currentColor; vertical-align: 1px; }
 .prov { font-size: .8rem; font-weight: 650; letter-spacing: .04em; }
+.prov.local { color: var(--violet); }
 .prov.claude { color: var(--claude); } .prov.codex { color: var(--codex); }
 .tk { font: .867rem var(--mono); color: var(--ink-2); }
 .sub { font-size: .867rem; color: var(--ink-3); }

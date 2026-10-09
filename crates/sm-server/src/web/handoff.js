@@ -49,7 +49,7 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
   const [note, setNote] = useState('Loading…');
   const [asking, setAsking] = useState(false);
   const path = scope === 'ticket' ? forTicket && ticketPath(forTicket) : `/sessions/${encodeURIComponent(agent.id)}/handoff-policy`;
-  const provider = agent?.provider === 'codex-fork' ? 'codex-fork' : 'claude';
+  const provider = ['codex-fork', 'opencode'].includes(agent?.provider) ? agent.provider : 'claude';
   const base = defaults?.provider_thresholds?.[provider]?.threshold_percent;
   // The agent's own window: Claude's is 1M for a `[1m]` model, else 200k.
   // An unheld ticket has no provider yet: show only what the ticket sets.

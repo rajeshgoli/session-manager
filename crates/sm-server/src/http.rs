@@ -3184,8 +3184,18 @@ async fn client_session_models(
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
     let empty_local = local && models.is_empty();
     let mut response = json!({ "models": models });
-    if empty_local {
-        response["reason"] = json!("no local model loaded");
+    if local {
+        let reason = if empty_local {
+            Some("no local model loaded".to_owned())
+        } else {
+            state
+                .session_store
+                .opencode_capacity_reason(&state.config.opencode)?
+        };
+        response["available"] = json!(reason.is_none());
+        if let Some(reason) = reason {
+            response["reason"] = json!(reason);
+        }
     }
     Ok(Json(response))
 }
@@ -24299,6 +24309,36 @@ mod tests {
                     Value::Null
                 }
             );
+        }
+        db.execute("UPDATE local_model SET state='ready'", [])
+            .unwrap();
+        let mut data: Value =
+            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        data["sessions"][0]["provider"] = json!("opencode");
+        data["sessions"][0]["friendly_name"] = json!("local-worker");
+        data["sessions"][0]["opencode"] = json!({"port":18500,"state_dir":"/private/tmp/opencode-test/local","version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"});
+        for (session_status, available) in [("idle", false), ("stopped", true)] {
+            data["sessions"][0]["status"] = json!(session_status);
+            fs::write(&config.paths.state_file, serde_json::to_vec(&data).unwrap()).unwrap();
+            let response = app
+                .clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/client/session-models?provider=opencode",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["models"], json!(["loaded-model"]));
+            assert_eq!(body["available"], available);
+            if !available {
+                assert_eq!(
+                    body["reason"],
+                    "no local seat free (1/1 used by local-worker)"
+                );
+            }
         }
         assert!(host.record().unwrap().is_some());
     }

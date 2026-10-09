@@ -1939,8 +1939,13 @@ pub(super) async fn start(
     payload: StartRequest,
     auto: bool,
 ) -> Result<Value, ApiError> {
-    if !matches!(payload.provider.as_str(), "claude" | "codex-fork") {
-        return Err(bad_request("provider must be claude or codex-fork"));
+    if !matches!(
+        payload.provider.as_str(),
+        "claude" | "codex-fork" | "opencode"
+    ) {
+        return Err(bad_request(
+            "provider must be claude, codex-fork or opencode",
+        ));
     }
     let key = ticket_key(&payload.repo, payload.number)?;
     if let Some(reviewer) = &payload.reviewer {

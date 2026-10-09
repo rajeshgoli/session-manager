@@ -322,6 +322,7 @@ function TerminalLimits({ data, config, write }) {
 // Only providers with a context gauge can hand off: plain Codex and
 // codex-app are not listed.
 const HANDOFF_PROVIDERS = [
+  ['opencode', 'Local (opencode)', () => 'Off. Local agents keep working until their context fills.'],
   ['claude', 'Claude agents', () => 'Off. Claude agents keep working until their context fills.'],
   ['codex-fork', 'Codex agents', window => `Off. Codex compacts its own context near the end of its ${window ? `${tokens(window)} ` : ''}window.`],
 ];

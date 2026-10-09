@@ -26,4 +26,12 @@ data class HandoffDefaults(
     @SerialName("ask_on_doc_review") val askOnDocReview: Boolean,
     @SerialName("review_floor_percent") val reviewFloorPercent: Double,
     @SerialName("reminder_percent") val reminderPercent: Double,
+    @SerialName("provider_thresholds") val providerThresholds: Map<String, HandoffThresholds> = emptyMap(),
+)
+
+@Serializable
+data class HandoffThresholds(
+    @SerialName("threshold_percent") val thresholdPercent: Double,
+    @SerialName("review_floor_percent") val reviewFloorPercent: Double,
+    @SerialName("reminder_percent") val reminderPercent: Double,
 )

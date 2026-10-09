@@ -23,7 +23,7 @@ function AgentRow({ row, busy, restore }) {
   return html`<article class="history-card history-agent" data-open-ref=${`agent:${row.id}`}>
     <div class="history-heading">
       <button class="text-button history-name" onClick=${() => openPanel(`agent:${row.id}`)}>${row.name}</button>
-      <span class=${`prov ${row.provider.startsWith('codex') ? 'codex' : 'claude'}`}>${providerLabel(row.provider).toUpperCase()}</span>
+      <span class=${`prov ${row.provider === 'opencode' ? 'local' : row.provider.startsWith('codex') ? 'codex' : 'claude'}`}>${providerLabel(row.provider).toUpperCase()}</span>
       ${ticket ? html`<span class="mono">#${ticket.number}</span>` : null}
       <span>· ${row.retired_automatically ? 'retired automatically' : row.state === 'retired' ? 'retired' : 'stopped'} ${age(row.ended_at)} ago</span>
       <span class="mono">${basename(row.working_dir)}</span>
