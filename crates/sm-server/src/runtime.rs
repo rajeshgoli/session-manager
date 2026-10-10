@@ -1260,6 +1260,8 @@ impl TmuxRuntime {
     }
 
     fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
+        // Spawn briefs go byte-for-byte inside a bracketed paste, where a CR
+        // cannot submit; only typed messages need the filter.
         let text = typeable_text(text);
         let text = text.as_ref();
         self.send_text(tmux_session, text)?;
@@ -1339,8 +1341,7 @@ impl TmuxRuntime {
 
     fn send_text(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.exit_copy_mode_if_needed(tmux_session);
-        let text = typeable_text(text);
-        for (index, chunk) in split_send_text_chunks(&text, self.send_keys_max_chunk_bytes)
+        for (index, chunk) in split_send_text_chunks(text, self.send_keys_max_chunk_bytes)
             .into_iter()
             .enumerate()
         {
