@@ -16656,6 +16656,83 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
 }
 
 #[tokio::test]
+async fn runtime_core_spawn_wait_reports_live_idle_child_as_idle() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-idle-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        true,
+        Duration::from_millis(200),
+        true,
+    );
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "idleparent",
+            "name": "idle-parent",
+            "working_dir": parent_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "parent idle prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(app.clone(), "idleparent", "runtime:parent idle prompt").await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "idlechild",
+            "parent_session_id": "idleparent",
+            "prompt": "idle child prompt",
+            "name": "idle-child",
+            "provider": "codex-fork",
+            "wait": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    wait_for_output_contains(app.clone(), "idlechild", "received:idle child prompt").await;
+
+    // The child is alive and idle: the parent hears idle, not completed,
+    // and nothing from the child's screen (#2140).
+    let parent_output = wait_for_output_contains(
+        app.clone(),
+        "idleparent",
+        "Child idle-child (idlechil) idle for ",
+    )
+    .await;
+    let parent_output = parent_output["output"].as_str().unwrap_or_default();
+    assert!(!parent_output.contains("idle-child (idlechil) completed"));
+    assert!(!parent_output.contains("received:idle child prompt"));
+
+    for id in ["idlechild", "idleparent"] {
+        let (status, _) =
+            post_json(app.clone(), &format!("/sessions/{id}/retire"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn runtime_core_spawn_brief_accepts_file_and_stdin_sources_after_delayed_composer_ready() {
     if !tmux_available() {
         return;
@@ -17150,7 +17227,7 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
     assert!(!parent_output["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("Idle for"));
+        .contains("idle for"));
     assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
 
     let (status, payload) =

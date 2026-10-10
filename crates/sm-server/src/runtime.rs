@@ -3,6 +3,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     env, fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
@@ -1259,6 +1260,8 @@ impl TmuxRuntime {
     }
 
     fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
+        let text = typeable_text(text);
+        let text = text.as_ref();
         self.send_text(tmux_session, text)?;
         let echoed = self.wait_for_claude_text_echo(tmux_session, text);
         thread::sleep(self.compute_settle_delay(text));
@@ -1336,7 +1339,8 @@ impl TmuxRuntime {
 
     fn send_text(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.exit_copy_mode_if_needed(tmux_session);
-        for (index, chunk) in split_send_text_chunks(text, self.send_keys_max_chunk_bytes)
+        let text = typeable_text(text);
+        for (index, chunk) in split_send_text_chunks(&text, self.send_keys_max_chunk_bytes)
             .into_iter()
             .enumerate()
         {
@@ -2160,6 +2164,31 @@ fn codex_text_parts(parts: &[Value]) -> Option<String> {
         text.push_str(part.get("text").and_then(Value::as_str)?);
         Some(text)
     })
+}
+
+/// Text typed with `send-keys -l` reaches the agent as keystrokes, so a
+/// carriage return presses Enter and an ESC presses Escape. Message text must
+/// never do either: a CR mid-message submitted screen fragments as phantom
+/// user turns (#2140). CRs become newlines; other control characters except
+/// newline and tab are dropped.
+fn typeable_text(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+    {
+        return Cow::Borrowed(text);
+    }
+    let text = text.replace("\r\n", "\n");
+    Cow::Owned(
+        text.chars()
+            .filter_map(|ch| match ch {
+                '\r' => Some('\n'),
+                '\n' | '\t' => Some(ch),
+                ch if ch.is_control() => None,
+                ch => Some(ch),
+            })
+            .collect(),
+    )
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_bytes: usize) -> Vec<&str> {
@@ -3249,6 +3278,15 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
                 if detail.contains("timed out")
         ));
         assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn typeable_text_cannot_press_enter_or_escape() {
+        assert!(matches!(typeable_text("plain\ttext\n"), Cow::Borrowed(_)));
+        assert_eq!(
+            typeable_text("a\r\nb\rc\u{1b}[21;3Hd\u{7f}"),
+            "a\nb\nc[21;3Hd"
+        );
     }
 
     #[test]
