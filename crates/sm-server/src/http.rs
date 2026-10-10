@@ -4934,25 +4934,23 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
                 idle_since = Instant::now();
             }
 
-            let completion_message =
-                if child.is_stopped() || runtime_child_session_exited(&state, &child) {
-                    Some("Session exited".to_owned())
-                } else {
-                    Some(idle_since.elapsed().as_secs())
-                        .filter(|idle_seconds| *idle_seconds >= wait_seconds)
-                        .map(|idle_seconds| {
-                            completion_summary(&state.session_store, &child_session_id)
-                                .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
-                        })
-                };
-            let Some(completion_message) = completion_message else {
-                continue;
+            // An idle child has not completed, and its terminal log is raw
+            // screen bytes, so the idle notice says idle and quotes none of
+            // it (#2140).
+            let outcome = if child.is_stopped() || runtime_child_session_exited(&state, &child) {
+                "completed: Session exited".to_owned()
+            } else {
+                let idle_seconds = idle_since.elapsed().as_secs();
+                if idle_seconds < wait_seconds {
+                    continue;
+                }
+                format!("idle for {idle_seconds}s")
             };
             let notification = format!(
-                "Child {} ({}) completed: {}",
+                "Child {} ({}) {}",
                 child_display_name(&child),
                 short_session_id(&child_session_id),
-                completion_message
+                outcome
             );
             let runtime = state
                 .config
@@ -5006,21 +5004,6 @@ fn child_output_size(child: &SessionRecord) -> Option<u64> {
         .metadata()
         .ok()
         .map(|metadata| metadata.len())
-}
-
-fn completion_summary(session_store: &SessionStore, child_session_id: &str) -> Option<String> {
-    let output = session_store.capture_output(child_session_id, 10).ok()??;
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| line.len() > 10)
-        .map(|line| {
-            if line.chars().count() > 100 {
-                format!("{}...", line.chars().take(100).collect::<String>())
-            } else {
-                line.to_owned()
-            }
-        })
 }
 
 fn child_display_name(child: &SessionRecord) -> String {
