@@ -1311,7 +1311,10 @@ impl TmuxRuntime {
     /// without it twice in a row means the Enter landed. A capture taken
     /// while Claude redraws, with the cursor parked outside the composer,
     /// proves nothing; treating it as a submit left a handoff brief unsent
-    /// (#2013). Another Enter on an empty Claude composer does nothing.
+    /// (#2013). A frame with no composer at all counts as empty: Claude has
+    /// replaced it, as with the `/btw` side panel, where another Enter
+    /// closes the panel before it answers (#2143). Another Enter on an empty
+    /// Claude composer does nothing.
     fn claude_composer_keeps_text(&self, tmux_session: &str, text: &str, echoed: bool) -> bool {
         let deadline = Instant::now() + CLAUDE_SUBMIT_CHECK_WINDOW;
         let mut cleared_frames = 0;
@@ -1319,8 +1322,13 @@ impl TmuxRuntime {
             let held = self
                 .capture_pane_text(tmux_session)
                 .zip(self.pane_cursor_position(tmux_session))
-                .and_then(|(pane, (_, cursor_y))| claude_live_composer(&pane, cursor_y))
-                .map(|composer| composer_holds_text(&composer, text));
+                .and_then(|(pane, (_, cursor_y))| {
+                    if claude_composer_rows(&pane).is_none() {
+                        return Some(false);
+                    }
+                    claude_live_composer(&pane, cursor_y)
+                        .map(|composer| composer_holds_text(&composer, text))
+                });
             match held {
                 Some(true) => cleared_frames = 0,
                 Some(false) => {
@@ -3465,6 +3473,23 @@ esac
         assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
 
         assert_eq!(enter_count(&log_path), 2);
+    }
+
+    /// Claude opens its `/btw` side panel in place of the composer. That is
+    /// a submit, and a second Enter would close the panel unanswered (#2143).
+    #[cfg(unix)]
+    #[test]
+    fn send_input_takes_a_side_panel_for_a_submit() {
+        let (runtime, log_path, _temp_dir) = fake_claude_composer_runtime(
+            r#"if [ "$(grep -c ' Enter$' "$log")" -ge 1 ]; then printf '%s\n' \
+      '▔▔▔▔▔▔▔▔▔▔' '    /btw what are you doing?' '' '      ✶ Answering…' '' \
+      '    ⇧←/→ to browse · x to clear history · Esc to close'
+    else cat "$held"; fi"#,
+        );
+
+        assert!(runtime.send_input("sm-test", HANDOFF_TEXT).unwrap());
+
+        assert_eq!(enter_count(&log_path), 1);
     }
 
     /// Two empty-composer frames split by a redraw frame are not two in a
