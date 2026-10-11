@@ -420,15 +420,25 @@ fn kill_notice_text(kill: &AgentProcessKill) -> String {
         n => format!(" and its {n} child processes"),
     };
     format!(
-        "[sm memory guard] sm killed PID {pid}{children}: `{command}` reached {memory}, over the {limit} limit for processes an agent runs from its own shell. \
+        "[sm memory guard] At {at} sm killed PID {pid}{children}: `{command}` reached {memory}, over the {limit} limit for processes an agent runs from its own shell. \
+You started this process from your shell, not with sm queue run; this guard never touches queue jobs, so a job you queued since is unaffected. \
 Do not rerun it from your shell; it will be killed again. Resubmit it through the queue: \
 `sm queue run --type <tests|perf|background> --label <label> --memory <size> -- <command>`. \
 Its peak was at least {memory} and it may have been still climbing, so set --memory above what you expect it to need.",
+        at = notice_time(&kill.killed_at),
         pid = kill.pid,
         command = kill.command,
         memory = memory_amount_text(kill.memory_bytes),
         limit = memory_amount_text(kill.limit_bytes),
     )
+}
+
+/// `HH:MM:SS UTC`. The notice waits until the agent is idle, so without a
+/// time it can read as being about whatever the agent ran last (sm#2142).
+fn notice_time(killed_at: &str) -> String {
+    OffsetDateTime::parse(killed_at, &Rfc3339)
+        .map(|at| format!("{:02}:{:02}:{:02} UTC", at.hour(), at.minute(), at.second()))
+        .unwrap_or_else(|_| killed_at.to_owned())
 }
 
 fn init_kills_schema(conn: &Connection) -> Result<()> {

@@ -190,6 +190,11 @@ fn notice_names_pid_command_memory_and_the_queue() {
         "{text}"
     );
     assert!(text.contains("over the 1.0 GiB limit"), "{text}");
+    assert!(
+        text.contains("At 21:37:05 UTC sm killed PID 4974"),
+        "{text}"
+    );
+    assert!(text.contains("not with sm queue run"), "{text}");
     assert!(text.contains("Do not rerun it from your shell"), "{text}");
     assert!(text.contains("sm queue run"), "{text}");
     assert!(text.contains("--memory"), "{text}");
