@@ -145,7 +145,7 @@ Then:
 
 Session manager is a Rust server (Axum + Tokio, Rust 1.86+) that runs Claude Code and Codex agents in tmux, tracks parent–child agent trees, and carries durable messages, reminders, and queue jobs between them. State is in SQLite. The `sm` CLI is its client.
 
-**Restart the live server only with `scripts/restart-rust-server.sh`, submitted through the queue:** `sm queue run --type background --label restart --timeout 30m --cwd ~/projects/session-manager-prod -- scripts/restart-rust-server.sh --update`. Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. 
+**Restart the live server only with `scripts/restart-rust-server.sh`, submitted through the sm queue run:** Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. The restart process builds, so it needs real memory, use `sm queue run` so it's not killed.
 
 **The live binaries are installed copies in `.local/bin/`, not `target/`.** An ordinary `cargo build` never touches the running server, and `cargo clean` never deletes `sm`. Keep `.local/bin` on `PATH`. To refresh only the CLI, run `scripts/install-sm-cli.sh`.
 
