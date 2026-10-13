@@ -672,6 +672,15 @@ struct QueueRunArgs {
     max_wait: Option<String>,
     #[arg(
         long,
+        value_name = "DURATION",
+        help = "When sm stops the job (cancel, timeout, perf displacement), how long it waits \
+                after SIGTERM before SIGKILL, for example 5m; at most 1h. Default: the server's \
+                queue_runner.cancel_grace_seconds (10s). Set it for jobs whose SIGTERM handler \
+                releases paid or shared resources"
+    )]
+    stop_grace: Option<String>,
+    #[arg(
+        long,
         value_name = "PERCENT",
         help = "Whole-host CPU allocation (1-100); required for perf"
     )]
@@ -1733,6 +1742,11 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     if max_wait_seconds.is_some_and(|seconds| seconds <= 0) {
         bail!("--max-wait must be greater than 0");
     }
+    let stop_grace_seconds = args
+        .stop_grace
+        .as_deref()
+        .map(parse_queue_stop_grace_seconds)
+        .transpose()?;
     let cpu_percent = args.cpu.as_deref().map(parse_queue_percent).transpose()?;
     let gpu_percent = args
         .gpu
@@ -1813,6 +1827,9 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     }
     if let Some(max_wait_seconds) = max_wait_seconds {
         body["max_wait_seconds"] = json!(max_wait_seconds);
+    }
+    if let Some(stop_grace_seconds) = stop_grace_seconds {
+        body["stop_grace_seconds"] = json!(stop_grace_seconds);
     }
     if let Some(cpu_percent) = cpu_percent {
         body["cpu_percent"] = json!(cpu_percent);
@@ -2050,6 +2067,21 @@ fn queue_waiting_text(job: &Value) -> Option<String> {
     )
 }
 
+/// The stop grace, and once sm has signalled the job, how the stop went.
+fn queue_stop_line(job: &Value) -> Option<String> {
+    let grace = job["stop_grace_seconds"].as_i64();
+    let signal = job["stop_signal"].as_str();
+    Some(match (signal, job["stop_deadline_at"].as_str()) {
+        (Some("SIGKILL"), _) => format!("Stop: SIGKILL after {}s grace", grace.unwrap_or(0)),
+        (Some(_), Some(deadline)) => format!(
+            "Stop: SIGTERM sent at {}; SIGKILL at {deadline} if still running",
+            job["stop_requested_at"].as_str().unwrap_or("-")
+        ),
+        (Some(_), None) => format!("Stop: ended after SIGTERM ({}s grace)", grace.unwrap_or(0)),
+        (None, _) => format!("Stop grace: {}s", grace?),
+    })
+}
+
 fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     let job_id = args.job_id.trim();
     if job_id.is_empty() {
@@ -2088,6 +2120,9 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         "Termination: {}",
         payload["termination_reason"].as_str().unwrap_or("-")
     );
+    if let Some(line) = queue_stop_line(&payload) {
+        println!("{line}");
+    }
     if payload["wait_blockers"].is_object() {
         println!(
             "Never started: the {}",
@@ -2181,12 +2216,22 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
         &format!("/queue-jobs/{}", encode_path_segment(job_id)),
         json!({}),
     )?;
-    println!(
-        "Cancelled queue job: {} ({})",
-        payload["label"].as_str().unwrap_or(job_id),
-        payload["state"].as_str().unwrap_or("-")
-    );
+    println!("{}", queue_cancel_text(&payload, job_id));
     Ok(())
+}
+
+/// A job still inside its stop grace is not cancelled yet (sm#2146).
+fn queue_cancel_text(payload: &Value, job_id: &str) -> String {
+    let label = payload["label"].as_str().unwrap_or(job_id);
+    match payload["stop_deadline_at"].as_str() {
+        Some(deadline) if payload["state"].as_str() == Some("running") => format!(
+            "Stopping queue job: {label}. Sent SIGTERM; sm sends SIGKILL at {deadline} if it is still running. The completion notice follows when it ends."
+        ),
+        _ => format!(
+            "Cancelled queue job: {label} ({})",
+            payload["state"].as_str().unwrap_or("-")
+        ),
+    }
 }
 
 fn run_request_codex_review(client: &ApiClient, mut args: RequestReviewArgs) -> Result<()> {
@@ -5468,6 +5513,19 @@ fn encode_path_segment(value: &str) -> String {
 
 fn encode_query_component(value: &str) -> String {
     encode_path_segment(value)
+}
+
+/// `--stop-grace`: a duration from 0 (SIGKILL at once) to one hour.
+fn parse_queue_stop_grace_seconds(value: &str) -> Result<i64> {
+    let seconds = if value.trim() == "0" {
+        0
+    } else {
+        parse_duration_seconds(value.trim())?
+    };
+    if seconds > sm_server::queue::MAX_QUEUE_STOP_GRACE_SECONDS {
+        bail!("--stop-grace must be at most 1h");
+    }
+    Ok(seconds)
 }
 
 fn parse_duration_seconds(value: &str) -> Result<i64> {

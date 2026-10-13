@@ -6553,7 +6553,9 @@ async fn queue_runtime_recovery_honors_persisted_running_cancellation() {
             .unwrap();
 
     assert_eq!(summary.recovered_running, 1);
-    assert_eq!(summary.finished_cancelled, 1);
+    // A deliberate stop of a live job is waited out by its poller, so
+    // startup is never held for a job's stop grace (sm#2146).
+    assert_eq!(summary.polling_running, 1);
     let mut exited = false;
     for _ in 0..50 {
         if child.try_wait().unwrap().is_some() {
@@ -6570,8 +6572,16 @@ async fn queue_runtime_recovery_honors_persisted_running_cancellation() {
         let _ = child.wait();
     }
     assert!(exited, "recovered cancelling process was not stopped");
-    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let mut detail = Value::Null;
+    for _ in 0..50 {
+        let (status, current) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        detail = current;
+        if detail["state"] != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(detail["state"], "cancelled");
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
 }
@@ -7112,7 +7122,9 @@ async fn queue_runtime_recovery_times_out_and_stops_live_running_job() {
             .unwrap();
 
     assert_eq!(summary.recovered_running, 1);
-    assert_eq!(summary.finished_timed_out, 1);
+    // A deliberate stop of a live job is waited out by its poller, so
+    // startup is never held for a job's stop grace (sm#2146).
+    assert_eq!(summary.polling_running, 1);
     let mut exited = false;
     for _ in 0..50 {
         if child.try_wait().unwrap().is_some() {
@@ -7129,8 +7141,16 @@ async fn queue_runtime_recovery_times_out_and_stops_live_running_job() {
         let _ = child.wait();
     }
     assert!(exited, "recovered timed-out process was not stopped");
-    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
-    assert_eq!(status, StatusCode::OK);
+    let mut detail = Value::Null;
+    for _ in 0..50 {
+        let (status, current) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        detail = current;
+        if detail["state"] != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(detail["state"], "timed_out");
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
 }

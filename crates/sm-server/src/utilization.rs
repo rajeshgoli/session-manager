@@ -994,7 +994,12 @@ fn hold_group(reason: Option<&str>) -> &'static str {
     match reason {
         Some("concurrency_cap") => "limits",
         Some(
-            "perf_running" | "awaiting_tests" | "perf_cooldown" | "displacing" | "local_model",
+            "perf_running"
+            | "awaiting_tests"
+            | "perf_cooldown"
+            | "displacing"
+            | "awaiting_displacement"
+            | "local_model",
         ) => "perf_rules",
         Some("memory_pressure" | "resource_budget_missing") => "memory",
         _ => "other",

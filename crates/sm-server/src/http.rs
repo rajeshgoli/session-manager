@@ -7983,14 +7983,22 @@ async fn cancel_queue_job_with_note(
     if let Some(note) = note {
         detail.insert("note".into(), json!(note));
     }
-    cancel_queue_job_inner(
-        &state,
-        &job_id,
-        peer_addr,
-        &headers,
-        web_owner.is_some(),
-        Some(&Value::Object(detail)),
-    )
+    let web_owner = web_owner.is_some();
+    let caller = crate::local_identity::current();
+    tokio::task::spawn_blocking(move || {
+        crate::local_identity::sync_scope(caller, || {
+            cancel_queue_job_inner(
+                &state,
+                &job_id,
+                peer_addr,
+                &headers,
+                web_owner,
+                Some(&Value::Object(detail)),
+            )
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(anyhow::anyhow!("queue cancel task failed: {error}")))?
 }
 
 fn limit_terminal_jobs_per_session(
@@ -8194,6 +8202,18 @@ async fn create_queue_job(
             detail: "max_wait_seconds must be greater than 0".to_owned(),
         });
     }
+    if payload
+        .stop_grace_seconds
+        .is_some_and(|seconds| !(0..=crate::queue::MAX_QUEUE_STOP_GRACE_SECONDS).contains(&seconds))
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!(
+                "stop_grace_seconds must be between 0 and {} (one hour)",
+                crate::queue::MAX_QUEUE_STOP_GRACE_SECONDS
+            ),
+        });
+    }
     let label = payload
         .label
         .as_deref()
@@ -8223,7 +8243,7 @@ async fn create_queue_job(
             },
         )?;
     }
-    let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+    let job = RetainedQueueStore::create_queue_job_in_state_dir_with_options(
         &queue_state_dir,
         CreateQueueJob {
             local_submitter: crate::local_identity::current(),
@@ -8242,6 +8262,7 @@ async fn create_queue_job(
             rank_tickets,
         },
         max_wait_seconds,
+        payload.stop_grace_seconds,
     )?;
     let job = if state.config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
@@ -8304,8 +8325,18 @@ async fn cancel_queue_job(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    cancel_queue_job_inner(&state, &job_id, peer_addr, &headers, false, None)
+    let caller = crate::local_identity::current();
+    tokio::task::spawn_blocking(move || {
+        crate::local_identity::sync_scope(caller, || {
+            cancel_queue_job_inner(&state, &job_id, peer_addr, &headers, false, None)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(anyhow::anyhow!("queue cancel task failed: {error}")))?
 }
+
+/// How long a cancel request waits for the job to end before answering.
+const QUEUE_CANCEL_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn cancel_queue_job_inner(
     state: &AppState,
@@ -8341,7 +8372,9 @@ fn cancel_queue_job_inner(
         }
     }
     let job_id = submitted_job.id;
-    let Some(job) = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
+    // A job with a long stop grace keeps stopping after this returns; its
+    // watcher sends SIGKILL at the deadline and the notice follows (sm#2146).
+    let Some(job) = RetainedQueueStore::cancel_queue_job_waiting_in_state_dir(
         &queue_state_dir,
         &message_queue_db_path,
         &job_id,
@@ -8349,6 +8382,7 @@ fn cancel_queue_job_inner(
         queue_admission_policy(state),
         state.config.rust_core.runtime_enabled,
         detail,
+        Some(QUEUE_CANCEL_WAIT_LIMIT),
     )?
     else {
         return Err(ApiError::NotFound("Queue job not found"));
@@ -16588,6 +16622,9 @@ struct QueueJobCreateRequest {
     timeout_seconds: Option<i64>,
     #[serde(default)]
     max_wait_seconds: Option<i64>,
+    /// Seconds between SIGTERM and SIGKILL when sm stops the job (sm#2146).
+    #[serde(default)]
+    stop_grace_seconds: Option<i64>,
     #[serde(default)]
     cpu_percent: Option<u8>,
     #[serde(default)]
@@ -17269,6 +17306,14 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
+    // Kept out of the literal above, which is at json!'s recursion limit.
+    response["stop_grace_seconds"] = json!(job.stop_grace_seconds);
+    response["stop_requested_at"] = json!(job.stop_requested_at);
+    response["stop_signal"] = json!(job.stop_signal);
+    response["stop_deadline_at"] = json!(crate::queue::queue_job_stop_deadline_at(
+        &job,
+        state.config.queue_runner.cancel_grace_seconds
+    ));
     // 1768 I2: what a review job reviews, for whom, and why this reviewer.
     response["review"] = review_runs::job_fields(state, &job)
         .unwrap_or_else(|error| {
@@ -17503,6 +17548,9 @@ mod tests {
             findings_json: None,
         };
         let job = QueueJobRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
             local_agent_id: None,
             quiet_alerted_at: None,
             id: "j1".into(),
