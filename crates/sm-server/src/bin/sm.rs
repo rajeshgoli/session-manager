@@ -7528,6 +7528,62 @@ mod tests {
     }
 
     #[test]
+    fn queue_stop_grace_accepts_zero_to_one_hour() {
+        assert_eq!(parse_queue_stop_grace_seconds("0").unwrap(), 0);
+        assert_eq!(parse_queue_stop_grace_seconds("5m").unwrap(), 300);
+        assert_eq!(parse_queue_stop_grace_seconds("1h").unwrap(), 3600);
+        assert!(parse_queue_stop_grace_seconds("2h").is_err());
+        let cli = Cli::try_parse_from([
+            "sm",
+            "queue",
+            "run",
+            "--type",
+            "background",
+            "--stop-grace",
+            "5m",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Command::Queue(queue_args) = cli.command else {
+            panic!("expected queue command");
+        };
+        let QueueCommand::Run(run_args) = queue_args.command else {
+            panic!("expected queue run");
+        };
+        assert_eq!(run_args.stop_grace.as_deref(), Some("5m"));
+    }
+
+    #[test]
+    fn queue_cancel_and_status_say_how_a_stop_is_going() {
+        let stopping = json!({
+            "label": "pod wave", "state": "running", "stop_grace_seconds": 300,
+            "stop_signal": "SIGTERM", "stop_requested_at": "2026-10-13T02:09:52Z",
+            "stop_deadline_at": "2026-10-13T02:14:52Z",
+        });
+        assert_eq!(
+            queue_cancel_text(&stopping, "job_1"),
+            "Stopping queue job: pod wave. Sent SIGTERM; sm sends SIGKILL at 2026-10-13T02:14:52Z if it is still running. The completion notice follows when it ends."
+        );
+        assert_eq!(
+            queue_stop_line(&stopping).unwrap(),
+            "Stop: SIGTERM sent at 2026-10-13T02:09:52Z; SIGKILL at 2026-10-13T02:14:52Z if still running"
+        );
+        let killed = json!({"label": "pod wave", "state": "cancelled", "stop_grace_seconds": 300, "stop_signal": "SIGKILL"});
+        assert_eq!(
+            queue_cancel_text(&killed, "job_1"),
+            "Cancelled queue job: pod wave (cancelled)"
+        );
+        assert_eq!(
+            queue_stop_line(&killed).unwrap(),
+            "Stop: SIGKILL after 300s grace"
+        );
+        let waiting = json!({"state": "pending", "stop_grace_seconds": 300});
+        assert_eq!(queue_stop_line(&waiting).unwrap(), "Stop grace: 300s");
+        assert_eq!(queue_stop_line(&json!({"state": "pending"})), None);
+    }
+
+    #[test]
     fn queue_cancel_cli_parses_retained_runtime_command() {
         let cli = Cli::try_parse_from(["sm", "queue", "cancel", "job_123abc"]).unwrap();
         let Command::Queue(queue_args) = cli.command else {
