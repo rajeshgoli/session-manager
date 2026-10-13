@@ -5404,9 +5404,15 @@ fn perf_has_finite_blockers(jobs: &[QueueJobRuntimeRecord]) -> bool {
         .any(|job| job.state == "running" && matches!(job.job_type.as_str(), "tests" | "review"))
 }
 
+/// A running job is being displaced, or is a background job sm is already
+/// stopping for another reason (a cancel): perf waits for either, and the
+/// cancel keeps its own terminal state.
 fn queue_job_displacement_in_progress(jobs: &[QueueJobRuntimeRecord]) -> bool {
-    jobs.iter()
-        .any(|job| job.state == "running" && job.holding_reason.as_deref() == Some("displacing"))
+    jobs.iter().any(|job| {
+        job.state == "running"
+            && (job.holding_reason.as_deref() == Some("displacing")
+                || (job.job_type == "background" && job.stop_requested_at.is_some()))
+    })
 }
 
 fn displace_background_for_perf_conn(
@@ -7888,9 +7894,9 @@ pub fn queue_hold_explanation(
             },
         ),
         "awaiting_displacement" => {
-            blockers = running.iter().copied().filter(|j| j.holding_reason.as_deref() == Some("displacing")).collect();
+            blockers = running.iter().copied().filter(|j| j.holding_reason.as_deref() == Some("displacing") || (j.job_type == "background" && j.stop_requested_at.is_some())).collect();
             (
-                "waiting for a displaced job to stop".into(),
+                "waiting for a stopping job to end".into(),
                 format!("A performance job is waiting for {} to finish stopping within its stop grace. New jobs are paused until it has.", names(&blockers)),
             )
         }
@@ -11357,6 +11363,35 @@ mod tests {
             get_queue_job_conn(&conn, &job.id).unwrap().unwrap().state,
             "memory_exceeded"
         );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn perf_leaves_a_background_job_that_is_being_cancelled_cancelled() {
+        let state_dir = unique_temp_path("cancelling-no-displace");
+        let message_queue_db = state_dir.join("messages.db");
+        let cancelling = running_job_with_pgid(&state_dir, "background", "pod wave", 999_992);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET holding_reason = 'cancelling', stop_requested_at = ?2,
+                 stop_signal = 'SIGTERM', stop_grace_seconds = 300 WHERE id = ?1",
+            params![cancelling.id, now_rfc3339()],
+        )
+        .unwrap();
+        create_test_job(&state_dir, "perf", "bench");
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert!(queue_job_displacement_in_progress(&jobs));
+        assert!(!displace_background_for_perf_conn(
+            &conn,
+            &jobs,
+            &message_queue_db,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap());
+        let row = get_queue_job_conn(&conn, &cancelling.id).unwrap().unwrap();
+        assert_eq!(row.holding_reason.as_deref(), Some("cancelling"));
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
     }

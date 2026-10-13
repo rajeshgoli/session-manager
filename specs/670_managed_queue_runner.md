@@ -168,11 +168,12 @@ When a `perf` job is ready, SM displaces running `background` jobs before starti
 
 Displacement behavior:
 
-1. Send SIGTERM to the process group.
-2. Wait 10 seconds.
-3. Send SIGKILL to the process group if it is still alive.
-4. Mark the job terminal state as `displaced`.
-5. Notify the requester that the job was displaced and must be resubmitted manually if still needed.
+1. Skip any background job SM is already stopping (a cancel or an earlier displacement in progress); the perf job waits as `awaiting_displacement` until it ends, and that job keeps its own terminal state.
+2. Send SIGTERM to the process group and its escaped descendants.
+3. Wait the job's stop grace: its `--stop-grace`, else `queue_runner.cancel_grace_seconds` (10 s by default). Admission itself waits at most the server grace plus 5 s; a longer grace continues under the job's watcher while queued work is held.
+4. Send SIGKILL to whatever is still alive when the grace runs out.
+5. Mark the job terminal state as `displaced`.
+6. Notify the requester that the job was displaced and must be resubmitted manually if still needed.
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
 
