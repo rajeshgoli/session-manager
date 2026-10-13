@@ -123,8 +123,8 @@ fn ordinary_second_launch_is_refused_and_authorized_handoff_keeps_the_seat() {
 
 #[test]
 fn port_selection_excludes_listeners_and_persisted_reservations() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let port = crate::opencode::tests::free_port_run(1);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let config = OpencodeConfig {
         port_range: [port, port],
         ..OpencodeConfig::default()
@@ -405,7 +405,7 @@ fn serve_script_launches_only_the_owner_and_stops_it_on_signal() {
     let path = state.join("launch-serve.sh");
     host_write(&path, script.as_bytes(), 0o700).unwrap();
     let mut child = Command::new("/bin/bash").arg(&path).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !counter.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }

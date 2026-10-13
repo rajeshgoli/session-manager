@@ -4321,7 +4321,7 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
     let (status, payload) = get_json(app, "/queue-jobs").await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload, json!({ "jobs": [] }));
+    assert_eq!(payload, json!({ "jobs": [], "agent_process_kills": [] }));
 
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
