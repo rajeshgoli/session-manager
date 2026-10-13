@@ -325,6 +325,9 @@ struct QueueJobRuntimeRecord {
     stop_grace_seconds: Option<i64>,
     stop_requested_at: Option<String>,
     stop_signal: Option<String>,
+    /// Descendants that had left the job's group when sm sent SIGTERM; they
+    /// cannot be traced to the job once their parents exit.
+    stop_escaped_pids: Vec<i64>,
     /// The job's lane rank for this admission pass; `i64::MAX` without one.
     lane_rank: i64,
 }
@@ -3967,6 +3970,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "stop_grace_seconds", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "stop_requested_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "stop_signal", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "stop_escaped_pids", "TEXT")?;
     Ok(())
 }
 
@@ -4278,7 +4282,7 @@ fn get_queue_job_runtime_conn(
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
                rank_tickets, owner, local_agent_id, local_binding_json,
-               stop_grace_seconds, stop_requested_at, stop_signal
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -4328,6 +4332,10 @@ fn get_queue_job_runtime_conn(
                 stop_grace_seconds: row.get(30)?,
                 stop_requested_at: row.get(31)?,
                 stop_signal: row.get(32)?,
+                stop_escaped_pids: row
+                    .get::<_, Option<String>>(33)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default(),
                 lane_rank: i64::MAX,
             })
         })
@@ -4345,7 +4353,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
                rank_tickets, owner, local_agent_id, local_binding_json,
-               stop_grace_seconds, stop_requested_at, stop_signal
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -4386,6 +4394,10 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 stop_grace_seconds: row.get(30)?,
                 stop_requested_at: row.get(31)?,
                 stop_signal: row.get(32)?,
+                stop_escaped_pids: row
+                    .get::<_, Option<String>>(33)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default(),
                 lane_rank: i64::MAX,
             })
         })?
@@ -5790,11 +5802,12 @@ fn monitor_queue_job_completion(
                 return;
             }
         };
-        if watch_queue_job_stop_in_state_dir(&state_dir, &job_id, cancel_grace_seconds) {
+        let watch = watch_queue_job_stop_in_state_dir(&state_dir, &job_id, cancel_grace_seconds);
+        if watch == QueueJobWatch::Cancelled {
             return;
         }
         if let Some(status) = child_status {
-            if !process_group_exists(pgid) {
+            if !process_group_exists(pgid) && watch != QueueJobWatch::EscapedAlive {
                 let exit_code = status.code().map(i64::from);
                 let state = if exit_code == Some(0) {
                     "succeeded"
@@ -6994,6 +7007,15 @@ fn poll_recovered_queue_job(
             }
             continue;
         }
+        // A stop under way ends only once its escaped descendants are gone too.
+        if job.stop_requested_at.is_some() && queue_job_stop_escaped_alive(&job) {
+            if let Err(error) =
+                stop_recovered_queue_job_conn(&conn, &job, pgid, cancel_grace_seconds)
+            {
+                eprintln!("queue recovered job {job_id} could not be stopped; retrying: {error:#}");
+            }
+            continue;
+        }
         // Like a live job, a recovered job is terminal only once its whole process
         // group is gone (specs/1244_queue_process_group_accounting.md).
         let group_alive = process_group_exists(pgid);
@@ -8184,12 +8206,14 @@ fn begin_queue_job_stop_conn(
     let requested_at = now_rfc3339();
     let claimed = conn.execute(
         "UPDATE queue_jobs
-         SET stop_requested_at = ?2, stop_signal = 'SIGTERM', stop_grace_seconds = ?3
+         SET stop_requested_at = ?2, stop_signal = 'SIGTERM', stop_grace_seconds = ?3,
+             stop_escaped_pids = ?4
          WHERE id = ?1 AND stop_requested_at IS NULL",
         params![
             job.id,
             requested_at,
-            i64::try_from(grace).unwrap_or(i64::MAX)
+            i64::try_from(grace).unwrap_or(i64::MAX),
+            serde_json::to_string(escaped)?
         ],
     )?;
     if claimed == 0 {
@@ -8202,7 +8226,13 @@ fn begin_queue_job_stop_conn(
     job.stop_requested_at = Some(requested_at);
     job.stop_signal = Some("SIGTERM".to_owned());
     job.stop_grace_seconds = Some(i64::try_from(grace).unwrap_or(i64::MAX));
+    job.stop_escaped_pids = escaped.to_vec();
     Ok(job)
+}
+
+/// A stopping job's recorded escaped descendants that are still alive.
+fn queue_job_stop_escaped_alive(job: &QueueJobRuntimeRecord) -> bool {
+    job.stop_escaped_pids.iter().any(|pid| process_exists(*pid))
 }
 
 /// SIGKILL for a job whose stop grace has run out, recorded once. `escaped`
@@ -8226,6 +8256,7 @@ fn kill_overdue_queue_job_conn(
             None => signal_processes(&escaped_job_processes(pgid), true),
         }
     }
+    signal_processes(&job.stop_escaped_pids, true);
     job.stop_signal = Some("SIGKILL".to_owned());
     conn.execute(
         "UPDATE queue_jobs SET stop_signal = 'SIGKILL' WHERE id = ?1",
@@ -8247,7 +8278,14 @@ fn stop_queue_job_and_wait_conn(
     let Some(pgid) = job.process_group_id.or(job.pid) else {
         return Ok(true);
     };
-    let escaped = escaped_job_processes(pgid);
+    // A stop already under way (e.g. before a restart) recorded its escaped
+    // descendants; their parents may be gone, so tracing would miss them.
+    let mut escaped = escaped_job_processes(pgid);
+    for pid in &job.stop_escaped_pids {
+        if !escaped.contains(pid) {
+            escaped.push(*pid);
+        }
+    }
     let mut job = begin_queue_job_stop_conn(conn, job, default_grace_seconds, &escaped)?;
     let started = Instant::now();
     loop {
@@ -8295,30 +8333,42 @@ fn stop_live_queue_job_in_state_dir(
     }
 }
 
-/// One watcher tick for a live job: true once it is cancelled; otherwise,
-/// if sm is stopping it, SIGKILL once its grace has run out (sm#2146).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueJobWatch {
+    Running,
+    /// sm is stopping the job and a descendant that left its group is alive:
+    /// the job is not over even if its group is gone.
+    EscapedAlive,
+    Cancelled,
+}
+
+/// One watcher tick for a live job. If sm is stopping it, SIGKILL once its
+/// grace has run out, its escaped descendants included (sm#2146).
 fn watch_queue_job_stop_in_state_dir(
     state_dir: &Path,
     job_id: &str,
     default_grace_seconds: u64,
-) -> bool {
+) -> QueueJobWatch {
     let Ok(conn) = open_queue_jobs_connection(&state_dir.join("queue_runner.db")) else {
-        return false;
+        return QueueJobWatch::Running;
     };
     let Ok(Some(mut job)) = get_queue_job_runtime_conn(&conn, job_id) else {
-        return false;
+        return QueueJobWatch::Running;
     };
     if job.state == "cancelled" {
-        return true;
+        return QueueJobWatch::Cancelled;
     }
-    if job.state == "running" {
-        if let Err(error) =
-            kill_overdue_queue_job_conn(&conn, &mut job, default_grace_seconds, None)
-        {
-            eprintln!("queue job {job_id} could not be stopped at its deadline: {error:#}");
-        }
+    if job.state != "running" || job.stop_requested_at.is_none() {
+        return QueueJobWatch::Running;
     }
-    false
+    if let Err(error) = kill_overdue_queue_job_conn(&conn, &mut job, default_grace_seconds, None) {
+        eprintln!("queue job {job_id} could not be stopped at its deadline: {error:#}");
+    }
+    if queue_job_stop_escaped_alive(&job) {
+        QueueJobWatch::EscapedAlive
+    } else {
+        QueueJobWatch::Running
+    }
 }
 
 fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
@@ -10354,6 +10404,77 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_stop_waits_for_and_kills_an_escaped_descendant() {
+        let state_dir = unique_temp_path("queue-stop-grace-escaped");
+        fs::create_dir_all(&state_dir).unwrap();
+        let pid_file = state_dir.join("escaped.pid");
+        // The job starts a setsid'd child that ignores SIGTERM, then exits
+        // on SIGTERM itself, leaving its group empty.
+        let child_script = state_dir.join("escaped.py");
+        fs::write(
+            &child_script,
+            format!(
+                "import os, signal, time\n\
+                 signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+                 open({:?}, 'w').write(str(os.getpid()))\n\
+                 time.sleep(60)\n",
+                pid_file.display().to_string()
+            ),
+        )
+        .unwrap();
+        let python = format!(
+            "import subprocess, sys, time\n\
+             subprocess.Popen([sys.executable, {:?}], start_new_session=True)\n\
+             time.sleep(60)",
+            child_script.display().to_string()
+        );
+        let job = started_job_with_stop_grace(&state_dir, "escaper", &python, 2, 1);
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while !pid_file.exists() || fs::read_to_string(&pid_file).unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "descendant never started");
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        let escaped: i64 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let answered = RetainedQueueStore::cancel_queue_job_waiting_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            &job.id,
+            1,
+            QueueAdmissionPolicy::default(),
+            false,
+            None,
+            Some(StdDuration::from_millis(500)),
+        )
+        .unwrap()
+        .unwrap();
+        // The group is gone by now, but the escaped descendant is not.
+        assert_eq!(answered.state, "running");
+        assert!(process_exists(escaped));
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the watcher never ended the job");
+            thread::sleep(StdDuration::from_millis(100));
+        };
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.stop_signal.as_deref(), Some("SIGKILL"));
+        assert!(
+            !process_exists(escaped),
+            "escaped descendant survived the stop"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn restart_recovery_waits_out_a_stop_without_a_second_sigterm() {
         let state_dir = unique_temp_path("queue-stop-grace-restart");
         fs::create_dir_all(&state_dir).unwrap();
@@ -11511,6 +11632,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11847,6 +11969,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11910,6 +12033,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11979,6 +12103,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -12055,6 +12180,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -12107,6 +12233,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -13294,6 +13421,7 @@ mod tests {
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
