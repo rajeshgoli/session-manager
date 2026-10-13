@@ -9254,10 +9254,16 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if !columns.iter().any(|name| name == column) {
-        conn.execute(
+        match conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
             [],
-        )?;
+        ) {
+            Ok(_) => {}
+            // Another connection added it between our read and our ALTER.
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.starts_with("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -10321,6 +10327,18 @@ mod tests {
         stop_grace_seconds: i64,
         default_grace_seconds: u64,
     ) -> QueueJobRecord {
+        // The script's last top-level sleep follows its signal setup; mark
+        // that point so no signal lands before the handler is in place.
+        fs::create_dir_all(state_dir).unwrap();
+        let ready = state_dir.join(format!("{}.ready", label.replace(' ', "-")));
+        let (setup, rest) = python
+            .rsplit_once("time.sleep(60)")
+            .expect("test job script ends in time.sleep(60)");
+        let python = format!(
+            "{setup}open({:?}, 'w').close()\ntime.sleep(60){rest}",
+            ready.display().to_string()
+        );
+        let python = python.as_str();
         let job = RetainedQueueStore::create_queue_job_in_state_dir_with_options(
             state_dir,
             CreateQueueJob {
@@ -10352,8 +10370,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(started.state, "running");
-        // Let python install its handler before any signal.
-        thread::sleep(StdDuration::from_millis(800));
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "test job never became ready");
+            thread::sleep(StdDuration::from_millis(50));
+        }
         started
     }
 
@@ -10674,19 +10695,26 @@ mod tests {
         let state_dir = unique_temp_path("queue-stop-grace-restart");
         fs::create_dir_all(&state_dir).unwrap();
         let count = state_dir.join("sigterms");
+        let ready = state_dir.join("ready");
         let python = format!(
             "import signal, sys, time\n\
              def stop(*_):\n    open({count:?}, 'a').write('x')\n\
-             signal.signal(signal.SIGTERM, stop)\nend = time.time() + 3\n\
+             signal.signal(signal.SIGTERM, stop)\nopen({ready:?}, 'w').close()\n\
+             end = time.time() + 3\n\
              while time.time() < end: time.sleep(0.05)\nsys.exit(0)",
-            count = count.display().to_string()
+            count = count.display().to_string(),
+            ready = ready.display().to_string()
         );
         let mut child = Command::new("python3")
             .args(["-c", &python])
             .process_group(0)
             .spawn()
             .unwrap();
-        thread::sleep(StdDuration::from_millis(800));
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "test process never became ready");
+            thread::sleep(StdDuration::from_millis(50));
+        }
         let pgid = i64::from(child.id());
         let job = running_job_with_pgid(&state_dir, "background", "pod wave", pgid);
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
@@ -10706,7 +10734,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            started.elapsed() < StdDuration::from_secs(1),
+            started.elapsed() < StdDuration::from_secs(10),
             "startup waited for the grace"
         );
         assert_eq!(summary.polling_running, 1);

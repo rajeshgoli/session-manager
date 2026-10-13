@@ -7201,7 +7201,7 @@ async fn queue_job_cancel_persists_pending_cancel() {
 
     let (status, cancelled) =
         delete_json(app.clone(), &format!("/queue-jobs/{job_id}"), json!({})).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
     assert_eq!(cancelled["id"], job_id);
     assert_eq!(cancelled["state"], "cancelled");
     assert!(cancelled["finished_at"].as_str().is_some());
