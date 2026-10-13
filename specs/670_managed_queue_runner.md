@@ -168,15 +168,18 @@ When a `perf` job is ready, SM displaces running `background` jobs before starti
 
 Displacement behavior:
 
-1. Send SIGTERM to the process group.
-2. Wait 10 seconds.
-3. Send SIGKILL to the process group if it is still alive.
-4. Mark the job terminal state as `displaced`.
-5. Notify the requester that the job was displaced and must be resubmitted manually if still needed.
+1. Skip any background job SM is already stopping (a cancel or an earlier displacement in progress); the perf job waits as `awaiting_displacement` until it ends, and that job keeps its own terminal state.
+2. Send SIGTERM to the process group and its escaped descendants.
+3. Wait the job's stop grace: its `--stop-grace`, else `queue_runner.cancel_grace_seconds` (10 s by default). Admission itself waits at most the server grace plus 5 s; a longer grace continues under the job's watcher while queued work is held.
+4. Send SIGKILL to whatever is still alive when the grace runs out.
+5. Mark the job terminal state as `displaced`.
+6. Notify the requester that the job was displaced and must be resubmitted manually if still needed.
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
 
 Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or, for `memory_exceeded`, the memory-guard cause described under perf memory enforcement, or `process_limit` for `process_limit_exceeded`). Every completion notification whose job was sampled carries `peak_processes=N`, the most processes its process group held at once. If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
+
+**Stop grace (sm#2146).** When SM stops a job on purpose (cancel, timeout, perf displacement) it sends SIGTERM to the job's process group and its escaped descendants once, records `stop_requested_at` and the grace in force, and sends SIGKILL only when that grace has run out. The grace is the job's own `sm queue run --stop-grace <duration>` (`stop_grace_seconds`, 0 to 3600), else `queue_runner.cancel_grace_seconds`. The memory and process-cap guards always use the server grace. The deadline is persisted: a cancel request answers after at most 15 s (`state` still `running`, `holding_reason` `cancelling`, `stop_deadline_at` set) and the job's watcher sends SIGKILL at the deadline; a server restart waits out the same deadline without a second SIGTERM; a perf job waits (`awaiting_displacement`) while a displaced job uses its grace. The wrapper traps TERM so it outlives the command and records its exit code. The completion notification adds `stop=SIGTERM (exited Ns after it; grace Gs)` or `stop=SIGKILL (still running Gs after SIGTERM)`, and `GET /queue-jobs/{id}` returns `stop_grace_seconds`, `stop_requested_at`, `stop_signal` and `stop_deadline_at`.
 
 ## Exclusive Perf Resource Gates
 

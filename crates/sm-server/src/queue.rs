@@ -229,6 +229,13 @@ pub struct QueueJobRecord {
     /// The tickets that place the job in a board lane (appendix H).
     #[serde(skip)]
     pub rank_tickets: Option<Vec<(String, i64)>>,
+    /// Seconds between SIGTERM and SIGKILL when sm stops the job; `None`
+    /// means the server's `queue_runner.cancel_grace_seconds`.
+    pub stop_grace_seconds: Option<i64>,
+    /// When sm sent the job SIGTERM to stop it (sm#2146).
+    pub stop_requested_at: Option<String>,
+    /// The last signal sm sent to stop the job: `SIGTERM` or `SIGKILL`.
+    pub stop_signal: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +322,12 @@ struct QueueJobRuntimeRecord {
     peak_process_count: Option<i64>,
     owner_forced_at: Option<String>,
     rank_tickets: Option<Vec<(String, i64)>>,
+    stop_grace_seconds: Option<i64>,
+    stop_requested_at: Option<String>,
+    stop_signal: Option<String>,
+    /// Descendants that had left the job's group when sm sent SIGTERM; they
+    /// cannot be traced to the job once their parents exit.
+    stop_escaped_pids: Vec<i64>,
     /// The job's lane rank for this admission pass; `i64::MAX` without one.
     lane_rank: i64,
 }
@@ -1574,7 +1587,7 @@ impl RetainedQueueStore {
         let result = (|| {
             let mut request = request;
             request.notify_session_id.clear();
-            let job = create_queue_job_conn(&conn, state_dir, request, 0)?;
+            let job = create_queue_job_conn(&conn, state_dir, request, 0, None)?;
             conn.execute(
                 "UPDATE queue_jobs SET owner=?2 WHERE id=?1",
                 params![job.id, owner],
@@ -1636,6 +1649,17 @@ impl RetainedQueueStore {
         request: CreateQueueJob,
         max_wait_seconds: i64,
     ) -> Result<QueueJobRecord> {
+        Self::create_queue_job_in_state_dir_with_options(state_dir, request, max_wait_seconds, None)
+    }
+
+    /// `stop_grace_seconds` is the job's own SIGTERM-to-SIGKILL wait when sm
+    /// stops it; `None` uses `queue_runner.cancel_grace_seconds` (sm#2146).
+    pub fn create_queue_job_in_state_dir_with_options(
+        state_dir: &Path,
+        request: CreateQueueJob,
+        max_wait_seconds: i64,
+        stop_grace_seconds: Option<i64>,
+    ) -> Result<QueueJobRecord> {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "failed to create queue runner state dir {}",
@@ -1654,7 +1678,13 @@ impl RetainedQueueStore {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         init_queue_jobs_schema(&conn)?;
-        create_queue_job_conn(&conn, state_dir, request, max_wait_seconds)
+        create_queue_job_conn(
+            &conn,
+            state_dir,
+            request,
+            max_wait_seconds,
+            stop_grace_seconds,
+        )
     }
 
     pub fn start_queue_job_in_state_dir(
@@ -1895,6 +1925,33 @@ impl RetainedQueueStore {
         admit_after_cancel: bool,
         detail: Option<&JsonValue>,
     ) -> Result<Option<QueueJobRecord>> {
+        Self::cancel_queue_job_waiting_in_state_dir(
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            cancel_grace_seconds,
+            admission_policy,
+            admit_after_cancel,
+            detail,
+            None,
+        )
+    }
+
+    /// Cancel, waiting at most `wait_limit` for a running job to end. A job
+    /// still inside its stop grace then comes back `running` with
+    /// `holding_reason = "cancelling"`; its watcher sends SIGKILL at the
+    /// deadline and the completion notice follows (sm#2146).
+    #[allow(clippy::too_many_arguments)] // the cancel inputs plus the caller's wait limit
+    pub fn cancel_queue_job_waiting_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        job_id: &str,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        admit_after_cancel: bool,
+        detail: Option<&JsonValue>,
+        wait_limit: Option<StdDuration>,
+    ) -> Result<Option<QueueJobRecord>> {
         let db_path = state_dir.join("queue_runner.db");
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
@@ -1948,9 +2005,17 @@ impl RetainedQueueStore {
             }
         };
         if let Some(running_job) = running_job {
-            if let Some(pgid) = running_job.process_group_id.or(running_job.pid) {
-                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            if !stop_queue_job_and_wait_conn(
+                &conn,
+                &running_job,
+                cancel_grace_seconds,
+                None,
+                wait_limit,
+            )? {
+                return get_queue_job_conn(&conn, job_id);
             }
+            // Re-read: the notice names the signal that ended the job.
+            let running_job = get_queue_job_runtime_conn(&conn, job_id)?.unwrap_or(running_job);
             let exit_code = read_exit_code(running_job.exit_code_path.as_deref());
             finish_queue_job_conn(
                 &conn,
@@ -3902,6 +3967,10 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
         "max_wait_seconds",
         "INTEGER NOT NULL DEFAULT 300",
     )?;
+    ensure_column(conn, "queue_jobs", "stop_grace_seconds", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "stop_requested_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "stop_signal", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "stop_escaped_pids", "TEXT")?;
     Ok(())
 }
 
@@ -4024,6 +4093,7 @@ fn create_queue_job_conn(
     state_dir: &Path,
     mut request: CreateQueueJob,
     max_wait_seconds: i64,
+    stop_grace_seconds: Option<i64>,
 ) -> Result<QueueJobRecord> {
     let id = generate_queue_job_id();
     let local_binding = local_wall::prepare(state_dir, &id, &mut request)?;
@@ -4085,11 +4155,11 @@ fn create_queue_job_conn(
              holding_reason, queued_at, started_at, finished_at, pid,
              process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
              queued_notified_at, started_notified_at, completion_notified_at, rank_tickets,
-             local_agent_id, local_binding_json)
+             local_agent_id, local_binding_json, stop_grace_seconds)
         VALUES
             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending',
              NULL, ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?17, ?18,
-             NULL, NULL, NULL, ?19, ?20, ?21)
+             NULL, NULL, NULL, ?19, ?20, ?21, ?22)
         "#,
         params![
             id,
@@ -4113,6 +4183,7 @@ fn create_queue_job_conn(
             request.rank_tickets.as_deref().map(rank_tickets_json),
             local_agent_id,
             local_binding_json,
+            stop_grace_seconds,
         ],
     )?;
     get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")
@@ -4129,6 +4200,10 @@ fn write_queue_job_wrapper(
     let mut lines = vec![
         "#!/bin/zsh".to_owned(),
         "set +e".to_owned(),
+        // A stop signals the whole group. Without a trap the wrapper dies at
+        // once and never records the command's exit code; a handler (unlike
+        // an ignore) is not inherited, so the command still gets SIGTERM.
+        "trap ':' TERM".to_owned(),
         format!("cd {} || exit 127", shell_quote(cwd)),
     ];
     for (key, value) in env {
@@ -4206,7 +4281,8 @@ fn get_queue_job_runtime_conn(
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets, owner, local_agent_id, local_binding_json
+               rank_tickets, owner, local_agent_id, local_binding_json,
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -4253,6 +4329,13 @@ fn get_queue_job_runtime_conn(
                 peak_process_count: row.get(24)?,
                 owner_forced_at: row.get(25)?,
                 rank_tickets: parse_rank_tickets(row.get(26)?),
+                stop_grace_seconds: row.get(30)?,
+                stop_requested_at: row.get(31)?,
+                stop_signal: row.get(32)?,
+                stop_escaped_pids: row
+                    .get::<_, Option<String>>(33)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default(),
                 lane_rank: i64::MAX,
             })
         })
@@ -4269,7 +4352,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
-               rank_tickets, owner, local_agent_id, local_binding_json
+               rank_tickets, owner, local_agent_id, local_binding_json,
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -4307,6 +4391,13 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 peak_process_count: row.get(24)?,
                 owner_forced_at: row.get(25)?,
                 rank_tickets: parse_rank_tickets(row.get(26)?),
+                stop_grace_seconds: row.get(30)?,
+                stop_requested_at: row.get(31)?,
+                stop_signal: row.get(32)?,
+                stop_escaped_pids: row
+                    .get::<_, Option<String>>(33)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default(),
                 lane_rank: i64::MAX,
             })
         })?
@@ -4452,6 +4543,11 @@ fn admit_pending_queue_jobs_conn(
         let perf_waiting_for_quiet_window =
             ready_perf.is_some() && !perf_blocked_by_tests_after_perf(&jobs);
         if perf_waiting_for_quiet_window {
+            if queue_job_displacement_in_progress(&jobs) {
+                summary.held +=
+                    mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_displacement")?;
+                break;
+            }
             if perf_has_finite_blockers(&jobs) {
                 summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
                 break;
@@ -5157,6 +5253,11 @@ fn next_admissible_queue_job_id_conn(
             }
             continue;
         }
+        if job_type == "perf" && queue_job_displacement_in_progress(jobs) {
+            summary.held +=
+                mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "awaiting_displacement")?;
+            continue;
+        }
         if job_type == "perf" && perf_blocked_by_tests_after_perf(jobs) {
             summary.held +=
                 mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "awaiting_tests")?;
@@ -5303,6 +5404,17 @@ fn perf_has_finite_blockers(jobs: &[QueueJobRuntimeRecord]) -> bool {
         .any(|job| job.state == "running" && matches!(job.job_type.as_str(), "tests" | "review"))
 }
 
+/// A running job is being displaced, or is a background job sm is already
+/// stopping for another reason (a cancel): perf waits for either, and the
+/// cancel keeps its own terminal state.
+fn queue_job_displacement_in_progress(jobs: &[QueueJobRuntimeRecord]) -> bool {
+    jobs.iter().any(|job| {
+        job.state == "running"
+            && (job.holding_reason.as_deref() == Some("displacing")
+                || (job.job_type == "background" && job.stop_requested_at.is_some()))
+    })
+}
+
 fn displace_background_for_perf_conn(
     conn: &Connection,
     jobs: &[QueueJobRuntimeRecord],
@@ -5322,6 +5434,10 @@ fn displace_background_for_perf_conn(
     if perf_has_finite_blockers(jobs) {
         return Ok(false);
     }
+    // One displacement at a time; the perf job is held until it ends.
+    if queue_job_displacement_in_progress(jobs) {
+        return Ok(false);
+    }
     let Some(background) = jobs
         .iter()
         // The owner started a forced run on purpose; perf waits instead.
@@ -5336,9 +5452,22 @@ fn displace_background_for_perf_conn(
     mark_queue_job_displacing_conn(conn, &background.id)?;
     let mut background = background;
     background.holding_reason = Some("displacing".to_owned());
-    if let Some(pgid) = background.process_group_id.or(background.pid) {
-        terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+    // Admission waits no longer than the server's grace. A job with a longer
+    // stop grace keeps stopping; its watcher finishes it as displaced and
+    // admits again. Returning true makes admission re-read the queue, which
+    // now shows the displacement and holds the perf job (sm#2146).
+    if !stop_queue_job_and_wait_conn(
+        conn,
+        &background,
+        cancel_grace_seconds,
+        None,
+        Some(StdDuration::from_secs(
+            cancel_grace_seconds.saturating_add(5),
+        )),
+    )? {
+        return Ok(true);
     }
+    let background = get_queue_job_runtime_conn(conn, &background.id)?.unwrap_or(background);
     let exit_code = read_exit_code(background.exit_code_path.as_deref());
     finish_queue_job_conn(
         conn,
@@ -5692,11 +5821,12 @@ fn monitor_queue_job_completion(
                 return;
             }
         };
-        if queue_job_is_cancelled_in_state_dir(&state_dir, &job_id) {
+        let watch = watch_queue_job_stop_in_state_dir(&state_dir, &job_id, cancel_grace_seconds);
+        if watch == QueueJobWatch::Cancelled {
             return;
         }
         if let Some(status) = child_status {
-            if !process_group_exists(pgid) {
+            if !process_group_exists(pgid) && watch != QueueJobWatch::EscapedAlive {
                 let exit_code = status.code().map(i64::from);
                 let state = if exit_code == Some(0) {
                     "succeeded"
@@ -5717,7 +5847,7 @@ fn monitor_queue_job_completion(
             }
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
+            stop_live_queue_job_in_state_dir(&state_dir, &job_id, &mut child, cancel_grace_seconds);
             let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
             finish_live_queue_job_until_recorded(
                 &state_dir,
@@ -6696,6 +6826,39 @@ fn recover_running_queue_job_conn(
         finish_queue_job_conn(conn, job, state, exit_code, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished(state));
     }
+    let group_alive = job
+        .process_group_id
+        .or(job.pid)
+        .is_some_and(process_group_exists);
+    // A cancel, displacement or timeout of a live job may need minutes of
+    // grace: start it (or keep the one already running) and let the poller
+    // wait it out, so startup is not held for it (sm#2146).
+    // A stop under way is not over while a recorded escaped descendant
+    // lives, even once the job's own group has exited.
+    let deliberate_stop = (group_alive
+        && (matches!(
+            job.holding_reason.as_deref(),
+            Some("cancelling" | "displacing")
+        ) || queue_job_timed_out(job)))
+        || (job.stop_requested_at.is_some() && queue_job_stop_escaped_alive(job));
+    if deliberate_stop {
+        if let Some(pgid) = job.process_group_id.or(job.pid) {
+            begin_queue_job_stop_conn(
+                conn,
+                job,
+                cancel_grace_seconds,
+                &escaped_job_processes(pgid),
+            )?;
+            return Ok(spawn_recovered_queue_job_poller(
+                state_dir,
+                message_queue_db_path,
+                &job.id,
+                job.pid.unwrap_or(pgid),
+                cancel_grace_seconds,
+                admission_policy,
+            ));
+        }
+    }
     if let Some(final_state) =
         forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
     {
@@ -6712,10 +6875,6 @@ fn recover_running_queue_job_conn(
         )?;
         return Ok(RecoveredQueueJobAction::Finished(final_state));
     }
-    let group_alive = job
-        .process_group_id
-        .or(job.pid)
-        .is_some_and(process_group_exists);
     if !group_alive && queue_job_exit_code_path_exists(job) {
         let exit_code = read_exit_code(job.exit_code_path.as_deref());
         let state = if exit_code == Some(0) {
@@ -6727,9 +6886,6 @@ fn recover_running_queue_job_conn(
         return Ok(RecoveredQueueJobAction::Finished(state));
     }
     if queue_job_timed_out(job) {
-        if let Some(pgid) = job.process_group_id.or(job.pid) {
-            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
-        }
         let exit_code = read_exit_code(job.exit_code_path.as_deref());
         finish_queue_job_conn(
             conn,
@@ -6769,9 +6925,27 @@ fn recover_running_queue_job_conn(
         return Ok(RecoveredQueueJobAction::Finished("failed"));
     }
 
+    Ok(spawn_recovered_queue_job_poller(
+        state_dir,
+        message_queue_db_path,
+        &job.id,
+        pid,
+        cancel_grace_seconds,
+        admission_policy,
+    ))
+}
+
+fn spawn_recovered_queue_job_poller(
+    state_dir: &Path,
+    message_queue_db_path: &Path,
+    job_id: &str,
+    pid: i64,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) -> RecoveredQueueJobAction {
     let state_dir = state_dir.to_path_buf();
     let message_queue_db_path = message_queue_db_path.to_path_buf();
-    let job_id = job.id.clone();
+    let job_id = job_id.to_owned();
     let recovered_shutdown = queue_shutdown();
     thread::spawn(move || {
         poll_recovered_queue_job(
@@ -6784,7 +6958,7 @@ fn recover_running_queue_job_conn(
             recovered_shutdown,
         );
     });
-    Ok(RecoveredQueueJobAction::Polling)
+    RecoveredQueueJobAction::Polling
 }
 
 // A recovered job has no child handle, so this poller is the only thing that will
@@ -6867,10 +7041,27 @@ fn poll_recovered_queue_job(
         if let Some(final_state) =
             forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
         {
-            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            let job = match stop_recovered_queue_job_conn(&conn, &job, pgid, cancel_grace_seconds) {
+                Ok(job) => job,
+                Err(error) => {
+                    eprintln!(
+                        "queue recovered job {job_id} could not be stopped; retrying: {error:#}"
+                    );
+                    continue;
+                }
+            };
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
             if finish(&conn, &job, final_state, exit_code, process_guard.peak()) {
                 return;
+            }
+            continue;
+        }
+        // A stop under way ends only once its escaped descendants are gone too.
+        if job.stop_requested_at.is_some() && queue_job_stop_escaped_alive(&job) {
+            if let Err(error) =
+                stop_recovered_queue_job_conn(&conn, &job, pgid, cancel_grace_seconds)
+            {
+                eprintln!("queue recovered job {job_id} could not be stopped; retrying: {error:#}");
             }
             continue;
         }
@@ -6890,7 +7081,15 @@ fn poll_recovered_queue_job(
             continue;
         }
         if queue_job_timed_out(&job) {
-            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            let job = match stop_recovered_queue_job_conn(&conn, &job, pgid, cancel_grace_seconds) {
+                Ok(job) => job,
+                Err(error) => {
+                    eprintln!(
+                        "queue recovered job {job_id} could not be stopped; retrying: {error:#}"
+                    );
+                    continue;
+                }
+            };
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
             if finish(&conn, &job, "timed_out", exit_code, process_guard.peak()) {
                 return;
@@ -6963,6 +7162,28 @@ fn poll_recovered_queue_job(
     }
 }
 
+/// A recovered job's stop, on its poller thread: cancels and displacements
+/// keep the job's own grace and any deadline set before the restart; the
+/// runaway guards use the server's grace as before. Returns the re-read row.
+fn stop_recovered_queue_job_conn(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+    pgid: i64,
+    default_grace_seconds: u64,
+) -> Result<QueueJobRuntimeRecord> {
+    if matches!(
+        job.holding_reason.as_deref(),
+        Some("memory_terminating" | "process_limit_terminating")
+    ) {
+        terminate_process_group_with_grace(pgid, default_grace_seconds);
+    } else {
+        let mut job = job.clone();
+        job.process_group_id = Some(pgid);
+        stop_queue_job_and_wait_conn(conn, &job, default_grace_seconds, None, None)?;
+    }
+    Ok(get_queue_job_runtime_conn(conn, &job.id)?.unwrap_or_else(|| job.clone()))
+}
+
 fn queue_job_timed_out(job: &QueueJobRuntimeRecord) -> bool {
     queue_job_timed_out_at(job, OffsetDateTime::now_utc())
 }
@@ -6990,17 +7211,6 @@ fn queue_elapsed_since(value: &str, now_utc: OffsetDateTime) -> Option<i64> {
     }
     let parsed = parse_python_naive_datetime(value)?;
     Some((local_now_naive(now_utc)? - parsed).whole_seconds())
-}
-
-fn queue_job_is_cancelled_in_state_dir(state_dir: &Path, job_id: &str) -> bool {
-    let db_path = state_dir.join("queue_runner.db");
-    let Ok(conn) = open_queue_jobs_connection(&db_path) else {
-        return false;
-    };
-    let Ok(Some(job)) = get_queue_job_runtime_conn(&conn, job_id) else {
-        return false;
-    };
-    job.state == "cancelled"
 }
 
 #[cfg(test)]
@@ -7683,6 +7893,13 @@ pub fn queue_hold_explanation(
                 )
             },
         ),
+        "awaiting_displacement" => {
+            blockers = running.iter().copied().filter(|j| j.holding_reason.as_deref() == Some("displacing") || (j.job_type == "background" && j.stop_requested_at.is_some())).collect();
+            (
+                "waiting for a stopping job to end".into(),
+                format!("A performance job is waiting for {} to finish stopping within its stop grace. New jobs are paused until it has.", names(&blockers)),
+            )
+        }
         "resource_budget_missing" => (
             "waiting for resource budget metadata".into(),
             "This legacy performance job has no complete recorded resource budget and cannot be started safely; resubmit it with explicit CPU, memory, and time budgets.".into(),
@@ -7754,6 +7971,20 @@ pub fn queue_log_filename(label: &str, id: &str) -> String {
     format!("{}--{id}.log", if slug.is_empty() { "job" } else { slug })
 }
 
+/// How sm's stop ended the job, for the completion notice (sm#2146).
+fn queue_job_stop_text(job: &QueueJobRuntimeRecord, finished_at: &str) -> Option<String> {
+    let requested_at = job.stop_requested_at.as_deref()?;
+    let grace = job.stop_grace_seconds.unwrap_or(0);
+    Some(if job.stop_signal.as_deref() == Some("SIGKILL") {
+        format!(" stop=SIGKILL (still running {grace}s after SIGTERM)")
+    } else {
+        let after = parse_queue_datetime(finished_at)
+            .and_then(|finished| queue_elapsed_since(requested_at, finished))
+            .map_or_else(|| "?".to_owned(), |seconds| seconds.max(0).to_string());
+        format!(" stop=SIGTERM (exited {after}s after it; grace {grace}s)")
+    })
+}
+
 fn queue_job_completion_text_with_policy(
     job: &QueueJobRuntimeRecord,
     state: &str,
@@ -7776,6 +8007,9 @@ fn queue_job_completion_text_with_policy(
         } else {
             memory_guard_detail_text(detail)
         });
+    }
+    if let Some(stop) = queue_job_stop_text(job, finished_at) {
+        termination_text.push_str(&stop);
     }
     let mut exit_text = exit_code.map_or_else(
         || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
@@ -7950,6 +8184,240 @@ fn terminate_process_group(pgid: i64, force: bool) {
         Signal::SIGTERM
     };
     let _ = killpg(Pid::from_raw(pgid), signal);
+}
+
+/// The longest stop grace a job may ask for (`sm queue run --stop-grace`).
+pub const MAX_QUEUE_STOP_GRACE_SECONDS: i64 = 3600;
+
+/// How long sm waits between SIGTERM and SIGKILL when it stops this job:
+/// its own `--stop-grace`, else the server's `cancel_grace_seconds`. The
+/// runaway guards (memory, process cap) protect the host and always use the
+/// server's (sm#2146).
+fn queue_job_stop_grace_seconds(job: &QueueJobRuntimeRecord, default_grace_seconds: u64) -> u64 {
+    if matches!(
+        job.holding_reason.as_deref(),
+        Some("memory_terminating" | "process_limit_terminating")
+    ) {
+        return default_grace_seconds;
+    }
+    job.stop_grace_seconds
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .unwrap_or(default_grace_seconds)
+}
+
+/// When sm SIGKILLs a job it is stopping, while it is still running; for
+/// `sm queue status` and the cancel reply.
+pub fn queue_job_stop_deadline_at(
+    job: &QueueJobRecord,
+    default_grace_seconds: u64,
+) -> Option<String> {
+    if job.state != "running" || job.stop_signal.as_deref() == Some("SIGKILL") {
+        return None;
+    }
+    let requested = parse_queue_datetime(job.stop_requested_at.as_deref()?)?;
+    let grace = job
+        .stop_grace_seconds
+        .unwrap_or(i64::try_from(default_grace_seconds).unwrap_or(i64::MAX));
+    (requested + time::Duration::seconds(grace))
+        .format(&Rfc3339)
+        .ok()
+}
+
+/// Seconds until a job sm is stopping gets SIGKILL; `None` when sm has not
+/// sent it SIGTERM.
+fn queue_job_stop_remaining_seconds(
+    job: &QueueJobRuntimeRecord,
+    default_grace_seconds: u64,
+    now_utc: OffsetDateTime,
+) -> Option<i64> {
+    let requested = job.stop_requested_at.as_deref()?;
+    let grace =
+        i64::try_from(queue_job_stop_grace_seconds(job, default_grace_seconds)).unwrap_or(i64::MAX);
+    // An unreadable stamp must not keep a stop waiting forever.
+    Some(queue_elapsed_since(requested, now_utc).map_or(0, |elapsed| grace.saturating_sub(elapsed)))
+}
+
+/// Starts a stop: SIGTERM to the job's group and its escaped processes, at
+/// most once per job. The time and grace are recorded first, so another
+/// caller, or the next server after a restart, waits out the same deadline
+/// instead of interrupting a cleanup handler with a second SIGTERM.
+fn begin_queue_job_stop_conn(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+    default_grace_seconds: u64,
+    escaped: &[i64],
+) -> Result<QueueJobRuntimeRecord> {
+    let mut job = job.clone();
+    if job.stop_requested_at.is_some() {
+        return Ok(job);
+    }
+    let grace = queue_job_stop_grace_seconds(&job, default_grace_seconds);
+    let requested_at = now_rfc3339();
+    let claimed = conn.execute(
+        "UPDATE queue_jobs
+         SET stop_requested_at = ?2, stop_signal = 'SIGTERM', stop_grace_seconds = ?3,
+             stop_escaped_pids = ?4
+         WHERE id = ?1 AND stop_requested_at IS NULL",
+        params![
+            job.id,
+            requested_at,
+            i64::try_from(grace).unwrap_or(i64::MAX),
+            serde_json::to_string(escaped)?
+        ],
+    )?;
+    if claimed == 0 {
+        return Ok(get_queue_job_runtime_conn(conn, &job.id)?.unwrap_or(job));
+    }
+    if let Some(pgid) = job.process_group_id.or(job.pid) {
+        terminate_process_group(pgid, false);
+        signal_processes(escaped, false);
+    }
+    job.stop_requested_at = Some(requested_at);
+    job.stop_signal = Some("SIGTERM".to_owned());
+    job.stop_grace_seconds = Some(i64::try_from(grace).unwrap_or(i64::MAX));
+    job.stop_escaped_pids = escaped.to_vec();
+    Ok(job)
+}
+
+/// A stopping job's recorded escaped descendants that are still alive.
+fn queue_job_stop_escaped_alive(job: &QueueJobRuntimeRecord) -> bool {
+    job.stop_escaped_pids.iter().any(|pid| process_exists(*pid))
+}
+
+/// SIGKILL for a job whose stop grace has run out, recorded once. `escaped`
+/// is the list taken before SIGTERM when the caller has one.
+fn kill_overdue_queue_job_conn(
+    conn: &Connection,
+    job: &mut QueueJobRuntimeRecord,
+    default_grace_seconds: u64,
+    escaped: Option<&[i64]>,
+) -> Result<()> {
+    if job.stop_signal.as_deref() == Some("SIGKILL")
+        || queue_job_stop_remaining_seconds(job, default_grace_seconds, OffsetDateTime::now_utc())
+            .is_none_or(|remaining| remaining > 0)
+    {
+        return Ok(());
+    }
+    if let Some(pgid) = job.process_group_id.or(job.pid) {
+        terminate_process_group(pgid, true);
+        match escaped {
+            Some(escaped) => signal_processes(escaped, true),
+            None => signal_processes(&escaped_job_processes(pgid), true),
+        }
+    }
+    signal_processes(&job.stop_escaped_pids, true);
+    job.stop_signal = Some("SIGKILL".to_owned());
+    conn.execute(
+        "UPDATE queue_jobs SET stop_signal = 'SIGKILL' WHERE id = ?1",
+        params![job.id],
+    )?;
+    Ok(())
+}
+
+/// Stops a job and waits for its processes to end: SIGTERM once, then
+/// SIGKILL when its grace runs out. Returns false if `wait_limit` passes
+/// first; the job's watcher then carries the stop on to the deadline.
+fn stop_queue_job_and_wait_conn(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+    default_grace_seconds: u64,
+    mut child: Option<&mut QueueChild>,
+    wait_limit: Option<StdDuration>,
+) -> Result<bool> {
+    let Some(pgid) = job.process_group_id.or(job.pid) else {
+        return Ok(true);
+    };
+    // A stop already under way (e.g. before a restart) recorded its escaped
+    // descendants; their parents may be gone, so tracing would miss them.
+    let mut escaped = escaped_job_processes(pgid);
+    for pid in &job.stop_escaped_pids {
+        if !escaped.contains(pid) {
+            escaped.push(*pid);
+        }
+    }
+    let mut job = begin_queue_job_stop_conn(conn, job, default_grace_seconds, &escaped)?;
+    let started = Instant::now();
+    loop {
+        // A local child's exit receipt can trail the kernel's view; see
+        // terminate_child_process_group_with_grace.
+        let awaiting_receipt = child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if !awaiting_receipt
+            && !process_group_exists(pgid)
+            && !escaped.iter().any(|pid| process_exists(*pid))
+        {
+            return Ok(true);
+        }
+        kill_overdue_queue_job_conn(conn, &mut job, default_grace_seconds, Some(&escaped))?;
+        if wait_limit.is_some_and(|limit| started.elapsed() >= limit) {
+            return Ok(false);
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
+}
+
+/// Stops a live job with its own grace and waits for it to end. Without a
+/// readable row it falls back to the server's grace.
+fn stop_live_queue_job_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    child: &mut QueueChild,
+    default_grace_seconds: u64,
+) {
+    let pgid = i64::from(child.id());
+    let stopped = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).and_then(|conn| {
+        let Some(job) = get_queue_job_runtime_conn(&conn, job_id)? else {
+            return Ok(false);
+        };
+        stop_queue_job_and_wait_conn(&conn, &job, default_grace_seconds, Some(child), None)
+    });
+    match stopped {
+        Ok(true) => {}
+        Ok(false) => terminate_child_process_group_with_grace(child, pgid, default_grace_seconds),
+        Err(error) => {
+            eprintln!("queue job {job_id} stop could not use its own grace: {error:#}");
+            terminate_child_process_group_with_grace(child, pgid, default_grace_seconds);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueJobWatch {
+    Running,
+    /// sm is stopping the job and a descendant that left its group is alive:
+    /// the job is not over even if its group is gone.
+    EscapedAlive,
+    Cancelled,
+}
+
+/// One watcher tick for a live job. If sm is stopping it, SIGKILL once its
+/// grace has run out, its escaped descendants included (sm#2146).
+fn watch_queue_job_stop_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    default_grace_seconds: u64,
+) -> QueueJobWatch {
+    let Ok(conn) = open_queue_jobs_connection(&state_dir.join("queue_runner.db")) else {
+        return QueueJobWatch::Running;
+    };
+    let Ok(Some(mut job)) = get_queue_job_runtime_conn(&conn, job_id) else {
+        return QueueJobWatch::Running;
+    };
+    if job.state == "cancelled" {
+        return QueueJobWatch::Cancelled;
+    }
+    if job.state != "running" || job.stop_requested_at.is_none() {
+        return QueueJobWatch::Running;
+    }
+    if let Err(error) = kill_overdue_queue_job_conn(&conn, &mut job, default_grace_seconds, None) {
+        eprintln!("queue job {job_id} could not be stopped at its deadline: {error:#}");
+    }
+    if queue_job_stop_escaped_alive(&job) {
+        QueueJobWatch::EscapedAlive
+    } else {
+        QueueJobWatch::Running
+    }
 }
 
 fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
@@ -8427,12 +8895,13 @@ fn list_queue_jobs_conn(
     } else {
         "NULL AS quiet_alerted_at"
     };
+    let stop_columns = queue_job_stop_projection(conn)?;
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}, {stop_columns}
         FROM queue_jobs
     "#
     );
@@ -8473,12 +8942,13 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
     } else {
         "NULL AS quiet_alerted_at"
     };
+    let stop_columns = queue_job_stop_projection(conn)?;
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}, {quiet_column}, {local_column}, {stop_columns}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -8586,6 +9056,14 @@ fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
     })
 }
 
+fn queue_job_stop_projection(conn: &Connection) -> Result<&'static str> {
+    Ok(if queue_job_columns(conn)?.contains("stop_signal") {
+        "stop_grace_seconds, stop_requested_at, stop_signal"
+    } else {
+        "NULL AS stop_grace_seconds, NULL AS stop_requested_at, NULL AS stop_signal"
+    })
+}
+
 fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJobRecord> {
     let argv_json: Option<String> = row.get(6)?;
     let argv = match argv_json
@@ -8636,6 +9114,9 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         owner_forced_at: row.get(25)?,
         rank_tickets: parse_rank_tickets(row.get(26)?),
         quiet_alerted_at: row.get(27)?,
+        stop_grace_seconds: row.get(29)?,
+        stop_requested_at: row.get(30)?,
+        stop_signal: row.get(31)?,
     })
 }
 
@@ -8773,10 +9254,16 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if !columns.iter().any(|name| name == column) {
-        conn.execute(
+        match conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
             [],
-        )?;
+        ) {
+            Ok(_) => {}
+            // Another connection added it between our read and our ALTER.
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.starts_with("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -9832,6 +10319,445 @@ mod tests {
         fs::remove_dir_all(state_dir).unwrap();
     }
 
+    /// A job submitted with `--stop-grace`, running for real under a monitor.
+    fn started_job_with_stop_grace(
+        state_dir: &Path,
+        label: &str,
+        python: &str,
+        stop_grace_seconds: i64,
+        default_grace_seconds: u64,
+    ) -> QueueJobRecord {
+        // The script's last top-level sleep follows its signal setup; mark
+        // that point so no signal lands before the handler is in place.
+        fs::create_dir_all(state_dir).unwrap();
+        let ready = state_dir.join(format!("{}.ready", label.replace(' ', "-")));
+        let (setup, rest) = python
+            .rsplit_once("time.sleep(60)")
+            .expect("test job script ends in time.sleep(60)");
+        let python = format!(
+            "{setup}open({:?}, 'w').close()\ntime.sleep(60){rest}",
+            ready.display().to_string()
+        );
+        let python = python.as_str();
+        let job = RetainedQueueStore::create_queue_job_in_state_dir_with_options(
+            state_dir,
+            CreateQueueJob {
+                local_submitter: None,
+                job_type: "background".into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["python3".into(), "-c".into(), python.into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 0,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+                rank_tickets: None,
+            },
+            DEFAULT_QUEUE_MAX_WAIT_SECONDS,
+            Some(stop_grace_seconds),
+        )
+        .unwrap();
+        let started = RetainedQueueStore::start_queue_job_in_state_dir(
+            state_dir,
+            &state_dir.join("messages.db"),
+            &job.id,
+            default_grace_seconds,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.state, "running");
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "test job never became ready");
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        started
+    }
+
+    fn completion_text(state_dir: &Path) -> String {
+        // The monitor thread may be creating the message schema right now.
+        let mut attempts = 0;
+        loop {
+            match RetainedQueueStore::new(state_dir.join("messages.db"))
+                .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            {
+                Ok(mut messages) => return messages.pop().expect("completion notice").text,
+                Err(error) if attempts < 20 => {
+                    attempts += 1;
+                    eprintln!("completion notice not readable yet: {error:#}");
+                    thread::sleep(StdDuration::from_millis(100));
+                }
+                Err(error) => panic!("completion notice unreadable: {error:#}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_waits_out_the_jobs_stop_grace_and_records_its_exit() {
+        let state_dir = unique_temp_path("queue-stop-grace-cleanup");
+        // Cleanup takes 2s, past the 1s server grace but inside the job's 30s.
+        let job = started_job_with_stop_grace(
+            &state_dir,
+            "pod wave",
+            "import signal, sys, time\n\
+             def stop(*_):\n    time.sleep(2)\n    sys.exit(7)\n\
+             signal.signal(signal.SIGTERM, stop)\ntime.sleep(60)",
+            30,
+            1,
+        );
+        let started = Instant::now();
+        let cancelled = RetainedQueueStore::cancel_queue_job_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            &job.id,
+            1,
+            QueueAdmissionPolicy::default(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() >= StdDuration::from_secs(2));
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(cancelled.stop_signal.as_deref(), Some("SIGTERM"));
+        assert_eq!(cancelled.stop_grace_seconds, Some(30));
+        // The wrapper outlives SIGTERM and records the handler's exit code.
+        assert_eq!(cancelled.exit_code, Some(7));
+        let text = completion_text(&state_dir);
+        assert!(
+            text.contains("completed: cancelled termination=cancelled stop=SIGTERM (exited "),
+            "{text}"
+        );
+        assert!(text.contains("s after it; grace 30s) exit=7"), "{text}");
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn cancel_answers_inside_the_grace_and_the_watcher_kills_at_the_deadline() {
+        let state_dir = unique_temp_path("queue-stop-grace-deadline");
+        let job = started_job_with_stop_grace(
+            &state_dir,
+            "stubborn",
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)",
+            2,
+            1,
+        );
+        let answered = RetainedQueueStore::cancel_queue_job_waiting_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            &job.id,
+            1,
+            QueueAdmissionPolicy::default(),
+            false,
+            None,
+            Some(StdDuration::from_millis(200)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(answered.state, "running");
+        assert_eq!(answered.holding_reason.as_deref(), Some("cancelling"));
+        assert_eq!(answered.stop_signal.as_deref(), Some("SIGTERM"));
+        assert!(queue_job_stop_deadline_at(&answered, 1).is_some());
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the watcher never ended the job");
+            thread::sleep(StdDuration::from_millis(100));
+        };
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.stop_signal.as_deref(), Some("SIGKILL"));
+        let text = completion_text(&state_dir);
+        assert!(
+            text.contains("stop=SIGKILL (still running 2s after SIGTERM)"),
+            "{text}"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_deferred_stop_waits_for_and_kills_an_escaped_descendant() {
+        let state_dir = unique_temp_path("queue-stop-grace-escaped");
+        fs::create_dir_all(&state_dir).unwrap();
+        let pid_file = state_dir.join("escaped.pid");
+        // The job starts a setsid'd child that ignores SIGTERM, then exits
+        // on SIGTERM itself, leaving its group empty.
+        let child_script = state_dir.join("escaped.py");
+        fs::write(
+            &child_script,
+            format!(
+                "import os, signal, time\n\
+                 signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+                 open({:?}, 'w').write(str(os.getpid()))\n\
+                 time.sleep(60)\n",
+                pid_file.display().to_string()
+            ),
+        )
+        .unwrap();
+        let python = format!(
+            "import subprocess, sys, time\n\
+             subprocess.Popen([sys.executable, {:?}], start_new_session=True)\n\
+             time.sleep(60)",
+            child_script.display().to_string()
+        );
+        let job = started_job_with_stop_grace(&state_dir, "escaper", &python, 2, 1);
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while !pid_file.exists() || fs::read_to_string(&pid_file).unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "descendant never started");
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        let escaped: i64 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let answered = RetainedQueueStore::cancel_queue_job_waiting_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            &job.id,
+            1,
+            QueueAdmissionPolicy::default(),
+            false,
+            None,
+            Some(StdDuration::from_millis(500)),
+        )
+        .unwrap()
+        .unwrap();
+        // The group is gone by now, but the escaped descendant is not.
+        assert_eq!(answered.state, "running");
+        assert!(process_exists(escaped));
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "the watcher never ended the job");
+            thread::sleep(StdDuration::from_millis(100));
+        };
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.stop_signal.as_deref(), Some("SIGKILL"));
+        assert!(
+            !process_exists(escaped),
+            "escaped descendant survived the stop"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn restart_recovery_kills_an_escaped_descendant_after_the_group_exits() {
+        let state_dir = unique_temp_path("queue-stop-grace-restart-escaped");
+        fs::create_dir_all(&state_dir).unwrap();
+        // Stands in for a setsid'd descendant: its own session, deaf to
+        // SIGTERM, and not our child, so launchd reaps it once killed.
+        let launched = Command::new("python3")
+            .args([
+                "-c",
+                "import subprocess, sys\n\
+                 p = subprocess.Popen([sys.executable, '-c', 'import signal, time; \
+                 signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], \
+                 start_new_session=True, stdin=subprocess.DEVNULL, \
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\nprint(p.pid)",
+            ])
+            .output()
+            .unwrap();
+        let escaped_pid: i64 = String::from_utf8_lossy(&launched.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let gone_pgid = i64::from(gone.id());
+        gone.wait().unwrap();
+        thread::sleep(StdDuration::from_millis(500));
+        assert!(process_exists(escaped_pid));
+        let job = running_job_with_pgid(&state_dir, "background", "pod wave", gone_pgid);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET holding_reason = 'cancelling', stop_requested_at = ?2,
+                 stop_signal = 'SIGTERM', stop_grace_seconds = 1, stop_escaped_pids = ?3
+             WHERE id = ?1",
+            params![job.id, now_rfc3339(), format!("[{escaped_pid}]")],
+        )
+        .unwrap();
+        let summary = RetainedQueueStore::recover_queue_jobs_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            1,
+        )
+        .unwrap();
+        assert_eq!(summary.polling_running, 1);
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the poller never finished the job"
+            );
+            thread::sleep(StdDuration::from_millis(100));
+        };
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.stop_signal.as_deref(), Some("SIGKILL"));
+        assert!(
+            !process_exists(escaped_pid),
+            "escaped descendant survived recovery"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn perf_waits_while_a_displaced_job_uses_its_stop_grace() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 200 * GIB))));
+        let state_dir = unique_temp_path("queue-stop-grace-displacement");
+        let background = started_job_with_stop_grace(
+            &state_dir,
+            "pod wave",
+            "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)",
+            30,
+            0,
+        );
+        let perf = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                local_submitter: None,
+                job_type: "perf".into(),
+                label: "bench".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(GIB),
+                rank_tickets: None,
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        RetainedQueueStore::admit_queue_jobs_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            0,
+        )
+        .unwrap();
+        // Admission waited the server grace (0s) plus 5s, not the job's 30s.
+        assert!(started.elapsed() < StdDuration::from_secs(15));
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let displaced = get_queue_job_conn(&conn, &background.id).unwrap().unwrap();
+        assert_eq!(displaced.state, "running");
+        assert_eq!(displaced.holding_reason.as_deref(), Some("displacing"));
+        let held = get_queue_job_conn(&conn, &perf.id).unwrap().unwrap();
+        assert_eq!(held.state, "pending");
+        assert_eq!(
+            held.holding_reason.as_deref(),
+            Some("awaiting_displacement")
+        );
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        terminate_process_group(background.process_group_id.unwrap(), true);
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        while get_queue_job_conn(&conn, &background.id)
+            .unwrap()
+            .unwrap()
+            .state
+            == "running"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the watcher never finished the job"
+            );
+            thread::sleep(StdDuration::from_millis(100));
+        }
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn restart_recovery_waits_out_a_stop_without_a_second_sigterm() {
+        let state_dir = unique_temp_path("queue-stop-grace-restart");
+        fs::create_dir_all(&state_dir).unwrap();
+        let count = state_dir.join("sigterms");
+        let ready = state_dir.join("ready");
+        let python = format!(
+            "import signal, sys, time\n\
+             def stop(*_):\n    open({count:?}, 'a').write('x')\n\
+             signal.signal(signal.SIGTERM, stop)\nopen({ready:?}, 'w').close()\n\
+             end = time.time() + 3\n\
+             while time.time() < end: time.sleep(0.05)\nsys.exit(0)",
+            count = count.display().to_string(),
+            ready = ready.display().to_string()
+        );
+        let mut child = Command::new("python3")
+            .args(["-c", &python])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "test process never became ready");
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        let pgid = i64::from(child.id());
+        let job = running_job_with_pgid(&state_dir, "background", "pod wave", pgid);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        // The previous server cancelled it with a 30s grace, then restarted.
+        conn.execute(
+            "UPDATE queue_jobs SET holding_reason = 'cancelling', stop_requested_at = ?2,
+                 stop_signal = 'SIGTERM', stop_grace_seconds = 30 WHERE id = ?1",
+            params![job.id, now_rfc3339()],
+        )
+        .unwrap();
+        terminate_process_group(pgid, false);
+        let started = Instant::now();
+        let summary = RetainedQueueStore::recover_queue_jobs_in_state_dir(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            1,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < StdDuration::from_secs(10),
+            "startup waited for the grace"
+        );
+        assert_eq!(summary.polling_running, 1);
+        let _ = child.wait();
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the poller never finished the job"
+            );
+            thread::sleep(StdDuration::from_millis(100));
+        };
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.stop_signal.as_deref(), Some("SIGTERM"));
+        assert_eq!(fs::read_to_string(&count).unwrap(), "x");
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
     fn running_job_with_pgid(
         state_dir: &Path,
         job_type: &str,
@@ -10470,6 +11396,35 @@ mod tests {
     }
 
     #[test]
+    fn perf_leaves_a_background_job_that_is_being_cancelled_cancelled() {
+        let state_dir = unique_temp_path("cancelling-no-displace");
+        let message_queue_db = state_dir.join("messages.db");
+        let cancelling = running_job_with_pgid(&state_dir, "background", "pod wave", 999_992);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET holding_reason = 'cancelling', stop_requested_at = ?2,
+                 stop_signal = 'SIGTERM', stop_grace_seconds = 300 WHERE id = ?1",
+            params![cancelling.id, now_rfc3339()],
+        )
+        .unwrap();
+        create_test_job(&state_dir, "perf", "bench");
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert!(queue_job_displacement_in_progress(&jobs));
+        assert!(!displace_background_for_perf_conn(
+            &conn,
+            &jobs,
+            &message_queue_db,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap());
+        let row = get_queue_job_conn(&conn, &cancelling.id).unwrap().unwrap();
+        assert_eq!(row.holding_reason.as_deref(), Some("cancelling"));
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn perf_never_displaces_an_owner_forced_background_run() {
         let state_dir = unique_temp_path("forced-no-displace");
         let message_queue_db = state_dir.join("messages.db");
@@ -10926,6 +11881,10 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11067,6 +12026,9 @@ mod tests {
     #[test]
     fn queue_hold_context_names_other_jobs_and_explains_global_and_type_gates() {
         let record = |id: &str, kind: &str, state: &str, reason: Option<&str>| QueueJobRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
             local_agent_id: None,
             quiet_alerted_at: None,
             id: id.into(),
@@ -11256,6 +12218,10 @@ mod tests {
     #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11316,6 +12282,10 @@ mod tests {
         let log_path = unique_temp_path("completion-log");
         fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
         let job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11382,6 +12352,10 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11455,6 +12429,10 @@ mod tests {
         )));
         assert!(!wrapper.contains("source \"$1\""));
         let job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -11504,6 +12482,10 @@ mod tests {
     #[test]
     fn zero_timeout_never_expires() {
         let mut job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
@@ -12688,6 +13670,10 @@ mod tests {
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
+            stop_grace_seconds: None,
+            stop_requested_at: None,
+            stop_signal: None,
+            stop_escaped_pids: Vec::new(),
             local_agent_id: None,
             local_binding_json: None,
             owner: None,
