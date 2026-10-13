@@ -22,13 +22,22 @@ impl Drop for ScratchDir {
 /// The first of `count` consecutive ports that are all bindable now. Ports
 /// come from below macOS's ephemeral range (49152+), where any outbound
 /// connection in the parallel suite could take one between check and use.
+/// A port is handed out once per process, so two fixtures that have not yet
+/// bound cannot draw the same run.
 pub(crate) fn free_port_run(count: u16) -> u16 {
+    static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut issued = ISSUED.lock().unwrap();
     for _ in 0..100 {
         let port = 20_000 + (OsRng.next_u32() % 20_000) as u16;
+        if (port..port + count).any(|p| issued.contains(&p)) {
+            continue;
+        }
         let listeners: Result<Vec<_>, _> = (port..port + count)
             .map(|p| TcpListener::bind(("127.0.0.1", p)))
             .collect();
         if listeners.is_ok() {
+            issued.extend(port..port + count);
             return port;
         }
     }
