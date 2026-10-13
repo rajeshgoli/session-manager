@@ -1,5 +1,5 @@
 use super::*;
-use crate::opencode::tests::{ScratchDir, Stub};
+use crate::opencode::tests::{free_port_run, ScratchDir, Stub};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 type Hook = Box<dyn FnOnce(&SessionRecord) + Send>;
@@ -240,11 +240,7 @@ impl Fixture {
     fn with_ports(ports: u16) -> Self {
         let scratch = ScratchDir::new();
         let path = scratch.path().join("sessions.json");
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port_run(ports);
         let driver = Arc::new(Driver {
             config: OpencodeConfig {
                 port_range: [port, port + ports - 1],
@@ -275,7 +271,16 @@ impl Fixture {
             attach_hook: Mutex::new(None),
             stop_hook: Mutex::new(None),
         });
-        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        // Session input locks are process-wide and keyed by socket and tmux
+        // session, so fixtures sharing a socket block each other's held hooks.
+        static SOCKETS: AtomicUsize = AtomicUsize::new(0);
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig {
+            tmux_socket_name: Some(format!(
+                "sm-opencode-test-{}",
+                SOCKETS.fetch_add(1, Ordering::Relaxed)
+            )),
+            ..crate::config::RustCoreConfig::default()
+        });
         let store = SessionStore::new_with_queue(path, scratch.path().join("queue.db"))
             .with_delivery_runtime(Some(runtime.clone()))
             .with_opencode_launch_driver(driver.clone());
