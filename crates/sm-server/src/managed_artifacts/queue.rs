@@ -457,9 +457,12 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         "UPDATE artifact_job_reservations SET placed=?2,start_bytes=?3 WHERE job_id=?1",
         params![id, location, start],
     )?;
+    // Submission may wait while the checkout advances. Attest the checkout
+    // used at admission, never the earlier submission snapshot.
+    let git = submission::GitState::capture(Path::new(&p.request.cwd));
     tx.execute(
-        "UPDATE artifact_jobs SET state='running' WHERE job_id=?1",
-        [id],
+        "UPDATE artifact_jobs SET state='running',commit_sha=?2,cwd_rel=?3,dirty=?4 WHERE job_id=?1",
+        params![id, git.commit_sha, git.cwd_rel, git.dirty],
     )?;
     tx.commit()?;
     Ok(None)
@@ -689,7 +692,13 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         "DELETE FROM artifact_meta WHERE key=?1",
         [format!("queue-size:{id}")],
     )?;
-    if job["state"] == "succeeded" && !outputs.is_empty() {
+    // An unstarted writer cannot have changed the previous successful build.
+    // Its departure may release the last reservation that deferred recording.
+    let successful_outputs = !outputs.is_empty() && outputs.iter().all(|name| {
+        tx.query_row("SELECT EXISTS(SELECT 1 FROM artifact_jobs WHERE root=?1 AND name=?2 AND state='succeeded')",
+            params![p.root.path, name], |row| row.get::<_, bool>(0)).unwrap_or(false)
+    });
+    if (job["state"] == "succeeded" || job["started_at"].is_null()) && successful_outputs {
         let a = artifact(&tx, &p.root.path, &outputs[0])?;
         let set = a["set_id"].as_str().context("set")?;
         let members = store::query(

@@ -624,3 +624,72 @@ fn recipe_push_does_not_hold_queue_or_artifact_database_write_locks() {
     complete(&f.conn(), &job.id, Some(&f.messages())).unwrap();
     assert_eq!(f.detail("out")["recipe_complete"], 1);
 }
+
+#[test]
+fn admission_captures_the_commit_and_dirty_state_that_will_run() {
+    for dirty in [false, true] {
+        let f = Fixture::new();
+        f.init_git();
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let job = f.submit(d);
+        let original = f.git(&["rev-parse", "HEAD"]);
+        fs::write(
+            Path::new(&f.root.repo_checkout).join("build.txt"),
+            "changed",
+        )
+        .unwrap();
+        if !dirty {
+            f.git(&["add", "build.txt"]);
+            f.git(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "changed before admission",
+            ]);
+        }
+        let actual = f.git(&["rev-parse", "HEAD"]);
+        admit(&f.conn(), &job.id).unwrap();
+        f.finish(&job.id, "succeeded");
+        let a = f.detail("out");
+        assert_eq!(a["jobs"][0]["commit_sha"], actual);
+        assert_eq!(a["jobs"][0]["dirty"], i64::from(dirty));
+        assert_eq!(a["recipe_complete"], i64::from(!dirty));
+        if !dirty {
+            assert_ne!(actual, original);
+            assert!(f
+                .git(&["ls-remote", "--tags", "origin"])
+                .starts_with(&actual));
+        }
+    }
+}
+
+#[test]
+fn unstarted_writer_departure_records_the_prior_successful_build() {
+    for terminal in ["cancelled", "wait_expired"] {
+        let f = Fixture::new();
+        f.init_git();
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let first = f.submit(d);
+        let later = f.submit(f.declarations("out"));
+        let conn = f.conn();
+        admit(&conn, &first.id).unwrap();
+        f.finish(&first.id, "succeeded");
+        assert_eq!(f.detail("out")["state"], "building");
+        conn.execute(
+            "UPDATE queue_jobs SET state=?2,finished_at=?3 WHERE id=?1",
+            params![later.id, terminal, now()],
+        )
+        .unwrap();
+        complete(&conn, &later.id, Some(&f.messages())).unwrap();
+        assert_eq!(f.detail("out")["state"], "live");
+        assert_eq!(f.detail("out")["recipe_complete"], 1);
+        assert_eq!(f.detail("out")["jobs"][1]["state"], terminal);
+    }
+}
