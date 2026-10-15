@@ -465,7 +465,7 @@ CREATE TABLE autopm_measurements (
   decision      TEXT,                -- keep | revert | extend | NULL on error
   PRIMARY KEY (experiment_id, attempt)
 );</code></pre>
-<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. Two direct transitions are server-only: <code>live | measuring → reverted</code> when the guard, the kill switch, a 👎 or your own switch-off turns the switch off; and <code>kept → reverted</code> when a 👎 or your switch-off lands during the 30-day period before cleanup (F.2). The decision note names the cause. <code>dark</code> means every build PR in <code>tickets_json</code> has merged, and the running server build (its <code>x-sm-build</code> commit) contains their merge commits. For Android changes, the app must also report a <code>client_version</code> at or above the build that carries them. A switched experiment's switch is still off. sm moves <code>building → dark</code> itself when these hold; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
+<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Only pre-live states (<code>planned</code>, <code>building</code>, <code>shadowed</code>, <code>awaiting_owner</code>, <code>dark</code>) may go to <code>abandoned</code>, with a note. A <code>live</code>, <code>measuring</code> or <code>kept</code> experiment can leave only by <code>reverted</code>, which turns its switch off in the same transaction. Two direct transitions are server-only: <code>live | measuring → reverted</code> when the guard, the kill switch, a 👎 or your own switch-off turns the switch off; and <code>kept → reverted</code> when a 👎 or your switch-off lands during the 30-day period before cleanup (F.2). The decision note names the cause. <code>dark</code> means every build PR in <code>tickets_json</code> has merged, and the running server build (its <code>x-sm-build</code> commit) contains their merge commits. For Android changes, the app must also report a <code>client_version</code> at or above the build that carries them. A switched experiment's switch is still off. sm moves <code>building → dark</code> itself when these hold; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
 <p>sm enforces these gates server-side. Each refusal returns 409 with the failing gate's name.</p>
 <table>
 <thead><tr><th>Action</th><th>Gate</th></tr></thead>
@@ -522,7 +522,7 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <li>Every seat that has claimed a ticket under #2170.</li>
 <li>Review runs on PRs linked to those tickets.</li>
 </ol>
-<p>The PM's in-context research helpers count as part of its seat. <code>GET /autopm/budget</code> returns <code>{window_start, resets_at, providers: {claude: {allowance, spent, remaining}, codex: {…}}}</code>; CLI <code>sm autopm budget</code>.</p>
+<p>The PM's in-context research helpers count as part of its seat. <code>GET /autopm/budget</code> returns <code>{window_start, resets_at, providers: {claude: {allowance, spent, reserved, remaining}, codex: {…}}}</code>. Here <code>reserved</code> is <code>open_hold</code> (C.4) and <code>remaining = allowance − spent − reserved</code>, the balance available for new work, the auto PM's own helpers included; CLI <code>sm autopm budget</code>.</p>
 <p><b>C.4 Enforcement.</b> Build tickets reserve budget when they start:</p>
 <pre><code>CREATE TABLE autopm_reservations (
   repo TEXT NOT NULL, number INTEGER NOT NULL,
@@ -540,7 +540,7 @@ unreserved   = allowance − spent − open_hold
 admit iff points_est ≤ unreserved</code></pre></li>
 <li>A reservation is released when its ticket closes or its agent retires.</li>
 <li>When a ticket's own spend passes 1.5 × its reservation, sm sends that ticket's agent <code>[sm autopm] ticket over estimate: reach a safe stop</code>.</li>
-<li>When a provider's <code>remaining</code> reaches zero, sm sends the same safe-stop message to the auto PM and to every agent on an autopm ticket of that provider. A safe stop means: push the work, comment on the ticket what remains, then go idle.</li>
+<li>When a provider's <code>allowance − spent</code> reaches zero, sm sends the same safe-stop message to the auto PM and to every agent on an autopm ticket of that provider. A safe stop means: push the work, comment on the ticket what remains, then go idle.</li>
 <li>Overshoot is therefore bounded by 0.5 × the open reservations.</li>
 <li>The auto PM checks <code>sm autopm budget</code> before spawning any helper, and stops researching when its provider is at zero.</li>
 </ul>
@@ -616,7 +616,7 @@ guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "l
 <li><b>Stats.</b> <code>median</code> is the median of values, averaging the two middle values when n is even. <code>mean</code> is the mean of values. <code>per_day</code> is the row count divided by the window length in days.</li>
 <li><b>Windows.</b> Baseline B = [live_at − 14 d, live_at). Halves H1 = [live_at, live_at + window/2) and H2 = [live_at + window/2, live_at + window).</li>
 <li><b>Bar.</b> For each half, change = (stat(H) − stat(B)) / stat(B). It meets the bar when change ≤ −min_change_pct/100 for <code>lower</code>, or ≥ +min_change_pct/100 for <code>higher</code>. If stat(B) = 0, the switch-on gate refuses with <code>baseline_zero</code> and the experiment stays <code>dark</code>.</li>
-<li><b>Guards.</b> Each guard is computed the same way, and fails in a half when it moves in <code>bad_direction</code> by more than <code>max_worse_pct</code>. When a <code>per_day</code> guard's baseline is 0, it fails when the half's count is 2 or more. Two guards are built in and cannot be removed: any 👎 vote, and the owner switching the switch off.</li>
+<li><b>Guards.</b> Each guard is computed the same way, and fails in a half when it moves in <code>bad_direction</code> by more than <code>max_worse_pct</code>. When a guard's baseline stat is 0, the percentage is undefined, and one rule replaces it for every stat. A <code>per_day</code> guard fails when the half has 2 or more rows. A <code>median</code> or <code>mean</code> guard fails when the half's stat is non-zero in <code>bad_direction</code>. Two guards are built in and cannot be removed: any 👎 vote, and the owner switching the switch off.</li>
 <li><b>Decision</b>, at <code>measure_at_ms</code>:
   <ul>
   <li>The rules apply in this order, and the first that matches wins:</li>
@@ -680,9 +680,10 @@ Job: make Rajesh more productive with sm while spending none of his attention.
 Each cycle: (1) measure experiments due; (2) mine the activity log, usage,
 Analytics › Time, bug reports and Rajesh's own tickets for friction, using
 Sonnet subagents in your context for data pulls; (3) choose at most what fits
-max_live and the budget; (4) write a plan per appendix F.1 (mocks for visible changes), get it reviewed;
-(5) file build tickets (sm autopm issue), order them, authorize auto-start;
-(6) merge a plan only after its review converges, then switch on when dark and healthy; (7) publish the readout and playbook PR.
+max_live and the budget; (4) write a plan per appendix F.1 (mocks for visible changes), get it reviewed,
+and merge it only after the review converges; (5) then file build tickets
+(sm autopm issue), order them, authorize auto-start; (6) switch on when dark
+and healthy; (7) publish the readout and playbook PR.
 
 Rules: no change ships without a fixed test. Ask-only changes go through shadow
 mode and one weekly ask. Never work where Rajesh has an open ticket. Never infer
