@@ -770,3 +770,74 @@ fn queued_reader_waits_when_a_later_writer_starts_first() {
     f.finish(&writer.id, "succeeded");
     assert_eq!(admit(&conn, &reader.id).unwrap(), None);
 }
+
+#[test]
+fn failed_set_member_prevents_recording_the_whole_set() {
+    let f = Fixture::new();
+    let mut d = f.declarations("a");
+    d.outputs.push("b".into());
+    let first = f.submit(d);
+    admit(&f.conn(), &first.id).unwrap();
+    f.finish(&first.id, "failed");
+    let second = f.submit(f.declarations("a"));
+    admit(&f.conn(), &second.id).unwrap();
+    f.finish(&second.id, "succeeded");
+    assert_eq!(f.detail("a")["state"], "building");
+    assert_eq!(f.detail("b")["state"], "building");
+}
+
+#[test]
+fn input_only_job_starts_below_the_output_capacity_floor() {
+    let mut f = Fixture::new();
+    let mut d = f.declarations("out");
+    d.record = None;
+    let build = f.submit(d);
+    admit(&f.conn(), &build.id).unwrap();
+    f.finish(&build.id, "succeeded");
+    f.manager.config.floor_percent = 100;
+    let reader = f.submit(submission::Declarations {
+        inputs: vec!["out".into()],
+        ..Default::default()
+    });
+    assert_eq!(admit(&f.conn(), &reader.id).unwrap(), None);
+}
+
+#[test]
+fn deferred_record_request_goes_to_successful_producer() {
+    let f = Fixture::new();
+    let mut d = f.declarations("out");
+    d.record = None;
+    let build = f.submit(d);
+    let mut request = f.request();
+    request.notify_session_id = "later-writer".into();
+    let prepared =
+        PreparedSubmission::prepare(&f.manager, &f.root, f.declarations("out"), &request).unwrap();
+    let later = RetainedQueueStore::create_queue_job_with_artifacts(
+        &f.state(),
+        request,
+        300,
+        None,
+        Some((&f.manager, &prepared)),
+    )
+    .unwrap();
+    let conn = f.conn();
+    admit(&conn, &build.id).unwrap();
+    f.finish(&build.id, "succeeded");
+    conn.execute(
+        "UPDATE queue_jobs SET state='cancelled',finished_at=?2 WHERE id=?1",
+        params![later.id, now()],
+    )
+    .unwrap();
+    complete(&conn, &later.id, Some(&f.messages())).unwrap();
+    let messages = RetainedQueueStore::new(f.messages());
+    let producer = messages
+        .pending_messages_for_target_by_category("maker", "queue-completion", 10)
+        .unwrap();
+    assert!(producer
+        .iter()
+        .any(|m| m.text.contains("built successfully with no record")));
+    assert!(messages
+        .pending_messages_for_target_by_category("later-writer", "queue-completion", 10)
+        .unwrap()
+        .is_empty());
+}

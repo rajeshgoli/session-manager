@@ -350,6 +350,14 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
             return hold(conn, id, "thawing");
         }
     }
+    if outputs.is_empty() {
+        // Readers still advertise active use, but consume no output capacity.
+        conn.execute(
+            "UPDATE artifact_job_reservations SET start_bytes=0 WHERE job_id=?1",
+            [id],
+        )?;
+        return Ok(None);
+    }
     let disk = r["disk_bytes"].as_u64().unwrap_or(0);
     let outputs = names(&r, "outputs_json")?;
     let mut existing = None;
@@ -720,7 +728,11 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         let busy = members
             .iter()
             .any(|name| super::ensure_not_in_use_except(&tx, &p.root.path, name, id).is_err());
-        if !busy {
+        let all_built = members.iter().map(|name| {
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM artifact_jobs WHERE root=?1 AND name=?2 AND state='succeeded')",
+                params![p.root.path, name], |row| row.get::<_, bool>(0))
+        }).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().all(|built| built);
+        if !busy && all_built {
             for name in &members {
                 if let Err(error) = validate_output(&tx, &p.root, name) {
                     invalid_outputs(&tx, &p, id, db, &error)?;
@@ -730,9 +742,11 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
             }
             let jobs=store::query(&tx,"SELECT DISTINCT s.prepared_json,j.seq FROM artifact_jobs j JOIN queue_artifact_submissions s ON s.job_id=j.job_id JOIN artifacts a ON a.root=j.root AND a.name=j.name WHERE a.root=?1 AND a.set_id=?2 AND j.state='succeeded' ORDER BY j.seq",&[&p.root.path,&set])?;
             let mut merged: Option<RecordFlags> = None;
+            let mut producer = p.request.notify_session_id.clone();
             for j in jobs {
                 let prepared: PreparedSubmission =
                     serde_json::from_str(j["prepared_json"].as_str().context("prepared")?)?;
+                producer = prepared.request.notify_session_id.clone();
                 if let Some(mut flags) = prepared.declarations.record {
                     if let Some(previous) = merged {
                         flags.consumers.extend(previous.consumers);
@@ -749,14 +763,14 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
                 for name in &members {
                     let today = OffsetDateTime::now_utc().date().to_string();
                     if attribution::request_due(&tx, &p.root.path, name, &today)? {
-                        notify(db,&format!("artifact-record:{}:{}:{today}",p.root.path,name.to_ascii_lowercase()),&p.request.notify_session_id,&format!("[sm artifact] {name} built successfully with no record. Run sm artifact record {name} --note \"one plain-English line\" --consumer '#N'."))?;
+                        notify(db,&format!("artifact-record:{}:{}:{today}",p.root.path,name.to_ascii_lowercase()),&producer,&format!("[sm artifact] {name} built successfully with no record. Run sm artifact record {name} --note \"one plain-English line\" --consumer '#N'."))?;
                         event(
                             &tx,
                             &p.root.path,
                             name,
                             "request_sent",
                             "sm",
-                            json!({"session":p.request.notify_session_id}),
+                            json!({"session":producer}),
                         )?;
                     }
                 }

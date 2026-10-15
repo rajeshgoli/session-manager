@@ -8377,7 +8377,16 @@ async fn create_queue_job(
     } else {
         job
     };
-    Ok(Json(queue_job_response(&state, job)?))
+    let response = queue_job_response(&state, job.clone()).unwrap_or_else(|error| {
+        eprintln!(
+            "committed queue response metadata unavailable for {}: {error:?}",
+            job.id
+        );
+        let mut response = json!(job);
+        response["type"] = json!(job.job_type);
+        response
+    });
+    Ok(Json(response))
 }
 
 /// Appendix H1: the tickets the job's claimant holds now, which place the
