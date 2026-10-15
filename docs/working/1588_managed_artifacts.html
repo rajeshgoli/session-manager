@@ -92,7 +92,7 @@
 
 <h2>Memo</h2>
 
-<p><b>Session Manager keeps every artifact folder in the cheapest form its use allows, and asks you only when no agent can decide.</b> When a folder appears in <code>~/artifacts</code>, sm asks the agent that made it for a record: what it is, which tickets will read it, and what a rebuild would cost. When nothing will read a folder any more, sm <b>freezes</b> it: it packs the folder into compressed archives on the <b>cold store</b>, an always-connected 4 TB external SSD. A data-pipeline folder holding 128 GB of data freezes to 7 GB in under a minute, and comes back in about a minute when a job needs it. When a disk runs short anyway, sm deletes in order of <b>gigabytes freed per minute you would wait to rebuild</b>, so a 20-minute pipeline output goes long before a 9-hour training output. Jobs declare the disk they will write, the way they declare memory. sm tells you when the backup drive is worth connecting, then backs up overnight only what cannot be rebuilt.</p>
+<p><b>Session Manager keeps every artifact folder in the cheapest form its use allows, and asks you only when no agent can decide.</b> An agent that makes a folder in <code>~/artifacts</code> records it in the same command: a one-line note on what it is, which tickets will read it, and what a rebuild would cost. Folders that appear any other way are recorded by their maker or a steward agent, never by you. When nothing will read a folder any more, sm <b>freezes</b> it: it packs the folder into compressed archives on the <b>cold store</b>, an always-connected 4 TB external SSD. A data-pipeline folder holding 128 GB of data freezes to 7 GB in under a minute, and comes back in about a minute when a job needs it. When a disk runs short anyway, sm deletes in order of <b>gigabytes freed per minute you would wait to rebuild</b>, so a 20-minute pipeline output goes long before a 9-hour training output. Jobs declare the disk they will write, the way they declare memory. Every night a disk at another house pulls an encrypted backup of what cannot be rebuilt, and sm tells you only when that stops working.</p>
 
 <p>The point is space without losing anything. The eight largest folders take 1.6 TB on disk today. Frozen, they would take about 0.3 TB (Figure 1). Nothing is thrown away to get there, and the one folder type that barely compresses, float32 <code>.npy</code> feature summaries, shows up as exactly that.</p>
 
@@ -140,7 +140,7 @@
 </figure>
 
 <h3>Why now</h3>
-<p>The Mac's 3.6 TB disk reached 97% full, with 125 GB free. 722 GB of artifact folders and an 823 GB data directory moved to a new external SSD by hand, with symlinks left behind so every path still works. That bought 2 TB, but deciding what to move meant reading 280 folders' free-text retention notes, which no program can act on. A note says "keep until the next experiment's readout"; a person can read that, sm cannot. The same work showed that the safe moves are mechanical: copy, verify every file, swap in a symlink. That is work for sm, not for the owner or an agent's afternoon.</p>
+<p>The Mac's 3.6 TB disk reached 97% full, with 125 GB free. 722 GB of artifact folders and an 823 GB data directory moved to a new external SSD by hand, with symlinks left behind so every path still works. That bought 2 TB, but deciding what to move meant reading 280 folders' free-text retention notes, which no program can act on. A note says "keep until the next experiment's readout"; a person can read that, sm cannot. The safe moves are mechanical (copy, verify every file, swap in a symlink): work for sm, not for the owner.</p>
 
 <div class="vocab">
 <b class="sans">Terms used in this memo</b>
@@ -149,15 +149,17 @@
 <dt>Cold store</dt><dd>A second disk that stays connected, here a 4 TB external SSD. sm moves folders there and keeps frozen archives there. A moved folder keeps its <code>~/artifacts</code> path through a symlink.</dd>
 <dt>Artifact</dt><dd>One top-level folder in the root, wherever it physically lives. Its name is the folder name, for example <code>4210_dataset</code>.</dd>
 <dt>Record</dt><dd>sm's entry for an artifact: who made it, its ticket, a description, its consumers, how it was built, GPU use, size, and where it lives.</dd>
+<dt>Note</dt><dd>One plain-English line, at most 140 characters, that the agent writes about the folder. It is what the Artifacts page shows.</dd>
+<dt>Artifact steward</dt><dd>A low-tier agent registered under that role in sm. It records folders nobody else claims.</dd>
 <dt>Consumer</dt><dd>A ticket that will read the artifact, for example <code>#4210</code>. Agents name them; sm checks on GitHub whether they are still open.</dd>
-<dt>Recipe</dt><dd>How the artifact was built: the <code>sm queue run</code> jobs that wrote it, the git commit each ran at, the artifacts each read, and each job's measured run time. sm records it from the queue; the agent writes none of it.</dd>
-<dt>Live, frozen</dt><dd><b>Live</b>: an ordinary folder, readable now. <b>Frozen</b>: compressed archives on the cold store; the folder at its path holds only a note saying how to thaw it.</dd>
-<dt>Thaw</dt><dd>Unpacking a frozen artifact back to live, onto the cold store. About a minute per 100 GB of data. sm does it by itself when a queue job needs the artifact.</dd>
+<dt>Recipe</dt><dd>The <code>sm queue run</code> jobs that built the artifact, their commit, inputs and run time, recorded by sm.</dd>
+<dt>Live, frozen</dt><dd><b>Live</b>: an ordinary folder. <b>Frozen</b>: compressed archives on the cold store; its path holds only a note on how to thaw it.</dd>
+<dt>Thaw</dt><dd>Unpacking a frozen artifact back to live, about a minute per 100 GB of data.</dd>
 <dt>Hot, cold</dt><dd><b>Cold</b>: every consumer ticket is closed, no queue job has used the folder for 14 days, and nothing else keeps it (a "keep for the project" mark, a keep-until date, or a spec on <code>main</code> naming it). Anything else is <b>hot</b>.</dd>
 <dt>Score</dt><dd>Gigabytes an action frees, divided by the minutes you would wait if the artifact is needed again: thaw minutes for a freeze, rebuild minutes for a deletion. Higher goes first.</dd>
 <dt>Enough</dt><dd>The free space sm restores on each disk when it falls short: room for the largest output any single job wrote in the last 30 days. About 350 GB today.</dd>
 <dt>Floor</dt><dd>The free space no job may cross when it starts: 5% of the disk, about 180 GB on the Mac.</dd>
-<dt>Digest</dt><dd>At most one message a day from sm to you in the sm app, and only when something needs you or happened that you should know.</dd>
+<dt>Digest</dt><dd>At most one sm message a day, only when something needs you.</dd>
 </dl>
 </div>
 
@@ -189,22 +191,26 @@
 <figcaption>Figure 2. Four states. A deleted artifact keeps its record and recipe, so an agent can rebuild it. Where a live folder sits (the Mac or the cold store) is a placement, not a state: moving it is free, and its path never changes.</figcaption>
 </figure>
 
-<h3>1. Every folder gets a record when it appears</h3>
-<p>sm looks at the top level of <code>~/artifacts</code> every minute. A new folder with no record is <b>unrecorded</b>. sm works out who made it, in this order: the queue job that declared it as its output; else the agent that holds the ticket whose number starts the folder name (nearly every folder follows <code>NNNN_name</code> today); else nobody, and it goes on your list. It then messages that agent:</p>
-<pre><code>[sm artifact] ~/artifacts/4210_dataset appeared (47 GB) with no record. Record it:
-  sm artifact record 4210_dataset --describe @README.md --consumer #4211 [--gpu-hours H --gpu-cost USD]</code></pre>
+<h3>1. Every folder is recorded in the command that makes it</h3>
+<p>An agent declares the record when it creates the folder, so there is no second step to forget. A queue build carries it on <code>sm queue run</code>; sm completes the record when the job succeeds:</p>
+<pre><code>sm queue run --type background --label 4210-dataset --artifact 4210_dataset --disk 60G \
+  --note "Dataset, labels and summaries for the next training run" --consumer #4211 \
+  --recipe-complete --cwd ~/worktrees/research-4210 -- ./build.sh</code></pre>
+<p>A folder made by hand, such as a checkpoint copied back from a rented GPU, is created with its record:</p>
+<pre><code>sm artifact new 4230_ckpt --note "Best checkpoint of sweep 3, 6.5 h on a rented GPU" \
+  --consumer #4230 --gpu-hours 6.5 --gpu-cost 14</code></pre>
 <table>
 <thead><tr><th style="width:30%">Field</th><th style="width:22%">Who fills it</th><th>Example</th></tr></thead>
 <tbody>
+<tr><td><b>Note</b>: one plain-English line, at most 140 characters, shown on the Artifacts page</td><td>agent (required)</td><td>"Dataset, labels and summaries for the next training run"</td></tr>
+<tr><td>Consumers</td><td>agent (required, unless kept for the project or until a date)</td><td><code>#4211</code>: kept hot while #4211 is open</td></tr>
+<tr><td>GPU hours and spend</td><td>agent (sm cannot see a rented machine)</td><td>"6.5 h, $14": never deleted by sm</td></tr>
+<tr><td>Longer description</td><td>agent (optional)</td><td><code>--describe @README.md</code></td></tr>
 <tr><td>Commit, run time, inputs, size</td><td>sm, from the queue</td><td>built at <code>8de048b4</code> in 22 min from <code>4180_labels</code></td></tr>
-<tr><td>Description</td><td>agent</td><td>"Dataset, labels and summaries for the next training run"</td></tr>
-<tr><td>Consumers</td><td>agent</td><td><code>#4211</code>: kept hot while #4211 is open</td></tr>
-<tr><td>GPU hours and spend</td><td>agent (sm cannot see a pod)</td><td>0; or "6.5 h, $14": never deleted automatically</td></tr>
-<tr><td>Keep for the project / keep until a date</td><td>agent, rarely</td><td>a reference dataset; a fixture until 31 Dec</td></tr>
 <tr><td>Hot or cold, score, backup due</td><td>sm, daily</td><td>—</td></tr>
 </tbody>
 </table>
-<p>A folder still unrecorded after 7 days is frozen and listed for you once, with Delete and Thaw buttons. Freezing instead of deleting means a forgotten record costs nothing permanent. The record also serves agents: one that finds a folder later reads what it is and who needs it, and can freeze, thaw, rebuild or delete it without asking you.</p>
+<p><b>A folder that appears any other way</b> (copied in by hand, or written by a script outside the queue) is <b>unrecorded</b>. sm sees it within a minute and asks for a record, in this order: the agent whose job wrote it; else the agent holding the ticket whose number starts the folder name (nearly every folder follows <code>NNNN_name</code>); else the <b>artifact steward</b>, a low-tier agent registered under that role, which reads the folder's notes, git history and queue logs and records it, or reports that it cannot. <b>None of this needs you.</b> A folder still unrecorded after 7 days is frozen and shown on the Artifacts page under "Unclaimed" with a Delete button (section 6). Pressing it is optional: left alone, the frozen folder costs a twentieth of its size.</p>
 
 <h3>2. Cold folders are frozen, not deleted</h3>
 <p>Every night sm freezes each live folder that is cold. Freezing writes the folder as zstd archives on the cold store, checks every file in the archives against the folder, and only then removes the folder, leaving a one-page <code>FROZEN.md</code> at its path that says how to thaw it. A queue job that names a frozen folder, in its <code>--input</code> or anywhere in its command, waits while sm thaws it, then starts. An agent working by hand runs <code>sm artifact thaw &lt;name&gt;</code>. Thawed folders land on the cold store, behind a symlink, so they never fill the Mac, and they count as used, so they do not freeze again for 14 days.</p>
@@ -227,23 +233,25 @@
 <h3>4. Jobs declare disk, like memory</h3>
 <p>A job that writes an artifact says how much: <code>sm queue run --artifact 4210_dataset --disk 60G …</code>. Space other running jobs have declared but not yet written counts as taken. The job starts when its declared size fits above the floor. If it does not fit, sm runs the pressure list. If the Mac is still short but the cold store has room, sm places the job's output folder on the cold store behind a symlink before it starts, so the job writes there without knowing. Otherwise the job waits, up to 24 hours, and starts by itself when space frees. A job that writes more than 1.5 times what it declared gets one warning; sm does not stop it, because running out of disk does not take the machine down the way running out of memory does.</p>
 
-<h3>5. Backups: sm says when, you plug in, it runs overnight</h3>
-<p>sm backs up what cannot be rebuilt: <code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, and every artifact with no recipe or with GPU spend, live or frozen. Artifacts with a recipe are skipped: their inputs and their commit are already safe, so a lost one costs a rebuild, not a loss. sm tracks what changed since the last backup. When something to back up has waited 7 days, the digest says so:</p>
-<pre><code>Backup: 41 GB new or changed since 13 Oct (2 GPU checkpoints, data top-ups).
-Connect the backup drive tonight; sm starts as soon as it appears.</code></pre>
-<p>When the drive appears, sm runs the backup at once with the existing restic setup, then messages you: "Backup done, 41 GB in 38 min, safe to unplug." The first full backup took 22 hours because it copied chain folders that can be rebuilt; under this rule those stay off the spinning drive.</p>
+<h3>5. Backups: pulled nightly by a disk at another house</h3>
+<p>The backup lives on an old Mac mini with a large disk at a friend's house in the same city. A disk at another address is safe from what threatens one at home: fire, theft, a power surge. If its disk fails, you swap in another and it refills; if the Mac fails, the copy is across town. It replaces a cloud drive that is expensive at this size.</p>
+<p><b>The mini pulls; the Mac never writes to it.</b> Each night sm writes an encrypted backup into a staging copy on the cold store. Later that night the mini fetches the new files through sm's existing web address, with a key that can read only that staging copy, and never deletes anything it holds. Nothing on the Mac, whether a bug, a runaway agent or ransomware, has any path to change the mini's copy.</p>
+<table>
+<thead><tr><th style="width:28%">Property</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>What is backed up</td><td><code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, and every artifact with no recipe or with GPU spend. Artifacts with a recipe are skipped: losing one costs a rebuild, not data.</td></tr>
+<tr><td>The friend cannot read it</td><td>restic encrypts it on the Mac; the mini never has the password.</td></tr>
+<tr><td>The mini checks it anyway</td><td>restic names every file after a fingerprint of its contents, so the mini verifies each file it fetches, and re-checks a sample weekly, without the password.</td></tr>
+<tr><td>Silence is not success</td><td>The mini reports each fetch to sm; sm messages you when two nights pass without one.</td></tr>
+<tr><td>Cost</td><td>The staging copy: about 1.3 TB on the cold store today, shrinking as folders freeze or gain recipes. The first copy is carried over on the disk.</td></tr>
+</tbody>
+</table>
 
 <h3>Examples</h3>
-<h4>1. A build, end to end</h4>
-<pre><code>sm queue run --type background --label 4210-dataset --artifact 4210_dataset --disk 60G \
-  --input 4180_labels --cwd ~/worktrees/research-4210 -- ./build.sh
-# sm checks space, records commit and inputs, the job runs 22 min and writes 47 GB
-sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-complete</code></pre>
-<p><code>--recipe-complete</code> is the agent's word that re-running the recorded job at its commit rebuilds the folder; sm then tags that commit on GitHub so it survives the squash merge. While #4211 is open the folder is hot. Fourteen days after #4211 closes and nothing has used it, sm freezes it: 47 GB becomes about 1 GB. If a job names it again in March, the job waits about 30 seconds for the thaw.</p>
+<h4>1. A build's life</h4>
+<p>The build in section 1 runs 22 minutes and writes 47 GB; its record is complete when it succeeds. <code>--recipe-complete</code> is the agent's word that re-running the job at its commit rebuilds the folder; sm tags that commit on GitHub so it survives the squash merge. While #4211 is open the folder is hot. Fourteen days after #4211 closes and nothing has used it, sm freezes it: 47 GB becomes about 1 GB. If a job names it again in March, the job waits about 30 seconds for the thaw.</p>
 <h4>2. A job that does not fit</h4>
-<p>The Mac has 300 GB free; the floor is 180 GB; a running job has declared 60 GB more. A new job declares 150 GB: 300 − 60 − 150 = 90, below the floor by 90 GB. sm moves an idle 193 GB folder to the cold store, which takes about a minute, and the job starts. Had the cold store been full too, sm would freeze idle folders there by score, and only then delete.</p>
-<h4>3. An unrecorded folder</h4>
-<p>An agent copies a 12 GB checkpoint, <code>4230_ckpt</code>, back from a rented GPU by hand. Its name starts with 4230; the agent holding #4230 gets the record request and records it with <code>--gpu-hours 6.5 --gpu-cost 14</code> and <code>--consumer #4230</code>. sm never deletes it, it is in the next backup, and it freezes after #4230 closes.</p>
+<p>The Mac has 300 GB free; the floor is 180 GB; a running job has declared 60 GB more. A new job declares 150 GB: 300 − 60 − 150 = 90, below the floor by 90 GB. sm moves an idle 193 GB folder to the cold store, which takes about a minute, and the job starts.</p>
 
 <div class="ruling">
 <b class="sans">Already decided</b>
@@ -252,24 +260,64 @@ sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-
 <li>A recipe is the queue job, its commit and the artifacts it read, recorded by sm. (26 Sep)</li>
 <li>A second, always-connected disk is the cold store. (15 Oct; replaces "no secondary drive")</li>
 <li>Cold folders are frozen with zstd proactively, not only when a disk is short. (15 Oct)</li>
-<li>Records carry consumers: the tickets that will read the folder. sm asks for the record when the folder appears and shows it in the sm app. (15 Oct)</li>
+<li>Records carry consumers: the tickets that will read the folder. A folder without one is asked for a record when it appears, and records show in the sm app. (15 Oct)</li>
 <li>Deletion under pressure ranks by gigabytes freed per minute of rebuild; there is no 4-hour cutoff. (15 Oct)</li>
 <li>"Enough" free space is the largest single job output of the last 30 days. (15 Oct)</li>
 <li>Jobs declare the disk they will write, like <code>--memory</code>, and sm makes room or holds them. (15 Oct)</li>
-<li>Backups cover what cannot be rebuilt, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>; sm says when to connect the drive and runs the backup when it appears. (15 Oct)</li>
+<li>Backups cover what cannot be rebuilt, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>; an old Mac mini at another house pulls them nightly through sm's existing web address. (15 Oct)</li>
 <li>Runpod volumes are out of scope; no per-epic disk budgets, but totals by epic are shown. (26 Sep)</li>
 </ol>
 </div>
+
+<h3>6. The Artifacts page</h3>
+<p>A new page in sm web and the sm app shows every artifact as its note, so you can see what is on disk without opening a folder. Sections appear only when non-empty; "Needs you" is usually absent.</p>
+<figure>
+<div class="sans" style="max-width:24rem;margin:0 auto;border:1px solid var(--ink-3);border-radius:18px;padding:.9rem .9rem 1.1rem;background:var(--surface);font-size:.8rem;line-height:1.35">
+  <div style="font-weight:700;font-size:1.05rem;margin-bottom:.5rem">Artifacts</div>
+  <div style="display:grid;grid-template-columns:5.2rem 1fr;gap:.25rem .5rem;align-items:center">
+    <span>Mac</span><span><span style="display:inline-block;width:62%;height:.55rem;background:var(--blue);border-radius:2px"></span><span style="display:inline-block;width:30%;height:.55rem;background:var(--rule);border-radius:2px"></span><br><span style="color:var(--ink-2)">2.2 of 3.6 TB used · 1.4 TB free · enough is 350 GB</span></span>
+    <span>Cold store</span><span><span style="display:inline-block;width:45%;height:.55rem;background:var(--blue);border-radius:2px"></span><span style="display:inline-block;width:47%;height:.55rem;background:var(--rule);border-radius:2px"></span><br><span style="color:var(--ink-2)">1.8 of 4.0 TB used</span></span>
+    <span>Backup</span><span style="color:var(--ink-2)">fetched by the mini 03:41 · 3.2 GB · weekly check Sun ✓</span>
+  </div>
+  <div style="margin-top:.8rem;font-weight:700;color:var(--orange)">Unclaimed (1)</div>
+  <div style="border-top:1px solid var(--rule);padding:.4rem 0">
+    <div><b>4199_fixture</b> <span style="color:var(--ink-2)">· 75 GB → 4 GB frozen</span></div>
+    <div style="font-style:italic">"No record. The steward found no notes or jobs for it. Frozen 2 Nov."</div>
+    <div style="margin-top:.25rem"><span style="border:1px solid var(--red);color:var(--red);border-radius:999px;padding:.05rem .6rem">Delete</span> <span style="color:var(--ink-2)">optional</span></div>
+  </div>
+  <div style="margin-top:.8rem;font-weight:700">Hot (12) · 1.2 TB</div>
+  <div style="border-top:1px solid var(--rule);padding:.4rem 0">
+    <div><b>4210_dataset</b> <span style="color:var(--ink-2)">· 47 GB · Mac</span></div>
+    <div style="font-style:italic">"Dataset, labels and summaries for the next training run"</div>
+    <div style="color:var(--ink-2)">for #4211 (open) · rebuild 22 min · by ada-3, 2 d ago</div>
+  </div>
+  <div style="border-top:1px solid var(--rule);padding:.4rem 0;background:var(--surface-2)">
+    <div><b>4230_ckpt</b> <span style="color:var(--ink-2)">· 12 GB · cold store</span> <span style="color:var(--violet);font-weight:700">GPU</span></div>
+    <div style="font-style:italic">"Best checkpoint of sweep 3, 6.5 h on a rented GPU"</div>
+    <div style="color:var(--ink-2)">for #4230 (open) · not rebuildable ($14) · backed up last night</div>
+    <div style="margin-top:.35rem;color:var(--ink-2)">Built by job <i>sweep3-pull</i> at <code>8de048b</code> · read by 2 jobs this week · events ▸</div>
+    <div style="margin-top:.35rem"><span style="border:1px solid var(--ink-3);border-radius:999px;padding:.05rem .6rem">Keep live 30 days</span> <span style="border:1px solid var(--red);color:var(--red);border-radius:999px;padding:.05rem .6rem">Delete</span></div>
+  </div>
+  <div style="margin-top:.8rem;font-weight:700">Frozen (96) · 0.31 TB, was 2.9 TB</div>
+  <div style="border-top:1px solid var(--rule);padding:.4rem 0">
+    <div><b>4102_chains</b> <span style="color:var(--ink-2)">· 308 GB → 33 GB</span></div>
+    <div style="font-style:italic">"Older pipeline views for the first experiment series"</div>
+    <div style="color:var(--ink-2)">frozen 30 Oct (#4100 closed) · thaw ~4 min · rebuild 20 min</div>
+  </div>
+  <div style="margin-top:.7rem;color:var(--ink-2)">This week: 3 frozen (−540 GB) · 1 thawed · 0 deleted · 0 moved</div>
+</div>
+<figcaption>Figure 3. Mock of the Artifacts page on a phone. Each row shows the note the agent wrote, its size (and frozen size), who it is kept for, and what a rebuild would cost. Tapping a row opens it (the shaded row): how it was built, recent use, and your buttons. Frozen rows offer Thaw instead of Keep live.</figcaption>
+</figure>
 
 <h3>Decision surface</h3>
 <table>
 <thead><tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
 <tbody>
-<tr><td>1. A folder nobody records within 7 days</td><td><b>Freeze it and list it for you once</b>, instead of deleting it (the 26 Sep rule).</td><td>Freezing frees most of the space and loses nothing if the owner was simply slow.</td></tr>
+<tr><td>1. A folder nobody records within 7 days</td><td><b>Freeze it and show it under "Unclaimed"</b> with an optional Delete, instead of deleting it (the 26 Sep rule). The artifact steward tries to record it first.</td><td>Freezing frees most of the space and loses nothing if the owner was simply slow.</td></tr>
 <tr><td>2. How long unused before "cold"</td><td><b>14 days with no queue job using it, after its consumers close.</b> One setting in sm's config.</td><td>Consumers do most of the work; 14 days only covers a follow-up run soon after a ticket closes.</td></tr>
 <tr><td>3. Starting safely</td><td><b>First 7 days report-only:</b> sm lists every freeze, move and deletion it would make, and does none.</td><td>You see a week of its judgement on real folders before it touches one.</td></tr>
-<tr><td>4. Your buttons in the sm app and sm web</td><td><b>Delete, Thaw, and Keep live 30 days.</b> Only your signed-in account can use them.</td><td>Every message that needs you can be answered from the phone.</td></tr>
-<tr><td>5. When sm asks you to connect the backup drive</td><td><b>When something to back up has waited 7 days</b>; never more than once every 3 days.</td><td>A weekly plug-in keeps the drive's noise to one night a week.</td></tr>
+<tr><td>4. The Artifacts page and its buttons</td><td><b>The page in Figure 3, with Delete, Thaw, and Keep live 30 days.</b> Only your signed-in account can press them.</td><td>You see what is on disk as one line each, and anything that needs you can be answered from the phone.</td></tr>
+<tr><td>5. When sm tells you about backups</td><td><b>Only when the mini has not fetched for two nights, or its weekly check finds a bad file.</b> A successful night is a line on the Artifacts page, not a message.</td><td>A message every morning would train you to ignore the one that matters.</td></tr>
 <tr><td>6. Review dates</td><td><b>None.</b> Revision 1 brought every folder back to you every 6 months.</td><td>A frozen folder costs almost nothing, and your attention is the scarcest thing here.</td></tr>
 </tbody>
 </table>
@@ -282,29 +330,26 @@ sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-
 <tr><td>2</td><td>Queue: <code>--artifact</code>, <code>--input</code>, <code>--disk</code>, recipe capture, commit tags, disk admission, output placement.</td><td>A big job can wait for disk.</td></tr>
 <tr><td>3</td><td>Freeze and thaw, moves to the cold store, the nightly cold check (report-only for 7 days).</td><td>The first digest of would-be freezes.</td></tr>
 <tr><td>4</td><td>The pressure list by score, "enough", the digest.</td><td>Disk stops filling.</td></tr>
-<tr><td>5</td><td>Backups: tracking, the plug-in message, running on connect.</td><td>"Connect the backup drive."</td></tr>
-<tr><td>6</td><td>The artifact list and your three buttons in sm web and the sm app.</td><td>The list, with totals by epic.</td></tr>
+<tr><td>5</td><td>Backups: scope tracking, the nightly staging run, the read-only fetch endpoint for the mini, missed-fetch alerts.</td><td>The backup line on the page.</td></tr>
+<tr><td>6</td><td>The Artifacts page (Figure 3) and your three buttons in sm web and the sm app.</td><td>The page.</td></tr>
 <tr><td>7</td><td>First user repo: import the existing folders from their retention notes, new agent instructions, the backup script reads sm's list.</td><td>One message listing what the import could not map.</td></tr>
 </tbody>
 </table>
 
 <h3>Risks</h3>
 <ul>
-<li><b>A folder read outside the queue gets no warning before it freezes.</b> An agent working by hand finds <code>FROZEN.md</code> at the path, runs <code>sm artifact thaw</code>, and waits a minute or two. Nothing is lost.</li>
+<li><b>A folder read outside the queue gets no warning before it freezes.</b> The agent finds <code>FROZEN.md</code>, runs <code>sm artifact thaw</code>, and waits a minute.</li>
 <li><b>A wrong "recipe complete" makes a deletion permanent.</b> For example, the job used a binary built outside the queue. Mitigations: the report-only week; the agent instruction that recipe jobs build what they use; and deletion is the last resort, after moving and freezing.</li>
 <li><b>The cold store is unplugged.</b> Moved and frozen folders become unreadable and their paths fail loudly. sm checks the cold store is mounted before any move, freeze or thaw, and pauses all three, with one message to you, while it is missing.</li>
-<li><b>GitHub cannot be reached.</b> sm treats every consumer as still open, so nothing goes cold on that basis.</li>
+<li><b>GitHub cannot be reached.</b> Every consumer counts as open, so nothing goes cold.</li>
 </ul>
 
 <h3>FAQ — what changed since the last revision</h3>
 <ul>
-<li><b>A second disk.</b> An always-connected external SSD is the cold store; revision 1 ruled out a secondary drive.</li>
-<li><b>Freezing replaces expiry.</b> Nothing is deleted because its reason to exist lapsed; it is frozen. Deletion happens only under disk pressure or by an explicit Delete.</li>
-<li><b>No 4-hour "cheap to rebuild" line.</b> Deletion ranks by gigabytes per minute of rebuild, and moves and freezes come first.</li>
-<li><b>Records are requested when a folder appears</b>, and name consumers. Revision 1 deleted unregistered folders after 7 days; this revision freezes them (decision 1).</li>
-<li><b>Review dates are gone</b> (decision 6).</li>
-<li><b><code>--est-size</code> is now <code>--disk</code></b>, and a job's output can be placed on the cold store when the Mac is short.</li>
-<li><b>Backups are new.</b></li>
+<li><b>A second disk</b> (the cold store) replaces "no secondary drive".</li>
+<li><b>Freezing replaces expiry</b>: nothing is deleted because its reason lapsed; deletion happens only under disk pressure or by Delete, ranked by gigabytes per rebuild minute, with no 4-hour line.</li>
+<li><b>Records come with the command that makes the folder</b>, with a note and consumers; stray folders are recorded by their maker or the steward, and frozen, not deleted, after 7 days.</li>
+<li><b>New:</b> the Artifacts page, <code>--disk</code> (was <code>--est-size</code>) with output placement on the cold store, and pulled backups. <b>Gone:</b> review dates.</li>
 </ul>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
@@ -359,6 +404,8 @@ sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-
   db_path: ~/.local/share/claude-sessions/artifacts.db
   mirror_dir: ~/.local/share/claude-sessions/artifact-mirrors
   scan_seconds: 60               # G.1 top-level scan
+  steward_role: artifact-steward # G.3 last resort for unattributed folders
+  note_max_chars: 140
   nightly_time: "04:17"          # local; F evaluation, nightly freeze, size walk
   digest_time: "08:07"           # local
   cold_after_days: 14
@@ -385,11 +432,13 @@ sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-
       cold_store: /Volumes/ColdSSD/artifacts
   backup:
     enabled: false
-    volume: /Volumes/BackupHDD       # presence of this path = drive connected
+    nightly_time: "02:17"        # local; staging run
     command: ~/.config/restic/backup.sh
-    nudge_after_days: 7
-    nudge_min_interval_days: 3
-    static_paths: [~/data, ~/projects, ~/.config]</code></pre>
+    static_paths: [~/data, ~/projects, ~/.config]
+    staging_repo: /Volumes/ColdSSD/.backup/restic
+    puller_token_file: ~/.config/session-manager/backup-puller.token   # 32+ random bytes, hex
+    alert_after_missed_nights: 2
+    local_volume: /Volumes/BackupHDD   # optional occasional second copy</code></pre>
 <ul>
 <li>Paths go through <code>expand_home</code> (<code>sessions.rs:15510</code>); <code>db_path</code>, <code>mirror_dir</code>, root and cold-store paths go through test isolation like <code>app_artifacts</code> (<code>config.rs:397</code>, <code>isolate_path_from_protected_root</code> at <code>config.rs:518</code>).</li>
 <li><b>Startup validation</b> (refuse to start and print the reason): each root exists and is a directory; each <code>cold_store</code>'s parent volume, when mounted, is APFS (<code>statfs</code> <code>f_fstypename == "apfs"</code>) and on a different <code>st_dev</code> from its root; times parse as <code>HH:MM</code>; <code>floor_percent</code> in 1–50; <code>freeze_level</code> in 1–19. An unmounted cold store is not a startup error (I.4).</li>
@@ -408,7 +457,8 @@ sm artifact record 4210_dataset --describe @README.md --consumer #4211 --recipe-
   origin TEXT NOT NULL,           -- queue|hand|adopted|unrecorded
   owner_session_id TEXT, owner_session_name TEXT,
   repo TEXT NOT NULL, ticket INTEGER, epic TEXT,
-  description TEXT,               -- markdown, 1..8000 chars once recorded
+  note TEXT,                      -- plain English, 1..note_max_chars once recorded
+  description TEXT,               -- optional markdown, <= 8000 chars
   project INTEGER NOT NULL DEFAULT 0,
   keep_until TEXT,                -- YYYY-MM-DD or NULL
   keep_live_until TEXT,           -- owner "Keep live"; blocks freeze/delete by sm
@@ -444,6 +494,7 @@ CREATE TABLE artifact_aliases (root TEXT, alias TEXT COLLATE NOCASE, target_name
 CREATE TABLE artifact_job_reservations (job_id TEXT PRIMARY KEY, root TEXT,
   outputs_json TEXT, inputs_json TEXT, disk_bytes INTEGER NOT NULL,
   placed TEXT,                    -- root|cold, decided at admission (E.3)
+  pending_record_json TEXT,       -- record flags given on sm queue run (E.1), applied at E.5
   start_bytes INTEGER, first_disk_hold_at TEXT, overrun_warned INTEGER DEFAULT 0);
 CREATE TABLE artifact_events (id INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT, name TEXT, at TEXT,
   kind TEXT,  -- created|recorded|request_sent|frozen|thawed|moved|deleted|would_*|rebuild_*|
@@ -457,17 +508,19 @@ CREATE TABLE backup_static (path TEXT PRIMARY KEY, content_stamp TEXT, backup_st
 
 <h3 id="D">D. The <code>sm artifact</code> commands</h3>
 <p>All commands call the HTTP API (M.2), accept <code>--root</code>, resolve the root as: <code>--root</code>; else the root whose <code>repo</code> matches the current directory's GitHub repo; else the only root; else an error listing roots. Exit 0 on success; on refusal exit 2 with one line starting <code>error:</code>. <code>#N</code> means <code>&lt;root repo&gt;#N</code>; <code>owner/repo#N</code> is accepted.</p>
-<h4>D.1 <code>sm artifact new &lt;name&gt; [--ticket N] [--epic L]</code></h4>
-<p>Creates a hand-made artifact in <b>building</b> at the placement E.3 would choose for 0 bytes (always the root unless it is below the floor) and prints its path. Refuses an invalid name, an existing record in any state but deleted, or an existing filesystem entry.</p>
-<h4>D.2 <code>sm artifact record &lt;name&gt;... --describe TEXT|@FILE [--consumer #N]... [--project] [--keep-until DATE] [--recipe-complete] [--gpu-hours H] [--gpu-cost USD] [--ticket N] [--epic L]</code></h4>
+<h4>D.1 <code>sm artifact new &lt;name&gt; RECORD-FLAGS</code></h4>
+<p>RECORD-FLAGS are D.2's flags except <code>--recipe-complete</code>, validated by D.2's rules; <code>--note</code> and one keep reason are required. Creates a hand-made artifact, already recorded, in <b>building</b> (it becomes live when the creating session runs <code>sm artifact done &lt;name&gt;</code>, or when that session ends) at the placement E.3 would choose for 0 bytes (always the root unless it is below the floor) and prints its path. Refuses an invalid name, an existing record in any state but deleted, or an existing filesystem entry.</p>
+<h4>D.2 <code>sm artifact record &lt;name&gt;... --note TEXT [--describe TEXT|@FILE] [--consumer #N]... [--project] [--keep-until DATE] [--recipe-complete] [--gpu-hours H] [--gpu-cost USD] [--ticket N] [--epic L]</code></h4>
+<p>For a folder that is unrecorded, or building without a pending record. Most folders never need it, because the record arrives with <code>sm queue run</code> (E.1) or <code>sm artifact new</code> (D.1).</p>
 <ul>
-<li>Each named artifact must be <b>building</b> (no waiting or running job names it as output) or <b>unrecorded</b>. Description 1–8000 chars.</li>
+<li>Each named artifact must be <b>building</b> (no waiting or running job names it as output) or <b>unrecorded</b>. <code>--note</code>: 1–<code>note_max_chars</code> characters, one line. <code>--describe</code>: optional, ≤ 8000 characters.</li>
 <li>At least one of <code>--consumer</code>, <code>--project</code>, <code>--keep-until</code> is required. <code>--keep-until</code> must be after today.</li>
 <li><code>--recipe-complete</code> requires the names to be exactly one whole set, each member with at least one succeeded job, every succeeded job with non-NULL <code>commit_sha</code> and <code>dirty = 0</code>; then E.6. Any failure changes nothing. Not allowed on an unrecorded artifact (origin becomes <code>adopted</code>, never rebuildable).</li>
 <li><code>ticket</code> = <code>--ticket</code>, else the requester's single active claim in the root's repo (<code>claims_for_session</code>, <code>work_claims.rs:872</code>), else NULL. <code>epic</code> = <code>--epic</code> or NULL.</li>
 <li>Success: state live, <code>recorded_at</code>, F runs for the set immediately.</li>
 </ul>
 <p>Example error: <code>error: 4210_dataset's set also contains 4210_context; name both with --recipe-complete</code>.</p>
+<p><code>sm artifact done &lt;name&gt;</code> moves a hand-made building artifact (D.1) to live; it refuses for queue-built ones. <code>sm artifact unclaimable &lt;name&gt; --note TEXT</code> (steward only, G.3) stores what the steward found and stops further requests.</p>
 <h4>D.3 <code>sm artifact consumer &lt;name&gt; add|remove #N</code>, <code>sm artifact mark &lt;name&gt; --project|--no-project|--keep-until DATE|--no-keep-until</code></h4>
 <p>Edit a live or frozen record. Removing the last keep reason is allowed; F decides. Every change is an event; a new <code>--project</code> appears once in the digest.</p>
 <h4>D.4 <code>sm artifact thaw &lt;name&gt; [--wait]</code>, <code>sm artifact freeze &lt;name&gt;</code></h4>
@@ -486,6 +539,9 @@ CREATE TABLE backup_static (path TEXT PRIMARY KEY, content_stamp TEXT, backup_st
 <li><code>--artifact NAME</code> (repeatable): output; absent (created building) or building. Refused if live, frozen or deleted ("choose a new name"), except K.2's own jobs.</li>
 <li><code>--input NAME</code> (repeatable): must be live, frozen or building-with-no-writer. Deleted and rebuildable: refused with "run sm artifact rebuild NAME first". Deleted and not rebuildable: refused.</li>
 <li><code>--disk SIZE</code>: parsed by <code>parse_queue_memory_bytes</code> (<code>bin/sm.rs:5619</code>). Required with <code>--artifact</code>, except K.2 jobs, which use the recorded <code>bytes_written</code>.</li>
+</ul>
+<ul>
+<li><b>Record flags</b>, allowed only with <code>--artifact</code>: <code>--note</code>, <code>--describe</code>, <code>--consumer</code>, <code>--project</code>, <code>--keep-until</code>, <code>--recipe-complete</code>, <code>--ticket</code>, <code>--epic</code>. They apply to every <code>--artifact</code> of the job and are validated at submission by D.2's per-field rules (the set-completeness rule is checked at E.5). Stored as <code>pending_record_json</code>. GPU flags are not accepted: queue jobs run on the Mac.</li>
 </ul>
 <p>A job with none of these behaves exactly as today. <code>--input</code> alone marks inputs in use for the job's life.</p>
 <h4>E.2 At submission (<code>create_queue_job</code>, <code>http.rs:8108</code> → <code>create_queue_job_conn</code>, <code>queue.rs:4091</code>)</h4>
@@ -516,7 +572,7 @@ fits(fs)        = free − outstanding − job.disk ≥ floor</code></pre>
 <h4>E.4 While running</h4>
 <p>Outputs and inputs of queued and running jobs carry the <i>in use</i> signal (F). If <code>current_output_size − start_bytes &gt; overrun_factor × disk</code>, the requester gets one message <code>[sm artifact] &lt;label&gt; has written X, declared Y</code> and an <code>overrun</code> event; nothing else happens.</p>
 <h4>E.5 At completion (<code>finish_queue_job_conn_with_policy</code>, <code>queue.rs:7425</code>)</h4>
-<p>Update <code>artifact_jobs</code> (state, exit code, <code>wall_seconds</code>), measure outputs, set <code>bytes_written</code>, delete the reservation, and set <code>last_used_at = started_at</code> on every input and output. Failed, timed-out and cancelled jobs stay as history and do not count toward the recipe. The recording shares the completion path, so the existing retry of unnotified completions repairs a crash between them.</p>
+<p>Update <code>artifact_jobs</code> (state, exit code, <code>wall_seconds</code>), measure outputs, set <code>bytes_written</code>, delete the reservation, and set <code>last_used_at = started_at</code> on every input and output. Failed, timed-out and cancelled jobs stay as history and do not count toward the recipe. <b>Pending record</b>: when the job succeeds and no other queued or running job writes any member of its set, apply the merged pending records of the set's jobs (consumers unioned; the latest note and description win) exactly as D.2 would, including <code>--recipe-complete</code> and E.6; members become live. If the set check fails, the record applies without recipe-complete and the requester gets one line saying why. A job that succeeds with no pending record leaves its outputs building and triggers G.3. A failed job leaves its outputs building; the requester re-runs or deletes them, and the orphan rule (A) applies after its session ends. The recording shares the completion path, so the existing retry of unnotified completions repairs a crash between them.</p>
 <h4>E.6 Commit tags</h4>
 <p>On <code>record --recipe-complete</code>, for each distinct <code>commit_sha</code> of the set's succeeded jobs, tag <code>artifact/&lt;set_id&gt;/&lt;sha7&gt;</code>: skip if <code>git ls-remote --tags origin</code> shows it; else push <code>&lt;sha&gt;:refs/tags/&lt;tag&gt;</code> from the job's <code>cwd</code> if it exists, else from the mirror (F.3); if neither has the commit, fail with <code>error: commit &lt;sha7&gt; is not available to push; rebuild from a pushed commit</code>. When a set becomes deleted and not rebuildable, or is rebuilt at a new commit, remove old tags from the mirror; failures are logged and retried nightly.</p>
 
@@ -566,13 +622,14 @@ fits(fs)        = free − outstanding − job.disk ≥ floor</code></pre>
 <ol>
 <li>A queued or running job's reservation lists the name as an output ⇒ that job's requester.</li>
 <li>The name matches <code>^(\d{2,6})[_-]</code> ⇒ the active claim holder for <code>(root repo, number)</code>. Add <code>WorkClaimStore::active_holder(repo, number)</code> using the existing predicate <code>ended_at IS NULL AND reserved_at IS NULL</code> (<code>work_claims/checks.rs:304</code>).</li>
+<li>Otherwise the session registered under <code>steward_role</code> (the role registry behind <code>sm lookup</code> and <code>sm roster</code>), if one is alive.</li>
 <li>Otherwise none.</li>
 </ol>
 <p>If the attributed session is alive, sm sends it a system message through the queue-wake path (<code>RetainedQueueStore::enqueue_message_once_with_metadata</code>, <code>queue.rs:2443</code>), keyed per (artifact, day) so it repeats at most daily:</p>
 <pre><code>[sm artifact] ~/artifacts/&lt;name&gt; appeared (&lt;size or "size pending"&gt;) with no record. Record it:
-  sm artifact record &lt;name&gt; --describe TEXT|@FILE --consumer #N [--recipe-complete] [--gpu-hours H --gpu-cost USD]
+  sm artifact record &lt;name&gt; --note "one plain-English line" --consumer #N [--recipe-complete] [--gpu-hours H --gpu-cost USD]
 Unrecorded folders are frozen on &lt;grace_until local date&gt;.</code></pre>
-<p>No live attributed session ⇒ the artifact appears in the digest under "Needs you: unrecorded, no owner" with Delete and Thaw/Keep actions. At <code>grace_until</code> (initially <code>initial_grace_days</code> for entries present at the first scan) it is frozen (A) unless in use.</p>
+<p>The steward's request adds: "Read its files, retention notes, <code>git log -S &lt;name&gt;</code> in the root's repo and the queue logs that mention it. Record it, or run <code>sm artifact unclaimable &lt;name&gt; --note TEXT</code> saying what you found." No live attributed session and no steward ⇒ no request; the page shows the folder under Unclaimed. At <code>grace_until</code> (initially <code>initial_grace_days</code> for entries present at the first scan) it is frozen (A) unless in use.</p>
 
 <h3 id="H">H. Freeze and thaw</h3>
 <h4>H.1 Format</h4>
@@ -673,26 +730,48 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <h4>L.1 Scope</h4>
 <ul>
 <li><b>Static paths</b> from config (<code>static_paths</code>), stamped nightly with the G.2 stamp into <code>backup_static</code>.</li>
-<li><b>Artifacts</b>: every recorded artifact in state live or frozen that is not rebuildable (no complete recipe, or any GPU hours/spend), plus unrecorded artifacts. A live one contributes its resolved directory; a frozen one contributes <code>&lt;cold_store&gt;/.frozen/&lt;name&gt;</code>.</li>
-<li><b>Due</b>: its current stamp differs from <code>backup_stamp</code> (for frozen ones the stamp is the manifest's <code>frozen_at</code>).</li>
+<li><b>Artifacts</b>: every recorded artifact in state live or frozen that is not rebuildable (no complete recipe, or any GPU hours or spend), plus unrecorded artifacts. A live one contributes its resolved directory; a frozen one contributes <code>&lt;cold_store&gt;/.frozen/&lt;name&gt;</code>.</li>
+<li>Stamps (<code>backup_stamp</code>, <code>backed_up_at</code>) record what the last successful staging run included.</li>
 </ul>
-<h4>L.2 Nudge</h4>
-<p>Nightly: if anything is due and the oldest due item has been due for ≥ <code>nudge_after_days</code>, and no backup nudge was sent in the last <code>nudge_min_interval_days</code>, the digest carries a Backup section (not blocking): the total due size, counts by kind, and "Connect the backup drive; sm starts as soon as it appears."</p>
-<h4>L.3 Running</h4>
+<h4>L.2 Nightly staging run</h4>
 <ol>
-<li>A thread checks every 60 s whether <code>backup.volume</code> exists and is a mount point (its <code>st_dev</code> differs from its parent's).</li>
-<li>On a transition to present, if anything is due, or the last successful run is older than 24 h and anything is due: write the include list (absolute resolved paths, one per line, static paths first) to <code>~/.local/share/claude-sessions/backup/include-&lt;run id&gt;.txt</code>; record each item's current stamp as its pending stamp; submit a queue job <code>--type background --label sm-backup --timeout none</code> running <code>backup.command</code> with environment <code>SM_BACKUP_INCLUDE=&lt;file&gt;</code> and <code>SM_BACKUP_VOLUME=&lt;volume&gt;</code>; insert a <code>backup_runs</code> row.</li>
-<li>On success: every included item's <code>backup_stamp</code> = its pending stamp and <code>backed_up_at</code> = start time; owner message (not blocking): "Backup done: &lt;bytes&gt; in &lt;duration&gt;. Safe to unplug." On failure: owner message with the last 20 log lines; stamps unchanged.</li>
-<li>A second appearance of the volume while a run is queued or running does nothing.</li>
+<li>At <code>nightly_time</code> (local), unless a staging job is queued or running: write the include list (absolute resolved paths, one per line, static paths first) to <code>~/.local/share/claude-sessions/backup/include-&lt;run id&gt;.txt</code>; record each item's current stamp as pending; submit a queue job <code>--type background --label sm-backup-stage --timeout none</code> running <code>command</code> with <code>SM_BACKUP_INCLUDE</code>, <code>SM_BACKUP_REPOSITORY = staging_repo</code> and <code>SM_BACKUP_MODE=stage</code>; insert a <code>backup_runs</code> row.</li>
+<li>On success: every included item's stamp = its pending stamp. On failure: one owner message with the last 20 log lines; stamps unchanged.</li>
+<li>The staging repository is a normal restic repository; its own retention (<code>forget --prune</code>) runs in the command after each run.</li>
+<li>When <code>local_volume</code> becomes a mount point (its <code>st_dev</code> differs from its parent's) and no copy to it succeeded in the last 24 h, the same job runs with <code>SM_BACKUP_MODE=local</code> and <code>SM_BACKUP_REPOSITORY = &lt;local_volume&gt;/restic</code>. It never alerts.</li>
 </ol>
-<p>The command owns the tool choice. The first user's command runs <code>rsync</code> for its data directory and <code>restic</code> (repository readable by <code>rustic</code> too) with <code>--files-from "$SM_BACKUP_INCLUDE"</code> for the rest, then its retention policy.</p>
+<h4>L.3 The fetch endpoint</h4>
+<p>Served on sm's existing web address, outside the owner login, authenticated only by <code>Authorization: Bearer &lt;puller token&gt;</code> (constant-time compare against <code>puller_token_file</code>; any other credential is refused; 10 failed attempts per minute from one address lock the endpoint for 10 minutes and send one owner message).</p>
+<table>
+<thead><tr><th style="width:38%">Route</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td><code>GET /backup/files?after=&lt;cursor&gt;</code></td><td><code>{files:[{path, size, mtime}], cursor}</code>: every regular file under <code>staging_repo</code> (relative paths, at most 5,000 per page, ordered by path), except files whose mtime is within the last 2 minutes or while a staging job is running (the listing then returns <code>{busy:true}</code>).</td></tr>
+<tr><td><code>GET /backup/file/&lt;path&gt;</code></td><td>The file's bytes, with <code>Range</code> support. <code>&lt;path&gt;</code> must canonicalize under <code>staging_repo</code>; symlinks are refused.</td></tr>
+<tr><td><code>POST /backup/report</code> <code>{kind: "fetch"|"check", files, bytes, bad:[path]}</code></td><td>Records a <code>backup_runs</code> row with the puller's result.</td></tr>
+</tbody>
+</table>
+<p>Every byte the endpoint serves is restic ciphertext: a leaked token exposes encrypted files and nothing else.</p>
+<h4>L.4 Alerts</h4>
+<ul>
+<li>When no <code>fetch</code> report with empty <code>bad</code> has arrived for <code>alert_after_missed_nights</code> × 24 h, one owner message (not blocking): "Backup: the remote copy has not fetched since &lt;local time&gt; (&lt;n&gt; nights). The staging copy is current; nothing is lost yet." It repeats at most daily, and the next good fetch sends "The remote copy is fetching again."</li>
+<li>A report with non-empty <code>bad</code> sends a blocking message naming the files.</li>
+</ul>
+<h4>L.5 The mini (first user's setup, not built by sm)</h4>
+<ul>
+<li>An old Mac mini with a large disk at another address, sleep disabled, outbound internet only: no ports opened.</li>
+<li>A launchd job at 03:30 local runs a short script: list <code>/backup/files</code>; download every file that is missing locally or differs in size, to a temporary name; for every file except <code>config</code>, check that its SHA-256 equals its file name (restic names every file under <code>data/</code>, <code>index/</code>, <code>snapshots/</code> and <code>keys/</code> by the hash of its contents); rename into place; never delete; <code>POST /backup/report</code>.</li>
+<li>Weekly it re-hashes a random 1% of its files and reports <code>kind: "check"</code>.</li>
+<li>Its copy is a superset of the staging repository (pruned files stay), which restic reads as a valid repository with extra history. Thinning it, rarely, is done by the owner with the password.</li>
+<li>The first copy is seeded over USB at home, then the disk moves.</li>
+</ul>
+<p>The command owns the tool choice. The first user's command runs <code>restic</code> (repository also readable by <code>rustic</code>) with <code>--files-from "$SM_BACKUP_INCLUDE"</code>, plus a plain-file <code>rsync</code> of its data directory in <code>local</code> mode.</p>
 
 <h3 id="M">M. Owner surface</h3>
 <h4>M.1 Messages</h4>
 <p>Through <code>OwnerMessageStore::create_once</code> (<code>owner_messages.rs:499</code>), sender id <code>sm-artifacts</code>, name "sm artifacts". Replies to this sender are refused with 409 "use the artifact list" in <code>reply_to_owner_message</code> (<code>http/messages.rs:639</code>), and the app and web hide the reply box for it.</p>
 <ul>
-<li><b>Digest</b>, at most daily at <code>digest_time</code>, only if a section is non-empty. Title: <code>Artifacts: &lt;n&gt; frozen, &lt;m&gt; need you, Mac &lt;p&gt;% used</code> ("would freeze" in report-only). Sections in order, each omitted when empty: <i>Needs you</i> (unrecorded with no owner; op, rebuild or deletion failures; new <code>project</code> marks; unverifiable consumers; vanished folders); <i>Backup</i> (L.2); <i>Frozen, thawed, moved and deleted since the last digest</i> (counts, GB, the five largest by name); <i>Disk</i> (per filesystem used, free, enough; top five epics by size).</li>
-<li><b>Disk</b> (J.3 step 3), <b>cold store missing</b> (I.4), <b>backup done/failed</b> (L.3).</li>
+<li><b>Digest</b>, at most daily at <code>digest_time</code>, only if a section is non-empty. Title: <code>Artifacts: &lt;n&gt; frozen, &lt;m&gt; need you, Mac &lt;p&gt;% used</code> ("would freeze" in report-only). Sections in order, each omitted when empty: <i>Needs you</i> (unrecorded with no owner; op, rebuild or deletion failures; new <code>project</code> marks; unverifiable consumers; vanished folders); <i>Backup</i> (the last night's result per target, as one line); <i>Frozen, thawed, moved and deleted since the last digest</i> (counts, GB, the five largest by name); <i>Disk</i> (per filesystem used, free, enough; top five epics by size).</li>
+<li><b>Disk</b> (J.3 step 3), <b>cold store missing</b> (I.4), <b>backup alerts</b> (L.2, L.4).</li>
 </ul>
 <h4>M.2 HTTP API</h4>
 <table>
@@ -704,10 +783,10 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <tr><td><code>POST /artifacts/{name}/owner-action</code> <code>{action: "delete"|"thaw"|"keep_live"}</code></td><td><b>owner only</b></td><td><code>delete</code>: K.1, reason owner, bypasses D.5 refusals except in use; for an input, the response lists dependents that become unrebuildable. <code>thaw</code>: H.4. <code>keep_live</code>: thaw if frozen, then <code>keep_live_until = today + keep_live_days</code>.</td></tr>
 </tbody>
 </table>
-<p><code>ArtifactSummary</code>: <code>name, root, state, op, location, hot, origin, disk_bytes, data_bytes, frozen_bytes, epic, ticket, owner_session_name, consumers:[{ref, state}], project, keep_until, keep_live_until, rebuild_seconds, rebuildable, last_used_at, backup_due, needs_owner</code>. <b>Owner only</b> means the request's actor email is not the local bypass actor and maps to a configured user with <code>owner: true</code>.</p>
+<p><code>ArtifactSummary</code>: <code>name, note, root, state, op, location, hot, origin, disk_bytes, data_bytes, frozen_bytes, epic, ticket, owner_session_name, consumers:[{ref, state}], project, keep_until, keep_live_until, rebuild_seconds, rebuildable, last_used_at, backup_due, needs_owner</code>. <b>Owner only</b> means the request's actor email is not the local bypass actor and maps to a configured user with <code>owner: true</code>.</p>
 <h4>M.3 sm web and the sm app</h4>
 <ul>
-<li><b>Web</b>: new page module <code>src/web/artifacts.js</code> registered in <code>PAGES</code> (<code>web/app.js:26</code>) and added to the assets list in <code>http/web.rs</code>, using <code>usePoll(() =&gt; api('/artifacts'), 60000)</code> (<code>web/ui.js:135,179</code>) like <code>LeftoverWorktrees</code> (<code>web/worktrees.js:48</code>). A bar per filesystem (used, floor and enough marks, outstanding), an epic filter, a table sorted by size with "needs you" rows pinned, row expansion to detail, and the three owner buttons with confirmation showing size and "not rebuildable" or "input of …" where relevant.</li>
+<li><b>Web</b>: new page module <code>src/web/artifacts.js</code> registered in <code>PAGES</code> (<code>web/app.js:26</code>) and added to the assets list in <code>http/web.rs</code>, using <code>usePoll(() =&gt; api('/artifacts'), 60000)</code> (<code>web/ui.js:135,179</code>) like <code>LeftoverWorktrees</code> (<code>web/worktrees.js:48</code>). Layout per memo Figure 3: a bar per filesystem (used, floor and enough marks, outstanding) and a backup line (last staging run, last fetch by the remote copy, last weekly check); then sections <i>Unclaimed</i> (unrecorded, steward-unclaimable, or frozen at grace), <i>Needs you</i> (M.1 items), <i>Hot</i>, <i>Cold, live</i>, <i>Frozen</i>, each with count and total and omitted when empty, rows sorted by size. Each row shows name, size (live → frozen), placement, a GPU badge, the note in italics, consumers with state, rebuild cost, owner and age. A tapped row expands to recipe, recent use, the last 10 events and the owner buttons (Delete; Thaw on frozen rows; Keep live 30 days on live rows), with a confirmation showing size and "not rebuildable" or "input of …" where relevant. An epic filter; a footer with the last 7 days' freezes, thaws, deletions and moves.</li>
 <li><b>App</b>: an Artifacts screen following <code>ui/guestbook/GuestbookViewModel.kt</code> + <code>GuestbookScreen.kt</code>, a <code>@GET("artifacts")</code> in <code>data/remote/ApiService.kt</code>, a repository method beside <code>SessionManagerRepository.kt:718</code>, and a navigation entry in <code>ui/navigation/AppNavigation.kt</code>. Digest links open the screen at the row.</li>
 </ul>
 
@@ -725,23 +804,23 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <tr><td>anything else, or no note</td><td>do not record; add to one owner list with size, date and best guess</td></tr>
 </tbody>
 </table>
-<p>The description is the note's text verbatim plus <code>(imported from retention note by &lt;sm id&gt;)</code>. Imported artifacts have origin <code>adopted</code> and no recipe; a later rebuild through the queue makes them rebuildable. Folders already moved to the cold store by hand appear as symlinks to <code>&lt;cold_store&gt;/&lt;name&gt;</code> and import with location cold (G.1).</p>
+<p>The note is the agent's one-line summary of the retention note (≤ 140 characters); the description is the retention note's text verbatim plus <code>(imported from retention note by &lt;sm id&gt;)</code>. Imported artifacts have origin <code>adopted</code> and no recipe; a later rebuild through the queue makes them rebuildable. Folders already moved to the cold store by hand appear as symlinks to <code>&lt;cold_store&gt;/&lt;name&gt;</code> and import with location cold (G.1).</p>
 <h4>N.2 Instruction change</h4>
 <p>The first user repo's agent-instruction rule about keeping things in the artifacts folder is replaced with:</p>
-<pre><code>**~/artifacts is managed by sm.** Build into it with `sm queue run --artifact &lt;name&gt; --disk &lt;size&gt;`, or make a folder by hand with `sm artifact new &lt;name&gt;`. Declare what a job reads with `--input &lt;name&gt;`. When the work is done, run `sm artifact record &lt;name&gt; --describe @&lt;file&gt; --consumer #&lt;ticket&gt;...` naming every ticket that will read it; add `--recipe-complete` only when re-running the recorded jobs at their commit rebuilds the folder (build binaries inside the job), and `--gpu-hours/--gpu-cost` for anything from a rented GPU. Folders nobody reads are frozen; a job that names one thaws it automatically; by hand run `sm artifact thaw &lt;name&gt; --wait`. A folder you find holding only FROZEN.md is frozen, not lost.</code></pre>
+<pre><code>**~/artifacts is managed by sm.** Make every folder with its record: `sm queue run --artifact &lt;name&gt; --disk &lt;size&gt; --note "&lt;one plain-English line&gt;" --consumer #&lt;ticket&gt;... [--recipe-complete]` for builds, or `sm artifact new &lt;name&gt; --note "…" --consumer #&lt;ticket&gt;... [--gpu-hours H --gpu-cost USD]` for anything made by hand (run `sm artifact done &lt;name&gt;` when it is complete). Name every ticket that will read it. Add `--recipe-complete` only when re-running the recorded job at its commit rebuilds the folder (build binaries inside the job). Declare what a job reads with `--input &lt;name&gt;`. Folders nobody reads are frozen; a job that names one thaws it automatically; by hand run `sm artifact thaw &lt;name&gt; --wait`. A folder you find holding only FROZEN.md is frozen, not lost.</code></pre>
 <h4>N.3 Backup command</h4>
-<p>The first user's backup script reads <code>SM_BACKUP_INCLUDE</code> and passes it to restic with <code>--files-from</code>, keeps its static data mirror and project/config paths, and drops the whole-artifacts-folder paths it backs up today.</p>
+<p>The first user's backup script reads <code>SM_BACKUP_INCLUDE</code>, <code>SM_BACKUP_REPOSITORY</code> and <code>SM_BACKUP_MODE</code>, passes the list to restic with <code>--files-from</code>, keeps its plain-file data mirror for <code>local</code> mode, and drops the whole-artifacts-folder paths it backs up today. The mini is set up per L.5.</p>
 
 <h3 id="O">O. Tickets, code locations and tests</h3>
 <p>Each ticket fits one agent without compaction; file sets are disjoint except where noted, so tickets run in order. Tier per repo rules: Mid (Opus 1M, high) for 1–6, Low (Sonnet 1M, high) for 7.</p>
 <table>
 <thead><tr><th style="width:4%">#</th><th style="width:20%">Covers</th><th style="width:30%">Code</th><th>Tests (each named in the PR)</th></tr></thead>
 <tbody>
-<tr><td>1</td><td>A (record, unrecorded, orphan), B, C, D.1–D.3, D.5 (live only), D.6, G, K.1, M.2 GET routes</td><td>new <code>managed_artifacts.rs</code> + <code>managed_artifacts/{store,scan,attribution,delete}.rs</code>; <code>config.rs</code>; <code>bin/sm.rs</code>; <code>http.rs</code> routes; <code>main.rs</code> threads; <code>work_claims.rs</code> <code>active_holder</code></td><td>name validation; root resolution; record/new/delete refusals (one test each); G.1 table (one test per row); size walk counts hard links once, skips symlinks and other devices, stamp ignores <code>.DS_Store</code>; attribution order; request repeats at most daily; unrecorded → frozen at grace is reported (report-only); deletion refuses targets outside roots; deletion re-check race; <code>.DS_Store</code> retry</td></tr>
-<tr><td>2</td><td>E, E.6, K.2, D.7, sets</td><td><code>queue.rs</code> (admission :4439, expiry :4675, finish :7425, hold text :7769); <code>http.rs</code> <code>create_queue_job</code> :8108; <code>bin/sm.rs</code> <code>QueueRunArgs</code> :654; <code>git_in</code> helper</td><td>input detection (three spellings, cold-store path, boundary char); dirty capture; set union; admission arithmetic with outstanding bytes; placement root → pressure → cold → hold; <code>disk_space</code> and <code>thawing</code> 24 h window vs normal; overrun once; recipe excludes failed jobs; tag push from cwd then mirror; rebuild chain order, success restores live, failure leaves building and excludes from delete</td></tr>
+<tr><td>1</td><td>A (record, unrecorded, orphan), B, C, D.1–D.3, D.5 (live only), D.6, G, K.1, M.2 GET routes</td><td>new <code>managed_artifacts.rs</code> + <code>managed_artifacts/{store,scan,attribution,delete}.rs</code>; <code>config.rs</code>; <code>bin/sm.rs</code>; <code>http.rs</code> routes; <code>main.rs</code> threads; <code>work_claims.rs</code> <code>active_holder</code></td><td>name validation; root resolution; record/new/done/delete refusals (one test each); note length and single line; steward routing, and <code>unclaimable</code> stops requests; G.1 table (one test per row); size walk counts hard links once, skips symlinks and other devices, stamp ignores <code>.DS_Store</code>; attribution order; request repeats at most daily; unrecorded → frozen at grace is reported (report-only); deletion refuses targets outside roots; deletion re-check race; <code>.DS_Store</code> retry</td></tr>
+<tr><td>2</td><td>E, E.6, K.2, D.7, sets</td><td><code>queue.rs</code> (admission :4439, expiry :4675, finish :7425, hold text :7769); <code>http.rs</code> <code>create_queue_job</code> :8108; <code>bin/sm.rs</code> <code>QueueRunArgs</code> :654; <code>git_in</code> helper</td><td>record flags validated at submission and refused without <code>--artifact</code>; pending record applied at success across a multi-job set; success without a pending record triggers the request; a failed job leaves outputs building; input detection (three spellings, cold-store path, boundary char); dirty capture; set union; admission arithmetic with outstanding bytes; placement root → pressure → cold → hold; <code>disk_space</code> and <code>thawing</code> 24 h window vs normal; overrun once; recipe excludes failed jobs; tag push from cwd then mirror; rebuild chain order, success restores live, failure leaves building and excludes from delete</td></tr>
 <tr><td>3</td><td>F, H, I, F.4 nightly freeze, D.4</td><td><code>managed_artifacts/{hotcold,freeze,thaw,moves,ops}.rs</code>; <code>Cargo.toml</code> (<code>tar</code>, <code>zstd</code> with <code>zstdmt</code>)</td><td>each F.1 condition flips hot/cold; GitHub failure ⇒ hot; mirror grep with exclusions; freeze round trip preserves paths, modes, mtimes, symlinks, empty dirs, files &gt; 2 GiB (sparse fixture), <code>._</code> names; part packing boundaries; freeze aborts when the tree changes mid-freeze; corrupt part detected at verify; thaw refuses <code>..</code> paths; placeholder and symlink swaps; crash recovery for each op; move keeps xattrs and transparent compression flag; cold store unmounted ⇒ no ops and one message</td></tr>
 <tr><td>4</td><td>J, M.1 digest</td><td><code>managed_artifacts/{pressure,score,digest}.rs</code>; <code>http/messages.rs</code> reply refusal</td><td>enough per filesystem; score ordering incl. +∞ moves and ties; every J.2 eligibility exclusion; stop rule; ratio sample cached until stamp changes; report-only cascade lists the same actions enforcing would take; step-3 message rate limit; digest sections empty ⇒ no message</td></tr>
-<tr><td>5</td><td>L</td><td><code>managed_artifacts/backup.rs</code></td><td>scope (rebuildable excluded, GPU included, frozen contributes archive path); due by stamp; nudge thresholds and interval; mount detection by <code>st_dev</code>; include file contents; success updates stamps captured at start, failure does not; duplicate appearance ignored</td></tr>
+<tr><td>5</td><td>L</td><td><code>managed_artifacts/backup.rs</code></td><td>scope (rebuildable excluded, GPU included, frozen contributes archive path); include file contents; success updates stamps captured at start, failure does not; fetch endpoint refuses other credentials, paths outside the staging repo, symlinks, and lists nothing during a staging run; lockout after repeated bad tokens; missed-fetch alert and recovery line; bad-file report is blocking; local volume by <code>st_dev</code> never alerts</td></tr>
 <tr><td>6</td><td>M.2 owner-action, M.3</td><td><code>http.rs</code>; <code>src/web/artifacts.js</code>, <code>web/app.js</code>, <code>http/web.rs</code>; Android <code>ui/artifacts/*</code>, <code>ApiService.kt</code>, <code>SessionManagerRepository.kt</code>, <code>AppNavigation.kt</code></td><td>owner-action refuses local bypass and non-owner; keep_live arithmetic and thaw; delete of an input reports dependents; web and app render a fixture list</td></tr>
 <tr><td>7</td><td>N</td><td>first user repo instructions; its backup script; operational import</td><td>after import, <code>sm artifact list --state unrecorded</code> holds only the entries on the owner list</td></tr>
 </tbody>
@@ -749,6 +828,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <p><b>Memo-to-appendix coverage.</b> Record on appearance → G, D.2. Consumers → C, D.3, F.1. Freezing → H, F.4. Thaw by jobs → E.2–E.3, H.4. Placeholder → H.3. Score and order → J. Moves → I. Disk declaration → E.1, E.3. Output on cold store → I.3. Enough and floor → J.1, E.3. Backup → L. Buttons → M.2–M.3. Report-only week → B. Cold store unplugged → I.4. GitHub failure → F.1. Recipe and tags → E.5–E.6, K.2. Runpod out of scope; GPU spend recorded only as <code>gpu_hours</code>/<code>gpu_cost_usd</code>.</p>
 
 <h3 id="Z">Z. FAQ</h3>
+<p><b>Why is the record declared at creation rather than afterwards?</b> A second command is the one agents forget, and the agent knows the consumers and the note best at the moment it starts the work. The after-the-fact path (G.3) exists for folders that bypass creation, and the steward closes it without the owner.</p>
 <p><b>Why not macOS transparent compression instead of freezing?</b> It needs no thaw, but it uses older, block-limited compressors (about 2× on the same pipeline folders that zstd shrinks 16–19×) and cannot compress a file over 2 GiB, which is where most bytes live. It also comes undone whenever a job rewrites a file. sm preserves it when moving folders (I.2) and otherwise leaves it alone.</p>
 <p><b>Why not a compressed disk image per folder?</b> Mounting dozens of images, keeping them mounted across restarts, and their read-only nature cost more than a minute's thaw, and their compression is weaker than zstd's.</p>
 <p><b>Why thaw onto the cold store, not the Mac?</b> Reads through the symlink run at SSD speed, and a thaw must never be the thing that fills the Mac. A job that writes the folder after a thaw writes there too.</p>
