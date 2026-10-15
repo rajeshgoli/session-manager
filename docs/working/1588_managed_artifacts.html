@@ -92,7 +92,7 @@
 
 <h2>Memo</h2>
 
-<p><b>Session Manager keeps every artifact folder in the cheapest form its use allows, and asks you only when no agent can decide.</b> An agent that makes a folder in <code>~/artifacts</code> records it in the same command: a one-line note on what it is, which tickets will read it, and what a rebuild would cost. Folders that appear any other way are recorded by their maker or a steward agent, never by you. When nothing will read a folder any more, sm <b>freezes</b> it: it packs the folder into compressed archives on the <b>cold store</b>, an always-connected 4 TB external SSD. A data-pipeline folder holding 128 GB of data freezes to 7 GB in under a minute, and comes back in about a minute when a job needs it. When a disk runs short anyway, sm deletes in order of <b>gigabytes freed per minute you would wait to rebuild</b>, so a 20-minute pipeline output goes long before a 9-hour training output. Jobs declare the disk they will write, the way they declare memory. Every night sm sends an encrypted backup of what cannot be rebuilt to a disk at another house, which keeps its own history; sm tells you only when that stops working.</p>
+<p><b>Session Manager keeps every artifact folder in the cheapest form its use allows, and asks you only when no agent can decide.</b> An agent that makes a folder in <code>~/artifacts</code> records it in the same command: a one-line note on what it is, which tickets will read it, and what a rebuild would cost. Folders that appear any other way are recorded by their maker or a steward agent, never by you. When nothing will read a folder any more, sm <b>freezes</b> it: it packs the folder into compressed archives on the <b>cold store</b>, an always-connected 4 TB external SSD. A data-pipeline folder holding 128 GB of data freezes to 7 GB in under a minute, and comes back in about a minute when a job needs it. When a disk runs short anyway, sm deletes in order of <b>gigabytes freed per minute you would wait to rebuild</b>, so a 20-minute pipeline output goes long before a 9-hour training output. Jobs declare the disk they will write, the way they declare memory. Every night a disk at another house asks sm for what changed, and keeps its own history of what cannot be rebuilt; sm tells you only when that stops working.</p>
 
 <p>The point is space without losing anything. The eight largest folders take 1.6 TB on disk today. Frozen, they would take about 0.3 TB (Figure 1). Nothing is thrown away to get there, and the one folder type that barely compresses, float32 <code>.npy</code> feature summaries, shows up as exactly that.</p>
 
@@ -233,21 +233,28 @@
 <h3>4. Jobs declare disk, like memory</h3>
 <p>A job that writes an artifact says how much: <code>sm queue run --artifact 4210_dataset --disk 60G …</code>. Space other running jobs have declared but not yet written counts as taken. The job starts when its declared size fits above the floor. If it does not fit, sm runs the pressure list. If the Mac is still short but the cold store has room, sm places the job's output folder on the cold store behind a symlink before it starts, so the job writes there without knowing. Otherwise the job waits, up to 24 hours, and starts by itself when space frees. A job that writes more than 1.5 times what it declared gets one warning; sm does not stop it, because running out of disk does not take the machine down the way running out of memory does.</p>
 
-<h3>5. Backups: nightly, to a disk at another house that owns them</h3>
-<p>The backup lives on an old Mac mini with a large disk at a friend's house in the same city. A disk at another address is safe from what threatens one at home: fire, theft, a power surge. If its disk fails, you swap in another and the next night refills it; if the Mac fails, the copy is across town. It replaces a cloud drive that is expensive at this size.</p>
-<p><b>The mini owns the backups; the Mac only adds to them.</b> Each night sm sends the changes since the last backup straight to the mini with restic. There is no second copy on the Mac. The mini accepts new backups but refuses every deletion from the Mac, so a bug, a runaway agent or ransomware on the Mac cannot erase history. How long backups are kept is the mini's own schedule.</p>
+<h3>5. Backups: the remote disk asks, the Mac prepares, the remote disk keeps history</h3>
+<p>The backup lives on an old Mac mini with a large disk at a friend's house in the same city. A disk at another address is safe from what threatens one at home: fire, theft, a power surge. It replaces a cloud drive that is expensive at this size. The mini only calls out to sm's existing web address; nothing new is opened at either house.</p>
+<table>
+<thead><tr><th style="width:5%">#</th><th style="width:22%">Who</th><th>What happens each night</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Mini, 02:30</td><td>Asks sm for tonight's backup, signed in with its own device certificate (the kind your phone uses: enrolled once, no login, no expiry to babysit).</td></tr>
+<tr><td>2</td><td>sm</td><td>Answers at once: "preparing, ready in about 4 minutes". It packs every backed-up file that changed since the mini last confirmed, plus a list of files that were deleted, into an outbox on the cold store.</td></tr>
+<tr><td>3</td><td>Mini</td><td>Comes back when told, downloads the outbox, and checks every part against its fingerprint.</td></tr>
+<tr><td>4</td><td>Mini</td><td>Applies the changes to its own copy of the files and records a restic snapshot of that copy. History, its schedule (7 daily, 4 weekly, 12 monthly) and a weekly integrity check all live on the mini.</td></tr>
+<tr><td>5</td><td>Mini, then sm</td><td>The mini confirms; sm deletes the outbox. An outbox nobody confirms is deleted after 48 hours, and the next night's is worked out from the last confirmed state, so nothing is missed.</td></tr>
+</tbody>
+</table>
 <table>
 <thead><tr><th style="width:28%">Property</th><th>How</th></tr></thead>
 <tbody>
 <tr><td>What is backed up</td><td><code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, and every artifact with no recipe or with GPU spend. Artifacts with a recipe are skipped: losing one costs a rebuild, not data.</td></tr>
-<tr><td>How long backups are kept</td><td>The mini's schedule: 7 daily, 4 weekly and 12 monthly backups; it thins older ones itself every morning.</td></tr>
-<tr><td>How the Mac reaches it</td><td>Through a Cloudflare Tunnel on the mini (no open ports at the friend's house), with a non-expiring Cloudflare Access service token: no login, nothing to renew.</td></tr>
-<tr><td>Who can read it</td><td>restic encrypts everything on the Mac. Thinning needs the restic password, so the mini holds it; its disk is encrypted with FileVault.</td></tr>
-<tr><td>Silence is not success</td><td>sm messages you when two nights fail, and once a week it re-reads 1% of the backup from the mini to prove it restores.</td></tr>
-<tr><td>Size</td><td>About 1.3 TB today: <code>~/data</code> is 0.8 TB of files that are already compressed, so restic shrinks them little; artifacts and projects add about 0.5 TB. A 4 TB disk leaves room for history. The first copy is written over USB at home, then the disk moves.</td></tr>
+<tr><td>Copies on the Mac</td><td>None kept. The outbox holds one night's changes, typically a few GB, until the mini confirms.</td></tr>
+<tr><td>The Mac cannot destroy history</td><td>It only offers files; deleted files stay in the mini's snapshots, and a night that would delete over a tenth of its files is held for you.</td></tr>
+<tr><td>Silence is not success</td><td>sm messages you when two nights pass without a confirmation, or when the mini's weekly check fails.</td></tr>
+<tr><td>The mini's disk</td><td>Its copy (about 1.3 TB today) plus history: 4 TB fits, 6–8 TB leaves room. FileVault on, since it holds the files and the restic password. Seeded over USB at home.</td></tr>
 </tbody>
 </table>
-<p>The spinning drive at home keeps its existing plain copy of <code>~/data</code> untouched; when you connect it, sm adds the same nightly backup to a restic store on it.</p>
 
 <h3>Examples</h3>
 <h4>1. A build's life</h4>
@@ -266,7 +273,7 @@
 <li>Deletion under pressure ranks by gigabytes freed per minute of rebuild; there is no 4-hour cutoff. (15 Oct)</li>
 <li>"Enough" free space is the largest single job output of the last 30 days. (15 Oct)</li>
 <li>Jobs declare the disk they will write, like <code>--memory</code>, and sm makes room or holds them. (15 Oct)</li>
-<li>Backups cover what cannot be rebuilt, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>, sent nightly to an old Mac mini at another house that owns their retention. (15 Oct)</li>
+<li>Backups cover what cannot be rebuilt, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>. An old Mac mini at another house asks for them nightly through sm's existing web address and owns their history. (15 Oct)</li>
 <li>Runpod volumes are out of scope; no per-epic disk budgets, but totals by epic are shown. (26 Sep)</li>
 </ol>
 </div>
@@ -289,7 +296,7 @@
 <tr><td>2. How long unused before "cold"</td><td><b>14 days with no queue job using it, after its consumers close.</b> One setting in sm's config.</td><td>Consumers do most of the work; 14 days only covers a follow-up run soon after a ticket closes.</td></tr>
 <tr><td>3. Starting safely</td><td><b>First 7 days report-only:</b> sm lists every freeze, move and deletion it would make, and does none.</td><td>You see a week of its judgement on real folders before it touches one.</td></tr>
 <tr><td>4. The Artifacts page and its buttons</td><td><b>The page in Figure 3, in sm web and the sm app, with Delete, Thaw, and Keep live 30 days.</b> Only your signed-in account can press them.</td><td>You see what is on disk as one line each, and anything that needs you can be answered from the phone.</td></tr>
-<tr><td>5. When sm tells you about backups</td><td><b>Only when two nightly backups fail, or the weekly restore check fails.</b> A successful night is a line on the Artifacts page, not a message.</td><td>A message every morning would train you to ignore the one that matters.</td></tr>
+<tr><td>5. When sm tells you about backups</td><td><b>Only when the mini has not confirmed for two nights, its weekly check fails, or it holds back a large deletion.</b> A successful night is a line on the Artifacts page, not a message.</td><td>A message every morning would train you to ignore the one that matters.</td></tr>
 <tr><td>6. Review dates</td><td><b>None.</b> Revision 1 brought every folder back to you every 6 months.</td><td>A frozen folder costs almost nothing, and your attention is the scarcest thing here.</td></tr>
 </tbody>
 </table>
@@ -302,7 +309,7 @@
 <tr><td>2</td><td>Queue: <code>--artifact</code>, <code>--input</code>, <code>--disk</code>, recipe capture, commit tags, disk admission, output placement.</td><td>A big job can wait for disk.</td></tr>
 <tr><td>3</td><td>Freeze and thaw, moves to the cold store, the nightly cold check (report-only for 7 days).</td><td>The first digest of would-be freezes.</td></tr>
 <tr><td>4</td><td>The pressure list by score, "enough", the digest.</td><td>Disk stops filling.</td></tr>
-<tr><td>5</td><td>Backups: scope tracking, the nightly run to the mini, failure alerts, the weekly restore check.</td><td>The backup line on the page.</td></tr>
+<tr><td>5</td><td>Backups: the request–prepare–confirm exchange with the mini, the outbox, <code>sm backup pull</code> for the mini, alerts.</td><td>The backup line on the page.</td></tr>
 <tr><td>6</td><td>The Artifacts page (Figure 3) and your three buttons in sm web and the sm app.</td><td>The page.</td></tr>
 <tr><td>7</td><td>First user repo: import the existing folders from their retention notes, new agent instructions, the backup script reads sm's list.</td><td>One message listing what the import could not map.</td></tr>
 </tbody>
@@ -321,7 +328,7 @@
 <li><b>A second disk</b> (the cold store) replaces "no secondary drive".</li>
 <li><b>Freezing replaces expiry</b>: nothing is deleted because its reason lapsed; deletion happens only under disk pressure or by Delete, ranked by gigabytes per rebuild minute, with no 4-hour line.</li>
 <li><b>Records come with the command that makes the folder</b>, with a note and consumers; stray folders are recorded by their maker or the steward, and frozen, not deleted, after 7 days.</li>
-<li><b>New:</b> the Artifacts page in sm web and the app, <code>--disk</code> (was <code>--est-size</code>) with output placement on the cold store, and nightly backups to a remote disk that owns them. <b>Gone:</b> review dates.</li>
+<li><b>New:</b> the Artifacts page in sm web and the app, <code>--disk</code> (was <code>--est-size</code>) with output placement on the cold store, and nightly backups that a remote disk asks for and keeps. <b>Gone:</b> review dates.</li>
 </ul>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
@@ -404,17 +411,15 @@
       cold_store: /Volumes/ColdSSD/artifacts
   backup:
     enabled: false
-    nightly_time: "02:17"        # local
-    command: ~/.config/restic/backup.sh
     static_paths: [~/data, ~/projects, ~/.config]
-    alert_after_failed_nights: 2
-    check_weekday: sun
-    check_read_percent: 1
-    remote:
-      reach_host: 127.0.0.1      # local end of `cloudflared access tcp` (L.4)
-      reach_port: 18000
-      repository: rest:http://127.0.0.1:18000/main
-    local_volume: /Volumes/BackupHDD   # optional occasional second copy</code></pre>
+    puller_devices: [backup-mini]      # device names from sm device enroll (L.3)
+    outbox: /Volumes/ColdSSD/.backup-outbox
+    outbox_part_bytes: 4294967296      # 4 GiB of input per part
+    ready_ttl_hours: 48
+    alert_after_missed_nights: 2
+    max_delete_fraction: 0.1
+    local_volume: /Volumes/BackupHDD   # optional occasional second copy
+    local_command: ~/.config/restic/backup.sh</code></pre>
 <ul>
 <li>Paths go through <code>expand_home</code> (<code>sessions.rs:15510</code>); <code>db_path</code>, <code>mirror_dir</code>, root and cold-store paths go through test isolation like <code>app_artifacts</code> (<code>config.rs:397</code>, <code>isolate_path_from_protected_root</code> at <code>config.rs:518</code>).</li>
 <li><b>Startup validation</b> (refuse to start and print the reason): each root exists and is a directory; each <code>cold_store</code>'s parent volume, when mounted, is APFS (<code>statfs</code> <code>f_fstypename == "apfs"</code>) and on a different <code>st_dev</code> from its root; times parse as <code>HH:MM</code>; <code>floor_percent</code> in 1–50; <code>freeze_level</code> in 1–19. An unmounted cold store is not a startup error (I.4).</li>
@@ -707,34 +712,43 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <ul>
 <li><b>Static paths</b> from config (<code>static_paths</code>), stamped nightly with the G.2 stamp into <code>backup_static</code>.</li>
 <li><b>Artifacts</b>: every recorded artifact in state live or frozen that is not rebuildable (no complete recipe, or any GPU hours or spend), plus unrecorded artifacts. A live one contributes its resolved directory; a frozen one contributes <code>&lt;cold_store&gt;/.frozen/&lt;name&gt;</code>.</li>
-<li>Stamps (<code>backup_stamp</code>, <code>backed_up_at</code>) record what the last successful remote run included.</li>
+<li>Each puller device has a <b>confirmed manifest</b>: the list <code>(path, size, mtime_ns)</code> of every in-scope regular file as of its last acknowledged request (L.2), stored in <code>backup_manifests(device, manifest_id, created_at, acked_at, body BLOB zstd-compressed)</code>. <code>backed_up_at</code> on an artifact is the latest ack whose manifest covered it unchanged.</li>
 </ul>
-<h4>L.2 Nightly run</h4>
+<h4>L.2 The exchange</h4>
+<p>All routes are served only on the mutual-TLS hostname the phone app uses (the <code>mobile_app</code> Cloudflare Access application). sm verifies the Access assertion for that application (<code>cloudflare_access.rs</code>) and requires its <code>common_name</code> to be in <code>puller_devices</code>; other identities get 403 here, and puller devices get 403 everywhere else.</p>
+<table>
+<thead><tr><th style="width:36%">Route</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>POST /backup/requests</code> <code>{have: manifest_id|null}</code></td><td>If an unacknowledged request for this device is <code>preparing</code> or <code>ready</code>, returns it. Otherwise: <code>have</code> must equal the device's latest acked manifest (else 409 <code>{expected}</code>; <code>null</code> is accepted only before the first ack, see seeding). Creates a request, queues the preparation (L.3) as a <code>background</code> queue job, and returns 202 <code>{id, state: "preparing", retry_after_seconds, estimate_bytes}</code>.</td></tr>
+<tr><td><code>GET /backup/requests/{id}</code></td><td><code>{state: preparing|ready|failed|expired|acked, retry_after_seconds?, manifest_id?, parts?: [{n, bytes, sha256}], deletions?, error?}</code>.</td></tr>
+<tr><td><code>GET /backup/requests/{id}/parts/{n}</code></td><td>The part's bytes, with <code>Range</code> support; only while <code>ready</code>.</td></tr>
+<tr><td><code>POST /backup/requests/{id}/ack</code> <code>{applied, snapshot_id?, held_deletions, check?: {ok, read_percent}, error?}</code></td><td><code>applied: true</code> marks the request <code>acked</code>, makes its manifest the device's confirmed manifest, deletes the outbox, and records a <code>backup_runs</code> row. <code>applied: false</code> records the error, keeps the previous confirmed manifest, and deletes the outbox.</td></tr>
+<tr><td><code>POST /backup/renew</code> (CSR)</td><td>From a puller device whose certificate expires within 30 days: a new certificate from the device CA; enrollment code keeps the Access device policy current.</td></tr>
+</tbody>
+</table>
+<p>A <code>ready</code> request not acknowledged within <code>ready_ttl_hours</code> becomes <code>expired</code> and its outbox is deleted; the next request is prepared against the last confirmed manifest, so its delta includes everything the expired one held.</p>
+<h4>L.3 Preparing an outbox</h4>
 <ol>
-<li>At <code>nightly_time</code> (local), unless a backup job is queued or running: write the include list (absolute resolved paths, one per line, static paths first) to <code>~/.local/share/claude-sessions/backup/include-&lt;run id&gt;.txt</code>; record each item's current stamp as pending; if a TCP connect to <code>reach_host:reach_port</code> fails within 10 s, record a run with state <code>unreachable</code> and stop; else submit a queue job <code>--type background --label sm-backup --timeout none</code> running <code>command</code> with <code>SM_BACKUP_INCLUDE</code>, <code>SM_BACKUP_REPOSITORY = remote.repository</code> and <code>SM_BACKUP_MODE=remote</code>; insert a <code>backup_runs</code> row.</li>
-<li>On success: every included item's stamp = its pending stamp, <code>backed_up_at</code> = start time. No message.</li>
-<li>The command runs <code>restic backup</code> only. It never runs <code>forget</code> or <code>prune</code> against the remote repository: retention belongs to the mini (L.5), and the remote refuses deletions from the Mac anyway.</li>
-<li>When <code>local_volume</code> becomes a mount point (its <code>st_dev</code> differs from its parent's) and no run to it succeeded in the last 24 h, the same job runs with <code>SM_BACKUP_MODE=local</code> and <code>SM_BACKUP_REPOSITORY = &lt;local_volume&gt;/restic</code>, followed by the same retention policy as the mini's, run by the command on that repository. It never alerts. The plain data copy already on that volume is not touched.</li>
+<li>Walk the scope (L.1) and build the new manifest. Changed = in the new manifest with a different <code>(size, mtime_ns)</code> or absent from the confirmed one; deleted = in the confirmed one and absent now. <code>.DS_Store</code> is excluded.</li>
+<li>Write <code>&lt;outbox&gt;/&lt;id&gt;/manifest.json</code> (<code>{manifest_id, base: confirmed id, changed_count, deleted:[path]}</code>) and parts <code>part-NNNN.tar.zst</code>: changed files in path order, PAX tar with absolute-path-free names relative to their scope root (prefixed by the root's final segment, e.g. <code>data/…</code>, <code>artifacts/…</code>), zstd level 3 (most bytes are already compressed), up to <code>outbox_part_bytes</code> of input each.</li>
+<li>Any file that changes while being read (size or mtime differs after reading) is left out and stays "changed" for the next night.</li>
+<li>Compute each part's SHA-256; set the request <code>ready</code>. <code>retry_after_seconds</code> while preparing = remaining input bytes / the median packing rate of the last five preparations (default 1 GB/s) + 30 s.</li>
+<li>Preconditions: the cold store is mounted and has free space for the estimate plus its floor; otherwise the request is <code>failed</code> with the reason and the mini retries the next night.</li>
 </ol>
-<h4>L.3 Alerts and the weekly check</h4>
+<p><b>Seeding.</b> <code>sm backup seed --device backup-mini --dest &lt;usb disk&gt;</code> on the Mac writes the full current scope as a plain copy into <code>&lt;dest&gt;/mirror/</code> and records that manifest as the device's confirmed one (acked by the seed command). The mini's first request then sends <code>have</code> = that id.</p>
+<h4>L.4 Alerts</h4>
 <ul>
-<li>When the last <code>alert_after_failed_nights</code> remote runs all failed or were unreachable: one owner message (not blocking): "Backup: no successful backup to the remote disk since &lt;local time&gt; (&lt;n&gt; nights). Last error: &lt;first line of the failure, or 'the remote disk is unreachable'&gt;. Nothing is lost yet; earlier backups are intact." It repeats at most daily; the next success sends "Backups to the remote disk are working again."</li>
-<li>On <code>check_weekday</code> after the nightly run: a queue job running <code>command</code> with <code>SM_BACKUP_MODE=check</code>, which runs <code>restic check --read-data-subset=&lt;check_read_percent&gt;%</code> against the remote repository (reads are allowed in append-only mode). Failure sends a blocking owner message with the last 20 log lines.</li>
-<li>The local volume never alerts: it is occasional by design.</li>
+<li>No acked request for <code>alert_after_missed_nights</code> × 24 h: one owner message (not blocking): "Backup: the remote disk has not confirmed since &lt;local time&gt; (&lt;n&gt; nights). Last state: &lt;no request / preparing failed: … / not acknowledged / applied false: …&gt;. Nothing is lost yet." At most daily; the next ack sends "The remote disk is confirming again."</li>
+<li>An ack with <code>check.ok = false</code>, or with <code>held_deletions &gt; 0</code>: a blocking owner message. For held deletions: "The remote disk held back N deletions (M% of its files). If you meant this, run <code>sm backup allow-deletes</code>." That sets a one-shot flag returned on the next <code>GET</code> as <code>allow_deletes: true</code>.</li>
 </ul>
-<h4>L.4 Reaching the mini (first user's setup, not built by sm)</h4>
+<h4>L.5 The mini</h4>
 <ul>
-<li>The mini runs <code>cloudflared</code> with a Cloudflare Tunnel that publishes its restic server as a TCP application at a hostname under the owner's zone, protected by a Cloudflare Access policy admitting one service token created with duration <i>Non-expiring</i>.</li>
-<li>The Mac runs a launchd job <code>cloudflared access tcp --hostname &lt;backup hostname&gt; --url 127.0.0.1:18000 --service-token-id &lt;id&gt; --service-token-secret &lt;secret&gt;</code>, so restic talks to <code>127.0.0.1:18000</code>. TCP mode avoids two limits of Cloudflare's HTTP proxy path: restic cannot add Access's headers, and proxied request bodies are capped (100 MB on non-enterprise plans). Throughput is measured during the first remote run; nightly changes are small.</li>
+<li>An old Mac mini with FileVault on, sleep disabled, outbound internet only, a 4 TB or larger disk, the sm CLI (not the server), and restic. Enrolled once at home with <code>sm device enroll backup-mini --headless</code>, a new flag that writes the private key and certificate to <code>~/.config/session-manager/device/</code> (mode 0600) because an unattended job cannot answer a keychain prompt.</li>
+<li>A launchd job at 02:30 local runs <code>sm backup pull --api-url https://&lt;mutual-TLS hostname&gt; --dest &lt;disk&gt;</code> (new in ticket 5). It: posts a request with its last confirmed id (kept in <code>&lt;disk&gt;/state.json</code>); polls honouring <code>retry_after_seconds</code> (give up after 3 h); downloads parts with resume, verifying SHA-256; extracts into <code>&lt;disk&gt;/mirror/</code> through temporary names and renames; applies deletions unless they exceed <code>max_delete_fraction</code> of the mirror's files and the request did not carry <code>allow_deletes</code> (then it holds them and reports <code>held_deletions</code>); runs <code>restic -r &lt;disk&gt;/restic backup &lt;disk&gt;/mirror</code>, then <code>forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune</code>, and on Sundays <code>check --read-data-subset=1%</code>; writes <code>state.json</code>; acks.</li>
+<li>The restic password lives in the mini's keychain under a name passed with <code>--restic-password-keychain</code>; retention flags are <code>sm backup pull</code> options with those defaults.</li>
+<li>If the ack fails after the mirror was updated, the next run re-requests with the old <code>have</code>; the delta is re-applied idempotently (same files, same content).</li>
 </ul>
-<h4>L.5 The mini (first user's setup, not built by sm)</h4>
-<ul>
-<li>An old Mac mini with FileVault on, sleep disabled, outbound internet only, and a 4 TB disk.</li>
-<li>launchd runs <code>rest-server --append-only --path &lt;disk&gt;/restic --listen 127.0.0.1:8000</code> (with an htpasswd user for the Mac). Append-only means clients can add data and snapshots and read everything, but cannot delete or overwrite.</li>
-<li>Retention is the mini's: a launchd job at 06:00 local runs <code>restic -r &lt;disk&gt;/restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune</code> against the local path (not through the server), with the restic password in the mini's keychain. It runs after the Mac's 02:17 backup has finished on a normal night; restic's repository lock keeps the two from overlapping on a slow one.</li>
-<li>The first copy is written over USB at home (the disk attached to the Mac, <code>restic init</code> and a full run), then the disk moves.</li>
-</ul>
-<p>The command owns the tool choice. The first user's command runs <code>restic</code> (repository also readable by <code>rustic</code>) with <code>--files-from "$SM_BACKUP_INCLUDE"</code>.</p>
+<p>The occasional local drive: when <code>local_volume</code> becomes a mount point and no run to it succeeded in the last 24 h, sm runs <code>local_command</code> as a queue job with <code>SM_BACKUP_INCLUDE</code> (the scope's paths) and <code>SM_BACKUP_REPOSITORY=&lt;local_volume&gt;/restic</code>; that command owns its own retention. It never alerts. The plain data copy already on that volume is not touched.</p>
 
 <h3 id="M">M. Owner surface</h3>
 <h4>M.1 Messages</h4>
@@ -756,7 +770,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <p><code>ArtifactSummary</code>: <code>name, note, root, state, op, location, hot, origin, disk_bytes, data_bytes, frozen_bytes, epic, ticket, owner_session_name, consumers:[{ref, state}], project, keep_until, keep_live_until, rebuild_seconds, rebuildable, last_used_at, backup_due, needs_owner</code>. <b>Owner only</b> means the request's actor email is not the local bypass actor and maps to a configured user with <code>owner: true</code>.</p>
 <h4>M.3 sm web and the sm app</h4>
 <ul>
-<li><b>Web</b>: new page module <code>crates/sm-server/src/web/artifacts.js</code> (+ <code>artifacts.css</code>) registered in <code>PAGES</code> (<code>web/app.js:26</code>, after Queue) and added to the assets list in <code>http/web.rs</code>, using <code>usePoll(() =&gt; api('/artifacts'), 60000)</code> (<code>web/ui.js:135,179</code>) like <code>LeftoverWorktrees</code> (<code>web/worktrees.js:48</code>), and the queue page's <code>q-tiles</code>/<code>q-card</code>/<code>q-heading</code> styles as in Figure 3a. Layout per memo Figure 3: a bar per filesystem (used, floor and enough marks, outstanding) and a backup line (last successful remote run, bytes sent, last weekly check); then sections <i>Unclaimed</i> (unrecorded, steward-unclaimable, or frozen at grace), <i>Needs you</i> (M.1 items), <i>Hot</i>, <i>Cold, live</i>, <i>Frozen</i>, each with count and total and omitted when empty, rows sorted by size. Each row shows name, size (live → frozen), placement, a GPU badge, the note in italics, consumers with state, rebuild cost, owner and age. A tapped row expands to recipe, recent use, the last 10 events and the owner buttons (Delete; Thaw on frozen rows; Keep live 30 days on live rows), with a confirmation showing size and "not rebuildable" or "input of …" where relevant. An epic filter; a footer with the last 7 days' freezes, thaws, deletions and moves.</li>
+<li><b>Web</b>: new page module <code>crates/sm-server/src/web/artifacts.js</code> (+ <code>artifacts.css</code>) registered in <code>PAGES</code> (<code>web/app.js:26</code>, after Queue) and added to the assets list in <code>http/web.rs</code>, using <code>usePoll(() =&gt; api('/artifacts'), 60000)</code> (<code>web/ui.js:135,179</code>) like <code>LeftoverWorktrees</code> (<code>web/worktrees.js:48</code>), and the queue page's <code>q-tiles</code>/<code>q-card</code>/<code>q-heading</code> styles as in Figure 3a. Layout per memo Figure 3: a bar per filesystem (used, floor and enough marks, outstanding) and a backup line (last confirmation by the remote disk, bytes sent, last weekly check); then sections <i>Unclaimed</i> (unrecorded, steward-unclaimable, or frozen at grace), <i>Needs you</i> (M.1 items), <i>Hot</i>, <i>Cold, live</i>, <i>Frozen</i>, each with count and total and omitted when empty, rows sorted by size. Each row shows name, size (live → frozen), placement, a GPU badge, the note in italics, consumers with state, rebuild cost, owner and age. A tapped row expands to recipe, recent use, the last 10 events and the owner buttons (Delete; Thaw on frozen rows; Keep live 30 days on live rows), with a confirmation showing size and "not rebuildable" or "input of …" where relevant. An epic filter; a footer with the last 7 days' freezes, thaws, deletions and moves.</li>
 <li><b>App</b>: an Artifacts screen following <code>ui/guestbook/GuestbookViewModel.kt</code> + <code>GuestbookScreen.kt</code>, a <code>@GET("artifacts")</code> in <code>data/remote/ApiService.kt</code>, a repository method beside <code>SessionManagerRepository.kt:718</code>, and a navigation entry in <code>ui/navigation/AppNavigation.kt</code> and a bottom-bar tab in <code>AppBottomNav.kt</code>, styled per Figure 3b (<code>Panel</code> cards, <code>SectionHeader</code> labels, <code>Cyan</code> accent). Digest links open the screen at the row.</li>
 </ul>
 
@@ -779,7 +793,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <p>The first user repo's agent-instruction rule about keeping things in the artifacts folder is replaced with:</p>
 <pre><code>**~/artifacts is managed by sm.** Make every folder with its record: `sm queue run --artifact &lt;name&gt; --disk &lt;size&gt; --note "&lt;one plain-English line&gt;" --consumer #&lt;ticket&gt;... [--recipe-complete]` for builds, or `sm artifact new &lt;name&gt; --note "…" --consumer #&lt;ticket&gt;... [--gpu-hours H --gpu-cost USD]` for anything made by hand (run `sm artifact done &lt;name&gt;` when it is complete). Name every ticket that will read it. Add `--recipe-complete` only when re-running the recorded job at its commit rebuilds the folder (build binaries inside the job). Declare what a job reads with `--input &lt;name&gt;`. Folders nobody reads are frozen; a job that names one thaws it automatically; by hand run `sm artifact thaw &lt;name&gt; --wait`. A folder you find holding only FROZEN.md is frozen, not lost.</code></pre>
 <h4>N.3 Backup command</h4>
-<p>The first user's backup script reads <code>SM_BACKUP_INCLUDE</code>, <code>SM_BACKUP_REPOSITORY</code> and <code>SM_BACKUP_MODE</code>, passes the list to restic with <code>--files-from</code> (<code>remote</code>, <code>local</code>) or runs the check (<code>check</code>), runs retention only in <code>local</code> mode, and drops the whole-artifacts-folder paths and the plain data mirror it runs today. The mini is set up per L.4–L.5.</p>
+<p>The first user's backup script becomes the local-drive command: it reads <code>SM_BACKUP_INCLUDE</code> and <code>SM_BACKUP_REPOSITORY</code>, passes the list to restic with <code>--files-from</code>, runs its retention, and drops the whole-artifacts-folder paths and the plain data mirror it runs today. The mini is seeded with <code>sm backup seed</code> and set up per L.5.</p>
 
 <h3 id="O">O. Tickets, code locations and tests</h3>
 <p>Each ticket fits one agent without compaction; file sets are disjoint except where noted, so tickets run in order. Tier per repo rules: Mid (Opus 1M, high) for 1–6, Low (Sonnet 1M, high) for 7.</p>
@@ -790,7 +804,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <tr><td>2</td><td>E, E.6, K.2, D.7, sets</td><td><code>queue.rs</code> (admission :4439, expiry :4675, finish :7425, hold text :7769); <code>http.rs</code> <code>create_queue_job</code> :8108; <code>bin/sm.rs</code> <code>QueueRunArgs</code> :654; <code>git_in</code> helper</td><td>record flags validated at submission and refused without <code>--artifact</code>; pending record applied at success across a multi-job set; success without a pending record triggers the request; a failed job leaves outputs building; input detection (three spellings, cold-store path, boundary char); dirty capture; set union; admission arithmetic with outstanding bytes; placement root → pressure → cold → hold; <code>disk_space</code> and <code>thawing</code> 24 h window vs normal; overrun once; recipe excludes failed jobs; tag push from cwd then mirror; rebuild chain order, success restores live, failure leaves building and excludes from delete</td></tr>
 <tr><td>3</td><td>F, H, I, F.4 nightly freeze, D.4</td><td><code>managed_artifacts/{hotcold,freeze,thaw,moves,ops}.rs</code>; <code>Cargo.toml</code> (<code>tar</code>, <code>zstd</code> with <code>zstdmt</code>)</td><td>each F.1 condition flips hot/cold; GitHub failure ⇒ hot; mirror grep with exclusions; freeze round trip preserves paths, modes, mtimes, symlinks, empty dirs, files &gt; 2 GiB (sparse fixture), <code>._</code> names; part packing boundaries; freeze aborts when the tree changes mid-freeze; corrupt part detected at verify; thaw refuses <code>..</code> paths; placeholder and symlink swaps; crash recovery for each op; move keeps xattrs and transparent compression flag; cold store unmounted ⇒ no ops and one message</td></tr>
 <tr><td>4</td><td>J, M.1 digest</td><td><code>managed_artifacts/{pressure,score,digest}.rs</code>; <code>http/messages.rs</code> reply refusal</td><td>enough per filesystem; score ordering incl. +∞ moves and ties; every J.2 eligibility exclusion; stop rule; ratio sample cached until stamp changes; report-only cascade lists the same actions enforcing would take; step-3 message rate limit; digest sections empty ⇒ no message</td></tr>
-<tr><td>5</td><td>L</td><td><code>managed_artifacts/backup.rs</code></td><td>scope (rebuildable excluded, GPU included, frozen contributes archive path); include file contents; unreachable remote recorded without a job; success updates stamps captured at start, failure does not; remote mode never runs forget or prune; failed-night alert and recovery line; weekly check job and its blocking failure message; local volume runs on mount at most daily and never alerts; missed-fetch alert and recovery line; bad-file report is blocking; local volume by <code>st_dev</code> never alerts</td></tr>
+<tr><td>5</td><td>L</td><td><code>managed_artifacts/backup.rs</code>; <code>bin/sm.rs</code> <code>backup pull</code>, <code>backup seed</code>, <code>backup allow-deletes</code>; device enrollment <code>--headless</code></td><td>scope (rebuildable excluded, GPU included, frozen contributes archive path); request returns the open request instead of a second one; <code>have</code> mismatch 409; delta changed/deleted against the confirmed manifest; file changing mid-read deferred; parts hashed and Range-served only while ready; ack advances the manifest and deletes the outbox, applied=false keeps it; expiry after TTL and the next delta includes the expired one; seed records an acked manifest; device authorization both ways; renewal window; <code>sm backup pull</code> resume, hash check, idempotent re-apply, deletion guard and allow-deletes; missed-night alert and recovery; local volume runs on mount at most daily and never alerts; missed-fetch alert and recovery line; bad-file report is blocking; local volume by <code>st_dev</code> never alerts</td></tr>
 <tr><td>6</td><td>M.2 owner-action, M.3</td><td><code>http.rs</code>; <code>web/artifacts.js</code>, <code>web/app.js</code>, <code>http/web.rs</code>; Android <code>ui/artifacts/*</code>, <code>ApiService.kt</code>, <code>SessionManagerRepository.kt</code>, <code>AppNavigation.kt</code></td><td>owner-action refuses local bypass and non-owner; keep_live arithmetic and thaw; delete of an input reports dependents; web and app render a fixture list</td></tr>
 <tr><td>7</td><td>N</td><td>first user repo instructions; its backup script; operational import</td><td>after import, <code>sm artifact list --state unrecorded</code> holds only the entries on the owner list</td></tr>
 </tbody>
