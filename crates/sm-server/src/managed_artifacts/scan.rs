@@ -114,6 +114,13 @@ impl ManagedArtifacts {
             let name = a["name"].as_str().unwrap();
             match fs::symlink_metadata(Path::new(&root.path).join(name)) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Queue submission records outputs before admission creates
+                    // their folders. Only an unstarted reservation excuses absence.
+                    if a["state"] == "building"
+                        && super::submission::awaiting_placement(&tx, &root.path, name)?
+                    {
+                        continue;
+                    }
                     tx.execute("UPDATE artifacts SET state='deleted',deleted_at=?3,deleted_by='unknown',delete_reason='vanished' WHERE root=?1 AND name=?2",params![root.path,name,now()])?;
                     event(&tx, &root.path, name, "vanished", "sm", json!({}))?;
                 }

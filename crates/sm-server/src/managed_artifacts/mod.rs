@@ -5,6 +5,7 @@ pub mod config;
 pub mod delete;
 pub mod scan;
 pub mod store;
+pub mod submission;
 use anyhow::{bail, Result};
 use config::{ArtifactRoot, ManagedArtifactsConfig};
 use rusqlite::{params, Connection, TransactionBehavior};
