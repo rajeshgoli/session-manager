@@ -258,7 +258,7 @@
 
 <h3>Examples</h3>
 <h4>1. A build's life</h4>
-<p>The build in section 1 runs 22 minutes and writes 47 GB; its record is complete when it succeeds. <code>--recipe-complete</code> is the agent's word that re-running the job at its commit rebuilds the folder; sm tags that commit on GitHub so it survives the squash merge. While #4211 is open the folder is hot. Fourteen days after #4211 closes and nothing has used it, sm freezes it: 47 GB becomes about 1 GB. If a job names it again in March, the job waits about 30 seconds for the thaw.</p>
+<p>The build in section 1 runs 22 minutes and writes 47 GB; its record is complete when it succeeds, and sm tags its commit on GitHub so the recipe survives the squash merge. While #4211 is open the folder is hot. Fourteen days after #4211 closes and nothing has used it, sm freezes it: 47 GB becomes about 1 GB. If a job names it again in March, the job waits about 30 seconds for the thaw.</p>
 <h4>2. A job that does not fit</h4>
 <p>The Mac has 300 GB free; the floor is 180 GB; a running job has declared 60 GB more. A new job declares 150 GB: 300 − 60 − 150 = 90, below the floor by 90 GB. sm moves an idle 193 GB folder to the cold store, which takes about a minute, and the job starts.</p>
 
@@ -318,7 +318,7 @@
 <h3>Risks</h3>
 <ul>
 <li><b>A folder read outside the queue gets no warning before it freezes.</b> The agent finds <code>FROZEN.md</code>, runs <code>sm artifact thaw</code>, and waits a minute.</li>
-<li><b>A wrong "recipe complete" makes a deletion permanent.</b> For example, the job used a binary built outside the queue. Mitigations: the report-only week; the agent instruction that recipe jobs build what they use; and deletion is the last resort, after moving and freezing.</li>
+<li><b>A wrong "recipe complete" makes a deletion permanent</b>, for example when the job used a binary built outside the queue. Deletion comes last, after moves and freezes, and the agent instruction says recipe jobs build what they use.</li>
 <li><b>The cold store is unplugged.</b> Moved and frozen folders become unreadable and their paths fail loudly. sm checks the cold store is mounted before any move, freeze or thaw, and pauses all three, with one message to you, while it is missing.</li>
 <li><b>GitHub cannot be reached.</b> Every consumer counts as open, so nothing goes cold.</li>
 </ul>
