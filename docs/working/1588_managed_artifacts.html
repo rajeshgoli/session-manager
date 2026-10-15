@@ -234,7 +234,7 @@
 <p>A job that writes an artifact says how much: <code>sm queue run --artifact 4210_dataset --disk 60G …</code>. Space other running jobs have declared but not yet written counts as taken. The job starts when its declared size fits above the floor. If it does not fit, sm runs the pressure list. If the Mac is still short but the cold store has room, sm places the job's output folder on the cold store behind a symlink before it starts, so the job writes there without knowing. Otherwise the job waits, up to 24 hours, and starts by itself when space frees. A job that writes more than 1.5 times what it declared gets one warning; sm does not stop it, because running out of disk does not take the machine down the way running out of memory does.</p>
 
 <h3>5. Backups: the remote disk asks, the Mac prepares, the remote disk keeps history</h3>
-<p>The backup lives on an old Mac mini with a large disk at a friend's house in the same city. A disk at another address is safe from what threatens one at home: fire, theft, a power surge. It replaces a cloud drive that is expensive at this size. The mini only calls out to sm's existing web address; nothing new is opened at either house.</p>
+<p>The backup lives on an old Mac mini at a friend's house in the same city, safe from what threatens a disk at home (fire, theft, a power surge), replacing an expensive cloud drive. The mini only calls out to sm's existing web address; nothing new is opened at either house.</p>
 <table>
 <thead><tr><th style="width:5%">#</th><th style="width:22%">Who</th><th>What happens each night</th></tr></thead>
 <tbody>
@@ -248,7 +248,7 @@
 <table>
 <thead><tr><th style="width:28%">Property</th><th>How</th></tr></thead>
 <tbody>
-<tr><td>What is backed up</td><td><code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, and every artifact with no recipe or with GPU spend. Artifacts with a recipe are skipped: losing one costs a rebuild, not data.</td></tr>
+<tr><td>What is backed up</td><td><code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, artifacts with no recipe or with GPU spend, and artifacts that rebuild slower than their compressed copy writes to the backup disk (~20 MB/s): a 20-minute chain ships as 7 GB in 6 minutes, so it is backed up.</td></tr>
 <tr><td>Copies on the Mac</td><td>None kept. The outbox holds one night's changes, compressed, until the mini confirms: typically a few GB, at most the largest new folder that cannot be rebuilt. The cold store has 1.8 TB free.</td></tr>
 <tr><td>The Mac cannot destroy history</td><td>It only offers files; old versions stay in the holding folders for their full time, and a night that would delete over a tenth of the files is held for you.</td></tr>
 <tr><td>Silence is not success</td><td>sm messages you when two nights pass without a confirmation, or when the mini's weekly re-check of 1% of its files against their fingerprints fails.</td></tr>
@@ -273,7 +273,7 @@
 <li>Deletion under pressure ranks by gigabytes freed per minute of rebuild; there is no 4-hour cutoff. (15 Oct)</li>
 <li>"Enough" free space is the largest single job output of the last 30 days. (15 Oct)</li>
 <li>Jobs declare the disk they will write, like <code>--memory</code>, and sm makes room or holds them. (15 Oct)</li>
-<li>Backups cover what cannot be rebuilt, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>. An old Mac mini at another house asks for them nightly through sm's existing web address and owns their history. (15 Oct)</li>
+<li>Backups cover what cannot be rebuilt, or rebuilds slower than the backup disk can write it, plus <code>~/data</code>, <code>~/projects</code> and <code>~/.config</code>. An old Mac mini at another house asks for them nightly through sm's existing web address and owns their history. (15 Oct)</li>
 <li>Runpod volumes are out of scope; no per-epic disk budgets, but totals by epic are shown. (26 Sep)</li>
 </ol>
 </div>
@@ -419,7 +419,8 @@
     alert_after_missed_nights: 2
     max_delete_fraction: 0.1
     plain_paths: [~/data]            # kept as plain files on the mini
-    holding_days: {default: 30, ~/projects: 60, ~/.config: 300}   # by scope root</code></pre>
+    holding_days: {default: 30, ~/projects: 60, ~/.config: 300}   # by scope root
+    backup_rate_default: 20MB          # per second, until measured (L.1)</code></pre>
 <ul>
 <li>Paths go through <code>expand_home</code> (<code>sessions.rs:15510</code>); <code>db_path</code>, <code>mirror_dir</code>, root and cold-store paths go through test isolation like <code>app_artifacts</code> (<code>config.rs:397</code>, <code>isolate_path_from_protected_root</code> at <code>config.rs:518</code>).</li>
 <li><b>Startup validation</b> (refuse to start and print the reason): each root exists and is a directory; each <code>cold_store</code>'s parent volume, when mounted, is APFS (<code>statfs</code> <code>f_fstypename == "apfs"</code>) and on a different <code>st_dev</code> from its root; times parse as <code>HH:MM</code>; <code>floor_percent</code> in 1–50; <code>freeze_level</code> in 1–19. An unmounted cold store is not a startup error (I.4).</li>
@@ -711,7 +712,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <h4>L.1 Scope</h4>
 <ul>
 <li><b>Static paths</b> from config (<code>static_paths</code>), stamped nightly with the G.2 stamp into <code>backup_static</code>.</li>
-<li><b>Artifacts</b>: every recorded artifact in state live or frozen that is not rebuildable (no complete recipe, or any GPU hours or spend), plus unrecorded artifacts. A live one contributes its resolved directory; a frozen one contributes <code>&lt;cold_store&gt;/.frozen/&lt;name&gt;</code>.</li>
+<li><b>Artifacts</b>: every recorded artifact in state live or frozen that is not rebuildable (no complete recipe, or any GPU hours or spend), or whose <code>rebuild_seconds</code> exceeds <code>ship_bytes / backup_rate</code>, plus unrecorded artifacts. <code>ship_bytes</code> is the compressed size the outbox would carry: <code>frozen_bytes</code> for a frozen artifact, else <code>data_bytes / ratio_estimate</code> (J.2). <code>backup_rate</code> is the median of <code>bytes / seconds</code> over the last ten acknowledged requests larger than 1 GB, from the mini's reported apply time (add <code>apply_seconds</code> to the ack), with <code>backup_rate_default</code> (20 MB/s) until ten exist. The decision is re-evaluated nightly; an artifact that leaves the scope is reported as deleted to the mini and follows its holding time. A live one contributes its resolved directory; a frozen one contributes <code>&lt;cold_store&gt;/.frozen/&lt;name&gt;</code>.</li>
 <li>Each puller device has a <b>confirmed manifest</b>: the list <code>(path, size, mtime_ns)</code> of every in-scope regular file as of its last acknowledged request (L.2), stored in <code>backup_manifests(device, manifest_id, created_at, acked_at, body BLOB zstd-compressed)</code>. <code>backed_up_at</code> on an artifact is the latest ack whose manifest covered it unchanged.</li>
 </ul>
 <h4>L.2 The exchange</h4>
@@ -722,7 +723,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <tr><td><code>POST /backup/requests</code> <code>{have: manifest_id|null}</code></td><td>If an unacknowledged request for this device is <code>preparing</code> or <code>ready</code>, returns it. Otherwise: <code>have</code> must equal the device's latest acked manifest (else 409 <code>{expected}</code>; <code>null</code> is accepted only before the first ack, see seeding). Creates a request, queues the preparation (L.3) as a <code>background</code> queue job, and returns 202 <code>{id, state: "preparing", retry_after_seconds, estimate_bytes}</code>.</td></tr>
 <tr><td><code>GET /backup/requests/{id}</code></td><td><code>{state: preparing|ready|failed|expired|acked, retry_after_seconds?, manifest_id?, parts?: [{n, bytes, sha256}], deletions?, error?}</code>.</td></tr>
 <tr><td><code>GET /backup/requests/{id}/parts/{n}</code></td><td>The part's bytes, with <code>Range</code> support; only while <code>ready</code>.</td></tr>
-<tr><td><code>POST /backup/requests/{id}/ack</code> <code>{applied, held_deletions, check?: {ok, files_checked, bad:[path]}, error?}</code></td><td><code>applied: true</code> marks the request <code>acked</code>, makes its manifest the device's confirmed manifest, deletes the outbox, and records a <code>backup_runs</code> row. <code>applied: false</code> records the error, keeps the previous confirmed manifest, and deletes the outbox.</td></tr>
+<tr><td><code>POST /backup/requests/{id}/ack</code> <code>{applied, apply_seconds, held_deletions, check?: {ok, files_checked, bad:[path]}, error?}</code></td><td><code>applied: true</code> marks the request <code>acked</code>, makes its manifest the device's confirmed manifest, deletes the outbox, and records a <code>backup_runs</code> row. <code>applied: false</code> records the error, keeps the previous confirmed manifest, and deletes the outbox.</td></tr>
 <tr><td><code>POST /backup/renew</code> (CSR)</td><td>From a puller device whose certificate expires within 30 days: a new certificate from the device CA; enrollment code keeps the Access device policy current.</td></tr>
 </tbody>
 </table>
