@@ -115,9 +115,9 @@
 
 <p>Three facts make this worth doing now:</p>
 <ul>
-<li><b>You are sm's product manager, and sm learns nothing from watching you.</b> It records which docs you open, when you answer agents and what you type into sessions, but no one reads that record to improve sm.</li>
-<li><b>Reading your habits off stored state goes wrong.</b> In one session I misread you twice. I took 136 messages never marked "handled" to mean you were behind; you had dealt with all of them. I took a quiet web inbox to mean the inbox was dead; you use it on Android as an alert for things you are expecting. A PM has to learn from behaviour, by surface, and test before acting.</li>
-<li><b>Quota expires unused most weeks.</b> Over the last eight weeks, Claude's weekly meter peaked between 39% and 92%; in a typical week more than 40 points expire. Codex peaked between 17% and 90%. A PM funded mostly from that surplus pays for itself from day 0.</li>
+<li><b>You are sm's product manager, and sm learns nothing from watching you.</b></li>
+<li><b>Reading your habits off stored state goes wrong.</b> In one session I misread you twice: I took unmarked messages for a backlog, and a quiet web inbox for a dead feature. You work from docs, and use the Android inbox as an alert. A PM must learn from behaviour, by surface, and test before acting.</li>
+<li><b>Quota expires unused most weeks.</b> Claude's weekly meter peaked at 39–92% over the last eight weeks, so 40+ points usually expire; Codex peaked at 17–90%. A PM funded mostly from that surplus pays for itself from day 0.</li>
 </ul>
 
 <figure>
@@ -179,20 +179,9 @@
 <p>The board carries all of it. #2170 is the goal and its lane is the autopm lane. Each Monday sm opens a cycle ticket under it and wakes the auto PM. The auto PM files each experiment's build tickets under the cycle ticket. sm auto-starts those tickets within budget, one fresh agent per ticket, in the normal workflow: PR, review, merge on a clean review, restart. The auto PM stays one seat for weeks. sm's default context handoff hands it to a fresh successor when its context fills, and its role, reminders and claims move with it.</p>
 
 <h3>What it sees</h3>
+<p>Today sm keeps your doc opens, message reads and replies, and agent time and tokens. It does not keep which surface you used, which screen, or whether a push brought you there. Ticket 1 adds a local activity log of exactly that: routes, ids, screens and timing, never message or prompt text (Appendix A has the before/after table). Typing into the Claude app and typing in a terminal look the same to sm, and stay that way.</p>
 
-<table>
-<thead><tr><th>Signal</th><th>Today</th><th>After ticket 1</th></tr></thead>
-<tbody>
-<tr><td>Which surface you used: Android app, web, typing into an agent, app terminal</td><td>Not stored. The server can tell Android from web per request but keeps nothing.</td><td>Every owner action, tagged by surface and device</td></tr>
-<tr><td>Which screen, and whether you arrived from a push</td><td>No</td><td>Yes, once the app sends two small headers (one app install)</td></tr>
-<tr><td>Docs you open</td><td>Latest view per revision only</td><td>Every open, with surface</td></tr>
-<tr><td>You typed to an agent (as you did in this session)</td><td>Inferred for Analytics › Time; not stored as an event</td><td>Stored per prompt. Claude app versus terminal stays indistinguishable; the hook does not say.</td></tr>
-<tr><td>Agent time, tokens and quota</td><td>Yes: <code>activity.db</code>, <code>usage.db</code>, Analytics › Spend and Time</td><td>Unchanged; the auto PM reads them</td></tr>
-<tr><td>Your reaction to a specific change</td><td>Bug reports only</td><td>Thumbs up or down per live change, optional</td></tr>
-</tbody>
-</table>
-
-<p>The tickets you file and the lanes you order are its strongest signal of what you want from sm. It reads them, and it never works in an area one of your open tickets covers.</p>
+<p>Your own tickets and lane order are its strongest signal of what you want; it never works where one of your open tickets does.</p>
 
 <h3>What it may do alone, and what it must ask</h3>
 
@@ -200,7 +189,7 @@
 <thead><tr><th style="width:22%">Kind of change</th><th>Path</th><th style="width:34%">Why</th></tr></thead>
 <tbody>
 <tr><td>Server, CLI and web behaviour behind a switch</td><td><b>Ships alone.</b> Merged switched off, then switched on.</td><td>Off is today's behaviour: restored in under a second on the server, and within 30 seconds in an open app.</td></tr>
-<tr><td>Bug fixes with no lasting side effects: no rows rewritten or deleted, no messages, pushes or GitHub writes, no board changes</td><td><b>Ships alone.</b> Revert is a commit revert plus the restart script.</td><td>A commit revert undoes all of it.</td></tr>
+<tr><td>Bug fixes with no lasting side effects: no rows rewritten or deleted, no messages, pushes or GitHub writes, no board changes</td><td><b>Ships alone</b>, as an ordinary reviewed PR, the way any agent's fix ships today. It is not an experiment and is not measured.</td><td>A commit revert undoes all of it.</td></tr>
 <tr><td>Changes whose only lasting effect is adding new rows in their own new tables</td><td><b>Ships alone</b>, behind a switch.</td><td>Switching off stops the writes; the old data is untouched.</td></tr>
 <tr><td>Docs, owner pages and the doc reader</td><td><b>Ships alone</b>, behind a switch.</td><td>Served by the server, so the Android app shows them with no install.</td></tr>
 <tr><td>Android app features</td><td><b>Ships alone</b>, but only inside an app update you install, with the feature off until switched on. At most one app update a week.</td><td>The install is yours; everything after it is revertable.</td></tr>
@@ -216,8 +205,68 @@
 <p>Thumbs are optional, and silence counts as neutral. The app gets a small "What changed" card listing live changes with 👍 / 👎. 👎 reverts immediately.</p>
 <p>The auto PM is measured too. Each readout reports changes kept against changes tried, points spent per kept change, and your thumbs. <b>After four straight cycles with no kept change, sm pauses the auto PM and tells you once.</b></p>
 
+<h3>What you will see</h3>
+<figure>
+<svg viewBox="0 0 690 440" role="img" aria-label="Wireframes: Settings, What changed card, a changed screen">
+  <style>.ph{fill:var(--surface);stroke:var(--ink-3);stroke-width:1.5} .hd{font:600 12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)} .tx{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)} .mu{font:10px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)} .cd{fill:var(--surface-2);stroke:var(--rule)} .bt{fill:var(--surface);stroke:var(--ink-3)} .on{fill:var(--green)} .bar{fill:var(--rule)} .bl{fill:var(--blue)} .or{fill:var(--orange)}</style>
+  <!-- Phone 1: Settings › Auto PM -->
+  <rect class="ph" x="5" y="5" width="220" height="420" rx="18"/>
+  <text class="hd" x="20" y="35">‹ Settings · Auto PM</text>
+  <rect class="cd" x="18" y="48" width="194" height="40" rx="6"/><text class="tx" x="28" y="72">Auto PM on</text><rect class="on" x="168" y="60" width="32" height="16" rx="8"/><circle cx="192" cy="68" r="6" fill="#fff"/>
+  <rect class="cd" x="18" y="96" width="194" height="40" rx="6"/><text class="tx" x="28" y="114">Skip this week</text><text class="mu" x="28" y="128">Allowance 0 until Oct 18 reset</text><rect class="bt" x="160" y="106" width="42" height="20" rx="10"/><text class="mu" x="168" y="120">Skip</text>
+  <text class="mu" x="20" y="158">THIS WEEK'S BUDGET (points)</text>
+  <text class="tx" x="20" y="178">Claude</text><text class="mu" x="160" y="178">7 of 20</text><rect class="bar" x="20" y="184" width="190" height="7" rx="3"/><rect class="bl" x="20" y="184" width="66" height="7" rx="3"/>
+  <text class="tx" x="20" y="208">Codex</text><text class="mu" x="160" y="208">18 of 50</text><rect class="bar" x="20" y="214" width="190" height="7" rx="3"/><rect class="bl" x="20" y="214" width="68" height="7" rx="3"/>
+  <text class="mu" x="20" y="244">LIVE CHANGES</text>
+  <rect class="cd" x="18" y="252" width="194" height="36" rx="6"/><text class="tx" x="28" y="274">2 live · 1 measuring  ›</text>
+  <rect class="cd" x="18" y="296" width="194" height="36" rx="6"/><text class="tx" x="28" y="318">Latest readout: W43  ›</text>
+  <rect class="cd" x="18" y="340" width="194" height="36" rx="6"/><text class="tx" x="28" y="358">Waiting on you: 1 decision</text><text class="mu" x="28" y="370">shadow-tested · tap to answer</text>
+  <text class="mu" x="20" y="404">Turning Auto PM off switches</text><text class="mu" x="20" y="416">every change off and holds it.</text>
+  <!-- Phone 2: What changed card -->
+  <rect class="ph" x="235" y="5" width="220" height="420" rx="18"/>
+  <text class="hd" x="250" y="35">‹ What changed</text>
+  <rect class="cd" x="248" y="50" width="194" height="110" rx="6"/>
+  <text class="tx" x="258" y="70">Decision card on asks</text><text class="mu" x="258" y="86">Judgment asks open with the</text><text class="mu" x="258" y="98">choices and one button each.</text><text class="mu" x="258" y="116">Live since Oct 21 · measured Nov 4</text>
+  <rect class="bt" x="258" y="128" width="40" height="22" rx="11"/><text class="tx" x="270" y="143">👍</text><rect class="bt" x="306" y="128" width="40" height="22" rx="11"/><text class="tx" x="318" y="143">👎</text><text class="mu" x="356" y="143">optional</text>
+  <rect class="cd" x="248" y="170" width="194" height="110" rx="6"/>
+  <text class="tx" x="258" y="190">Awaited-reply pushes</text><text class="mu" x="258" y="206">Replies to your own asks get</text><text class="mu" x="258" y="218">their own notification class.</text><text class="mu" x="258" y="236">Live since Oct 23 · measured Nov 6</text>
+  <rect class="bt" x="258" y="248" width="40" height="22" rx="11"/><text class="tx" x="270" y="263">👍</text><rect class="bt" x="306" y="248" width="40" height="22" rx="11"/><text class="tx" x="318" y="263">👎</text>
+  <text class="mu" x="250" y="304">👎 switches that change off at</text><text class="mu" x="250" y="316">once; only you can turn it back on.</text>
+  <text class="mu" x="250" y="340">RECENTLY ENDED</text>
+  <text class="tx" x="250" y="360">Inbox badge in board header</text><text class="mu" x="250" y="374">Reverted Oct 19 · missed its bar</text>
+  <!-- Phone 3: a changed screen with chip -->
+  <rect class="ph" x="465" y="5" width="220" height="420" rx="18"/>
+  <text class="hd" x="480" y="35">‹ Day plans: first plan</text>
+  <rect x="478" y="46" width="194" height="22" rx="11" fill="var(--surface-2)" stroke="var(--orange)"/><text class="mu" x="488" y="61">✦ New: decision card   👍  👎   ✕</text>
+  <rect class="cd" x="478" y="78" width="194" height="170" rx="6"/>
+  <text class="tx" x="488" y="98">Your call on #2114</text>
+  <text class="mu" x="488" y="114">Agent recommends: worth your time,</text><text class="mu" x="488" y="126">so iteration 2 gets filed.</text>
+  <rect class="bt" x="488" y="140" width="174" height="26" rx="6"/><text class="tx" x="498" y="157">Worth my time</text>
+  <rect class="bt" x="488" y="172" width="174" height="26" rx="6"/><text class="tx" x="498" y="189">Unclear: plan one more day</text>
+  <rect class="bt" x="488" y="204" width="174" height="26" rx="6"/><text class="tx" x="498" y="221">Fix the agent's view first</text>
+  <rect class="bar" x="478" y="262" width="194" height="8" rx="3"/><rect class="bar" x="478" y="278" width="160" height="8" rx="3"/><rect class="bar" x="478" y="294" width="180" height="8" rx="3"/><rect class="bar" x="478" y="310" width="120" height="8" rx="3"/>
+  <text class="mu" x="480" y="340">The doc follows as today.</text>
+</svg>
+<figcaption>Wireframes, not final design; the build agent matches each to the app's existing style. Left: Settings › Auto PM (on/off, skip this week, budget, waiting decisions). Middle: the "What changed" list with optional thumbs. Right: a changed screen with its dismissible chip, here the decision card from the first worked example.</figcaption>
+</figure>
+
+<h3>How one change gets built</h3>
+<table>
+<thead><tr><th style="width:4%">#</th><th style="width:22%">Step</th><th>Artifact</th><th style="width:24%">Checked by</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Find the friction</td><td>A query over the activity log showing the pattern, with counts</td><td>The auto PM, with Sonnet helpers</td></tr>
+<tr><td>2</td><td>Plan</td><td>A short plan doc: hypothesis, evidence, change, path, metric and guards, side effects, budget. <b>Any visible change includes a mock</b> for each affected surface, drawn in the plan as HTML or SVG.</td><td>Codex reviewer, through <code>sm request-review</code>. The review covers the mock too: does it show what the plan claims, on every surface it touches?</td></tr>
+<tr><td>3</td><td>Plan merges</td><td>The merge commit is recorded</td><td>sm refuses anything later unless this happened after a completed review</td></tr>
+<tr><td>4</td><td>Build</td><td>A PR per ticket, by a fresh agent. Visible changes carry screenshots from the Android emulator and the web, beside the mock.</td><td>Codex reviewer, as for any sm PR. The off-equals-today test must pass.</td></tr>
+<tr><td>5</td><td>Ship and switch on</td><td>Deployed switched off; then switched on</td><td>sm's gates, the health guard</td></tr>
+<tr><td>6</td><td>Measure and decide</td><td>Result row: keep, extend or revert</td><td>sm, from the committed query</td></tr>
+<tr><td>7</td><td>Learn</td><td>Playbook entry and weekly readout, with screenshots of what is live</td><td>Codex reviewer on the readout PR</td></tr>
+</tbody>
+</table>
+<p><b>What it may change about its own workflow.</b> The steps sm enforces stay fixed unless you approve a change: plan review before building, the gates, measurement, budget, its powers and the ask-only list. Changing any of them is itself an ask-only change. Everything else is the auto PM's to improve from what it learns, and it records each change in the playbook's Method section with its reason. That covers how it researches, what goes in a plan beyond the required parts, how it draws mocks, how it sizes tickets, and when in the week it does what.</p>
+
 <h3>How it learns</h3>
-<p>The playbook is one Markdown file in git, capped at 300 lines, in five fixed sections: how you work (observed patterns, each with evidence and date), what worked, what did not, standing rules, and ranked open hypotheses. The auto PM reads it at the start of every cycle, and every handoff brief points its successor to it. It changes only through the cycle's readout PR, so you can read or edit it like any file. It starts from what this session learned:</p>
+<p>The playbook is one Markdown file in git, capped at 1,500 lines, about 20,000 tokens: roughly 2% of the auto PM's context, read once per cycle and once per handoff. It holds conclusions, not data. Each entry is a few lines that link to the plan doc and measurement record behind it, so the evidence never has to fit in the file. It has six fixed sections: how you work (observed patterns, each with evidence and date), what worked, what did not, standing rules, its own method, and ranked open hypotheses. The auto PM reads it at the start of every cycle, and every handoff brief points its successor to it. It changes only through the cycle's readout PR, so you can read or edit it like any file. It starts from what this session learned:</p>
 <ul>
 <li>You work from docs, not the inbox.</li>
 <li>On Android, the inbox is an alert for things you are expecting.</li>
@@ -228,27 +277,27 @@
 
 <h3>Two worked examples</h3>
 <p><b>Heavy asks.</b> Hypothesis: asks that require reading a long artifact wait several times longer than yes/no asks. #2114 has waited since 2026-10-14 on a single three-way call about a day plan. Change: when an agent asks you to judge a doc, the doc reader opens with a decision card: the choices, the agent's recommendation in two lines, and one button each. Metric: median hours from ask to decision for judgment asks, from the activity log and doc review records. Bar: at least 25% faster across 14 days, with no rise in reversed decisions. Path: doc reader, behind a switch, no install. It ships alone.</p>
-<p><b>Inbox alerts.</b> Hypothesis: you open the Android inbox mostly within minutes of a push about something you asked for, and rarely otherwise. First the auto PM checks that this pattern exists in two weeks of the activity log. If it does, the change marks the pushes you are waiting on (replies to your own asks) as a separate, higher-priority class. Metric: minutes from push to open for those pushes, plus inbox opens with no push behind them as a guard. If the pattern is not there, the playbook records that and nothing ships.</p>
+<p><b>Inbox alerts.</b> It first checks two weeks of the activity log for the pattern you described: Android inbox opens cluster just after pushes about things you asked for. If the pattern holds, it gives those pushes their own class and measures minutes from push to open. If not, the playbook records that and nothing ships.</p>
 
 <h3>Budget</h3>
 <p>Each provider's allowance is a dedicated amount plus surplus. The surplus is quota the projection says will expire, released only from day four of the week and only beyond a 20-point safety margin. sm counts the auto PM's spend across its own seat and successors, the agents building its tickets, and the reviews of their PRs. Each build ticket reserves its estimated cost when it starts, and sm refuses a start whose estimate exceeds what is left unreserved. Overshoot is therefore limited to estimation error. At zero, agents mid-ticket reach a safe stopping point and stop. "Skip this week" in Settings sets that week's allowance to zero. The auto PM's own thinking runs on Claude. Building prefers Codex, which has the most unused quota.</p>
 
 <h3>What it costs you</h3>
 <ul>
-<li><b>Once:</b> reviewing this memo, switching it on in Settings, and installing one app update.</li>
-<li><b>Weekly, optional:</b> a one-page readout published as a doc, with no notification. You see it among your docs if you look.</li>
-<li><b>At most one message a week</b>, and only when a shadow-built change needs your yes or no. It holds up to three decisions, each answerable in one word. Unanswered after 14 days counts as no. Each decision says plainly what the shadow run could and could not test. Changes to agent instructions or other repos can only be checked offline in shadow mode; their real effect is measured after you say yes, like any other change.</li>
+<li><b>Once:</b> reviewing this memo, switching it on, and installing one app update.</li>
+<li><b>Weekly, optional:</b> a one-page readout among your docs, with no notification.</li>
+<li><b>At most one message a week</b>, only for shadow-built changes: up to three yes/no decisions, each saying what the shadow run could and could not test. No answer within 14 days means no.</li>
 </ul>
 
 <h3>Risks</h3>
 <table>
 <thead><tr><th style="width:28%">Risk</th><th>Control</th></tr></thead>
 <tbody>
-<tr><td>It breaks sm, the thing you rely on to see your agents</td><td>Switches, health guard, kill switch, and the normal review plus blue/green restart. Restart and deploy scripts are ask-only, so the revert path never depends on its own change.</td></tr>
-<tr><td>It games its own metrics</td><td>The test is fixed and committed before building. The bar is high and must hold for two weeks, and guard metrics must hold too.</td></tr>
-<tr><td>It bloats sm, already about 30% of your Claude spend</td><td>At most three live changes. Hiding unused features is a first-class outcome. Every change counts against budget.</td></tr>
-<tr><td>It collides with your own sm work</td><td>It never edits files an open claim's PR changes, and it queues behind your tickets with <code>sm board after</code>.</td></tr>
-<tr><td>It drifts from what you want</td><td>It reads your tickets and lane order; thumbs and the four-cycle auto-pause catch drift that slips past that.</td></tr>
+<tr><td>It breaks sm</td><td>Switches, health guard, kill switch, normal review and blue/green restart; deploy scripts are ask-only so the undo path cannot break itself.</td></tr>
+<tr><td>It games its metrics</td><td>The test is committed before building; sm runs it; the bar is high, two weeks, with guards.</td></tr>
+<tr><td>It bloats sm (already ~30% of your Claude spend)</td><td>At most three live changes; hiding unused features counts as a win; everything is budgeted.</td></tr>
+<tr><td>It collides with your work</td><td>Never edits files under an open claim; queues behind your tickets.</td></tr>
+<tr><td>It drifts from what you want</td><td>Reads your tickets and lane order; thumbs; auto-pause after four empty cycles.</td></tr>
 </tbody>
 </table>
 
@@ -280,7 +329,16 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision.</p>
+<p>Changes since the version you reviewed (24cb1f3):</p>
+<ul>
+<li><b>Playbook cap:</b> 1,500 lines instead of 300, with evidence kept in linked plan docs. A sixth section, Method, records how the auto PM works and how it changes that.</li>
+<li><b>New: "What you will see"</b>, wireframes of Settings › Auto PM, the What changed list, and a changed screen.</li>
+<li><b>New: "How one change gets built"</b>, the step-by-step workflow. Mocks are required in plans for any visible change and are reviewed by Codex; build PRs carry screenshots. The auto PM may improve its own method; changing the steps sm enforces is ask-only.</li>
+<li><b>Switch-off reach:</b> under a second on the server, and within 30 seconds in an open app (it previously said under a second everywhere).</li>
+<li><b>Bug fixes</b> ship as ordinary reviewed PRs, not as experiments. Every change that goes live unattended has a switch; a change that cannot have one goes live only on your yes, with its rollback stated in the ask.</li>
+<li><b>"What it sees"</b> is now a paragraph; its table moved to Appendix A.</li>
+<li><b>Appendix-only fixes from three Codex rounds:</b> side-effect rules, held switches, budget reservations, server-enforced plan gates, shadow evidence per class, guard history, the measurement contract, a fail-closed budget when quota data is stale, and direct safety reverts in the state machine.</li>
+</ul>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -298,6 +356,18 @@
 </div>
 
 <h3 id="a">A. Owner activity log</h3>
+<p><b>A.0 What changes.</b></p>
+<table>
+<thead><tr><th>Signal</th><th>Today</th><th>After ticket 1</th></tr></thead>
+<tbody>
+<tr><td>Which surface you used: Android app, web, typing into an agent, app terminal</td><td>Not stored. The server can tell Android from web per request but keeps nothing.</td><td>Every owner action, tagged by surface and device</td></tr>
+<tr><td>Which screen, and whether you arrived from a push</td><td>No</td><td>Yes, once the app sends two small headers (one app install)</td></tr>
+<tr><td>Docs you open</td><td>Latest view per revision only</td><td>Every open, with surface</td></tr>
+<tr><td>You typed to an agent (as you did in this session)</td><td>Inferred for Analytics › Time; not stored as an event</td><td>Stored per prompt. Claude app versus terminal stays indistinguishable; the hook does not say.</td></tr>
+<tr><td>Agent time, tokens and quota</td><td>Yes: <code>activity.db</code>, <code>usage.db</code>, Analytics › Spend and Time</td><td>Unchanged; the auto PM reads them</td></tr>
+<tr><td>Your reaction to a specific change</td><td>Bug reports only</td><td>Thumbs up or down per live change, optional</td></tr>
+</tbody>
+</table>
 <p><b>A.1 Table.</b> <code>owner_events</code> in the queue database (<code>sm_send.db_path</code>, the database holding <code>owner_messages</code>).</p>
 <pre><code>CREATE TABLE owner_events (
   id          INTEGER PRIMARY KEY,
@@ -348,7 +418,7 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
 <ul>
 <li>The server holds an in-memory copy, updated on every write, and code asks <code>switches::is_on("key")</code>. A missing key reads as off.</li>
 <li>When <code>autopm.enabled</code> is false (C.1), every switch reads as off whatever its row says.</li>
-<li>Only <code>POST /autopm/experiments</code> creates a switch row, with <code>on_=0</code>, when the experiment has <code>path=switch</code>. The key must not already exist. An experiment can therefore only flip the switch it created.</li>
+<li>Only <code>POST /autopm/experiments</code> creates a switch row, with <code>on_=0</code>, whenever the experiment has a <code>switch_key</code> (every <code>path=switch</code> experiment, and any shadow experiment whose post-approval build has a switch). The key must not already exist. An experiment can therefore only flip the switch it created.</li>
 <li>Clients receive <code>switches: {key: bool}</code> in <code>/client/bootstrap</code> and <code>/client/settings</code>; every response also carries <code>x-sm-switches: &lt;version&gt;</code>, a counter that rises on every switch write (and on enable or disable). A client that sees a version other than its cached one re-reads the switches before acting on its next screen. In the foreground, both clients also re-read at least every 30 s on their existing refresh loops. An off transition therefore reaches an open app within 30 s, or at its next request.</li>
 <li>Writes: <code>PUT /autopm/switches/{key} {on, reason}</code>.
   <ul>
@@ -363,8 +433,8 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
   cycle_ticket   INTEGER NOT NULL,
   title          TEXT NOT NULL,
   hypothesis     TEXT NOT NULL,
-  path           TEXT NOT NULL,      -- switch | revert | shadow
-  switch_key     TEXT,               -- set iff path = switch
+  path           TEXT NOT NULL,      -- switch | shadow
+  switch_key     TEXT,               -- required for switch; for shadow, set iff the post-approval build has a switch
   plan_path      TEXT NOT NULL,      -- docs/autopm/plans/&lt;id&gt;.html
   plan_pr        INTEGER NOT NULL,
   plan_commit    TEXT,               -- merge commit on main; set by sm when it sees the merge
@@ -395,7 +465,7 @@ CREATE TABLE autopm_measurements (
   decision      TEXT,                -- keep | revert | extend | NULL on error
   PRIMARY KEY (experiment_id, attempt)
 );</code></pre>
-<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. <code>dark</code> means every build PR in <code>tickets_json</code> has merged, and the running server build (its <code>x-sm-build</code> commit) contains their merge commits. For Android changes, the app must also report a <code>client_version</code> at or above the build that carries them. A switched experiment's switch is still off. sm moves <code>building → dark</code> itself when these hold; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
+<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. Two direct transitions are server-only: <code>live | measuring → reverted</code> when the guard, the kill switch, a 👎 or your own switch-off turns the switch off; and <code>kept → reverted</code> when a 👎 or your switch-off lands during the 30-day period before cleanup (F.2). The decision note names the cause. <code>dark</code> means every build PR in <code>tickets_json</code> has merged, and the running server build (its <code>x-sm-build</code> commit) contains their merge commits. For Android changes, the app must also report a <code>client_version</code> at or above the build that carries them. A switched experiment's switch is still off. sm moves <code>building → dark</code> itself when these hold; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
 <p>sm enforces these gates server-side. Each refusal returns 409 with the failing gate's name.</p>
 <table>
 <thead><tr><th>Action</th><th>Gate</th></tr></thead>
@@ -404,7 +474,7 @@ CREATE TABLE autopm_measurements (
 <tr><td><code>POST /autopm/issues</code> for experiment X</td><td><code>plan_merged</code>; the issue body names X; X's state is <code>planned</code> or <code>building</code>.</td></tr>
 <tr><td><code>PUT /autopm/auto-start</code></td><td>The ticket is in X's <code>tickets_json</code>; <code>plan_merged</code>; the budget reservation is admitted (C.4).</td></tr>
 <tr><td>Switch on</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; the switch is not held; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> = now and <code>measure_at_ms = live_at_ms + window_days × 86 400 000</code>.</td></tr>
-<tr><td>Go live without a switch (<code>POST /autopm/experiments/{id}/live</code>), for <code>path=revert</code> and approved shadow changes that cannot have a switch</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> and <code>measure_at_ms</code> as above. Rollback for these experiments is B.6. The state becomes <code>reverted</code> when the running build no longer contains the change's merge commits.</td></tr>
+<tr><td>Go live without a switch (<code>POST /autopm/experiments/{id}/live</code>), only for a shadow experiment with no <code>switch_key</code> that you approved</td><td>Your yes (E.2), whose ask stated that rollback is manual and gave the restore procedure; <code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> and <code>measure_at_ms</code> as above. Rollback for these experiments is B.6. The state becomes <code>reverted</code> when the running build no longer contains the change's merge commits.</td></tr>
 <tr><td>Shadow yes → building</td><td>Only by the owner's answer (E.2).</td></tr>
 </tbody>
 </table>
@@ -424,7 +494,7 @@ CREATE TABLE autopm_measurements (
 <li>The auto PM and every agent on an autopm ticket get <code>[sm autopm] disabled by Rajesh: push work in progress, comment on your ticket, stop</code>.</li>
 </ol>
 <p>Re-enabling turns nothing back on. Held switches stay off until you turn each one on yourself.</p>
-<p><b>B.6 Revert path.</b> For <code>path=revert</code> changes: <code>git revert</code> the merge commit, open a PR, wait for a clean review, merge, then <code>scripts/restart-rust-server.sh</code>. If main has moved on in a way that conflicts, deploy the previous build with <code>--allow-behind-main</code> first, then land the revert. <code>path=revert</code> is valid only for changes with no lasting side effects (memo table); <code>POST /autopm/experiments</code> requires the plan to state "side effects: none".</p>
+<p><b>B.6 Bug fixes and manual rollback.</b> A bug fix with no lasting side effects is filed with <code>POST /autopm/issues {kind: "fix"}</code>. It needs no experiment and no plan, but does need a budget reservation, and it ships through the ordinary PR and review flow. Every unattended live experiment has a switch, so the guard, the kill switch and 👎 always have something to turn off. Manual rollback, used for fixes and for switchless shadow changes you approved: <code>git revert</code> the merge commit, open a PR, wait for a clean review, merge, then <code>scripts/restart-rust-server.sh</code>. If main has moved on in a way that conflicts, deploy the previous build with <code>--allow-behind-main</code> first, then land the revert. For an approved data change, run the restore procedure tested in shadow mode (E.1). <code>kind: "fix"</code> requires the ticket body to state "side effects: none".</p>
 
 <h3 id="c">C. Budget</h3>
 <p><b>C.1 Owner setting</b> <code>autopm</code> in <code>owner_settings</code> (hot, <code>owner_settings.rs:22</code>):</p>
@@ -442,7 +512,9 @@ CREATE TABLE autopm_measurements (
 <pre><code>allowance = 0                               if skip_window_starting = this window's start
           = dedicated                       before 96 h into the window
           = dedicated + min(cap, max(0, headroom - margin))   from 96 h on
-headroom  = projected_free_headroom_points from build_projection (usage_report.rs)</code></pre>
+headroom  = projected_free_headroom_points from build_projection (usage_report.rs)
+            -- if build_projection returns None, or its newest sample is older than 6 h,
+            -- the surplus term is 0: allowance = dedicated (or 0 when skipped)</code></pre>
 <p>Example: on Thursday the Claude projection says the week ends at 55%, so headroom is 45. The allowance is 5 + min(15, 45 − 20) = 20 points.</p>
 <p><b>C.3 Spend.</b> Spend is the token use in <code>usage.db</code> <code>seat_tokens</code> for the current window, converted to points with the fitted rates in <code>quota_rates.rs</code>. It covers three groups of seats:</p>
 <ol>
@@ -497,7 +569,7 @@ admit iff points_est ≤ unreserved</code></pre></li>
 </tbody>
 </table>
 <p>The role cannot reorder lanes, end lanes, or start tickets outside #2170. CLI wrappers: <code>sm autopm {issue|start|switch|exp|ask|events|budget}</code>.</p>
-<p><b>D.5 Build tickets.</b> One agent per ticket, tier from the ticket's <code>Tier:</code> line (<code>owner_settings.rs:531</code>). The auto PM writes <code>Tier: Mid</code> and names Codex (<code>gpt-6-sol</code> medium or <code>gpt-5.6-terra</code> high) in the auto-start unless Codex has no budget left. Build agents follow CLAUDE.md's workflow unchanged: worktree, PR with <code>Closes #N</code>, <code>sm request-review</code>, merge on a clean review, restart with the script, clean up. The ticket body states the experiment id, the switch key, the off-equals-today test, and the metric query path.</p>
+<p><b>D.5 Build tickets.</b> One agent per ticket, tier from the ticket's <code>Tier:</code> line (<code>owner_settings.rs:531</code>). The auto PM writes <code>Tier: Mid</code> and names Codex (<code>gpt-6-sol</code> medium or <code>gpt-5.6-terra</code> high) in the auto-start unless Codex has no budget left. Build agents follow CLAUDE.md's workflow unchanged: worktree, PR with <code>Closes #N</code>, <code>sm request-review</code>, merge on a clean review, restart with the script, clean up. The ticket body states the experiment id, the switch key, the off-equals-today test, and the metric query path. For a visible change, the PR adds screenshots in <code>docs/autopm/proof/&lt;id&gt;/</code>: the Android preview emulator against live data for app screens, and a browser for web and the doc reader. Each screenshot sits beside its mock, with the switch on and off.</p>
 <p><b>D.6 Collisions.</b> Before filing a build ticket, the auto PM lists open session-manager claims and Rajesh's open session-manager tickets. If the files it expects to touch overlap any PR from those claims, it files the ticket <code>sm board after</code> the conflicting ticket. It never works in an area one of Rajesh's open tickets addresses; it records the idea in the playbook's hypotheses instead.</p>
 <p><b>D.7 Context.</b> The auto PM uses the default Claude handoff policy (threshold 35%, <code>handoff/policy.rs:29</code>). Its handoff note always lists live experiments with their measurement dates, the cycle ticket, and the path of the playbook. Measurement dates are set as <code>sm remind</code> reminders, which handoff moves to the successor.</p>
 
@@ -523,10 +595,11 @@ admit iff points_est ≤ unreserved</code></pre></li>
 <li>the hypothesis;</li>
 <li>the evidence from the activity log;</li>
 <li>the change;</li>
-<li>its path (switch, revert or shadow) and why;</li>
+<li>its path (switch or shadow) and why, and for shadow whether the post-approval build has a switch;</li>
 <li><code>metric_json</code> and <code>guards_json</code> per F.2, with the committed queries and the current baseline values;</li>
 <li>the window;</li>
 <li>side effects: "none", or each lasting effect listed (which decides the path);</li>
+<li>a mock for every visible change, one per affected surface (Android, web, doc reader), drawn inline as HTML or SVG;</li>
 <li>the points estimate;</li>
 <li>the build tickets.</li>
 </ul>
@@ -553,7 +626,7 @@ guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "l
   <li>(4) otherwise <b>revert</b>.</li>
   </ul></li>
 <li><b>Errors.</b> A query error or timeout records <code>status=error</code> and retries hourly. After 3 errors, the experiment is reverted with note "metric failed".</li>
-<li><b>Revert</b> sets the switch off with <code>changed_by=autopm</code>, not held. For <code>path=revert</code> it files the revert ticket per B.6. Each decision writes a row to <code>autopm_measurements</code> and wakes the auto PM.</li>
+<li><b>Revert</b> sets the switch off with <code>changed_by=autopm</code>, not held. A switchless shadow experiment that misses its bar wakes the auto PM to file the manual rollback per B.6, and the readout states it. Each decision writes a row to <code>autopm_measurements</code> and wakes the auto PM.</li>
 <li><b>Result shape:</b> <code>{"baseline": {stat, n}, "h1": {stat, n, change}, "h2": {…}, "guards": [{query, baseline, h1, h2, failed}]}</code>.</li>
 <li><b>Immediate revert:</b> a 👎 at any time turns the switch off at once (<code>held=1, changed_by=feedback</code>), without waiting for the measurement date.</li>
 </ul>
@@ -568,9 +641,10 @@ guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "l
 <li>What worked</li>
 <li>What did not</li>
 <li>Rules (things never to try again, and constraints Rajesh set)</li>
+<li>Method (how the auto PM itself works; it may change this, B-gated steps excepted)</li>
 <li>Open hypotheses (ranked)</li>
 </ol>
-<p>The file is capped at 300 lines; past that, the auto PM merges or drops its weakest entries. It changes only in readout PRs. Seed (ticket 3 commits it):</p>
+<p>The file is capped at 1,500 lines; past that, the auto PM merges or drops its weakest entries. It changes only in readout PRs. Seed (ticket 3 commits it):</p>
 <pre><code>## How Rajesh works
 - Reads and reviews docs; skips the inbox as a work queue. (session 8bbcb31a, 2026-10-15)
 - On Android, uses the inbox as an alert for things he is expecting; rarely uses the web inbox. (same)
@@ -581,6 +655,9 @@ guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "l
 ## Rules
 - Never infer disuse or backlog from stored state; check the activity log by surface. (two misreadings, 2026-10-15)
 - Hide a feature only after 30 days of zero use on every surface.
+## Method
+- Weekly: measure due experiments, mine, plan, file, switch on, read out (appendix H).
+- Every plan with a visible change carries a mock per surface; build PRs carry emulator and web screenshots.
 ## Open hypotheses
 1. Decision cards on judgment asks cut time-to-decision.
 2. Pushes for awaited replies deserve their own class.</code></pre>
@@ -603,7 +680,7 @@ Job: make Rajesh more productive with sm while spending none of his attention.
 Each cycle: (1) measure experiments due; (2) mine the activity log, usage,
 Analytics › Time, bug reports and Rajesh's own tickets for friction, using
 Sonnet subagents in your context for data pulls; (3) choose at most what fits
-max_live and the budget; (4) write a plan per appendix F.1, get it reviewed;
+max_live and the budget; (4) write a plan per appendix F.1 (mocks for visible changes), get it reviewed;
 (5) file build tickets (sm autopm issue), order them, authorize auto-start;
 (6) merge a plan only after its review converges, then switch on when dark and healthy; (7) publish the readout and playbook PR.
 
