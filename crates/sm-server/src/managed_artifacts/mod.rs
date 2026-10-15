@@ -42,8 +42,12 @@ pub fn validate_note(note: &str, max: usize) -> Result<()> {
     Ok(())
 }
 pub fn validate_date(date: &str) -> Result<()> {
+    validate_date_at(date, OffsetDateTime::now_utc())
+}
+fn validate_date_at(date: &str, at: OffsetDateTime) -> Result<()> {
     let format = time::format_description::parse("[year]-[month]-[day]")?;
-    if time::Date::parse(date, &format)? <= OffsetDateTime::now_utc().date() {
+    let (today, _) = attribution::local_calendar(at)?;
+    if time::Date::parse(date, &format)? <= time::Date::parse(&today, &format)? {
         bail!("keep-until must be after today");
     }
     Ok(())
@@ -218,6 +222,8 @@ impl ManagedArtifacts {
                 bail!("{name} must be building or unrecorded");
             }
             ensure_not_in_use(&tx, &root.path, name)?;
+            std::fs::metadata(std::path::Path::new(&root.path).join(a["name"].as_str().unwrap()))
+                .map_err(|error| anyhow::anyhow!("{name} cannot be recorded: {error}"))?;
             if flags.recipe_complete {
                 bail!("recipe validation and commit tagging require queue integration");
             }

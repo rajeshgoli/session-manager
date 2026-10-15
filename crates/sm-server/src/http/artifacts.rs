@@ -331,7 +331,7 @@ impl AppState {
                 let Some((owner, steward)) = selected else {
                     continue;
                 };
-                let text=format!("[sm artifact] {}/{name} appeared (size pending) with no record. Record it:\n  sm artifact record {name} --note \"one plain-English line\" --consumer '#N' [--recipe-complete] [--gpu-hours H --gpu-cost USD]\nUnrecorded folders are frozen on {}.{}",root.path,a["grace_until"].as_str().unwrap_or("unknown"),if steward{"\nRead its files, retention notes, git log -S in the root's repo and the queue logs that mention it. Record it, or run sm artifact unclaimable with --note saying what you found."}else{""});
+                let text=format!("[sm artifact] {}/{name} appeared (size pending) with no record. Record it:\n  sm artifact record {name} --note \"one plain-English line\" --consumer '#N' [--recipe-complete] [--gpu-hours H --gpu-cost USD]\nUnrecorded folders are frozen on {}.{}",root.path,a["grace_until"].as_str().unwrap_or("unknown"),if steward{format!("\nRead its files, retention notes, git log -S {name} in the root's repo and the queue logs that mention it. Record it, or run sm artifact unclaimable {name} --note TEXT saying what you found.")}else{String::new()});
                 let id = format!(
                     "artifact-record:{}:{}:{today}",
                     root.path,

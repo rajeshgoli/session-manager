@@ -414,3 +414,39 @@ fn orphan_cleanup_report_only_then_enforcing() {
     assert_eq!(deleted["delete_reason"], "orphan");
     assert!(!f.path("123_data").exists());
 }
+
+#[test]
+fn record_refuses_vanished_entry_without_partial_updates() {
+    let f = Fixture::new();
+    for name in ["123_data", "456_data"] {
+        fs::create_dir(f.path(name)).unwrap();
+    }
+    f.svc.scan(&f.root).unwrap();
+    fs::remove_dir(f.path("456_data")).unwrap();
+    assert!(f
+        .svc
+        .record(
+            &f.root,
+            &["123_data".into(), "456_data".into()],
+            &f.flags(),
+            "maker"
+        )
+        .is_err());
+    for name in ["123_data", "456_data"] {
+        assert_eq!(
+            f.svc.store.detail(&f.root.path, name).unwrap()["state"],
+            "unrecorded"
+        );
+    }
+}
+#[test]
+fn keep_until_compares_against_the_local_calendar() {
+    for timestamp in ["2026-10-16T01:00:00Z", "2026-10-16T23:00:00Z"] {
+        let now = OffsetDateTime::parse(timestamp, &Rfc3339).unwrap();
+        let (local, _) = attribution::local_calendar(now).unwrap();
+        let format = time::format_description::parse("[year]-[month]-[day]").unwrap();
+        let today = time::Date::parse(&local, &format).unwrap();
+        assert!(validate_date_at(&today.to_string(), now).is_err());
+        assert!(validate_date_at(&today.next_day().unwrap().to_string(), now).is_ok());
+    }
+}
