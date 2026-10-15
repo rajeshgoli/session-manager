@@ -29,6 +29,7 @@ mod git_repo;
 mod history;
 mod merge_holds;
 mod model;
+mod queue_artifacts;
 mod watch;
 
 #[derive(Parser)]
@@ -657,6 +658,8 @@ enum QueueCommand {
 #[derive(Args)]
 #[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueRunArgs {
+    #[command(flatten)]
+    artifacts: queue_artifacts::QueueArtifactArgs,
     #[arg(long = "type", value_parser = ["tests", "perf", "background", "service", "review"], default_value = "tests")]
     job_type: String,
     #[arg(long)]
@@ -1852,6 +1855,7 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     if let Some(memory_bytes) = memory_bytes {
         body["memory_bytes"] = json!(memory_bytes);
     }
+    args.artifacts.apply(&mut body)?;
     let payload = client.post_json("/queue-jobs", body)?;
     let id = payload["id"].as_str().unwrap_or("unknown");
     let label = payload["label"].as_str().unwrap_or("-");

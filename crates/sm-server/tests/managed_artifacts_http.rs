@@ -61,12 +61,14 @@ impl Fixture {
                     path: dir.join("root").display().to_string(),
                     cold_store: dir.join("cold").display().to_string(),
                     repo: "owner/research".into(),
+                    repo_checkout: dir.join("repo").display().to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
             },
             ..Default::default()
         };
+        config.queue_runner.state_dir = dir.join("queue-runner").display().to_string();
         config.rust_core.fixture_writes_enabled = true;
         config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
         let state = AppState::new(config);
@@ -353,4 +355,188 @@ async fn managed_artifacts_real_cli_round_trip_and_exit_codes() {
     .await
     .unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn queue_artifact_api_validates_before_persisting() {
+    let f = Fixture::new();
+    for declarations in [
+        json!({"outputs":["out"]}),
+        json!({"record":{"note":"note","project":true}}),
+        json!({"outputs":["out"],"disk_bytes":1024,"record":{"note":"bad\nnote","project":true}}),
+    ] {
+        let (status,body)=f.request("POST","/queue-jobs",Some("maker"),json!({"type":"background","notify_target":"maker","requester_session_id":"maker","cwd":f.dir,"argv":["/usr/bin/true"],"artifacts":declarations})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(f.store().detail(&f.root(), "out").is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_cli_build_records_artifact_recipe_and_preserves_commit() {
+    use sm_server::{managed_artifacts::submission::git_in, queue::RetainedQueueStore};
+    let f = Fixture::new();
+    let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
+    fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q"]).unwrap();
+    fs::write(repo.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    let output = f.dir.join("root/compiled/tool");
+    let script = repo.join("build.sh");
+    fs::write(
+        &script,
+        format!(
+            "/usr/bin/cc main.c -o '{}'\n'{}'\n",
+            output.display(),
+            output.display()
+        ),
+    )
+    .unwrap();
+    git_in(&repo, &["add", "main.c", "build.sh"]).unwrap();
+    git_in(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "build fixture",
+        ],
+    )
+    .unwrap();
+    let remote = f.dir.join("remote.git");
+    git_in(&repo, &["init", "--bare", "-q", remote.to_str().unwrap()]).unwrap();
+    git_in(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = f.app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sm"))
+            .args([
+                "--api-url",
+                &format!("http://{addr}"),
+                "queue",
+                "run",
+                "--type",
+                "background",
+                "--label",
+                "artifact-real-build",
+                "--cwd",
+                repo.to_str().unwrap(),
+                "--artifact",
+                "compiled",
+                "--disk",
+                "1M",
+                "--note",
+                "Compiled test tool",
+                "--consumer",
+                "#123",
+                "--recipe-complete",
+                "--notify",
+                "maker",
+                "--script-file",
+                script.to_str().unwrap(),
+            ])
+            .env("SESSION_MANAGER_ID", "maker")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let state_dir = f.dir.join("queue-runner");
+    let job = RetainedQueueStore::resolve_queue_job_from_path(
+        &state_dir.join("queue_runner.db"),
+        "artifact-real-build",
+    )
+    .unwrap()
+    .unwrap();
+    RetainedQueueStore::start_queue_job_in_state_dir(
+        &state_dir,
+        &f.dir.join("queue.db"),
+        &job.id,
+        1,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let a = f.store().detail(&f.root(), "compiled").unwrap();
+        if a["state"] == "live" {
+            let notices = RetainedQueueStore::new(f.dir.join("queue.db"))
+                .pending_messages_for_target_by_category("maker", "queue-completion", 20)
+                .unwrap();
+            assert_eq!(
+                a["recipe_complete"],
+                1,
+                "artifact: {a}; notices: {:?}",
+                notices.iter().map(|n| &n.text).collect::<Vec<_>>()
+            );
+            assert_eq!(a["note"], "Compiled test tool");
+            assert!(a["jobs"][0]["tag"]
+                .as_str()
+                .unwrap()
+                .starts_with("artifact/compiled/"));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "build did not record: {a}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(output.is_file());
+    server.abort();
+}
+
+#[tokio::test]
+async fn queue_submission_survives_a_failed_post_commit_thaw_notice() {
+    use sm_server::managed_artifacts::{
+        queue::{install_operations, Operations},
+        ManagedArtifacts,
+    };
+    struct Unavailable;
+    impl Operations for Unavailable {
+        fn thaw(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("injected thaw worker failure")
+        }
+        fn pressure(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let conn = f.store().open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'frozen-input','frozen','cold','frozen-input','queue','owner/research',?2)",rusqlite::params![f.root(),sm_server::managed_artifacts::now()]).unwrap();
+    install_operations(&f.root(), std::sync::Arc::new(Unavailable));
+    let (status,body)=f.request("POST","/queue-jobs",Some("maker"),json!({"type":"background","label":"notice-failure","notify_target":"maker","requester_session_id":"maker","cwd":f.dir,"argv":["/usr/bin/true"],"artifacts":{"inputs":["frozen-input"]}})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "pending");
+    assert!(body["id"].is_string());
+    let queue = rusqlite::Connection::open(f.dir.join("queue-runner/queue_runner.db")).unwrap();
+    sm_server::managed_artifacts::queue::repair(&queue, Some(&f.dir.join("queue.db"))).unwrap();
+    let count: i64 = queue
+        .query_row(
+            "SELECT COUNT(*) FROM queue_jobs WHERE label='notice-failure'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }

@@ -356,11 +356,11 @@ fn set_union_is_transitive_and_pending_record_and_recipe_are_preserved() {
 }
 
 #[test]
-fn git_capture_ignores_untracked_files_and_records_dirty_tracked_files() {
+fn git_capture_records_untracked_and_dirty_tracked_files() {
     let f = Fixture::new();
     git_in(&f.dir, &["init", "-q"]).unwrap();
     fs::write(f.dir.join("tracked"), "before").unwrap();
-    git_in(&f.dir, &["add", "tracked"]).unwrap();
+    git_in(&f.dir, &["add", "."]).unwrap();
     git_in(
         &f.dir,
         &[
@@ -381,6 +381,9 @@ fn git_capture_ignores_untracked_files_and_records_dirty_tracked_files() {
     assert!(!clean.dirty);
     assert_eq!(clean.cwd_rel.as_deref(), Some("subdir"));
     assert_eq!(clean.commit_sha.as_ref().unwrap().len(), 40);
+    fs::write(f.dir.join("untracked-input"), "input").unwrap();
+    assert!(GitState::capture(&f.dir).dirty);
+    fs::remove_file(f.dir.join("untracked-input")).unwrap();
     fs::write(f.dir.join("tracked"), "after").unwrap();
     assert!(GitState::capture(&f.dir).dirty);
     let other = Fixture::new();

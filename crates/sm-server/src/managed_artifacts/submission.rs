@@ -62,7 +62,7 @@ pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         .to_owned())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitState {
     pub commit_sha: Option<String>,
     pub cwd_rel: Option<String>,
@@ -79,7 +79,7 @@ impl GitState {
             Ok(Self {
                 commit_sha: Some(git_in(&cwd, &["rev-parse", "HEAD"])?),
                 cwd_rel: Some(cwd.strip_prefix(top)?.to_string_lossy().into_owned()),
-                dirty: !git_in(&cwd, &["status", "--porcelain", "--untracked-files=no"])?
+                dirty: !git_in(&cwd, &["status", "--porcelain", "--untracked-files=all"])?
                     .is_empty(),
             })
         };
@@ -94,11 +94,11 @@ impl GitState {
 /// The prepared command is private so it cannot change after git/input capture.
 /// `persist` returns deleted-reference warnings for durable delivery by the
 /// queue caller; it never sends a message before the transaction commits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedSubmission {
-    declarations: Declarations,
-    root: ArtifactRoot,
-    request: CreateQueueJob,
+    pub(super) declarations: Declarations,
+    pub(super) root: ArtifactRoot,
+    pub(super) request: CreateQueueJob,
     git: GitState,
     detected: Vec<String>,
 }

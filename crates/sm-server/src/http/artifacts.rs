@@ -78,13 +78,10 @@ pub(super) async fn show(
     Ok(Json(svc.store.detail(&root.path, &name).map_err(refusal)?).into_response())
 }
 fn filesystems(svc: &ManagedArtifacts, root: &ma::config::ArtifactRoot) -> Vec<Value> {
-    [(&root.path,"root"),(&root.cold_store,"cold")].into_iter().map(|(path,role)|{
-        match nix::sys::statvfs::statvfs(StdPath::new(path)) {
-            Ok(s)=>{let bytes=u64::from(s.blocks())*s.fragment_size();let floor=bytes*svc.config.floor_percent/100;json!({"path":path,"role":role,"bytes":bytes,"free":u64::from(s.blocks_available())*s.fragment_size(),"floor":floor,"enough":floor,"outstanding":0,"mounted":true,"waiting_jobs":[]})},
-            Err(_)=>json!({"path":path,"role":role,"mounted":false,"bytes":null,"free":null,"floor":null,"enough":null,"outstanding":0,"waiting_jobs":[]}),
-        }
-    }).collect()
+    ma::queue::disk_status(svc, root)
+        .unwrap_or_else(|error| vec![json!({"path":root.path,"error":error.to_string()})])
 }
+
 fn actor(state: &AppState, headers: &HeaderMap) -> Result<SessionRecord, ApiError> {
     let id = header_text(headers, "x-sm-session-id").ok_or(ApiError::Status {
         status: StatusCode::BAD_REQUEST,
@@ -268,7 +265,17 @@ impl AppState {
                     }
                 }
                 if a["state"] != "unrecorded" {
-                    continue;
+                    if a["state"] != "building" || !a["recorded_at"].is_null() {
+                        continue;
+                    }
+                    let conn = svc.store.open()?;
+                    if ma::ensure_not_in_use(&conn, &root.path, name).is_err() {
+                        continue;
+                    }
+                    let succeeded:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM artifact_jobs WHERE root=?1 AND name=?2 AND state='succeeded')",rusqlite::params![root.path,name],|r|r.get(0))?;
+                    if !succeeded {
+                        continue;
+                    }
                 }
                 let mut conn = svc.store.open()?;
                 let tx =
@@ -293,7 +300,7 @@ impl AppState {
                                     Some(j.id.as_str()) == r["job_id"].as_str()
                                         && matches!(
                                             j.state.as_str(),
-                                            "queued" | "running" | "holding"
+                                            "pending" | "queued" | "running" | "holding"
                                         )
                                 }) {
                                     if let Some(id) = &job.requester_session_id {
@@ -306,6 +313,11 @@ impl AppState {
                             }
                         }
 
+                        if owner.is_none() && a["origin"] == "queue" {
+                            if let Some(id) = a["owner_session_id"].as_str() {
+                                owner = alive(id)?;
+                            }
+                        }
                         Ok(owner)
                     },
                     || {
@@ -366,7 +378,11 @@ impl AppState {
             });
             let now = time::OffsetDateTime::now_utc();
             let perf = jobs.iter().any(|j| {
-                j.job_type == "perf" && matches!(j.state.as_str(), "queued" | "running" | "holding")
+                j.job_type == "perf"
+                    && matches!(
+                        j.state.as_str(),
+                        "pending" | "queued" | "running" | "holding"
+                    )
             });
             if ma::attribution::size_walk_due(previous, now, &svc.config.nightly_time, perf)? {
                 svc.measure_root(root)?;

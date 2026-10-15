@@ -338,8 +338,9 @@ enum RecoveredQueueJobAction {
     Finished(&'static str),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateQueueJob {
+    #[serde(skip)]
     pub local_submitter: Option<crate::local_egress::gateway::VerifiedLocalAgent>,
     pub job_type: String,
     pub label: String,
@@ -1660,6 +1661,25 @@ impl RetainedQueueStore {
         max_wait_seconds: i64,
         stop_grace_seconds: Option<i64>,
     ) -> Result<QueueJobRecord> {
+        Self::create_queue_job_with_artifacts(
+            state_dir,
+            request,
+            max_wait_seconds,
+            stop_grace_seconds,
+            None,
+        )
+    }
+
+    pub fn create_queue_job_with_artifacts(
+        state_dir: &Path,
+        request: CreateQueueJob,
+        max_wait_seconds: i64,
+        stop_grace_seconds: Option<i64>,
+        artifacts: Option<(
+            &crate::managed_artifacts::ManagedArtifacts,
+            &crate::managed_artifacts::submission::PreparedSubmission,
+        )>,
+    ) -> Result<QueueJobRecord> {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "failed to create queue runner state dir {}",
@@ -1678,12 +1698,13 @@ impl RetainedQueueStore {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         init_queue_jobs_schema(&conn)?;
-        create_queue_job_conn(
+        create_queue_job_conn_with_artifacts(
             &conn,
             state_dir,
             request,
             max_wait_seconds,
             stop_grace_seconds,
+            artifacts,
         )
     }
 
@@ -1739,6 +1760,17 @@ impl RetainedQueueStore {
                 cancel_grace_seconds,
                 admission_policy,
                 admission_policy.resource_retry_interval_seconds,
+            );
+            return get_queue_job_conn(&conn, job_id);
+        }
+        if let Some(reason) = crate::managed_artifacts::queue::admit(&conn, job_id)? {
+            mark_pending_queue_jobs_holding_conn(&conn, Some(job_id), &reason)?;
+            schedule_queue_admission_retry(
+                state_dir.to_path_buf(),
+                message_queue_db_path.to_path_buf(),
+                cancel_grace_seconds,
+                admission_policy,
+                30,
             );
             return get_queue_job_conn(&conn, job_id);
         }
@@ -1880,18 +1912,30 @@ impl RetainedQueueStore {
         admission_policy: QueueAdmissionPolicy,
         continue_after_failed_start: bool,
     ) -> Result<()> {
-        let db_path = state_dir.join("queue_runner.db");
-        let conn = open_queue_jobs_connection(&db_path)?;
-        init_queue_jobs_schema(&conn)?;
-        admit_pending_queue_jobs_conn(
-            &conn,
-            state_dir,
-            message_queue_db_path,
-            cancel_grace_seconds,
-            admission_policy,
-            continue_after_failed_start,
-        )?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            let db_path = state_dir.join("queue_runner.db");
+            let conn = open_queue_jobs_connection(&db_path)?;
+            init_queue_jobs_schema(&conn)?;
+            admit_pending_queue_jobs_conn(
+                &conn,
+                state_dir,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                continue_after_failed_start,
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            schedule_queue_admission_retry(
+                state_dir.to_path_buf(),
+                message_queue_db_path.to_path_buf(),
+                cancel_grace_seconds,
+                admission_policy,
+                30,
+            );
+        }
+        result
     }
 
     pub fn cancel_queue_job_in_state_dir(
@@ -2001,6 +2045,20 @@ impl RetainedQueueStore {
                     Some(message_queue_db_path),
                 )?;
                 tx.commit()?;
+                let cancelled = get_queue_job_runtime_conn(&conn, job_id)?
+                    .context("cancelled queue job disappeared")?;
+                record_queue_job_completion_notification_conn(
+                    &conn,
+                    &cancelled,
+                    &cancelled.state,
+                    cancelled.exit_code,
+                    cancelled
+                        .finished_at
+                        .as_deref()
+                        .context("cancelled job finish time")?,
+                    Some(message_queue_db_path),
+                    None,
+                )?;
                 None
             }
         };
@@ -3882,6 +3940,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 }
 
 fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
+    crate::managed_artifacts::queue::init(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS queue_jobs (
@@ -4091,10 +4150,38 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
 fn create_queue_job_conn(
     conn: &Connection,
     state_dir: &Path,
-    mut request: CreateQueueJob,
+    request: CreateQueueJob,
     max_wait_seconds: i64,
     stop_grace_seconds: Option<i64>,
 ) -> Result<QueueJobRecord> {
+    create_queue_job_conn_with_artifacts(
+        conn,
+        state_dir,
+        request,
+        max_wait_seconds,
+        stop_grace_seconds,
+        None,
+    )
+}
+fn create_queue_job_conn_with_artifacts(
+    conn: &Connection,
+    state_dir: &Path,
+    mut request: CreateQueueJob,
+    max_wait_seconds: i64,
+    stop_grace_seconds: Option<i64>,
+    artifacts: Option<(
+        &crate::managed_artifacts::ManagedArtifacts,
+        &crate::managed_artifacts::submission::PreparedSubmission,
+    )>,
+) -> Result<QueueJobRecord> {
+    if let Some((manager, _)) = artifacts {
+        crate::managed_artifacts::submission::attach_store(conn, &manager.store)?;
+        conn.execute("INSERT INTO queue_artifact_context(id,config_json) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json",[serde_json::to_string(&manager.config)?])?;
+    }
+    let transaction = artifacts
+        .map(|_| conn.unchecked_transaction())
+        .transpose()?;
+    let conn: &Connection = transaction.as_deref().unwrap_or(conn);
     let id = generate_queue_job_id();
     let local_binding = local_wall::prepare(state_dir, &id, &mut request)?;
     let local_binding_json = local_binding
@@ -4186,7 +4273,19 @@ fn create_queue_job_conn(
             stop_grace_seconds,
         ],
     )?;
-    get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")
+    if let Some((manager, prepared)) = artifacts {
+        crate::managed_artifacts::queue::save(
+            transaction.as_ref().expect("artifact transaction"),
+            manager,
+            prepared,
+            &id,
+        )?;
+    }
+    let result = get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(result)
 }
 
 fn write_queue_job_wrapper(
@@ -4448,6 +4547,7 @@ fn admit_pending_queue_jobs_conn(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let admission_policy = live_admission_policy(state_dir, admission_policy);
+    crate::managed_artifacts::queue::repair(conn, Some(message_queue_db_path))?;
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
     // Validate before clearing any existing holds: after a restart, preserved
@@ -4468,7 +4568,7 @@ fn admit_pending_queue_jobs_conn(
         return Err(error);
     }
     let requeued = conn.execute(
-        "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL",
+        "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL AND holding_reason NOT IN ('disk_space','thawing')",
         [],
     )?;
     let mut summary = QueueAdmissionSummary {
@@ -4501,7 +4601,9 @@ fn admit_pending_queue_jobs_conn(
         }
         // An unavailable local wall must not block unrelated hosted jobs.
         jobs.retain(|job| {
-            job.state != "pending" || !local_wall_waits_for_restoration(job, state_dir)
+            job.state != "pending"
+                || (!local_wall_waits_for_restoration(job, state_dir)
+                    && !attempted_candidates.contains(&job.id))
         });
         if !jobs.iter().any(|job| job.state == "pending") {
             break;
@@ -4584,7 +4686,7 @@ fn admit_pending_queue_jobs_conn(
         let Some(candidate) = get_queue_job_runtime_conn(conn, &candidate_id)? else {
             continue;
         };
-        if queue_job_wait_remaining_seconds(&candidate).is_some_and(|seconds| seconds <= 0) {
+        if artifact_aware_wait_remaining(conn, &candidate)?.is_some_and(|seconds| seconds <= 0) {
             expire_pending_queue_jobs_conn(
                 conn,
                 std::slice::from_ref(&candidate),
@@ -4617,7 +4719,10 @@ fn admit_pending_queue_jobs_conn(
     let deadline_retry = list_queue_job_runtime_records_conn(conn)?
         .iter()
         .filter(|job| job.state == "pending")
-        .filter_map(queue_job_wait_remaining_seconds)
+        .map(|job| artifact_aware_wait_remaining(conn, job))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .min()
         .map(|seconds| seconds.max(1) as u64);
     if let Some(seconds) = deadline_retry {
@@ -4649,7 +4754,10 @@ fn schedule_pending_queue_deadline_retry(
     let retry_after_seconds = list_queue_job_runtime_records_conn(conn)?
         .iter()
         .filter(|job| job.state == "pending")
-        .filter_map(queue_job_wait_remaining_seconds)
+        .map(|job| artifact_aware_wait_remaining(conn, job))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .min()
         .map(|seconds| seconds.max(1) as u64);
     if let Some(seconds) = retry_after_seconds {
@@ -4664,6 +4772,15 @@ fn schedule_pending_queue_deadline_retry(
     Ok(())
 }
 
+fn artifact_aware_wait_remaining(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+) -> Result<Option<i64>> {
+    Ok(
+        crate::managed_artifacts::queue::remaining(conn, &job.id, job.holding_reason.as_deref())?
+            .or_else(|| queue_job_wait_remaining_seconds(job)),
+    )
+}
 fn queue_job_wait_remaining_seconds(job: &QueueJobRuntimeRecord) -> Option<i64> {
     if job.job_type == "review" {
         return None;
@@ -4680,7 +4797,7 @@ fn expire_pending_queue_jobs_conn(
 ) -> Result<usize> {
     let mut expired = 0;
     for job in jobs.iter().filter(|job| job.state == "pending") {
-        if queue_job_wait_remaining_seconds(job).is_some_and(|seconds| seconds <= 0) {
+        if artifact_aware_wait_remaining(conn, job)?.is_some_and(|seconds| seconds <= 0) {
             let mut job = job.clone();
             if job.job_type == "perf" {
                 if let Some(reason) = perf_resource_hold_reason(&job, admission_policy) {
@@ -5798,11 +5915,26 @@ fn monitor_queue_job_completion(
     let mut process_guard = ProcessGuard::new(process_limit);
     let timeout = (timeout_seconds > 0).then(|| StdDuration::from_secs(timeout_seconds as u64));
     let pgid = i64::from(child.id());
+    let mut next_artifact_check = Instant::now();
     let mut next_memory_check = Instant::now();
     let mut failed_memory_samples = 0u8;
     loop {
         if shutdown.is_stopped() {
             return;
+        }
+        if Instant::now() >= next_artifact_check {
+            if let Err(error) = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))
+                .and_then(|conn| {
+                    crate::managed_artifacts::queue::check_overrun(
+                        &conn,
+                        &job_id,
+                        &message_queue_db_path,
+                    )
+                })
+            {
+                eprintln!("artifact overrun check deferred for {job_id}: {error:#}");
+            }
+            next_artifact_check = Instant::now() + StdDuration::from_secs(300);
         }
         let child_status = match child.try_wait() {
             Ok(status) => status,
@@ -7321,6 +7453,11 @@ fn requeue_owner_forced_job_after_host_pressure_conn(
     if job.state != "running" || job.owner_forced_at.is_none() || !host_pressure {
         return Ok(false);
     }
+    // A stopped writer may have left partial data. Finish it normally instead
+    // of silently replaying a command that may append or skip existing files.
+    if crate::managed_artifacts::queue::has_outputs(conn, job_id)? {
+        return Ok(false);
+    }
     // Keeping queued_at keeps the job's place; stretching the wait limit by
     // the time already spent gives it the full wait again.
     let waited = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
@@ -7517,6 +7654,13 @@ fn record_queue_job_completion_notification_conn(
     message_queue_db_path: Option<&Path>,
     admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<bool> {
+    // Commit the terminal queue state before artifact bookkeeping or external
+    // notifications. The durable notification-required flag retries a crash
+    // between that commit and completion.
+    if !conn.is_autocommit() {
+        return Ok(false);
+    }
+    crate::managed_artifacts::queue::complete(conn, &job.id, message_queue_db_path)?;
     let Some(completion_notified_at) = queue_job_completion_notified_at(
         job,
         state,
@@ -7797,6 +7941,9 @@ pub fn queue_hold_explanation(
     let mut blockers: Vec<&QueueJobRecord> = Vec::new();
     let mut queued_ahead = 0;
     let (summary, detail) = match reason {
+        "artifact_writer" => ("waiting for an artifact writer".into(),"Another running job writes one of these outputs. This job retries after that writer finishes; it retains its existing admission deadline.".into()),
+        "disk_space" => ("waiting for disk space".into(),"The declared output and outstanding writes must fit above the filesystem's free-space floor. Retries automatically within the artifact disk wait window.".into()),
+        "thawing" => ("waiting for artifact inputs to thaw".into(),"Frozen inputs must be restored before this job starts. Retries automatically within the artifact disk wait window.".into()),
         "local_wall" => (
             "waiting for local agent restoration".into(),
             "The server is restoring this agent's sandbox and host services. The command remains pending and retries automatically; other eligible jobs can run.".into(),
@@ -9390,6 +9537,68 @@ mod tests {
     use time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn failed_admission_schedules_another_pass() {
+        let state_dir = env::temp_dir().join(format!(
+            "sm-admission-retry-error-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO queue_artifact_context(id,config_json) VALUES(1,'invalid config')",
+            [],
+        )
+        .unwrap();
+        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,QueueAdmissionPolicy::default()).is_err());
+        assert!(queue_admission_retries()
+            .lock()
+            .unwrap()
+            .contains_key(&state_dir));
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn disk_and_thaw_waits_survive_the_normal_admission_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        let old = (OffsetDateTime::now_utc() - Duration::hours(23))
+            .format(&Rfc3339)
+            .unwrap();
+        let config = serde_json::to_string(
+            &crate::managed_artifacts::config::ManagedArtifactsConfig::default(),
+        )
+        .unwrap();
+        for reason in ["disk_space", "thawing"] {
+            conn.execute("INSERT INTO queue_jobs(id,type,label,cwd,env_json,timeout_seconds,state,queued_at,max_wait_seconds,holding_reason,notify_session_id) VALUES(?1,'background',?1,'/','{}',60,'pending',?2,300,?1,'maker')",params![reason,old]).unwrap();
+            conn.execute("INSERT INTO queue_artifact_submissions(job_id,config_json,prepared_json,first_hold_at) VALUES(?1,?2,'{}',?3)",params![reason,config,old]).unwrap();
+        }
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        for job in &jobs {
+            assert!(queue_job_wait_remaining_seconds(job).unwrap() < 0);
+            assert!(artifact_aware_wait_remaining(&conn, job).unwrap().unwrap() > 3500);
+        }
+        assert_eq!(
+            expire_pending_queue_jobs_conn(
+                &conn,
+                &jobs,
+                Path::new("/unused/messages.db"),
+                QueueAdmissionPolicy::default()
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute("UPDATE queue_jobs SET holding_reason='concurrency_cap'", [])
+            .unwrap();
+        for job in list_queue_job_runtime_records_conn(&conn).unwrap() {
+            assert!(artifact_aware_wait_remaining(&conn, &job).unwrap().unwrap() > 3500);
+        }
+    }
 
     #[test]
     fn handoff_moves_queue_job_wakes_still_owed() {
@@ -11352,6 +11561,41 @@ mod tests {
         .unwrap();
         let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
         assert_eq!(finished.state, "memory_exceeded");
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn owner_forced_artifact_writer_is_not_requeued_after_host_pressure() {
+        let state_dir = unique_temp_path("forced-artifact-stop");
+        let job = running_job_with_pgid(&state_dir, "tests", "artifact writer", 501);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at=?2, termination_detail_json=?3 WHERE id=?1",
+            params![
+                job.id,
+                now_rfc3339(),
+                serde_json::json!({"cause":MEMORY_GUARD_HOST_PRESSURE}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO queue_artifact_submissions(job_id, config_json, prepared_json) VALUES(?1, '{}', ?2)",
+            params![job.id, r#"{"declarations":{"outputs":["out"]}}"#]).unwrap();
+        assert!(!requeue_owner_forced_job_after_host_pressure_conn(&conn, &job.id, None).unwrap());
+        assert_eq!(
+            get_queue_job_runtime_conn(&conn, &job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        // Input-only jobs retain the existing automatic retry behavior.
+        conn.execute(
+            "UPDATE queue_artifact_submissions SET prepared_json=?1",
+            [r#"{"declarations":{"outputs":[]}}"#],
+        )
+        .unwrap();
+        assert!(requeue_owner_forced_job_after_host_pressure_conn(&conn, &job.id, None).unwrap());
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
     }
