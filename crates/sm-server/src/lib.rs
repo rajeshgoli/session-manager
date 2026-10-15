@@ -54,6 +54,7 @@ pub mod local_model;
 pub mod local_sockets;
 #[cfg(target_os = "macos")]
 pub mod local_wall;
+pub mod managed_artifacts;
 pub mod mobile_devices;
 pub mod notes;
 pub mod opencode;

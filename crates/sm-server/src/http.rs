@@ -353,6 +353,7 @@ pub enum GitHubPullRequestState {
 
 mod agent_history;
 mod analytics;
+mod artifacts;
 mod ask;
 mod auto_retire;
 mod board;
@@ -663,6 +664,7 @@ fn btw_worker_blocks_handover_across_rollback_generations() {
 
 #[derive(Clone)]
 pub struct AppState {
+    managed_artifacts: Option<crate::managed_artifacts::ManagedArtifacts>,
     config: AppConfig,
     local_agent_verifier: crate::local_egress::gateway::StampVerifier,
     #[cfg(target_os = "macos")]
@@ -853,7 +855,15 @@ impl AppState {
         let gateway_directory = test_isolation_root_from_environment()?
             .map(|root| root.join("local-egress"))
             .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
+        let managed_artifacts = if config.managed_artifacts.enabled {
+            Some(crate::managed_artifacts::ManagedArtifacts::new(
+                &config.managed_artifacts,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
+            managed_artifacts,
             #[cfg(target_os = "macos")]
             local_walls: None,
             local_agent_verifier: crate::local_egress::gateway::StampVerifier::new(
@@ -1988,6 +1998,9 @@ pub fn router(state: AppState) -> Router {
             get(merge_holds::list).post(merge_holds::place),
         )
         .route("/merge-holds/release", post(merge_holds::release))
+        .route("/artifacts", get(artifacts::list).post(artifacts::create))
+        .route("/artifacts/{name}", get(artifacts::show))
+        .route("/artifacts/{name}/{action}", post(artifacts::action))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/board", get(board::get_board))
         .route("/board/not-before", put(board::put_not_before))
@@ -21656,7 +21669,9 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 26] = [
+    const OWNER_WEB_READS: [&str; 28] = [
+        "/artifacts",
+        "/artifacts/missing",
         "/claims",
         "/claims?session=fork1001&active=false",
         "/client/model",

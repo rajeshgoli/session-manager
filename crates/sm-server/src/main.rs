@@ -131,6 +131,24 @@ async fn main() -> Result<()> {
             sm_server::config::local_env_overlay_path(&args.config, args.local_env.as_deref());
         println!("owner name: {}", config.owner_name);
         println!(
+            "managed_artifacts:\n{}",
+            serde_yaml::to_string(&config.managed_artifacts)?
+        );
+        if config.managed_artifacts.enabled {
+            for root in &config.managed_artifacts.resolved()?.roots {
+                for (path, role) in [(&root.path, "root"), (&root.cold_store, "cold")] {
+                    match nix::sys::statvfs::statvfs(std::path::Path::new(path)) {
+                        Ok(s) => {
+                            let bytes = u64::from(s.blocks()) * s.fragment_size();
+                            let floor = bytes * config.managed_artifacts.floor_percent / 100;
+                            println!("artifact {role}: {path} mounted=true bytes={bytes} free={} floor={floor} enough={floor}",u64::from(s.blocks_available())*s.fragment_size());
+                        }
+                        Err(_) => println!("artifact {role}: {path} mounted=false"),
+                    }
+                }
+            }
+        }
+        println!(
             "local env overlay: {} ({})",
             overlay.display(),
             if overlay.exists() {
@@ -287,6 +305,22 @@ async fn main() -> Result<()> {
         } else {
             state
         };
+        if config.managed_artifacts.enabled {
+            let artifact_state = state.clone();
+            let artifact_shutdown = shutdown.clone();
+            let interval = Duration::from_secs(config.managed_artifacts.scan_seconds);
+            thread::spawn(move || loop {
+                if artifact_shutdown.is_stopped() {
+                    break;
+                }
+                run_background_pass("managed artifacts", || {
+                    if let Err(error) = artifact_state.managed_artifacts_pass() {
+                        eprintln!("managed artifacts pass failed: {error:#}");
+                    }
+                });
+                thread::sleep(interval);
+            });
+        }
         if config.rust_core.runtime_enabled {
             state.register_local_model()?;
             let reload_dir = queue_state_dir.clone();
