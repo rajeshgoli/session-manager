@@ -18,7 +18,7 @@ await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/prea
 await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults, canStartAnyway, blockedReasons, modelShort, matchType, chipText, autoStartBody, retryBody, defaultType, laneCandidates, CUSTOM } = modules.get(`${root}/board-start.js`).namespace;
-const { canStartWhenReady } = board.namespace;
+const { canStartWhenReady, boardSections } = board.namespace;
 const { reviewFallback, reviewerText, switchKind, inheritedPolicy, tier } = modules.get(`${root}/reviews.js`).namespace;
 const queueModel = load(`${root}/queue-model.js`);
 await queueModel.link(() => { throw new Error('queue-model has no imports'); });
@@ -54,6 +54,14 @@ test('other tickets always expose needs-you rows and blockers omit closed depend
   assert.deepEqual(openBlockers(blocked).map(t => t.number), [3]);
   assert.equal(blockedText(blocked), '#3');
   assert.equal(threadHref({key:'agent:session-1',at:'message one'}), '/inbox?open=thread:session-1&at=message%20one');
+});
+test('other tickets sit under their repo top lane; lane-less repos go last', () => {
+  const lane = (id, repo) => ({ id, goal: { repo } });
+  const lanes = [lane(1, 'o/far'), lane(2, 'o/sm'), lane(3, 'o/far')];
+  const others = [{ repo: 'o/sm' }, { repo: 'o/far' }, { repo: 'o/new' }];
+  const order = boardSections(lanes, others).map((s) => s.lane ? `lane ${s.lane.id}` : `other ${s.other.repo}`);
+  assert.deepEqual(order, ['lane 1', 'other o/far', 'lane 2', 'other o/sm', 'lane 3', 'other o/new']);
+  assert.deepEqual(boardSections([], [{ repo: 'o/far' }]).map((s) => s.other.repo), ['o/far']);
 });
 test('clock clips at the chosen window and preserves gaps and quiet segments', () => {
   const end = '2026-09-30T03:00:00Z';
