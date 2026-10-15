@@ -200,18 +200,19 @@
 <thead><tr><th style="width:22%">Kind of change</th><th>Path</th><th style="width:34%">Why</th></tr></thead>
 <tbody>
 <tr><td>Server, CLI and web behaviour behind a switch</td><td><b>Ships alone.</b> Merged switched off, then switched on.</td><td>Off is today's behaviour, restored in under a second.</td></tr>
-<tr><td>Bug fixes and changes that leave stored data's shape untouched</td><td><b>Ships alone.</b> Revert is a commit revert plus the restart script.</td><td>Nothing persisted to undo.</td></tr>
+<tr><td>Bug fixes with no lasting side effects: no rows rewritten or deleted, no messages, pushes or GitHub writes, no board changes</td><td><b>Ships alone.</b> Revert is a commit revert plus the restart script.</td><td>A commit revert undoes all of it.</td></tr>
+<tr><td>Changes whose only lasting effect is adding new rows in their own new tables</td><td><b>Ships alone</b>, behind a switch.</td><td>Switching off stops the writes; the old data is untouched.</td></tr>
 <tr><td>Docs, owner pages and the doc reader</td><td><b>Ships alone</b>, behind a switch.</td><td>Served by the server, so the Android app shows them with no install.</td></tr>
 <tr><td>Android app features</td><td><b>Ships alone</b>, but only inside an app update you install, with the feature off until switched on. At most one app update a week.</td><td>The install is yours; everything after it is revertable.</td></tr>
 <tr><td>Hiding a feature you seem not to use</td><td><b>Ships alone</b>, as a switch, only after 30 days of zero use on <i>every</i> surface. Deleting its code waits another 30 days switched off.</td><td>My inbox misreading is the reason for the rule.</td></tr>
-<tr><td>Stored data rewritten or dropped; text or commands other agents rely on; CLAUDE.md or AGENTS.md; the restart, handover or deploy scripts; other repos; anything outside sm (GitHub settings, posts)</td><td><b>Shadow build and measure, then ask you.</b></td><td>Either undoing it loses something, or the undo depends on the thing changed.</td></tr>
+<tr><td>Existing rows rewritten or deleted; messages or pushes sent; GitHub or board changes made on its own initiative; text or commands other agents rely on; CLAUDE.md or AGENTS.md; the restart, handover or deploy scripts; other repos; anything outside sm (GitHub settings, posts)</td><td><b>Shadow build and measure, then ask you.</b></td><td>Either undoing it loses something, or the undo depends on the thing changed.</td></tr>
 </tbody>
 </table>
 
-<p>Two automatic safeties sit under all of it. A <b>health guard</b> in the server turns off every switch flipped in the last hour if owner-facing errors or failed <code>sm send</code> deliveries jump. A <b>kill switch</b> in Settings turns every switch off and stops the auto PM. One thumbs-down on a change reverts it at once, without waiting for the auto PM.</p>
+<p>Two automatic safeties sit under all of it. A <b>health guard</b> in the server turns off every switch flipped in the last hour if owner-facing errors or failed <code>sm send</code> deliveries jump. A <b>kill switch</b> in Settings turns every switch off and stops the auto PM. One thumbs-down on a change reverts it at once, without waiting for the auto PM. A switch turned off by the guard, the kill switch or a thumbs-down stays off: the auto PM cannot turn it back on; only you can. sm itself refuses to build or switch on anything whose plan has not merged after review, so the review step is enforced, not just promised.</p>
 
 <h3>How it knows a change helped</h3>
-<p>Every plan fixes four things before anything is built: the metric, as a query committed to the repo; its baseline over the previous 14 days; the bar to clear; and the measurement date. The default bar is a 25% improvement in the median, holding in both weeks of a 14-day window, while guard metrics do not get 25% worse. The guard metrics are your manual reverts, thumbs-down and bug reports about the area. With one user and noisy weeks, the bar is deliberately high: it detects big wins and ignores small ones. A change that misses the bar is reverted, even if it "might be helping".</p>
+<p>Every plan fixes four things before anything is built: the metric, as a query committed to the repo; its baseline over the previous 14 days; the bar to clear; and the measurement date. The default bar is a 25% improvement in the median, holding in both weeks of a 14-day window, while guard metrics do not get 25% worse. The guard metrics are your manual reverts, thumbs-down and bug reports about the area. With one user and noisy weeks, the bar is deliberately high: it detects big wins and ignores small ones. A change that misses the bar is reverted, even if it "might be helping". sm runs the measurement itself, from the committed query, so the auto PM cannot grade its own work.</p>
 <p>Thumbs are optional, and silence counts as neutral. The app gets a small "What changed" card listing live changes with 👍 / 👎. 👎 reverts immediately.</p>
 <p>The auto PM is measured too. Each readout reports changes kept against changes tried, points spent per kept change, and your thumbs. <b>After four straight cycles with no kept change, sm pauses the auto PM and tells you once.</b></p>
 
@@ -230,13 +231,13 @@
 <p><b>Inbox alerts.</b> Hypothesis: you open the Android inbox mostly within minutes of a push about something you asked for, and rarely otherwise. First the auto PM checks that this pattern exists in two weeks of the activity log. If it does, the change marks the pushes you are waiting on (replies to your own asks) as a separate, higher-priority class. Metric: minutes from push to open for those pushes, plus inbox opens with no push behind them as a guard. If the pattern is not there, the playbook records that and nothing ships.</p>
 
 <h3>Budget</h3>
-<p>Each provider's allowance is a dedicated amount plus surplus. The surplus is quota the projection says will expire, released only from day four of the week and only beyond a 20-point safety margin. sm counts the auto PM's spend across its own seat and successors, the agents building its tickets, and the reviews of their PRs. At zero, sm stops starting autopm tickets; agents mid-ticket reach a safe stopping point and stop. "Skip this week" in Settings sets that week's allowance to zero. The auto PM's own thinking runs on Claude. Building prefers Codex, which has the most unused quota.</p>
+<p>Each provider's allowance is a dedicated amount plus surplus. The surplus is quota the projection says will expire, released only from day four of the week and only beyond a 20-point safety margin. sm counts the auto PM's spend across its own seat and successors, the agents building its tickets, and the reviews of their PRs. Each build ticket reserves its estimated cost when it starts, and sm refuses a start whose estimate exceeds what is left unreserved. Overshoot is therefore limited to estimation error. At zero, agents mid-ticket reach a safe stopping point and stop. "Skip this week" in Settings sets that week's allowance to zero. The auto PM's own thinking runs on Claude. Building prefers Codex, which has the most unused quota.</p>
 
 <h3>What it costs you</h3>
 <ul>
 <li><b>Once:</b> reviewing this memo, switching it on in Settings, and installing one app update.</li>
 <li><b>Weekly, optional:</b> a one-page readout published as a doc, with no notification. You see it among your docs if you look.</li>
-<li><b>At most one message a week</b>, and only when a shadow-built change needs your yes or no. It holds up to three decisions, each answerable in one word. Unanswered after 14 days counts as no.</li>
+<li><b>At most one message a week</b>, and only when a shadow-built change needs your yes or no. It holds up to three decisions, each answerable in one word. Unanswered after 14 days counts as no. Each decision says plainly what the shadow run could and could not test. Changes to agent instructions or other repos can only be checked offline in shadow mode; their real effect is measured after you say yes, like any other change.</li>
 </ul>
 
 <h3>Risks</h3>
@@ -270,7 +271,7 @@
 <tr><td>1. Budget</td><td><b>Claude: 5 dedicated + surplus up to 15. Codex: 20 dedicated + surplus up to 30.</b> Points per week; "Skip this week" in Settings.</td><td>Claude usually has 40+ points expiring, so this barely touches work you would have done; building leans on Codex.</td></tr>
 <tr><td>2. Models</td><td><b>Auto PM on Opus 5.5 (1M context), high effort; Sonnet research helpers inside its context; build tickets Mid tier, Codex first.</b></td><td>Your call; matches where quota is free.</td></tr>
 <tr><td>3. Its powers on the board</td><td><b>It may file tickets under #2170, auto-start them within budget, order tickets inside its own lane, and flip its own switches. Where its lane sits among your lanes, and ending it, stay yours.</b></td><td>The narrowest exception to "only Rajesh orders or ends lanes" that still lets it run unattended.</td></tr>
-<tr><td>4. Ask-only list</td><td><b>As in the table above:</b> rewriting or dropping stored data, text other agents rely on, CLAUDE.md and AGENTS.md, restart/handover/deploy scripts, other repos, anything outside sm.</td><td>Each one either loses something on undo or breaks the undo.</td></tr>
+<tr><td>4. Ask-only list</td><td><b>As in the table above:</b> rewriting or deleting existing rows, sending messages or pushes, GitHub or board changes on its own initiative, text other agents rely on, CLAUDE.md and AGENTS.md, restart/handover/deploy scripts, other repos, anything outside sm.</td><td>Each one either loses something on undo or breaks the undo.</td></tr>
 <tr><td>5. Android</td><td><b>One install now; afterwards at most one app update a week, features off until switched on.</b></td><td>Your install tap is the only step it cannot take.</td></tr>
 <tr><td>6. Activity log scope</td><td><b>Routes, ids, screens, timing and surface; never message or prompt text; local only; 180 days.</b></td><td>Enough to see workflow, nothing worth leaking.</td></tr>
 <tr><td>7. Your touchpoints</td><td><b>Optional weekly readout doc, no notification; at most one decision message a week.</b></td><td>Anything more spends the currency it is trying to save.</td></tr>
@@ -316,37 +317,44 @@ CREATE INDEX owner_events_at ON owner_events(at_ms);
 CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
 <p><b>A.2 Surface.</b></p>
 <ul>
-<li><code>android</code>: the request passed <code>device_auth_user</code> (<code>http.rs:16135</code>) or arrived through the MobileApp Access application (<code>mark_in_app</code>, <code>http.rs:2313</code>). Owner pages loaded in the app's WebView (<code>DocReader.kt:69</code>) count as android.</li>
-<li><code>web</code>: the request passed <code>owner_web_guard</code> (<code>http.rs:15841</code>) and not the above.</li>
-<li><code>agent_prompt</code>: a Claude <code>UserPromptSubmit</code> hook or a Codex prompt the server classes as owner-typed (<code>is_owner_typed_prompt</code>, <code>owner_messages.rs:131</code>; Codex path <code>sessions.rs:8529</code>). <code>target_kind=session</code>, <code>target_id</code> = the session. The Claude app, claude.ai and the terminal are not distinguishable; record them all as <code>agent_prompt</code>.</li>
-<li><code>terminal</code>: input on the app terminal websocket (<code>http.rs:9680</code>). Coalesce to one event per session per 60 s of input.</li>
+<li><code>android</code>: the request passed <code>device_auth_user</code> (<code>http.rs</code>) or arrived through the MobileApp Access application (<code>mark_in_app</code> in <code>http.rs</code>). Owner pages loaded in the app's WebView (<code>ui/watch/DocReader.kt</code>) count as android.</li>
+<li><code>web</code>: the request passed <code>owner_web_guard</code> (<code>http.rs</code>) and not the above.</li>
+<li><code>agent_prompt</code>: a Claude <code>UserPromptSubmit</code> hook or a Codex prompt the server classes as owner-typed (<code>is_owner_typed_prompt</code> in <code>owner_messages.rs</code>; Codex path <code>codex_fork_user_prompt</code> in <code>sessions.rs</code>). <code>target_kind=session</code>, <code>target_id</code> = the session. The Claude app, claude.ai and the terminal are not distinguishable; record them all as <code>agent_prompt</code>.</li>
+<li><code>terminal</code>: submitted input on the app terminal websocket (the two <code>owner_answered(…, "terminal")</code> calls in <code>http.rs</code>, gated by <code>terminal_frame_submits_input</code>). Coalesce to one event per session per 60 s of input.</li>
 </ul>
 <p>Requests from agents (an <code>x-sm-session-id</code> header or the local-agent gateway) and loopback requests without owner auth are never recorded.</p>
 <p><b>A.3 Action.</b> <code>action</code> is a stable name from a static map keyed by method and route template, for example <code>GET /client/sessions/{id}</code> → <code>session.open</code>, <code>GET /docs/{id}</code> → <code>doc.open</code>, <code>POST /inbox/…/reply</code> → <code>inbox.reply</code>, <code>PUT /client/board/order</code> → <code>board.order</code>. A route absent from the map records its template string, such as <code>GET /client/queue</code>, so nothing is silently dropped. Keep the map in one module and cover it with a test that every owner route resolves to some action. Ids from path parameters fill <code>target_id</code>. Query strings and bodies are never stored.</p>
 <p><b>A.4 Background requests are not events.</b> A request is background when it carries <code>x-sm-bg: 1</code>, or when no client header is present and its route is on the poll list: <code>/watch/state</code>, <code>/client/host-status</code>, <code>/client/board/badge</code>, <code>/client/utilization/series</code>, <code>/client/usage/meters</code>, <code>/client/queue/stats</code>, <code>/inbox</code> when <code>format=json</code> and <code>x-sm-bg</code> is set. Background requests are not stored.</p>
-<p><b>A.5 Client headers</b> (ticket 4). Android adds <code>x-sm-screen</code> (the current screen's route name, for example <code>board</code>, <code>session/detail</code>, <code>inbox/thread</code>, <code>doc</code>) and <code>x-sm-bg</code> in its OkHttp interceptor (<code>AuthInterceptor.kt</code>). It sends <code>x-sm-nav: push:&lt;notice_id&gt;</code> on the first request after a notification tap, <code>launch</code> after a cold start, and <code>nav</code> otherwise. The web client sends the same headers from its router (<code>crates/sm-server/src/web/ui.js</code>).</p>
+<p><b>A.5 Client headers</b> (ticket 4). Android adds <code>x-sm-screen</code> (the current screen's route name, for example <code>board</code>, <code>session/detail</code>, <code>inbox/thread</code>, <code>doc</code>) and <code>x-sm-bg</code> in its OkHttp interceptor (<code>AuthInterceptor.kt</code>). It sends <code>x-sm-nav: push:&lt;notice_id&gt;</code> on the first request after a notification tap; the server stores that as <code>nav=push</code> and <code>notice_id=&lt;notice_id&gt;</code>. Any other header value outside the four names stores <code>nav=NULL</code>. The app sends <code>launch</code> after a cold start, <code>link</code> after opening an sm link from outside the app, and <code>nav</code> otherwise. The web client sends the same headers from its router (<code>crates/sm-server/src/web/ui.js</code>).</p>
 <p><b>A.6 Retention.</b> Rows older than 180 days are deleted by a daily prune. The log is never sent off the machine.</p>
-<p><b>A.7 Read.</b> <code>GET /autopm/events?since_ms=&amp;until_ms=&amp;surface=&amp;action=&amp;limit=</code> (owner or <code>autopm</code> role; limit ≤ 10 000, ordered by <code>at_ms</code>, cursor by <code>id</code>). CLI: <code>sm autopm events [--since 7d] [--surface S] [--action A] [--json]</code>.</p>
+<p><b>A.7 Read.</b> <code>GET /autopm/events?since_ms=&amp;until_ms=&amp;surface=&amp;action=&amp;limit=&amp;cursor=</code> (owner or <code>autopm</code> role). Rows are ordered by <code>(at_ms, id)</code>; <code>limit</code> ≤ 10 000. The response is <code>{events, next_cursor}</code>: <code>next_cursor</code> is the last row's <code>"&lt;at_ms&gt;:&lt;id&gt;"</code>, or null at the end, and <code>cursor=</code> continues strictly after it. CLI: <code>sm autopm events [--since 7d] [--surface S] [--action A] [--json]</code> follows cursors to the end.</p>
 <p><b>A.8 Example.</b> You tap a push about a reply on Android, read the thread, then open the doc it links:</p>
 <pre><code>at_ms          surface  action         target            screen        nav
-1792040000000  android  inbox.thread   thread:t_91       inbox/thread  push:n_442
+1792040000000  android  inbox.thread   thread:t_91       inbox/thread  push n_442
 1792040041000  android  doc.open       doc:far/2102_...  doc           nav
 1792040302000  android  doc.review     doc:far/2102_...  doc           nav</code></pre>
 
 <h3 id="b">B. Switches and experiments</h3>
 <p><b>B.1 Switches.</b></p>
 <pre><code>CREATE TABLE experiment_switches (
-  key          TEXT PRIMARY KEY,   -- e.g. "decision-card"
-  on_          INTEGER NOT NULL DEFAULT 0,
+  key           TEXT PRIMARY KEY,   -- "autopm.&lt;experiment slug&gt;", e.g. "autopm.decision-card"
+  experiment_id TEXT NOT NULL,      -- the experiment that created it
+  on_           INTEGER NOT NULL DEFAULT 0,
+  held          INTEGER NOT NULL DEFAULT 0,  -- 1 = only the owner may turn it on
   changed_at_ms INTEGER NOT NULL,
-  changed_by   TEXT NOT NULL,      -- autopm | owner | guard | feedback | killswitch
-  reason       TEXT
+  changed_by    TEXT NOT NULL,      -- autopm | owner | guard | feedback | killswitch
+  reason        TEXT
 );</code></pre>
 <ul>
 <li>The server holds an in-memory copy, updated on every write, and code asks <code>switches::is_on("key")</code>. A missing key reads as off.</li>
 <li>When <code>autopm.enabled</code> is false (C.1), every switch reads as off whatever its row says.</li>
+<li>Only <code>POST /autopm/experiments</code> creates a switch row, with <code>on_=0</code>, when the experiment has <code>path=switch</code>. The key must not already exist. An experiment can therefore only flip the switch it created.</li>
 <li>Clients receive <code>switches: {key: bool}</code> in <code>/client/bootstrap</code> and <code>/client/settings</code>; the web client re-reads on its existing stale-build check, and Android on resume.</li>
-<li>Writes: <code>PUT /autopm/switches/{key} {on, reason}</code> (owner or <code>autopm</code> role).</li>
+<li>Writes: <code>PUT /autopm/switches/{key} {on, reason}</code>.
+  <ul>
+  <li>Owner: may set either value. Turning a switch on as owner clears <code>held</code>.</li>
+  <li>The <code>autopm</code> role: may turn its own experiment's switch off at any time. It may turn it on only when every switch-on gate in B.3 holds. A held switch refuses it with 409 <code>held: only Rajesh can turn this back on</code>.</li>
+  </ul></li>
 <li>Off must equal pre-change behaviour exactly. Every experiment's build PR includes a test asserting that.</li>
 </ul>
 <p><b>B.2 Experiment record.</b></p>
@@ -356,36 +364,66 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
   title          TEXT NOT NULL,
   hypothesis     TEXT NOT NULL,
   path           TEXT NOT NULL,      -- switch | revert | shadow
-  switch_key     TEXT,               -- required when path = switch
-  tickets_json   TEXT NOT NULL,      -- build ticket numbers
-  metric_query   TEXT NOT NULL,      -- repo path docs/autopm/metrics/&lt;id&gt;.sql
-  guard_queries  TEXT NOT NULL,      -- JSON array of repo paths
-  baseline       REAL,
-  bar            TEXT NOT NULL,      -- e.g. "median -25% both weeks"
-  window_days    INTEGER NOT NULL DEFAULT 14,
+  switch_key     TEXT,               -- set iff path = switch
+  plan_path      TEXT NOT NULL,      -- docs/autopm/plans/&lt;id&gt;.html
+  plan_pr        INTEGER NOT NULL,
+  plan_commit    TEXT,               -- merge commit on main; set by sm when it sees the merge
+  plan_reviewed_sha TEXT,            -- head sha of the completed sm review run that cleared merge
+  tickets_json   TEXT NOT NULL DEFAULT '[]',
+  metric_json    TEXT NOT NULL,      -- F.2 metric spec
+  guards_json    TEXT NOT NULL,      -- F.2 guard specs (JSON array)
+  window_days    INTEGER NOT NULL DEFAULT 14,  -- even, ≥ 14
   live_at_ms     INTEGER,
   measure_at_ms  INTEGER,
-  result         REAL,
+  extended       INTEGER NOT NULL DEFAULT 0,
   state          TEXT NOT NULL,      -- see B.3
   decision_note  TEXT,
   votes_up       INTEGER NOT NULL DEFAULT 0,
   votes_down     INTEGER NOT NULL DEFAULT 0,
-  points_est_json   TEXT,            -- {"claude":2,"codex":6}
+  points_est_json   TEXT NOT NULL,   -- {"claude":2,"codex":6}
   points_spent_json TEXT,
   created_at_ms  INTEGER NOT NULL,
   updated_at_ms  INTEGER NOT NULL
+);
+CREATE TABLE autopm_measurements (
+  experiment_id TEXT NOT NULL,
+  attempt       INTEGER NOT NULL,
+  at_ms         INTEGER NOT NULL,
+  status        TEXT NOT NULL,       -- ok | error
+  error         TEXT,
+  result_json   TEXT,                -- F.2 result shape
+  decision      TEXT,                -- keep | revert | extend | NULL on error
+  PRIMARY KEY (experiment_id, attempt)
 );</code></pre>
-<p><b>B.3 States.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>; <code>shadow</code> experiments go <code>planned → building → shadowed → awaiting_owner → (yes) building → dark → … | (no or 14 days) abandoned</code>. Any state may go to <code>abandoned</code> with a note. <code>dark</code> means merged and deployed with its switch off. <code>live</code> means switched on. sm enforces at most <code>autopm.max_live</code> (default 3) experiments in <code>live</code> or <code>measuring</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code>, <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
-<p><b>B.4 Health guard.</b> Every 60 s the server samples three counters over the trailing 10 minutes: owner-route responses with status ≥ 500, failed <code>sm send</code> deliveries, and caught handler panics. If any counter exceeds max(3, twice its 95th percentile over the previous 7 days), the guard does two things. It switches off every switch turned on within the last 60 minutes, with <code>changed_by=guard</code>. Then it wakes the auto PM with <code>[sm autopm] guard reverted &lt;keys&gt;: &lt;counter&gt; &lt;value&gt;</code>. The guard never touches switches older than 60 minutes; those failures are the auto PM's to diagnose.</p>
+<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. <code>dark</code> means merged and deployed with the switch off; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
+<p>sm enforces these gates server-side. Each refusal returns 409 with the failing gate's name.</p>
+<table>
+<thead><tr><th>Action</th><th>Gate</th></tr></thead>
+<tbody>
+<tr><td><code>plan_merged</code> (used by the rows below)</td><td><code>plan_pr</code> is merged into main. sm records <code>plan_commit</code> (the merge commit) and <code>plan_reviewed_sha</code>. The last <code>sm request-review</code> run on that PR completed at the PR's final head sha. <code>plan_path</code> exists at <code>plan_commit</code> and contains the experiment id.</td></tr>
+<tr><td><code>POST /autopm/issues</code> for experiment X</td><td><code>plan_merged</code>; the issue body names X; X's state is <code>planned</code> or <code>building</code>.</td></tr>
+<tr><td><code>PUT /autopm/auto-start</code></td><td>The ticket is in X's <code>tickets_json</code>; <code>plan_merged</code>; the budget reservation is admitted (C.4).</td></tr>
+<tr><td>Switch on</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; the switch is not held; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> and <code>measure_at_ms = live_at_ms + window_days</code>.</td></tr>
+<tr><td>Shadow yes → building</td><td>Only by the owner's answer (E.2).</td></tr>
+</tbody>
+</table>
+<p><b>B.4 Health guard.</b></p>
+<ul>
+<li><b>Samples.</b> The server keeps three in-memory counters: owner-route responses with status ≥ 500, failed <code>sm send</code> deliveries, and caught handler panics. At each minute boundary it writes them, then resets them, into <code>guard_samples(minute_ms INTEGER PRIMARY KEY, owner_5xx INTEGER, delivery_failures INTEGER, panics INTEGER)</code> in <code>utilization.db</code>. Minutes the server was down have no row. Rows older than 8 days are pruned.</li>
+<li><b>Current value.</b> Per counter, the sum over the rows of the latest 10 minutes. Missing rows count as zero.</li>
+<li><b>Baseline.</b> For every minute m from 7 days ago up to 60 minutes ago whose 10 rows m−9…m all exist, take the sum of those rows. The baseline is the 95th percentile of those sums, by nearest rank.</li>
+<li><b>Threshold.</b> max(3, 2 × baseline). With fewer than 1 440 baseline sums (under a day of history, as right after first deploy), the threshold is 3: the guard trips more easily, never less.</li>
+<li><b>Action.</b> The guard is evaluated every 60 s. When any counter's current value exceeds its threshold, the guard does two things. It turns off every switch turned on within the last 60 minutes, with <code>held=1, changed_by=guard</code>. Then it wakes the auto PM with <code>[sm autopm] guard reverted &lt;keys&gt;: &lt;counter&gt; &lt;value&gt; &gt; &lt;threshold&gt;</code>. Switches on for longer than 60 minutes are left alone; those failures are the auto PM's to diagnose.</li>
+</ul>
 <p><b>B.5 Kill switch.</b> <code>autopm.enabled=false</code> (Settings › Auto PM, or <code>PUT /client/settings</code>) takes effect immediately:</p>
 <ol>
-<li>All switches read off (B.1).</li>
+<li>In one transaction, every switch with <code>on_=1</code> becomes <code>on_=0, held=1, changed_by=killswitch</code>.</li>
 <li>sm stops auto-starting autopm-lane tickets.</li>
 <li>Cycle creation stops.</li>
 <li>The auto PM and every agent on an autopm ticket get <code>[sm autopm] disabled by Rajesh: push work in progress, comment on your ticket, stop</code>.</li>
 </ol>
-<p>Re-enabling restores the rows' own switch values.</p>
-<p><b>B.6 Revert path.</b> For <code>path=revert</code> changes: <code>git revert</code> the merge commit, open a PR, wait for a clean review, merge, then <code>scripts/restart-rust-server.sh</code>. If main has moved on in a way that conflicts, deploy the previous build with <code>--allow-behind-main</code> first, then land the revert.</p>
+<p>Re-enabling turns nothing back on. Held switches stay off until you turn each one on yourself.</p>
+<p><b>B.6 Revert path.</b> For <code>path=revert</code> changes: <code>git revert</code> the merge commit, open a PR, wait for a clean review, merge, then <code>scripts/restart-rust-server.sh</code>. If main has moved on in a way that conflicts, deploy the previous build with <code>--allow-behind-main</code> first, then land the revert. <code>path=revert</code> is valid only for changes with no lasting side effects (memo table); <code>POST /autopm/experiments</code> requires the plan to state "side effects: none".</p>
 
 <h3 id="c">C. Budget</h3>
 <p><b>C.1 Owner setting</b> <code>autopm</code> in <code>owner_settings</code> (hot, <code>owner_settings.rs:22</code>):</p>
@@ -403,7 +441,7 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
 <pre><code>allowance = 0                               if skip_window_starting = this window's start
           = dedicated                       before 96 h into the window
           = dedicated + min(cap, max(0, headroom - margin))   from 96 h on
-headroom  = projected_free_headroom_points from build_projection (usage_report.rs:851)</code></pre>
+headroom  = projected_free_headroom_points from build_projection (usage_report.rs)</code></pre>
 <p>Example: on Thursday the Claude projection says the week ends at 55%, so headroom is 45. The allowance is 5 + min(15, 45 − 20) = 20 points.</p>
 <p><b>C.3 Spend.</b> Spend is the token use in <code>usage.db</code> <code>seat_tokens</code> for the current window, converted to points with the fitted rates in <code>quota_rates.rs</code>. It covers three groups of seats:</p>
 <ol>
@@ -412,7 +450,27 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <li>Review runs on PRs linked to those tickets.</li>
 </ol>
 <p>The PM's in-context research helpers count as part of its seat. <code>GET /autopm/budget</code> returns <code>{window_start, resets_at, providers: {claude: {allowance, spent, remaining}, codex: {…}}}</code>; CLI <code>sm autopm budget</code>.</p>
-<p><b>C.4 Enforcement.</b> sm does not auto-start an autopm-lane ticket whose resolved provider has <code>remaining ≤ 0</code>. When a provider first reaches zero in a window, sm sends the auto PM and every agent on an autopm ticket of that provider <code>[sm autopm] &lt;provider&gt; budget spent: reach a safe stop</code>. A safe stop means: push the work, comment on the ticket what remains, then go idle. Overshoot is bounded by the work already in flight. The auto PM itself checks <code>sm autopm budget</code> before spawning any helper, and stops researching when its provider is at zero.</p>
+<p><b>C.4 Enforcement.</b> Build tickets reserve budget when they start:</p>
+<pre><code>CREATE TABLE autopm_reservations (
+  repo TEXT NOT NULL, number INTEGER NOT NULL,
+  provider TEXT NOT NULL, points REAL NOT NULL,
+  window_start TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL, released_at_ms INTEGER,
+  PRIMARY KEY (repo, number, window_start)
+);</code></pre>
+<ul>
+<li><code>PUT /autopm/auto-start</code> carries <code>points_est &gt; 0</code>, which is required.</li>
+<li>Admission runs in one <code>BEGIN IMMEDIATE</code> transaction, so concurrent starts serialize.
+<pre><code>open_hold    = Σ over unreleased reservations r of this provider and window:
+                 max(0, r.points − spent_by_ticket(r))
+unreserved   = allowance − spent − open_hold
+admit iff points_est ≤ unreserved</code></pre></li>
+<li>A reservation is released when its ticket closes or its agent retires.</li>
+<li>When a ticket's own spend passes 1.5 × its reservation, sm sends that ticket's agent <code>[sm autopm] ticket over estimate: reach a safe stop</code>.</li>
+<li>When a provider's <code>remaining</code> reaches zero, sm sends the same safe-stop message to the auto PM and to every agent on an autopm ticket of that provider. A safe stop means: push the work, comment on the ticket what remains, then go idle.</li>
+<li>Overshoot is therefore bounded by 0.5 × the open reservations.</li>
+<li>The auto PM checks <code>sm autopm budget</code> before spawning any helper, and stops researching when its provider is at zero.</li>
+</ul>
 
 <h3 id="d">D. The autopm role, cycles and the board</h3>
 <p><b>D.1 Role.</b> <code>autopm</code> is an sm role like <code>maintainer</code> (agent registrations). sm allows one live holder. Handoff moves roles to the successor (specs/1651_context_handoff.html, appendix G). Only a seat sm started as the auto PM may register it.</p>
@@ -431,7 +489,7 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <tbody>
 <tr><td><code>POST /autopm/issues</code></td><td>Creates a session-manager issue, label <code>autopm</code>, as a sub-issue of the current cycle ticket</td><td>session-manager only; body must contain a <code>Tier:</code> line and the experiment id</td></tr>
 <tr><td><code>PUT /autopm/auto-start</code></td><td>Authorizes auto-start of one of its open tickets</td><td>Ticket must be under #2170; provider must have budget left (C.4)</td></tr>
-<tr><td><code>PUT /autopm/switches/{key}</code></td><td>Turns a switch on or off</td><td>Only keys named by one of its experiments</td></tr>
+<tr><td><code>PUT /autopm/switches/{key}</code></td><td>Turns a switch on or off</td><td>Only the switch its experiment created; on only through the B.3 gates; never a held switch</td></tr>
 <tr><td><code>POST/PATCH /autopm/experiments</code></td><td>Records experiments</td><td>State moves per B.3; <code>max_live</code> enforced</td></tr>
 <tr><td><code>POST /autopm/ask</code></td><td>Sends the weekly decision message (E.2)</td><td>One per cycle</td></tr>
 <tr><td><code>sm board after</code> / <code>under</code></td><td>Orders its tickets inside the lane</td><td>Already agent-callable; the role adds nothing</td></tr>
@@ -443,12 +501,19 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <p><b>D.7 Context.</b> The auto PM uses the default Claude handoff policy (threshold 35%, <code>handoff/policy.rs:29</code>). Its handoff note always lists live experiments with their measurement dates, the cycle ticket, and the path of the playbook. Measurement dates are set as <code>sm remind</code> reminders, which handoff moves to the successor.</p>
 
 <h3 id="e">E. Shadow mode and asks</h3>
-<p><b>E.1 Shadow build.</b> The build agent works on a branch and runs the change on a scratch server: a copy of live state with <code>rust_core.runtime_enabled: false</code> (the scratch-server recipe used for local benches), on a port other than 8420. Evidence comes from one of two sources:</p>
-<ul>
-<li>replaying the last 14 days of <code>owner_events</code> against both builds;</li>
-<li>computing the metric offline on the copy.</li>
-</ul>
-<p>The agent records the evidence in <code>decision_note</code> and sets state <code>awaiting_owner</code>. A shadow build never touches the live server, the live databases or the installed app.</p>
+<p><b>E.1 Shadow build.</b> The build agent works on a branch and runs the change against a scratch server: a copy of live state with <code>rust_core.runtime_enabled: false</code> (the scratch-server recipe used for local benches), on a port other than 8420. A shadow build never touches the live server, the live databases or the installed app. What it can show depends on the class of change:</p>
+<table>
+<thead><tr><th style="width:26%">Ask-only class</th><th>Evidence the shadow run must produce</th><th style="width:24%">Cannot be shown before yes</th></tr></thead>
+<tbody>
+<tr><td>Existing rows rewritten or deleted</td><td>Back up the copy, run the change, and check invariants: row counts, references, and identical JSON from read routes for 50 sampled ids apart from the intended fields. Then restore from the backup and show the restore is byte-identical. The tested restore procedure goes into the ask.</td><td>Your reaction</td></tr>
+<tr><td>Messages, pushes, GitHub or board changes on its own initiative</td><td>Run with every outbound effect replaced by a recorder, against the triggering history of the last 14 days (message and event rows on the copy). The ask lists what would have been sent or changed, with counts.</td><td>Your reaction</td></tr>
+<tr><td>Text or commands other agents rely on; CLAUDE.md or AGENTS.md</td><td>The diff, plus how many agents and messages in the last 14 days the change would have touched, from the copy. Optionally, one probe agent on the scratch server performs a scripted task under the new text.</td><td>Effect on real agents</td></tr>
+<tr><td>Restart, handover or deploy scripts</td><td>Three runs against a scratch launchd label and port, one of them with a forced failure, each ending in a verified rollback.</td><td>—</td></tr>
+<tr><td>Other repos; anything outside sm</td><td>The diff and the size of the problem from the activity log.</td><td>Everything else</td></tr>
+</tbody>
+</table>
+<p>For read-only behaviour, the shadow run may also replay the last 14 days of GET events (method, route and <code>target_id</code>) against both builds and compare the responses. Write requests are never replayed, because the log stores no bodies.</p>
+<p>The agent records the evidence, and the "cannot be shown" column for its class, in <code>decision_note</code>, then sets state <code>awaiting_owner</code>. After you answer yes, the change ships behind a switch where it can have one, and is measured like any other experiment.</p>
 <p><b>E.2 The ask.</b> <code>POST /autopm/ask</code> sends one owner message, non-blocking, title <code>Auto PM: N decisions</code>. Each decision is at most 120 words: what it changes, the evidence, what yes does, what no does. You answer in the inbox thread, one word per decision ("1 yes, 2 no"). sm parses the reply into each experiment's state, and the auto PM asks again in plain words only if it cannot parse the reply. A decision unanswered after 14 days becomes <code>abandoned</code>, with note "no answer". The auto PM does not ask about it again unless the evidence changes materially.</p>
 
 <h3 id="f">F. Measurement and feedback</h3>
@@ -458,17 +523,36 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <li>the evidence from the activity log;</li>
 <li>the change;</li>
 <li>its path (switch, revert or shadow) and why;</li>
-<li>the metric query and the guard queries;</li>
-<li>the baseline value, the bar and the window;</li>
+<li><code>metric_json</code> and <code>guards_json</code> per F.2, with the committed queries and the current baseline values;</li>
+<li>the window;</li>
+<li>side effects: "none", or each lasting effect listed (which decides the path);</li>
 <li>the points estimate;</li>
 <li>the build tickets.</li>
 </ul>
 <p>Converged means the review raised no P1, or the auto PM answered each P1 per CLAUDE.md's review loop.</p>
-<p><b>F.2 Decision rule</b> (default, overridable only in the plan, before building):</p>
+<p><b>F.2 Metric contract.</b> sm runs every measurement, not the auto PM, so a successor agent cannot reinterpret one.</p>
+<pre><code>metric_json = {"query": "docs/autopm/metrics/&lt;id&gt;.sql",
+               "stat": "median" | "mean" | "per_day",
+               "direction": "lower" | "higher",
+               "min_change_pct": 25}
+guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "lower",
+                "max_worse_pct": 25}, ...]</code></pre>
 <ul>
-<li><b>keep</b> when the metric beats the bar in both 7-day halves of the window, every guard is within 25% of its baseline, and there are no 👎;</li>
-<li><b>reverted</b> immediately on any 👎 (the server switches it off, <code>changed_by=feedback</code>), or at measurement when the bar is missed or a guard fails;</li>
-<li><b>extend once</b> by 14 days when the metric has fewer than 10 observations; still under 10 after that means <code>reverted</code> with note "insufficient data".</li>
+<li><b>Query.</b> A single SQLite <code>SELECT</code>, run read-only at <code>plan_commit</code>. The databases are attached as schemas <code>q</code> (queue database), <code>act</code> (<code>activity.db</code>), <code>usage</code>, <code>util</code> and <code>bugs</code>. The bound parameters are <code>:from_ms</code> and <code>:until_ms</code>. It returns rows <code>(at_ms INTEGER, value REAL)</code>, one per observation, with <code>from_ms ≤ at_ms &lt; until_ms</code>. Rows with a <code>NULL</code> value are ignored. The timeout is 30 s.</li>
+<li><b>Stats.</b> <code>median</code> is the median of values, averaging the two middle values when n is even. <code>mean</code> is the mean of values. <code>per_day</code> is the row count divided by the window length in days.</li>
+<li><b>Windows.</b> Baseline B = [live_at − 14 d, live_at). Halves H1 = [live_at, live_at + window/2) and H2 = [live_at + window/2, live_at + window).</li>
+<li><b>Bar.</b> For each half, change = (stat(H) − stat(B)) / stat(B). It meets the bar when change ≤ −min_change_pct/100 for <code>lower</code>, or ≥ +min_change_pct/100 for <code>higher</code>. If stat(B) = 0, the switch-on gate refuses with <code>baseline_zero</code> and the experiment stays <code>dark</code>.</li>
+<li><b>Guards.</b> Each guard is computed the same way, and fails in a half when it moves in <code>bad_direction</code> by more than <code>max_worse_pct</code>. When a <code>per_day</code> guard's baseline is 0, it fails when the half's count is 2 or more. Two guards are built in and cannot be removed: any 👎 vote, and the owner switching the switch off.</li>
+<li><b>Decision</b>, at <code>measure_at_ms</code>:
+  <ul>
+  <li><b>keep</b>: both halves meet the bar and no guard fails;</li>
+  <li><b>extend</b>, once (<code>extended=1</code>, <code>measure_at_ms += 14 d</code>, halves recomputed over the longer window): either half has fewer than 10 observations;</li>
+  <li><b>revert</b>: anything else, including fewer than 10 observations after extending. The note is "insufficient data".</li>
+  </ul></li>
+<li><b>Errors.</b> A query error or timeout records <code>status=error</code> and retries hourly. After 3 errors, the experiment is reverted with note "metric failed".</li>
+<li><b>Revert</b> sets the switch off with <code>changed_by=autopm</code>, not held. For <code>path=revert</code> it files the revert ticket per B.6. Each decision writes a row to <code>autopm_measurements</code> and wakes the auto PM.</li>
+<li><b>Result shape:</b> <code>{"baseline": {stat, n}, "h1": {stat, n, change}, "h2": {…}, "guards": [{query, baseline, h1, h2, failed}]}</code>.</li>
+<li><b>Immediate revert:</b> a 👎 at any time turns the switch off at once (<code>held=1, changed_by=feedback</code>), without waiting for the measurement date.</li>
 </ul>
 <p>A kept change keeps its switch for 30 days, then a cleanup ticket removes the switch and the old code path.</p>
 <p><b>F.3 Feedback.</b> A "What changed" card appears in Settings › Auto PM (Android and web), and as a dismissible chip on any screen a live switch changes. It lists live experiments: title, one line, live since, 👍 / 👎. <code>POST /client/autopm/feedback {experiment_id, vote: "up"|"down", note?}</code> (owner only) increments the counts. A down vote also switches the experiment off and wakes the auto PM.</p>
@@ -518,7 +602,7 @@ Analytics › Time, bug reports and Rajesh's own tickets for friction, using
 Sonnet subagents in your context for data pulls; (3) choose at most what fits
 max_live and the budget; (4) write a plan per appendix F.1, get it reviewed;
 (5) file build tickets (sm autopm issue), order them, authorize auto-start;
-(6) switch on when dark and healthy; (7) publish the readout and playbook PR.
+(6) merge a plan only after its review converges, then switch on when dark and healthy; (7) publish the readout and playbook PR.
 
 Rules: no change ships without a fixed test. Ask-only changes go through shadow
 mode and one weekly ask. Never work where Rajesh has an open ticket. Never infer
@@ -531,9 +615,9 @@ your note lists live experiments, dates, cycle ticket and playbook path.</code><
 <table>
 <thead><tr><th>Ticket</th><th>Code</th><th>Tests (each behaviour named in A–G)</th></tr></thead>
 <tbody>
-<tr><td>1 Owner activity log</td><td>new <code>owner_events.rs</code>; middleware layer in <code>http.rs</code> router (<code>http.rs:1795</code>); hooks at <code>owner_answered</code> (<code>http/messages.rs:22</code>) and terminal input (<code>http.rs:9680</code>); route + <code>sm autopm events</code> in <code>bin/sm.rs</code></td><td>surface per auth path (A.2); agent and loopback requests not recorded; every owner route maps to an action (A.3); background exclusion (A.4); headers stored (A.5); prune at 180 d (A.6); no body or query stored</td></tr>
-<tr><td>2 Switches, experiments, budget</td><td>new <code>autopm/{switches,experiments,budget,guard}.rs</code>; <code>owner_settings.rs</code> key <code>autopm</code>; bootstrap and settings responses</td><td>missing key off; kill switch forces off and restores (B.5); state machine and <code>max_live</code> (B.3); guard thresholds and 60-min scope (B.4); allowance formula incl. skip and day-4 release (C.2); spend attribution three groups (C.3); auto-start refusal at zero and the safe-stop message (C.4)</td></tr>
-<tr><td>3 Seat and cycles</td><td><code>autopm/{role,cycle,ask}.rs</code>; board auto-start path (<code>http/board.rs:322</code>, <code>board/launch.rs:171</code>); issue creation via <code>BoardSource::create_issue</code> (<code>http/board.rs:65</code>); lane review policy (<code>http/review_policies.rs</code>); brief and playbook seed files</td><td>enable creates lane, policy, cycle, auto-start (D.2); Monday cycle creation and roll-over, none in a skipped window (D.3); role powers and refusals (D.4); one holder; role moves on handoff (D.1); ask parsing and 14-day abandon (E.2); four-cycle auto-pause (F.4)</td></tr>
+<tr><td>1 Owner activity log</td><td>new <code>owner_events.rs</code>; middleware layer in <code>http.rs</code> router; hooks at <code>owner_answered</code> (<code>http/messages.rs:22</code>) and terminal input (<code>terminal_frame_submits_input</code> path); route + <code>sm autopm events</code> in <code>bin/sm.rs</code></td><td>surface per auth path (A.2); agent and loopback requests not recorded; every owner route maps to an action (A.3); background exclusion (A.4); headers stored (A.5); prune at 180 d (A.6); no body or query stored</td></tr>
+<tr><td>2 Switches, experiments, budget</td><td>new <code>autopm/{switches,experiments,budget,guard}.rs</code>; <code>owner_settings.rs</code> key <code>autopm</code>; bootstrap and settings responses</td><td>missing key off; switch created only by its experiment; held switches refuse the role and owner-on clears held (B.1); kill switch holds every on switch and re-enable turns nothing on (B.5); state machine, every gate in B.3 incl. plan merged at a reviewed head, and <code>max_live</code>; guard samples durable across restart, baseline population, no-history threshold 3, 60-min scope (B.4); metric runner: query contract, stats, halves, bar, guards, extend, baseline zero, errors and retries, result shape (F.2); allowance formula incl. skip and day-4 release (C.2); spend attribution three groups (C.3); reservation admission under concurrent starts, release on close, over-estimate and zero-remaining safe-stop messages (C.4)</td></tr>
+<tr><td>3 Seat and cycles</td><td><code>autopm/{role,cycle,ask}.rs</code>; board auto-start path (<code>process_auto_starts</code> in <code>http/board.rs</code>, <code>resolve</code> in <code>board/launch.rs</code>); issue creation via <code>BoardSource::create_issue</code> (<code>board/sync.rs</code>); lane review policy (<code>http/review_policies.rs</code>); brief and playbook seed files</td><td>enable creates lane, policy, cycle, auto-start (D.2); Monday cycle creation and roll-over, none in a skipped window (D.3); role powers and refusals (D.4); one holder; role moves on handoff (D.1); ask parsing and 14-day abandon (E.2); four-cycle auto-pause (F.4)</td></tr>
 <tr><td>4 App and web</td><td><code>android-app/…/AuthInterceptor.kt</code>, navigation, notification intent; <code>crates/sm-server/src/web/ui.js</code>; Settings › Auto PM screens; feedback route</td><td>headers per A.5 (instrumented test); switches read on resume; card and chip render for live switches; 👎 switches off (F.3); settings toggles enabled / skip week</td></tr>
 </tbody>
 </table>
