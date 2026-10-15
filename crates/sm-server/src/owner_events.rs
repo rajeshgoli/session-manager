@@ -3,7 +3,7 @@
 //! and timing. Never a body, query string, message or prompt text.
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +18,9 @@ pub const DEFAULT_LIMIT: usize = 1_000;
 /// Terminal input coalesces to one row per session per this window (A.2).
 const TERMINAL_COALESCE: Duration = Duration::from_secs(60);
 const MAX_HEADER_CHARS: usize = 128;
+/// A request repeating a row this recent writes nothing, so a page polling
+/// without `x-sm-bg` shows as one row a minute.
+pub const REPEAT_WINDOW_MS: i64 = 60_000;
 
 pub const SURFACES: [&str; 4] = ["android", "web", "agent_prompt", "terminal"];
 
@@ -111,11 +114,43 @@ impl OwnerEventStore {
 
     /// Stores `event`; its `id` is ignored and assigned here.
     pub fn record(&self, event: &OwnerEvent) -> Result<i64> {
+        Ok(self
+            .record_unless_repeat(event, false)?
+            .expect("an uncoalesced record always inserts"))
+    }
+
+    /// Stores `event`, or with `coalesce` skips it when a row with the same
+    /// surface, device, action and target was recorded in the
+    /// [`REPEAT_WINDOW_MS`] before it. Returns the new id, if any.
+    pub fn record_unless_repeat(&self, event: &OwnerEvent, coalesce: bool) -> Result<Option<i64>> {
         if !SURFACES.contains(&event.surface.as_str()) {
             bail!("unknown surface {}", event.surface);
         }
-        let conn = self.open_write()?;
-        conn.execute(
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if coalesce {
+            let repeat = tx
+                .query_row(
+                    "SELECT 1 FROM owner_events
+                     WHERE action = ?1 AND at_ms > ?2 AND surface = ?3 AND device_id IS ?4
+                       AND target_kind IS ?5 AND target_id IS ?6
+                     LIMIT 1",
+                    params![
+                        event.action,
+                        event.at_ms - REPEAT_WINDOW_MS,
+                        event.surface,
+                        event.device_id,
+                        event.target_kind,
+                        event.target_id,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if repeat.is_some() {
+                return Ok(None);
+            }
+        }
+        tx.execute(
             "INSERT INTO owner_events (at_ms, surface, device_id, action, target_kind,
                target_id, screen, nav, notice_id, status, duration_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -133,7 +168,9 @@ impl OwnerEventStore {
                 event.duration_ms,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(id))
     }
 
     /// Deletes rows older than [`RETENTION_MS`] before `now_ms`.

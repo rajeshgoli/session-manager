@@ -128,7 +128,11 @@ pub(super) async fn record(
             duration_ms: Some(duration_ms),
             ..OwnerEvent::default()
         };
-        if let Err(error) = store(&state).record(&event) {
+        // Rows carrying the client's screen or nav headers are never coalesced.
+        let coalesce = !["x-sm-screen", "x-sm-nav"]
+            .into_iter()
+            .any(|name| headers.contains_key(name));
+        if let Err(error) = store(&state).record_unless_repeat(&event, coalesce) {
             eprintln!("owner event {method} {route} not recorded: {error:#}");
         }
     });

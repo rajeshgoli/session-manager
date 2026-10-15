@@ -249,6 +249,43 @@ async fn records_owner_requests_by_surface_and_never_agents_or_strangers() {
 }
 
 #[tokio::test]
+async fn polls_without_screen_or_nav_coalesce_to_one_row_a_minute() {
+    let f = fixture();
+    let bearer = f.bearer.as_str();
+    let board = |headers: &[(&str, &str)]| {
+        let mut all = vec![("authorization", bearer)];
+        all.extend_from_slice(headers);
+        request(Method::GET, "/client/board", "testserver", &all, "")
+    };
+    for _ in 0..3 {
+        f.send(board(&[])).await;
+    }
+    assert_eq!(f.settled_rows(1).await.len(), 1);
+    // Rows carrying the client's screen or nav are never coalesced.
+    for headers in [
+        [("x-sm-screen", "board")],
+        [("x-sm-screen", "board")],
+        [("x-sm-nav", "nav")],
+    ] {
+        f.send(board(&headers)).await;
+    }
+    assert_eq!(f.settled_rows(4).await.len(), 4);
+    f.send(board(&[])).await;
+    // Another target is another row.
+    let session = request(
+        Method::GET,
+        "/client/sessions/fork1001",
+        "testserver",
+        &[("authorization", bearer)],
+        "",
+    );
+    f.send(session).await;
+    let rows = f.settled_rows(5).await;
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert_eq!(rows.iter().filter(|e| e.action == "board.open").count(), 4);
+}
+
+#[tokio::test]
 async fn events_route_pages_with_the_cursor_and_is_owner_only() {
     let f = fixture();
     // Recent enough that the startup prune leaves them alone.

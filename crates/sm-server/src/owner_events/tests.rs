@@ -89,6 +89,38 @@ fn list_filters_by_window_surface_and_action() {
 }
 
 #[test]
+fn repeats_within_a_minute_coalesce_by_surface_device_action_and_target() {
+    let store = OwnerEventStore::new(temp_db("repeat"));
+    let at = |at_ms: i64, device: Option<&str>, target: Option<&str>| OwnerEvent {
+        at_ms,
+        device_id: device.map(str::to_owned),
+        target_kind: target.map(|_| "session".to_owned()),
+        target_id: target.map(str::to_owned),
+        ..event(at_ms, "android", "board.open")
+    };
+    let t = 1_800_000_000_000;
+    let inserted =
+        |e: OwnerEvent, coalesce: bool| store.record_unless_repeat(&e, coalesce).unwrap().is_some();
+    assert!(inserted(at(t, None, None), true));
+    assert!(!inserted(at(t + 5_000, None, None), true));
+    assert!(!inserted(at(t + REPEAT_WINDOW_MS - 1, None, None), true));
+    // Uncoalesced rows always land.
+    assert!(inserted(at(t + 6_000, None, None), false));
+    // A different device or target is a different row.
+    assert!(inserted(at(t + 7_000, Some("pixel"), None), true));
+    assert!(!inserted(at(t + 8_000, Some("pixel"), None), true));
+    assert!(inserted(at(t + 9_000, None, Some("s1")), true));
+    let web = OwnerEvent {
+        surface: "web".into(),
+        ..at(t + 10_000, None, None)
+    };
+    assert!(inserted(web, true));
+    // A minute after the last row, the poll shows again.
+    assert!(inserted(at(t + 6_000 + REPEAT_WINDOW_MS, None, None), true));
+    assert_eq!(store.list(&query(100)).unwrap().0.len(), 6);
+}
+
+#[test]
 fn prune_deletes_only_rows_past_180_days() {
     let store = OwnerEventStore::new(temp_db("prune"));
     // A missing database stays missing.
