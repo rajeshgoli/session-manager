@@ -1,5 +1,6 @@
 //! Managed artifact records. Filesystem operations share the database's immediate
 //! transaction so a competing mutation cannot invalidate a deletion's checks.
+pub mod archive;
 pub mod attribution;
 pub mod config;
 pub mod delete;
