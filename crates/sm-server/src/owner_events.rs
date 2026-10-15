@@ -5,7 +5,7 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -55,6 +55,36 @@ pub struct OwnerEventStore {
     db_path: PathBuf,
 }
 
+/// Rows being recorded, per database: token to `at_ms`. A row's time is
+/// taken when its request arrives but written after the response, so a
+/// reader must not page past a time that may still gain rows.
+type InFlight = HashMap<PathBuf, BTreeMap<u64, i64>>;
+
+fn in_flight() -> &'static Mutex<(u64, InFlight)> {
+    static IN_FLIGHT: OnceLock<Mutex<(u64, InFlight)>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// A row about to be recorded, holding back [`OwnerEventStore::settled_before`]
+/// until it is dropped.
+pub struct Pending {
+    db_path: PathBuf,
+    token: u64,
+    pub at_ms: i64,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut guard = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rows) = guard.1.get_mut(&self.db_path) {
+            rows.remove(&self.token);
+            if rows.is_empty() {
+                guard.1.remove(&self.db_path);
+            }
+        }
+    }
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS owner_events (
@@ -80,6 +110,37 @@ fn init_schema(conn: &Connection) -> Result<()> {
 impl OwnerEventStore {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
+    }
+
+    /// Takes the time of a row to be recorded. Under one lock with
+    /// [`Self::settled_before`], so every later row is at or after what a
+    /// reader has been told is settled.
+    pub fn begin(&self) -> Pending {
+        let mut guard = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        guard.0 += 1;
+        let token = guard.0;
+        let at_ms = now_ms();
+        guard
+            .1
+            .entry(self.db_path.clone())
+            .or_default()
+            .insert(token, at_ms);
+        Pending {
+            db_path: self.db_path.clone(),
+            token,
+            at_ms,
+        }
+    }
+
+    /// Rows before this time are final: the earliest row still being
+    /// recorded, or now.
+    pub fn settled_before(&self) -> i64 {
+        let guard = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .1
+            .get(&self.db_path)
+            .and_then(|rows| rows.values().min().copied())
+            .unwrap_or_else(now_ms)
     }
 
     fn open_write(&self) -> Result<Connection> {
@@ -253,7 +314,7 @@ pub fn now_ms() -> i64 {
 
 /// An owner-typed agent prompt (A.2). Never stores the prompt.
 pub fn record_agent_prompt(db_path: &Path, session_id: &str) {
-    record_session_input(db_path, "agent_prompt", session_id, now_ms());
+    record_session_input(db_path, "agent_prompt", session_id);
 }
 
 /// Submitted app-terminal input, coalesced to one row per session per 60 s.
@@ -271,12 +332,14 @@ pub fn record_terminal_input(db_path: &Path, session_id: &str) {
         }
         recent.insert(key, now);
     }
-    record_session_input(db_path, "terminal", session_id, now_ms());
+    record_session_input(db_path, "terminal", session_id);
 }
 
-fn record_session_input(db_path: &Path, surface: &str, session_id: &str, at_ms: i64) {
+fn record_session_input(db_path: &Path, surface: &str, session_id: &str) {
+    let store = OwnerEventStore::new(db_path.to_path_buf());
+    let pending = store.begin();
     let event = OwnerEvent {
-        at_ms,
+        at_ms: pending.at_ms,
         surface: surface.to_owned(),
         action: if surface == "terminal" {
             "terminal.input"
@@ -288,9 +351,10 @@ fn record_session_input(db_path: &Path, surface: &str, session_id: &str, at_ms: 
         target_id: Some(session_id.to_owned()),
         ..OwnerEvent::default()
     };
-    if let Err(error) = OwnerEventStore::new(db_path.to_path_buf()).record(&event) {
+    if let Err(error) = store.record(&event) {
         eprintln!("owner event {surface} for {session_id} not recorded: {error:#}");
     }
+    drop(pending);
 }
 
 /// `x-sm-nav` (A.5): `push:<notice_id>`, `launch`, `link` or `nav`; anything

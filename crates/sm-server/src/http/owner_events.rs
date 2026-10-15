@@ -148,7 +148,8 @@ pub(super) async fn record(
     }
     let peer_addr = request_peer_addr(&request);
     let method = request.method().as_str().to_owned();
-    let at_ms = log::now_ms();
+    let pending = store(&state).begin();
+    let at_ms = pending.at_ms;
     let started = Instant::now();
     let response = next.run(request).await;
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -182,6 +183,7 @@ pub(super) async fn record(
         if let Err(error) = store(&state).record_unless_repeat(&event, coalesce) {
             eprintln!("owner event {method} {route} not recorded: {error:#}");
         }
+        drop(pending);
     });
     response
 }
@@ -234,8 +236,7 @@ pub(super) async fn list_events(
     // header, or a request whose identity is the owner's.
     let local = is_request_local_bypass(&state, &request);
     if from_agent(request.headers())
-        || (state.config.google_auth.requested()
-            && !local
+        || (!local
             && owner_surface(&state, request.headers(), request_peer_addr(&request)).is_none())
     {
         return Err(ApiError::Status {
@@ -262,15 +263,17 @@ pub(super) async fn list_events(
             )));
         }
     }
+    let store = store(&state);
+    // Never past a row still being written, so a cursor cannot skip it.
+    let settled = store.settled_before();
     let event_query = EventQuery {
         since_ms: query.since_ms,
-        until_ms: query.until_ms,
+        until_ms: Some(query.until_ms.map_or(settled, |until| until.min(settled))),
         surface,
         action: query.action.filter(|a| !a.is_empty()),
         limit,
         after,
     };
-    let store = store(&state);
     let (events, next_cursor) = tokio::task::spawn_blocking(move || store.list(&event_query))
         .await
         .map_err(|error| ApiError::Internal(error.into()))??;

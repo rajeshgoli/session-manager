@@ -394,6 +394,20 @@ async fn events_route_pages_with_the_cursor_and_is_owner_only() {
     assert_eq!(f.send(guest).await.0, StatusCode::FORBIDDEN);
     let anonymous = request(Method::GET, "/autopm/events", "testserver", &[], "");
     assert_eq!(f.send(anonymous).await.0, StatusCode::UNAUTHORIZED);
+    // A row still being written holds the feed back to just before it.
+    let pending = f.store.begin();
+    f.store
+        .record(&OwnerEvent {
+            at_ms: pending.at_ms + 1,
+            surface: "web".into(),
+            action: "late".into(),
+            ..OwnerEvent::default()
+        })
+        .unwrap();
+    let late = "/autopm/events?action=late";
+    assert_eq!(f.send(get(late)).await.1["events"], json!([]));
+    drop(pending);
+    assert_eq!(f.send(get(late)).await.1["events"][0]["action"], "late");
     let owner = request(
         Method::GET,
         "/autopm/events",
@@ -444,4 +458,35 @@ fn only_owner_users_count_as_the_owner() {
     assert!(is_owner_user_id(&config, "rajesh"));
     assert!(!is_owner_user_id(&config, "guest"));
     assert!(!is_owner_user_id(&config, ""));
+}
+
+#[tokio::test]
+async fn events_route_needs_the_owner_without_google_auth() {
+    let mut config = cloudflare_access_config();
+    config.google_auth.allowlist_emails = vec!["rajeshgoli@gmail.com".into()];
+    add_users(&mut config);
+    config.paths.state_file = write_session_state("fork1001", "running");
+    config.sm_send.db_path = PathBuf::from(&config.paths.state_file)
+        .with_file_name("messages.db")
+        .display()
+        .to_string();
+    assert!(!config.google_auth.requested());
+    let state = AppState::new(config);
+    seed_cloudflare_access_jwks(&state);
+    let app = router(state);
+    for (email, expected) in [
+        ("guest@example.com", StatusCode::FORBIDDEN),
+        ("rajeshgoli@gmail.com", StatusCode::OK),
+    ] {
+        let assertion = test_browser_access_assertion("sm-browser-aud", email, 4_102_444_800);
+        let request = request(
+            Method::GET,
+            "/autopm/events",
+            "sm.example.com",
+            &[("cf-access-jwt-assertion", &assertion)],
+            "",
+        );
+        let status = app.clone().oneshot(request).await.unwrap().status();
+        assert_eq!(status, expected, "{email}");
+    }
 }

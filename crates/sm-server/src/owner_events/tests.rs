@@ -121,6 +121,24 @@ fn repeats_within_a_minute_coalesce_by_surface_device_action_and_target() {
 }
 
 #[test]
+fn rows_still_being_recorded_hold_back_the_settled_time() {
+    let store = OwnerEventStore::new(temp_db("settled"));
+    let other = OwnerEventStore::new(temp_db("settled-other"));
+    let before = now_ms();
+    assert!(store.settled_before() >= before);
+    let first = store.begin();
+    let second = store.begin();
+    assert!(second.at_ms >= first.at_ms);
+    // Another database's rows do not hold this one back.
+    let _elsewhere = other.begin();
+    assert_eq!(store.settled_before(), first.at_ms);
+    drop(first);
+    assert_eq!(store.settled_before(), second.at_ms);
+    drop(second);
+    assert!(store.settled_before() >= before);
+}
+
+#[test]
 fn prune_deletes_only_rows_past_180_days() {
     let store = OwnerEventStore::new(temp_db("prune"));
     // A missing database stays missing.
