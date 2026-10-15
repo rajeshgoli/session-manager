@@ -19,6 +19,7 @@ const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 mod artifact;
+mod autopm;
 mod board;
 mod bug;
 mod claims;
@@ -136,6 +137,8 @@ enum Command {
     Board(board::BoardArgs),
     /// Read a bug filed from the sm app: its text, page data, server facts, screenshot
     Bug(bug::BugArgs),
+    /// The auto PM's inputs: the owner activity log
+    Autopm(autopm::AutopmArgs),
 }
 
 #[derive(Args)]
@@ -1390,6 +1393,7 @@ fn run() -> Result<()> {
         Command::History(args) => history::run_history(&client, args)?,
         Command::Board(args) => board::run_board(&client, args)?,
         Command::Bug(args) => bug::run_bug(&client, args)?,
+        Command::Autopm(args) => autopm::run(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())

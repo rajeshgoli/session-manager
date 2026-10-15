@@ -60,6 +60,7 @@ pub mod notes;
 pub mod opencode;
 pub mod owner_doc_render;
 pub mod owner_docs;
+pub mod owner_events;
 pub mod owner_inbox;
 pub mod owner_messages;
 pub mod owner_push;
