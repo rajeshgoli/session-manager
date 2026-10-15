@@ -8628,6 +8628,7 @@ impl SessionStore {
                         .recently_delivered_prompt(session_id, &prompt)
                         .is_ok_and(|delivered| !delivered)
                 {
+                    crate::owner_events::record_agent_prompt(queue.db_path(), session_id);
                     let store = crate::owner_messages::OwnerMessageStore::new(
                         queue.db_path().to_path_buf(),
                     );

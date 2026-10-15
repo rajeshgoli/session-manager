@@ -377,6 +377,7 @@ mod merge_holds;
 mod messages;
 mod notes;
 mod opencode_readers;
+mod owner_events;
 mod review_paired;
 mod review_policies;
 mod review_runs;
@@ -1843,6 +1844,7 @@ pub fn router(state: AppState) -> Router {
         auto_retire::spawn_auto_retire_sweeper(state.clone());
     }
     handoff::spawn_handoff_sweeper(state.clone());
+    owner_events::spawn_prune(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -2318,6 +2320,7 @@ pub fn router(state: AppState) -> Router {
             post(browser_terminal::create_ticket),
         )
         .route("/client/sessions/{session_id}", get(get_client_session))
+        .route("/autopm/events", get(owner_events::list_events))
         .fallback(not_found);
     if inbound_email_alias != DEFAULT_EMAIL_WEBHOOK_PATH {
         app = app.route(&inbound_email_alias, post(inbound_email_webhook));
@@ -2329,6 +2332,10 @@ pub fn router(state: AppState) -> Router {
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         mark_in_app,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        owner_events::record,
     ))
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -2653,6 +2660,10 @@ async fn claude_hook(
                     crate::owner_messages::is_owner_typed_prompt(prompt, delivered)
                 })
             {
+                crate::owner_events::record_agent_prompt(
+                    &expand_home(&state.config.sm_send.db_path),
+                    &session_id,
+                );
                 let _ = messages::owner_answered(&state, &session_id, "claude_prompt");
             }
         }
@@ -9769,6 +9780,7 @@ where
                     return Ok(true);
                 }
                 if terminal_frame_submits_input(frame) {
+                    owner_events::record_terminal_input(state, session_id);
                     let _ = messages::owner_answered(state, session_id, "terminal");
                 }
             }
@@ -9799,6 +9811,7 @@ where
                 return Ok(true);
             }
             if terminal_frame_submits_input(frame) {
+                owner_events::record_terminal_input(state, session_id);
                 let _ = messages::owner_answered(state, session_id, "terminal");
             }
         }
@@ -19431,7 +19444,7 @@ mod tests {
         );
     }
 
-    fn write_session_state(session_id: &str, status: &str) -> String {
+    pub(super) fn write_session_state(session_id: &str, status: &str) -> String {
         let dir = env::temp_dir().join(format!(
             "sm-rust-mobile-ticket-{}-{}",
             process::id(),
@@ -19489,7 +19502,11 @@ mod tests {
         config
     }
 
-    fn local_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {
+    pub(super) fn local_request(
+        method: Method,
+        uri: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
         let mut request = axum::http::Request::builder()
             .method(method)
             .uri(uri)
@@ -20234,7 +20251,7 @@ mod tests {
         public_request_with_host(method, uri, body, "sm.rajeshgo.li")
     }
 
-    fn public_request_with_host(
+    pub(super) fn public_request_with_host(
         method: Method,
         uri: &str,
         body: Body,
@@ -20275,7 +20292,7 @@ mod tests {
         config
     }
 
-    fn cloudflare_access_config() -> AppConfig {
+    pub(super) fn cloudflare_access_config() -> AppConfig {
         let mut config = AppConfig::default();
         config.cloudflare_access.team_domain = Some("team.cloudflareaccess.com".to_owned());
         config.cloudflare_access.browser.enabled = true;
@@ -20293,7 +20310,7 @@ mod tests {
         config
     }
 
-    fn google_auth_config() -> AppConfig {
+    pub(super) fn google_auth_config() -> AppConfig {
         let mut config = AppConfig::default();
         config.google_auth.enabled = true;
         config.google_auth.public_host = Some("sm.rajeshgo.li".to_owned());
@@ -20332,7 +20349,7 @@ mod tests {
         common_name: &'a str,
     }
 
-    fn test_mobile_access_assertion(common_name: &str) -> String {
+    pub(super) fn test_mobile_access_assertion(common_name: &str) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("google-test-key".to_owned());
         let claims = TestAccessClaims {
@@ -20361,7 +20378,7 @@ mod tests {
         email: &'a str,
     }
 
-    fn test_browser_access_assertion(aud: &str, email: &str, exp: usize) -> String {
+    pub(super) fn test_browser_access_assertion(aud: &str, email: &str, exp: usize) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("google-test-key".to_owned());
         let claims = TestBrowserAccessClaims {
@@ -20748,7 +20765,7 @@ mod tests {
         assert_eq!(records[0].state, "waiting");
     }
 
-    fn seed_cloudflare_access_jwks(state: &AppState) {
+    pub(super) fn seed_cloudflare_access_jwks(state: &AppState) {
         state.cloudflare_access_jwks_cache.lock().unwrap().insert(
             "https://team.cloudflareaccess.com".to_owned(),
             CloudflareAccessJwksCacheEntry {
