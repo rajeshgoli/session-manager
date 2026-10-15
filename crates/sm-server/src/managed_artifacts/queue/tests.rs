@@ -745,3 +745,28 @@ fn foreign_build_commit_is_preserved_in_the_artifact_roots_repository() {
     owner.git(&["fetch", "origin", &format!("refs/tags/{tag}")]);
     assert_eq!(owner.git(&["rev-parse", "FETCH_HEAD"]), sha);
 }
+
+#[test]
+fn queued_reader_waits_when_a_later_writer_starts_first() {
+    let f = Fixture::new();
+    let mut d = f.declarations("out");
+    d.record = None;
+    let build = f.submit(d);
+    let conn = f.conn();
+    admit(&conn, &build.id).unwrap();
+    f.finish(&build.id, "succeeded");
+    let reader = f.submit(submission::Declarations {
+        inputs: vec!["OUT".into()],
+        ..Default::default()
+    });
+    let writer = f.submit(f.declarations("out"));
+    assert_eq!(admit(&conn, &writer.id).unwrap(), None);
+    assert_eq!(
+        admit(&conn, &reader.id).unwrap().as_deref(),
+        Some("artifact_writer")
+    );
+    let unrelated = f.submit(f.declarations("other"));
+    assert_eq!(admit(&conn, &unrelated.id).unwrap(), None);
+    f.finish(&writer.id, "succeeded");
+    assert_eq!(admit(&conn, &reader.id).unwrap(), None);
+}

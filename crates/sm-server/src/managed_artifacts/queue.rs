@@ -326,8 +326,15 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
     .pop()
     .context("artifact reservation missing; recover before admission")?;
     let outputs = names(&r, "outputs_json")?;
+    let inputs = names(&r, "inputs_json")?;
     for active in store::query(conn,"SELECT outputs_json,inputs_json FROM artifact_job_reservations WHERE root=?1 AND job_id<>?2 AND start_bytes IS NOT NULL",&[&p.root.path,&id])? {
-        if names(&active,"outputs_json")?.into_iter().chain(names(&active,"inputs_json")?).any(|other|outputs.iter().any(|name|name.eq_ignore_ascii_case(&other))) {
+        let active_outputs = names(&active, "outputs_json")?;
+        let active_inputs = names(&active, "inputs_json")?;
+        let writer_conflict = active_outputs.iter().chain(&active_inputs)
+            .any(|other| outputs.iter().any(|name| name.eq_ignore_ascii_case(other)));
+        let reader_conflict = active_outputs.iter()
+            .any(|other| inputs.iter().any(|name| name.eq_ignore_ascii_case(other)));
+        if writer_conflict || reader_conflict {
             return Ok(Some("artifact_writer".into()));
         }
     }
