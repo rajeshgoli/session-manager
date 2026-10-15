@@ -507,6 +507,77 @@ pub fn check_overrun(conn: &Connection, id: &str, db: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_output(conn: &Connection, root: &ArtifactRoot, name: &str) -> Result<()> {
+    let a = artifact(conn, &root.path, name)?;
+    if a["state"] != "building" {
+        bail!("output {name} is no longer building");
+    }
+    let base = if a["location"] == "cold" {
+        &root.cold_store
+    } else {
+        &root.path
+    };
+    let physical = Path::new(base).join(name);
+    let metadata = physical
+        .symlink_metadata()
+        .with_context(|| format!("output {name} is missing"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("output {name} is not a managed directory");
+    }
+    if a["location"] == "cold" {
+        let logical = Path::new(&root.path).join(name);
+        if !logical.symlink_metadata()?.file_type().is_symlink()
+            || std::fs::canonicalize(&logical)? != std::fs::canonicalize(&physical)?
+        {
+            bail!("output {name} has an unexpected placement");
+        }
+    }
+    Ok(())
+}
+
+fn invalid_outputs(
+    conn: &Connection,
+    p: &PreparedSubmission,
+    id: &str,
+    db: Option<&Path>,
+    error: &anyhow::Error,
+) -> Result<()> {
+    notify(
+        db,
+        &format!("artifact-invalid-output-{id}"),
+        &p.request.notify_session_id,
+        &format!(
+            "[sm artifact] {} outputs were not recorded: {error:#}",
+            p.request.label
+        ),
+    )?;
+    event(
+        conn,
+        &p.root.path,
+        "",
+        "op_failed",
+        id,
+        json!({"operation":"validate_outputs","error":format!("{error:#}")}),
+    )?;
+    conn.execute(
+        "UPDATE artifact_jobs SET state='failed' WHERE job_id=?1",
+        [id],
+    )?;
+    conn.execute(
+        "DELETE FROM artifact_job_reservations WHERE job_id=?1",
+        [id],
+    )?;
+    conn.execute(
+        "DELETE FROM artifact_meta WHERE key=?1",
+        [format!("queue-size:{id}")],
+    )?;
+    conn.execute(
+        "UPDATE queue_artifact_submissions SET completed=1 WHERE job_id=?1",
+        [id],
+    )?;
+    Ok(())
+}
+
 pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
     let Some((manager, p)) = load(conn, id)? else {
         return Ok(());
@@ -562,6 +633,15 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         )
         .map_or(0, |(start, end)| (end - start).whole_seconds().max(0));
     let outputs = &p.declarations.outputs;
+    if job["state"] == "succeeded" {
+        for name in outputs {
+            if let Err(error) = validate_output(&tx, &p.root, name) {
+                invalid_outputs(&tx, &p, id, db, &error)?;
+                tx.commit()?;
+                return Ok(());
+            }
+        }
+    }
     let written = if let Some(r) = &reservation {
         size(&tx, &p.root, &names(r, "outputs_json")?)?
             .saturating_sub(r["start_bytes"].as_u64().unwrap_or(0))
@@ -614,6 +694,13 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
             .iter()
             .any(|name| super::ensure_not_in_use(&tx, &p.root.path, name).is_err());
         if !busy {
+            for name in &members {
+                if let Err(error) = validate_output(&tx, &p.root, name) {
+                    invalid_outputs(&tx, &p, id, db, &error)?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
             let jobs=store::query(&tx,"SELECT DISTINCT s.prepared_json,j.seq FROM artifact_jobs j JOIN queue_artifact_submissions s ON s.job_id=j.job_id JOIN artifacts a ON a.root=j.root AND a.name=j.name WHERE a.root=?1 AND a.set_id=?2 AND j.state='succeeded' ORDER BY j.seq",&[&p.root.path,&set])?;
             let mut merged: Option<RecordFlags> = None;
             for j in jobs {

@@ -57,7 +57,18 @@ pub fn preserve(
     let mirror = crate::sessions::expand_home(&config.mirror_dir)
         .join(format!("{}.git", root.repo.replace('/', "__")));
     for (sha, cwds) in commits {
-        let tag = format!("artifact/{set}/{}", &sha[..7]);
+        // Encode ref-unsafe bytes, including dots (Git rejects .lock and ..).
+        let encoded: String = set
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        let tag = format!("artifact/{encoded}/{}", &sha[..7]);
         let mut candidates = cwds
             .into_iter()
             .map(std::path::PathBuf::from)

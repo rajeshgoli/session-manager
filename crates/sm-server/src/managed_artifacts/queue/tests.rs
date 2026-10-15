@@ -414,3 +414,91 @@ fn failed_thaw_worker_leaves_a_retryable_hold_with_a_deadline() {
     assert_eq!(admit(&conn, &job.id).unwrap().as_deref(), Some("thawing"));
     assert!(remaining(&conn, &job.id, Some("thawing")).unwrap().unwrap() > 86000);
 }
+
+#[test]
+fn successful_command_with_invalid_output_does_not_record_or_preserve_recipe() {
+    for replacement in ["missing", "file", "symlink"] {
+        let f = Fixture::new();
+        f.init_git();
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let job = f.submit(d);
+        let conn = f.conn();
+        admit(&conn, &job.id).unwrap();
+        let path = Path::new(&f.root.path).join("out");
+        fs::remove_dir(&path).unwrap();
+        let external = f.dir.join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("keep"), "untouched").unwrap();
+        match replacement {
+            "file" => fs::write(&path, "not a directory").unwrap(),
+            "symlink" => std::os::unix::fs::symlink(&external, &path).unwrap(),
+            _ => {}
+        }
+        f.finish(&job.id, "succeeded");
+        assert_eq!(f.detail("out")["state"], "building");
+        assert_eq!(f.detail("out")["recipe_complete"], 0);
+        assert_eq!(f.detail("out")["jobs"][0]["state"], "failed");
+        super::super::ensure_not_in_use(&conn, &f.root.path, "out").unwrap();
+        complete(&conn, &job.id, Some(&f.messages())).unwrap();
+        assert_eq!(
+            fs::read_to_string(external.join("keep")).unwrap(),
+            "untouched"
+        );
+        assert!(f.git(&["ls-remote", "--tags", "origin"]).is_empty());
+    }
+}
+
+#[test]
+fn valid_artifact_names_are_encoded_in_preserved_tags() {
+    let f = Fixture::new();
+    f.init_git();
+    for (name, encoded) in [
+        ("data.lock", "data%2Elock"),
+        ("data..v2", "data%2E%2Ev2"),
+        ("data.", "data%2E"),
+    ] {
+        let mut d = f.declarations(name);
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let job = f.submit(d);
+        admit(&f.conn(), &job.id).unwrap();
+        f.finish(&job.id, "succeeded");
+        assert_eq!(f.detail(name)["recipe_complete"], 1);
+        assert!(f
+            .git(&["ls-remote", "--tags", "origin"])
+            .contains(&format!("refs/tags/artifact/{encoded}/")));
+    }
+}
+
+#[test]
+fn final_record_revalidates_earlier_outputs_in_the_set() {
+    let f = Fixture::new();
+    let mut d = f.declarations("first");
+    d.outputs.push("second".into());
+    let first = f.submit(d);
+    let second = f.submit(f.declarations("second"));
+    admit(&f.conn(), &first.id).unwrap();
+    f.finish(&first.id, "succeeded");
+    assert_eq!(f.detail("first")["state"], "building");
+    fs::remove_dir(Path::new(&f.root.path).join("first")).unwrap();
+    admit(&f.conn(), &second.id).unwrap();
+    f.finish(&second.id, "succeeded");
+    assert_eq!(f.detail("first")["state"], "building");
+    assert_eq!(f.detail("second")["state"], "building");
+}
+
+#[test]
+fn cold_output_requires_the_expected_logical_symlink() {
+    let f = Fixture::new();
+    let job = f.submit(f.declarations("out"));
+    let conn = f.conn();
+    admit(&conn, &job.id).unwrap();
+    fs::create_dir_all(Path::new(&f.root.cold_store).join("out")).unwrap();
+    conn.execute("UPDATE artifacts SET location='cold'", [])
+        .unwrap();
+    assert!(validate_output(&conn, &f.root, "out").is_err());
+    let logical = Path::new(&f.root.path).join("out");
+    fs::remove_dir(&logical).unwrap();
+    std::os::unix::fs::symlink(Path::new(&f.root.cold_store).join("out"), &logical).unwrap();
+    assert!(validate_output(&conn, &f.root, "out").is_ok());
+}
