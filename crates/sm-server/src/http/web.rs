@@ -53,6 +53,7 @@ const ASSETS: &[Asset] = &[
     asset!("terminal-route.js", JS),
     asset!("vendor/xterm.js", JS),
     asset!("vendor/addon-fit.js", JS),
+    asset!("vendor/addon-web-links.js", JS),
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("board.js", JS),
     asset!("board-start.js", JS),
@@ -260,9 +261,9 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .collect();
         let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
-        // Raw source bytes, excluding vendors. The host restart banner (#2054)
-        // brings the app to 347,582 bytes; 346 KiB leaves ~2% headroom.
-        const BUDGET: usize = 346 * 1024;
+        // Raw source bytes, excluding vendors. Clickable terminal links (#2177)
+        // bring the app to 354,970 bytes; 352 KiB leaves ~1.5% headroom.
+        const BUDGET: usize = 352 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",
