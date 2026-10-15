@@ -8,8 +8,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "sm-submission-{}-{}",
+            "sm-submission-{}-{}-{serial}",
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
@@ -421,6 +423,26 @@ fn scan_preserves_outputs_waiting_for_admission_but_detects_vanished_started_out
         .unwrap()
         .execute(
             "UPDATE artifact_job_reservations SET start_bytes=0 WHERE job_id='waiting'",
+            [],
+        )
+        .unwrap();
+    f.manager.scan(&f.root).unwrap();
+    assert_eq!(f.detail("out")["state"], "deleted");
+    assert_eq!(f.detail("out")["delete_reason"], "vanished");
+}
+
+#[test]
+fn queued_writer_does_not_mask_a_vanished_started_output() {
+    let f = Fixture::new();
+    // Insert the queued reservation first so iteration cannot stop at it.
+    f.persist("waiting", f.declarations(&["out"])).unwrap();
+    f.persist("started", f.declarations(&["OUT"])).unwrap();
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE artifact_job_reservations SET start_bytes=0 WHERE job_id='started'",
             [],
         )
         .unwrap();

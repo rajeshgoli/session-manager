@@ -275,9 +275,10 @@ fn resolve_input(conn: &Connection, root: &str, name: &str) -> Result<Option<Val
 }
 
 pub(super) fn awaiting_placement(conn: &Connection, root: &str, name: &str) -> Result<bool> {
+    let mut waiting = false;
     for r in store::query(
         conn,
-        "SELECT outputs_json FROM artifact_job_reservations WHERE root=?1 AND start_bytes IS NULL",
+        "SELECT outputs_json,start_bytes FROM artifact_job_reservations WHERE root=?1",
         &[&root],
     )? {
         let outputs: Vec<String> =
@@ -286,10 +287,14 @@ pub(super) fn awaiting_placement(conn: &Connection, root: &str, name: &str) -> R
             .iter()
             .any(|output| output.eq_ignore_ascii_case(name))
         {
-            return Ok(true);
+            // A later queued writer cannot excuse a started writer's missing output.
+            if !r["start_bytes"].is_null() {
+                return Ok(false);
+            }
+            waiting = true;
         }
     }
-    Ok(false)
+    Ok(waiting)
 }
 
 fn ensure_no_writer(conn: &Connection, root: &str, name: &str) -> Result<()> {
