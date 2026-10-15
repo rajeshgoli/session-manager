@@ -239,7 +239,7 @@
 <thead><tr><th style="width:5%">#</th><th style="width:22%">Who</th><th>What happens each night</th></tr></thead>
 <tbody>
 <tr><td>1</td><td>Mini, 02:30</td><td>Asks sm for tonight's backup, signed in with its own device certificate (the kind your phone uses: enrolled once, no login, no expiry to babysit).</td></tr>
-<tr><td>2</td><td>sm</td><td>Answers at once: "preparing, ready in about 4 minutes". It packs every backed-up file that changed since the mini last confirmed, plus a list of files that were deleted, into an outbox on the cold store.</td></tr>
+<tr><td>2</td><td>sm</td><td>Answers at once: "preparing, ready in about 4 minutes". It packs every backed-up file that changed since the mini last confirmed, compressed with zstd, plus a list of files that were deleted, into an outbox on the cold store.</td></tr>
 <tr><td>3</td><td>Mini</td><td>Comes back when told, downloads the outbox, and checks every part against its fingerprint.</td></tr>
 <tr><td>4</td><td>Mini</td><td>Applies the changes to its own copy of the files and records a restic snapshot of that copy. History, its schedule (7 daily, 4 weekly, 12 monthly) and a weekly integrity check all live on the mini.</td></tr>
 <tr><td>5</td><td>Mini, then sm</td><td>The mini confirms; sm deletes the outbox. An outbox nobody confirms is deleted after 48 hours, and the next night's is worked out from the last confirmed state, so nothing is missed.</td></tr>
@@ -249,10 +249,10 @@
 <thead><tr><th style="width:28%">Property</th><th>How</th></tr></thead>
 <tbody>
 <tr><td>What is backed up</td><td><code>~/data</code>, <code>~/projects</code>, <code>~/.config</code>, and every artifact with no recipe or with GPU spend. Artifacts with a recipe are skipped: losing one costs a rebuild, not data.</td></tr>
-<tr><td>Copies on the Mac</td><td>None kept. The outbox holds one night's changes, typically a few GB, until the mini confirms.</td></tr>
+<tr><td>Copies on the Mac</td><td>None kept. The outbox holds one night's changes, compressed, until the mini confirms: typically a few GB, at most the largest new folder that cannot be rebuilt. The cold store has 1.8 TB free.</td></tr>
 <tr><td>The Mac cannot destroy history</td><td>It only offers files; deleted files stay in the mini's snapshots, and a night that would delete over a tenth of its files is held for you.</td></tr>
 <tr><td>Silence is not success</td><td>sm messages you when two nights pass without a confirmation, or when the mini's weekly check fails.</td></tr>
-<tr><td>The mini's disk</td><td>Its copy (about 1.3 TB today) plus history: 4 TB fits, 6–8 TB leaves room. FileVault on, since it holds the files and the restic password. Seeded over USB at home.</td></tr>
+<tr><td>The mini's disk</td><td><b>8 TB.</b> It keeps a plain copy for restic to snapshot: about 3.6 TB today, because no existing folder has a recipe yet, so every artifact counts as not rebuildable. History adds about 1.3 TB. The copy shrinks as folders freeze (their archives replace them) or gain recipes. FileVault on. Seeded over USB at home.</td></tr>
 </tbody>
 </table>
 
@@ -730,7 +730,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <h4>L.3 Preparing an outbox</h4>
 <ol>
 <li>Walk the scope (L.1) and build the new manifest. Changed = in the new manifest with a different <code>(size, mtime_ns)</code> or absent from the confirmed one; deleted = in the confirmed one and absent now. <code>.DS_Store</code> is excluded.</li>
-<li>Write <code>&lt;outbox&gt;/&lt;id&gt;/manifest.json</code> (<code>{manifest_id, base: confirmed id, changed_count, deleted:[path]}</code>) and parts <code>part-NNNN.tar.zst</code>: changed files in path order, PAX tar with absolute-path-free names relative to their scope root (prefixed by the root's final segment, e.g. <code>data/…</code>, <code>artifacts/…</code>), zstd level 3 (most bytes are already compressed), up to <code>outbox_part_bytes</code> of input each.</li>
+<li>Write <code>&lt;outbox&gt;/&lt;id&gt;/manifest.json</code> (<code>{manifest_id, base: confirmed id, changed_count, deleted:[path]}</code>) and parts <code>part-NNNN.tar.zst</code>: changed files in path order, PAX tar with absolute-path-free names relative to their scope root (prefixed by the root's final segment, e.g. <code>data/…</code>, <code>artifacts/…</code>), zstd level 3, multithreaded (measured 16× on pipeline data at 2.6 GB/s; already-compressed data files pass through at near 1×), up to <code>outbox_part_bytes</code> of input each.</li>
 <li>Any file that changes while being read (size or mtime differs after reading) is left out and stays "changed" for the next night.</li>
 <li>Compute each part's SHA-256; set the request <code>ready</code>. <code>retry_after_seconds</code> while preparing = remaining input bytes / the median packing rate of the last five preparations (default 1 GB/s) + 30 s.</li>
 <li>Preconditions: the cold store is mounted and has free space for the estimate plus its floor; otherwise the request is <code>failed</code> with the reason and the mini retries the next night.</li>
@@ -743,7 +743,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 </ul>
 <h4>L.5 The mini</h4>
 <ul>
-<li>An old Mac mini with FileVault on, sleep disabled, outbound internet only, a 4 TB or larger disk, the sm CLI (not the server), and restic. Enrolled once at home with <code>sm device enroll backup-mini --headless</code>, a new flag that writes the private key and certificate to <code>~/.config/session-manager/device/</code> (mode 0600) because an unattended job cannot answer a keychain prompt.</li>
+<li>An old Mac mini with FileVault on, sleep disabled, outbound internet only, an 8 TB APFS disk (plain copy of the scope, about 3.6 TB today, plus restic history), the sm CLI (not the server), and restic. Enrolled once at home with <code>sm device enroll backup-mini --headless</code>, a new flag that writes the private key and certificate to <code>~/.config/session-manager/device/</code> (mode 0600) because an unattended job cannot answer a keychain prompt.</li>
 <li>A launchd job at 02:30 local runs <code>sm backup pull --api-url https://&lt;mutual-TLS hostname&gt; --dest &lt;disk&gt;</code> (new in ticket 5). It: posts a request with its last confirmed id (kept in <code>&lt;disk&gt;/state.json</code>); polls honouring <code>retry_after_seconds</code> (give up after 3 h); downloads parts with resume, verifying SHA-256; extracts into <code>&lt;disk&gt;/mirror/</code> through temporary names and renames; applies deletions unless they exceed <code>max_delete_fraction</code> of the mirror's files and the request did not carry <code>allow_deletes</code> (then it holds them and reports <code>held_deletions</code>); runs <code>restic -r &lt;disk&gt;/restic backup &lt;disk&gt;/mirror</code>, then <code>forget --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune</code>, and on Sundays <code>check --read-data-subset=1%</code>; writes <code>state.json</code>; acks.</li>
 <li>The restic password lives in the mini's keychain under a name passed with <code>--restic-password-keychain</code>; retention flags are <code>sm backup pull</code> options with those defaults.</li>
 <li>If the ack fails after the mirror was updated, the next run re-requests with the old <code>have</code>; the delta is re-applied idempotently (same files, same content).</li>
