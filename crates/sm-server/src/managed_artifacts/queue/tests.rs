@@ -375,3 +375,42 @@ fn older_job_finishing_later_does_not_regress_last_use() {
     f.finish(&job.id, "succeeded");
     assert_eq!(f.detail("out")["last_used_at"], future);
 }
+
+#[test]
+fn shared_outputs_wait_for_the_active_writer_but_unrelated_outputs_can_start() {
+    let f = Fixture::new();
+    let first = f.submit(f.declarations("shared"));
+    let second = f.submit(f.declarations("SHARED"));
+    let other = f.submit(f.declarations("other"));
+    let conn = f.conn();
+    assert_eq!(admit(&conn, &first.id).unwrap(), None);
+    assert_eq!(
+        admit(&conn, &second.id).unwrap().as_deref(),
+        Some("artifact_writer")
+    );
+    assert_eq!(admit(&conn, &other.id).unwrap(), None);
+    f.finish(&first.id, "succeeded");
+    assert_eq!(admit(&conn, &second.id).unwrap(), None);
+}
+#[test]
+fn failed_thaw_worker_leaves_a_retryable_hold_with_a_deadline() {
+    struct Failing;
+    impl Operations for Failing {
+        fn thaw(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: &str) -> Result<()> {
+            bail!("temporary thaw failure")
+        }
+        fn pressure(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'input','frozen','cold','input','queue','owner/repo',?2)",params![f.root.path,now()]).unwrap();
+    install_operations(&f.root.path, std::sync::Arc::new(Failing));
+    let mut d = f.declarations("out");
+    d.inputs.push("input".into());
+    let job = f.submit(d);
+    let conn = f.conn();
+    assert_eq!(admit(&conn, &job.id).unwrap().as_deref(), Some("thawing"));
+    assert!(remaining(&conn, &job.id, Some("thawing")).unwrap().unwrap() > 86000);
+}

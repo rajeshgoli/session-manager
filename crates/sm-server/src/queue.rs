@@ -1912,18 +1912,30 @@ impl RetainedQueueStore {
         admission_policy: QueueAdmissionPolicy,
         continue_after_failed_start: bool,
     ) -> Result<()> {
-        let db_path = state_dir.join("queue_runner.db");
-        let conn = open_queue_jobs_connection(&db_path)?;
-        init_queue_jobs_schema(&conn)?;
-        admit_pending_queue_jobs_conn(
-            &conn,
-            state_dir,
-            message_queue_db_path,
-            cancel_grace_seconds,
-            admission_policy,
-            continue_after_failed_start,
-        )?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            let db_path = state_dir.join("queue_runner.db");
+            let conn = open_queue_jobs_connection(&db_path)?;
+            init_queue_jobs_schema(&conn)?;
+            admit_pending_queue_jobs_conn(
+                &conn,
+                state_dir,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                continue_after_failed_start,
+            )?;
+            Ok(())
+        })();
+        if result.is_err() {
+            schedule_queue_admission_retry(
+                state_dir.to_path_buf(),
+                message_queue_db_path.to_path_buf(),
+                cancel_grace_seconds,
+                admission_policy,
+                30,
+            );
+        }
+        result
     }
 
     pub fn cancel_queue_job_in_state_dir(
@@ -7904,6 +7916,7 @@ pub fn queue_hold_explanation(
     let mut blockers: Vec<&QueueJobRecord> = Vec::new();
     let mut queued_ahead = 0;
     let (summary, detail) = match reason {
+        "artifact_writer" => ("waiting for an artifact writer".into(),"Another running job writes one of these outputs. This job retries after that writer finishes; it retains its existing admission deadline.".into()),
         "disk_space" => ("waiting for disk space".into(),"The declared output and outstanding writes must fit above the filesystem's free-space floor. Retries automatically within the artifact disk wait window.".into()),
         "thawing" => ("waiting for artifact inputs to thaw".into(),"Frozen inputs must be restored before this job starts. Retries automatically within the artifact disk wait window.".into()),
         "local_wall" => (
@@ -9499,6 +9512,31 @@ mod tests {
     use time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn failed_admission_schedules_another_pass() {
+        let state_dir = env::temp_dir().join(format!(
+            "sm-admission-retry-error-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO queue_artifact_context(id,config_json) VALUES(1,'invalid config')",
+            [],
+        )
+        .unwrap();
+        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,QueueAdmissionPolicy::default()).is_err());
+        assert!(queue_admission_retries()
+            .lock()
+            .unwrap()
+            .contains_key(&state_dir));
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
 
     #[test]
     fn disk_and_thaw_waits_survive_the_normal_admission_window() {

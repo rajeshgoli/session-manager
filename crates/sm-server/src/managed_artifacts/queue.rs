@@ -317,12 +317,20 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
     )?
     .pop()
     .context("artifact reservation missing; recover before admission")?;
+    let outputs = names(&r, "outputs_json")?;
+    for active in store::query(conn,"SELECT outputs_json FROM artifact_job_reservations WHERE root=?1 AND job_id<>?2 AND start_bytes IS NOT NULL",&[&p.root.path,&id])? {
+        if names(&active,"outputs_json")?.iter().any(|other|outputs.iter().any(|name|name.eq_ignore_ascii_case(other))) {
+            return Ok(Some("artifact_writer".into()));
+        }
+    }
     for input in names(&r, "inputs_json")? {
         let a = artifact(conn, &p.root.path, &input)?;
         if a["state"] == "frozen" || a["op"] == "thawing" {
             request_operation(conn, &p.root.path, &input, "thaw_requested", id)?;
             if let Some(worker) = worker(&p.root.path) {
-                worker.thaw(&manager, &p.root, &input)?;
+                if let Err(error) = worker.thaw(&manager, &p.root, &input) {
+                    eprintln!("artifact thaw deferred for {id}: {error:#}");
+                }
             }
             return hold(conn, id, "thawing");
         }
@@ -386,7 +394,11 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
                     let required = floor
                         .saturating_add(outstanding(conn, &manager, device)?)
                         .saturating_add(disk);
-                    worker.pressure(&manager, &p.root, required.saturating_sub(free))?;
+                    if let Err(error) =
+                        worker.pressure(&manager, &p.root, required.saturating_sub(free))
+                    {
+                        eprintln!("artifact pressure pass deferred for {id}: {error:#}");
+                    }
                     let (free, floor, device) = fs_stats(path, manager.config.floor_percent)?;
                     if fits(free, floor, outstanding(conn, &manager, device)?, disk) {
                         placement = Some(location);
