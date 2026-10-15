@@ -238,7 +238,7 @@ pub struct QueueJobRecord {
     pub stop_signal: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct QueueAdmissionPolicy {
     pub max_running_jobs: i64,
     pub perf_cooldown_seconds: i64,

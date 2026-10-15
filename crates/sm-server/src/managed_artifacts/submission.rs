@@ -99,6 +99,8 @@ pub struct PreparedSubmission {
     pub(super) declarations: Declarations,
     pub(super) root: ArtifactRoot,
     pub(super) request: CreateQueueJob,
+    #[serde(default)]
+    pub(super) rebuild: Option<(String, usize)>,
     git: GitState,
     detected: Vec<String>,
 }
@@ -126,6 +128,7 @@ impl PreparedSubmission {
             declarations,
             root: root.clone(),
             request: request.clone(),
+            rebuild: None,
             git: GitState::capture(Path::new(&request.cwd)),
             detected,
         })
@@ -151,7 +154,13 @@ impl PreparedSubmission {
                 &[&root.path, name],
             )?;
             let stored = if let Some(a) = rows.first() {
-                if a["state"] != "building" || !a["op"].is_null() {
+                if a["state"] != "building"
+                    || (!a["op"].is_null()
+                        && !self
+                            .rebuild
+                            .as_ref()
+                            .is_some_and(|(id, _)| a["op"] == format!("rebuilding:{id}")))
+                {
                     bail!("{name} is not an available building output; choose a new name");
                 }
                 a["name"].as_str().context("artifact name")?.to_owned()
@@ -204,7 +213,13 @@ impl PreparedSubmission {
                     Some("building") => ensure_no_writer(tx, &root.path, &stored)?,
                     _ => bail!("input {stored} must be live, frozen or building without a writer"),
                 }
-                if !a["op"].is_null() && a["op"] != "thawing" {
+                if !a["op"].is_null()
+                    && a["op"] != "thawing"
+                    && !self
+                        .rebuild
+                        .as_ref()
+                        .is_some_and(|(id, _)| a["op"] == format!("rebuilding:{id}"))
+                {
                     bail!("input {stored} has an operation in progress");
                 }
                 inputs.insert(
@@ -222,6 +237,13 @@ impl PreparedSubmission {
             .map(serde_json::to_string)
             .transpose()?;
         tx.execute("INSERT INTO artifact_job_reservations(job_id,root,outputs_json,inputs_json,disk_bytes,pending_record_json) VALUES(?1,?2,?3,?4,?5,?6)", params![job_id,root.path,serde_json::to_string(&outputs)?,serde_json::to_string(&input_names)?,self.declarations.disk_bytes.unwrap_or(0),pending])?;
+        if let Some((id, index)) = &self.rebuild {
+            let changed = tx.execute("UPDATE artifact_rebuild_steps SET job_id=?3 WHERE run_id=?1 AND position=?2 AND (job_id IS NULL OR job_id=?3)",params![id,index,job_id])?;
+            if changed != 1 {
+                bail!("rebuild step was already submitted");
+            }
+            return Ok(warnings);
+        }
         let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM artifact_jobs",
             [],

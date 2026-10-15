@@ -4,6 +4,7 @@ pub mod attribution;
 pub mod config;
 pub mod delete;
 pub mod queue;
+pub mod rebuild;
 pub mod recipe;
 pub mod scan;
 pub mod store;
@@ -362,6 +363,13 @@ pub fn ensure_not_in_use(conn: &Connection, root: &str, name: &str) -> Result<()
 }
 
 fn ensure_not_in_use_except(conn: &Connection, root: &str, name: &str, except: &str) -> Result<()> {
+    let a = artifact(conn, root, name)?;
+    if a["op"]
+        .as_str()
+        .is_some_and(|op| op.starts_with("rebuilding:"))
+    {
+        bail!("{name} is in use by an artifact rebuild");
+    }
     let jobs=store::query(conn,"SELECT job_id FROM artifact_jobs WHERE root=?1 AND name=?2 AND job_id<>?3 AND state IN ('queued','waiting','running','holding')",&[&root,&name,&except])?;
     if let Some(job) = jobs.first() {
         bail!("{name} is in use by job {}", job["job_id"]);

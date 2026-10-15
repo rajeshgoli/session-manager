@@ -19,6 +19,9 @@ enum ArtifactCommand {
         #[command(flatten)]
         flags: Flags,
     },
+    Rebuild {
+        name: String,
+    },
     Done {
         name: String,
     },
@@ -152,6 +155,7 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
             b["names"] = json!(names);
             (names[0].clone(), "record", b)
         }
+        ArtifactCommand::Rebuild { name } => (name, "rebuild", json!({})),
         ArtifactCommand::Done { name } => (name, "done", json!({})),
         ArtifactCommand::Consumer {
             name,

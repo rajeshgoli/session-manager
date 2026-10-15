@@ -503,6 +503,55 @@ async fn real_cli_build_records_artifact_recipe_and_preserves_commit() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(output.is_file());
+    let before = f.store().detail(&f.root(), "compiled").unwrap();
+    // Exercise the actual CLI mutation routes for deletion and rebuild.
+    for action in ["delete", "rebuild"] {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sm"));
+            command.args([
+                "--api-url",
+                &format!("http://{addr}"),
+                "artifact",
+                action,
+                "compiled",
+            ]);
+            if action == "delete" {
+                command.args(["--reason", "rebuild acceptance test"]);
+            }
+            command.env("SESSION_MANAGER_ID", "maker").output().unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{action}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if action == "delete" {
+            assert!(!output.exists());
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let after = f.store().detail(&f.root(), "compiled").unwrap();
+        if after["state"] == "live" {
+            assert_eq!(after["consumers"], before["consumers"]);
+            assert_eq!(after["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(after["note"], before["note"]);
+            assert!(output.is_file());
+            assert!(after["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "rebuilt"));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rebuild did not finish: {after}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     server.abort();
 }
 
