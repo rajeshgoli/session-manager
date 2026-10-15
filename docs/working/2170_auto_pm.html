@@ -199,7 +199,7 @@
 <table>
 <thead><tr><th style="width:22%">Kind of change</th><th>Path</th><th style="width:34%">Why</th></tr></thead>
 <tbody>
-<tr><td>Server, CLI and web behaviour behind a switch</td><td><b>Ships alone.</b> Merged switched off, then switched on.</td><td>Off is today's behaviour, restored in under a second.</td></tr>
+<tr><td>Server, CLI and web behaviour behind a switch</td><td><b>Ships alone.</b> Merged switched off, then switched on.</td><td>Off is today's behaviour: restored in under a second on the server, and within 30 seconds in an open app.</td></tr>
 <tr><td>Bug fixes with no lasting side effects: no rows rewritten or deleted, no messages, pushes or GitHub writes, no board changes</td><td><b>Ships alone.</b> Revert is a commit revert plus the restart script.</td><td>A commit revert undoes all of it.</td></tr>
 <tr><td>Changes whose only lasting effect is adding new rows in their own new tables</td><td><b>Ships alone</b>, behind a switch.</td><td>Switching off stops the writes; the old data is untouched.</td></tr>
 <tr><td>Docs, owner pages and the doc reader</td><td><b>Ships alone</b>, behind a switch.</td><td>Served by the server, so the Android app shows them with no install.</td></tr>
@@ -349,7 +349,7 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
 <li>The server holds an in-memory copy, updated on every write, and code asks <code>switches::is_on("key")</code>. A missing key reads as off.</li>
 <li>When <code>autopm.enabled</code> is false (C.1), every switch reads as off whatever its row says.</li>
 <li>Only <code>POST /autopm/experiments</code> creates a switch row, with <code>on_=0</code>, when the experiment has <code>path=switch</code>. The key must not already exist. An experiment can therefore only flip the switch it created.</li>
-<li>Clients receive <code>switches: {key: bool}</code> in <code>/client/bootstrap</code> and <code>/client/settings</code>; the web client re-reads on its existing stale-build check, and Android on resume.</li>
+<li>Clients receive <code>switches: {key: bool}</code> in <code>/client/bootstrap</code> and <code>/client/settings</code>; every response also carries <code>x-sm-switches: &lt;version&gt;</code>, a counter that rises on every switch write (and on enable or disable). A client that sees a version other than its cached one re-reads the switches before acting on its next screen. In the foreground, both clients also re-read at least every 30 s on their existing refresh loops. An off transition therefore reaches an open app within 30 s, or at its next request.</li>
 <li>Writes: <code>PUT /autopm/switches/{key} {on, reason}</code>.
   <ul>
   <li>Owner: may set either value. Turning a switch on as owner clears <code>held</code>.</li>
@@ -395,7 +395,7 @@ CREATE TABLE autopm_measurements (
   decision      TEXT,                -- keep | revert | extend | NULL on error
   PRIMARY KEY (experiment_id, attempt)
 );</code></pre>
-<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. <code>dark</code> means merged and deployed with the switch off; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
+<p><b>B.3 States and gates.</b> <code>planned → building → dark → live → measuring → kept | reverted</code>. Shadow experiments run <code>planned → building → shadowed → awaiting_owner</code>, then on yes <code>→ building → dark → …</code>, and on no (or 14 days without an answer) <code>→ abandoned</code>. Any state may go to <code>abandoned</code> with a note. <code>dark</code> means every build PR in <code>tickets_json</code> has merged, and the running server build (its <code>x-sm-build</code> commit) contains their merge commits. For Android changes, the app must also report a <code>client_version</code> at or above the build that carries them. A switched experiment's switch is still off. sm moves <code>building → dark</code> itself when these hold; <code>live</code> means switched on; <code>measuring</code> begins at <code>measure_at_ms</code>. Routes: <code>POST /autopm/experiments</code>, <code>PATCH /autopm/experiments/{id}</code> (state moves only along the arrows), <code>GET /autopm/experiments</code>; CLI <code>sm autopm exp {new|set|list|show}</code>.</p>
 <p>sm enforces these gates server-side. Each refusal returns 409 with the failing gate's name.</p>
 <table>
 <thead><tr><th>Action</th><th>Gate</th></tr></thead>
@@ -403,7 +403,8 @@ CREATE TABLE autopm_measurements (
 <tr><td><code>plan_merged</code> (used by the rows below)</td><td><code>plan_pr</code> is merged into main. sm records <code>plan_commit</code> (the merge commit) and <code>plan_reviewed_sha</code>. The last <code>sm request-review</code> run on that PR completed at the PR's final head sha. <code>plan_path</code> exists at <code>plan_commit</code> and contains the experiment id.</td></tr>
 <tr><td><code>POST /autopm/issues</code> for experiment X</td><td><code>plan_merged</code>; the issue body names X; X's state is <code>planned</code> or <code>building</code>.</td></tr>
 <tr><td><code>PUT /autopm/auto-start</code></td><td>The ticket is in X's <code>tickets_json</code>; <code>plan_merged</code>; the budget reservation is admitted (C.4).</td></tr>
-<tr><td>Switch on</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; the switch is not held; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> and <code>measure_at_ms = live_at_ms + window_days</code>.</td></tr>
+<tr><td>Switch on</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; the switch is not held; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> = now and <code>measure_at_ms = live_at_ms + window_days × 86 400 000</code>.</td></tr>
+<tr><td>Go live without a switch (<code>POST /autopm/experiments/{id}/live</code>), for <code>path=revert</code> and approved shadow changes that cannot have a switch</td><td><code>autopm.enabled</code>; X is <code>dark</code>; <code>plan_merged</code>; live plus measuring experiments &lt; <code>autopm.max_live</code>. Success sets <code>live_at_ms</code> and <code>measure_at_ms</code> as above. Rollback for these experiments is B.6. The state becomes <code>reverted</code> when the running build no longer contains the change's merge commits.</td></tr>
 <tr><td>Shadow yes → building</td><td>Only by the owner's answer (E.2).</td></tr>
 </tbody>
 </table>
@@ -545,16 +546,18 @@ guards_json = [{"query": "...sql", "stat": "...", "bad_direction": "higher" | "l
 <li><b>Guards.</b> Each guard is computed the same way, and fails in a half when it moves in <code>bad_direction</code> by more than <code>max_worse_pct</code>. When a <code>per_day</code> guard's baseline is 0, it fails when the half's count is 2 or more. Two guards are built in and cannot be removed: any 👎 vote, and the owner switching the switch off.</li>
 <li><b>Decision</b>, at <code>measure_at_ms</code>:
   <ul>
-  <li><b>keep</b>: both halves meet the bar and no guard fails;</li>
-  <li><b>extend</b>, once (<code>extended=1</code>, <code>measure_at_ms += 14 d</code>, halves recomputed over the longer window): either half has fewer than 10 observations;</li>
-  <li><b>revert</b>: anything else, including fewer than 10 observations after extending. The note is "insufficient data".</li>
+  <li>The rules apply in this order, and the first that matches wins:</li>
+  <li>(1) <b>revert</b> if any guard fails;</li>
+  <li>(2) if either half has fewer than 10 observations: <b>extend</b> once (<code>extended=1</code>, <code>measure_at_ms += 14 × 86 400 000</code>, halves recomputed over the longer window), or <b>revert</b> with note "insufficient data" if already extended;</li>
+  <li>(3) <b>keep</b> if both halves meet the bar;</li>
+  <li>(4) otherwise <b>revert</b>.</li>
   </ul></li>
 <li><b>Errors.</b> A query error or timeout records <code>status=error</code> and retries hourly. After 3 errors, the experiment is reverted with note "metric failed".</li>
 <li><b>Revert</b> sets the switch off with <code>changed_by=autopm</code>, not held. For <code>path=revert</code> it files the revert ticket per B.6. Each decision writes a row to <code>autopm_measurements</code> and wakes the auto PM.</li>
 <li><b>Result shape:</b> <code>{"baseline": {stat, n}, "h1": {stat, n, change}, "h2": {…}, "guards": [{query, baseline, h1, h2, failed}]}</code>.</li>
 <li><b>Immediate revert:</b> a 👎 at any time turns the switch off at once (<code>held=1, changed_by=feedback</code>), without waiting for the measurement date.</li>
 </ul>
-<p>A kept change keeps its switch for 30 days, then a cleanup ticket removes the switch and the old code path.</p>
+<p>A kept change keeps its switch for 30 days. If you turn it off during that time, or it gets a 👎, the experiment becomes <code>reverted</code>, and the cleanup ticket removes the <i>new</i> code path and the switch. Otherwise, after 30 days with the switch still on and not held, the cleanup ticket removes the switch and the <i>old</i> code path.</p>
 <p><b>F.3 Feedback.</b> A "What changed" card appears in Settings › Auto PM (Android and web), and as a dismissible chip on any screen a live switch changes. It lists live experiments: title, one line, live since, 👍 / 👎. <code>POST /client/autopm/feedback {experiment_id, vote: "up"|"down", note?}</code> (owner only) increments the counts. A down vote also switches the experiment off and wakes the auto PM.</p>
 <p><b>F.4 The auto PM's own score</b>, in every readout: experiments kept / finished, points spent per kept experiment, votes, changes you reverted or switched off yourself. After four consecutive closed cycles with zero <code>kept</code>, sm sets <code>autopm.enabled=false</code> and sends one owner message: "Auto PM paused: four cycles, nothing kept. Readouts: …".</p>
 
