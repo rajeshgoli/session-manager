@@ -11,6 +11,34 @@ struct Fixture {
     app: Router,
     store: OwnerEventStore,
     bearer: String,
+    guest_bearer: String,
+}
+
+/// An owner and a guest, each with an app login and an enrolled phone.
+fn add_users(config: &mut AppConfig) {
+    config
+        .google_auth
+        .allowlist_emails
+        .push("guest@example.com".into());
+    for (user_id, email, owner, device) in [
+        ("rajesh", "rajeshgoli@gmail.com", true, "pixel-9"),
+        ("guest", "guest@example.com", false, "guest-phone"),
+    ] {
+        config.mobile_terminal.allowed_users.insert(
+            user_id.into(),
+            MobileTerminalUserConfig {
+                email: Some(email.into()),
+                interactive_shell_access: true,
+                mobile_terminal_owner: owner,
+                registered_device_keys: vec![crate::config::MobileTerminalDeviceKeyConfig {
+                    id: device.into(),
+                    public_key: "fixture".into(),
+                    enabled: true,
+                }],
+                ..Default::default()
+            },
+        );
+    }
 }
 
 fn fixture() -> Fixture {
@@ -19,18 +47,23 @@ fn fixture() -> Fixture {
     config.paths.state_file = write_session_state("fork1001", "running");
     let db = PathBuf::from(&config.paths.state_file).with_file_name("messages.db");
     config.sm_send.db_path = db.display().to_string();
-    let bearer = format!(
-        "Bearer {}",
-        issue_device_access_token(&config, "rajeshgoli@gmail.com", "Rajesh")
-            .unwrap()
-            .access_token
-    );
+    add_users(&mut config);
+    let token = |email: &str| {
+        format!(
+            "Bearer {}",
+            issue_device_access_token(&config, email, "Someone")
+                .unwrap()
+                .access_token
+        )
+    };
+    let (bearer, guest_bearer) = (token("rajeshgoli@gmail.com"), token("guest@example.com"));
     let state = AppState::new(config);
     seed_cloudflare_access_jwks(&state);
     Fixture {
         app: router(state),
         store: OwnerEventStore::new(db),
         bearer,
+        guest_bearer,
     }
 }
 
@@ -92,6 +125,8 @@ async fn records_owner_requests_by_surface_and_never_agents_or_strangers() {
     let stranger =
         test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
     let phone = test_mobile_access_assertion("pixel-9");
+    let guest_phone = test_mobile_access_assertion("guest-phone");
+    let guest = f.guest_bearer.as_str();
     // Not recorded: agents, loopback without owner auth, strangers,
     // background polls and static files.
     for skipped in [
@@ -110,6 +145,20 @@ async fn records_owner_requests_by_surface_and_never_agents_or_strangers() {
             "",
         ),
         local_request(Method::GET, "/client/board", Body::empty()),
+        request(
+            Method::GET,
+            "/client/board",
+            "testserver",
+            &[("authorization", guest)],
+            "",
+        ),
+        request(
+            Method::GET,
+            "/client/board",
+            "sm-app.example.com",
+            &[("cf-access-jwt-assertion", &guest_phone)],
+            "",
+        ),
         request(
             Method::GET,
             "/client/board",
@@ -335,6 +384,14 @@ async fn events_route_pages_with_the_cursor_and_is_owner_only() {
             .insert(header, "abc12345".parse().unwrap());
         assert_eq!(f.send(request).await.0, StatusCode::FORBIDDEN, "{header}");
     }
+    let guest = request(
+        Method::GET,
+        "/autopm/events",
+        "testserver",
+        &[("authorization", &f.guest_bearer)],
+        "",
+    );
+    assert_eq!(f.send(guest).await.0, StatusCode::FORBIDDEN);
     let anonymous = request(Method::GET, "/autopm/events", "testserver", &[], "");
     assert_eq!(f.send(anonymous).await.0, StatusCode::UNAUTHORIZED);
     let owner = request(
@@ -373,4 +430,18 @@ async fn owner_typed_claude_prompts_are_recorded_without_their_text() {
         ("agent_prompt", "agent.prompt", Some("fork1001"))
     );
     assert!(!serde_json::to_string(&rows).unwrap().contains("ship"));
+}
+
+#[test]
+fn only_owner_users_count_as_the_owner() {
+    let mut config = google_auth_config();
+    // With no users configured, the allowlist is the owner.
+    assert!(is_owner_email(&config, "rajeshgoli@gmail.com"));
+    add_users(&mut config);
+    assert!(is_owner_email(&config, "rajeshgoli@gmail.com"));
+    assert!(!is_owner_email(&config, "guest@example.com"));
+    assert!(!is_owner_email(&config, "stranger@example.com"));
+    assert!(is_owner_user_id(&config, "rajesh"));
+    assert!(!is_owner_user_id(&config, "guest"));
+    assert!(!is_owner_user_id(&config, ""));
 }

@@ -9482,7 +9482,7 @@ async fn run_mobile_terminal_bridge_inner(
                 &master,
                 &frame,
                 state,
-                &ticket.session_id,
+                ticket,
                 &mut close_code,
                 &mut close_reason,
             )
@@ -9608,7 +9608,7 @@ async fn run_mobile_terminal_bridge_inner(
                     &master,
                     &frame,
                     state,
-                    &ticket.session_id,
+                    ticket,
                     &mut close_code,
                     &mut close_reason,
                 )
@@ -9728,13 +9728,16 @@ async fn process_mobile_terminal_client_frame<S>(
     master: &Arc<OwnedFd>,
     frame: &Value,
     state: &AppState,
-    session_id: &str,
+    ticket: &MobileTerminalTicket,
     close_code: &mut u16,
     close_reason: &mut String,
 ) -> Result<bool, String>
 where
     S: futures_util::Sink<Message> + Unpin,
 {
+    let session_id = ticket.session_id.as_str();
+    // Only the owner's input is owner activity; a guest's is not.
+    let owner_input = owner_events::is_owner_user_id(&state.config, &ticket.user_id);
     match mobile_terminal_frame_type(frame).as_deref() {
         Some("transport_keepalive") => {
             // Ping/Pong are transport frames, not terminal input or disconnects.
@@ -9780,7 +9783,9 @@ where
                     return Ok(true);
                 }
                 if terminal_frame_submits_input(frame) {
-                    owner_events::record_terminal_input(state, session_id);
+                    if owner_input {
+                        owner_events::record_terminal_input(state, session_id);
+                    }
                     let _ = messages::owner_answered(state, session_id, "terminal");
                 }
             }
@@ -9811,7 +9816,9 @@ where
                 return Ok(true);
             }
             if terminal_frame_submits_input(frame) {
-                owner_events::record_terminal_input(state, session_id);
+                if owner_input {
+                    owner_events::record_terminal_input(state, session_id);
+                }
                 let _ = messages::owner_answered(state, session_id, "terminal");
             }
         }

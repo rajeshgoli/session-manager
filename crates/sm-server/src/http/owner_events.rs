@@ -13,6 +13,42 @@ pub(super) fn store(state: &AppState) -> OwnerEventStore {
     OwnerEventStore::new(expand_home(&state.config.sm_send.db_path))
 }
 
+fn is_owner(user: &MobileTerminalUserConfig) -> bool {
+    user.owner || user.mobile_terminal_owner
+}
+
+/// A configured user flagged as the owner; guests are not.
+pub(super) fn is_owner_user_id(config: &AppConfig, user_id: &str) -> bool {
+    config
+        .mobile_terminal
+        .allowed_users
+        .get(user_id)
+        .is_some_and(is_owner)
+}
+
+/// The owner's email: a configured owner user's or, with no users
+/// configured, any allowlisted email.
+fn is_owner_email(config: &AppConfig, email: &str) -> bool {
+    if config.mobile_terminal.allowed_users.is_empty() {
+        return allowlisted_google_email(config, email);
+    }
+    mobile_terminal_visible_user(config, email).is_some_and(|(_, user)| is_owner(user))
+}
+
+/// A phone enrolled to an owner user.
+fn is_owner_device(state: &AppState, device: &str) -> bool {
+    state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .filter(|(_, user)| is_owner(user))
+        .any(|(user_id, _)| {
+            mobile_cloudflare_access_device_enrolled_for_user(state, user_id, device)
+                .unwrap_or(false)
+        })
+}
+
 /// The surface and device of a request carrying owner auth (A.2), or `None`
 /// for agents, loopback without owner auth, and everyone else.
 fn owner_surface(
@@ -34,10 +70,14 @@ fn owner_surface(
             .ok()
         }) {
             let device = context.identity.trim();
-            return Some(("android", (!device.is_empty()).then(|| device.to_owned())));
+            if is_owner_device(state, device) {
+                return Some(("android", Some(device.to_owned())));
+            }
         }
     }
-    if device_auth_user(headers, &state.config).is_some() {
+    if device_auth_user(headers, &state.config)
+        .is_some_and(|user| is_owner_email(&state.config, &user.email))
+    {
         return Some(("android", None));
     }
     if application == Some(CloudflareAccessApplication::Browser)
@@ -51,13 +91,20 @@ fn owner_surface(
             )
             .ok()
         }) {
-            if browser_owner_email(state, &context).is_ok_and(|email| email.is_some()) {
+            if browser_owner_email(state, &context)
+                .ok()
+                .flatten()
+                .is_some_and(|email| is_owner_email(&state.config, &email))
+            {
                 return Some(("web", context.common_name.clone()));
             }
         }
     }
     browser_session_user(headers, &state.config)
-        .filter(|user| allowlisted_google_email(&state.config, &user.email))
+        .filter(|user| {
+            allowlisted_google_email(&state.config, &user.email)
+                && is_owner_email(&state.config, &user.email)
+        })
         .map(|_| ("web", None))
 }
 
@@ -183,7 +230,14 @@ pub(super) async fn list_events(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
-    if from_agent(request.headers()) {
+    // Past the page login, only the owner: loopback without an agent
+    // header, or a request whose identity is the owner's.
+    let local = is_request_local_bypass(&state, &request);
+    if from_agent(request.headers())
+        || (state.config.google_auth.requested()
+            && !local
+            && owner_surface(&state, request.headers(), request_peer_addr(&request)).is_none())
+    {
         return Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
             detail: OWNER_ONLY.into(),
