@@ -28,6 +28,19 @@ export function visibleOther(tickets) {
   const rest = tickets.filter((t) => t.state !== 'needs_you' && !hasOperations(t));
   return [...urgent, ...rest.slice(0, Math.max(0, OTHER_ROW_LIMIT - urgent.length))];
 }
+/** Board sections in render order: each repo's other tickets sit right under
+ * that repo's top lane, so tickets agents file without a lane stay near the
+ * work they came from (#2152). Repos with no visible lane go last. */
+export function boardSections(lanes, others) {
+  const byRepo = new Map(others.map((group) => [group.repo, group]));
+  const sections = [];
+  for (const lane of lanes) {
+    sections.push({ lane });
+    const group = byRepo.get(lane.goal.repo);
+    if (group) { sections.push({ other: group }); byRepo.delete(lane.goal.repo); }
+  }
+  return [...sections, ...[...byRepo.values()].map((other) => ({ other }))];
+}
 export const openBlockers = (ticket) => (ticket.waits_on || []).filter((item) => item.state !== 'done');
 export const blockedText = (ticket) => openBlockers(ticket).map((item) => `#${item.number}`).join(', ');
 export function clockSegments(segments, end, hours) {
@@ -298,9 +311,9 @@ export function BoardPage() {
       <button class="btn sm pri" disabled=${!selected.size} onClick=${()=>openBatch(null)}>Shared setup</button>${selected.size?html`<button class="link-btn" onClick=${()=>setSelected(new Set())}>Clear selection</button>`:null}</div>
     ${error || actionError ? html`<p class="err" role="alert">${actionError || error.message}</p>` : null}
     ${data ? html`
-      ${data.lanes.length ? visibleLanes.map((lane) => html`<${Lane} key=${lane.id} lane=${lane} index=${data.lanes.findIndex(l=>l.id===lane.id)} count=${data.lanes.length}
-        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />`) : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
-      ${visibleOthers.map((group) => html`<section class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
+      ${data.lanes.length ? null : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
+      ${boardSections(visibleLanes, visibleOthers).map(({ lane, other: group }) => lane ? html`<${Lane} key=${lane.id} lane=${lane} index=${data.lanes.findIndex(l=>l.id===lane.id)} count=${data.lanes.length}
+        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />` : html`<section key=${`other ${group.repo}`} class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
         ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />`)}
         ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />` : null}</section>`)}
       <div class="clock-legend"><span class="ball green">agent working</span><span class="ball green">queue job running (hatched)</span><span class="ball amber">queue or review</span><span class="ball magenta">waiting on you</span><span class="ball red">nothing moving</span></div>` : null}
