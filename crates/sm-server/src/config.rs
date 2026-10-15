@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub email: EmailConfig,
     pub mobile_analytics: MobileAnalyticsConfig,
     pub app_artifacts: AppArtifactsConfig,
+    pub managed_artifacts: crate::managed_artifacts::config::ManagedArtifactsConfig,
     pub bug_reports: BugReportsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
@@ -96,6 +97,7 @@ impl Default for AppConfig {
             email: EmailConfig::default(),
             mobile_analytics: MobileAnalyticsConfig::default(),
             app_artifacts: AppArtifactsConfig::default(),
+            managed_artifacts: Default::default(),
             bug_reports: BugReportsConfig::default(),
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
@@ -211,6 +213,7 @@ impl AppConfig {
         config.validate_queue_runner_capacity()?;
         config.validate_codex_fork_create_startup_timeout()?;
         config.utilization.validate()?;
+        config.managed_artifacts.validate()?;
         config.opencode.validate()?;
 
         Ok(config)
@@ -401,6 +404,43 @@ impl AppConfig {
             Path::new("apps"),
             &expand_home_for_path_match(&default_app_artifacts_dir()),
         )?;
+
+        let defaults = crate::managed_artifacts::config::ManagedArtifactsConfig::default();
+        self.managed_artifacts.db_path = isolate_path_from_protected_root(
+            &self.managed_artifacts.db_path,
+            &defaults.db_path,
+            &instance,
+            Path::new("artifacts.db"),
+            &expand_home_for_path_match(&defaults.db_path),
+        )?;
+        self.managed_artifacts.mirror_dir = isolate_path_from_protected_root(
+            &self.managed_artifacts.mirror_dir,
+            &defaults.mirror_dir,
+            &instance,
+            Path::new("artifact-mirrors"),
+            &expand_home_for_path_match(&defaults.mirror_dir),
+        )?;
+        for (index, root) in self.managed_artifacts.roots.iter_mut().enumerate() {
+            root.path = isolate_path_from_protected_root(
+                &root.path,
+                "~/artifacts",
+                &instance,
+                Path::new(&format!("artifact-roots/{index}")),
+                &expand_home_for_path_match("~/artifacts"),
+            )?;
+            if path_is_under_home(&root.cold_store)?
+                || Path::new(&root.cold_store).starts_with("/Volumes")
+            {
+                anyhow::bail!(
+                    "test isolation refuses production cold store {}",
+                    root.cold_store
+                );
+            }
+            root.repo_checkout = instance
+                .join(format!("artifact-checkouts/{index}"))
+                .display()
+                .to_string();
+        }
 
         // Default production indexes can make a test AppState scan live agent
         // artifacts during startup. Fixtures that explicitly point elsewhere
@@ -2166,6 +2206,8 @@ pub struct RustCoreConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
+    managed_artifacts: crate::managed_artifacts::config::ManagedArtifactsConfig,
+    #[serde(default)]
     paths: RawPathsConfig,
     #[serde(default)]
     humans: YamlValue,
@@ -2328,6 +2370,7 @@ impl From<RawConfig> for AppConfig {
             app_artifacts: AppArtifactsConfig {
                 root_dir: paths.app_artifacts_dir,
             },
+            managed_artifacts: raw.managed_artifacts,
             bug_reports: BugReportsConfig {
                 db_path: paths.bug_reports_db,
                 max_reports: raw.bug_reports.max_reports,

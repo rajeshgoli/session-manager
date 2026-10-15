@@ -18,6 +18,7 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
+mod artifact;
 mod board;
 mod bug;
 mod claims;
@@ -84,6 +85,7 @@ enum Command {
     Lookup(LookupArgs),
     Roster(EmptyArgs),
     Queue(QueueArgs),
+    Artifact(artifact::ArtifactArgs),
     Model(model::ModelArgs),
     #[command(name = "enroll-device")]
     EnrollDevice(EnrollDeviceArgs),
@@ -1375,6 +1377,12 @@ fn run() -> Result<()> {
         Command::Review(args) => run_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
+        Command::Artifact(args) => {
+            if let Err(error) = artifact::run(&client, args) {
+                eprintln!("error: {}", error.to_string().replace(['\n', '\r'], " "));
+                process::exit(2);
+            }
+        }
         Command::MergeHold(args) => merge_holds::run(&client, args)?,
         Command::Ticket(args) => claims::run_ticket(&client, args)?,
         Command::Pr(args) => claims::run_pr(&client, args)?,

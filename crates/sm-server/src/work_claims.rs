@@ -868,6 +868,16 @@ impl WorkClaimStore {
         Ok(rows)
     }
 
+    /// Confirmed active holder for artifact attribution; spawn reservations never own files.
+    pub fn active_holder(&self, repo: &str, number: i64) -> Result<Option<String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn.query_row(
+            "SELECT session_id FROM work_claims WHERE repo=?1 AND number=?2 AND ended_at IS NULL AND reserved_at IS NULL ORDER BY claimed_at DESC, id LIMIT 1",
+            params![repo, number], |row| row.get(0)).optional()?)
+    }
+
     /// A session's claims with item title and state; reservations excluded.
     pub fn claims_for_session(
         &self,
