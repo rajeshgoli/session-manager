@@ -63,7 +63,7 @@ function fakeSocket() {
       const reply = (f, ms) => setTimeout(() => this.readyState === 1 && this.onmessage({ data: JSON.stringify(f) }), ms);
       if (frame.type === 'auth') {
         reply({ type: 'status', state: 'attached' }, 5);
-        reply({ type: 'output', sequence: 1, data: btoa('rajesh@studio ~ % ') }, 10);
+        reply({ type: 'output', sequence: 1, data: btoa(window.termOutput || 'rajesh@studio ~ % ') }, 10);
       }
       if (frame.type === 'ping') reply({ type: 'pong', id: frame.id }, this.url.startsWith('ws://localhost') ? 2 : 40);
     }
@@ -281,5 +281,49 @@ test('route: another server on localhost and a failed direct socket both use Clo
     assert.equal(failed.state.tickets, 2);
     assert.equal(JSON.parse(await failed.page.evaluate(() => sessionStorage.getItem('sm-term-route'))).url, 'relay');
     assert.deepEqual(failed.errors, []);
+  } finally { await browser.close(); }
+});
+
+test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse mode on', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    // tmux with `mouse on` turns on SGR mouse tracking before drawing the pane.
+    await page.addInitScript(() => {
+      window.termOutput = '\x1b[?1000h\x1b[?1006h'
+        + 'PR: https://github.com/rajeshgoli/session-manager/pull/2177\r\n'
+        + '\x1b]8;;https://sm.example.com/docs/memo\x07the memo\x1b]8;;\x07\r\n'
+        + '\x1b]8;;javascript:alert(1)\x07bad\x1b]8;;\x07\r\n';
+      window.opened = [];
+      window.open = (url, target, features) => { window.opened.push([url, target, features]); return null; };
+    });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.xterm-rows', { hasText: 'the memo' }).waitFor();
+    const cell = await page.evaluate(() => {
+      const rows = document.querySelector('.xterm-rows').getBoundingClientRect();
+      const row = document.querySelector('.xterm-rows > div');
+      return { x: rows.left, y: rows.top, h: row.getBoundingClientRect().height };
+    });
+    const cw = await page.evaluate(() => {
+      const span = document.createElement('span'); span.textContent = 'M'.repeat(100);
+      document.querySelector('.xterm-rows > div').appendChild(span);
+      const w = span.getBoundingClientRect().width / 100; span.remove(); return w;
+    });
+    const at = (col, row) => [cell.x + (col + 0.5) * cw, cell.y + (row + 0.5) * cell.h];
+    const click = async (col, row) => {
+      const [x, y] = at(col, row);
+      await page.mouse.move(x, y);
+      await page.waitForTimeout(100);
+      await page.mouse.click(x, y);
+    };
+    await click(10, 0);
+    await click(2, 1);
+    await click(1, 2);
+    assert.deepEqual(await page.evaluate(() => window.opened), [
+      ['https://github.com/rajeshgoli/session-manager/pull/2177', '_blank', 'noopener,noreferrer'],
+      ['https://sm.example.com/docs/memo', '_blank', 'noopener,noreferrer'],
+    ]);
+    assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

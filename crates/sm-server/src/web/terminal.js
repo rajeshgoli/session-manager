@@ -7,6 +7,7 @@ import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-ro
 import { NotesView } from './notes.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
+import './vendor/addon-web-links.js';
 
 const keys = [['Esc', 'escape'], ['Tab', 'tab'], ['Shift+Tab', 'shift-tab'], ['↑', 'up'], ['↓', 'down'], ['Ctrl-C', 'ctrl-c']];
 const back = () => history.length > 1 ? history.back() : navigate('/');
@@ -14,6 +15,12 @@ const PING_MS = 5000;
 // A direct path that answered its probe attaches in well under this; past it, use the relay.
 const DIRECT_HANDSHAKE_MS = 5000;
 const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
+// Terminal links open in a new tab; web URLs only.
+const openLink = (event, uri) => {
+  if (!/^https?:\/\//i.test(uri)) return;
+  event?.preventDefault?.();
+  window.open(uri, '_blank', 'noopener,noreferrer');
+};
 const session = () => { try { return window.sessionStorage; } catch (e) { return null; } };
 
 // ---- switcher (1782 G1) ---------------------------------------------------------
@@ -150,9 +157,12 @@ export function TerminalPage({ id, open }) {
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
       scrollback: 10000, theme: { background: '#0E0F14', foreground: '#D7DAE3' },
+      // OSC 8 links, without xterm's confirm dialog.
+      linkHandler: { activate: openLink, allowNonHttpProtocols: false },
     });
     const fit = new window.FitAddon.FitAddon();
     terminal.loadAddon(fit);
+    terminal.loadAddon(new window.WebLinksAddon.WebLinksAddon(openLink));
     terminal.open(host.current);
     let socket = null, stopped = false, live = false, timer = null, handshakeTimer = null, retries = 0;
     let pinger = null, pingId = 0, samples = [];
