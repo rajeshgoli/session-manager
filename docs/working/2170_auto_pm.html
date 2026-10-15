@@ -422,7 +422,7 @@ CREATE INDEX owner_events_action ON owner_events(action, at_ms);</code></pre>
 <li>Clients receive <code>switches: {key: bool}</code> in <code>/client/bootstrap</code> and <code>/client/settings</code>; every response also carries <code>x-sm-switches: &lt;version&gt;</code>, a counter that rises on every switch write (and on enable or disable). A client that sees a version other than its cached one re-reads the switches before acting on its next screen. In the foreground, both clients also re-read at least every 30 s on their existing refresh loops. An off transition therefore reaches an open app within 30 s, or at its next request.</li>
 <li>Writes: <code>PUT /autopm/switches/{key} {on, reason}</code>.
   <ul>
-  <li>Owner: may set either value. Turning a switch on as owner clears <code>held</code>.</li>
+  <li>Owner: may set either value. Turning a switch on as owner clears <code>held</code>. If its experiment is <code>reverted</code>, the same transaction moves it back to <code>live</code>: a fresh <code>live_at_ms</code> and <code>measure_at_ms</code>, <code>extended=0</code>, its old measurement rows kept but superseded. Any open revert-cleanup ticket for it is closed with the comment "Rajesh re-enabled the change". The only other <code>reverted → live</code> path is this owner action.</li>
   <li>The <code>autopm</code> role: may turn its own experiment's switch off at any time. It may turn it on only when every switch-on gate in B.3 holds. A held switch refuses it with 409 <code>held: only Rajesh can turn this back on</code>.</li>
   </ul></li>
 <li>Off must equal pre-change behaviour exactly. Every experiment's build PR includes a test asserting that.</li>
@@ -510,7 +510,8 @@ CREATE TABLE autopm_measurements (
   "skip_window_starting": null,        // ISO date of a window start, or null
   "max_live": 3,
   "paused_at": null,                  // set by the auto-pause (F.4); cleared by Resume
-  "pm_points": {"claude": 5, "codex": 0},   // standing reservation for the auto PM seat and its helpers
+  "pm_points": {"claude": 4, "codex": 0},      // standing reservation: auto PM seat and its helpers
+  "review_points": {"claude": 1, "codex": 5},  // standing reservation: every review of an autopm PR
   "app_updates_per_week": 1
 }</code></pre>
 <p><b>C.2 Allowance per provider per weekly window</b> (Claude <code>weekly_all</code>; Codex <code>codex_10080</code> of the account the build agents use):</p>
@@ -525,9 +526,9 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
 <ol>
 <li>Every seat that has held the <code>autopm</code> role, including handoff successors.</li>
 <li>Every seat that has claimed a ticket under #2170.</li>
-<li>Review runs on PRs linked to those tickets.</li>
+<li>Every review run on an autopm PR: plan PRs, build and fix PRs, and readout PRs, by any provider in the fallback chain.</li>
 </ol>
-<p>The PM's in-context research helpers count as part of its seat. <code>GET /autopm/budget</code> returns <code>{window_start, resets_at, providers: {claude: {allowance, spent, reserved, remaining}, codex: {…}}}</code>. Here <code>reserved</code> is <code>open_hold</code> (C.4) and <code>remaining = allowance − spent − reserved</code>, the balance available for new work, the auto PM's own helpers included; CLI <code>sm autopm budget</code>.</p>
+<p>The PM's in-context research helpers count as part of its seat. <code>GET /autopm/budget</code> returns <code>{window_start, resets_at, providers: {claude: {allowance, spent, reserved, remaining, pm: {held, spent, left}, reviews: {held, spent, left}}, codex: {…}}}</code>. Here <code>reserved</code> is <code>open_hold</code> (C.4), and <code>remaining = allowance − spent − reserved</code> is the balance for new tickets. <code>pm.left</code> and <code>reviews.left</code> are what each standing reservation still has; CLI <code>sm autopm budget</code>.</p>
 <p><b>C.4 Enforcement.</b> Build tickets reserve budget when they start:</p>
 <pre><code>CREATE TABLE autopm_reservations (
   repo TEXT NOT NULL, number INTEGER NOT NULL,
@@ -537,18 +538,19 @@ headroom  = projected_free_headroom_points from build_projection (usage_report.r
   PRIMARY KEY (repo, number, provider, window_start)
 );</code></pre>
 <ul>
-<li><code>PUT /autopm/auto-start</code> carries <code>points_est: {provider: points}</code>, which is required. It must include the build provider and the review provider (Codex under the lane's review policy, D.2), each &gt; 0, with the review estimate covering every expected review round. sm writes one reservation row per provider.</li>
+<li><code>PUT /autopm/auto-start</code> carries <code>points_est &gt; 0</code> for the build provider, which is required. Reviews are not reserved per ticket; they draw on the standing review reservation below.</li>
 <li>Admission runs in one <code>BEGIN IMMEDIATE</code> transaction, so concurrent starts serialize.
 <pre><code>open_hold    = Σ over unreleased reservations r of this provider and window:
                  max(0, r.points − spent_by_ticket(r))
 unreserved   = allowance − spent − open_hold
-admit iff, for every provider in points_est, points_est[provider] ≤ unreserved(provider)
-               (all rows written or none, in the same transaction)</code></pre></li>
+admit iff points_est ≤ unreserved(build provider)</code></pre></li>
 <li>A reservation is released when its ticket closes or its agent retires.</li>
 <li>When a ticket's own spend passes 1.5 × its reservation, sm sends that ticket's agent <code>[sm autopm] ticket over estimate: reach a safe stop</code>.</li>
 <li>When a provider's <code>allowance − spent</code> reaches zero, sm sends the same safe-stop message to the auto PM and to every agent on an autopm ticket of that provider. A safe stop means: push the work, comment on the ticket what remains, then go idle.</li>
-<li>Every spender holds a reservation (build tickets, fixes, and the auto PM seat), so overshoot is bounded by 0.5 × the open reservations.</li>
-<li>At each window's start, and on enable, sm creates a standing reservation <code>(repo="autopm", number=0)</code> for the auto PM seat of <code>min(pm_points, allowance)</code> per provider. The PM seat's own spend, in-context helpers included, counts against that reservation, and the same 1.5× over-estimate safe stop applies to the auto PM. It checks <code>sm autopm budget</code> before spawning any helper, and spawns none once its own reservation is used.</li>
+<li>Every spend is charged to exactly one reservation: a build or fix seat to its ticket's, the auto PM seat to <code>pm</code>, and every review run, whatever provider ends up taking it, to that provider's <code>reviews</code>. Overshoot is therefore bounded by 0.5 × the open reservations.</li>
+<li>At each window's start, and on enable, sm creates two standing reservations per provider, admitted in this order and each capped by what is still unreserved: <code>pm</code> = <code>(repo="autopm", number=0)</code> of <code>pm_points</code>, then <code>reviews</code> = <code>(repo="autopm", number=1)</code> of <code>review_points</code>. Their spend never releases them early; they release at the window's end.</li>
+<li>The auto PM seat's own spend, helpers included, counts against <code>pm</code>, and the same 1.5× safe stop applies to it. Before spawning a helper it checks <code>pm.left</code> from <code>sm autopm budget</code>, and spawns none at zero.</li>
+<li>For reviews, when sm resolves the reviewer for an autopm PR (<code>review/mod.rs</code> <code>chain()</code>), it skips any provider whose <code>reviews.left</code> is ≤ 0, as it already skips a provider over its weekly meter. If no provider remains, the review waits for the next window, and sm tells the requesting agent <code>[sm autopm] review budget spent until &lt;reset&gt;</code>.</li>
 </ul>
 
 <h3 id="d">D. The autopm role, cycles and the board</h3>
@@ -693,8 +695,8 @@ and healthy; (7) publish the readout and playbook PR.
 
 Rules: no change ships without a fixed test. Ask-only changes go through shadow
 mode and one weekly ask. Never work where Rajesh has an open ticket. Never infer
-disuse from stored state. Check sm autopm budget before every spawn; at zero,
-stop. Do not message Rajesh except via sm autopm ask. Do not write build code
+disuse from stored state. Check pm.left in sm autopm budget before every helper
+spawn, and remaining before every ticket start; at zero, stop. Do not message Rajesh except via sm autopm ask. Do not write build code
 yourself. Use sm remind for measurement dates. Hand off by the default policy;
 your note lists live experiments, dates, cycle ticket and playbook path.</code></pre>
 
@@ -703,7 +705,7 @@ your note lists live experiments, dates, cycle ticket and playbook path.</code><
 <thead><tr><th>Ticket</th><th>Code</th><th>Tests (each behaviour named in A–G)</th></tr></thead>
 <tbody>
 <tr><td>1 Owner activity log</td><td>new <code>owner_events.rs</code>; middleware layer in <code>http.rs</code> router; hooks at <code>owner_answered</code> (<code>http/messages.rs:22</code>) and terminal input (<code>terminal_frame_submits_input</code> path); route + <code>sm autopm events</code> in <code>bin/sm.rs</code></td><td>surface per auth path (A.2); agent and loopback requests not recorded; every owner route maps to an action (A.3); background exclusion (A.4); headers stored (A.5); prune at 180 d (A.6); no body or query stored</td></tr>
-<tr><td>2 Switches, experiments, budget</td><td>new <code>autopm/{switches,experiments,budget,guard}.rs</code>; <code>owner_settings.rs</code> key <code>autopm</code>; bootstrap and settings responses</td><td>missing key off; switch created only by its experiment; held switches refuse the role and owner-on clears held (B.1); kill switch holds every on switch and re-enable turns nothing on (B.5); state machine, every gate in B.3 incl. plan merged at a reviewed head, and <code>max_live</code>; guard samples durable across restart, baseline population, no-history threshold 3, 60-min scope (B.4); metric runner: query contract, stats, halves, bar, guards, extend, baseline zero, errors and retries, result shape (F.2); allowance formula incl. skip and day-4 release (C.2); spend attribution three groups (C.3); reservation admission under concurrent starts, release on close, standing auto PM reservation per window, per-provider build and review reservations admitted all-or-none, over-estimate and zero-balance safe-stop messages (C.4); <code>remaining</code> deducts <code>reserved</code> (C.3); fix-ticket issue and auto-start gates (B.3); app-deploy cap refuses the second autopm deploy in a week and leaves other agents' deploys alone (B.3); abandon refused for live, measuring and kept (B.3); zero-baseline guard rule for each stat and direction (F.2)</td></tr>
+<tr><td>2 Switches, experiments, budget</td><td>new <code>autopm/{switches,experiments,budget,guard}.rs</code>; <code>owner_settings.rs</code> key <code>autopm</code>; bootstrap and settings responses</td><td>missing key off; switch created only by its experiment; held switches refuse the role and owner-on clears held (B.1); kill switch holds every on switch and re-enable turns nothing on (B.5); state machine, every gate in B.3 incl. plan merged at a reviewed head, and <code>max_live</code>; guard samples durable across restart, baseline population, no-history threshold 3, 60-min scope (B.4); metric runner: query contract, stats, halves, bar, guards, extend, baseline zero, errors and retries, result shape (F.2); allowance formula incl. skip and day-4 release (C.2); spend attribution three groups (C.3); reservation admission under concurrent starts, release on close, standing <code>pm</code> and <code>reviews</code> reservations per window and their order and caps; every review run, fallbacks included, charged to its provider's <code>reviews</code>; chain skips a provider with no review budget; owner switch-on of a reverted experiment returns it to live and closes its revert-cleanup (B.1); over-estimate and zero-balance safe-stop messages (C.4); <code>remaining</code> deducts <code>reserved</code> (C.3); fix-ticket issue and auto-start gates (B.3); app-deploy cap refuses the second autopm deploy in a week and leaves other agents' deploys alone (B.3); abandon refused for live, measuring and kept (B.3); zero-baseline guard rule for each stat and direction (F.2)</td></tr>
 <tr><td>3 Seat and cycles</td><td><code>autopm/{role,cycle,ask}.rs</code>; board auto-start path (<code>process_auto_starts</code> in <code>http/board.rs</code>, <code>resolve</code> in <code>board/launch.rs</code>); issue creation via <code>BoardSource::create_issue</code> (<code>board/sync.rs</code>); lane review policy (<code>http/review_policies.rs</code>); brief and playbook seed files</td><td>enable creates lane, policy, cycle, auto-start (D.2); Monday cycle creation and roll-over, none in a skipped window (D.3); role powers and refusals (D.4); one holder; role moves on handoff (D.1); ask parsing and 14-day abandon (E.2); auto-pause counts only cycles with a decision, sets <code>paused_at</code>, leaves switches untouched, still runs cleanup tickets, and idles the seat once nothing is live or measuring (F.4); sm files keep- and revert-cleanup tickets on their due day (F.2)</td></tr>
 <tr><td>4 App and web</td><td><code>android-app/…/AuthInterceptor.kt</code>, navigation, notification intent; <code>crates/sm-server/src/web/ui.js</code>; Settings › Auto PM screens; feedback route</td><td>headers per A.5 (instrumented test); switches read on resume; card and chip render for live switches; 👎 switches off (F.3); settings toggles enabled / skip week / Resume (clears <code>paused_at</code>)</td></tr>
 </tbody>
