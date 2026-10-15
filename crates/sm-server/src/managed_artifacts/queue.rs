@@ -58,6 +58,14 @@ pub fn save(
     tx.execute("INSERT INTO queue_artifact_submissions(job_id,config_json,prepared_json,warnings_json) VALUES(?1,?2,?3,?4)",params![id,serde_json::to_string(&manager.config)?,serde_json::to_string(prepared)?,serde_json::to_string(&warnings)?])?;
     Ok(())
 }
+/// Artifact writers cannot safely replay over partially written output directories.
+pub fn has_outputs(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM queue_artifact_submissions WHERE job_id=?1 AND json_array_length(prepared_json, '$.declarations.outputs') > 0)",
+        [id], |row| row.get(0),
+    )?)
+}
+
 fn load(conn: &Connection, id: &str) -> Result<Option<(ManagedArtifacts, PreparedSubmission)>> {
     let row: Option<(String, String)> = conn
         .query_row(
@@ -615,6 +623,9 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
             &p.request.notify_session_id,
             warning,
         )?;
+    }
+    if let Some(db) = db {
+        check_overrun(conn, id, db)?;
     }
     let tx = conn.unchecked_transaction()?;
     let reservation = store::query(

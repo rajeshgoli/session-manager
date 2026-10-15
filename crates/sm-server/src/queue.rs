@@ -7439,6 +7439,11 @@ fn requeue_owner_forced_job_after_host_pressure_conn(
     if job.state != "running" || job.owner_forced_at.is_none() || !host_pressure {
         return Ok(false);
     }
+    // A stopped writer may have left partial data. Finish it normally instead
+    // of silently replaying a command that may append or skip existing files.
+    if crate::managed_artifacts::queue::has_outputs(conn, job_id)? {
+        return Ok(false);
+    }
     // Keeping queued_at keeps the job's place; stretching the wait limit by
     // the time already spent gives it the full wait again.
     let waited = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
@@ -11536,6 +11541,41 @@ mod tests {
         .unwrap();
         let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
         assert_eq!(finished.state, "memory_exceeded");
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn owner_forced_artifact_writer_is_not_requeued_after_host_pressure() {
+        let state_dir = unique_temp_path("forced-artifact-stop");
+        let job = running_job_with_pgid(&state_dir, "tests", "artifact writer", 501);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at=?2, termination_detail_json=?3 WHERE id=?1",
+            params![
+                job.id,
+                now_rfc3339(),
+                serde_json::json!({"cause":MEMORY_GUARD_HOST_PRESSURE}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO queue_artifact_submissions(job_id, config_json, prepared_json) VALUES(?1, '{}', ?2)",
+            params![job.id, r#"{"declarations":{"outputs":["out"]}}"#]).unwrap();
+        assert!(!requeue_owner_forced_job_after_host_pressure_conn(&conn, &job.id, None).unwrap());
+        assert_eq!(
+            get_queue_job_runtime_conn(&conn, &job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        // Input-only jobs retain the existing automatic retry behavior.
+        conn.execute(
+            "UPDATE queue_artifact_submissions SET prepared_json=?1",
+            [r#"{"declarations":{"outputs":[]}}"#],
+        )
+        .unwrap();
+        assert!(requeue_owner_forced_job_after_host_pressure_conn(&conn, &job.id, None).unwrap());
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
     }

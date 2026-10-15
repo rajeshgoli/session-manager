@@ -502,3 +502,26 @@ fn cold_output_requires_the_expected_logical_symlink() {
     std::os::unix::fs::symlink(Path::new(&f.root.cold_store).join("out"), &logical).unwrap();
     assert!(validate_output(&conn, &f.root, "out").is_ok());
 }
+
+#[test]
+fn completion_checks_short_build_overrun_once() {
+    let f = Fixture::new();
+    let mut d = f.declarations("out");
+    d.disk_bytes = Some(0);
+    let job = f.submit(d);
+    let conn = f.conn();
+    admit(&conn, &job.id).unwrap();
+    check_overrun(&conn, &job.id, &f.messages()).unwrap();
+    fs::write(Path::new(&f.root.path).join("out/data"), vec![1u8; 65536]).unwrap();
+    f.finish(&job.id, "succeeded");
+    complete(&conn, &job.id, Some(&f.messages())).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_events WHERE kind='overrun'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(f.detail("out")["state"], "live");
+}
