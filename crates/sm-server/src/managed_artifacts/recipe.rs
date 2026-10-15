@@ -59,6 +59,26 @@ pub fn preserve(
     }
     let mirror = crate::sessions::expand_home(&config.mirror_dir)
         .join(format!("{}.git", root.repo.replace('/', "__")));
+    // The artifact root owns the recovery repository. A build's checkout may
+    // supply an object, but must never choose where its preservation tag lives.
+    let checkout = crate::sessions::expand_home(&root.repo_checkout);
+    let target = [&checkout, &mirror]
+        .into_iter()
+        .find_map(|path| {
+            let remote = git_in(path, &["remote", "get-url", "origin"]).ok()?;
+            if remote.is_empty() {
+                return None;
+            }
+            // Resolve relative local remotes against the configured checkout, not
+            // the source checkout from which Git will push the object.
+            let local = path.join(&remote);
+            Some(
+                std::fs::canonicalize(local)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(remote),
+            )
+        })
+        .context("configured artifact repository has no available origin")?;
     for (sha, cwds) in commits {
         // Encode ref-unsafe bytes, including dots (Git rejects .lock and ..).
         let encoded: String = set
@@ -89,15 +109,22 @@ pub fn preserve(
             ))?;
         let remote = git_in(
             source,
-            &["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")],
+            &["ls-remote", "--tags", &target, &format!("refs/tags/{tag}")],
         )?;
         if remote.is_empty() {
             git_in(
                 source,
-                &["push", "origin", &format!("{sha}:refs/tags/{tag}")],
+                &["push", &target, &format!("{sha}:refs/tags/{tag}")],
             )?;
         } else if remote.split_whitespace().next() != Some(sha.as_str()) {
             bail!("tag {tag} points at another commit");
+        }
+        let verified = git_in(
+            source,
+            &["ls-remote", "--tags", &target, &format!("refs/tags/{tag}")],
+        )?;
+        if verified.split_whitespace().next() != Some(sha.as_str()) {
+            bail!("tag {tag} was not preserved in the configured artifact repository");
         }
         conn.execute("UPDATE artifact_jobs SET tag=?3 WHERE root=?1 AND commit_sha=?2 AND name IN (SELECT name FROM artifacts WHERE root=?1 AND set_id=?4)",params![root.path,sha,tag,set])?;
         event(

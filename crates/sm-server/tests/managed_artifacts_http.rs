@@ -61,6 +61,7 @@ impl Fixture {
                     path: dir.join("root").display().to_string(),
                     cold_store: dir.join("cold").display().to_string(),
                     repo: "owner/research".into(),
+                    repo_checkout: dir.join("repo").display().to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -374,8 +375,8 @@ async fn queue_artifact_api_validates_before_persisting() {
 async fn real_cli_build_records_artifact_recipe_and_preserves_commit() {
     use sm_server::{managed_artifacts::submission::git_in, queue::RetainedQueueStore};
     let f = Fixture::new();
-    let repo = f.dir.join("repo");
-    fs::create_dir(&repo).unwrap();
+    let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
+    fs::create_dir_all(&repo).unwrap();
     git_in(&repo, &["init", "-q"]).unwrap();
     fs::write(repo.join("main.c"), "int main(void) { return 0; }\n").unwrap();
     let output = f.dir.join("root/compiled/tool");
@@ -479,7 +480,15 @@ async fn real_cli_build_records_artifact_recipe_and_preserves_commit() {
     loop {
         let a = f.store().detail(&f.root(), "compiled").unwrap();
         if a["state"] == "live" {
-            assert_eq!(a["recipe_complete"], 1);
+            let notices = RetainedQueueStore::new(f.dir.join("queue.db"))
+                .pending_messages_for_target_by_category("maker", "queue-completion", 20)
+                .unwrap();
+            assert_eq!(
+                a["recipe_complete"],
+                1,
+                "artifact: {a}; notices: {:?}",
+                notices.iter().map(|n| &n.text).collect::<Vec<_>>()
+            );
             assert_eq!(a["note"], "Compiled test tool");
             assert!(a["jobs"][0]["tag"]
                 .as_str()

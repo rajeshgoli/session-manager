@@ -693,3 +693,55 @@ fn unstarted_writer_departure_records_the_prior_successful_build() {
         assert_eq!(f.detail("out")["jobs"][1]["state"], terminal);
     }
 }
+
+#[test]
+fn foreign_build_commit_is_preserved_in_the_artifact_roots_repository() {
+    let owner = Fixture::new();
+    owner.init_git();
+    let foreign = Fixture::new();
+    foreign.init_git();
+    fs::write(
+        Path::new(&foreign.root.repo_checkout).join("foreign.txt"),
+        "foreign source",
+    )
+    .unwrap();
+    foreign.git(&["add", "foreign.txt"]);
+    foreign.git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "foreign build",
+    ]);
+    let sha = foreign.git(&["rev-parse", "HEAD"]);
+    let mut request = owner.request();
+    request.cwd = foreign.root.repo_checkout.clone();
+    let mut d = owner.declarations("out");
+    d.record.as_mut().unwrap().recipe_complete = true;
+    let prepared = PreparedSubmission::prepare(&owner.manager, &owner.root, d, &request).unwrap();
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
+        &owner.state(),
+        request,
+        300,
+        None,
+        Some((&owner.manager, &prepared)),
+    )
+    .unwrap();
+    admit(&owner.conn(), &job.id).unwrap();
+    owner.finish(&job.id, "succeeded");
+    assert_eq!(owner.detail("out")["recipe_complete"], 1);
+    assert!(owner
+        .git(&["ls-remote", "--tags", "origin"])
+        .starts_with(&sha));
+    assert!(foreign.git(&["ls-remote", "--tags", "origin"]).is_empty());
+    let tag = owner.detail("out")["jobs"][0]["tag"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    owner.git(&["fetch", "origin", &format!("refs/tags/{tag}")]);
+    assert_eq!(owner.git(&["rev-parse", "FETCH_HEAD"]), sha);
+}
