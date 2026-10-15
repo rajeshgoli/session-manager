@@ -132,19 +132,22 @@ pub fn repair(conn: &Connection, messages: Option<&Path>) -> Result<()> {
             tx.commit()?;
         }
         if let Some(messages) = messages {
-            submission_notices(conn, id, messages)?;
+            if let Err(error) = submission_notices(conn, id, messages) {
+                eprintln!("artifact submission notices deferred for {id}: {error:#}");
+            }
         }
         if !matches!(row["state"].as_str(), Some("pending" | "running")) {
-            complete(conn, id, messages)?;
+            if let Err(error) = complete(conn, id, messages) {
+                eprintln!("artifact completion deferred for {id}: {error:#}");
+            }
         }
     }
     Ok(())
 }
 
-pub fn remaining(conn: &Connection, id: &str, reason: Option<&str>) -> Result<Option<i64>> {
-    if !matches!(reason, Some("disk_space" | "thawing")) {
-        return Ok(None);
-    }
+pub fn remaining(conn: &Connection, id: &str, _reason: Option<&str>) -> Result<Option<i64>> {
+    // Once granted, the artifact wait window survives temporary scheduler
+    // holds. The current reason describes the blocker, not a new deadline.
     let row:Option<(String,String)>=conn.query_row("SELECT first_hold_at,config_json FROM queue_artifact_submissions WHERE job_id=?1 AND first_hold_at IS NOT NULL",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     row.map(|(at, config)| {
         let config: ManagedArtifactsConfig = serde_json::from_str(&config)?;

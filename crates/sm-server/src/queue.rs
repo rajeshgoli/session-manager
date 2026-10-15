@@ -9533,7 +9533,7 @@ mod tests {
         conn.execute("UPDATE queue_jobs SET holding_reason='concurrency_cap'", [])
             .unwrap();
         for job in list_queue_job_runtime_records_conn(&conn).unwrap() {
-            assert!(artifact_aware_wait_remaining(&conn, &job).unwrap().unwrap() < 0);
+            assert!(artifact_aware_wait_remaining(&conn, &job).unwrap().unwrap() > 3500);
         }
     }
 

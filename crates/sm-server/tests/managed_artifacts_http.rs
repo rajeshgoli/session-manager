@@ -496,3 +496,38 @@ async fn real_cli_build_records_artifact_recipe_and_preserves_commit() {
     assert!(output.is_file());
     server.abort();
 }
+
+#[tokio::test]
+async fn queue_submission_survives_a_failed_post_commit_thaw_notice() {
+    use sm_server::managed_artifacts::{
+        queue::{install_operations, Operations},
+        ManagedArtifacts,
+    };
+    struct Unavailable;
+    impl Operations for Unavailable {
+        fn thaw(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("injected thaw worker failure")
+        }
+        fn pressure(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let conn = f.store().open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'frozen-input','frozen','cold','frozen-input','queue','owner/research',?2)",rusqlite::params![f.root(),sm_server::managed_artifacts::now()]).unwrap();
+    install_operations(&f.root(), std::sync::Arc::new(Unavailable));
+    let (status,body)=f.request("POST","/queue-jobs",Some("maker"),json!({"type":"background","label":"notice-failure","notify_target":"maker","requester_session_id":"maker","cwd":f.dir,"argv":["/usr/bin/true"],"artifacts":{"inputs":["frozen-input"]}})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "pending");
+    assert!(body["id"].is_string());
+    let queue = rusqlite::Connection::open(f.dir.join("queue-runner/queue_runner.db")).unwrap();
+    sm_server::managed_artifacts::queue::repair(&queue, Some(&f.dir.join("queue.db"))).unwrap();
+    let count: i64 = queue
+        .query_row(
+            "SELECT COUNT(*) FROM queue_jobs WHERE label='notice-failure'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}

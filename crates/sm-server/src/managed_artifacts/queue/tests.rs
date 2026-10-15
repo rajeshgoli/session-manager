@@ -216,9 +216,11 @@ fn disk_and_thaw_holds_keep_the_first_twenty_four_hour_deadline() {
             <= 3600
     );
     assert!(remaining(&conn, &job.id, Some("thawing")).unwrap().unwrap() > 3500);
-    assert_eq!(
-        remaining(&conn, &job.id, Some("concurrency_cap")).unwrap(),
-        None
+    assert!(
+        remaining(&conn, &job.id, Some("concurrency_cap"))
+            .unwrap()
+            .unwrap()
+            > 3500
     );
     admit(&conn, &job.id).unwrap();
     assert!(

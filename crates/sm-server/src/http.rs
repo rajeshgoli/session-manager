@@ -8341,26 +8341,38 @@ async fn create_queue_job(
         }
     })?;
     if prepared.is_some() {
-        let conn =
-            crate::queue::open_queue_jobs_connection(&queue_state_dir.join("queue_runner.db"))?;
-        crate::managed_artifacts::queue::submission_notices(
-            &conn,
-            &job.id,
-            &expand_home(&state.config.sm_send.db_path),
-        )?;
+        let notices =
+            crate::queue::open_queue_jobs_connection(&queue_state_dir.join("queue_runner.db"))
+                .and_then(|conn| {
+                    crate::managed_artifacts::queue::submission_notices(
+                        &conn,
+                        &job.id,
+                        &expand_home(&state.config.sm_send.db_path),
+                    )
+                });
+        if let Err(error) = notices {
+            eprintln!(
+                "artifact submission notices deferred for {}: {error:#}",
+                job.id
+            );
+        }
     }
     let job = if state.config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
-        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
-            &queue_state_dir,
-            &message_queue_db_path,
-            state.config.queue_runner.cancel_grace_seconds,
-            queue_admission_policy(&state),
-        )?;
+        let admission=RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &queue_state_dir,&message_queue_db_path,state.config.queue_runner.cancel_grace_seconds,queue_admission_policy(&state),
+        );
+        if let Err(error) = admission {
+            // The submission is already durable. Reporting rejection here
+            // invites the caller to submit and execute the same work twice.
+            eprintln!("initial admission deferred for {}: {error:#}", job.id);
+        }
         RetainedQueueStore::get_queue_job_from_path(
             &queue_state_dir.join("queue_runner.db"),
             &job.id,
-        )?
+        )
+        .ok()
+        .flatten()
         .unwrap_or(job)
     } else {
         job
@@ -17395,10 +17407,7 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
-    if matches!(
-        job.holding_reason.as_deref(),
-        Some("disk_space" | "thawing")
-    ) {
+    if job.state == "pending" {
         let conn = crate::queue::open_queue_jobs_connection(
             &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
                 .join("queue_runner.db"),
