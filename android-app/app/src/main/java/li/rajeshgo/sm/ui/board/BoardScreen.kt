@@ -164,9 +164,6 @@ fun boardThreadTarget(ticket: BoardTicket): ThreadTarget? {
 /** Blocked rows show while a lane has at most this many non-done tickets (spec 1782 H1). */
 const val BLOCKED_ROW_LIMIT = 12
 
-/** Most recently closed tickets shown as rows; the rest fold. */
-const val DONE_ROW_LIMIT = 3
-
 /** "Not in any lane" rows per repo before "{n} more ›"; needs-you rows always show. */
 const val OTHER_ROW_LIMIT = 10
 
@@ -787,7 +784,6 @@ private fun LaneBody(lane: BoardLane, groups: LaneGroups, actions: BoardRowActio
     var doneOpen by rememberSaveable(lane.id) { mutableStateOf(false) }
     var changesOpen by rememberSaveable(lane.id) { mutableStateOf(false) }
     val head = lane.longestChain.firstOrNull()
-    val moreDone = groups.done.drop(DONE_ROW_LIMIT)
     Column(Modifier.padding(top = 10.dp, end = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (lane.longestChain.size > 1) {
             Text(
@@ -812,10 +808,10 @@ private fun LaneBody(lane: BoardLane, groups: LaneGroups, actions: BoardRowActio
             FoldLine(blockedFoldCaption(groups.blocked, base), null, blockedOpen) { blockedOpen = !blockedOpen }
             if (blockedOpen) groups.blocked.forEach { TicketRow(it, base, head, actions, slim = true) }
         }
-        groups.done.take(DONE_ROW_LIMIT).forEach { TicketRow(it, base, null, actions, slim = true) }
-        if (moreDone.isNotEmpty()) {
-            FoldLine("${moreDone.size} more done", null, doneOpen) { doneOpen = !doneOpen }
-            if (doneOpen) moreDone.forEach { TicketRow(it, base, null, actions, slim = true) }
+        // Closed tickets always fold so the lane shows only open work.
+        if (groups.done.isNotEmpty()) {
+            FoldLine("${groups.done.size} done", null, doneOpen) { doneOpen = !doneOpen }
+            if (doneOpen) groups.done.forEach { TicketRow(it, base, null, actions, slim = true) }
         }
         if (lane.changes.isNotEmpty()) {
             FoldLine("Recent changes", null, changesOpen) { changesOpen = !changesOpen }

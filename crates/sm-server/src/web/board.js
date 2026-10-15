@@ -10,7 +10,6 @@ import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
 export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
 export const BLOCKED_ROW_LIMIT = 12;
-export const DONE_ROW_LIMIT = 3;
 export const OTHER_ROW_LIMIT = 10;
 const ticketKey = (t) => `${t.repo}#${t.number}`;
 const ticketLink = (t) => openItem('ticket', ticketKey(t), t.url || `https://github.com/${t.repo}/issues/${t.number}`);
@@ -168,15 +167,15 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, lanePolicy = nu
     </div>
   </div>`;
 }
-function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy = null }) {
+function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy = null, open = false }) {
   if (!tickets.length) return null;
   const blockers = [...new Map(tickets.flatMap(openBlockers).map((t) => [ticketKey(t), t])).values()];
-  const caption = label === 'Blocked' ? `${tickets.length} blocked` : label === 'More done' ? `${tickets.length} more done` : `${tickets.length} more`;
-  return html`<details class="board-fold"><summary>${caption}${label === 'Blocked' && blockers.length ? ` · waiting on ${blockers.map((t) => `#${t.number}`).join(', ')}` : ' ›'}</summary>
+  const caption = label === 'Blocked' ? `${tickets.length} blocked` : label === 'Done' ? `${tickets.length} done` : `${tickets.length} more`;
+  return html`<details class="board-fold" open=${open}><summary>${caption}${label === 'Blocked' && blockers.length ? ` · waiting on ${blockers.map((t) => `#${t.number}`).join(', ')}` : ' ›'}</summary>
     ${tickets.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${lanePolicy} slim />`)}
   </details>`;
 }
-function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move }) {
+function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move, showDone = false }) {
   const [ending, setEnding] = useState(false);
   const [reviews, setReviews] = useState(false);
   const [lining, setLining] = useState(false);
@@ -224,8 +223,8 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
     ${!short ? groups.active.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />`) : null}
     ${(showBlocked ? groups.blocked : groups.blocked.filter(hasOperations)).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
     <div class="lane-folds">${!showBlocked ? html`<${Fold} tickets=${groups.blocked.filter(t=>!hasOperations(t))} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />` : null}
-      ${groups.done.filter((t,i)=>i<DONE_ROW_LIMIT || hasOperations(t)).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
-      <${Fold} tickets=${groups.done.filter((t,i)=>i>=DONE_ROW_LIMIT && !hasOperations(t))} label="More done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
+      ${groups.done.filter(hasOperations).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
+      <${Fold} tickets=${groups.done.filter(t=>!hasOperations(t))} label="Done" open=${showDone} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
   </section>`;
 }
 function AddLane({ repos, mutate, busy, onClose }) {
@@ -313,7 +312,7 @@ export function BoardPage() {
     ${data ? html`
       ${data.lanes.length ? null : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
       ${boardSections(visibleLanes, visibleOthers).map(({ lane, other: group }) => lane ? html`<${Lane} key=${lane.id} lane=${lane} index=${data.lanes.findIndex(l=>l.id===lane.id)} count=${data.lanes.length}
-        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} />` : html`<section key=${`other ${group.repo}`} class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
+        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} showDone=${filter==='finished'} />` : html`<section key=${`other ${group.repo}`} class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2>
         ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />`)}
         ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />` : null}</section>`)}
       <div class="clock-legend"><span class="ball green">agent working</span><span class="ball green">queue job running (hatched)</span><span class="ball amber">queue or review</span><span class="ball magenta">waiting on you</span><span class="ball red">nothing moving</span></div>` : null}
