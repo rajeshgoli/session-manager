@@ -8256,27 +8256,99 @@ async fn create_queue_job(
             },
         )?;
     }
-    let job = RetainedQueueStore::create_queue_job_in_state_dir_with_options(
+    let request = CreateQueueJob {
+        local_submitter: crate::local_identity::current(),
+        job_type: job_type.to_owned(),
+        label,
+        requester_session_id,
+        notify_session_id: notify_session.id,
+        cwd: cwd_path.display().to_string(),
+        argv,
+        script,
+        env: payload.env,
+        timeout_seconds,
+        cpu_percent: payload.cpu_percent,
+        gpu_percent: (job_type == "perf").then_some(payload.gpu_percent.unwrap_or(0)),
+        memory_bytes: payload.memory_bytes,
+        rank_tickets,
+    };
+    let prepared = if let Some(mut declarations) = payload.artifacts {
+        let manager = state.managed_artifacts.as_ref().ok_or(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "managed artifacts are disabled".into(),
+        })?;
+        let repo = crate::managed_artifacts::submission::git_in(
+            &cwd_path,
+            &["remote", "get-url", "origin"],
+        )
+        .ok()
+        .and_then(|url| crate::work_attribution::github_repo_from_remote_url(&url));
+        let root = manager
+            .config
+            .resolve_root(payload.artifact_root.as_deref(), repo.as_deref())
+            .map_err(|e| ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: e.to_string(),
+            })?;
+        if let Some(flags) = &mut declarations.record {
+            if flags.ticket.is_none() {
+                if let Some(actor) = &request.requester_session_id {
+                    let claims =
+                        claims::work_claim_store(&state).claims_for_session(actor, true)?;
+                    let tickets: Vec<_> = claims
+                        .iter()
+                        .filter(|c| c.claim.repo == root.repo && c.claim.kind == "ticket")
+                        .collect();
+                    if tickets.len() == 1 {
+                        flags.ticket = Some(tickets[0].claim.number);
+                    }
+                }
+            }
+        }
+        Some(
+            crate::managed_artifacts::submission::PreparedSubmission::prepare(
+                manager,
+                root,
+                declarations,
+                &request,
+            )
+            .map_err(|e| ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: e.to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
         &queue_state_dir,
-        CreateQueueJob {
-            local_submitter: crate::local_identity::current(),
-            job_type: job_type.to_owned(),
-            label,
-            requester_session_id,
-            notify_session_id: notify_session.id,
-            cwd: cwd_path.display().to_string(),
-            argv,
-            script,
-            env: payload.env,
-            timeout_seconds,
-            cpu_percent: payload.cpu_percent,
-            gpu_percent: (job_type == "perf").then_some(payload.gpu_percent.unwrap_or(0)),
-            memory_bytes: payload.memory_bytes,
-            rank_tickets,
-        },
+        request,
         max_wait_seconds,
         payload.stop_grace_seconds,
-    )?;
+        prepared
+            .as_ref()
+            .zip(state.managed_artifacts.as_ref())
+            .map(|(p, m)| (m, p)),
+    )
+    .map_err(|error| {
+        if prepared.is_some() {
+            ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: error.to_string(),
+            }
+        } else {
+            error.into()
+        }
+    })?;
+    if prepared.is_some() {
+        let conn =
+            crate::queue::open_queue_jobs_connection(&queue_state_dir.join("queue_runner.db"))?;
+        crate::managed_artifacts::queue::submission_notices(
+            &conn,
+            &job.id,
+            &expand_home(&state.config.sm_send.db_path),
+        )?;
+    }
     let job = if state.config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
         RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
@@ -16616,6 +16688,10 @@ struct ScheduleReminderQuery {
 
 #[derive(Debug, Deserialize)]
 struct QueueJobCreateRequest {
+    #[serde(default)]
+    artifacts: Option<crate::managed_artifacts::submission::Declarations>,
+    #[serde(default)]
+    artifact_root: Option<String>,
     #[serde(default = "default_queue_job_type", rename = "type")]
     job_type: String,
     #[serde(default)]
@@ -17319,6 +17395,27 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
+    if matches!(
+        job.holding_reason.as_deref(),
+        Some("disk_space" | "thawing")
+    ) {
+        let conn = crate::queue::open_queue_jobs_connection(
+            &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+                .join("queue_runner.db"),
+        )?;
+        if let Some(remaining) = crate::managed_artifacts::queue::remaining(
+            &conn,
+            &job.id,
+            job.holding_reason.as_deref(),
+        )? {
+            response["holding"]["wait_remaining_seconds"] = json!(remaining.max(0));
+            response["holding"]["max_wait_seconds"] = json!(state
+                .config
+                .managed_artifacts
+                .disk_hold_max_wait_hours
+                .saturating_mul(3600));
+        }
+    }
     // Kept out of the literal above, which is at json!'s recursion limit.
     response["stop_grace_seconds"] = json!(job.stop_grace_seconds);
     response["stop_requested_at"] = json!(job.stop_requested_at);

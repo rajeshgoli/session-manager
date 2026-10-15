@@ -3,6 +3,8 @@
 pub mod attribution;
 pub mod config;
 pub mod delete;
+pub mod queue;
+pub mod recipe;
 pub mod scan;
 pub mod store;
 pub mod submission;
@@ -225,13 +227,13 @@ impl ManagedArtifacts {
             ensure_not_in_use(&tx, &root.path, name)?;
             std::fs::metadata(std::path::Path::new(&root.path).join(a["name"].as_str().unwrap()))
                 .map_err(|error| anyhow::anyhow!("{name} cannot be recorded: {error}"))?;
-            if flags.recipe_complete {
-                bail!("recipe validation and commit tagging require queue integration");
-            }
+        }
+        if flags.recipe_complete {
+            recipe::preserve(&tx, &self.config, root, names)?;
         }
         for name in names {
             apply_record(&tx, root, name, flags, actor)?;
-            tx.execute("UPDATE artifacts SET state='live',origin=CASE WHEN origin='unrecorded' THEN 'adopted' ELSE origin END WHERE root=?1 AND name=?2",params![root.path,name])?;
+            tx.execute("UPDATE artifacts SET state='live',recipe_complete=?3,origin=CASE WHEN origin='unrecorded' THEN 'adopted' ELSE origin END WHERE root=?1 AND name=?2",params![root.path,name,flags.recipe_complete])?;
             event(&tx, &root.path, name, "recorded", actor, json!({}))?;
         }
         let result = names
