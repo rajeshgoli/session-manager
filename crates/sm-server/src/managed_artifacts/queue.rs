@@ -326,8 +326,8 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
     .pop()
     .context("artifact reservation missing; recover before admission")?;
     let outputs = names(&r, "outputs_json")?;
-    for active in store::query(conn,"SELECT outputs_json FROM artifact_job_reservations WHERE root=?1 AND job_id<>?2 AND start_bytes IS NOT NULL",&[&p.root.path,&id])? {
-        if names(&active,"outputs_json")?.iter().any(|other|outputs.iter().any(|name|name.eq_ignore_ascii_case(other))) {
+    for active in store::query(conn,"SELECT outputs_json,inputs_json FROM artifact_job_reservations WHERE root=?1 AND job_id<>?2 AND start_bytes IS NOT NULL",&[&p.root.path,&id])? {
+        if names(&active,"outputs_json")?.into_iter().chain(names(&active,"inputs_json")?).any(|other|outputs.iter().any(|name|name.eq_ignore_ascii_case(&other))) {
             return Ok(Some("artifact_writer".into()));
         }
     }
@@ -627,7 +627,7 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
     if let Some(db) = db {
         check_overrun(conn, id, db)?;
     }
-    let tx = conn.unchecked_transaction()?;
+    let mut tx = conn.unchecked_transaction()?;
     let reservation = store::query(
         &tx,
         "SELECT * FROM artifact_job_reservations WHERE job_id=?1",
@@ -643,7 +643,11 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
                 .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
         )
         .map_or(0, |(start, end)| (end - start).whole_seconds().max(0));
-    let outputs = &p.declarations.outputs;
+    let canonical_outputs = names(
+        reservation.as_ref().context("artifact reservation")?,
+        "outputs_json",
+    )?;
+    let outputs = &canonical_outputs;
     if job["state"] == "succeeded" {
         for name in outputs {
             if let Err(error) = validate_output(&tx, &p.root, name) {
@@ -685,10 +689,6 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         "DELETE FROM artifact_meta WHERE key=?1",
         [format!("queue-size:{id}")],
     )?;
-    tx.execute(
-        "DELETE FROM artifact_job_reservations WHERE job_id=?1",
-        [id],
-    )?;
     if job["state"] == "succeeded" && !outputs.is_empty() {
         let a = artifact(&tx, &p.root.path, &outputs[0])?;
         let set = a["set_id"].as_str().context("set")?;
@@ -703,7 +703,7 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
             .collect();
         let busy = members
             .iter()
-            .any(|name| super::ensure_not_in_use(&tx, &p.root.path, name).is_err());
+            .any(|name| super::ensure_not_in_use_except(&tx, &p.root.path, name, id).is_err());
         if !busy {
             for name in &members {
                 if let Err(error) = validate_output(&tx, &p.root, name) {
@@ -747,9 +747,14 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
             }
             if let Some(mut flags) = merged {
                 if flags.recipe_complete {
-                    if let Err(error) =
-                        super::recipe::preserve(&tx, &manager.config, &p.root, &members)
-                    {
+                    // Keep the reservation durable while releasing both database
+                    // write locks before contacting the remote. A crash retries
+                    // completion and tag preservation idempotently.
+                    tx.commit()?;
+                    let preserved =
+                        super::recipe::preserve(conn, &manager.config, &p.root, &members);
+                    tx = conn.unchecked_transaction()?;
+                    if let Err(error) = preserved {
                         flags.recipe_complete = false;
                         notify(
                             db,
@@ -762,21 +767,49 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
                         )?;
                     }
                 }
-                for name in &members {
-                    super::apply_record(&tx, &p.root, name, &flags, &p.request.notify_session_id)?;
-                    tx.execute("UPDATE artifacts SET state='live',recipe_complete=?3 WHERE root=?1 AND name=?2",params![p.root.path,name,flags.recipe_complete])?;
-                    event(
-                        &tx,
-                        &p.root.path,
-                        name,
-                        "recorded",
-                        id,
-                        json!({"job_id":id}),
-                    )?;
+                // A submission may have extended the set while Git was running.
+                // Leave recording to that job's completion if it now has work.
+                let current_members = store::query(
+                    &tx,
+                    "SELECT name FROM artifacts WHERE root=?1 AND set_id=?2",
+                    &[&p.root.path, &set],
+                )?;
+                let unchanged = current_members.len() == members.len()
+                    && current_members
+                        .iter()
+                        .all(|a| members.iter().any(|n| a["name"] == *n));
+                let available = unchanged
+                    && members.iter().all(|name| {
+                        super::ensure_not_in_use_except(&tx, &p.root.path, name, id).is_ok()
+                    });
+                if available {
+                    for name in &members {
+                        validate_output(&tx, &p.root, name)?;
+                        super::apply_record(
+                            &tx,
+                            &p.root,
+                            name,
+                            &flags,
+                            &p.request.notify_session_id,
+                        )?;
+                        tx.execute("UPDATE artifacts SET state='live',recipe_complete=?3 WHERE root=?1 AND name=?2",params![p.root.path,name,flags.recipe_complete])?;
+                        event(
+                            &tx,
+                            &p.root.path,
+                            name,
+                            "recorded",
+                            id,
+                            json!({"job_id":id}),
+                        )?;
+                    }
                 }
             }
         }
     }
+    tx.execute(
+        "DELETE FROM artifact_job_reservations WHERE job_id=?1",
+        [id],
+    )?;
     tx.execute(
         "UPDATE queue_artifact_submissions SET completed=1 WHERE job_id=?1",
         [id],

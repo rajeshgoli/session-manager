@@ -559,3 +559,68 @@ fn pending_artifact_cancellation_commits_and_releases_reservation() {
     assert_eq!(notices.len(), 1);
     assert!(notices[0].text.contains("cancelled"));
 }
+
+#[test]
+fn writer_waits_for_active_reader_but_readers_can_share_inputs() {
+    let f = Fixture::new();
+    let mut d = f.declarations("out");
+    d.record = None;
+    let build = f.submit(d);
+    admit(&f.conn(), &build.id).unwrap();
+    f.finish(&build.id, "succeeded");
+    let reader = f.submit(submission::Declarations {
+        inputs: vec!["out".into()],
+        ..Default::default()
+    });
+    let other_reader = f.submit(submission::Declarations {
+        inputs: vec!["out".into()],
+        ..Default::default()
+    });
+    let conn = f.conn();
+    assert_eq!(admit(&conn, &reader.id).unwrap(), None);
+    assert_eq!(admit(&conn, &other_reader.id).unwrap(), None);
+    let writer = f.submit(f.declarations("OUT"));
+    assert_eq!(
+        admit(&conn, &writer.id).unwrap().as_deref(),
+        Some("artifact_writer")
+    );
+    f.finish(&reader.id, "succeeded");
+    assert_eq!(
+        admit(&conn, &writer.id).unwrap().as_deref(),
+        Some("artifact_writer")
+    );
+    f.finish(&other_reader.id, "succeeded");
+    assert_eq!(admit(&conn, &writer.id).unwrap(), None);
+    f.finish(&writer.id, "succeeded");
+    assert_eq!(f.detail("out")["state"], "live");
+    assert_eq!(
+        f.detail("out")["jobs"].as_array().unwrap().last().unwrap()["state"],
+        "succeeded"
+    );
+}
+
+#[test]
+fn recipe_push_does_not_hold_queue_or_artifact_database_write_locks() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.init_git();
+    let mut d = f.declarations("out");
+    d.record.as_mut().unwrap().recipe_complete = true;
+    let job = f.submit(d);
+    admit(&f.conn(), &job.id).unwrap();
+    let hook = f.dir.join("remote.git/hooks/pre-receive");
+    let script = format!(
+        "#!/usr/bin/env python3\nimport sqlite3, sys\nfor path, sql in {:?}:\n    conn = sqlite3.connect(path, timeout=0.1)\n    conn.execute(sql)\n    conn.commit()\nsys.stdin.read()\n",
+        vec![
+            (f.state().join("queue_runner.db").display().to_string(), "UPDATE queue_jobs SET label=label"),
+            (f.dir.join("artifacts.db").display().to_string(), "UPDATE artifacts SET note=note"),
+        ]
+    );
+    fs::write(&hook, script).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    f.finish(&job.id, "succeeded");
+    assert_eq!(f.detail("out")["recipe_complete"], 1);
+    assert_eq!(f.detail("out")["state"], "live");
+    complete(&f.conn(), &job.id, Some(&f.messages())).unwrap();
+    assert_eq!(f.detail("out")["recipe_complete"], 1);
+}

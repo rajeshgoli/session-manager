@@ -9,6 +9,9 @@ pub fn preserve(
     root: &ArtifactRoot,
     names: &[String],
 ) -> Result<()> {
+    if !conn.is_autocommit() {
+        bail!("preserve recipe tags outside database transactions");
+    }
     let first = names.first().context("name at least one artifact")?;
     let a = artifact(conn, &root.path, first)?;
     let set = a["set_id"].as_str().context("set")?;
