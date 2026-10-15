@@ -166,6 +166,23 @@ fn mutate(
                     svc.record(root, &names, &flags, &actor.id)
                 }
             }
+            "rebuild" => ma::rebuild::start(
+                svc,
+                root,
+                &name,
+                &actor.id,
+                ma::rebuild::Execution {
+                    queue_dir: expand_home(
+                        &state.config.queue_runner_state_dir().to_string_lossy(),
+                    ),
+                    messages: expand_home(&state.config.sm_send.db_path),
+                    worktrees: crate::config::test_isolation_root_from_environment()?
+                        .map(|p| p.join("rebuild-worktrees"))
+                        .unwrap_or_else(|| expand_home("~/worktrees")),
+                    policy: queue_admission_policy(state),
+                    cancel_grace: state.config.queue_runner.cancel_grace_seconds,
+                },
+            ),
             "done" => svc.done(root, &name, &actor.id),
             "consumers" | "marks" => svc.edit(root, &name, &action, &body, &actor.id),
             "delete" => svc.delete(
@@ -215,6 +232,9 @@ fn mutate(
         }
     })()
     .map_err(refusal)?;
+    if action == "rebuild" {
+        ma::rebuild::kick(svc.clone());
+    }
     Ok(Json(result).into_response())
 }
 impl AppState {
@@ -222,6 +242,7 @@ impl AppState {
         let Some(svc) = &self.managed_artifacts else {
             return Ok(());
         };
+        ma::rebuild::kick(svc.clone());
         let jobs = RetainedQueueStore::list_queue_jobs_from_path(
             &expand_home(&self.config.sm_send.db_path),
             Default::default(),

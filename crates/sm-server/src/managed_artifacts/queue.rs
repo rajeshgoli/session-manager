@@ -437,7 +437,13 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
     let tx = conn.unchecked_transaction()?;
     for name in &outputs {
         let a = artifact(&tx, &p.root.path, name)?;
-        if a["state"] != "building" || !a["op"].is_null() {
+        if a["state"] != "building"
+            || (!a["op"].is_null()
+                && !p
+                    .rebuild
+                    .as_ref()
+                    .is_some_and(|(id, _)| a["op"] == format!("rebuilding:{id}")))
+        {
             bail!("output {name} is no longer available");
         }
         let base = if location == "cold" {
@@ -533,7 +539,7 @@ pub fn check_overrun(conn: &Connection, id: &str, db: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_output(conn: &Connection, root: &ArtifactRoot, name: &str) -> Result<()> {
+pub(super) fn validate_output(conn: &Connection, root: &ArtifactRoot, name: &str) -> Result<()> {
     let a = artifact(conn, &root.path, name)?;
     if a["state"] != "building" {
         bail!("output {name} is no longer building");
@@ -589,6 +595,13 @@ fn invalid_outputs(
         "UPDATE artifact_jobs SET state='failed' WHERE job_id=?1",
         [id],
     )?;
+    if let Some((run, position)) = &p.rebuild {
+        conn.execute(
+            "UPDATE artifact_rebuild_steps SET error=?3 WHERE run_id=?1 AND position=?2",
+            params![run, position, format!("{error:#}")],
+        )?;
+    }
+
     conn.execute(
         "DELETE FROM artifact_job_reservations WHERE job_id=?1",
         [id],
@@ -713,7 +726,10 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         tx.query_row("SELECT EXISTS(SELECT 1 FROM artifact_jobs WHERE root=?1 AND name=?2 AND state='succeeded')",
             params![p.root.path, name], |row| row.get::<_, bool>(0)).unwrap_or(false)
     });
-    if (job["state"] == "succeeded" || job["started_at"].is_null()) && successful_outputs {
+    if p.rebuild.is_none()
+        && (job["state"] == "succeeded" || job["started_at"].is_null())
+        && successful_outputs
+    {
         let a = artifact(&tx, &p.root.path, &outputs[0])?;
         let set = a["set_id"].as_str().context("set")?;
         let members = store::query(
@@ -845,6 +861,9 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         [id],
     )?;
     tx.commit()?;
+    if p.rebuild.is_some() {
+        super::rebuild::kick(manager);
+    }
     Ok(())
 }
 

@@ -56,3 +56,13 @@ CREATE TABLE IF NOT EXISTS backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, qu
 CREATE TABLE IF NOT EXISTS backup_static (path TEXT PRIMARY KEY, content_stamp TEXT, backup_stamp TEXT, backed_up_at TEXT);
 
 CREATE TABLE IF NOT EXISTS artifact_meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS artifact_rebuilds (
+ id TEXT PRIMARY KEY, root TEXT NOT NULL, set_id TEXT NOT NULL,
+ plan_json TEXT NOT NULL, execution_json TEXT NOT NULL,
+ state TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, error TEXT, notified INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS artifact_rebuild_active
+ ON artifact_rebuilds(root,set_id) WHERE state IN ('preparing','running');
+CREATE TABLE IF NOT EXISTS artifact_rebuild_steps (
+ run_id TEXT NOT NULL, position INTEGER NOT NULL, job_id TEXT UNIQUE, error TEXT,
+ PRIMARY KEY(run_id,position));

@@ -860,3 +860,323 @@ fn untracked_build_input_prevents_complete_recipe() {
     assert_eq!(f.detail("out")["recipe_complete"], 0);
     assert!(f.git(&["ls-remote", "--tags", "origin"]).is_empty());
 }
+
+fn rebuild_execution(f: &Fixture) -> super::super::rebuild::Execution {
+    super::super::rebuild::Execution {
+        queue_dir: f.state(),
+        messages: f.messages(),
+        worktrees: f.dir.join("worktrees"),
+        policy: crate::queue::QueueAdmissionPolicy {
+            memory_min_free_bytes: 0,
+            ..Default::default()
+        },
+        cancel_grace: 1,
+    }
+}
+fn rebuild_fixture(f: &Fixture, script: &str) {
+    f.init_git();
+    let mut d = f.declarations("out");
+    d.record.as_mut().unwrap().recipe_complete = true;
+    let mut request = f.request();
+    request.argv = None;
+    request.script = Some(script.into());
+    let prepared = PreparedSubmission::prepare(&f.manager, &f.root, d, &request).unwrap();
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
+        &f.state(),
+        request,
+        300,
+        None,
+        Some((&f.manager, &prepared)),
+    )
+    .unwrap();
+    admit(&f.conn(), &job.id).unwrap();
+    f.finish(&job.id, "succeeded");
+    assert_eq!(f.detail("out")["recipe_complete"], 1);
+    fs::remove_dir(Path::new(&f.root.path).join("out")).unwrap();
+    f.conn()
+        .execute("UPDATE artifacts SET state='deleted',rebuildable=1", [])
+        .unwrap();
+}
+fn await_rebuild(f: &Fixture, id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        super::super::rebuild::resume(&f.manager).unwrap();
+        let state: String = f
+            .conn()
+            .query_row(
+                "SELECT state FROM artifact_rebuilds WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let notified: bool = f
+            .conn()
+            .query_row(
+                "SELECT notified FROM artifact_rebuilds WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if matches!(state.as_str(), "succeeded" | "failed") && notified {
+            return state;
+        }
+        assert!(std::time::Instant::now() < deadline, "rebuild timed out");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+#[test]
+fn rebuild_replays_a_preserved_recipe_and_retains_records() {
+    let f = Fixture::new();
+    rebuild_fixture(
+        &f,
+        &format!("printf rebuilt > '{}/out/result'", f.root.path),
+    );
+    let before = f.detail("out");
+    let result =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    let id = result["rebuild_id"].as_str().unwrap();
+    assert!(f
+        .manager
+        .record(
+            &f.root,
+            &["out".into()],
+            &RecordFlags {
+                note: "Premature record".into(),
+                project: true,
+                ..Default::default()
+            },
+            "maker"
+        )
+        .is_err());
+    f.manager.scan(&f.root).unwrap();
+    assert_eq!(f.detail("out")["state"], "building");
+    assert_eq!(await_rebuild(&f, id), "succeeded");
+    super::super::rebuild::resume(&f.manager).unwrap();
+    let after = f.detail("out");
+    assert_eq!(after["state"], "live");
+    assert_eq!(after["consumers"], before["consumers"]);
+    assert_eq!(after["note"], before["note"]);
+    assert_eq!(after["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(Path::new(&f.root.path).join("out/result")).unwrap(),
+        "rebuilt"
+    );
+    assert_eq!(fs::read_dir(f.dir.join("worktrees")).unwrap().count(), 0);
+}
+#[test]
+fn rebuild_failure_keeps_diagnostics_and_blocks_deletion() {
+    let f = Fixture::new();
+    rebuild_fixture(&f, "exit 9");
+    let result =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    assert_eq!(
+        await_rebuild(&f, result["rebuild_id"].as_str().unwrap()),
+        "failed"
+    );
+    assert_eq!(f.detail("out")["state"], "building");
+    assert_eq!(f.detail("out")["needs_owner"], true);
+    assert!(f
+        .manager
+        .delete(&f.root, "out", "maker", "failed build")
+        .is_err());
+    assert!(fs::read_dir(f.dir.join("worktrees")).unwrap().count() > 0);
+}
+#[test]
+fn rebuild_refuses_live_artifacts_and_deleted_external_inputs() {
+    let f = Fixture::new();
+    rebuild_fixture(&f, "true");
+    let conn = f.conn();
+    conn.execute("UPDATE artifacts SET state='live'", [])
+        .unwrap();
+    assert!(super::super::rebuild::plan(&conn, &f.root, "out", "maker").is_err());
+    conn.execute("UPDATE artifacts SET state='deleted'", [])
+        .unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'lost','deleted','root','lost','queue','owner/repo',?2)",params![f.root.path,now()]).unwrap();
+    conn.execute("INSERT INTO artifact_inputs(root,name,input,source,job_id) SELECT root,name,'lost','declared',job_id FROM artifact_jobs",[]).unwrap();
+    assert!(super::super::rebuild::plan(&conn, &f.root, "out", "maker")
+        .unwrap_err()
+        .to_string()
+        .contains("input lost is deleted"));
+}
+
+#[test]
+fn failed_rebuild_can_retry_without_reusing_partial_output() {
+    let f = Fixture::new();
+    let permit = f.dir.join("permit");
+    rebuild_fixture(
+        &f,
+        &format!(
+            "printf attempt >> '{}/out/result'; test -f '{}'",
+            f.root.path,
+            permit.display()
+        ),
+    );
+    let first =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    assert_eq!(
+        await_rebuild(&f, first["rebuild_id"].as_str().unwrap()),
+        "failed"
+    );
+    fs::write(&permit, "allowed").unwrap();
+    let second =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    assert_eq!(
+        await_rebuild(&f, second["rebuild_id"].as_str().unwrap()),
+        "succeeded"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(&f.root.path).join("out/result")).unwrap(),
+        "attempt"
+    );
+    assert_eq!(f.detail("out")["needs_owner"], false);
+    assert!(Path::new(&f.root.path)
+        .join(format!(
+            ".sm-{}-out",
+            second["rebuild_id"].as_str().unwrap()
+        ))
+        .join("result")
+        .exists());
+}
+
+#[test]
+fn rebuild_replays_distinct_commits_in_order_without_failed_jobs() {
+    let f = Fixture::new();
+    f.init_git();
+    let mut request = f.request();
+    request.argv = None;
+    request.script = Some(format!("cat build.txt >> '{}/out/result'", f.root.path));
+    let submit = |f: &Fixture, request: CreateQueueJob| {
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let p = PreparedSubmission::prepare(&f.manager, &f.root, d, &request).unwrap();
+        RetainedQueueStore::create_queue_job_with_artifacts(
+            &f.state(),
+            request,
+            300,
+            None,
+            Some((&f.manager, &p)),
+        )
+        .unwrap()
+    };
+    let first = submit(&f, request.clone());
+    admit(&f.conn(), &first.id).unwrap();
+    fs::write(Path::new(&f.root.repo_checkout).join("build.txt"), "second").unwrap();
+    f.git(&["add", "build.txt"]);
+    f.git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "second commit",
+    ]);
+    let second = submit(&f, request);
+    f.finish(&first.id, "succeeded");
+    admit(&f.conn(), &second.id).unwrap();
+    f.finish(&second.id, "succeeded");
+    let conn = f.conn();
+    conn.execute("INSERT INTO artifact_jobs(root,name,job_id,seq,state) VALUES(?1,'out','failed-original',0,'failed')",[&f.root.path]).unwrap();
+    fs::remove_dir(Path::new(&f.root.path).join("out")).unwrap();
+    conn.execute("UPDATE artifacts SET state='deleted',rebuildable=1", [])
+        .unwrap();
+    let plan = super::super::rebuild::plan(&conn, &f.root, "out", "maker").unwrap();
+    assert_eq!(plan.steps.len(), 2);
+    assert_ne!(plan.steps[0].commit, plan.steps[1].commit);
+    let run =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    assert_eq!(
+        await_rebuild(&f, run["rebuild_id"].as_str().unwrap()),
+        "succeeded"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(&f.root.path).join("out/result")).unwrap(),
+        "inputsecond"
+    );
+    assert_eq!(f.detail("out")["jobs"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn rebuild_recovers_a_submitted_step_without_submitting_it_twice() {
+    let f = Fixture::new();
+    rebuild_fixture(&f, &format!("printf once >> '{}/out/result'", f.root.path));
+    let mut execution = rebuild_execution(&f);
+    execution.policy.max_running_jobs = 0;
+    let run = super::super::rebuild::start(&f.manager, &f.root, "out", "maker", execution.clone())
+        .unwrap();
+    let id = run["rebuild_id"].as_str().unwrap();
+    super::super::rebuild::resume(&f.manager).unwrap();
+    let conn = f.conn();
+    let first: String = conn
+        .query_row(
+            "SELECT job_id FROM artifact_rebuild_steps WHERE run_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let restored = ManagedArtifacts::new(&f.manager.config).unwrap();
+    super::super::rebuild::resume(&restored).unwrap();
+    let second: String = conn
+        .query_row(
+            "SELECT job_id FROM artifact_rebuild_steps WHERE run_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first, second);
+    execution.policy.max_running_jobs = 4;
+    conn.execute(
+        "UPDATE artifact_rebuilds SET execution_json=?2 WHERE id=?1",
+        params![id, serde_json::to_string(&execution).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(await_rebuild(&f, id), "succeeded");
+    assert_eq!(
+        fs::read_to_string(Path::new(&f.root.path).join("out/result")).unwrap(),
+        "once"
+    );
+}
+
+#[test]
+fn rebuild_waits_for_frozen_input_thaw() {
+    struct Thaw;
+    impl Operations for Thaw {
+        fn thaw(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, name: &str) -> Result<()> {
+            manager.store.open()?.execute(
+                "UPDATE artifacts SET state='live',location='root' WHERE root=?1 AND name=?2",
+                params![root.path, name],
+            )?;
+            Ok(())
+        }
+        fn pressure(&self, _: &ManagedArtifacts, _: &ArtifactRoot, _: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    rebuild_fixture(&f, "true");
+    fs::create_dir(Path::new(&f.root.path).join("input")).unwrap();
+    let conn = f.conn();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'input','frozen','root','input','hand','owner/repo',?2)",params![f.root.path,now()]).unwrap();
+    conn.execute("INSERT INTO artifact_inputs(root,name,input,source,job_id) SELECT root,name,'input','declared',job_id FROM artifact_jobs",[]).unwrap();
+    install_operations(&f.root.path, std::sync::Arc::new(Thaw));
+    let run =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    assert_eq!(
+        await_rebuild(&f, run["rebuild_id"].as_str().unwrap()),
+        "succeeded"
+    );
+    assert_eq!(f.detail("input")["state"], "live");
+    assert!(f.detail("input")["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "thaw_requested"));
+}
