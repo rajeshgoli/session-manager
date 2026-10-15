@@ -2045,6 +2045,20 @@ impl RetainedQueueStore {
                     Some(message_queue_db_path),
                 )?;
                 tx.commit()?;
+                let cancelled = get_queue_job_runtime_conn(&conn, job_id)?
+                    .context("cancelled queue job disappeared")?;
+                record_queue_job_completion_notification_conn(
+                    &conn,
+                    &cancelled,
+                    &cancelled.state,
+                    cancelled.exit_code,
+                    cancelled
+                        .finished_at
+                        .as_deref()
+                        .context("cancelled job finish time")?,
+                    Some(message_queue_db_path),
+                    None,
+                )?;
                 None
             }
         };
@@ -7640,6 +7654,12 @@ fn record_queue_job_completion_notification_conn(
     message_queue_db_path: Option<&Path>,
     admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<bool> {
+    // Commit the terminal queue state before artifact bookkeeping or external
+    // notifications. The durable notification-required flag retries a crash
+    // between that commit and completion.
+    if !conn.is_autocommit() {
+        return Ok(false);
+    }
     crate::managed_artifacts::queue::complete(conn, &job.id, message_queue_db_path)?;
     let Some(completion_notified_at) = queue_job_completion_notified_at(
         job,

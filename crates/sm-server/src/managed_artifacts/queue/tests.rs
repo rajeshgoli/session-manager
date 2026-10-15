@@ -525,3 +525,37 @@ fn completion_checks_short_build_overrun_once() {
     assert_eq!(count, 1);
     assert_eq!(f.detail("out")["state"], "live");
 }
+
+#[test]
+fn pending_artifact_cancellation_commits_and_releases_reservation() {
+    let f = Fixture::new();
+    let job = f.submit(f.declarations("out"));
+    let cancelled = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
+        &f.state(),
+        &f.messages(),
+        &job.id,
+        0,
+        crate::queue::QueueAdmissionPolicy::default(),
+        false,
+        Some(&json!({"cause":"owner_cancel"})),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(cancelled.state, "cancelled");
+    let conn = f.conn();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_job_reservations WHERE job_id=?1",
+            [&job.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(f.detail("out")["jobs"][0]["state"], "cancelled");
+    assert!(!Path::new(&f.root.path).join("out").exists());
+    let notices = RetainedQueueStore::new(f.messages())
+        .pending_messages_for_target_by_category("maker", "queue-completion", 10)
+        .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].text.contains("cancelled"));
+}
