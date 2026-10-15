@@ -79,7 +79,7 @@ impl GitState {
             Ok(Self {
                 commit_sha: Some(git_in(&cwd, &["rev-parse", "HEAD"])?),
                 cwd_rel: Some(cwd.strip_prefix(top)?.to_string_lossy().into_owned()),
-                dirty: !git_in(&cwd, &["status", "--porcelain", "--untracked-files=no"])?
+                dirty: !git_in(&cwd, &["status", "--porcelain", "--untracked-files=all"])?
                     .is_empty(),
             })
         };

@@ -841,3 +841,22 @@ fn deferred_record_request_goes_to_successful_producer() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn untracked_build_input_prevents_complete_recipe() {
+    let f = Fixture::new();
+    f.init_git();
+    let mut d = f.declarations("out");
+    d.record.as_mut().unwrap().recipe_complete = true;
+    let job = f.submit(d);
+    fs::write(
+        Path::new(&f.root.repo_checkout).join("untracked.conf"),
+        "build input",
+    )
+    .unwrap();
+    admit(&f.conn(), &job.id).unwrap();
+    f.finish(&job.id, "succeeded");
+    assert_eq!(f.detail("out")["jobs"][0]["dirty"], 1);
+    assert_eq!(f.detail("out")["recipe_complete"], 0);
+    assert!(f.git(&["ls-remote", "--tags", "origin"]).is_empty());
+}

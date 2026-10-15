@@ -8331,7 +8331,11 @@ async fn create_queue_job(
             .map(|(p, m)| (m, p)),
     )
     .map_err(|error| {
-        if prepared.is_some() {
+        if prepared.is_some()
+            && error.downcast_ref::<rusqlite::Error>().is_none()
+            && error.downcast_ref::<std::io::Error>().is_none()
+            && error.downcast_ref::<serde_json::Error>().is_none()
+        {
             ApiError::Status {
                 status: StatusCode::BAD_REQUEST,
                 detail: error.to_string(),
