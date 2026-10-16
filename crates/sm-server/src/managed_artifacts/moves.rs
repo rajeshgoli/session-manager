@@ -36,13 +36,19 @@ pub fn remove_finder_files(root: &Path) -> Result<()> {
         if !metadata.is_dir() {
             return Ok(());
         }
+        let saved = archive::root_metadata(path)?;
+        let mut removed = false;
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             if entry.file_name() == ".DS_Store" && !entry.file_type()?.is_dir() {
                 fs::remove_file(entry.path())?;
+                removed = true;
             } else if entry.file_type()?.is_dir() {
                 walk(&entry.path(), device)?;
             }
+        }
+        if removed {
+            archive::restore_metadata(path, &saved)?;
         }
         Ok(())
     }
@@ -172,7 +178,12 @@ mod tests {
         fs::write(source.join("._literal"), "ordinary data").unwrap();
         fs::write(source.join(".DS_Store"), "finder").unwrap();
         std::os::unix::fs::symlink("._literal", source.join("link")).unwrap();
+        let mut root_before = archive::root_metadata(&source).unwrap();
+        root_before.mtime = 123456789;
+        root_before.mtime_nsec = 123456789;
+        archive::restore_metadata(&source, &root_before).unwrap();
         remove_finder_files(&source).unwrap();
+        assert_eq!(archive::root_metadata(&source).unwrap(), root_before);
         let before = archive::inventory(&source).unwrap();
         let dest = f.path("dest");
         copy_verified(&source, &dest).unwrap();

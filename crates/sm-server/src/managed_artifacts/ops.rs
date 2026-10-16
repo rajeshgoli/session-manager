@@ -150,7 +150,8 @@ pub fn request(
                     .as_str()
                     .is_some_and(|s| s < now().as_str());
             ensure!(
-                a["state"] == "live" || (kind == "freezing" && actor == "sm" && expired),
+                a["state"] == "live"
+                    || (kind == "freezing" && matches!(actor, "sm" | "sm-nightly") && expired),
                 "{n} is not live"
             );
             ensure_not_in_use(&tx, &root.path, n)?;
@@ -166,6 +167,18 @@ pub fn request(
             if kind == "moving" {
                 ensure!(a["location"] == "root", "{n} is already on cold store");
             }
+        }
+        if kind == "freezing" && actor == "sm-nightly" && a["state"] == "live" {
+            ensure!(
+                !super::hotcold::is_hot(
+                    &tx,
+                    &root.path,
+                    n,
+                    manager.config.cold_after_days,
+                    OffsetDateTime::now_utc()
+                )?,
+                "{n} is no longer cold"
+            );
         }
         let m = Member {
             name: n.into(),
@@ -309,6 +322,19 @@ fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
                     "{} is kept live",
                     m.name
                 );
+                if op.actor == "sm-nightly" && current["state"] == "live" {
+                    ensure!(
+                        !super::hotcold::is_hot(
+                            &tx,
+                            &op.root.path,
+                            &m.name,
+                            manager.config.cold_after_days,
+                            OffsetDateTime::now_utc()
+                        )?,
+                        "{} is no longer cold",
+                        m.name
+                    );
+                }
                 let (_, staging, _) = paths(&op.root, m, &op.kind);
                 let manifest = archive::Manifest::read(&staging)?;
                 archive::verify_source(&source(&op.root, m)?, &manifest.entries)?;

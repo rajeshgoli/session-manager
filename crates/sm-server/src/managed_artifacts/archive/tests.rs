@@ -273,3 +273,44 @@ fn managed_artifacts_archive_root_metadata_round_trip() {
     extract(&archive, &f.path("dest"), &manifest, 2).unwrap();
     assert_eq!(root_metadata(&f.path("dest")).unwrap(), root);
 }
+
+#[test]
+#[ignore = "writes more than 2 GiB; run explicitly for archive acceptance"]
+fn managed_artifacts_archive_sparse_over_two_gib_round_trip() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+    fn digest(path: &Path) -> Vec<u8> {
+        let mut file = File::open(path).unwrap();
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        hash.finalize().to_vec()
+    }
+    let f = Fixture::new();
+    let source = f.path("source");
+    fs::create_dir(&source).unwrap();
+    let path = source.join("large");
+    let mut file = File::create(&path).unwrap();
+    let size = 2 * 1024 * 1024 * 1024 + 123u64;
+    file.set_len(size).unwrap();
+    file.write_all(b"begin").unwrap();
+    file.seek(SeekFrom::End(-3)).unwrap();
+    file.write_all(b"end").unwrap();
+    file.sync_all().unwrap();
+    let archive = f.path("archive");
+    let mut settings = config();
+    settings.freeze_level = 1;
+    settings.freeze_part_bytes = 1024 * 1024;
+    let manifest = pack(&source, &archive, "large", &settings).unwrap();
+    assert_eq!(manifest.parts.len(), 1);
+    let dest = f.path("dest");
+    extract(&archive, &dest, &manifest, 2).unwrap();
+    assert_eq!(fs::metadata(dest.join("large")).unwrap().len(), size);
+    assert_eq!(digest(&path), digest(&dest.join("large")));
+}

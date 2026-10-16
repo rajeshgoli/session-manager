@@ -4,6 +4,7 @@ pub mod archive;
 pub mod attribution;
 pub mod config;
 pub mod delete;
+pub mod hotcold;
 pub mod moves;
 pub mod ops;
 pub mod queue;
@@ -122,10 +123,21 @@ pub struct ManagedArtifacts {
 }
 impl ManagedArtifacts {
     pub fn new(config: &ManagedArtifactsConfig) -> Result<Self> {
-        Ok(Self {
+        let manager = Self {
             config: config.resolved()?,
             store: ArtifactStore::new(crate::sessions::expand_home(&config.db_path)),
-        })
+        };
+        let mut conn = manager.store.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for root in &manager.config.roots {
+            store::set_meta(
+                &tx,
+                &format!("cold_days:{}", root.path),
+                &manager.config.cold_after_days.to_string(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(manager)
     }
     pub fn create(
         &self,
