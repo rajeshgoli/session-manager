@@ -460,7 +460,11 @@ pub fn missed_alerts(manager: &ManagedArtifacts, at: i64) -> Result<()> {
 
 // Update display stamps only for scope roots that are still unchanged. Missing
 // or modified local data never invalidates a remote confirmation.
-fn mark_covered(conn: &Connection, manager: &ManagedArtifacts, request: &Value) -> Result<()> {
+pub(super) fn mark_covered(
+    conn: &Connection,
+    manager: &ManagedArtifacts,
+    request: &Value,
+) -> Result<()> {
     let covered: Vec<Value> =
         serde_json::from_str(request["coverage_json"].as_str().unwrap_or("[]"))?;
     for scope in covered {

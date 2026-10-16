@@ -20,6 +20,7 @@ const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 mod artifact;
 mod autopm;
+mod backup;
 mod board;
 mod bug;
 mod claims;
@@ -88,6 +89,7 @@ enum Command {
     Roster(EmptyArgs),
     Queue(QueueArgs),
     Artifact(artifact::ArtifactArgs),
+    Backup(backup::BackupArgs),
     Model(model::ModelArgs),
     #[command(name = "enroll-device")]
     EnrollDevice(EnrollDeviceArgs),
@@ -903,6 +905,7 @@ fn run() -> Result<()> {
     let command = match command {
         Command::EnrollDevice(args) => return run_enroll_device(args),
         Command::Device(args) => return device::run(args, cli.api_url),
+        Command::Backup(args) => return backup::run(args, cli.api_url),
         command => command,
     };
     let api_url = resolve_api_url(cli.api_url)?;
@@ -1396,7 +1399,9 @@ fn run() -> Result<()> {
             }
         }
         Command::Roster(_) => print_roster(&client)?,
-        Command::Device(_) => unreachable!("device is handled before generic API selection"),
+        Command::Device(_) | Command::Backup(_) => {
+            unreachable!("device is handled before generic API selection")
+        }
         Command::ListDevices(args) => run_list_devices(&client, args)?,
         Command::RemoveDevice(args) => run_remove_device(&client, args)?,
         Command::Wait(args) => wait_for_session(&client, &args.session_id, args.seconds)?,

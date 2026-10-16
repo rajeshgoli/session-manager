@@ -493,3 +493,334 @@ fn incremental_capacity_estimate_counts_only_changed_files() {
         (3, 30)
     );
 }
+
+#[test]
+fn client_round_trip_history_deletion_guard_and_lost_ack_replay() {
+    use super::client::Destination;
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::write(f.dir.join("projects/code"), b"source code").unwrap();
+    symlink("code", f.dir.join("projects/link")).unwrap();
+    let first = f.prepare("first", None);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("first", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    let applied = dest
+        .apply("first", &first.transfer, &staging, false, 0.1)
+        .unwrap();
+    assert_eq!(applied.files, 3);
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert_eq!(
+        dest.apply("first", &first.transfer, &staging, false, 0.1)
+            .unwrap()
+            .files,
+        3
+    );
+    dest.confirm("first").unwrap();
+    fs::write(f.dir.join("data/prices"), b"new prices").unwrap();
+    fs::remove_file(f.dir.join("projects/code")).unwrap();
+    let second = f.prepare("second", Some(&first.manifest));
+    let staging = dest
+        .unpack("second", &second.transfer, &second.parts, &second.directory)
+        .unwrap();
+    assert_eq!(
+        dest.apply("second", &second.transfer, &staging, false, 0.1)
+            .unwrap()
+            .held_deletions,
+        1
+    );
+    assert!(dest.root.join("packed/projects/code.zst").exists());
+    dest.restore(&f.dir.join("restored"), None, &[]).unwrap();
+    assert_eq!(
+        fs::read(f.dir.join("restored/data/prices")).unwrap(),
+        b"new prices"
+    );
+    assert_eq!(
+        fs::read(f.dir.join("restored/projects/code")).unwrap(),
+        b"source code"
+    );
+    assert_eq!(
+        fs::read_link(f.dir.join("restored/projects/link")).unwrap(),
+        PathBuf::from("code")
+    );
+    let third = f.prepare("third", Some(&second.manifest));
+    let staging = dest
+        .unpack("third", &third.transfer, &third.parts, &third.directory)
+        .unwrap();
+    assert_eq!(
+        dest.apply("third", &third.transfer, &staging, true, 0.1)
+            .unwrap()
+            .held_deletions,
+        0
+    );
+    assert!(!dest.root.join("packed/projects/code.zst").exists());
+    // Choose a time immediately before the replacement, ignoring initial creation.
+    dest.conn
+        .execute("UPDATE history SET held_at=100 WHERE run LIKE '%first'", [])
+        .unwrap();
+    dest.conn
+        .execute(
+            "UPDATE history SET held_at=300 WHERE run NOT LIKE '%first'",
+            [],
+        )
+        .unwrap();
+    dest.restore(&f.dir.join("historical"), Some(200), &[])
+        .unwrap();
+    assert_eq!(
+        fs::read(f.dir.join("historical/data/prices")).unwrap(),
+        b"prices"
+    );
+    assert_eq!(
+        fs::read(f.dir.join("historical/projects/code")).unwrap(),
+        b"source code"
+    );
+    dest.expire_history(31 * 86400 + 300).unwrap();
+    assert_eq!(
+        dest.conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE path LIKE 'plain/%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert!(
+        dest.conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE path LIKE 'packed/%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+            > 0
+    );
+    dest.expire_history(61 * 86400 + 300).unwrap();
+    assert_eq!(
+        dest.conn
+            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn client_detects_corruption_and_refuses_untracked_file_loss_and_symlink_escape() {
+    use super::client::Destination;
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let first = f.prepare("first", None);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    assert!(Destination::open(&dest.root).is_err());
+    let staging = dest
+        .unpack("first", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    fs::create_dir_all(dest.root.join("plain/data")).unwrap();
+    fs::write(dest.root.join("plain/data/prices"), b"untracked").unwrap();
+    assert!(dest
+        .apply("first", &first.transfer, &staging, false, 0.1)
+        .is_err());
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"untracked"
+    );
+    fs::remove_file(dest.root.join("plain/data/prices")).unwrap();
+    dest.apply("first", &first.transfer, &staging, false, 0.1)
+        .unwrap();
+    assert!(dest.check().unwrap().ok);
+    fs::write(dest.root.join("plain/data/prices"), b"broken").unwrap();
+    assert!(!dest.check().unwrap().ok);
+    fs::write(first.directory.join(&first.parts[0].file), b"bad part").unwrap();
+    assert!(dest
+        .unpack("corrupt", &first.transfer, &first.parts, &first.directory)
+        .is_err());
+    let other = Destination::open(&f.dir.join("other")).unwrap();
+    symlink(f.dir.join("data"), other.root.join("plain")).unwrap();
+    let second = f.prepare("second", None);
+    let mut other = other;
+    let stage = other
+        .unpack("second", &second.transfer, &second.parts, &second.directory)
+        .unwrap();
+    assert!(other
+        .apply("second", &second.transfer, &stage, false, 0.1)
+        .is_err());
+    assert_eq!(fs::read(f.dir.join("data/prices")).unwrap(), b"prices");
+}
+
+#[test]
+fn client_resumes_interrupted_download_and_recovers_a_lost_ack_response() {
+    use super::{
+        client::Destination,
+        lifecycle::RequestStatus,
+        pull::{self, Remote},
+    };
+    struct Fake {
+        status: RequestStatus,
+        bytes: Vec<u8>,
+        interrupt: bool,
+        lose_ack: bool,
+        acked: bool,
+        offsets: Vec<u64>,
+    }
+    impl Remote for Fake {
+        fn json(
+            &mut self,
+            method: &str,
+            path: &str,
+            _body: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            if method == "POST" && path.ends_with("/ack") {
+                self.acked = true;
+                if self.lose_ack {
+                    self.lose_ack = false;
+                    anyhow::bail!("lost acknowledgement response");
+                }
+                return Ok((200, serde_json::json!({"ok":true})));
+            }
+            let mut status = self.status.clone();
+            if self.acked {
+                status.state = "acked".into();
+            }
+            Ok((200, serde_json::to_value(status)?))
+        }
+        fn download(
+            &mut self,
+            _id: &str,
+            _part: &Part,
+            offset: u64,
+            writer: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            self.offsets.push(offset);
+            if self.interrupt {
+                self.interrupt = false;
+                writer.write_all(&self.bytes[..7])?;
+                anyhow::bail!("connection lost");
+            }
+            writer.write_all(&self.bytes[offset as usize..])?;
+            Ok(())
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let first = f.prepare("first", None);
+    let bytes = fs::read(first.directory.join(&first.parts[0].file)).unwrap();
+    let mut fake = Fake {
+        status: RequestStatus {
+            id: "first".into(),
+            state: "ready".into(),
+            retry_after_seconds: None,
+            estimate_bytes: 6,
+            manifest_id: Some("first".into()),
+            parts: first.parts,
+            manifest: Some(first.transfer),
+            deletions: vec![],
+            allow_deletes: false,
+            max_delete_fraction: 0.1,
+            error: None,
+        },
+        bytes,
+        interrupt: true,
+        lose_ack: true,
+        acked: false,
+        offsets: vec![],
+    };
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    assert!(pull::pull(&mut dest, &mut fake).is_err());
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert!(pull::pull(&mut dest, &mut fake).is_err());
+    assert_eq!(fake.offsets, vec![0, 7]);
+    assert!(fake.acked);
+    assert!(dest.state().unwrap().confirmed.is_none());
+    let history: i64 = dest
+        .conn
+        .query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
+        .unwrap();
+    assert!(pull::pull(&mut dest, &mut fake).unwrap().applied);
+    assert_eq!(dest.state().unwrap().confirmed.as_deref(), Some("first"));
+    assert!(dest.meta("pending_request").unwrap().is_none());
+    assert!(dest.meta("pending_ack").unwrap().is_none());
+    assert!(!dest.root.join(".downloads/first").exists());
+    assert!(!dest.root.join(".incoming/first").exists());
+    assert_eq!(
+        dest.conn
+            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        history
+    );
+}
+
+#[test]
+fn seed_adopts_plain_copy_confirms_full_scope_and_next_request_is_empty() {
+    use super::{client::Destination, lifecycle, seed};
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::create_dir(f.dir.join("existing-data")).unwrap();
+    fs::copy(
+        f.dir.join("data/prices"),
+        f.dir.join("existing-data/prices"),
+    )
+    .unwrap();
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let id = seed::seed(
+        &f.manager,
+        "backup-mini",
+        &mut dest,
+        Some(&f.dir.join("existing-data")),
+    )
+    .unwrap();
+    assert!(!f.dir.join("existing-data").exists());
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"prices"
+    );
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+            .unwrap()
+            .unwrap()
+            .manifest_id,
+        id
+    );
+    let lifecycle::RequestResult::Open(request) =
+        lifecycle::request(&f.manager, "backup-mini", Some(&id)).unwrap()
+    else {
+        panic!()
+    };
+    lifecycle::prepare_request(&f.manager, &request.id).unwrap();
+    let status = lifecycle::status(&f.manager, "backup-mini", &request.id).unwrap();
+    assert!(status.parts.is_empty());
+    assert!(status.manifest.unwrap().changed.is_empty());
+}
+
+#[test]
+fn seed_rejects_mismatched_adoption_without_moving_original() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::create_dir(f.dir.join("existing-data")).unwrap();
+    fs::write(f.dir.join("existing-data/prices"), b"old").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    assert!(super::seed::seed(
+        &f.manager,
+        "backup-mini",
+        &mut dest,
+        Some(&f.dir.join("existing-data"))
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(f.dir.join("existing-data/prices")).unwrap(),
+        b"old"
+    );
+    assert!(confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .is_none());
+}

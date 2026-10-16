@@ -219,7 +219,7 @@ fn helper_call_in_keychain(
     String::from_utf8(output.stdout).context("Keychain helper output was not UTF-8")
 }
 
-fn owner_assertion(url: &str) -> Result<String> {
+pub(super) fn owner_assertion(url: &str) -> Result<String> {
     let cached = ProcessCommand::new("cloudflared")
         .args(["access", "token", "--app", url])
         .output()
