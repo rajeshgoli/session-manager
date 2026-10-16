@@ -218,6 +218,10 @@ pub fn terminal_lan_router(state: Arc<AppState>) -> Router {
             state.clone(),
             local_agent::authenticate,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            backup::guard,
+        ))
         .with_state(state)
 }
 
@@ -357,6 +361,7 @@ mod artifacts;
 mod ask;
 mod auto_retire;
 mod autopm;
+mod backup;
 mod board;
 mod board_clock;
 mod board_launch;
@@ -2036,6 +2041,13 @@ pub fn router(state: AppState) -> Router {
             get(merge_holds::list).post(merge_holds::place),
         )
         .route("/merge-holds/release", post(merge_holds::release))
+        .route("/backup/requests", post(backup::request))
+        .route("/backup/requests/{id}", get(backup::status))
+        .route("/backup/requests/{id}/parts/{n}", get(backup::part))
+        .route("/backup/requests/{id}/ack", post(backup::ack))
+        .route("/backup/probe", post(backup::probe))
+        .route("/backup/status", get(backup::summary))
+        .route("/backup/allow-deletes", post(backup::allow_deletes))
         .route("/artifacts", get(artifacts::list).post(artifacts::create))
         .route("/artifacts/{name}", get(artifacts::show))
         .route("/artifacts/{name}/{action}", post(artifacts::action))
@@ -2404,6 +2416,10 @@ pub fn router(state: AppState) -> Router {
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         local_agent::authenticate,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        backup::guard,
     ))
     .with_state(state)
 }
@@ -21956,6 +21972,7 @@ mod tests {
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
         vec![
+            (Method::POST, "/backup/allow-deletes", json!({})),
             (Method::POST, "/client/model/load", json!({"key":"fixture"})),
             (Method::POST, "/client/model/unload", json!({})),
             (

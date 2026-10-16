@@ -178,6 +178,16 @@ pub fn prepare(
     base: Option<&Manifest>,
     id: &str,
 ) -> Result<Prepared> {
+    prepare_with_progress(manager, scopes, base, id, |_| Ok(()))
+}
+
+pub(super) fn prepare_with_progress(
+    manager: &ManagedArtifacts,
+    scopes: &[Scope],
+    base: Option<&Manifest>,
+    id: &str,
+    mut progress: impl FnMut(u64) -> Result<()>,
+) -> Result<Prepared> {
     safe_relative(id)?;
     ensure!(!id.contains('/'), "outbox id must be a single segment");
     scope::validate_scopes(scopes)?;
@@ -194,7 +204,8 @@ pub fn prepare(
             && fs::metadata(&r.cold_store).is_ok_and(|m| m.dev() == parent_meta.dev())),
         "outbox is not on a mounted cold store"
     );
-    let estimate: u128 = scopes.iter().map(|s| u128::from(s.estimated_bytes)).sum();
+    let (_, estimate) = pending_input(scopes, base)?;
+    let estimate = u128::from(estimate);
     let disk = nix::sys::statvfs::statvfs(parent)?;
     let free = u128::from(disk.blocks_available()) * u128::from(disk.fragment_size());
     let floor = u128::from(disk.blocks())
@@ -314,6 +325,7 @@ pub fn prepare(
                 manifest.files.insert(path, record.clone());
                 changed.push(record);
             }
+            progress(entry.size)?;
             if spool.exists() {
                 fs::remove_file(spool)?;
             }
@@ -351,4 +363,52 @@ pub fn prepare(
         deferred,
         directory,
     })
+}
+
+/// Count only changed regular files; full-scope estimates must not reserve a
+/// second complete backup for an incremental request.
+pub(super) fn pending_input(scopes: &[Scope], base: Option<&Manifest>) -> Result<(u64, u64)> {
+    let mut input = 0u64;
+    let mut estimate = 0u64;
+    for scope in scopes {
+        let entries = archive::inventory(&scope.source)?;
+        let mut total = 0u64;
+        let mut changed = 0u64;
+        for entry in entries {
+            if entry.kind != "file" || entry.path.split('/').any(|p| p.starts_with("._")) {
+                continue;
+            }
+            total = total
+                .checked_add(entry.size)
+                .context("backup size overflow")?;
+            let path = format!(
+                "{}/{}{}",
+                scope.prefix(),
+                entry.path,
+                if scope.plain { "" } else { ".zst" }
+            );
+            let unchanged = base.and_then(|m| m.files.get(&path)).is_some_and(|old| {
+                old.target.is_none()
+                    && old.size == entry.size
+                    && old.mode == entry.mode
+                    && old.mtime_ns
+                        == i128::from(entry.mtime) * 1_000_000_000 + i128::from(entry.mtime_nsec)
+            });
+            if !unchanged {
+                changed = changed
+                    .checked_add(entry.size)
+                    .context("backup size overflow")?;
+            }
+        }
+        input = input.checked_add(changed).context("backup size overflow")?;
+        let packed = if total == 0 {
+            0
+        } else {
+            (u128::from(changed) * u128::from(scope.estimated_bytes)).div_ceil(u128::from(total))
+        };
+        estimate = estimate
+            .checked_add(u64::try_from(packed)?)
+            .context("backup estimate overflow")?;
+    }
+    Ok((input, estimate))
 }

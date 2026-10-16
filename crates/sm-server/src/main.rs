@@ -73,6 +73,11 @@ struct Args {
     /// it after the service has been stopped.
     #[arg(long)]
     check_config: bool,
+    /// Internal application-owned backup preparation worker.
+    #[arg(long, requires = "backup_db", hide = true)]
+    backup_prepare: Option<String>,
+    #[arg(long, requires = "backup_prepare", hide = true)]
+    backup_db: Option<PathBuf>,
     /// Wait for the serving slot to pass its listeners before startup writes.
     #[arg(long)]
     take_over: bool,
@@ -84,6 +89,12 @@ async fn main() -> Result<()> {
     // enables more than one crypto backend, so choose one before either runs.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
+    if let Some(id) = args.backup_prepare {
+        return sm_server::managed_artifacts::backup::lifecycle::run_worker(
+            args.backup_db.unwrap(),
+            &id,
+        );
+    }
     if let Some(path) = args.local_wall_owner {
         #[cfg(target_os = "macos")]
         {
@@ -314,6 +325,9 @@ async fn main() -> Result<()> {
                     break;
                 }
                 run_background_pass("managed artifacts", || {
+                    if let Err(error) = artifact_state.backup_pass() {
+                        eprintln!("backup pass failed: {error:#}");
+                    }
                     if let Err(error) = artifact_state.managed_artifacts_pass() {
                         eprintln!("managed artifacts pass failed: {error:#}");
                     }

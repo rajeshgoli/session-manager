@@ -93,3 +93,18 @@ CREATE TABLE IF NOT EXISTS backup_rate_samples (
  kind TEXT NOT NULL CHECK(kind IN ('fetch','apply','probe')),
  bytes INTEGER NOT NULL CHECK(bytes>0), seconds REAL NOT NULL CHECK(seconds>0));
 CREATE INDEX IF NOT EXISTS backup_rate_window ON backup_rate_samples(device,kind,id);
+
+CREATE TABLE IF NOT EXISTS backup_requests (
+ id TEXT PRIMARY KEY, device TEXT NOT NULL, state TEXT NOT NULL,
+ base TEXT, created_at INTEGER NOT NULL, ready_at INTEGER, acked_at INTEGER,
+ config_json TEXT NOT NULL, outbox TEXT NOT NULL, queue_job_id TEXT,
+ manifest_id TEXT, parts_json TEXT, transfer_json TEXT, ack_json TEXT, coverage_json TEXT,
+ estimate_bytes INTEGER NOT NULL DEFAULT 0, remaining_input INTEGER NOT NULL DEFAULT 0, packed_input_bytes INTEGER,
+ packing_seconds REAL, packing_rate REAL NOT NULL DEFAULT 1000000000,
+ max_delete_fraction REAL NOT NULL DEFAULT 0.1, allow_deletes INTEGER NOT NULL DEFAULT 0,
+ error TEXT, cleaned INTEGER NOT NULL DEFAULT 0);
+CREATE UNIQUE INDEX IF NOT EXISTS backup_open_device ON backup_requests(device)
+ WHERE state IN ('preparing','ready');
+CREATE TABLE IF NOT EXISTS backup_alerts (
+ key TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL,
+ blocking INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);

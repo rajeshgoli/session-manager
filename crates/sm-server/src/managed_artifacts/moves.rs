@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(test)]
-thread_local! { pub(super) static TEST_MOUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { pub(crate) static TEST_MOUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 pub fn cold_mounted(root: &ArtifactRoot) -> bool {
     #[cfg(test)]

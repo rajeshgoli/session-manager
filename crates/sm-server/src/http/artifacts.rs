@@ -65,7 +65,7 @@ pub(super) async fn list(
         .iter()
         .filter_map(|a| a.get("needs_you").filter(|n| !n.is_null()).cloned())
         .collect();
-    Ok(Json(json!({"needs_you_count":needs_you.len(),"needs_you":needs_you,"artifacts":artifacts,"filesystems":filesystems(svc,root),"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
+    Ok(Json(json!({"backup":ma::backup::lifecycle::owner_summary(svc)?,"needs_you_count":needs_you.len(),"needs_you":needs_you,"artifacts":artifacts,"filesystems":filesystems(svc,root),"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
 }
 pub(super) async fn show(
     State(state): State<Arc<AppState>>,

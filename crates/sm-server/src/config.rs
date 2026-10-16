@@ -420,6 +420,21 @@ impl AppConfig {
             Path::new("artifact-mirrors"),
             &expand_home_for_path_match(&defaults.mirror_dir),
         )?;
+        if self.managed_artifacts.backup.enabled {
+            for path in self
+                .managed_artifacts
+                .backup
+                .static_paths
+                .iter()
+                .chain(std::iter::once(&self.managed_artifacts.backup.outbox))
+            {
+                if path_is_under_home(path)?
+                    || expand_home_for_path_match(path).starts_with("/Volumes")
+                {
+                    anyhow::bail!("test isolation refuses production backup path {}", path);
+                }
+            }
+        }
         for (index, root) in self.managed_artifacts.roots.iter_mut().enumerate() {
             root.path = isolate_path_from_protected_root(
                 &root.path,
