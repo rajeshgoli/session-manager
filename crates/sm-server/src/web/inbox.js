@@ -145,7 +145,7 @@ export function InboxPage({ openRef }) {
   </div>`;
 }
 
-export function Thread({ id, workKey, controls, agent, embedded = false }) {
+export function Thread({ id, workKey, controls, agent, embedded = false, empty = null }) {
   const endpoint = workKey ? `/inbox/thread/${encodeURIComponent(workKey)}` : `/inbox/agent/${encodeURIComponent(id)}`;
   const [data, error, reload] = usePoll(() => api(`${endpoint}?format=json`), 30000, [endpoint]);
   const [body, setBody] = useState('');
@@ -217,6 +217,8 @@ export function Thread({ id, workKey, controls, agent, embedded = false }) {
     } catch (e) { setFailure(e.message); }
     finally { setBusy(false); }
   };
+  // An agent that has sent nothing yet has no thread; the host shows what it offers instead.
+  if (empty && error?.status === 404 && !data) return empty;
   return html`<section class=${`thread-reader${embedded ? ' embedded' : ''}`}>
     ${embedded ? null : html`<div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>`}
     ${agent ? html`<div class="thread-links"><${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}

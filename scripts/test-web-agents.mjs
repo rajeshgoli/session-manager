@@ -330,6 +330,7 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
         sent.push(JSON.parse(request.postData()));
         return route.fulfill({ json: {} });
       }
+      if (url.pathname === '/inbox/agent/sm-1776') return route.fulfill({ status: 404, json: { detail: 'Thread not found' } });
       if (url.pathname === '/inbox/agent/sm-1726-engineer') {
         return route.fulfill({ json: { thread_key: 'ticket:rajeshgoli/session-manager#1726', title: 'sm-1726-engineer', status: 'idle', can_send: true,
           reply_options: [{ id: 'sm-1726-engineer', name: 'sm-1726-engineer', status: 'live', can_send: true }, { id: 'sm-1726-helper', name: 'sm-1726-helper', status: 'live', can_send: true }], items: [
@@ -361,6 +362,10 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
     // A terminal permission prompt is not an Inbox question: Details opens on Work.
     await page.goto('http://localhost/?open=agent:sm-1776');
     await page.locator('.details-band .tabs button.on', { hasText: 'Work' }).waitFor();
+    // An agent with no thread yet keeps the plain message box on its Inbox tab.
+    await page.locator('.details-band .tabs button', { hasText: 'Inbox' }).click();
+    await page.locator('.details-band', { hasText: 'No messages yet.' }).waitFor();
+    assert.equal(await page.locator('.details-band .msgbox').count(), 1);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

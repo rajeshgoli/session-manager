@@ -597,7 +597,8 @@ export function AgentPanel({ id, controls }) {
           class=${tab === key ? 'on' : ''} onClick=${() => setPicked(key)}>${label}</button>`,
       )}
     </div>
-    ${tab === 'inbox' ? html`<${Thread} key=${agent.id} id=${agent.id} embedded />` : html`<div class="pbody">
+    ${tab === 'inbox' ? html`<${Thread} key=${agent.id} id=${agent.id} embedded
+      empty=${html`<div class="pbody"><p class="muted">No messages yet.</p></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />` : html`<div class="pbody">
       ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload}
         onReply=${() => setPicked('inbox')} />` : null}
       ${tab === 'activity' ? html`<${ActivityTab} id=${agent.id} />` : null}
