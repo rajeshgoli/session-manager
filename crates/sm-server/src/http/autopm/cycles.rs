@@ -133,6 +133,9 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
         once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
         return Ok(true);
     }
+    if session.is_stopped() {
+        return Ok(false);
+    }
     let Some(session) = super::super::auto_retire::ready_for_message(state, session) else {
         return Ok(false);
     };
