@@ -10,7 +10,13 @@ use submission::{attach_store, PreparedSubmission};
 /// the durable request pending; admission never assumes it freed space.
 pub trait Operations: Send + Sync {
     fn thaw(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, name: &str) -> Result<()>;
-    fn pressure(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, needed: u64) -> Result<()>;
+    /// Absolute target for free bytes minus current outstanding reservations.
+    fn pressure(
+        &self,
+        manager: &ManagedArtifacts,
+        root: &ArtifactRoot,
+        available_target: u64,
+    ) -> Result<()>;
 }
 fn operations(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<dyn Operations>>> {
@@ -434,12 +440,8 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
                     params![id, now()],
                 )?;
                 if let Some(worker) = worker(&p.root.path) {
-                    let required = floor
-                        .saturating_add(outstanding(conn, &manager, device)?)
-                        .saturating_add(disk);
-                    if let Err(error) =
-                        worker.pressure(&manager, &p.root, required.saturating_sub(free))
-                    {
+                    let available_target = floor.saturating_add(disk);
+                    if let Err(error) = worker.pressure(&manager, &p.root, available_target) {
                         eprintln!("artifact pressure pass deferred for {id}: {error:#}");
                     }
                     let (free, floor, device) = fs_stats(path, manager.config.floor_percent)?;

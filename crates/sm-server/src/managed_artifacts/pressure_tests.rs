@@ -705,3 +705,25 @@ fn disappeared_device_notices_are_resolved_and_never_republished() {
     .unwrap();
     assert_eq!(sent, 0);
 }
+
+#[test]
+fn admission_target_does_not_grow_when_space_was_freed_before_the_pass() {
+    let mut f = Fixture::new();
+    f.live("a", 4096);
+    f.manager.config.deletion_mode = "enforcing".into();
+    // Admission wanted 300 available bytes; another pass has already freed 500.
+    f.disks(500, 10000);
+    pass(&f.manager, &f.root.path, 300).unwrap();
+    let a = artifact(&f.conn(), &f.root.path, "a").unwrap();
+    assert_eq!(a["state"], "live");
+    assert_eq!(a["location"], "root");
+    let count: i64 = f
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_events WHERE kind='pressure_action'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}

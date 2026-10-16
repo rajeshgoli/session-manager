@@ -57,7 +57,7 @@ fn waiting(conn: &Connection, manager: &ManagedArtifacts, device: u64) -> Result
     Ok(largest)
 }
 
-pub fn pass(manager: &ManagedArtifacts, path: &str, needed: u64) -> Result<()> {
+pub fn pass(manager: &ManagedArtifacts, path: &str, available_target: u64) -> Result<()> {
     let (_, _, device) = queue::fs_stats(path, manager.config.floor_percent)?;
     let lock = OpenOptions::new()
         .create(true)
@@ -75,7 +75,6 @@ pub fn pass(manager: &ManagedArtifacts, path: &str, needed: u64) -> Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let (initial, _, _) = queue::fs_stats(path, manager.config.floor_percent)?;
     let conn = manager.store.open()?;
     for root in &manager.config.roots {
         let stale = store::meta(&conn, &format!("evaluated:{}", root.path))?
@@ -97,11 +96,7 @@ pub fn pass(manager: &ManagedArtifacts, path: &str, needed: u64) -> Result<()> {
         let (free, floor, _) = queue::fs_stats(path, manager.config.floor_percent)?;
         let outstanding = queue::outstanding(&conn, manager, device)?;
         let goal =
-            target(enough_target, floor, waiting(&conn, manager, device)?).max(if needed > 0 {
-                initial.saturating_add(needed).saturating_sub(outstanding)
-            } else {
-                0
-            });
+            target(enough_target, floor, waiting(&conn, manager, device)?).max(available_target);
         if satisfied(free, outstanding, goal, simulated) {
             store::set_meta(&conn, &format!("pressure_pending:{device}"), "null")?;
             return Ok(());
@@ -270,9 +265,9 @@ pub fn periodic(manager: &ManagedArtifacts) -> Result<()> {
     }
     Ok(())
 }
-pub fn kick(manager: ManagedArtifacts, root: ArtifactRoot, needed: u64) {
+pub fn kick(manager: ManagedArtifacts, root: ArtifactRoot, available_target: u64) {
     std::thread::spawn(move || {
-        if let Err(error) = pass(&manager, &root.path, needed) {
+        if let Err(error) = pass(&manager, &root.path, available_target) {
             eprintln!("artifact pressure deferred: {error:#}");
         }
     });

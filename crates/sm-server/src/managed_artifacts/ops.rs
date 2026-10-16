@@ -675,8 +675,13 @@ impl queue::Operations for QueueOperations {
         kick(manager.clone());
         Ok(())
     }
-    fn pressure(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, needed: u64) -> Result<()> {
-        super::pressure::kick(manager.clone(), root.clone(), needed);
+    fn pressure(
+        &self,
+        manager: &ManagedArtifacts,
+        root: &ArtifactRoot,
+        available_target: u64,
+    ) -> Result<()> {
+        super::pressure::kick(manager.clone(), root.clone(), available_target);
         Ok(())
     }
 }
