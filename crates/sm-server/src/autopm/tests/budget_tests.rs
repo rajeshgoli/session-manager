@@ -564,3 +564,14 @@ fn a_window_turning_over_while_auto_pm_is_off_still_moves_open_reservations() {
     assert!(holds.iter().any(|r| r.number == 3005), "{holds:?}");
     assert_eq!(holds.len(), 3, "the ticket, then pm and reviews on enable");
 }
+
+#[test]
+fn an_empty_budget_reads_zero_not_negative_zero() {
+    let f = Fixture::new("negative-zero");
+    let mut off = f.settings.clone();
+    off.enabled = false;
+    f.window("codex", W0, 90.0, T0);
+    budget::sync_windows(&f.store, &off, T0).unwrap();
+    let status = budget::status(&f.store, &off, T0).unwrap();
+    assert_eq!(status["providers"]["codex"]["reserved"].to_string(), "0.0");
+}
