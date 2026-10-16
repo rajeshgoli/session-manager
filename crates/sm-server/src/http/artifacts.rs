@@ -61,7 +61,11 @@ pub(super) async fn list(
         }
         artifacts.push(value);
     }
-    Ok(Json(json!({"artifacts":artifacts,"filesystems":filesystems(svc,root),"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
+    let needs_you: Vec<_> = artifacts
+        .iter()
+        .filter_map(|a| a.get("needs_you").filter(|n| !n.is_null()).cloned())
+        .collect();
+    Ok(Json(json!({"needs_you_count":needs_you.len(),"needs_you":needs_you,"artifacts":artifacts,"filesystems":filesystems(svc,root),"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
 }
 pub(super) async fn show(
     State(state): State<Arc<AppState>>,
@@ -285,8 +289,8 @@ impl AppState {
                 let result = messages::owner_message_store(self).create_once(
                     crate::owner_messages::NewOwnerMessage {
                         human: self.config.owner_name.clone(),
-                        sender_session_id: "sm".into(),
-                        sender_session_name: "Session Manager".into(),
+                        sender_session_id: "sm-artifacts".into(),
+                        sender_session_name: "sm artifacts".into(),
                         title: "Artifact cold store is disconnected".into(),
                         body_markdown: body.into(),
                         blocking: false,
@@ -459,6 +463,40 @@ impl AppState {
                 ma::hotcold::nightly(svc, root, &claims::GhCliWorkItemSource)?;
             }
         }
+        ma::pressure::periodic(svc)?;
+        ma::pressure::resolve_notices(svc, |prefix| {
+            let inbox = messages::owner_message_store(self);
+            for (suffix, _) in inbox.open_keyed("sm-artifacts", prefix)? {
+                inbox.mark_handled_by_delivery_key(&format!("{prefix}{suffix}"))?;
+            }
+            Ok(())
+        })?;
+        ma::pressure::notify(svc, time::OffsetDateTime::now_utc(), |key, body| {
+            let inbox = messages::owner_message_store(self);
+            let prefix = format!("{}:", key.rsplit_once(':').map(|(p, _)| p).unwrap_or(key));
+            for (suffix, _) in inbox.open_keyed("sm-artifacts", &prefix)? {
+                if format!("{prefix}{suffix}") != key {
+                    inbox.mark_handled_by_delivery_key(&format!("{prefix}{suffix}"))?;
+                }
+            }
+            let result = inbox.create_once(
+                crate::owner_messages::NewOwnerMessage {
+                    human: self.config.owner_name.clone(),
+                    sender_session_id: "sm-artifacts".into(),
+                    sender_session_name: "sm artifacts".into(),
+                    title: "Artifacts need disk space".into(),
+                    body_markdown: body.into(),
+                    blocking: true,
+                },
+                Some(key),
+            )?;
+            if let crate::owner_messages::CreateOwnerMessage::Created(message) = result {
+                follows::notice_new_message(self, &message);
+                Ok(())
+            } else {
+                anyhow::bail!("owner message unread cap reached")
+            }
+        })?;
         self.session_store
             .drain_runtime_pending_message_targets_by_category("artifact")?;
         Ok(())

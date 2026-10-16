@@ -589,3 +589,94 @@ async fn queue_submission_survives_a_failed_post_commit_thaw_notice() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn managed_artifacts_needs_you_badge_counts_current_items() {
+    let f = Fixture::new();
+    for name in ["orphan", "second"] {
+        fs::create_dir(f.dir.join("root").join(name)).unwrap();
+    }
+    f.state.managed_artifacts_pass().unwrap();
+    let (status, list) = f.request("GET", "/artifacts", None, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["needs_you_count"], 2);
+    assert_eq!(list["needs_you"].as_array().unwrap().len(), 2);
+    f.request(
+        "POST",
+        "/artifacts/orphan/record",
+        Some("maker"),
+        json!({"note":"recorded","consumers":["#1"]}),
+    )
+    .await;
+    let (_, list) = f.request("GET", "/artifacts", None, json!({})).await;
+    assert_eq!(list["needs_you_count"], 1);
+    assert_eq!(list["needs_you"][0]["name"], "second");
+    assert_eq!(list["mode"], "report_only");
+}
+
+#[tokio::test]
+async fn managed_artifacts_system_messages_refuse_replies() {
+    use sm_server::owner_messages::{CreateOwnerMessage, NewOwnerMessage, OwnerMessageStore};
+    let f = Fixture::new();
+    let result = OwnerMessageStore::new(f.dir.join("queue.db"))
+        .create(NewOwnerMessage {
+            human: f.state.config().owner_name.clone(),
+            sender_session_id: "sm-artifacts".into(),
+            sender_session_name: "sm artifacts".into(),
+            title: "Disk space".into(),
+            body_markdown: "Use the artifact list".into(),
+            blocking: true,
+        })
+        .unwrap();
+    let CreateOwnerMessage::Created(message) = result else {
+        panic!("message not created")
+    };
+    let (status, body) = f
+        .request(
+            "POST",
+            &format!("/messages/{}/reply", message.id),
+            None,
+            json!({"submission_id":"reply-artifacts","body":"test"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("use the artifact list"));
+    let (_, body) = f
+        .request(
+            "GET",
+            &format!("/messages/{}?format=json", message.id),
+            None,
+            json!({}),
+        )
+        .await;
+    assert!(body["reply_to_session_id"].is_null());
+    assert_eq!(body["state"], "needs_you");
+}
+
+#[tokio::test]
+async fn managed_artifacts_recovered_pressure_closes_blocking_message() {
+    use sm_server::managed_artifacts::store;
+    use sm_server::owner_messages::{NewOwnerMessage, OwnerMessageStore};
+    let f = Fixture::new();
+    let inbox = OwnerMessageStore::new(f.dir.join("queue.db"));
+    let key = "pressure_pending:123:100";
+    inbox
+        .create_once(
+            NewOwnerMessage {
+                human: f.state.config().owner_name.clone(),
+                sender_session_id: "sm-artifacts".into(),
+                sender_session_name: "sm artifacts".into(),
+                title: "Disk space".into(),
+                body_markdown: "Space needed".into(),
+                blocking: true,
+            },
+            Some(key),
+        )
+        .unwrap();
+    assert!(inbox.is_open_by_delivery_key(key).unwrap());
+    store::set_meta(&f.store().open().unwrap(), "pressure_pending:123", "null").unwrap();
+    f.state.managed_artifacts_pass().unwrap();
+    assert!(!inbox.is_open_by_delivery_key(key).unwrap());
+    f.state.managed_artifacts_pass().unwrap();
+    assert!(!inbox.is_open_by_delivery_key(key).unwrap());
+}

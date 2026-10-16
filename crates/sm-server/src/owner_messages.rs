@@ -99,7 +99,7 @@ impl OwnerMessageState {
 }
 
 /// First match wins: replied, handled, needs you (blocking and the sender
-/// has not ended), read, new.
+/// has not ended, or is the persistent artifact service), read, new.
 pub fn derive_message_state(
     message: &OwnerMessage,
     replied: bool,
@@ -109,7 +109,7 @@ pub fn derive_message_state(
         OwnerMessageState::Replied
     } else if message.handled_at.is_some() {
         OwnerMessageState::Handled
-    } else if message.blocking && !sender_ended {
+    } else if message.blocking && (!sender_ended || message.sender_session_id == "sm-artifacts") {
         OwnerMessageState::NeedsYou
     } else if message.first_viewed_at.is_some() {
         OwnerMessageState::Read

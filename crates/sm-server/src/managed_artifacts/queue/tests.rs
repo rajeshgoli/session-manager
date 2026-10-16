@@ -1180,3 +1180,29 @@ fn rebuild_waits_for_frozen_input_thaw() {
         .iter()
         .any(|e| e["kind"] == "thaw_requested"));
 }
+
+#[test]
+fn disk_hold_is_cleared_when_readmission_waits_for_a_writer() {
+    let f = Fixture::new();
+    let first = f.submit(f.declarations("out"));
+    let second = f.submit(f.declarations("out"));
+    let conn = f.conn();
+    assert_eq!(admit(&conn, &first.id).unwrap(), None);
+    conn.execute(
+        "INSERT INTO artifact_disk_holds VALUES(?1,?2,'root','old disk hold')",
+        params![second.id, f.root.path],
+    )
+    .unwrap();
+    assert_eq!(
+        admit(&conn, &second.id).unwrap().as_deref(),
+        Some("artifact_writer")
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_disk_holds WHERE job_id=?1",
+            [&second.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}

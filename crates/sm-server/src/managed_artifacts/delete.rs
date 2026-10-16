@@ -6,7 +6,7 @@ use std::{
 };
 
 #[cfg(test)]
-thread_local! { static BEFORE_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub(super) static BEFORE_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 
 pub fn target(parent: &Path, name: &str) -> Result<PathBuf> {
     validate_name(name)?;
@@ -63,6 +63,9 @@ impl ManagedArtifacts {
     pub fn delete_orphan(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
         self.delete_inner(root, name, "sm", "orphan", true, false)
     }
+    pub fn delete_pressure(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
+        self.delete_inner(root, name, "sm", "pressure", true, false)
+    }
     pub fn recover_deletions(&self, root: &ArtifactRoot) -> Result<()> {
         for a in self.store.list(&root.path)? {
             if a["op"] == "deleting" {
@@ -102,9 +105,13 @@ impl ManagedArtifacts {
             "SELECT * FROM artifacts WHERE root=?1 AND set_id=?2",
             &[&root.path, &a["set_id"].as_str().unwrap_or(name)],
         )?;
+        let pressure = reason == "pressure" && actor == "sm";
+        if pressure {
+            score::deletion_eligible(&tx, &root.path, &members)?;
+        }
         for member in &members {
             let n = member["name"].as_str().unwrap();
-            if automatic {
+            if automatic && !pressure {
                 let created =
                     OffsetDateTime::parse(member["created_at"].as_str().unwrap_or(""), &Rfc3339)?;
                 if member["state"] != "building"
@@ -128,7 +135,7 @@ impl ManagedArtifacts {
                 bail!("{n} is kept for the project; remove the mark first");
             }
             ensure_not_in_use(&tx, &root.path, n)?;
-            let dependents=store::query(&tx,"SELECT DISTINCT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted'",&[&root.path,&n])?;
+            let dependents=store::query(&tx,"SELECT DISTINCT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
             if !dependents.is_empty() {
                 bail!("{n} is an input of {}", json!(dependents));
             }
@@ -140,15 +147,14 @@ impl ManagedArtifacts {
         if automatic && self.config.deletion_mode == "report_only" {
             for member in &members {
                 let n = member["name"].as_str().unwrap();
-                let exists:i64=tx.query_row("SELECT COUNT(*) FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE AND kind='would_delete'",params![root.path,n],|r|r.get(0))?;
-                if exists == 0 {
+                if !needs_you::warning_current(&tx, &root.path, n)? {
                     event(
                         &tx,
                         &root.path,
                         n,
                         "would_delete",
                         "sm",
-                        json!({"reason":"orphan"}),
+                        json!({"reason":reason}),
                     )?;
                 }
             }
@@ -157,7 +163,7 @@ impl ManagedArtifacts {
             return Ok(result);
         }
         for member in &members {
-            tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if automatic {"orphan"} else {"agent"},recovering])?;
+            tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if pressure {"pressure"} else if automatic {"orphan"} else {"agent"},recovering])?;
         }
         tx.commit()?;
         #[cfg(test)]
@@ -174,7 +180,11 @@ impl ManagedArtifacts {
             "SELECT * FROM artifacts WHERE root=?1 AND set_id=?2",
             &[&root.path, &a["set_id"].as_str().unwrap_or(name)],
         )?;
+        let mut removal_started = false;
         let result = (|| {
+            if pressure {
+                score::deletion_eligible(&tx, &root.path, &members)?;
+            }
             for member in &members {
                 let n = member["name"].as_str().unwrap();
                 if member["op"] != "deleting" || member["state"] == "deleted" {
@@ -184,7 +194,7 @@ impl ManagedArtifacts {
                     bail!("{n} is kept for the project; remove the mark first");
                 }
                 ensure_not_in_use(&tx, &root.path, n)?;
-                let dependents = store::query(&tx,"SELECT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted'",&[&root.path,&n])?;
+                let dependents = store::query(&tx,"SELECT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
                 if !dependents.is_empty() {
                     bail!("{n} is an input of {}", json!(dependents));
                 }
@@ -221,12 +231,20 @@ impl ManagedArtifacts {
                     }
                 }
                 for path in paths {
+                    removal_started = true;
                     remove_entry(&path)?;
                 }
             }
             Ok::<_, anyhow::Error>(())
         })();
         if let Err(error) = result {
+            if pressure && !removal_started {
+                // A rejected pre-removal check cancels the intent. Only a
+                // partially executed deletion belongs to crash recovery.
+                for member in &members {
+                    tx.execute("UPDATE artifacts SET op=NULL,deleted_by=NULL,delete_reason=NULL WHERE root=?1 AND name=?2 AND op='deleting'",params![root.path,member["name"].as_str().unwrap()])?;
+                }
+            }
             for member in &members {
                 event(
                     &tx,

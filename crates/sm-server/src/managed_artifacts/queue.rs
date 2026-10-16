@@ -10,7 +10,13 @@ use submission::{attach_store, PreparedSubmission};
 /// the durable request pending; admission never assumes it freed space.
 pub trait Operations: Send + Sync {
     fn thaw(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, name: &str) -> Result<()>;
-    fn pressure(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, needed: u64) -> Result<()>;
+    /// Absolute target for free bytes minus current outstanding reservations.
+    fn pressure(
+        &self,
+        manager: &ManagedArtifacts,
+        root: &ArtifactRoot,
+        available_target: u64,
+    ) -> Result<()>;
 }
 fn operations(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<dyn Operations>>> {
@@ -114,6 +120,10 @@ pub fn repair(conn: &Connection, messages: Option<&Path>) -> Result<()> {
     let Some(config) = config else { return Ok(()) };
     let manager = ManagedArtifacts::new(&serde_json::from_str(&config)?)?;
     attach_store(conn, &manager.store)?;
+    if store::meta(conn, "pressure_history_imported_v2")?.is_none() {
+        conn.execute("INSERT INTO artifact_completions(job_id,root,state,finished_at,bytes_written,placement) SELECT q.id,j.root,q.state,q.finished_at,MAX(j.bytes_written),CASE WHEN COUNT(DISTINCT a.location)=1 AND MIN(a.state)='live' AND MAX(a.state)='live' AND NOT EXISTS(SELECT 1 FROM artifact_jobs old JOIN artifact_events e ON e.root=old.root AND e.name=old.name WHERE old.job_id=q.id AND e.kind IN ('moved','frozen','thawed','deleted','vanished','created','rebuilt') AND e.at>=q.finished_at) THEN MAX(a.location) END FROM main.queue_jobs q JOIN artifact_jobs j ON j.job_id=q.id JOIN artifacts a ON a.root=j.root AND a.name=j.name WHERE q.finished_at IS NOT NULL AND j.bytes_written IS NOT NULL GROUP BY q.id,j.root ON CONFLICT(job_id) DO UPDATE SET placement=COALESCE(artifact_completions.placement,excluded.placement)",[])?;
+        store::set_meta(conn, "pressure_history_imported_v2", &now())?;
+    }
     // Artifact-side-only submission commits must not retain in-use protection
     // forever. Keep the records and failure history, never delete their files.
     let tx = conn.unchecked_transaction()?;
@@ -199,7 +209,15 @@ fn size(conn: &Connection, root: &ArtifactRoot, outputs: &[String]) -> Result<u6
     }
     Ok(total)
 }
-fn fs_stats(path: &str, percent: u64) -> Result<(u64, u64, u64)> {
+#[cfg(test)]
+type TestDisks = Box<dyn Fn(&str) -> Result<(u64, u64, u64)>>;
+#[cfg(test)]
+thread_local! { pub(super) static TEST_DISKS: std::cell::RefCell<Option<TestDisks>> = const { std::cell::RefCell::new(None) }; }
+pub(super) fn fs_stats(path: &str, percent: u64) -> Result<(u64, u64, u64)> {
+    #[cfg(test)]
+    if let Some(value) = TEST_DISKS.with(|f| f.borrow().as_ref().map(|f| f(path))) {
+        return value;
+    }
     let path = Path::new(path);
     let stat = nix::sys::statvfs::statvfs(path)?;
     Ok((
@@ -211,7 +229,11 @@ fn fs_stats(path: &str, percent: u64) -> Result<(u64, u64, u64)> {
         std::fs::metadata(path)?.dev(),
     ))
 }
-fn outstanding(conn: &Connection, manager: &ManagedArtifacts, device: u64) -> Result<u64> {
+pub(super) fn outstanding(
+    conn: &Connection,
+    manager: &ManagedArtifacts,
+    device: u64,
+) -> Result<u64> {
     let mut result = 0u64;
     for r in store::query(
         conn,
@@ -309,6 +331,9 @@ pub fn submission_notices(conn: &Connection, id: &str, db: &Path) -> Result<()> 
 fn hold(conn: &Connection, id: &str, reason: &str) -> Result<Option<String>> {
     conn.execute("UPDATE queue_artifact_submissions SET first_hold_at=COALESCE(first_hold_at,?2) WHERE job_id=?1",params![id,now()])?;
     conn.execute("UPDATE artifact_job_reservations SET first_disk_hold_at=COALESCE(first_disk_hold_at,?2) WHERE job_id=?1",params![id,now()])?;
+    if reason != "disk_space" {
+        conn.execute("DELETE FROM artifact_disk_holds WHERE job_id=?1", [id])?;
+    }
     Ok(Some(reason.into()))
 }
 
@@ -335,6 +360,7 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         let reader_conflict = active_outputs.iter()
             .any(|other| inputs.iter().any(|name| name.eq_ignore_ascii_case(other)));
         if writer_conflict || reader_conflict {
+            conn.execute("DELETE FROM artifact_disk_holds WHERE job_id=?1",[id])?;
             return Ok(Some("artifact_writer".into()));
         }
     }
@@ -414,12 +440,8 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
                     params![id, now()],
                 )?;
                 if let Some(worker) = worker(&p.root.path) {
-                    let required = floor
-                        .saturating_add(outstanding(conn, &manager, device)?)
-                        .saturating_add(disk);
-                    if let Err(error) =
-                        worker.pressure(&manager, &p.root, required.saturating_sub(free))
-                    {
+                    let available_target = floor.saturating_add(disk);
+                    if let Err(error) = worker.pressure(&manager, &p.root, available_target) {
                         eprintln!("artifact pressure pass deferred for {id}: {error:#}");
                     }
                     let (free, floor, device) = fs_stats(path, manager.config.floor_percent)?;
@@ -432,6 +454,7 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         }
     }
     let Some(location) = placement else {
+        conn.execute("INSERT INTO artifact_disk_holds(job_id,root,role,label) VALUES(?1,?2,?3,?4) ON CONFLICT(job_id) DO UPDATE SET role=excluded.role,label=excluded.label",params![id,p.root.path,existing.as_deref().unwrap_or("root"),p.request.label])?;
         return hold(conn, id, "disk_space");
     };
     let tx = conn.unchecked_transaction()?;
@@ -478,6 +501,7 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         "UPDATE artifact_job_reservations SET placed=?2,start_bytes=?3 WHERE job_id=?1",
         params![id, location, start],
     )?;
+    tx.execute("DELETE FROM artifact_disk_holds WHERE job_id=?1", [id])?;
     // Submission may wait while the checkout advances. Attest the checkout
     // used at admission, never the earlier submission snapshot.
     let git = submission::GitState::capture(Path::new(&p.request.cwd));
@@ -695,6 +719,7 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         0
     };
     tx.execute("UPDATE artifact_jobs SET state=?2,exit_code=?3,wall_seconds=?4,bytes_written=?5 WHERE job_id=?1",params![id,job["state"].as_str(),job["exit_code"].as_i64(),wall,written])?;
+    tx.execute("INSERT INTO artifact_completions(job_id,root,state,finished_at,bytes_written,placement) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(job_id) DO UPDATE SET state=excluded.state,finished_at=excluded.finished_at,bytes_written=excluded.bytes_written,placement=excluded.placement",params![id,p.root.path,job["state"].as_str().unwrap_or("failed"),job["finished_at"].as_str().unwrap_or(&now()),written,reservation.as_ref().and_then(|r|r["placed"].as_str())])?;
     if let Some(r) = &reservation {
         for name in names(r, "inputs_json")?
             .into_iter()
@@ -879,7 +904,7 @@ pub fn disk_status(manager: &ManagedArtifacts, root: &ArtifactRoot) -> Result<Ve
         match fs_stats(path,manager.config.floor_percent) {
             Ok((free,floor,device)) if role=="root" || super::moves::cold_mounted(root) => {
                 let stat=nix::sys::statvfs::statvfs(Path::new(path))?;
-                result.push(json!({"path":path,"role":role,"mounted":true,"bytes":u64::from(stat.blocks())*stat.fragment_size(),"free":free,"floor":floor,"enough":floor,"outstanding":outstanding(&conn,manager,device)?,"waiting_jobs":waiting}));
+                result.push(json!({"path":path,"role":role,"mounted":true,"bytes":u64::from(stat.blocks())*stat.fragment_size(),"free":free,"floor":floor,"enough":super::pressure::enough(&conn,manager,device,floor)?,"outstanding":outstanding(&conn,manager,device)?,"waiting_jobs":waiting}));
             }
             _=>result.push(json!({"path":path,"role":role,"mounted":false,"bytes":null,"free":null,"floor":null,"enough":null,"outstanding":0,"waiting_jobs":waiting})),
         }

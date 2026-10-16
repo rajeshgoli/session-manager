@@ -419,3 +419,29 @@ fn open_keyed_lists_unhandled_messages_by_key_prefix() {
         .is_empty());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn artifact_service_blockers_need_owner_until_handled_without_a_session() {
+    let mut alert = message(true);
+    alert.sender_session_id = "sm-artifacts".into();
+    assert_eq!(
+        derive_message_state(&alert, false, true),
+        OwnerMessageState::NeedsYou
+    );
+    alert.first_viewed_at = Some("2026-10-15T00:00:00Z".into());
+    assert_eq!(
+        derive_message_state(&alert, false, true),
+        OwnerMessageState::NeedsYou
+    );
+    alert.handled_at = Some("2026-10-15T01:00:00Z".into());
+    assert_eq!(
+        derive_message_state(&alert, false, true),
+        OwnerMessageState::Handled
+    );
+    alert.handled_at = None;
+    alert.blocking = false;
+    assert_eq!(
+        derive_message_state(&alert, false, true),
+        OwnerMessageState::Read
+    );
+}
