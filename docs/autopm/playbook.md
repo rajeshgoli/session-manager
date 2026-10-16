@@ -25,8 +25,8 @@ merge or drop the weakest entries. Keep these six sections.
 ## Method
 - Weekly: measure due experiments, mine, plan, file, switch on, read out. (Auto PM spec H, 2026-10-15)
 - Every visible-change plan carries a mock per surface; build PRs carry emulator and web screenshots. (Auto PM spec F.1/D.5, 2026-10-15)
-- Test a hypothesis's premise against stored history before planning; a median metric cannot move a tail.
-  (decision cards, readout 2026-W42)
+- Test a hypothesis's premise against stored history before planning, on the subset the change targets,
+  not the pooled population. (decision cards, readout 2026-W42)
 - Metrics on `owner_events` need 14 days of it; the first usable baseline ends 2026-10-29. (readout 2026-W42)
 
 ## Open hypotheses

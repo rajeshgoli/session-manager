@@ -109,7 +109,7 @@
 <h1>Auto PM readout — week 42, 2026</h1>
 <p class="sans"><small>Author: Auto PM, Claude Opus 5.5 <code>9d6ee0e7</code> · Cycle ticket #2232 · Goal #2170 · 2026-10-15</small></p>
 
-<p><b>I shipped nothing this week, on purpose.</b> The record of what you do on each surface (Android app, web, typing to agents) is one day old, and a measured change needs 14 days of it as a baseline. The one idea with prior evidence, decision cards on asks that need your judgment, did not hold up against sm's history. No change is live or being measured, no switch was flipped, and nothing waits on you.</p>
+<p><b>I shipped nothing this week, on purpose.</b> The record of what you do on each surface (Android app, web, typing to agents) is one day old, and a measured change needs 14 days of it as a baseline. The one idea with prior evidence, decision cards on asks that need your judgment, is not yet supported by sm's history. No change is live or being measured, no switch was flipped, and nothing waits on you.</p>
 
 <h3>What the data says about asks that need your judgment</h3>
 <p>An <i>ask</i> here is an agent's request for your review of a doc (<code>sm doc publish --review</code>) or a message that waits for your reply (<code>sm send rajesh --blocking</code>). I measured the time from each ask to your answer from sm's records, which start on Sep 24:</p>
@@ -136,15 +136,15 @@
 </svg>
 <figcaption>Hours from ask to your answer. Blue: median ask. Orange: the ask slower than three in four (75th percentile). 92 doc-review asks and 82 reply asks in total. The week of Oct 2–8 had a slow tail; the other weeks did not.</figcaption>
 </figure>
-<p>The median ask is answered within an hour every week, usually within 20 minutes, so a card cannot clear sm's 25% bar on the median. The problem is the few asks that stall, like the day plan in fractal-algo-rust #2114, open since Oct 14. I have not yet found what they share. A card also needs agents to supply the choices, which changes text agents rely on and needs your yes; I will not ask before the evidence is better.</p>
+<p>The median ask is answered within an hour every week, usually within 20 minutes, so most asks do not stall. A card is meant for the few that do, like the day plan in fractal-algo-rust #2114, open since Oct 14. These figures pool all asks, so they neither support nor rule out the card; I first need to find what the stalled asks share and measure that subset. A card also needs agents to supply the choices, which changes text agents rely on and needs your yes; I will not ask before the evidence is better.</p>
 <p><b>A data trap, avoided.</b> Until 21:42 on Oct 15 the web log shows you opening the inbox and queue every minute. That was a tab loaded before the web client marked its background polls; it stopped on reload. I filed no fix, and my queries exclude web rows before 22:00 that day.</p>
 
 <h3>Spend and score</h3>
 <table>
-<thead><tr><th>Provider</th><th>Weekly allowance</th><th>Auto PM spend</th><th>Reserved for builds</th><th>Left</th></tr></thead>
+<thead><tr><th>Provider</th><th>Weekly allowance</th><th>Spent</th><th>Standing holds</th><th>Left for new builds</th></tr></thead>
 <tbody>
-<tr><td>Claude (resets Oct 18)</td><td>20 points</td><td>0.1 (this seat, one research helper)</td><td>none</td><td>12.5</td></tr>
-<tr><td>Codex (resets Oct 22)</td><td>20 points</td><td>0</td><td>none</td><td>12.9</td></tr>
+<tr><td>Claude (resets Oct 18)</td><td>20 points</td><td>2.6: 2.5 building the Auto PM itself, 0.1 this seat</td><td>4.9 (my seat, reviews)</td><td>12.5</td></tr>
+<tr><td>Codex (resets Oct 22)</td><td>20 points</td><td>2.0 building the Auto PM itself</td><td>5.0 (reviews)</td><td>12.9</td></tr>
 </tbody>
 </table>
 <p>A <i>point</i> is 1% of a provider's weekly quota, as on the app's usage meter. Score: 0 kept of 0 finished; no votes, no owner reverts. With nothing measured, this cycle does not count toward the four-cycle auto-pause.</p>
