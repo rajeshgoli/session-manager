@@ -145,7 +145,7 @@ export function InboxPage({ openRef }) {
   </div>`;
 }
 
-export function Thread({ id, workKey, controls, agent }) {
+export function Thread({ id, workKey, controls, agent, embedded = false, empty = null }) {
   const endpoint = workKey ? `/inbox/thread/${encodeURIComponent(workKey)}` : `/inbox/agent/${encodeURIComponent(id)}`;
   const [data, error, reload] = usePoll(() => api(`${endpoint}?format=json`), 30000, [endpoint]);
   const [body, setBody] = useState('');
@@ -209,14 +209,18 @@ export function Thread({ id, workKey, controls, agent }) {
     if (attempt.current?.signature !== signature) attempt.current = {signature, id: crypto.randomUUID()};
     setBusy(true); setFailure('');
     try {
-      await write(`${endpoint}/send`, {...payload, submission_id: attempt.current.id});
+      // An agent's thread may be a ticket's work thread; only its send honours the chosen recipient.
+      const sendPath = data?.thread_key ? `/inbox/thread/${encodeURIComponent(data.thread_key)}/send` : `${endpoint}/send`;
+      await write(sendPath, {...payload, submission_id: attempt.current.id});
       scrollOnLoad.current = true;
       attempt.current = null; setBody(''); setQuotes([]); reload();
     } catch (e) { setFailure(e.message); }
     finally { setBusy(false); }
   };
-  return html`<section class="thread-reader">
-    <div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>
+  // An agent that has sent nothing yet has no thread; the host shows what it offers instead.
+  if (empty && error?.status === 404 && !data) return empty;
+  return html`<section class=${`thread-reader${embedded ? ' embedded' : ''}`}>
+    ${embedded ? null : html`<div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>`}
     ${agent ? html`<div class="thread-links"><${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
       prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
       agent=${{ id: agent.id, name: agent.name, provider: agent.provider, fact: factText(agent.facts) }}

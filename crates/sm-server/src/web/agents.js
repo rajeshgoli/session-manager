@@ -1,6 +1,6 @@
 // Agents page and agent panel (spec 1710 D6.1, D6.2; 1782 F). Data: GET /watch/state.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { safeThreadHtml } from './inbox.js';
+import { safeThreadHtml, Thread } from './inbox.js';
 import {
   html, api, usePoll, useNow, config, age, limitText, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
@@ -561,8 +561,11 @@ function useAgent(id) {
 export function AgentPanel({ id, controls }) {
   const { agent, claims, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
-  const [tab, setTab] = useState('work');
-  useEffect(() => setTab('work'), [id]);
+  // An open question opens on the agent's Inbox thread so it can be answered here (sm#2245).
+  const [picked, setPicked] = useState(null);
+  useEffect(() => setPicked(null), [id]);
+  // A terminal permission prompt is answered in the terminal, so it stays on Work.
+  const tab = picked || (['message', 'doc_review'].includes(agent?.facts?.you?.kind) ? 'inbox' : 'work');
   if (!agent) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
@@ -589,17 +592,19 @@ export function AgentPanel({ id, controls }) {
       jobs=${agent.jobs || []} thread=${agent.thread}
       docs=${agent.docs || []} />
     <div class="tabs" role="tablist">
-      ${[['work', 'Work'], ['activity', 'Activity'], ['summary', 'Summary']].map(
+      ${[['work', 'Work'], ['inbox', 'Inbox'], ['activity', 'Activity'], ['summary', 'Summary']].map(
         ([key, label]) => html`<button type="button" role="tab" aria-selected=${tab === key}
-          class=${tab === key ? 'on' : ''} onClick=${() => setTab(key)}>${label}</button>`,
+          class=${tab === key ? 'on' : ''} onClick=${() => setPicked(key)}>${label}</button>`,
       )}
     </div>
-    <div class="pbody">
-      ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload} />` : null}
+    ${tab === 'inbox' ? html`<${Thread} key=${agent.id} id=${agent.id} embedded
+      empty=${html`<div class="pbody"><p class="muted">No messages yet.</p></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />` : html`<div class="pbody">
+      ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload}
+        onReply=${() => setPicked('inbox')} />` : null}
       ${tab === 'activity' ? html`<${ActivityTab} id=${agent.id} />` : null}
       ${tab === 'summary' ? html`<${SummaryTab} agent=${agent} />` : null}
-    </div>
-    ${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}
+    </div>`}
+    ${agent.state !== 'stopped' && tab !== 'inbox' ? html`<${MessageBox} agent=${agent} />` : null}
   `;
 }
 
@@ -690,7 +695,7 @@ function MoreMenu({ agent, onClose }) {
 
 const DOC_LINK = (doc) => doc.reader_path || doc.browser_url || doc.url;
 
-function WorkTab({ agent, claims, now, onAnswered }) {
+function WorkTab({ agent, claims, now, onAnswered, onReply }) {
   const jobs = (agent.jobs || []).filter((job) => ['running', 'pending'].includes(job.state));
   const reviews = (agent.waiting_on || []).filter((w) => w.kind === 'review');
   const docs = agent.docs || [];
@@ -733,18 +738,18 @@ function WorkTab({ agent, claims, now, onAnswered }) {
       ? html`<section><h3>Last words</h3><div class="quote">${agent.status_text}</div>
           ${agent.status_at ? html`<div class="sub">${clock(agent.status_at)}</div>` : null}</section>`
       : null}
-    <${LastTurn} id=${agent.id} />
+    <${LastTurn} id=${agent.id} onReply=${onReply} />
     <${NoteEditor} agent=${agent} onSaved=${onAnswered} />
     <section><h3>Workspace</h3><div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div></section>
   `;
 }
 
 // What the agent wrote at the end of its latest turn; none yet is a 404.
-function LastTurn({ id }) {
+function LastTurn({ id, onReply }) {
   const [turn] = usePoll(() => api(`/sessions/${encodeURIComponent(id)}/last-turn`).catch(() => null), 30000, [id]);
   if (!turn) return null;
-  // Reply continues in the agent's Inbox thread, where its answer appears.
-  const reply = () => { navigate('/inbox'); openPanel(`thread:${id}`); };
+  // Reply continues in the agent's Inbox thread, shown in this panel's Inbox tab.
+  const reply = onReply || (() => { navigate('/inbox'); openPanel(`thread:${id}`); });
   return html`<section><h3>Last turn</h3>
     <div class="quote last-turn md" dangerouslySetInnerHTML=${{ __html: safeThreadHtml(turn.html || '') }} />
     <div class="last-turn-foot"><span class="sub">${clock(turn.at)}</span>
