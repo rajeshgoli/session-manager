@@ -1068,6 +1068,14 @@ async fn pinged_board_events_collect_in_one_board_row() {
     assert_eq!(thread["items"].as_array().unwrap().len(), 2, "{thread}");
     assert_eq!(thread["items"][0]["link"], "/board#lane-1");
     assert_eq!(row(&inbox(&f, "open").await, "board")["group"], "earlier");
+
+    // Done and Archive, which every client offers on a row, mark it read.
+    for path in ["/inbox/done", "/inbox/archive", "/inbox/unarchive"] {
+        let (status, body) =
+            request(&f.app, "POST", path, Some(json!({"thread_key": "board"}))).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    assert_eq!(row(&inbox(&f, "open").await, "board")["group"], "earlier");
 }
 
 #[tokio::test]

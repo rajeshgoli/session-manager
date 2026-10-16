@@ -182,14 +182,18 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
   const pinned = useRef(false);
   const options = data?.reply_options || [];
   const revisionItems = (data?.items || []).filter(item => item.type === 'doc_revision');
-  const newestItem = revisionItems[revisionItems.length - 1];
-  const newestDoc = newestItem && docRevision(newestItem);
+  // Pin the document the thread's status describes (the server's choice in
+  // a multi-doc thread), so the review label and Review button target it.
   const docOf = item => docRevision(item)?.path?.split('?')[0];
+  const statusPath = data?.doc_url ? readerPath(data.doc_url)?.split('?')[0] : null;
+  const newestItem = (statusPath && revisionItems.filter(item => docOf(item) === statusPath).at(-1))
+    || revisionItems[revisionItems.length - 1];
+  const newestDoc = newestItem && docRevision(newestItem);
   const revisions = newestDoc ? revisionItems.filter(item => docOf(item) === newestDoc.path?.split('?')[0]).length : 0;
   const newest = newestDoc?.path ? { item: newestItem, doc: newestDoc } : null;
   // A card keeps the flag it was published with; the thread's status says
   // whether the request is still open (dismissed or reviewed clears it).
-  const reviewOpen = data?.status === 'review_requested';
+  const reviewOpen = data?.status === 'review_requested' && (!statusPath || docOf(newestItem) === statusPath);
   const defaultTarget = options.find(option => option.status === 'live' && option.can_send)
     || options.find(option => option.can_send);
   const target = options.find(option => option.id === targetId && option.can_send) || defaultTarget;

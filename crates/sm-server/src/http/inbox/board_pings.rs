@@ -88,6 +88,13 @@ pub(super) fn board_row(state: &AppState) -> Result<Option<InboxRow>, ApiError> 
     }))
 }
 
+/// Done and Archive on the Board row mark it read: it drops to Earlier and
+/// the next pinged event brings it back to New.
+pub(super) fn mark_handled(state: &AppState) -> Result<(), ApiError> {
+    inbox_store(state).mark_read(BOARD_THREAD, 0)?;
+    Ok(())
+}
+
 /// The Board row as a thread: each pinged event, linking to its lane.
 pub(super) fn board_thread(state: &AppState) -> Result<Response, ApiError> {
     let notices = pinged(state)?;

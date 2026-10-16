@@ -941,6 +941,10 @@ pub(super) async fn post_done(
     ensure_inbox_write_allowed(&state, &headers, peer_addr, "/inbox/done")?;
     let payload: DoneRequest = docs::parse_json_body(&body)?;
     let key = payload.thread_key.trim();
+    if key == board_pings::BOARD_THREAD {
+        board_pings::mark_handled(&state)?;
+        return Ok(Json(json!({ "thread_key": key, "done": true })));
+    }
     if !["agent:", "doc:", "docpath:", "ticket:", "pr:"]
         .iter()
         .any(|prefix| key.starts_with(prefix))

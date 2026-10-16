@@ -881,7 +881,7 @@ pub(crate) fn thread_page(
     if json_format {
         return Ok(Json(
             json!({"thread_key": key, "title": row.title, "status": row.status,
-            "repo": row.repo, "can_send": reply_to.is_some(), "reply_to": reply_to,
+            "doc_url": row.doc_url, "repo": row.repo, "can_send": reply_to.is_some(), "reply_to": reply_to,
             "reply_options": options, "items": items, "review_asks": review_actions}),
         )
         .into_response());
@@ -1240,6 +1240,12 @@ pub(crate) async fn post_archive(
     ensure_inbox_write_allowed(&state, &headers, peer_addr, "/inbox/archive")?;
     let payload: DoneRequest = docs::parse_json_body(&body)?;
     let key = payload.thread_key.trim();
+    if key == super::board_pings::BOARD_THREAD {
+        super::board_pings::mark_handled(&state)?;
+        return Ok(Json(
+            json!({"thread_key": key, "archived": true, "done": true}),
+        ));
+    }
     let items = mark_done(&state, key).await?;
     inbox_store(&state).mark_archive(key, items)?;
     Ok(Json(
@@ -1256,6 +1262,9 @@ pub(crate) async fn post_unarchive(
     ensure_inbox_write_allowed(&state, &headers, peer_addr, "/inbox/unarchive")?;
     let payload: DoneRequest = docs::parse_json_body(&body)?;
     let key = payload.thread_key.trim();
+    if key == super::board_pings::BOARD_THREAD {
+        return Ok(Json(json!({"thread_key": key, "archived": false})));
+    }
     if !ThreadCatalog::load(&state)?
         .rows(&state)?
         .iter()
