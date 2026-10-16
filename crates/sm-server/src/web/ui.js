@@ -262,8 +262,10 @@ export const network = {
 /**
  * Call `load` now and every `ms` while the browser tab is visible (D2), and
  * keep the last good value on a failure. Returns `[value, error, reload]`.
+ * `background` marks even the first load as not the owner's (spec 2170 A.5):
+ * the shell's own counters, not a page opening.
  */
-export function usePoll(load, ms, deps = []) {
+export function usePoll(load, ms, deps = [], { background = false } = {}) {
   const [state, setState] = useState({ value: undefined, error: null });
   const saved = useRef(load);
   saved.current = load;
@@ -285,7 +287,7 @@ export function usePoll(load, ms, deps = []) {
         try {
           // A poll's repeats are background; its first load is the page opening.
           const was = clientNav.state.polling;
-          clientNav.state.polling = !wasFirst;
+          clientNav.state.polling = background || !wasFirst;
           const pending = saved.current();
           clientNav.state.polling = was;
           const value = await pending;

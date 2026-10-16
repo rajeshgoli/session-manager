@@ -602,8 +602,9 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).ackFollow(followId) }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun fetchInbox(baseUrl: String, token: String, filter: String): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
-        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter) } }) { ScreenCache.inbox[filter] = it }
+    /** `background` for the app's own reads (the badge refresher), which are never the owner's (spec 2170 A.5). */
+    suspend fun fetchInbox(baseUrl: String, token: String, filter: String, background: Boolean = false): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter, if (background) "1" else null) } }) { ScreenCache.inbox[filter] = it }
     }
 
     suspend fun fetchBoard(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardResponse = withContext(Dispatchers.IO) {
