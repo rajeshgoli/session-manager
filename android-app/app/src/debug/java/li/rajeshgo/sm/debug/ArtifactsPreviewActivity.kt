@@ -28,9 +28,16 @@ class ArtifactsPreviewActivity : ComponentActivity() {
             {"name":"small_receipt","state":"live","disk_bytes":100000,"note":"Run receipt"},
             {"name":"unknown","state":"unrecorded"}]
         }""").jsonObject
+        val showMarkdown = intent.getBooleanExtra("markdown", false)
+        val displayed = if (showMarkdown) {
+            val row = fixture["artifacts"]!!.let { (it as kotlinx.serialization.json.JsonArray)[0] }.jsonObject
+            val updated = kotlinx.serialization.json.JsonObject(row + ("description" to kotlinx.serialization.json.JsonPrimitive("## Retention\n\n**Keep** [source](https://example.com/source) and https://example.com/report.\n\n- Saved research inputs\n- Retain through the current experiment\n\n| File | Use |\n| --- | --- |\n| data | training |")))
+            li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.name = "2050_labels"
+            kotlinx.serialization.json.JsonObject(fixture + ("artifacts" to kotlinx.serialization.json.JsonArray(listOf(updated))))
+        } else fixture
         setContent { SessionManagerTheme {
             androidx.compose.material3.Surface(color = androidx.compose.material3.MaterialTheme.colorScheme.background) {
-            ArtifactsContent(ArtifactsState(data = fixture), { finish() }, AppMenuActions({}, {}, {}, {}, {}, {}), {}, { _, _ -> }, {})
+            ArtifactsContent(ArtifactsState(data = displayed), { finish() }, AppMenuActions({}, {}, {}, {}, {}, {}), {}, { _, _ -> }, {})
             }
         } }
     }

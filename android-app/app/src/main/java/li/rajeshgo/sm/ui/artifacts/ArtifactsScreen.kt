@@ -19,6 +19,7 @@ import kotlinx.serialization.json.JsonObject
 import li.rajeshgo.sm.ui.navigation.*
 import li.rajeshgo.sm.ui.queue.SectionHeader
 import li.rajeshgo.sm.ui.theme.*
+import li.rajeshgo.sm.ui.watch.MarkdownText
 
 @Composable
 fun ArtifactsScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: ArtifactsViewModel, onNavigate: (String) -> Unit) {
@@ -181,11 +182,11 @@ private fun ArtifactSheet(a: JsonObject, canAct: Boolean, busy: Boolean, days: L
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(a.text("name"), style = MaterialTheme.typography.titleLarge)
             Text("${storageSize(measuredArtifactBytes(a))} · ${artifactSummary(a)}", color = TextSecondary)
-            a.text("description").ifBlank { a.text("note") }.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            a.text("description").ifBlank { a.text("note") }.takeIf { it.isNotBlank() }?.let { MarkdownText(it, richLinks = true) }
             if (a.text("state") == "unrecorded") Text("An agent can recover the context from git, saved files and job history. You do not need to reconstruct it.", color = TextSecondary)
             a.rows("consumers").takeIf { it.isNotEmpty() }?.let { Text("Used by " + it.joinToString { c -> c.text("ref") }, color = TextSecondary) }
             Text(if (!a.flag("backup_due") && a.text("backed_up_at").isNotBlank()) "Backup confirmed" else "No current backup confirmed", color = TextMuted, style = MaterialTheme.typography.bodySmall)
-            artifactReport(a)?.let { Text(it) }
+            artifactReport(a)?.let { MarkdownText(it, richLinks = true) }
             if (canAct) {
                 Button(onClick = { onAction("investigate") }, enabled = !busy && a.text("investigating").isBlank()) { Text(if (a.text("investigating").isBlank()) "Ask an agent to investigate" else "Agent investigating") }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -1882,9 +1882,17 @@ private fun WhatSummarySection(
 }
 
 @Composable
-internal fun MarkdownText(markdown: String) {
+internal fun MarkdownText(markdown: String, richLinks: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val markwon = remember(context) { io.noties.markwon.Markwon.create(context) }
+    val markwon = remember(context, richLinks) {
+        io.noties.markwon.Markwon.builder(context).apply {
+            if (richLinks) {
+                usePlugin(io.noties.markwon.linkify.LinkifyPlugin.create(android.text.util.Linkify.WEB_URLS))
+                usePlugin(io.noties.markwon.ext.tables.TablePlugin.create(context))
+                usePlugin(io.noties.markwon.movement.MovementMethodPlugin.create(io.noties.markwon.ext.tables.TableAwareMovementMethod.create()))
+            }
+        }.build()
+    }
     val textColor = MaterialTheme.colorScheme.onSurface.toArgb()
     val linkColor = Cyan.toArgb()
     androidx.compose.ui.viewinterop.AndroidView(

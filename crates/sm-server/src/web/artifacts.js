@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, config, ConfirmButton, bus } from './ui.js';
+import { html, api, usePoll, config, ConfirmButton, bus, LinkedText, linkifyHtml } from './ui.js';
+import { safeThreadHtml } from './inbox.js';
 import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupLabel } from './artifacts-model.js';
 
 function Row({ row: a, open, select }) {
@@ -14,11 +15,11 @@ function Detail({ a, data, close, act, busy }) {
   return html`<section class="artifact-detail" aria-label="Folder details">
     <div class="artifact-detail-heading"><h2>${a.name}</h2><button class="btn sm" onClick=${close} aria-label="Close details">Close</button></div>
     <p class="artifact-muted">${size(artifactBytes(a))} · ${artifactSummary(a)}</p>
-    <p class="artifact-description">${a.description || a.note}</p>
+    ${a.description_html ? html`<div class="artifact-markdown" dangerouslySetInnerHTML=${{__html:linkifyHtml(safeThreadHtml(a.description_html))}} />` : html`<p class="artifact-description"><${LinkedText} text=${a.description || a.note} /></p>`}
     ${a.state === 'unrecorded' ? html`<p>An agent can recover the context from git, saved files and job history. You do not need to reconstruct it.</p>` : null}
     ${(a.consumers || []).length ? html`<p>Used by ${a.consumers.map(c => c.ref).join(', ')}</p>` : null}
     <p class="artifact-muted">${backupLabel(a)}</p>
-    ${a.report ? html`<pre>${artifactReport(a)}</pre>` : null}
+    ${a.report ? html`<div class="artifact-markdown">${a.report_html ? html`<div dangerouslySetInnerHTML=${{__html:linkifyHtml(safeThreadHtml(a.report_html))}} />` : html`<${LinkedText} text=${artifactReport(a)} />`}</div>` : null}
     ${data.can_act ? html`<fieldset disabled=${busy}><legend>Owner actions</legend>
       ${!a.investigating ? html`<button class="btn artifact-primary" onClick=${() => act(a,'investigate')}>Ask an agent to investigate</button>` : html`<p>Agent investigating</p>`}
       ${a.state === 'frozen' ? html`<${ConfirmButton} label="Restore" confirmLabel="Restore" className="btn sm" prompt=${`Restore ${prompt}`} onConfirm=${() => act(a,'thaw')} />` : null}
