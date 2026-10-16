@@ -430,6 +430,116 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     complete_handoff(&state, predecessor_id, &successor.id).await
 }
 
+/// A retired Auto PM seat at its handoff threshold must not be relaunched just
+/// to receive one wake. Create and transfer to its successor directly, using
+/// the ordinary handoff transfer table, while the predecessor stays retired.
+pub(super) async fn start_retired_autopm_successor(
+    state: &Arc<AppState>,
+    predecessor: &SessionRecord,
+) -> anyhow::Result<Option<SessionRecord>> {
+    let note_path = predecessor
+        .last_handoff_path
+        .clone()
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .unwrap_or_else(|| {
+            expand_home(&predecessor.working_dir)
+                .join("docs/autopm/brief.md")
+                .display()
+                .to_string()
+        });
+    let note = HandoffNote {
+        kind: crate::handoff::execute::NoteKind::Path,
+        value: note_path,
+    };
+    let Some(plan) = state
+        .session_store
+        .claim_retired_handoff_start(&predecessor.id, &note)?
+    else {
+        return Ok(None);
+    };
+    let detached_worktree = match super::auto_retire::rebuild_retired_worktree(state, predecessor) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state
+                .session_store
+                .fail_handoff(&predecessor.id, &format!("{error:#}"))?;
+            return Err(error);
+        }
+    };
+    let successor = match create_successor(state, &plan).await {
+        Ok(successor) => successor,
+        Err(error) => {
+            state.session_store.fail_handoff(&predecessor.id, &error)?;
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+    wait_for_successor_readiness(state, &successor).await;
+    if let Some(retired_at) = predecessor.completed_at.as_deref() {
+        super::claims::work_claim_store(state)
+            .reopen_retired_claims(&predecessor.id, retired_at)?;
+    }
+    let brief = move_work(state, &state.session_store, &predecessor.id, &successor.id)?;
+    state.session_store.queue_handoff_notice(
+        &predecessor.id,
+        &successor.id,
+        &brief.text,
+        &execute::brief_message_id(&predecessor.id),
+        &[&successor.id, &predecessor.id],
+    )?;
+    if let Some((branch, base)) = detached_worktree {
+        let working_dir = expand_home(&predecessor.working_dir).display().to_string();
+        let text = format!(
+            "[sm] Branch {branch} is gone (merged and deleted), so your worktree {working_dir} \
+             was rebuilt detached at {base}."
+        );
+        state.session_store.queue_handoff_notice(
+            &predecessor.id,
+            &successor.id,
+            &text,
+            &execute::detached_worktree_message_id(&predecessor.id),
+            &[&successor.id, &predecessor.id],
+        )?;
+    }
+    state
+        .session_store
+        .hand_off_pending_messages(&predecessor.id, &successor.id)?;
+    state.session_store.finish_handoff(&predecessor.id)?;
+    Ok(Some(successor))
+}
+
+async fn wait_for_successor_readiness(state: &Arc<AppState>, successor: &SessionRecord) {
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let runtime = state
+        .runtime()
+        .for_socket_name(successor.tmux_socket_name.as_deref());
+    let (tmux_session, provider, store, successor_id) = (
+        successor.tmux_session.clone(),
+        successor.provider.clone(),
+        state.session_store.clone(),
+        successor.id.clone(),
+    );
+    let ready = tokio::task::spawn_blocking(move || {
+        if provider == "opencode" {
+            if store.opencode_http_ready(&successor_id)? {
+                Ok(())
+            } else {
+                anyhow::bail!("Opencode successor is not ready")
+            }
+        } else {
+            runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
+        }
+    })
+    .await;
+    if let Ok(Err(error)) = ready {
+        eprintln!(
+            "handoff successor {} not ready for its brief: {error:#}",
+            successor.id
+        );
+    }
+}
+
 /// F.2: the same provider, model, effort, worktree, machine and parent,
 /// through the core create path. No initial prompt: the brief follows the
 /// transfer. The error is the D.6 reason.
@@ -542,7 +652,13 @@ async fn complete_handoff(
         .hand_off_pending_messages(predecessor_id, successor_id)?;
     // Step 4. Sends resolve to the successor once the predecessor has
     // stopped; anything that reached it before then moves now.
-    retire_predecessor(state, predecessor_id, successor_id).await?;
+    if state
+        .session_store
+        .get_session(predecessor_id)?
+        .is_none_or(|predecessor| !predecessor.auto_retired())
+    {
+        retire_predecessor(state, predecessor_id, successor_id).await?;
+    }
     state
         .session_store
         .hand_off_pending_messages(predecessor_id, successor_id)?;

@@ -221,3 +221,42 @@ fn a_doc_review_wakes_its_auto_retired_author_by_restoring_it() {
     );
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn only_an_auto_retired_autopm_role_binding_survives_registry_pruning() {
+    let retired = |id: &str| {
+        json!({"id": id, "name": id, "working_dir": "/repo", "tmux_session": id,
+            "provider": "claude", "status": "stopped", "completion_status": "retired",
+            "created_at": COMPLETED, "last_activity": NOW, "completed_at": NOW,
+            "terminal_provenance": {"cause": "explicit_retire", "observed_at": NOW,
+                "authority": "server_lifecycle", "source": crate::sessions::AUTO_RETIRE_SOURCE}})
+    };
+    let (state, dir) = state_with(json!([]));
+    fs::write(
+        dir.join("sessions.json"),
+        json!({
+            "sessions": [retired("pm"), retired("maint")],
+            "agent_registrations": [
+                {"role": "autopm", "session_id": "pm", "created_at": NOW},
+                {"role": "maintainer", "session_id": "maint", "created_at": NOW}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .session_store
+            .lookup_agent_registration("autopm")
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "pm"
+    );
+    assert!(state
+        .session_store
+        .lookup_agent_registration("maintainer")
+        .unwrap()
+        .is_none());
+    let _ = fs::remove_dir_all(dir);
+}

@@ -237,25 +237,18 @@ pub(super) fn reply_recipient(state: &AppState, session_id: &str) -> Option<Sess
     }
 }
 
-/// `reply_recipient`, restored when it is auto-retired, right before a
-/// message is queued for it. A failed restore falls back to the chain.
-/// Blocking: git and the provider relaunch run here.
-pub(super) fn ready_recipient(state: &AppState, session_id: &str) -> Option<SessionRecord> {
-    let recipient = reply_recipient(state, session_id)?;
-    super::auto_retire::ready_for_message(state, recipient)
-        .or_else(|| live_recipient(state, session_id))
-}
-
 /// Async `ready_recipient`.
 pub(super) async fn ready_recipient_async(
     state: &Arc<AppState>,
     session_id: &str,
 ) -> Result<Option<SessionRecord>, ApiError> {
-    let work = state.clone();
-    let id = session_id.to_owned();
-    tokio::task::spawn_blocking(move || ready_recipient(&work, &id))
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))
+    let recipient = reply_recipient(state, session_id);
+    Ok(match recipient {
+        Some(recipient) => super::auto_retire::ready_for_message_async(state, recipient)
+            .await
+            .or_else(|| live_recipient(state, session_id)),
+        None => None,
+    })
 }
 
 /// Whether the sender has ended, for the needs-you state. A sender that is

@@ -12673,12 +12673,11 @@ fn session_has_maintainer_identity(session: &SessionRecord) -> bool {
 }
 
 fn prune_agent_registrations_raw(state: &mut Value) -> Result<bool> {
-    let live_session_ids = snapshot_from_raw_value(state)?
+    let sessions = snapshot_from_raw_value(state)?
         .into_sessions()
         .into_iter()
-        .filter(SessionRecord::is_live_for_registry)
-        .map(|session| session.id)
-        .collect::<BTreeSet<_>>();
+        .map(|session| (session.id.clone(), session))
+        .collect::<BTreeMap<_, _>>();
     let mut removed = Vec::<AgentRegistrationRecord>::new();
     {
         let registrations = ensure_agent_registrations_array_mut(state)?;
@@ -12686,7 +12685,17 @@ fn prune_agent_registrations_raw(state: &mut Value) -> Result<bool> {
             let Some(registration) = raw_registration_record(entry) else {
                 return false;
             };
-            if live_session_ids.contains(&registration.session_id) {
+            let live = sessions
+                .get(&registration.session_id)
+                .is_some_and(SessionRecord::is_live_for_registry);
+            // Auto PM is the one role whose holder may be deliberately
+            // auto-retired. Keep that binding so a role-addressed wake can
+            // restore the same seat; every other stopped holder is pruned.
+            let retired_autopm = registration.role == crate::autopm::ROLE
+                && sessions
+                    .get(&registration.session_id)
+                    .is_some_and(SessionRecord::auto_retired);
+            if live || retired_autopm {
                 return true;
             }
             removed.push(registration);

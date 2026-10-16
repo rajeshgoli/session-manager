@@ -122,19 +122,44 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     let Some(session) = state.session_store.get_session(&id)? else {
         return Ok(false);
     };
+    let settings = typed(state, &state.session_store.owner_settings()?);
+    if !settings.enabled || settings.paused_at.is_some() || skipped(state, &settings)? {
+        return Ok(true);
+    }
+    if super::super::auto_retire::retired_autopm_needs_successor(state, &session) {
+        // The cycle wake below remains durably addressed to the retired
+        // holder; the message-ready path creates its successor before it is
+        // delivered.
+        once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
+        return Ok(true);
+    }
     if session.is_stopped() {
         return Ok(false);
     }
-    let settings = typed(state, &state.session_store.owner_settings()?);
-    if settings.enabled && settings.paused_at.is_none() && !skipped(state, &settings)? {
-        state.session_store.authorize_autopm_seat(&id)?;
-        store(state).record_seat(&id, autopm::now_ms())?;
-        once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
-    }
+    let Some(session) = super::super::auto_retire::ready_for_message(state, session) else {
+        return Ok(false);
+    };
+    let id = session.id;
+    state.session_store.authorize_autopm_seat(&id)?;
+    store(state).record_seat(&id, autopm::now_ms())?;
+    once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
     Ok(true)
 }
 
 pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> anyhow::Result<()> {
+    // Every Auto PM wake is also the next-message restore trigger. The
+    // once-only id continues to deduplicate the wake after a retry.
+    let target = match state.session_store.get_session(target)? {
+        Some(session)
+            if super::super::auto_retire::retired_autopm_needs_successor(state, &session) =>
+        {
+            session.id
+        }
+        Some(session) => super::super::auto_retire::ready_for_message(state, session)
+            .map(|session| session.id)
+            .unwrap_or_else(|| target.to_owned()),
+        None => target.to_owned(),
+    };
     // Handoff may have repointed an already queued message to its successor.
     let conn = store(state).open()?;
     let initialized: bool = conn.query_row(
@@ -152,7 +177,7 @@ pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> any
         RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
             .enqueue_message_once_with_metadata(
                 key,
-                target,
+                &target,
                 text,
                 "sequential",
                 QueueMessageMetadata::default(),
@@ -162,7 +187,7 @@ pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> any
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
-            .drain_runtime_pending_messages_for_session(target, &runtime)?;
+            .drain_runtime_pending_messages_for_session(&target, &runtime)?;
     }
     Ok(())
 }

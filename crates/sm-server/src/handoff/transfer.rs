@@ -222,6 +222,66 @@ impl SessionStore {
         Ok(Some(plan))
     }
 
+    /// Starts the transfer of an auto-retired seat without restoring its
+    /// process. This is the context-limit counterpart of `claim_handoff_start`:
+    /// it creates the same successor plan and leaves the predecessor retired.
+    pub fn claim_retired_handoff_start(
+        &self,
+        session_id: &str,
+        note: &HandoffNote,
+    ) -> Result<Option<SuccessorPlan>> {
+        let _submission = self.lock_opencode_submission(session_id)?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let Some(existing) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Ok(None);
+        };
+        if !existing.auto_retired() || existing.successor_session_id.is_some() {
+            return Ok(None);
+        }
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        if raw_handoff_record(session).is_some_and(|record| {
+            !matches!(record.state, HandoffPhase::Asked | HandoffPhase::Failed)
+        }) {
+            return Ok(None);
+        }
+        let now = now_rfc3339();
+        let mut record = HandoffRecord::asked(
+            HandoffTrigger::Context,
+            &now,
+            session
+                .get("context_used_percentage")
+                .and_then(Value::as_f64),
+        );
+        record.state = HandoffPhase::Spawning;
+        record.note = Some(note.to_json());
+        record.accepted_at = Some(now);
+        write_handoff_record(session, &record);
+        let predecessor_name = raw_session_display_name(session, session_id);
+        let text = |key: &str| json_text(session.get(key)).filter(|value| !value.is_empty());
+        let plan = SuccessorPlan {
+            predecessor_id: session_id.to_owned(),
+            successor_name: execute::successor_name(&predecessor_name),
+            predecessor_name,
+            provider: text("provider").unwrap_or_else(default_provider),
+            model: text("model"),
+            reasoning_effort: text("reasoning_effort"),
+            working_dir: text("working_dir").unwrap_or_default(),
+            node: text("node").unwrap_or_else(default_node),
+            parent_session_id: text("parent_session_id"),
+        };
+        self.write_raw_json_value(&state)?;
+        Ok(Some(plan))
+    }
+
     /// The successor exists but no work has moved yet. Persist recovery before
     /// any wait or delivery-resolution gate can defer the driver.
     pub(crate) fn record_opencode_handoff_successor(
@@ -895,6 +955,24 @@ mod tests {
         store.write_raw_json_value(&state).unwrap();
     }
 
+    fn set_auto_retired(store: &SessionStore, session_id: &str) {
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        let session = session_object_mut(sessions, session_id).unwrap();
+        session.insert("status".to_owned(), json!("stopped"));
+        session.insert("completion_status".to_owned(), json!("retired"));
+        session.insert(
+            "terminal_provenance".to_owned(),
+            json!({
+                "cause": "explicit_retire",
+                "observed_at": "2026-09-29T00:02:00Z",
+                "authority": "server_lifecycle",
+                "source": "auto_retire",
+            }),
+        );
+        store.write_raw_json_value(&state).unwrap();
+    }
+
     fn queued(store: &SessionStore, session_id: &str) -> Vec<String> {
         store
             .queue_store
@@ -1012,6 +1090,41 @@ mod tests {
             HandoffPhase::Spawning
         );
         assert_eq!(store.claim_handoff_start("pred0001").unwrap(), None);
+    }
+
+    #[test]
+    fn retired_auto_pm_start_is_claimed_once_until_it_fails() {
+        let store = store("retired-start", "stopped");
+        set_auto_retired(&store, "pred0001");
+
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            record(&store, "pred0001").unwrap().state,
+            HandoffPhase::Spawning
+        );
+        assert_eq!(
+            store
+                .claim_retired_handoff_start("pred0001", &note())
+                .unwrap(),
+            None
+        );
+
+        store
+            .fail_handoff("pred0001", "worktree unavailable")
+            .unwrap();
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
+
+        set_record(&store, "pred0001", "asked");
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -155,6 +155,14 @@ pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -
 pub(in crate::http) fn review_wake_target(state: &AppState, doc: &OwnerDoc) -> Option<String> {
     let session_id = review_wake_recipient(state, doc)?;
     match state.session_store.get_session(&session_id).ok().flatten() {
+        // Keep the review wake on the retired Auto PM target. The durable
+        // message-ready sweep creates its context-handoff successor before
+        // delivery, rather than reviving the over-limit predecessor.
+        Some(session)
+            if super::super::auto_retire::retired_autopm_needs_successor(state, &session) =>
+        {
+            Some(session.id)
+        }
         Some(session) if super::super::messages::restores(&session) => {
             super::super::auto_retire::ready_for_message(state, session)
                 .map(|session| session.id)
