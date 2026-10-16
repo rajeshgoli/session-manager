@@ -650,6 +650,7 @@ async fn managed_artifacts_system_messages_refuse_replies() {
         )
         .await;
     assert!(body["reply_to_session_id"].is_null());
+    assert_eq!(body["state"], "needs_you");
 }
 
 #[tokio::test]
