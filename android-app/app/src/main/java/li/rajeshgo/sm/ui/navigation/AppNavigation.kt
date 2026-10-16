@@ -68,6 +68,7 @@ object Routes {
     const val HISTORY = "history"
     const val NOTES = "notes"
     const val GUESTBOOK = "guestbook"
+    const val ARTIFACTS = "artifacts"
     const val AUTOPM = "autopm"
 }
 
@@ -199,6 +200,14 @@ fun AppNavigation() {
 
     // A `/board` link or a tapped board alert opens the Board tab, which scrolls to its lane.
     val pendingBoardLink = BoardLinkRequests.pending
+    val artifactsViewModel: li.rajeshgo.sm.ui.artifacts.ArtifactsViewModel = viewModel()
+    val openArtifacts = li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open
+    LaunchedEffect(openArtifacts, isLoggedIn) {
+        if (openArtifacts && isLoggedIn == true) {
+            navController.navigate(Routes.ARTIFACTS) { launchSingleTop = true }
+            li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open = false
+        }
+    }
     LaunchedEffect(pendingBoardLink, isLoggedIn) {
         if (pendingBoardLink != null && isLoggedIn == true &&
             navController.currentDestination?.route != Routes.BOARD
@@ -209,6 +218,9 @@ fun AppNavigation() {
 
     Box(Modifier.fillMaxSize()) {
         NavHost(navController = navController, startDestination = startDestination) {
+            composable(Routes.ARTIFACTS) {
+                li.rajeshgo.sm.ui.artifacts.ArtifactsScreen(onBack = { navController.popBackStack() }, menu = menu, viewModel = artifactsViewModel, onNavigate = { toTab(it) })
+            }
             composable(Routes.SETTINGS) {
                 SettingsScreen(
                     onNavigateToWatch = {

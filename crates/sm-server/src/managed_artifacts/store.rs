@@ -89,7 +89,10 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         .filter(|j| j["state"] == "succeeded")
         .map(|j| j["wall_seconds"].as_f64().unwrap_or(0.0))
         .sum::<f64>());
-    value["rebuildable"] = json!(value["recipe_complete"] == 1 && !has_gpu(&value));
+    let missing_input: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM artifact_inputs i LEFT JOIN artifacts a ON a.root=i.root AND a.name=i.input WHERE i.root=?1 AND i.name=?2 AND (a.name IS NULL OR a.state='deleted'))", rusqlite::params![root,name], |r| r.get(0))?;
+    value["rebuildable"] =
+        json!(value["recipe_complete"] == 1 && !has_gpu(&value) && !missing_input);
+    value["dependents"] = json!(query(conn, "SELECT DISTINCT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input IN (SELECT name FROM artifacts WHERE root=?1 AND set_id=?2) AND a.state!='deleted' AND a.set_id<>?2", &[&root, &value["set_id"].as_str().unwrap_or(name)])?);
     value["hot"] = json!(super::hotcold::is_hot(
         conn,
         root,
@@ -109,6 +112,12 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
     let needs = super::needs_you::item(conn, &value)?;
     value["needs_owner"] = json!(needs.is_some());
     value["needs_you"] = needs.unwrap_or(Value::Null);
+    value["investigating"] = json!(meta(
+        conn,
+        &format!("investigating:{root}:{}", name.to_ascii_lowercase())
+    )?
+    .filter(|s| !s.is_empty()));
+    value["report"] = query(conn, "SELECT actor,at,detail_json FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE AND kind='report' ORDER BY id DESC LIMIT 1", &[&root,&name])?.pop().unwrap_or(Value::Null);
     Ok(value)
 }
 pub fn thaw_rate(conn: &Connection, root: &str) -> Result<f64> {

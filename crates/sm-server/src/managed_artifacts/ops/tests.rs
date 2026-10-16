@@ -95,6 +95,25 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn managed_artifacts_keep_live_thaws_and_protects_for_configured_days() {
+    let f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    let pending = keep_live(&f.manager, &f.root, "sample", "owner").unwrap();
+    assert_eq!(pending["op"], "thawing");
+    let expected = (OffsetDateTime::now_utc().date()
+        + time::Duration::days(f.manager.config.keep_live_days))
+    .to_string();
+    assert_eq!(pending["keep_live_until"], expected);
+    resume(&f.manager).unwrap();
+    f.assert_bytes("sample");
+    assert_eq!(f.detail("sample")["state"], "live");
+    assert_eq!(f.detail("sample")["keep_live_until"], expected);
+    assert!(request(&f.manager, &f.root, "sample", "freezing", "sm").is_err());
+}
+
+#[test]
 fn managed_artifacts_ops_freeze_thaw_round_trip_and_placeholder() {
     let f = Fixture::new();
     f.create("sample");

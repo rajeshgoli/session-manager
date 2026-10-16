@@ -111,6 +111,47 @@ fn thaw_not_written(conn: &Connection, root: &str, name: &str) -> Result<()> {
 
 /// Claims the whole set in a short transaction. Call kick after the surrounding
 /// queue transaction releases its lock; no filesystem copy runs in this call.
+pub fn keep_live(
+    manager: &ManagedArtifacts,
+    root: &ArtifactRoot,
+    name: &str,
+    actor: &str,
+) -> Result<Value> {
+    let a = manager.store.detail(&root.path, name)?;
+    if a["state"] == "frozen" {
+        request(manager, root, name, "thawing", actor)?;
+    }
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let a = artifact(&tx, &root.path, name)?;
+    ensure!(
+        a["state"] == "live" || a["op"] == "thawing",
+        "artifact must be live or thawing"
+    );
+    ensure!(
+        a["op"].is_null() || a["op"] == "thawing",
+        "artifact is busy"
+    );
+    let until = (OffsetDateTime::now_utc().date()
+        + time::Duration::days(manager.config.keep_live_days))
+    .to_string();
+    tx.execute(
+        "UPDATE artifacts SET keep_live_until=?3 WHERE root=?1 AND set_id=?2",
+        params![root.path, a["set_id"].as_str(), until],
+    )?;
+    event(
+        &tx,
+        &root.path,
+        name,
+        "owner_keep_live",
+        actor,
+        json!({"until":until}),
+    )?;
+    let result = store::detail(&tx, &root.path, name)?;
+    tx.commit()?;
+    Ok(result)
+}
+
 pub fn request(
     manager: &ManagedArtifacts,
     root: &ArtifactRoot,

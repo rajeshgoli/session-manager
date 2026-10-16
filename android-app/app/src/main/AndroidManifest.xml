@@ -56,6 +56,7 @@
                 <data android:pathPrefix="/board" />
                 <data android:path="/history" />
                 <data android:path="/guestbook" />
+                <data android:path="/artifacts" />
             </intent-filter>
         </activity>
         <service

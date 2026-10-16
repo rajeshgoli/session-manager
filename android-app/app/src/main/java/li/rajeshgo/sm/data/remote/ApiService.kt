@@ -294,6 +294,12 @@ interface ApiService {
         @Query("before") before: Long?,
     ): li.rajeshgo.sm.data.model.GuestbookResponse
 
+    @GET("artifacts")
+    suspend fun getArtifacts(): kotlinx.serialization.json.JsonObject
+
+    @POST("artifacts/{name}/owner-action")
+    suspend fun artifactOwnerAction(@Path("name") name: String, @Body body: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
+
     /** Agents no longer live (sm#1661), newest first; `before` is the previous page's `next_before`. */
     @GET("history/agents?format=json")
     suspend fun getAgentHistory(

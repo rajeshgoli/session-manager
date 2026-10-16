@@ -266,6 +266,13 @@ impl ManagedArtifacts {
             apply_record(&tx, root, name, flags, actor)?;
             tx.execute("UPDATE artifacts SET state='live',recipe_complete=?3,origin=CASE WHEN origin='unrecorded' THEN 'adopted' ELSE origin END WHERE root=?1 AND name=?2",params![root.path,name,flags.recipe_complete])?;
             event(&tx, &root.path, name, "recorded", actor, json!({}))?;
+            tx.execute(
+                "DELETE FROM artifact_meta WHERE key=?1 AND value=?2",
+                params![
+                    format!("investigating:{}:{}", root.path, name.to_ascii_lowercase()),
+                    actor
+                ],
+            )?;
         }
         let result = names
             .iter()

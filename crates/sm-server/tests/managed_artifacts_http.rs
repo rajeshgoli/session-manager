@@ -71,6 +71,17 @@ impl Fixture {
         config.queue_runner.state_dir = dir.join("queue-runner").display().to_string();
         config.rust_core.fixture_writes_enabled = true;
         config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
+        config.google_auth.session_cookie_secret = Some("artifact-test-secret".into());
+        for (email, owner) in [("owner@example.com", true), ("guest@example.com", false)] {
+            config.mobile_terminal.allowed_users.insert(
+                email.into(),
+                sm_server::config::MobileTerminalUserConfig {
+                    email: Some(email.into()),
+                    owner,
+                    ..Default::default()
+                },
+            );
+        }
         let state = AppState::new(config);
         let app = router(state.clone());
         WorkClaimStore::new(dir.join("queue.db"))
@@ -107,7 +118,21 @@ impl Fixture {
             .uri(path)
             .header("content-type", "application/json");
         if let Some(actor) = actor {
-            builder = builder.header("x-sm-session-id", actor);
+            if actor.contains('@') {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+                use hmac::{Hmac, Mac};
+                let payload = URL_SAFE_NO_PAD.encode(json!({"type":"device_access","email":actor,"exp":time::OffsetDateTime::now_utc().unix_timestamp()+3600}).to_string());
+                let mut mac =
+                    Hmac::<sha2::Sha256>::new_from_slice(b"artifact-test-secret").unwrap();
+                mac.update(payload.as_bytes());
+                let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+                builder = builder.header(
+                    "authorization",
+                    format!("Bearer smat_{payload}.{signature}"),
+                );
+            } else {
+                builder = builder.header("x-sm-session-id", actor);
+            }
         }
         let mut request = builder
             .body(if method == "GET" {
@@ -125,6 +150,24 @@ impl Fixture {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 }
+#[tokio::test]
+async fn managed_artifacts_owner_action_refuses_local_bypass_and_agent_headers() {
+    let f = Fixture::new();
+    for actor in [None, Some("maker"), Some("guest@example.com")] {
+        for action in ["delete", "thaw", "keep_live", "investigate"] {
+            let (status, _) = f
+                .request(
+                    "POST",
+                    "/artifacts/sample/owner-action",
+                    actor,
+                    json!({"action":action}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{action} {actor:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn managed_artifacts_http_commands_and_refusals() {
     let f = Fixture::new();
@@ -214,6 +257,154 @@ async fn managed_artifacts_http_commands_and_refusals() {
         .0,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn managed_artifacts_owner_keep_live_and_delete() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts",
+            Some("maker"),
+            json!({"name":"sample","note":"retained data","project":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.request("POST", "/artifacts/sample/done", Some("maker"), json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, kept) = f
+        .request(
+            "POST",
+            "/artifacts/sample/owner-action",
+            Some("owner@example.com"),
+            json!({"action":"keep_live"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    assert_eq!(
+        kept["keep_live_until"],
+        (time::OffsetDateTime::now_utc().date() + time::Duration::days(30)).to_string()
+    );
+    let (status, list) = f
+        .request("GET", "/artifacts", Some("owner@example.com"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["can_act"], true);
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts/sample/delete",
+            Some("maker"),
+            json!({"reason":"cleanup"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (status, deleted) = f
+        .request(
+            "POST",
+            "/artifacts/sample/owner-action",
+            Some("owner@example.com"),
+            json!({"action":"delete"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["state"], "deleted");
+}
+
+#[tokio::test]
+async fn managed_artifacts_investigate_spawns_once_and_report_finishes() {
+    let f = Fixture::new();
+    f.register_steward();
+    let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
+    fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts",
+            Some("maker"),
+            json!({"name":"sample","note":"inspect this dataset","project":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, started) = f
+        .request(
+            "POST",
+            "/artifacts/sample/owner-action",
+            Some("owner@example.com"),
+            json!({"action":"investigate"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let child = started["investigating"].as_str().unwrap();
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts/sample/owner-action",
+            Some("owner@example.com"),
+            json!({"action":"investigate"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts/sample/report",
+            Some("maker"),
+            json!({"note":"keep it","recommend":"keep"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, reported) = f
+        .request(
+            "POST",
+            "/artifacts/sample/report",
+            Some(child),
+            json!({"note":"keep it","recommend":"keep"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reported}");
+    assert!(reported["investigating"].is_null());
+    assert!(reported["report"]["detail_json"]
+        .as_str()
+        .unwrap()
+        .contains("keep it"));
 }
 #[tokio::test]
 async fn managed_artifacts_steward_requests_and_unclaimable() {

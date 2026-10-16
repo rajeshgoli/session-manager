@@ -741,6 +741,14 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getGuestbook(repo, before) }
     }
 
+    suspend fun fetchArtifacts(baseUrl: String, token: String): kotlinx.serialization.json.JsonObject = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getArtifacts() }
+    }
+
+    suspend fun artifactOwnerAction(baseUrl: String, token: String, name: String, body: kotlinx.serialization.json.JsonObject): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).artifactOwnerAction(name, body); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchAgentHistory(baseUrl: String, token: String, query: String?, before: String?): li.rajeshgo.sm.data.model.AgentHistoryResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getAgentHistory(query, before) }
     }
