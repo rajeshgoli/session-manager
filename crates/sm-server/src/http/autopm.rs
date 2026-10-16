@@ -30,7 +30,12 @@ pub(super) fn store(state: &AppState) -> AutopmStore {
 }
 
 pub(super) fn settings(state: &AppState) -> Result<Settings, ApiError> {
-    Ok(Settings::from_owner(&state.session_store.owner_settings()?))
+    Ok(typed(state, &state.session_store.owner_settings()?))
+}
+
+/// The `autopm` setting, typed, with the configured owner name.
+pub(super) fn typed(state: &AppState, owner_settings: &Value) -> Settings {
+    Settings::from_owner(owner_settings).with_owner(&state.config.owner_name)
 }
 
 /// The commit the running server was built from (the restart script sets
@@ -589,7 +594,7 @@ pub(super) fn review_gate(
     step: &Value,
 ) -> ReviewGate {
     let result = (|| -> anyhow::Result<ReviewGate> {
-        let settings = Settings::from_owner(&state.session_store.owner_settings()?);
+        let settings = typed(state, &state.session_store.owner_settings()?);
         if !settings.enabled {
             return Ok(ReviewGate::Proceed);
         }
@@ -741,14 +746,55 @@ fn settle_review_slots(state: &AppState, store: &AutopmStore) -> anyhow::Result<
     Ok(())
 }
 
-/// The Android deploy cap (B.3): a session on a ticket under #2170 may make
-/// `app_updates_per_week` app deploys a week. `Ok(Some(ticket))` is a
-/// counted deploy, to record once it is stored.
+/// A counted autopm app deploy's claimed weekly slot (B.3). Dropping it
+/// before [`DeployClaim::finish`] frees the slot, so a deploy that fails
+/// partway does not use up the week.
+pub(super) struct DeployClaim {
+    store: AutopmStore,
+    slot: autopm::DeploySlot,
+    finished: bool,
+}
+
+impl DeployClaim {
+    /// A counted deploy must name its version, or its experiment could
+    /// never see the app installed.
+    pub(super) fn check_version(&self, version_name: Option<&str>) -> Result<(), ApiError> {
+        if version_name.is_some_and(|v| experiments::version_at_least(v, "0") == Some(true)) {
+            return Ok(());
+        }
+        Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "version_name: an autopm app deploy needs a dotted numeric version_name".into(),
+        })
+    }
+
+    pub(super) fn finish(mut self, hash: &str, version_name: &str) {
+        self.finished = true;
+        if let Err(error) = self.store.finish_app_deploy(&self.slot, hash, version_name) {
+            eprintln!(
+                "autopm app deploy for #{} not recorded: {error:#}",
+                self.slot.ticket
+            );
+        }
+    }
+}
+
+impl Drop for DeployClaim {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = self.store.release_app_deploy(&self.slot) {
+                eprintln!("autopm app deploy slot not released: {error:#}");
+            }
+        }
+    }
+}
+
+/// The Android deploy cap (B.3) for a deploy from an agent's shell.
 pub(super) fn app_deploy_cap(
     state: &AppState,
     app_name: &str,
     headers: &HeaderMap,
-) -> Result<Option<i64>, ApiError> {
+) -> Result<Option<DeployClaim>, ApiError> {
     if app_name != "session-manager-android" {
         return Ok(None);
     }
@@ -756,21 +802,15 @@ pub(super) fn app_deploy_cap(
         return Ok(None);
     };
     let settings = settings(state)?;
-    store(state)
-        .check_app_deploy(&settings, &session, autopm::now_ms())
-        .map_err(api_error)
-}
-
-pub(super) fn record_app_deploy(
-    state: &AppState,
-    ticket: i64,
-    hash: &str,
-    version_name: Option<&str>,
-) {
-    if let Err(error) = store(state).record_app_deploy(ticket, hash, version_name, autopm::now_ms())
-    {
-        eprintln!("autopm app deploy for #{ticket} not recorded: {error:#}");
-    }
+    let store = store(state);
+    Ok(store
+        .claim_app_deploy(&settings, &session, autopm::now_ms())
+        .map_err(api_error)?
+        .map(|slot| DeployClaim {
+            store,
+            slot,
+            finished: false,
+        }))
 }
 
 /// The owner devices' reported app versions.
@@ -800,7 +840,7 @@ pub(super) fn minute(
     experiments_due: bool,
 ) -> anyhow::Result<()> {
     let store = store(state);
-    let settings = Settings::from_owner(&state.session_store.owner_settings()?);
+    let settings = typed(state, &state.session_store.owner_settings()?);
     state.autopm_switches.set_enabled(settings.enabled);
     let mut effects = Vec::new();
     let guard_db = guard::open(&store.paths.utilization_db)?;
@@ -829,7 +869,7 @@ pub(super) fn minute(
                 .map_err(|fail| anyhow::anyhow!("{:?}", api_error(fail)))?,
         );
         effects.extend(
-            experiments::cancelled_cleanup_prs(&store.open()?)
+            experiments::cancelled_cleanup_prs(&store.open()?, &settings.owner)
                 .map_err(|fail| anyhow::anyhow!("{:?}", api_error(fail)))?,
         );
     }

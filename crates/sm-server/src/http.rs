@@ -3818,7 +3818,7 @@ async fn deploy_app_artifact(
             login_url: None,
         });
     };
-    let autopm_ticket = {
+    let autopm_deploy = {
         let state = state.clone();
         let app_name = app_name.clone();
         let headers = headers.clone();
@@ -3900,8 +3900,11 @@ async fn deploy_app_artifact(
         });
     }
 
+    if let Some(claim) = &autopm_deploy {
+        claim.check_version(version_name.as_deref())?;
+    }
     let root = expand_home(&state.config.app_artifacts.root_dir);
-    let stored_version_name = version_name.clone();
+    let stored_version_name = version_name.clone().unwrap_or_default();
     let stored = store_artifact(
         &root,
         &app_name,
@@ -3915,13 +3918,8 @@ async fn deploy_app_artifact(
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail: format!("Failed to store artifact: {error}"),
     })?;
-    if let Some(ticket) = autopm_ticket {
-        autopm::record_app_deploy(
-            &state,
-            ticket,
-            &stored.artifact_hash,
-            stored_version_name.as_deref(),
-        );
+    if let Some(claim) = autopm_deploy {
+        claim.finish(&stored.artifact_hash, &stored_version_name);
     }
     Ok(Json(AppArtifactDeployResponse {
         ok: true,

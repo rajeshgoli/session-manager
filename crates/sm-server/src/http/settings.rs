@@ -48,7 +48,7 @@ pub(super) async fn put_settings(
             .get("autopm")
             .map(|_| state.session_store.owner_settings())
             .transpose()?
-            .map(|settings| crate::autopm::Settings::from_owner(&settings));
+            .map(|settings| autopm::typed(&state, &settings));
         let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
         // Store and apply under the live policy's lock, so overlapping PUTs
         // cannot leave admission on older limits than the stored ones.
@@ -90,7 +90,7 @@ pub(super) async fn put_settings(
             board::request_recompute(&state);
         }
         if let Some(before) = autopm_before {
-            let after = crate::autopm::Settings::from_owner(&settings);
+            let after = autopm::typed(&state, &settings);
             autopm::on_settings_change(&state, &before, &after);
         }
         Ok(with_switches(

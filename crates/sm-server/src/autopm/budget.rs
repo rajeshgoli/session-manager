@@ -698,21 +698,27 @@ fn open_window(
         "repo != ?1 AND provider = ?2 AND released_at_ms IS NULL AND window_start != ?3",
         &[&STANDING_REPO, &provider, &sample.window_start],
     )?;
+    // Reservations move with the window even while the auto PM is off, so
+    // re-enabling later finds them in the current one; messages and the
+    // standing reservations wait for it to be on.
     let mut effects = Vec::new();
-    if !settings.enabled {
-        return Ok(effects);
-    }
-    let holders = experiments::stoppable_holders(conn).map_err(fail_to_anyhow)?;
+    let holders = if settings.enabled {
+        experiments::stoppable_holders(conn).map_err(fail_to_anyhow)?
+    } else {
+        Vec::new()
+    };
     if skip {
         conn.execute(
             "UPDATE autopm_reservations SET suspended_at_ms = COALESCE(suspended_at_ms, ?3)
              WHERE repo != ?1 AND provider = ?2 AND released_at_ms IS NULL",
             params![STANDING_REPO, provider, now],
         )?;
-        effects.extend(safe_stop(
-            &format!("[sm autopm] this {provider} window is skipped: reach a safe stop"),
-            &holders,
-        ));
+        if settings.enabled {
+            effects.extend(safe_stop(
+                &format!("[sm autopm] this {provider} window is skipped: reach a safe stop"),
+                &holders,
+            ));
+        }
         return Ok(effects);
     }
     for r in open {
@@ -739,6 +745,9 @@ fn open_window(
                 text: format!("[sm autopm] budget restored: resume #{}", r.number),
             });
         }
+    }
+    if !settings.enabled {
+        return Ok(effects);
     }
     let starved = ensure_standing(conn, usage_db, settings, provider, now)?;
     let pm_was_zero = previous.is_some_and(|(_, skipped)| skipped);
@@ -850,7 +859,8 @@ pub fn apply_skip(store: &AutopmStore, settings: &Settings, now: i64) -> Result<
                 )?;
                 effects.extend(safe_stop(
                     &format!(
-                        "[sm autopm] Rajesh skipped this {provider} window: reach a safe stop"
+                        "[sm autopm] {} skipped this {provider} window: reach a safe stop",
+                        settings.owner
                     ),
                     &holders,
                 ));
@@ -1095,10 +1105,9 @@ pub fn review_gate(
         let Some(b) = balance(&tx, usage, settings, step.provider, now)? else {
             return Ok(ReviewGate::Wait(None));
         };
-        if b.allowance <= 0.0 {
-            return Ok(ReviewGate::Wait(None));
-        }
-        if b.left(REVIEWS) <= 0.0 {
+        // No allowance means no review reservation either: both move on to
+        // a funded fallback, or wait for the next window.
+        if b.allowance <= 0.0 || b.left(REVIEWS) <= 0.0 {
             for later in step.later {
                 if let Some(other) = balance(&tx, usage, settings, later, now)? {
                     if other.allowance > 0.0 && other.left(REVIEWS) > 0.0 {

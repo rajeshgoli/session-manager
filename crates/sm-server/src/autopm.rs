@@ -156,11 +156,18 @@ pub struct Settings {
     pub pm_points: BTreeMap<String, f64>,
     pub review_points: BTreeMap<String, f64>,
     pub app_updates_per_week: i64,
+    /// The owner's name for messages (`owner_name` in config).
+    pub owner: String,
 }
 
 pub const PROVIDERS: [&str; 2] = ["claude", "codex"];
 
 impl Settings {
+    pub fn with_owner(mut self, owner: &str) -> Self {
+        self.owner = owner.to_owned();
+        self
+    }
+
     /// From the effective owner settings object.
     pub fn from_owner(settings: &Value) -> Self {
         let autopm = &settings["autopm"];
@@ -181,6 +188,7 @@ impl Settings {
             pm_points: points("pm_points"),
             review_points: points("review_points"),
             app_updates_per_week: autopm["app_updates_per_week"].as_i64().unwrap_or(1),
+            owner: crate::config::DEFAULT_OWNER_NAME.to_owned(),
         }
     }
 }
@@ -411,27 +419,31 @@ pub fn week_start_ms(now: i64) -> i64 {
 impl AutopmStore {
     /// The app-deploy cap (B.3): a session holding a live claim on a ticket
     /// under #2170 is refused 429 `app_update_cap` once this week already
-    /// holds `app_updates_per_week` autopm deploys. Returns the ticket a
-    /// counted deploy belongs to. Off while the auto PM is off.
-    pub fn check_app_deploy(
+    /// holds `app_updates_per_week` autopm deploys. The slot is claimed in
+    /// the same transaction as the count, so two concurrent deploys cannot
+    /// both fit; [`Self::finish_app_deploy`] fills it once the APK is stored
+    /// and [`Self::release_app_deploy`] frees it if the deploy fails.
+    /// Off while the auto PM is off.
+    pub fn claim_app_deploy(
         &self,
         settings: &Settings,
         session_id: &str,
         now: i64,
-    ) -> Out<Option<i64>> {
+    ) -> Out<Option<DeploySlot>> {
         if !settings.enabled {
             return Ok(None);
         }
-        let conn = self.open()?;
-        let under = tickets_under_goal(&conn)?;
-        let Some(ticket) = goal_claims(&conn, &under)?
+        let mut conn = self.open()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let under = tickets_under_goal(&tx)?;
+        let Some(ticket) = goal_claims(&tx, &under)?
             .into_iter()
             .find(|claim| claim.live && claim.session_id == session_id && claim.number != GOAL)
             .map(|claim| claim.number)
         else {
             return Ok(None);
         };
-        let count: i64 = conn.query_row(
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM autopm_app_deploys WHERE at_ms >= ?1",
             [week_start_ms(now)],
             |row| row.get(0),
@@ -446,9 +458,35 @@ impl AutopmStore {
             }
             .into());
         }
-        Ok(Some(ticket))
+        tx.execute(
+            "INSERT INTO autopm_app_deploys(at_ms, repo, number, apk_hash) VALUES (?1, ?2, ?3, '')",
+            params![now, REPO, ticket],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(DeploySlot { id, ticket }))
     }
 
+    pub fn finish_app_deploy(
+        &self,
+        slot: &DeploySlot,
+        apk_hash: &str,
+        version_name: &str,
+    ) -> Result<()> {
+        self.open()?.execute(
+            "UPDATE autopm_app_deploys SET apk_hash = ?2, version_name = ?3 WHERE id = ?1",
+            params![slot.id, apk_hash, version_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_app_deploy(&self, slot: &DeploySlot) -> Result<()> {
+        self.open()?
+            .execute("DELETE FROM autopm_app_deploys WHERE id = ?1", [slot.id])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn record_app_deploy(
         &self,
         number: i64,
@@ -463,6 +501,13 @@ impl AutopmStore {
         )?;
         Ok(())
     }
+}
+
+/// A claimed weekly app-deploy slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploySlot {
+    pub id: i64,
+    pub ticket: i64,
 }
 
 /// `autopm_fixes` row.

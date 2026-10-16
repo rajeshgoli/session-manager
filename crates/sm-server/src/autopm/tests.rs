@@ -117,7 +117,7 @@ fn temp_dir(name: &str) -> PathBuf {
 fn enabled_settings() -> Settings {
     let mut owner = crate::owner_settings::defaults();
     owner["autopm"]["enabled"] = json!(true);
-    Settings::from_owner(&owner)
+    Settings::from_owner(&owner).with_owner("Rajesh")
 }
 
 impl Fixture {
@@ -465,6 +465,11 @@ fn a_held_switch_refuses_the_role_and_the_owner_turning_it_on_clears_held() {
     let role = experiments::set_switch(&f.ctx(), Actor::Autopm, "autopm.card", true, None);
     let refused = refusal(role.unwrap_err());
     assert_eq!(refused.message(), "held: only Rajesh can turn this back on");
+    // Not even the owner switches on a change that is still being built.
+    f.set_state("x-2026w43-card", "building");
+    let building = experiments::set_switch(&f.ctx(), Actor::Owner, "autopm.card", true, None);
+    assert_eq!(gate_of(building), "not_dark");
+    f.set_state("x-2026w43-card", "dark");
     let (row, _) =
         experiments::set_switch(&f.ctx(), Actor::Owner, "autopm.card", true, None).unwrap();
     assert!(row.on && !row.held);
@@ -566,7 +571,7 @@ fn owner_switching_a_reverted_change_back_on_relives_it_and_cancels_its_cleanup(
         .is_some());
     // A PR opened for the cancelled cleanup afterwards is held too.
     f.link(4040, 4042);
-    let holds = experiments::cancelled_cleanup_prs(&f.conn()).unwrap();
+    let holds = experiments::cancelled_cleanup_prs(&f.conn(), "Rajesh").unwrap();
     assert!(holds
         .iter()
         .any(|e| matches!(e, Effect::MergeHold { pr: 4042, .. })));
@@ -1049,24 +1054,30 @@ fn the_app_deploy_cap_refuses_the_second_autopm_deploy_and_leaves_other_agents_a
     f.under(3001, GOAL);
     f.under(3004, 3001);
     f.claim(3004, "app-agent", T0, true);
-    let check =
-        |settings: &Settings, session: &str, at| f.store.check_app_deploy(settings, session, at);
-    assert_eq!(check(&f.settings, "app-agent", T0).unwrap(), Some(3004));
-    f.store
-        .record_app_deploy(3004, "apk1", Some("0.5.70"), T0)
-        .unwrap();
-    let refused = refusal(check(&f.settings, "app-agent", T0 + 1).unwrap_err());
+    let claim =
+        |settings: &Settings, session: &str, at| f.store.claim_app_deploy(settings, session, at);
+    let slot = claim(&f.settings, "app-agent", T0).unwrap().unwrap();
+    assert_eq!(slot.ticket, 3004);
+    // A second deploy, even while the first is still uploading, is over.
+    let refused = refusal(claim(&f.settings, "app-agent", T0 + 1).unwrap_err());
     assert_eq!(
         (refused.status, refused.gate.as_str()),
         (429, "app_update_cap")
     );
-    assert_eq!(check(&f.settings, "someone-else", T0 + 1).unwrap(), None);
+    // A failed deploy frees its slot; a stored one keeps it.
+    f.store.release_app_deploy(&slot).unwrap();
+    let slot = claim(&f.settings, "app-agent", T0 + 2).unwrap().unwrap();
+    f.store.finish_app_deploy(&slot, "apk1", "0.5.70").unwrap();
+    assert!(claim(&f.settings, "app-agent", T0 + 3).is_err());
+    assert_eq!(claim(&f.settings, "someone-else", T0 + 3).unwrap(), None);
     assert_eq!(
-        check(&f.settings, "app-agent", T0 + 8 * DAY_MS).unwrap(),
+        claim(&f.settings, "app-agent", T0 + 8 * DAY_MS)
+            .unwrap()
+            .map(|slot| slot.ticket),
         Some(3004),
         "a new week"
     );
     let mut off = f.settings.clone();
     off.enabled = false;
-    assert_eq!(check(&off, "app-agent", T0 + 1).unwrap(), None);
+    assert_eq!(claim(&off, "app-agent", T0 + 1).unwrap(), None);
 }

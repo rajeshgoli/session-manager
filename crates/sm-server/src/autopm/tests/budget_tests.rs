@@ -535,4 +535,32 @@ fn autopm_reviews_serialize_per_provider_skip_a_spent_provider_and_exempt_revert
         ReviewGate::Proceed,
         "nothing applies while off"
     );
+    // A provider with no allowance moves on to a funded fallback.
+    f.conn()
+        .execute("DELETE FROM autopm_review_charges", [])
+        .unwrap();
+    let mut no_claude = s.clone();
+    no_claude.dedicated.insert("claude".into(), 0.0);
+    assert_eq!(
+        gate(&no_claude, "r6", 900, "claude", &["codex".to_owned()]),
+        ReviewGate::Skip("claude autopm review budget spent".into())
+    );
+}
+
+#[test]
+fn a_window_turning_over_while_auto_pm_is_off_still_moves_open_reservations() {
+    let mut f = Fixture::new("rollover-off");
+    f.settings.dedicated.insert("codex".into(), 6.0);
+    f.window("codex", W0, 10.0, W0 + HOUR_MS);
+    budget::sync_windows(&f.store, &f.settings, W0 + HOUR_MS).unwrap();
+    budget::admit(&f.store, &f.settings, "codex", 3005, 1.0, W0 + DAY_MS).unwrap();
+    let w1 = W0 + 7 * DAY_MS;
+    f.window("codex", w1, 1.0, w1 + HOUR_MS);
+    let mut off = f.settings.clone();
+    off.enabled = false;
+    budget::tick(&f.store, &off, w1 + HOUR_MS, &no_provider).unwrap();
+    budget::on_enable(&f.store, &f.settings, w1 + 2 * HOUR_MS).unwrap();
+    let holds = budget::holds(&f.conn(), "codex", &format_ms(w1)).unwrap();
+    assert!(holds.iter().any(|r| r.number == 3005), "{holds:?}");
+    assert_eq!(holds.len(), 3, "the ticket, then pm and reviews on enable");
 }

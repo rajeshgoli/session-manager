@@ -857,18 +857,27 @@ pub fn set_switch(
         }
         (_, true) if x.state == "dark" => {
             if actor != Actor::Owner && row.held {
-                return Err(refuse("held", "only Rajesh can turn this back on"));
+                return Err(refuse(
+                    "held",
+                    format!("only {} can turn this back on", ctx.settings.owner),
+                ));
             }
             go_live(ctx, actor, &x, true)?;
         }
-        (Actor::Owner, true) => {
+        // A live, measuring or kept change whose switch the guard or kill
+        // switch held: the owner turns it back on. Any other state has no
+        // gate-free way on.
+        (Actor::Owner, true) if matches!(x.state.as_str(), "live" | "measuring" | "kept") => {
             let conn = ctx.store.open()?;
             switches::write(&conn, key, true, Some(false), "owner", reason, ctx.now)?;
             ctx.switches.reload(&conn)?;
         }
         (_, true) => {
-            if row.held {
-                return Err(refuse("held", "only Rajesh can turn this back on"));
+            if actor != Actor::Owner && row.held {
+                return Err(refuse(
+                    "held",
+                    format!("only {} can turn this back on", ctx.settings.owner),
+                ));
             }
             return Err(refuse(
                 "not_dark",
@@ -882,11 +891,11 @@ pub fn set_switch(
             let by = changed_by(actor);
             if matches!(x.state.as_str(), "live" | "measuring" | "kept") {
                 let cause = if actor == Actor::Owner {
-                    "Rajesh switched it off"
+                    format!("{} switched it off", ctx.settings.owner)
                 } else {
-                    "auto PM switched off"
+                    "auto PM switched off".to_owned()
                 };
-                effects = reverse(&tx, &x, cause, by, false, ctx.now)?;
+                effects = reverse(&tx, &x, &cause, by, false, ctx.now)?;
             } else {
                 switches::write(&tx, key, false, None, by, reason, ctx.now)?;
             }
@@ -909,6 +918,7 @@ fn reenable(ctx: &Ctx<'_>, x: &Experiment, key: &str) -> Out<Vec<Effect>> {
             "Auto PM is off; turn Auto PM on first",
         ));
     }
+    let reenabled = format!("{} re-enabled the change", ctx.settings.owner);
     let mut conn = ctx.store.open()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     switches::write(
@@ -917,7 +927,7 @@ fn reenable(ctx: &Ctx<'_>, x: &Experiment, key: &str) -> Out<Vec<Effect>> {
         true,
         Some(false),
         "owner",
-        Some("Rajesh re-enabled the change"),
+        Some(&reenabled),
         ctx.now,
     )?;
     tx.execute(
@@ -939,26 +949,28 @@ fn reenable(ctx: &Ctx<'_>, x: &Experiment, key: &str) -> Out<Vec<Effect>> {
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut effects = vec![Effect::WakeAutopm {
-        text: format!("[sm autopm] Rajesh re-enabled {}: live again", x.id),
+        text: format!("[sm autopm] {reenabled}: {} is live again", x.id),
     }];
     for number in cleanups {
         tx.execute(
             "UPDATE autopm_fixes SET cancelled_at_ms = ?3 WHERE repo = ?1 AND number = ?2",
             params![super::REPO, number, ctx.now],
         )?;
-        effects.extend(cancelled_cleanup_holds(&tx, number)?);
+        effects.extend(cancelled_cleanup_holds(&tx, number, &reenabled)?);
         effects.push(Effect::CloseIssue {
             number,
-            comment: "Rajesh re-enabled the change".into(),
+            comment: reenabled.clone(),
         });
         effects.push(Effect::CancelAutoStart {
             number,
-            reason: "Rajesh re-enabled the change".into(),
+            reason: reenabled.clone(),
         });
         for session_id in super::live_holders(&tx, number)? {
             effects.push(Effect::Message {
                 session_id,
-                text: "[sm autopm] cleanup cancelled: Rajesh re-enabled the change. Close your PR unmerged and stop".into(),
+                text: format!(
+                    "[sm autopm] cleanup cancelled: {reenabled}. Close your PR unmerged and stop"
+                ),
             });
         }
     }
@@ -968,19 +980,19 @@ fn reenable(ctx: &Ctx<'_>, x: &Experiment, key: &str) -> Out<Vec<Effect>> {
 }
 
 /// Merge holds for every PR linked to a cancelled cleanup ticket.
-fn cancelled_cleanup_holds(conn: &Connection, number: i64) -> Out<Vec<Effect>> {
+fn cancelled_cleanup_holds(conn: &Connection, number: i64, why: &str) -> Out<Vec<Effect>> {
     Ok(linked_prs(conn, number)?
         .into_iter()
         .map(|pr| Effect::MergeHold {
             pr,
-            reason: format!("cleanup #{number} was cancelled: Rajesh re-enabled the change"),
+            reason: format!("cleanup #{number} was cancelled: {why}"),
         })
         .collect())
 }
 
 /// Holds on PRs linked to cancelled cleanup tickets, including PRs opened
 /// after the cancellation. The HTTP layer places each once.
-pub fn cancelled_cleanup_prs(conn: &Connection) -> Out<Vec<Effect>> {
+pub fn cancelled_cleanup_prs(conn: &Connection, owner: &str) -> Out<Vec<Effect>> {
     let numbers: Vec<i64> = {
         let mut stmt = conn.prepare(
             "SELECT number FROM autopm_fixes WHERE repo = ?1 AND kind = 'cleanup'
@@ -991,7 +1003,11 @@ pub fn cancelled_cleanup_prs(conn: &Connection) -> Out<Vec<Effect>> {
     };
     let mut effects = Vec::new();
     for number in numbers {
-        effects.extend(cancelled_cleanup_holds(conn, number)?);
+        effects.extend(cancelled_cleanup_holds(
+            conn,
+            number,
+            &format!("{owner} re-enabled the change"),
+        )?);
     }
     Ok(effects)
 }
@@ -1159,7 +1175,10 @@ pub fn patch(
                 if actor != Actor::Owner {
                     return Err(refuse(
                         "owner_answer",
-                        "only Rajesh's yes moves a shadow experiment to building",
+                        format!(
+                            "only {}'s yes moves a shadow experiment to building",
+                            ctx.settings.owner
+                        ),
                     ));
                 }
                 set_state(&tx, id, "building", None, ctx.now)?;
@@ -1178,11 +1197,11 @@ pub fn patch(
             }
             ("live" | "measuring" | "kept", "reverted") => {
                 let cause = if actor == Actor::Owner {
-                    "Rajesh asked to revert it"
+                    format!("{} asked to revert it", ctx.settings.owner)
                 } else {
-                    "auto PM reverted it"
+                    "auto PM reverted it".to_owned()
                 };
-                effects = reverse(&tx, &x, cause, changed_by(actor), false, ctx.now)?;
+                effects = reverse(&tx, &x, &cause, changed_by(actor), false, ctx.now)?;
             }
             ("building", "dark") | ("rolling_back", "reverted") | ("live", "measuring") => {
                 return Err(refuse("server_only", "sm makes this move itself"));
@@ -1297,10 +1316,14 @@ pub fn vote(
     let mut effects = Vec::new();
     if !up {
         if matches!(x.state.as_str(), "live" | "measuring" | "kept") {
-            effects = reverse(&tx, &x, "Rajesh voted 👎", "feedback", true, ctx.now)?;
+            let cause = format!("{} voted 👎", ctx.settings.owner);
+            effects = reverse(&tx, &x, &cause, "feedback", true, ctx.now)?;
         } else {
             effects.push(Effect::WakeAutopm {
-                text: format!("[sm autopm] Rajesh voted 👎 on {id} ({})", x.state),
+                text: format!(
+                    "[sm autopm] {} voted 👎 on {id} ({})",
+                    ctx.settings.owner, x.state
+                ),
             });
         }
     }
@@ -1332,13 +1355,15 @@ pub fn disable(ctx: &Ctx<'_>) -> Out<Vec<Effect>> {
             )?;
         }
     }
-    let text =
-        "[sm autopm] disabled by Rajesh: push work in progress, comment on your ticket, stop";
-    let mut effects = vec![Effect::WakeAutopm { text: text.into() }];
+    let text = format!(
+        "[sm autopm] disabled by {}: push work in progress, comment on your ticket, stop",
+        ctx.settings.owner
+    );
+    let mut effects = vec![Effect::WakeAutopm { text: text.clone() }];
     for (_, session_id) in stoppable_holders(&tx)? {
         effects.push(Effect::Message {
             session_id,
-            text: text.into(),
+            text: text.clone(),
         });
     }
     tx.commit()?;
@@ -1444,7 +1469,8 @@ fn check_dark(
     let needed: Vec<String> = {
         let placeholders = tickets.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT version_name FROM autopm_app_deploys WHERE repo = ? AND number IN ({placeholders})"
+            "SELECT version_name FROM autopm_app_deploys
+             WHERE repo = ? AND apk_hash != '' AND number IN ({placeholders})"
         ))?;
         let mut values: Vec<rusqlite::types::Value> = vec![super::REPO.to_owned().into()];
         values.extend(tickets.iter().map(|t| rusqlite::types::Value::Integer(*t)));
