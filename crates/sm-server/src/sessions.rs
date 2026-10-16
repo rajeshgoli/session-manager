@@ -7281,6 +7281,31 @@ impl SessionStore {
         }
     }
 
+    /// Server-only authorization for a seat started by the Auto PM cycle launcher.
+    /// Call before delivering its brief; no HTTP route exposes this operation.
+    pub fn authorize_autopm_seat(&self, session_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("Auto PM seat {session_id} not found"))?;
+        if raw_session_is_stopped(session) {
+            anyhow::bail!("Cannot authorize a stopped Auto PM seat");
+        }
+        session.insert("autopm_authorized".into(), Value::Bool(true));
+        self.write_raw_json_value(&state)
+    }
+
+    pub fn is_authorized_autopm_seat(&self, session_id: &str) -> Result<bool> {
+        let state = self.load_raw_json_value()?;
+        Ok(
+            raw_session_object(&state, session_id).is_some_and(|session| {
+                session.get("autopm_authorized").and_then(Value::as_bool) == Some(true)
+                    && !raw_session_is_stopped(session)
+            }),
+        )
+    }
+
     pub fn register_agent_role(
         &self,
         session_id: &str,
@@ -7386,6 +7411,17 @@ impl SessionStore {
         if session.is_stopped() {
             return Ok(RegistryMutationOutcome::Conflict(
                 "Stopped sessions cannot register roles".to_owned(),
+            ));
+        }
+
+        if normalized_role == crate::autopm::ROLE
+            && raw_session_object(&state, session_id)
+                .and_then(|session| session.get("autopm_authorized"))
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Ok(RegistryMutationOutcome::Conflict(
+                "Only a server-started Auto PM seat may register autopm".into(),
             ));
         }
 
@@ -17370,7 +17406,7 @@ fn default_delivery_mode() -> String {
     "sequential".to_owned()
 }
 
-fn normalize_role(role: &str) -> String {
+pub fn normalize_role(role: &str) -> String {
     let mut normalized = String::new();
     let mut last_was_dash = false;
     for ch in role.trim().chars().flat_map(char::to_lowercase) {

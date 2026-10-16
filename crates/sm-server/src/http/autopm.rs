@@ -3,11 +3,10 @@
 //! deploy limits, the health guard's counters, and the minute ticker that
 //! runs the guard, the budget upkeep and sm's own experiment moves.
 //!
-//! The routes the autopm role will call (sm#2175) are owner-only until that
-//! role exists: the owner's app or browser login, or loopback without an
-//! agent header.
+//! The owner and authenticated live autopm role holder may use the control routes.
 
 use super::*;
+pub(super) mod role;
 use crate::autopm::budget::{self, ReviewGate, ReviewStep};
 use crate::autopm::experiments::{self, Ctx, Git, Pull};
 use crate::autopm::{self, guard, switches, Actor, AutopmStore, Effect, Fail, Paths, Settings};
@@ -16,7 +15,7 @@ use futures_util::FutureExt;
 use rusqlite::OptionalExtension;
 
 const EXPERIMENT_TICK: Duration = Duration::from_secs(300);
-const OWNER_ONLY: &str = "autopm routes are owner-only until the autopm role exists";
+const OWNER_ONLY: &str = "requires the owner";
 
 pub(super) fn store(state: &AppState) -> AutopmStore {
     let config = &state.config;
@@ -282,7 +281,7 @@ pub(super) async fn list_switches(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    role::actor(&state, &request)?;
     blocking(move || {
         let rows = switches::load(&store(&state).open()?)?;
         Ok(Json(json!({
@@ -300,7 +299,7 @@ pub(super) async fn put_switch(
     Path(key): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    let actor = role::actor(&state, &request)?;
     ensure_core_writes_enabled(&state)?;
     let body = json_body(request).await?;
     let on = body["on"].as_bool().ok_or_else(|| ApiError::Status {
@@ -313,7 +312,7 @@ pub(super) async fn put_switch(
         let settings = settings(&state)?;
         let (row, effects) = experiments::set_switch(
             &ctx(&state, &store, &settings),
-            Actor::Owner,
+            actor,
             &key,
             on,
             reason.as_deref(),
@@ -332,7 +331,7 @@ pub(super) async fn list_experiments(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    role::actor(&state, &request)?;
     blocking(move || {
         let experiments =
             experiments::list(&store(&state).open()?).map_err(|e| ApiError::Internal(e.into()))?;
@@ -347,7 +346,7 @@ pub(super) async fn get_experiment(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    role::actor(&state, &request)?;
     blocking(move || {
         let conn = store(&state).open()?;
         let experiment = experiments::get(&conn, &id)
@@ -386,13 +385,13 @@ pub(super) async fn create_experiment(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    owner_only(&state, &request)?;
+    let actor = role::actor(&state, &request)?;
     ensure_core_writes_enabled(&state)?;
     let body = json_body(request).await?;
     blocking(move || {
         let store = store(&state);
         let settings = settings(&state)?;
-        let experiment = experiments::create(&ctx(&state, &store, &settings), Actor::Owner, &body)
+        let experiment = experiments::create(&ctx(&state, &store, &settings), actor, &body)
             .map_err(api_error)?;
         Ok((
             StatusCode::CREATED,
@@ -408,14 +407,14 @@ pub(super) async fn patch_experiment(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    let actor = role::actor(&state, &request)?;
     ensure_core_writes_enabled(&state)?;
     let body = json_body(request).await?;
     blocking(move || {
         let store = store(&state);
         let settings = settings(&state)?;
         let (experiment, effects) =
-            experiments::patch(&ctx(&state, &store, &settings), Actor::Owner, &id, &body)
+            experiments::patch(&ctx(&state, &store, &settings), actor, &id, &body)
                 .map_err(api_error)?;
         run_effects(&state, effects);
         Ok(Json(json!({ "experiment": experiment })))
@@ -429,13 +428,13 @@ pub(super) async fn experiment_live(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    let actor = role::actor(&state, &request)?;
     ensure_core_writes_enabled(&state)?;
     blocking(move || {
         let store = store(&state);
         let settings = settings(&state)?;
         let experiment =
-            experiments::go_live_switchless(&ctx(&state, &store, &settings), Actor::Owner, &id)
+            experiments::go_live_switchless(&ctx(&state, &store, &settings), actor, &id)
                 .map_err(api_error)?;
         Ok(Json(json!({ "experiment": experiment })))
     })
@@ -447,7 +446,7 @@ pub(super) async fn get_budget(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    owner_only(&state, &request)?;
+    role::actor(&state, &request)?;
     blocking(move || {
         let store = store(&state);
         let settings = settings(&state)?;

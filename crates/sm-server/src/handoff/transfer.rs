@@ -314,6 +314,7 @@ impl SessionStore {
         }
         let inherited = [
             policy::OVERRIDE_KEY,
+            "autopm_authorized",
             "is_em",
             "role",
             "context_monitor_enabled",
