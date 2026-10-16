@@ -443,6 +443,9 @@ fn authorization_current(
     {
         return Ok(false);
     }
+    if !super::autopm::actions::may_dispatch(state, record)? {
+        return Ok(false);
+    }
     if new_agent_settings(state)?.auto_start_paused {
         return Ok(false);
     }

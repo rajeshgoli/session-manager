@@ -6,6 +6,7 @@
 //! The owner and authenticated live autopm role holder may use the control routes.
 
 use super::*;
+pub(super) mod actions;
 pub(super) mod cycles;
 pub(super) mod role;
 use crate::autopm::budget::{self, ReviewGate, ReviewStep};
@@ -1006,6 +1007,9 @@ pub(super) fn minute(
         );
     }
     run_effects(state, effects);
+    if let Err(error) = actions::tick(state) {
+        eprintln!("autopm decision upkeep failed: {error:#}");
+    }
     cycles::tick(state, autopm::now_ms())?;
     Ok(())
 }

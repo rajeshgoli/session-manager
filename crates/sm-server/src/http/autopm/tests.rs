@@ -555,3 +555,58 @@ async fn autopm_routes_use_role_actor_and_preserve_owner_only_feedback() {
         StatusCode::FORBIDDEN
     );
 }
+
+#[tokio::test]
+async fn autopm_action_routes_refuse_other_callers_and_validate_before_effects() {
+    let state = role_state();
+    state.session_store.authorize_autopm_seat("pm").unwrap();
+    state
+        .session_store
+        .register_agent_role(
+            "pm",
+            RoleRegistrationRequest {
+                requester_session_id: "pm".into(),
+                role: "autopm".into(),
+            },
+        )
+        .unwrap();
+    let app = router(state);
+    for (method, path) in [
+        (Method::POST, "/autopm/issues"),
+        (Method::PUT, "/autopm/auto-start"),
+        (Method::POST, "/autopm/ask"),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(role_request(
+                    method.clone(),
+                    path,
+                    "other",
+                    "other-secret",
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(local_request(method, path, Body::from("{}")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let (status,body)=response_json(app.clone().oneshot(role_request(Method::POST,"/autopm/ask","pm","pm-secret",
+        json!({"decisions":[{"experiment_id":"a","text":"x"},{"experiment_id":"b","text":"x"},{"experiment_id":"c","text":"x"},{"experiment_id":"d","text":"x"}]}))).await.unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("too_many_decisions:"));
+    let (status,_)=response_json(app.oneshot(role_request(Method::POST,"/autopm/issues","pm","pm-secret",
+        json!({"request_id":"request1","title":"x","body":"Tier: Mid\nside effects: none","kind":"fix"}))).await.unwrap()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "disabled Auto PM cannot file");
+}
