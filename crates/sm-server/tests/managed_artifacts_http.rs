@@ -401,6 +401,59 @@ async fn managed_artifacts_investigate_spawns_once_and_report_finishes() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reported}");
     assert!(reported["investigating"].is_null());
+    // Reporting clears artifact metadata, but the cleanup registration persists.
+    let claims = WorkClaimStore::new(f.dir.join("queue.db"));
+    let conn = rusqlite::Connection::open(f.dir.join("queue.db")).unwrap();
+    let path: String = conn
+        .query_row(
+            "SELECT path FROM investigation_worktrees WHERE session_id = ?1",
+            [child],
+            |row| row.get(0),
+        )
+        .unwrap();
+    use sm_server::work_claims::worktrees::{run_worktree_cleanup, CleanupRequest, CleanupSession};
+    let mut sessions = [CleanupSession {
+        id: child.into(),
+        name: "investigator".into(),
+        working_dir: path.clone(),
+        retired: false,
+        stopped: false,
+        retired_at: None,
+        local: true,
+    }];
+    assert!(run_worktree_cleanup(
+        &claims,
+        CleanupRequest {
+            sessions: &sessions,
+            ..Default::default()
+        }
+    )
+    .unwrap()
+    .is_empty());
+    assert!(std::path::Path::new(&path).exists());
+    sessions[0].retired = true;
+    sessions[0].stopped = true;
+    sessions[0].retired_at = Some(
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let outcomes = run_worktree_cleanup(
+        &claims,
+        CleanupRequest {
+            sessions: &sessions,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome.path == path && outcome.removed),
+        "{outcomes:?}"
+    );
+    assert!(!std::path::Path::new(&path).exists());
+
     assert!(reported["report"]["detail_json"]
         .as_str()
         .unwrap()
@@ -870,4 +923,95 @@ async fn managed_artifacts_recovered_pressure_closes_blocking_message() {
     assert!(!inbox.is_open_by_delivery_key(key).unwrap());
     f.state.managed_artifacts_pass().unwrap();
     assert!(!inbox.is_open_by_delivery_key(key).unwrap());
+}
+
+#[tokio::test]
+async fn managed_artifacts_failed_investigation_worktree_is_cleanup_candidate() {
+    use sm_server::work_claims::worktrees::{run_worktree_cleanup, CleanupRequest};
+    use std::os::unix::fs::PermissionsExt;
+    for metadata_created in [false, true] {
+        let f = Fixture::new();
+        let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
+        fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        if metadata_created {
+            // Git creates the detached worktree, then its checkout hook fails.
+            let hook = repo.join(".git/hooks/post-checkout");
+            fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        } else {
+            // A file blocks Git from creating its worktree metadata directory.
+            fs::write(repo.join(".git/worktrees"), "blocked").unwrap();
+        }
+        assert_eq!(
+            f.request(
+                "POST",
+                "/artifacts",
+                Some("maker"),
+                json!({"name":"sample","note":"inspect this dataset","project":true})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let failure = f
+            .request(
+                "POST",
+                "/artifacts/sample/owner-action",
+                Some("owner@example.com"),
+                json!({"action":"investigate"}),
+            )
+            .await;
+        assert_eq!(failure.0, StatusCode::CONFLICT, "{failure:?}");
+        let conn = rusqlite::Connection::open(f.dir.join("queue.db")).unwrap();
+        let (path, failed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT path, spawn_failed_at FROM investigation_worktrees",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(failed.is_some());
+        assert_eq!(std::path::Path::new(&path).exists(), metadata_created);
+        let detail = f
+            .request(
+                "GET",
+                "/artifacts/sample",
+                Some("owner@example.com"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(detail.0, StatusCode::OK);
+        assert!(detail.1["investigating"].is_null());
+        let claims = WorkClaimStore::new(f.dir.join("queue.db"));
+        let outcomes = run_worktree_cleanup(&claims, CleanupRequest::default()).unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome.path == path && outcome.removed == metadata_created),
+            "{outcomes:?}"
+        );
+        assert!(!std::path::Path::new(&path).exists());
+    }
 }

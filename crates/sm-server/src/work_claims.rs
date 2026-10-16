@@ -90,6 +90,13 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
         );
+        CREATE TABLE IF NOT EXISTS investigation_worktrees (
+            path TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            spawn_failed_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS worktree_keeps (
             path TEXT PRIMARY KEY,
             session_id TEXT,

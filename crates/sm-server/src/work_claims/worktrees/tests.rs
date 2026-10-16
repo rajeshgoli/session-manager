@@ -1470,3 +1470,97 @@ fn deleting_a_detached_worktree_keeps_its_commits_on_a_rescue_branch() {
     assert_eq!(deleted.rescued.as_deref(), Some("sm-rescue/wt"));
     assert_eq!(run_git(&repo.main, &["rev-parse", "sm-rescue/wt"]), head);
 }
+
+/// Investigations have no claim, and registration survives artifact report/record.
+#[test]
+fn investigation_worktrees_follow_safe_cleanup_lifecycle() {
+    let repo = Repo::new();
+    for scenario in [
+        "completed",
+        "active",
+        "dirty",
+        "unpushed",
+        "kept",
+        "failed",
+        "uncertain",
+        "remote",
+    ] {
+        let (path, base) = repo.worktree(scenario, scenario);
+        run_git(Path::new(&path), &["checkout", "--detach"]);
+        let id = format!("investigation-{scenario}");
+        repo.store
+            .register_investigation_worktree(&id, &path, REPO, &base)
+            .unwrap();
+        let mut owner = session(&id, &path, scenario != "active" && scenario != "uncertain");
+        if scenario == "remote" {
+            owner.local = false;
+        }
+        if scenario == "dirty" {
+            fs::write(Path::new(&path).join("notes"), "unsaved").unwrap();
+        }
+        if scenario == "unpushed" {
+            run_git(
+                Path::new(&path),
+                &["commit", "--allow-empty", "-m", "private"],
+            );
+        }
+        if scenario == "kept" {
+            repo.keep(&path, "retain investigation evidence");
+        }
+        if scenario == "failed" || scenario == "uncertain" {
+            repo.store.fail_investigation_worktree(&id).unwrap();
+        }
+        let sessions = if scenario == "failed" {
+            vec![]
+        } else {
+            vec![owner]
+        };
+        let outcomes = repo.recheck(&sessions);
+        let removed = matches!(scenario, "completed" | "failed");
+        assert_eq!(
+            !Path::new(&path).exists(),
+            removed,
+            "{scenario}: {outcomes:?}"
+        );
+        if removed {
+            assert!(outcomes
+                .iter()
+                .any(|result| result.path == path && result.removed));
+            let event = repo
+                .store
+                .events()
+                .unwrap()
+                .into_iter()
+                .find(|event| event.kind == REMOVED && event.payload["path"] == path)
+                .unwrap();
+            assert_eq!(event.ticket, None);
+            assert_eq!(event.pr, None);
+        } else if matches!(scenario, "active" | "uncertain" | "remote") {
+            assert!(!outcomes.iter().any(|result| result.path == path));
+        } else {
+            assert!(leftover_worktrees(&repo.store, &sessions)
+                .unwrap()
+                .iter()
+                .any(|left| left.path == path && left.ticket.is_none() && left.pr.is_none()));
+        }
+    }
+}
+
+#[test]
+fn investigation_worktree_is_preserved_while_another_session_uses_it() {
+    let repo = Repo::new();
+    let (path, base) = repo.worktree("investigation", "investigation");
+    run_git(Path::new(&path), &["checkout", "--detach"]);
+    repo.store
+        .register_investigation_worktree("investigator", &path, REPO, &base)
+        .unwrap();
+    let sessions = [
+        session("investigator", &path, true),
+        session("reader", &path, false),
+    ];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "in use by reader-agent")]
+    );
+    assert!(Path::new(&path).exists());
+}

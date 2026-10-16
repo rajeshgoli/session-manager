@@ -306,9 +306,23 @@ async fn investigate(
         &svc.config.investigate_model
     }
     .to_owned();
+    let claims = claims::work_claim_store(&state);
+    let mut reserved = false;
     let result = async {
+        let base = tokio::process::Command::new("git").arg("-C").arg(&root.repo_checkout)
+            .args(["rev-parse", "HEAD"]).output().await?;
+        if !base.status.success() {
+            return Err(ApiError::Status { status: StatusCode::CONFLICT, detail: String::from_utf8_lossy(&base.stderr).into_owned() });
+        }
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_owned();
+        // Reserve a new directory so a failed git add cannot enroll an
+        // unrelated existing worktree in cleanup.
+        tokio::fs::create_dir_all(worktree.parent().expect("worktree parent")).await?;
+        tokio::fs::create_dir(&worktree).await?;
+        reserved = true;
+        claims.register_investigation_worktree(&id, &worktree.to_string_lossy(), &root.repo, &base)?;
         let output = tokio::process::Command::new("git").arg("-C").arg(&root.repo_checkout)
-            .args(["worktree", "add", "--detach"]).arg(&worktree).arg("HEAD").output().await?;
+            .args(["worktree", "add", "--detach"]).arg(&worktree).arg(&base).output().await?;
         if !output.status.success() {
             return Err(ApiError::Status { status: StatusCode::CONFLICT, detail: String::from_utf8_lossy(&output.stderr).into_owned() });
         }
@@ -336,13 +350,12 @@ async fn investigate(
             "DELETE FROM artifact_meta WHERE key=?1 AND value=?2",
             rusqlite::params![key, id],
         )?;
-        let _ = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&root.repo_checkout)
-            .args(["worktree", "remove"])
-            .arg(&worktree)
-            .output()
-            .await;
+        if reserved {
+            // Git may fail before writing any metadata. Only remove the
+            // empty directory we reserved; real worktrees go through cleanup.
+            let _ = tokio::fs::remove_dir(&worktree).await;
+        }
+        claims.fail_investigation_worktree(&id)?;
     } else {
         artifact_store::event(
             &conn,
