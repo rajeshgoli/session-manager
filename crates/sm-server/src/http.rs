@@ -2046,6 +2046,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/requests/{id}/parts/{n}", get(backup::part))
         .route("/backup/requests/{id}/ack", post(backup::ack))
         .route("/backup/probe", post(backup::probe))
+        .route("/backup/renew", post(backup::renew))
         .route("/backup/status", get(backup::summary))
         .route("/backup/allow-deletes", post(backup::allow_deletes))
         .route("/artifacts", get(artifacts::list).post(artifacts::create))
@@ -9139,6 +9140,8 @@ async fn set_studio_ssh(
 struct ComputerEnrollmentRequest {
     name: String,
     csr_pem: String,
+    #[serde(default)]
+    headless: bool,
 }
 
 async fn enroll_browser_computer(
@@ -9175,7 +9178,11 @@ async fn enroll_browser_computer(
     let name = payload.name;
     let config = state.config.clone();
     let chain = tokio::task::spawn_blocking(move || {
-        mobile_devices::enroll_computer(&config, &user_id, &name, &payload.csr_pem)
+        if payload.headless {
+            mobile_devices::enroll_backup(&config, &user_id, &name, &payload.csr_pem)
+        } else {
+            mobile_devices::enroll_computer(&config, &user_id, &name, &payload.csr_pem)
+        }
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;

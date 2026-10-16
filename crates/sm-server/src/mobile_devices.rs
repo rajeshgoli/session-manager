@@ -182,6 +182,80 @@ pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str)
     })
 }
 
+pub fn enroll_backup(config: &AppConfig, user_id: &str, name: &str, csr: &str) -> Result<String> {
+    anyhow::ensure!(
+        config
+            .managed_artifacts
+            .backup
+            .puller_devices
+            .iter()
+            .any(|d| d == name),
+        "headless enrollment requires a configured backup puller device"
+    );
+    enroll_computer(config, user_id, name, csr)
+}
+
+pub fn renew_backup(
+    config: &AppConfig,
+    name: &str,
+    csr: &str,
+    certificate: &str,
+) -> Result<String> {
+    renew_backup_with_sync(config, name, csr, certificate, |ca_cert| {
+        ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, ca_cert)?;
+        sync_device_common_name(&config.cloudflare_access, name, DevicePolicyAction::Allow)
+    })
+}
+fn renew_backup_with_sync(
+    config: &AppConfig,
+    name: &str,
+    csr: &str,
+    certificate: &str,
+    sync: impl FnOnce(&Path) -> Result<()>,
+) -> Result<String> {
+    use crate::device_identity::{certificate_expiry, certificate_name, openssl};
+    anyhow::ensure!(
+        config
+            .managed_artifacts
+            .backup
+            .puller_devices
+            .iter()
+            .any(|d| d == name),
+        "unknown backup device"
+    );
+    anyhow::ensure!(
+        certificate_name(certificate)? == name,
+        "renewal certificate names another device"
+    );
+    let expiry = certificate_expiry(certificate)?;
+    let now = time::OffsetDateTime::now_utc();
+    anyhow::ensure!(
+        expiry > now && expiry - now <= time::Duration::days(30),
+        "certificate is not within its renewal window"
+    );
+    let ca = expand_home(&config.mobile_terminal.device_ca_cert_path);
+    openssl(
+        &[
+            "verify",
+            "-purpose",
+            "sslclient",
+            "-CAfile",
+            ca.to_str().context("CA path is not UTF-8")?,
+            "/dev/stdin",
+        ],
+        certificate,
+    )?;
+    let key = extract_public_key_from_csr_with_openssl(csr)?;
+    let certified_key = openssl(&["x509", "-pubkey", "-noout"], certificate)?;
+    anyhow::ensure!(
+        key.trim() == certified_key.trim(),
+        "renewal must retain the enrolled key"
+    );
+    let connection = open_device_db(&mobile_device_db_path(config))?;
+    let user: String = connection.query_row("SELECT user_id FROM mobile_device_enrollments WHERE common_name=?1 AND public_key_pem=?2 AND kind='computer' AND revoked_at IS NULL", params![name, key.trim()], |row| row.get(0)).context("renewal requires an active enrolled device")?;
+    enroll_computer_with_sync(config, &user, name, csr, sync)
+}
+
 fn enroll_computer_with_sync(
     config: &AppConfig,
     user_id: &str,
@@ -201,7 +275,17 @@ fn enroll_computer_with_sync(
         bail!("Device name must match [a-z0-9-]{{1,32}}");
     }
     let public_key = extract_public_key_from_csr_with_openssl(csr)?;
-    validate_mobile_terminal_proof_public_key(&public_key)?;
+    if config
+        .managed_artifacts
+        .backup
+        .puller_devices
+        .iter()
+        .any(|device| device == name)
+    {
+        validate_cloudflare_client_csr_public_key(&public_key)?;
+    } else {
+        validate_mobile_terminal_proof_public_key(&public_key)?;
+    }
     let ca_cert = expand_home(&config.mobile_terminal.device_ca_cert_path);
     let ca_key = expand_home(&config.mobile_terminal.device_ca_key_path);
     // Use the installed CA; never silently create a different trust root.
@@ -2020,6 +2104,116 @@ mod tests {
         pkcs8::{EncodePublicKey, LineEnding},
     };
 
+    #[test]
+    fn headless_backup_identity_enrollment_and_renewal_boundaries() {
+        use crate::device_identity::{openssl, Identity};
+        let dir = temporary_dir("sm-backup-identity").unwrap();
+        let mut config = AppConfig::default();
+        config.mobile_terminal.device_enrollment_db_path =
+            dir.join("devices.db").display().to_string();
+        config.mobile_terminal.device_ca_cert_path = dir.join("ca.pem").display().to_string();
+        config.mobile_terminal.device_ca_key_path = dir.join("ca.key").display().to_string();
+        config.cloudflare_access.browser.enabled = true;
+        config.cloudflare_access.browser.device_policy = true;
+        config.cloudflare_access.browser.app_id = Some("app".into());
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".into());
+        config.cloudflare_access.mobile_device_policy_id = Some("policy".into());
+        config.cloudflare_access.account_id = Some("account".into());
+        config.cloudflare_access.api_token = Some("test-token".into());
+        config.managed_artifacts.backup.puller_devices = vec!["backup-mini".into()];
+        ensure_device_ca(
+            Path::new(&config.mobile_terminal.device_ca_cert_path),
+            Path::new(&config.mobile_terminal.device_ca_key_path),
+        )
+        .unwrap();
+        let root = dir.join("identity");
+        let identity = Identity::open(&root, "backup-mini", true).unwrap();
+        let csr = identity.csr().unwrap();
+        let chain =
+            enroll_computer_with_sync(&config, "owner", "backup-mini", &csr, |_| Ok(())).unwrap();
+        identity.install(&chain).unwrap();
+        assert!(!identity.renewal_due().unwrap());
+        for name in ["private-key.pem", "certificate.pem", "identity.json"] {
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            renew_backup_with_sync(&config, "backup-mini", &csr, &chain, |_| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("renewal window")
+        );
+        let short = openssl(
+            &[
+                "x509",
+                "-req",
+                "-CA",
+                &config.mobile_terminal.device_ca_cert_path,
+                "-CAkey",
+                &config.mobile_terminal.device_ca_key_path,
+                "-set_serial",
+                "12345",
+                "-days",
+                "20",
+                "-sha256",
+            ],
+            &csr,
+        )
+        .unwrap();
+        identity.install(&short).unwrap();
+        assert!(identity.renewal_due().unwrap());
+        let calls = std::cell::Cell::new(0);
+        let renewed = renew_backup_with_sync(&config, "backup-mini", &csr, &short, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        identity.install(&renewed).unwrap();
+        assert!(!identity.renewal_due().unwrap());
+        assert!(
+            renew_backup_with_sync(&config, "backup-mini", &csr, &short, |_| anyhow::bail!(
+                "policy sync failed"
+            ))
+            .is_err()
+        );
+        let other = Identity::open(&dir.join("other"), "other", true).unwrap();
+        assert!(identity
+            .install(
+                &openssl(
+                    &[
+                        "req",
+                        "-x509",
+                        "-new",
+                        "-key",
+                        dir.join("other/private-key.pem").to_str().unwrap(),
+                        "-subj",
+                        "/CN=backup-mini",
+                        "-days",
+                        "20"
+                    ],
+                    ""
+                )
+                .unwrap()
+            )
+            .is_err());
+        assert!(renew_backup_with_sync(
+            &config,
+            "backup-mini",
+            &other.csr().unwrap(),
+            &short,
+            |_| Ok(())
+        )
+        .is_err());
+        revoke_device(&mobile_device_db_path(&config), "owner", "backup-mini").unwrap();
+        assert!(renew_backup_with_sync(&config, "backup-mini", &csr, &short, |_| Ok(())).is_err());
+        drop(identity);
+        assert!(Identity::load(&root).is_ok());
+        drop(other);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn browser_certificate_policy_preserves_email_and_settings() {
         let mut application = json!({ "id": "app", "aud": "aud", "domain": "sm.example.com", "session_duration": "24h",

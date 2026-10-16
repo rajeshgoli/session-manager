@@ -11,18 +11,29 @@ pub(super) struct DeviceArgs {
 
 #[derive(Subcommand)]
 enum DeviceCommand {
-    /// Install a non-exportable Mac certificate for browser sign-in.
-    Enroll { name: String },
+    /// Enroll a browser certificate, or a file-based backup identity with --headless.
+    Enroll {
+        name: String,
+        #[arg(long)]
+        headless: bool,
+        #[arg(long, default_value = "~/.config/session-manager/device")]
+        identity: PathBuf,
+    },
     /// Repair Chrome signing permissions on an existing Mac device key.
     RepairKeyAccess { name: String },
 }
 
 pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
     let repair = matches!(&args.command, DeviceCommand::RepairKeyAccess { .. });
-    let name = match args.command {
-        DeviceCommand::Enroll { name } | DeviceCommand::RepairKeyAccess { name } => name,
+    let (name, headless, identity) = match args.command {
+        DeviceCommand::Enroll {
+            name,
+            headless,
+            identity,
+        } => (name, headless, identity),
+        DeviceCommand::RepairKeyAccess { name } => (name, false, PathBuf::new()),
     };
-    if !cfg!(target_os = "macos") {
+    if !headless && !cfg!(target_os = "macos") {
         bail!("sm device requires macOS");
     }
     if !mobile_devices::valid_computer_name(&name) {
@@ -47,6 +58,40 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
     } else {
         Some(owner_assertion(&url)?)
     };
+    if headless {
+        let identity = sm_server::device_identity::Identity::open(
+            &sm_server::sessions::expand_home(&identity.to_string_lossy()),
+            &name,
+            true,
+        )?;
+        let csr = identity.csr()?;
+        let origin = format!("{}://{}", client.scheme, client.authority);
+        let cookie = assertion
+            .as_ref()
+            .map(|token| format!("CF_Authorization={token}"));
+        let mut headers = vec![("Origin", origin.as_str())];
+        if let Some(token) = assertion.as_deref() {
+            headers.push(("cf-access-jwt-assertion", token));
+        }
+        if let Some(cookie) = cookie.as_deref() {
+            headers.push(("Cookie", cookie));
+        }
+        let response = client
+            .request_with_headers(
+                "POST",
+                "/client/devices/enroll",
+                Some(json!({"name": name, "csr_pem": csr, "headless": true})),
+                &headers,
+            )?
+            .into_json()?;
+        identity.install(
+            response["certificate_chain_pem"]
+                .as_str()
+                .context("server returned no certificate")?,
+        )?;
+        println!("Enrolled {name} for unattended backups.");
+        return Ok(());
+    }
     with_keychain_helper(|helper| {
         let csr = helper_call(helper, "prepare", &name, None)?;
         let origin = format!("{}://{}", client.scheme, client.authority);

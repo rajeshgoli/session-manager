@@ -400,3 +400,284 @@ async fn ready_parts_use_persisted_outbox_after_configuration_change() {
         original.as_slice()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    use crate::{
+        device_identity::{openssl, Identity},
+        managed_artifacts::backup::{
+            client::Destination,
+            pull::{self, HttpRemote, Remote},
+            seed, Part,
+        },
+    };
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let mut f = Fixture::new();
+    fs::create_dir(f.dir.join("projects")).unwrap();
+    f.state
+        .config
+        .managed_artifacts
+        .backup
+        .static_paths
+        .push(f.dir.join("projects").display().to_string());
+    f.state.managed_artifacts =
+        Some(ManagedArtifacts::new(&f.state.config.managed_artifacts).unwrap());
+    let ca_key = f.dir.join("ca.key");
+    let ca_path = f.dir.join("ca.pem");
+    let ca = openssl(
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-subj",
+            "/CN=temporary-backup-test-ca",
+            "-days",
+            "1",
+        ],
+        "",
+    )
+    .unwrap();
+    fs::write(&ca_path, &ca).unwrap();
+    let server_key = f.dir.join("server.key");
+    let csr = openssl(
+        &[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ],
+        "",
+    )
+    .unwrap();
+    let extensions = f.dir.join("server.ext");
+    fs::write(
+        &extensions,
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
+    )
+    .unwrap();
+    let server_cert = openssl(
+        &[
+            "x509",
+            "-req",
+            "-CA",
+            ca_path.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-set_serial",
+            "10",
+            "-days",
+            "1",
+            "-extfile",
+            extensions.to_str().unwrap(),
+        ],
+        &csr,
+    )
+    .unwrap();
+    let identity_dir = f.dir.join("identity");
+    let identity = Identity::open(&identity_dir, "backup-mini", true).unwrap();
+    let client_cert = openssl(
+        &[
+            "x509",
+            "-req",
+            "-CA",
+            ca_path.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-set_serial",
+            "11",
+            "-days",
+            "1",
+        ],
+        &identity.csr().unwrap(),
+    )
+    .unwrap();
+    identity.install(&format!("{client_cert}\n{ca}")).unwrap();
+    drop(identity);
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca.as_bytes()).unwrap())
+        .unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap();
+    let tls = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(server_cert.as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(&fs::read(server_key).unwrap()).unwrap(),
+        )
+        .unwrap();
+    // Emulate only the trusted Access edge: TLS requires the temporary client
+    // certificate; the real application still verifies the signed assertion.
+    let assertion = super::super::tests::test_mobile_access_assertion("backup-mini");
+    let app = router(f.state.clone()).layer(axum::middleware::from_fn(
+        move |mut req: Request, next: axum::middleware::Next| {
+            let assertion = assertion.clone();
+            async move {
+                req.headers_mut()
+                    .insert(HOST, "sm-app.example.com".parse().unwrap());
+                req.headers_mut()
+                    .insert("cf-access-jwt-assertion", assertion.parse().unwrap());
+                next.run(req).await
+            }
+        },
+    ));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = axum_server::Handle::new();
+    let server = axum_server::from_tcp_rustls(
+        listener,
+        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls)),
+    )
+    .unwrap()
+    .handle(handle.clone())
+    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    let server = tokio::spawn(server);
+    let dir = f.dir.clone();
+    let manager = f.state.managed_artifacts.as_ref().unwrap().clone();
+    tokio::task::spawn_blocking(move || {
+        moves::TEST_MOUNTED.set(true);
+        let certs = |pem: &[u8]| {
+            ureq::tls::parse_pem(pem)
+                .filter_map(|item| match item.unwrap() {
+                    ureq::tls::PemItem::Certificate(c) => Some(c),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let trusted = ureq::tls::RootCerts::new_with_certs(&certs(ca.as_bytes()));
+        let client = ureq::tls::ClientCert::new_with_certs(
+            &certs(
+                fs::read(identity_dir.join("certificate.pem"))
+                    .unwrap()
+                    .as_slice(),
+            ),
+            ureq::tls::PrivateKey::from_pem(
+                &fs::read(identity_dir.join("private-key.pem")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(trusted.clone())
+                    .client_cert(Some(client))
+                    .build(),
+            )
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .into();
+        let base = format!("https://127.0.0.1:{}", address.port());
+        let no_identity: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(ureq::tls::TlsConfig::builder().root_certs(trusted).build())
+            .build()
+            .into();
+        assert!(no_identity
+            .get(format!("{base}/backup/status"))
+            .call()
+            .is_err());
+        struct Mini {
+            remote: HttpRemote,
+            manager: ManagedArtifacts,
+            interrupt: bool,
+            lose_ack: bool,
+            offsets: Vec<u64>,
+        }
+        impl Remote for Mini {
+            fn json(
+                &mut self,
+                method: &str,
+                path: &str,
+                body: Option<Value>,
+            ) -> anyhow::Result<(u16, Value)> {
+                let response = self.remote.json(method, path, body)?;
+                if method == "POST" && path == "/backup/requests" && response.0 == 202 {
+                    let id = response.1["id"].as_str().unwrap();
+                    life::prepare_request(&self.manager, id)?;
+                    return self
+                        .remote
+                        .json("GET", &format!("/backup/requests/{id}"), None);
+                }
+                if path.ends_with("/ack") && self.lose_ack {
+                    self.lose_ack = false;
+                    anyhow::bail!("injected lost ack response");
+                }
+                Ok(response)
+            }
+            fn download(
+                &mut self,
+                id: &str,
+                part: &Part,
+                offset: u64,
+                output: &mut dyn std::io::Write,
+            ) -> anyhow::Result<()> {
+                self.offsets.push(offset);
+                if self.interrupt {
+                    self.interrupt = false;
+                    let mut bytes = Vec::new();
+                    self.remote.download(id, part, offset, &mut bytes)?;
+                    output.write_all(&bytes[..7])?;
+                    anyhow::bail!("injected interrupted local write");
+                }
+                self.remote.download(id, part, offset, output)
+            }
+            fn probe(&mut self) -> anyhow::Result<Value> {
+                self.remote.probe()
+            }
+        }
+        fs::write(dir.join("data/prices"), b"original").unwrap();
+        fs::write(dir.join("data/deleted"), b"delete me").unwrap();
+        fs::write(dir.join("projects/code"), b"code").unwrap();
+        let mut dest = Destination::open(&dir.join("remote")).unwrap();
+        let seeded = seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+        fs::write(dir.join("data/prices"), b"replacement").unwrap();
+        fs::remove_file(dir.join("data/deleted")).unwrap();
+        fs::write(dir.join("projects/code"), b"new code").unwrap();
+        life::allow_deletes(&manager, "backup-mini").unwrap();
+        let mut mini = Mini {
+            remote: HttpRemote { agent, base },
+            manager,
+            interrupt: true,
+            lose_ack: true,
+            offsets: Vec::new(),
+        };
+        assert!(pull::pull(&mut dest, &mut mini).is_err());
+        assert!(pull::pull(&mut dest, &mut mini).is_err());
+        let ack = pull::pull(&mut dest, &mut mini).unwrap();
+        assert!(ack.applied);
+        assert!(mini.offsets.contains(&7));
+        assert_ne!(
+            dest.state().unwrap().confirmed.as_deref(),
+            Some(seeded.as_str())
+        );
+        assert!(dest.check().unwrap().ok);
+        assert!(!dest.root.join("plain/data/deleted").exists());
+        dest.restore(&dir.join("restored"), None, &[]).unwrap();
+        assert_eq!(
+            fs::read(dir.join("restored/data/prices")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(dir.join("restored/projects/code")).unwrap(),
+            b"new code"
+        );
+        assert!(mini.remote.probe().is_ok());
+        moves::TEST_MOUNTED.set(false);
+    })
+    .await
+    .unwrap();
+    handle.shutdown();
+    server.await.unwrap().unwrap();
+}

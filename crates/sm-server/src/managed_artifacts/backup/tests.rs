@@ -1236,3 +1236,179 @@ fn adoption_rejects_file_removed_during_preparation() {
     assert!(source.exists());
     assert!(!dest.root.join("plain/data").exists());
 }
+
+#[test]
+fn restore_requires_initialized_source_and_preserves_file_mtimes() {
+    use super::client::Destination;
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    let missing = f.dir.join("missing");
+    assert!(Destination::open_existing(&missing).is_err());
+    assert!(!missing.exists());
+    assert!(Destination::open_existing(&f.dir.join("data")).is_err());
+    assert!(!f.dir.join("data/state.db").exists());
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::write(f.dir.join("projects/code"), b"code").unwrap();
+    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_456_789);
+    for path in ["data/prices", "projects/code"] {
+        fs::File::open(f.dir.join(path))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(timestamp))
+            .unwrap();
+    }
+    let first = f.prepare("restore", None);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("restore", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("restore", &first.transfer, &staging, true, 1.0)
+        .unwrap();
+    dest.confirm("restore").unwrap();
+    drop(dest);
+    let dest = Destination::open_existing(&f.dir.join("remote")).unwrap();
+    dest.restore(&f.dir.join("restored"), None, &[]).unwrap();
+    for path in ["data/prices", "projects/code"] {
+        let source = fs::metadata(f.dir.join(path)).unwrap();
+        let restored = fs::metadata(f.dir.join("restored").join(path)).unwrap();
+        assert_eq!(
+            (restored.mtime(), restored.mtime_nsec()),
+            (source.mtime(), source.mtime_nsec())
+        );
+    }
+}
+
+#[test]
+fn seed_crash_after_source_commit_recovers_adopted_records_remotely() {
+    use super::{client::Destination, pull::Remote};
+    struct Server<'a>(&'a ManagedArtifacts);
+    impl Remote for Server<'_> {
+        fn json(
+            &mut self,
+            _: &str,
+            path: &str,
+            _: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            let id = path.rsplit('/').next().unwrap();
+            Ok((
+                200,
+                serde_json::to_value(lifecycle::status(self.0, "backup-mini", id)?)?,
+            ))
+        }
+        fn download(
+            &mut self,
+            _: &str,
+            _: &Part,
+            _: u64,
+            _: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            panic!()
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            panic!()
+        }
+    }
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.directory("existing-data").unwrap();
+    fs::copy(f.dir.join("data/prices"), source.join("prices")).unwrap();
+    seed::FAIL_AFTER_SOURCE_COMMIT.set(true);
+    assert!(
+        seed::seed_inner(&f.manager, "backup-mini", &mut dest, Some(&source))
+            .unwrap_err()
+            .to_string()
+            .contains("injected crash")
+    );
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert!(dest.records().unwrap().is_empty());
+    drop(dest);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    seed::recover_remote(&mut dest, &mut Server(&f.manager)).unwrap();
+    let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(confirmed.manifest_id.as_str())
+    );
+    assert_eq!(dest.records().unwrap(), confirmed.files);
+    assert!(dest.meta("pending_seed").unwrap().is_none());
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"prices"
+    );
+}
+
+#[test]
+fn uncommitted_seed_is_rolled_back_on_remote_recovery() {
+    use super::{client::Destination, pull::Remote};
+    struct Missing;
+    impl Remote for Missing {
+        fn json(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            Ok((
+                404,
+                serde_json::json!({"detail":"backup request not found"}),
+            ))
+        }
+        fn download(
+            &mut self,
+            _: &str,
+            _: &Part,
+            _: u64,
+            _: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            panic!()
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            panic!()
+        }
+    }
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"original").unwrap();
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let first = f.prepare("confirmed", None);
+    let staging = dest
+        .unpack("confirmed", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("confirmed", &first.transfer, &staging, true, 1.0)
+        .unwrap();
+    dest.confirm("confirmed").unwrap();
+    let original = dest.records().unwrap();
+    fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
+    let next = f.prepare("seed-interrupted", None);
+    dest.set_meta(
+        "pending_seed",
+        &serde_json::json!({"id":"seed-interrupted","manifest":next.manifest,"adoption":null})
+            .to_string(),
+    )
+    .unwrap();
+    let staging = dest
+        .unpack(
+            "seed-interrupted",
+            &next.transfer,
+            &next.parts,
+            &next.directory,
+        )
+        .unwrap();
+    dest.apply("seed-interrupted", &next.transfer, &staging, true, 1.0)
+        .unwrap();
+    drop(dest);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    seed::recover_remote(&mut dest, &mut Missing).unwrap();
+    assert_eq!(dest.records().unwrap(), original);
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some("confirmed")
+    );
+    assert!(dest.meta("pending_seed").unwrap().is_none());
+}

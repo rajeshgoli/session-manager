@@ -67,7 +67,7 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
                         .unix_timestamp())
                 })
                 .transpose()?;
-            let dest = Destination::open(&expanded(&from))?;
+            let dest = Destination::open_existing(&expanded(&from))?;
             println!(
                 "Restored {} paths.",
                 dest.restore(&expanded(&to), at, &paths)?
@@ -93,7 +93,28 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
         } => {
             let url = resolve_api_url(api_url)?;
             let identity = expanded(&identity);
+            let device = sm_server::device_identity::Identity::load(&identity)?;
             let mut remote = HttpRemote::new(&url, &identity)?;
+            if device.renewal_due()? {
+                let (status, body) = remote.json(
+                    "POST",
+                    "/backup/renew",
+                    Some(json!({
+                        "csr_pem": device.csr()?, "certificate_pem": device.certificate()?
+                    })),
+                )?;
+                ensure!(
+                    (200..300).contains(&status),
+                    "device certificate renewal failed: {status} {body}"
+                );
+                device.install(
+                    body["certificate_chain_pem"]
+                        .as_str()
+                        .context("renewal response has no certificate")?,
+                )?;
+                remote = HttpRemote::new(&url, &identity)?;
+            }
+
             let mut destination = Destination::open(&expanded(&dest))?;
             if check {
                 let (status, body) = remote.json("GET", "/backup/status", None)?;

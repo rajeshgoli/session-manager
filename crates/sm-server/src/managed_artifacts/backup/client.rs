@@ -103,6 +103,21 @@ pub(super) fn verify(path: &Path, record: &FileRecord) -> Result<()> {
     Ok(())
 }
 impl Destination {
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        ensure!(
+            path.is_dir(),
+            "backup source does not exist: {}",
+            path.display()
+        );
+        let root = fs::canonicalize(path)?;
+        ensure!(
+            safe_path(&root, "state.db", false)?.is_file()
+                && safe_path(&root, "state.json", false)?.is_file(),
+            "backup source is not initialized: {}",
+            path.display()
+        );
+        Self::open(path)
+    }
     pub fn open(path: &Path) -> Result<Self> {
         fs::create_dir_all(path)?;
         let root = fs::canonicalize(path)?;
@@ -651,6 +666,19 @@ impl Destination {
                 } else {
                     io::copy(&mut File::open(source)?, &mut writer)?;
                 }
+                let nanos = record.mtime_ns.unsigned_abs();
+                let duration = std::time::Duration::new(
+                    u64::try_from(nanos / 1_000_000_000)
+                        .context("restore timestamp out of range")?,
+                    (nanos % 1_000_000_000) as u32,
+                );
+                let modified = if record.mtime_ns < 0 {
+                    std::time::UNIX_EPOCH.checked_sub(duration)
+                } else {
+                    std::time::UNIX_EPOCH.checked_add(duration)
+                }
+                .context("restore timestamp out of range")?;
+                writer.set_times(std::fs::FileTimes::new().set_modified(modified))?;
                 writer.sync_all()?;
             }
             count += 1;
