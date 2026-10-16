@@ -228,6 +228,9 @@ pub(super) fn restores(session: &SessionRecord) -> bool {
 /// Who a reply to `session_id` goes to: an auto-retired session itself,
 /// which the send restores, else `live_recipient`'s chain.
 pub(super) fn reply_recipient(state: &AppState, session_id: &str) -> Option<SessionRecord> {
+    if session_id == "sm-artifacts" {
+        return None;
+    }
     match state.session_store.get_session(session_id).ok().flatten() {
         Some(session) if restores(&session) => Some(session),
         _ => live_recipient(state, session_id),
@@ -645,6 +648,9 @@ pub(super) async fn reply_to_owner_message(
 ) -> Result<Json<Value>, ApiError> {
     ensure_message_write_allowed(&state, &headers, peer_addr, &message_id, "reply")?;
     let message = find_message(&state, &message_id)?;
+    if message.sender_session_id == "sm-artifacts" {
+        return Err(conflict("use the artifact list"));
+    }
     let payload: ReplyRequest = docs::parse_json_body(&body)?;
     let submission_id = payload.submission_id.trim().to_owned();
     if !valid_submission_id(&submission_id) {

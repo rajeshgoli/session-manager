@@ -13,7 +13,7 @@ use crate::work_claims::{
 
 /// `gh api graphql`, parsed whatever the exit code (appendix D).
 #[derive(Debug)]
-pub(super) struct GhCliWorkItemSource;
+pub(crate) struct GhCliWorkItemSource;
 
 pub(super) fn gh_graphql_stdout(query: &str) -> Result<Vec<u8>, String> {
     let mut nonce = [0u8; 8];

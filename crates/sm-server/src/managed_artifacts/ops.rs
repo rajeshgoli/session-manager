@@ -339,6 +339,18 @@ fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
                 let manifest = archive::Manifest::read(&staging)?;
                 archive::verify_source(&source(&op.root, m)?, &manifest.entries)?;
                 tx.execute("UPDATE artifacts SET state='frozen',frozen_at=?3,frozen_bytes=?4,content_stamp=?5,data_bytes=?6 WHERE root=?1 AND name=?2",params![op.root.path,m.name,manifest.frozen_at,manifest.parts.iter().map(|p| p.output_bytes).sum::<u64>(),manifest.content_stamp,manifest.data_bytes])?;
+                let bytes = manifest
+                    .parts
+                    .iter()
+                    .map(|p| p.output_bytes)
+                    .sum::<u64>()
+                    .max(1);
+                tx.execute("UPDATE artifacts SET ratio_estimate=?3,ratio_sampled_at=?4 WHERE root=?1 AND name=?2",params![op.root.path,m.name,manifest.data_bytes as f64 / bytes as f64,now()])?;
+                store::set_meta(
+                    &tx,
+                    &format!("ratio_stamp:{}:{}", op.root.path, m.name),
+                    &manifest.content_stamp,
+                )?;
             }
         } else {
             thaw_not_written(&tx, &op.root.path, &m.name)?;
@@ -663,14 +675,8 @@ impl queue::Operations for QueueOperations {
         kick(manager.clone());
         Ok(())
     }
-    fn pressure(
-        &self,
-        _manager: &ManagedArtifacts,
-        _root: &ArtifactRoot,
-        _needed: u64,
-    ) -> Result<()> {
-        // The pressure ticket installs the pressure worker. Admission retains
-        // its durable hold and never assumes this callback freed space.
+    fn pressure(&self, manager: &ManagedArtifacts, root: &ArtifactRoot, needed: u64) -> Result<()> {
+        super::pressure::kick(manager.clone(), root.clone(), needed);
         Ok(())
     }
 }

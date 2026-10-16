@@ -97,18 +97,9 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         .any(|c| c["state"] == "UNKNOWN" && c["checked_at"].is_string()));
     value["backup_due"] =
         json!(value["backup_stamp"] != value["content_stamp"] || value["backed_up_at"].is_null());
-    value["needs_owner"] = json!(
-        value["consumer_unverifiable"] == true
-            || value["op"]
-                .as_str()
-                .is_some_and(|op| op.starts_with("rebuild_failed:"))
-            || value["delete_reason"] == "vanished"
-            || value["events"].as_array().unwrap().iter().any(|e| matches!(
-                e["kind"].as_str(),
-                Some("unclaimable" | "op_failed" | "would_delete" | "project_added")
-            ))
-            || (value["state"] == "unrecorded" && value["owner_session_id"].is_null())
-    );
+    let needs = super::needs_you::item(conn, &value)?;
+    value["needs_owner"] = json!(needs.is_some());
+    value["needs_you"] = needs.unwrap_or(Value::Null);
     Ok(value)
 }
 pub fn thaw_rate(conn: &Connection, root: &str) -> Result<f64> {

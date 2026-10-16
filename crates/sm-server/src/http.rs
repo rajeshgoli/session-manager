@@ -363,7 +363,7 @@ mod board_launch;
 mod board_links;
 mod browser_terminal;
 mod bugs;
-mod claims;
+pub(crate) mod claims;
 mod docs;
 mod follows;
 mod github;
