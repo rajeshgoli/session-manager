@@ -358,8 +358,6 @@ export function TerminalPage({ id, open }) {
     <div class="term-bar" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
-      <button type="button" class=${`icon-btn${switcher ? ' on' : ''}`} title="Agents (⌘\\)" aria-label="Agents"
-        aria-pressed=${switcher} onClick=${toggleSwitcher}><${Icon} name=${switcher ? 'fold' : 'unfold'} /></button>
       <button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>
       ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
       <span class="t">${agent ? agent.name : id}</span><span class="sub term-state">${agent ? agent.state : ''}</span>
@@ -377,11 +375,14 @@ export function TerminalPage({ id, open }) {
         onClick=${() => control.current?.redraw()}>Redraw</button>
       <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
     </div>
-    <div class=${`term-main${switcher ? ' with-switch' : ''}${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
-      ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
-        idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>`
-        : html`<button type="button" class="term-switch-strip" title="Show agents (⌘\\)" aria-label="Unfold agent list"
-            onClick=${() => { toggleSwitcher(); refocus(); }}></button>`}
+    <div class=${`term-main${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
+      <div class="term-side">
+        ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
+          idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
+        <button type="button" class="term-edge" title=${`${switcher ? 'Fold' : 'Unfold'} agent list (⌘\\)`}
+          aria-label=${`${switcher ? 'Fold' : 'Unfold'} agent list`} aria-expanded=${switcher}
+          onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>
+      </div>
       <div class="term-body" ref=${host}></div>
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
