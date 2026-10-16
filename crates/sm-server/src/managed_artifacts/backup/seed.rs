@@ -37,7 +37,95 @@ impl Drop for AdoptionMove {
         }
     }
 }
+#[derive(Serialize, Deserialize)]
+struct Journal {
+    id: String,
+    manifest: Manifest,
+    adoption: Option<(PathBuf, PathBuf)>,
+}
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_AFTER_SOURCE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+fn pending(dest: &Destination) -> Result<Option<Journal>> {
+    dest.meta("pending_seed")?
+        .map(|body| serde_json::from_str(&body).map_err(Into::into))
+        .transpose()
+}
+fn resolve(dest: &mut Destination, journal: &Journal, committed: bool) -> Result<()> {
+    if committed {
+        // A source commit can precede the adopted-record transaction or local
+        // state file. The complete manifest repairs both without the source disk.
+        for record in journal
+            .manifest
+            .files
+            .values()
+            .filter(|r| r.target.is_none())
+        {
+            super::client::verify(&dest.root.join(&record.path), record)?;
+        }
+        let tx = dest.conn.transaction()?;
+        tx.execute("DELETE FROM files", [])?;
+        for (path, record) in &journal.manifest.files {
+            tx.execute(
+                "INSERT INTO files(path,body) VALUES(?1,?2)",
+                params![path, serde_json::to_string(record)?],
+            )?;
+        }
+        tx.commit()?;
+        dest.confirm(&journal.id)?;
+    } else {
+        dest.rollback(&journal.id)?;
+        if let Some((source, target)) = &journal.adoption {
+            if target.exists() && !source.exists() {
+                fs::rename(target, source)?;
+            }
+        }
+    }
+    let incoming = dest.root.join(".incoming").join(&journal.id);
+    if incoming.exists() {
+        fs::remove_dir_all(incoming)?;
+    }
+    dest.conn
+        .execute("DELETE FROM metadata WHERE key='pending_seed'", [])?;
+    Ok(())
+}
+pub(super) fn recover_remote(
+    dest: &mut Destination,
+    remote: &mut impl super::pull::Remote,
+) -> Result<()> {
+    if let Some(journal) = pending(dest)? {
+        let (code, status) =
+            remote.json("GET", &format!("/backup/requests/{}", journal.id), None)?;
+        let committed = code == 200 && status["state"] == "acked";
+        ensure!(
+            committed || code == 404,
+            "cannot determine pending seed confirmation: {code} {status}"
+        );
+        resolve(dest, &journal, committed)?;
+    }
+    Ok(())
+}
+fn recover_local(manager: &ManagedArtifacts, device: &str, dest: &mut Destination) -> Result<()> {
+    if let Some(journal) = pending(dest)? {
+        let conn = manager.store.open()?;
+        let committed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM backup_requests WHERE id=?1 AND device=?2 AND state='acked')", params![journal.id, device], |r| r.get(0))?;
+        resolve(dest, &journal, committed)?;
+    }
+    Ok(())
+}
 pub fn seed(
+    manager: &ManagedArtifacts,
+    device: &str,
+    dest: &mut Destination,
+    adopt: Option<&Path>,
+) -> Result<String> {
+    recover_local(manager, device, dest)?;
+    let result = seed_inner(manager, device, dest, adopt);
+    if result.is_err() {
+        recover_local(manager, device, dest)?;
+    }
+    result
+}
+pub(super) fn seed_inner(
     manager: &ManagedArtifacts,
     device: &str,
     dest: &mut Destination,
@@ -133,6 +221,12 @@ pub fn seed(
         "backup head changed during seed preparation; retry"
     );
     let _incoming = SeedOutbox(dest.root.join(".incoming").join(&id));
+    let mut journal = Journal {
+        id: id.clone(),
+        manifest: prepared.manifest.clone(),
+        adoption: None,
+    };
+    dest.set_meta("pending_seed", &serde_json::to_string(&journal)?)?;
     let mut adoption_move = AdoptionMove(None);
     if let Some(adopt) = adopt {
         let plain: Vec<_> = scopes.iter().filter(|s| s.plain).collect();
@@ -192,6 +286,8 @@ pub fn seed(
                 );
                 super::client::verify(&source.join(entry.path), expected)?;
             }
+            journal.adoption = Some((source.clone(), target.clone()));
+            dest.set_meta("pending_seed", &serde_json::to_string(&journal)?)?;
             fs::rename(&source, &target)
                 .context("adopt-plain must be on the destination filesystem")?;
             adoption_move.0 = Some((source, target));
@@ -252,6 +348,10 @@ pub fn seed(
         tx.commit()?;
         source_committed = true;
         adoption_move.0 = None;
+        #[cfg(test)]
+        if FAIL_AFTER_SOURCE_COMMIT.replace(false) {
+            anyhow::bail!("injected crash after source commit");
+        }
         destination_tx.commit()?;
         Ok(())
     })();
@@ -262,7 +362,7 @@ pub fn seed(
         }
         return Err(error);
     }
-    dest.confirm(&id)?;
+    resolve(dest, &journal, true)?;
     lifecycle::expire(manager, at)?;
     if staging.exists() {
         fs::remove_dir_all(staging)?;

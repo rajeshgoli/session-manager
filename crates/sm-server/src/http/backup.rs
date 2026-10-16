@@ -124,6 +124,31 @@ fn device(request: &Request) -> Result<String, ApiError> {
         .ok_or_else(|| error(StatusCode::FORBIDDEN, "backup device identity missing"))
 }
 #[derive(Deserialize)]
+struct Renewal {
+    csr_pem: String,
+    certificate_pem: String,
+}
+pub(super) async fn renew(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let name = device(&request)?;
+    let Json(body) = Json::<Renewal>::from_request(request, &state)
+        .await
+        .map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if body.csr_pem.len() > 16_384 || body.certificate_pem.len() > 32_768 {
+        return Err(error(StatusCode::BAD_REQUEST, "renewal input too large"));
+    }
+    let config = state.config.clone();
+    let chain = tokio::task::spawn_blocking(move || {
+        mobile_devices::renew_backup(&config, &name, &body.csr_pem, &body.certificate_pem)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
+    .map_err(refusal)?;
+    Ok(Json(json!({"certificate_chain_pem":chain})))
+}
+#[derive(Deserialize)]
 struct Have {
     have: Option<String>,
 }

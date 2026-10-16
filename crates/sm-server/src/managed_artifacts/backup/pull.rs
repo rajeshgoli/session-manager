@@ -83,6 +83,7 @@ pub(super) fn pull_with_check(
     remote: &mut impl Remote,
     sunday: bool,
 ) -> Result<Ack> {
+    super::seed::recover_remote(dest, remote)?;
     let deadline = Instant::now() + Duration::from_secs(3 * 3600);
     let pending = dest.meta("pending_request")?.filter(|s| !s.is_empty());
     let mut status = if let Some(id) = pending {
