@@ -20631,6 +20631,7 @@ fn create_active_codex_review_request_fixture_db(
 fn create_queue_jobs_fixture_db(state_dir: &PathBuf) {
     fs::create_dir_all(state_dir).unwrap();
     let conn = Connection::open(state_dir.join("queue_runner.db")).unwrap();
+    sm_server::managed_artifacts::queue::init(&conn).unwrap();
     conn.execute_batch(
         r#"
         CREATE TABLE queue_jobs (
