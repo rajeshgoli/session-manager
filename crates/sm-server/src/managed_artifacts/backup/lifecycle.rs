@@ -372,7 +372,7 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
             ack.error
         ],
     )?;
-    tx.execute("INSERT INTO backup_runs(queue_job_id,started_at,finished_at,state,include_count,include_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![r["queue_job_id"].as_str(),r["created_at"].to_string(),now(),if ack.applied {"acked"}else{"failed"},load_manifest(&tx,device,id)?.files.len() as i64,ack.fetched_bytes])?;
+    tx.execute("INSERT INTO backup_runs(queue_job_id,started_at,finished_at,state,include_count,include_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![r["queue_job_id"].as_str(),time::OffsetDateTime::from_unix_timestamp(r["created_at"].as_i64().context("request creation time")?)?.format(&time::format_description::well_known::Rfc3339)?,now(),if ack.applied {"acked"}else{"failed"},load_manifest(&tx,device,id)?.files.len() as i64,ack.fetched_bytes])?;
     if ack.check.as_ref().is_some_and(|c| !c.ok) {
         alert(
             &tx,
@@ -499,5 +499,43 @@ pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
         let runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests WHERE device=?1 ORDER BY created_at DESC,id DESC LIMIT 7",&[device])?;
         devices.push(json!({"device":device,"confirmed":confirmed(&conn,device)?.map(|m|m.manifest_id),"runs":runs,"rates":rates(&conn,device,parse_rate(&manager.config.backup.backup_rate_default)?)?}));
     }
-    Ok(json!({"enabled":manager.config.backup.enabled,"devices":devices}))
+    let mut runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests ORDER BY created_at DESC,id DESC LIMIT 7",&[])?;
+    for run in &mut runs {
+        for (source, target) in [("created_at", "started_at"), ("acked_at", "finished_at")] {
+            run[target] = run[source]
+                .as_i64()
+                .map(|at| {
+                    time::OffsetDateTime::from_unix_timestamp(at).map(|at| {
+                        at.format(&time::format_description::well_known::Rfc3339)
+                            .expect("UTC timestamp formats")
+                    })
+                })
+                .transpose()?
+                .map(Value::String)
+                .unwrap_or(Value::Null);
+        }
+        let ack: Value = serde_json::from_str(run["ack_json"].as_str().unwrap_or("{}"))?;
+        run["include_bytes"] = ack
+            .get("fetched_bytes")
+            .cloned()
+            .unwrap_or_else(|| run["estimate_bytes"].clone());
+    }
+    let rates = devices
+        .first()
+        .map(|d| d["rates"].clone())
+        .unwrap_or(Value::Null);
+    let confirmed_at = artifact_store::query(
+        &conn,
+        "SELECT acked_at FROM backup_requests WHERE state='acked' ORDER BY acked_at DESC LIMIT 1",
+        &[],
+    )?
+    .first()
+    .and_then(|r| r["acked_at"].as_i64())
+    .map(time::OffsetDateTime::from_unix_timestamp)
+    .transpose()?
+    .map(|at| at.format(&time::format_description::well_known::Rfc3339))
+    .transpose()?;
+    Ok(
+        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"]}),
+    )
 }

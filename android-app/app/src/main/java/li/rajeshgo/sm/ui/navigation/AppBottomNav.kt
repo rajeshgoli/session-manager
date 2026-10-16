@@ -56,6 +56,13 @@ fun AppBottomNav(
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             val inboxBadge = InboxBadge.needsYou
+            val artifactsBadge = li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.needsYou
+            AppBottomNavItem(
+                label = if (artifactsBadge > 0) "Artifacts · $artifactsBadge" else "Artifacts",
+                selected = currentRoute == Routes.ARTIFACTS,
+                icon = { Icon(Icons.AutoMirrored.Rounded.ViewList, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                onClick = { li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open = true },
+            )
             AppBottomNavItem(
                 label = when {
                     inboxBadge > 0 -> "Inbox · $inboxBadge"
