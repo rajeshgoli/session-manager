@@ -315,6 +315,48 @@ export function Toggle({ checked, onChange, label, disabled = false }) {
     onClick=${() => onChange(!checked)}>${label ? html`<span class="sr-only">${label}</span>` : null}</button>`;
 }
 
+// A bare http(s) URL, without trailing sentence punctuation or a closing bracket.
+const URL_RE = /https?:\/\/[^\s<>"'`]*[^\s<>"'`.,;:!?)\]}]/g;
+
+/** Plain text with each bare URL as a link that opens in a new tab. */
+export function LinkedText({ text }) {
+  const source = String(text || '');
+  const out = [];
+  let last = 0;
+  for (const match of source.matchAll(URL_RE)) {
+    out.push(source.slice(last, match.index), html`<a href=${match[0]} target="_blank" rel="noopener noreferrer">${match[0]}</a>`);
+    last = match.index + match[0].length;
+  }
+  out.push(source.slice(last));
+  return out;
+}
+
+/** Sanitized HTML with bare URLs in its text turned into links; every link opens in a new tab. */
+export function linkifyHtml(source) {
+  const doc = new DOMParser().parseFromString(source, 'text/html');
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const texts = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.parentElement.closest('a') && node.data.match(URL_RE)) texts.push(node);
+  }
+  for (const node of texts) {
+    const parts = doc.createDocumentFragment();
+    let last = 0;
+    for (const match of node.data.matchAll(URL_RE)) {
+      parts.append(node.data.slice(last, match.index));
+      const link = doc.createElement('a');
+      link.href = match[0];
+      link.textContent = match[0];
+      parts.append(link);
+      last = match.index + match[0].length;
+    }
+    parts.append(node.data.slice(last));
+    node.replaceWith(parts);
+  }
+  for (const link of doc.body.querySelectorAll('a[href]')) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
+  return doc.body.innerHTML;
+}
+
 export const threadHref = thread => `/inbox?open=thread:${encodeURIComponent(thread.key.replace(/^agent:/, ''))}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`;
 
 /** Shared related-item chips. Empty kinds do not occupy space. */

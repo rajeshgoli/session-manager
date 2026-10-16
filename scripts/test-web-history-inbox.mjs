@@ -33,7 +33,7 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
           data = {rows:[{repo:'owner/repo',number:1,title:'Fixture ticket',state:'open'}], next_before:'older-cursor',
             agents:[{id:'abc12345',name:'sm-1768',provider:'claude',state:'retired',ended_at:new Date(Date.now()-240000).toISOString(),
               working_dir:'/Users/fixture/projects/session-manager',restorable:false,unrestorable_reason:'Runs on node mini',
-              last_turn:{at:'2026-09-30T12:00:00Z',text:'Memo 1768 is merged and published.'},
+              last_turn:{at:'2026-09-30T12:00:00Z',text:'Memo 1768 is merged and published at https://sm.example.com/docs/memo.'},
               work:{tickets:[{repo:'owner/repo',number:1768,title:'Memo',state:'closed'}],prs:[],docs:[]}}]};
         } else if (url.pathname === '/watch/state') {
           data = {sessions:retired ? [] : [{id:'fixture',name:'fixture-agent',provider:'claude',state:'idle',claims:[{kind:'ticket',repo:'owner/repo',number:1782}],jobs:[],
@@ -50,6 +50,10 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
           data = {title:'Long thread',status:'working',can_send:true,reply_to:'Fixture agent',items:[{type:'turn',finished:true,at:'2026-09-30T12:00:00Z',html:'<p>Finished summary</p>'},
             {type:'turn',finished:false,at:'2026-09-30T12:05:00Z',html:'<p>Answer to the owner</p>'},
             ...Array.from({length:count}, (_,i) => ({html:`<div class="b"><p data-sm-line="1">Message ${i+1}: enough text to wrap over multiple lines on mobile.</p></div>`}))]};
+        } else if (url.pathname === '/guestbook') {
+          data = {entries:[{session_id:'abc12345',session_name:'sm-1768',provider:'claude',signed_at:'2026-09-30T12:00:00Z',repos:['owner/repo'],claims:[],
+            html:'<p>See https://github.com/owner/repo/pull/7 and <a href="https://example.com/x">this</a>.</p>'},
+            {session_id:'abc12346',session_name:'sm-1769',provider:'claude',signed_at:'2026-09-30T12:00:00Z',repos:[],claims:[],text:'Plain https://example.com/plain, done.'}]};
         } else if (url.pathname === '/inbox') data = {rows:[]};
         else if (url.pathname.startsWith('/t/')) data = {item:{title:'Fixture ticket',state:'open'},events:[]};
         await route.fulfill({json:data});
@@ -68,6 +72,9 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       assert.equal(new URL(requests.at(-1)).pathname, '/history/agents');
       assert.match(await agent.textContent(), /sm-1768.*CLAUDE.*#1768.*retired 4m ago.*session-manager/s);
       assert.match(await agent.locator('.history-last-turn').textContent(), /Last turn: “Memo 1768 is merged/);
+      const turnLink = agent.locator('.history-last-turn a');
+      assert.equal(await turnLink.getAttribute('href'), 'https://sm.example.com/docs/memo', 'a URL in the last turn is a link, without the full stop');
+      assert.equal(await turnLink.getAttribute('target'), '_blank');
       const restore = agent.getByRole('button', {name:'Restore'});
       assert.ok(await restore.isDisabled());
       assert.equal(await restore.getAttribute('title'), 'Runs on node mini');
@@ -102,6 +109,12 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       // Wait for the data request, not the page navigation, which also carries `q`.
       const agentsRequest = page.waitForRequest(request => { const url = new URL(request.url());
         return url.pathname === '/history/agents' && url.searchParams.get('format') === 'json' && url.searchParams.get('q') === 'former'; });
+      await page.goto('http://localhost/guestbook');
+      const signed = page.locator('.guestbook-markdown a');
+      await signed.first().waitFor();
+      assert.deepEqual(await signed.evaluateAll(links => links.map(link => [link.getAttribute('href'), link.target])),
+        [['https://github.com/owner/repo/pull/7', '_blank'], ['https://example.com/x', '_blank']]);
+      assert.equal(await page.locator('.guestbook-text a').getAttribute('href'), 'https://example.com/plain');
       await page.goto('http://localhost/history/agents?q=former&limit=3');
       await agentsRequest;
       await page.waitForFunction(() => document.querySelector('.list-filter input')?.value === 'former');

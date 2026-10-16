@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, providerLabel, age, basename } from './ui.js';
+import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, LinkedText, providerLabel, age, basename } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 
 export function WorkLinks({ work = {} }) {
@@ -30,8 +30,8 @@ function AgentRow({ row, busy, restore }) {
       <button class="btn pri sm history-restore" disabled=${!row.restorable || !!busy} title=${row.unrestorable_reason || 'Restore agent'}
         onClick=${() => restore(row)}>${busy === row.id ? 'Restoring…' : 'Restore'}</button>
     </div>
-    ${row.last_turn?.text ? html`<p class="history-last-turn">Last turn: “${row.last_turn.text}”</p>`
-      : row.last_status ? html`<p class="history-last-turn">Last words: “${row.last_status}”</p>` : null}
+    ${row.last_turn?.text ? html`<p class="history-last-turn">Last turn: “<${LinkedText} text=${row.last_turn.text} />”</p>`
+      : row.last_status ? html`<p class="history-last-turn">Last words: “<${LinkedText} text=${row.last_status} />”</p>` : null}
     <${Links} ticket=${ticket} tickets=${tickets} prs=${work.prs || []} docs=${work.docs || []} />
   </article>`;
 }
@@ -108,7 +108,7 @@ function Ticket({ id, controls }) {
         : html`${historyError?.status === 404 ? html`<p>No agent has worked on this ticket yet, so sm has no history for it.</p>`
           : historyError ? html`<p role="alert">${historyError.message}</p>` : null}
           ${history ? html`<p>${history.item.state}</p><${WorkLinks} work=${history.item} />
-            ${(history.events || []).map(event => html`<article class="history-card"><small>${event.at} · ${event.name || ''}</small><p>${event.text}</p>
+            ${(history.events || []).map(event => html`<article class="history-card"><small>${event.at} · ${event.name || ''}</small><p><${LinkedText} text=${event.text} /></p>
               ${event.link ? html`<button class="btn sm" onClick=${() => followLink(event.link)}>Open item</button>` : null}</article>`)}` : !historyError ? 'Loading…' : null}`}
     </div>
   </div>`;

@@ -261,6 +261,62 @@ test('Retire confirmation stays usable above details with a long name on a phone
   } finally { await browser.close(); }
 });
 
+test('Details opens beside the terminal on desktop and below it on a phone; a ticket opens there too', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+      const { page, state, errors } = await open(browser, { viewport });
+      state.sessions = state.sessions.map((agent) => agent.id === 'sm-1776'
+        ? { ...agent, claims: [{ kind: 'ticket', repo: 'owner/repo', number: 2200, title: 'Three issues' }] } : agent);
+      await page.route(`${ORIGIN}/claims?**`, (route) => route.fulfill({ json: { claims: [] } }));
+      await page.goto(`${ORIGIN}/terminal/sm-1776`);
+      await page.locator('.term-connection', { hasText: 'Live' }).waitFor();
+      const before = await page.locator('.term-body').boundingBox();
+      await page.locator('.term-bar').getByRole('button', { name: 'Details' }).click();
+      const panel = page.locator('.term-panel');
+      await panel.waitFor();
+      assert.equal(new URL(page.url()).pathname, '/terminal/sm-1776', 'Details stays on the terminal page');
+      assert.equal(new URL(page.url()).searchParams.get('open'), 'agent:sm-1776');
+      const body = await page.locator('.term-body').boundingBox();
+      const box = await panel.boundingBox();
+      if (viewport.width > 900) {
+        assert.ok(body.x + body.width <= box.x + 1, 'panel sits to the right of the terminal');
+        assert.ok(body.width < before.width, 'terminal narrows to make room');
+      } else {
+        assert.ok(body.y + body.height <= box.y + 1, `panel sits below the terminal ${JSON.stringify({ body, box })}`);
+        assert.ok(body.height < before.height, 'terminal shortens to make room');
+      }
+      const ticket = panel.getByRole('button', { name: /#2200/ }).first();
+      await ticket.waitFor();
+      await ticket.click();
+      await page.waitForFunction(() => new URLSearchParams(location.search).get('open') === 'ticket:owner/repo#2200');
+      assert.equal(new URL(page.url()).pathname, '/terminal/sm-1776', 'a ticket opens beside the terminal too');
+      await panel.locator('.ticket-reader').waitFor();
+      assert.deepEqual(errors, []);
+      await page.context().close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('Report a bug: typing goes to the dialog, not the terminal', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-connection', { hasText: 'Live' }).waitFor();
+    await page.locator('.term-bar .bug-btn').click();
+    const field = page.locator('.board-start-overlay').locator('textarea, input[type="text"], input:not([type])').first();
+    await field.waitFor();
+    await field.click();
+    // The bar's click handler hands focus back to the terminal on a timer; let it run.
+    await page.waitForTimeout(100);
+    await page.keyboard.type('broken');
+    assert.equal(await field.inputValue(), 'broken');
+    const typed = await page.evaluate(() => window.sockets.flatMap((s) => s.sent).filter((f) => f.type === 'input').map((f) => f.data).join(''));
+    assert.equal(typed, '', 'no keystrokes reach the terminal');
+  } finally { await browser.close(); }
+});
+
 test('route: another server on localhost and a failed direct socket both use Cloudflare', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {

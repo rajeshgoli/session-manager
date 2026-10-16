@@ -141,7 +141,9 @@ function App() {
         if (!(await canLeaveNotes())) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];
-        const path = bandKind(ref) && !openOrigin && pageFor(current.path) !== (kind === 'agent' ? 'agents' : 'queue')
+        // The terminal page shows every panel beside its terminal, so it never jumps to Agents or Queue.
+        const page = pageFor(current.path);
+        const path = bandKind(ref) && !openOrigin && page !== 'terminal' && page !== (kind === 'agent' ? 'agents' : 'queue')
           ? kind === 'agent' ? '/' : '/queue' : current.path;
         history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, ref));
         setLoc(readLocation());
