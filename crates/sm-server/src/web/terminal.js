@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store, toast } from './ui.js';
 import { RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
-import { chooseRoute, relayRoute, rememberRoute, routeText } from './terminal-route.js';
+import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -181,6 +181,9 @@ export function TerminalPage({ id, open }) {
     terminal.open(host.current);
     let socket = null, stopped = false, live = false, timer = null, handshakeTimer = null, retries = 0;
     let pinger = null, pingId = 0, samples = [];
+    // Background probes for the direct path while on the relay; a switch that fails stops them for this page.
+    let directTimer = null, directSwitch = true, switching = false;
+    const stopDirect = () => { clearTimeout(directTimer); directTimer = null; };
     const pings = new Map();
     const send = (frame) => {
       if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
@@ -251,13 +254,36 @@ export function TerminalPage({ id, open }) {
     // A direct socket that ends before attaching uses a fresh ticket through the relay (G4).
     const fallback = (ws, instance) => {
       clearTimeout(handshakeTimer);
+      if (switching) directSwitch = false;
       if (socket === ws) socket = null;
       ws.close();
       rememberRoute(session(), 'relay', instance, Date.now());
       connect(true);
     };
+    // On the relay soon after a direct socket, probe for the direct path a few times and
+    // move back to it when it answers, so a server restart does not pin this tab to the
+    // relay for ten minutes. Away from this machine's network no direct socket ran
+    // recently, so nothing is probed.
+    const watchDirect = (ws, ticket) => {
+      if (!directSwitch || !recentlyDirect(session(), Date.now())) return;
+      const next = (i) => {
+        if (i >= DIRECT_RETRY_MS.length) return;
+        directTimer = setTimeout(async () => {
+          const found = await findDirect(ticket, { fetchImpl: (url, init) => fetch(url, init) });
+          if (stopped || socket !== ws || !live) return;
+          if (!found) { next(i + 1); return; }
+          rememberRoute(session(), found, ticket.server_instance, Date.now());
+          send({ type: 'detach' });
+          socket = null; live = false; stopPing(); switching = true;
+          ws.close();
+          connect();
+        }, DIRECT_RETRY_MS[i]);
+      };
+      next(0);
+    };
     const connect = async (relayOnly = false) => {
       if (stopped) return;
+      stopDirect();
       setError('');
       try {
         const ticket = await api(`/client/sessions/${encodeURIComponent(id)}/browser-attach-ticket`, { method: 'POST' });
@@ -295,6 +321,9 @@ export function TerminalPage({ id, open }) {
             clearTimeout(handshakeTimer);
             attached = true; live = true; retries = 0; setConnection('Live'); terminal.focus();
             stopPing(); ping(); pinger = setInterval(ping, PING_MS);
+            switching = false;
+            if (chosen.direct) markDirect(session(), Date.now());
+            else watchDirect(ws, ticket);
           } else if (frame.type === 'pong') {
             const sent = pings.get(frame.id);
             if (sent === undefined) return;
@@ -318,7 +347,7 @@ export function TerminalPage({ id, open }) {
           if (stopped || socket !== ws) return;
           if (chosen.direct && !attached) { fallback(ws, ticket.server_instance); return; }
           clearTimeout(handshakeTimer);
-          live = false; stopPing();
+          live = false; stopPing(); stopDirect();
           if (ended || event.code === 1000 || event.code === 1008) setConnection('Ended');
           else retry();
         };
@@ -343,7 +372,7 @@ export function TerminalPage({ id, open }) {
     const observer = new ResizeObserver(resize);
     observer.observe(host.current);
     const detach = () => { live = false; stopPing(); send({ type: 'detach' }); if (socket) socket.close(); };
-    const pagehide = () => { stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); detach(); };
+    const pagehide = () => { stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); stopDirect(); detach(); };
     const pageshow = (event) => { if (event.persisted) setAttempt((n) => n + 1); };
     window.addEventListener('pagehide', pagehide);
     window.addEventListener('pageshow', pageshow);
@@ -351,7 +380,7 @@ export function TerminalPage({ id, open }) {
     fitNow();
     connect();
     return () => {
-      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
+      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
   }, [id, attempt]);

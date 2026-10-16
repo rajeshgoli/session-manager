@@ -7,7 +7,7 @@ const strip = (text) => text.replace(/^import .*;\n/gm, '').replace(/^export /gm
 const web = (name) => readFile(new URL(`../crates/sm-server/src/web/${name}`, import.meta.url), 'utf8');
 // The route module runs for real; it finds no direct entry and uses the relay.
 const source = strip(await web('terminal-route.js')) + strip(await web('terminal.js'));
-function fixture(direct = []) {
+function fixture(direct = [], { storage, probes } = {}) {
   let minted = 0;
   const states = [], timers = new Map(), sockets = [];
   let effect, cleanup, timerId = 0;
@@ -26,7 +26,7 @@ function fixture(direct = []) {
   const context = vm.createContext({
     URL, WebSocket:Socket, location:{href:'https://sm.example.com/terminal/test',protocol:'https:',hostname:'sm.example.com'},
     window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},WebLinksAddon:{WebLinksAddon:class {}},addEventListener(){},removeEventListener(){},
-      innerWidth:1440,matchMedia:()=>({matches:false})},
+      innerWidth:1440,matchMedia:()=>({matches:false}),sessionStorage:storage},
     getComputedStyle:()=>({fontSize:'15px'}),document:{documentElement:{}},performance:{now:()=>0},
     setInterval:()=>0,clearInterval(){},config:{},stored:(key,fallback)=>fallback,store(){},sectionAgents:()=>[],
     SECTION_LABEL:{},SECTION_TONE:{},youFact:()=>null,jobsFact:()=>null,agentFact:()=>null,markAnswered(){},
@@ -34,7 +34,7 @@ function fixture(direct = []) {
     useRef:()=>({current:null}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
     useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
     api:async()=>({ws_url:'/client/terminal',ticket_id:`test-${++minted}`,ticket_secret:'test',server_instance:'inst',direct}),
-    fetch:async()=>({ok:true,json:async()=>({instance:'inst'})}),AbortController,
+    fetch:async()=>({ok:true,json:async()=>({instance:probes?probes.shift()??'inst':'inst'})}),AbortController,
     setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),
   });
   vm.runInContext(source+'\nTerminalPage({id:"test",open:false});',context);
@@ -76,4 +76,43 @@ test('a direct socket that closes before attaching mints a new ticket and uses t
   assert.equal(f.sockets[1].url,'wss://sm.example.com/client/terminal');
   assert.notEqual(f.states[0],'Reconnecting','the fallback is not a retry');
   f.sockets[1].attach();assert.equal(f.states[0],'Live');f.cleanup();
+});
+const memory=(items={})=>({getItem:k=>k in items?items[k]:null,setItem:(k,v)=>{items[k]=String(v);},items});
+const DIRECT=[{url:'ws://localhost:8420/client/terminal',probe:'http://localhost:8420/client/terminal/probe'}];
+test('on the relay soon after a direct socket, the page moves back to direct once its probe answers',async()=>{
+  // A restart: the first probe misses, so this connection uses the relay.
+  const storage=memory({'sm-term-direct-at':String(Date.now()-60000)});
+  const f=fixture(DIRECT,{storage,probes:['other','other']});await f.settle();
+  assert.equal(f.sockets[0].url,'wss://sm.example.com/client/terminal');
+  f.sockets[0].attach();assert.equal(f.states[0],'Live');
+  // The first background probe misses too; the second answers and the page reconnects directly.
+  assert.equal(f.timers.size,1);await f.tick();
+  assert.equal(f.sockets.length,1);assert.equal(f.timers.size,1);
+  await f.tick();
+  assert.equal(f.sockets[0].readyState,3);assert.equal(f.sockets.length,2);
+  assert.equal(f.sockets[1].url,'ws://localhost:8420/client/terminal');
+  assert.equal(JSON.parse(storage.items['sm-term-route']).url,'ws://localhost:8420/client/terminal');
+  f.sockets[1].attach();assert.equal(f.states[0],'Live');assert.equal(f.timers.size,0);f.cleanup();
+});
+test('away from this machine (no recent direct socket) the relay probes nothing in the background',async()=>{
+  const storage=memory();
+  const f=fixture(DIRECT,{storage,probes:['other']});await f.settle();
+  assert.equal(f.sockets[0].url,'wss://sm.example.com/client/terminal');
+  f.sockets[0].attach();assert.equal(f.timers.size,0);f.cleanup();
+});
+test('background probes stop after five misses',async()=>{
+  const storage=memory({'sm-term-direct-at':String(Date.now())});
+  const f=fixture(DIRECT,{storage,probes:Array(6).fill('other')});await f.settle();
+  f.sockets[0].attach();
+  for(let n=0;n<5;n++){assert.equal(f.timers.size,1);await f.tick();}
+  assert.equal(f.timers.size,0);assert.equal(f.sockets.length,1);f.cleanup();
+});
+test('a switch back to direct that fails returns to the relay and stops probing for this page',async()=>{
+  const storage=memory({'sm-term-direct-at':String(Date.now())});
+  const f=fixture(DIRECT,{storage,probes:['other']});await f.settle();
+  f.sockets[0].attach();await f.tick();
+  assert.equal(f.sockets[1].url,'ws://localhost:8420/client/terminal');
+  f.sockets[1].fail();await f.settle();
+  assert.equal(f.sockets[2].url,'wss://sm.example.com/client/terminal');
+  f.sockets[2].attach();assert.equal(f.states[0],'Live');assert.equal(f.timers.size,0);f.cleanup();
 });
