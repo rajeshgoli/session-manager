@@ -929,82 +929,89 @@ async fn managed_artifacts_recovered_pressure_closes_blocking_message() {
 async fn managed_artifacts_failed_investigation_worktree_is_cleanup_candidate() {
     use sm_server::work_claims::worktrees::{run_worktree_cleanup, CleanupRequest};
     use std::os::unix::fs::PermissionsExt;
-    let f = Fixture::new();
-    let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
-    fs::create_dir_all(&repo).unwrap();
-    for args in [
-        vec!["init"],
-        vec![
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "initial",
-        ],
-    ] {
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success());
+    for metadata_created in [false, true] {
+        let f = Fixture::new();
+        let repo = PathBuf::from(&f.state.config().managed_artifacts.roots[0].repo_checkout);
+        fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        if metadata_created {
+            // Git creates the detached worktree, then its checkout hook fails.
+            let hook = repo.join(".git/hooks/post-checkout");
+            fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        } else {
+            // A file blocks Git from creating its worktree metadata directory.
+            fs::write(repo.join(".git/worktrees"), "blocked").unwrap();
+        }
+        assert_eq!(
+            f.request(
+                "POST",
+                "/artifacts",
+                Some("maker"),
+                json!({"name":"sample","note":"inspect this dataset","project":true})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let failure = f
+            .request(
+                "POST",
+                "/artifacts/sample/owner-action",
+                Some("owner@example.com"),
+                json!({"action":"investigate"}),
+            )
+            .await;
+        assert_eq!(failure.0, StatusCode::CONFLICT, "{failure:?}");
+        let conn = rusqlite::Connection::open(f.dir.join("queue.db")).unwrap();
+        let (path, failed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT path, spawn_failed_at FROM investigation_worktrees",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(failed.is_some());
+        assert_eq!(std::path::Path::new(&path).exists(), metadata_created);
+        let detail = f
+            .request(
+                "GET",
+                "/artifacts/sample",
+                Some("owner@example.com"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(detail.0, StatusCode::OK);
+        assert!(detail.1["investigating"].is_null());
+        let claims = WorkClaimStore::new(f.dir.join("queue.db"));
+        let outcomes = run_worktree_cleanup(&claims, CleanupRequest::default()).unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome.path == path && outcome.removed == metadata_created),
+            "{outcomes:?}"
+        );
+        assert!(!std::path::Path::new(&path).exists());
     }
-    // Git creates the detached worktree, then its checkout hook fails.
-    let hook = repo.join(".git/hooks/post-checkout");
-    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(
-        f.request(
-            "POST",
-            "/artifacts",
-            Some("maker"),
-            json!({"name":"sample","note":"inspect this dataset","project":true})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    let failure = f
-        .request(
-            "POST",
-            "/artifacts/sample/owner-action",
-            Some("owner@example.com"),
-            json!({"action":"investigate"}),
-        )
-        .await;
-    assert_eq!(failure.0, StatusCode::CONFLICT, "{failure:?}");
-    let conn = rusqlite::Connection::open(f.dir.join("queue.db")).unwrap();
-    let (path, failed): (String, Option<String>) = conn
-        .query_row(
-            "SELECT path, spawn_failed_at FROM investigation_worktrees",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert!(failed.is_some());
-    assert!(std::path::Path::new(&path).exists());
-    let detail = f
-        .request(
-            "GET",
-            "/artifacts/sample",
-            Some("owner@example.com"),
-            Value::Null,
-        )
-        .await;
-    assert_eq!(detail.0, StatusCode::OK);
-    assert!(detail.1["investigating"].is_null());
-    let claims = WorkClaimStore::new(f.dir.join("queue.db"));
-    let outcomes = run_worktree_cleanup(&claims, CleanupRequest::default()).unwrap();
-    assert!(
-        outcomes
-            .iter()
-            .any(|outcome| outcome.path == path && outcome.removed),
-        "{outcomes:?}"
-    );
-    assert!(!std::path::Path::new(&path).exists());
 }
