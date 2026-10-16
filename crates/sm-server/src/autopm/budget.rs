@@ -467,8 +467,9 @@ pub fn status(store: &AutopmStore, settings: &Settings, now: i64) -> Result<Valu
     }))
 }
 
+/// Two decimals; `+ 0.0` turns the `-0.0` an empty float sum gives into 0.
 fn round(points: f64) -> f64 {
-    (points * 100.0).round() / 100.0
+    (points * 100.0).round() / 100.0 + 0.0
 }
 
 fn refuse(gate: &str, detail: impl Into<String>) -> Fail {
