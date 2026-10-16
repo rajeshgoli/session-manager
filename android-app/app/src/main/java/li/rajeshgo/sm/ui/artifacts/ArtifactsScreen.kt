@@ -1,126 +1,204 @@
 package li.rajeshgo.sm.ui.artifacts
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.serialization.json.JsonObject
-import li.rajeshgo.sm.ui.navigation.AppMenuActions
-import li.rajeshgo.sm.ui.navigation.AppTopBar
+import li.rajeshgo.sm.ui.navigation.*
 import li.rajeshgo.sm.ui.queue.SectionHeader
-import li.rajeshgo.sm.ui.theme.Cyan
-import li.rajeshgo.sm.ui.theme.Panel
-
-private fun bytes(n: Long): String = if (n >= 1073741824) "%.1f GB".format(n / 1073741824.0) else "%.1f MB".format(n / 1048576.0)
+import li.rajeshgo.sm.ui.theme.*
 
 @Composable
 fun ArtifactsScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: ArtifactsViewModel, onNavigate: (String) -> Unit) {
     val state by viewModel.state.collectAsState()
+    ArtifactsContent(state, onBack, menu, viewModel::refresh, viewModel::act, onNavigate)
+}
+
+@Composable
+internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: AppMenuActions,
+    refresh: () -> Unit, act: (JsonObject, String) -> Unit, onNavigate: (String) -> Unit) {
     val data = state.data
-    var epic by remember { mutableStateOf("") }
-    var confirmation by remember { mutableStateOf<Pair<JsonObject,String>?>(null) }
-    val listState = rememberLazyListState()
+    val rows = data?.rows("artifacts").orEmpty()
+    val inventory = artifactInventory(rows)
+    val decisions = inventory.filter(::artifactNeedsDecision)
+    var browse by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    var limit by remember(query) { mutableIntStateOf(25) }
+    var selected by remember { mutableStateOf<JsonObject?>(null) }
+    var confirmation by remember { mutableStateOf<Pair<JsonObject, String>?>(null) }
     LaunchedEffect(data, ArtifactsNavigation.name) {
-        val target = ArtifactsNavigation.name ?: return@LaunchedEffect
-        var offset = 4 + data?.rows("filesystems").orEmpty().size
-        for ((_, rows) in artifactGroups(data?.rows("artifacts").orEmpty(), epic)) {
-            val index = rows.indexOfFirst { it.text("name") == target }
-            if (index >= 0) { listState.scrollToItem(offset + 1 + index); break }
-            offset += rows.size + 1
+        ArtifactsNavigation.name?.let { name ->
+            rows.firstOrNull { it.text("name") == name }?.let { selected = it; ArtifactsNavigation.name = null }
         }
     }
-    Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
-        AppTopBar(title = "Artifacts", menu = menu, onBack = onBack)
-        LazyColumn(Modifier.weight(1f), state = listState, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().background(MaterialTheme.colorScheme.background)) {
+        LazyColumn(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 112.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)) {
             item {
-                state.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                TextButton(onClick = viewModel::refresh) { Text("Refresh") }
-                if (data == null) Text("Loading artifacts…")
+                AppTopBar(title = if (browse) "All artifacts" else "Artifacts", subtitle = "Storage & saved work",
+                    menu = menu, current = Routes.ARTIFACTS, onBack = { if (browse) browse = false else onBack() },
+                    onRefresh = refresh, modifier = Modifier.padding(bottom = 8.dp))
+                state.error?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall) }
             }
-            item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                val frozen = data?.rows("artifacts").orEmpty().filter { it.text("state") == "frozen" }
-                Surface(color = Panel, modifier = Modifier.weight(1f)) { Column(Modifier.padding(12.dp)) { Text("Frozen", color = Cyan); Text(bytes(frozen.sumOf(::artifactSize))); Text("${frozen.size} folders") } }
-                Surface(color = Panel, modifier = Modifier.weight(1f)) { Column(Modifier.padding(12.dp)) { Text("Needs you", color = Cyan); Text("${data?.number("needs_you_count") ?: 0}") } }
-            } }
-            items(data?.rows("filesystems").orEmpty()) { f ->
-                Surface(color = Panel) { Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                    Text(f.text("path"), color = Cyan)
-                    LinearProgressIndicator(progress = { ((f.number("bytes")-f.number("free")).toFloat()/f.number("bytes").coerceAtLeast(1)).coerceIn(0f,1f) }, modifier = Modifier.fillMaxWidth())
-                    Text("${bytes(f.number("free"))} free · floor ${bytes(f.number("floor"))} · enough ${bytes(f.number("enough"))}")
-                    Text("Outstanding ${bytes(f.number("outstanding"))}")
-                } }
-            }
-            item { Surface(color = Panel) { Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                SectionHeader("BACKUP")
-                val backup = data?.get("backup") as? JsonObject
-                val runs = backup?.rows("runs").orEmpty()
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    (6 downTo 0).forEach { ago ->
-                        val day = java.time.LocalDate.now().minusDays(ago.toLong()).toString()
-                        val run = runs.firstOrNull { it.text("started_at").startsWith(day) }
-                        Column { Text(day.takeLast(5)); Text(if (run == null) "—" else if (run.text("state") in listOf("acked","succeeded")) "✓" else "✗") }
+            if (data == null) {
+                item { Text("Loading storage…", color = TextMuted, modifier = Modifier.padding(16.dp)) }
+            } else if (browse) {
+                item {
+                    OutlinedTextField(value = query, onValueChange = { query = it }, placeholder = { Text("Search saved work") },
+                        singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
+                    Text("Largest first · unmeasured folders last", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                }
+                val filtered = artifactInventory(rows, query)
+                items(filtered.take(limit), key = { it.text("root") + "/" + it.text("name") }) { a -> ArtifactRow(a) { selected = a } }
+                item {
+                    if (filtered.isEmpty()) Text("No matching folders", color = TextMuted, modifier = Modifier.padding(vertical = 16.dp))
+                    if (filtered.size > limit) TextButton(onClick = { limit += 25 }) { Text("Show 25 more · ${filtered.size - limit} remaining") }
+                }
+            } else {
+                item { StoragePanel(data.rows("filesystems")) }
+                item {
+                    val backup = data["backup"] as? JsonObject
+                    Text(backupSummary(backup), color = if (backup?.flag("enabled") == true) TextSecondary else Amber,
+                        style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 2.dp, top = 8.dp))
+                }
+                if (decisions.isNotEmpty()) {
+                    item { SectionHeader("CLEANUP TO REVIEW") }
+                    items(decisions.take(5), key = { "review:" + it.text("root") + it.text("name") }) { a -> ArtifactRow(a) { selected = a } }
+                    if (decisions.size > 5) item { TextButton(onClick = { browse = true }) { Text("Browse all ${decisions.size} proposals") } }
+                }
+                item {
+                    SectionHeader("TAKING UP SPACE")
+                    Text("Largest folders over 1 GB", color = TextMuted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 6.dp))
+                }
+                val largest = largestArtifacts(rows)
+                items(largest, key = { it.text("root") + "/" + it.text("name") }) { a -> ArtifactRow(a) { selected = a } }
+                item {
+                    if (largest.isEmpty()) Text("No measured folders over 1 GB", color = TextSecondary, modifier = Modifier.padding(vertical = 12.dp))
+                    TextButton(onClick = { browse = true }) { Text("Browse all ${inventory.size} folders  ›") }
+                }
+                item {
+                    SectionHeader("MANAGED IN THE BACKGROUND")
+                    val compressed = inventory.filter { it.text("state") == "frozen" }
+                    val unmeasured = inventory.count { measuredArtifactBytes(it) == null }
+                    val missing = inventory.count { it.text("state") == "unrecorded" }
+                    Column(Modifier.padding(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (compressed.isNotEmpty()) Text("${compressed.size} compressed folders · ${storageSize(compressed.sumOf(::artifactSize))}", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                        if (missing > 0) Text("$missing folders need an agent's record. This is bookkeeping, not a decision for you.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                        if (unmeasured > 0) Text("$unmeasured folder sizes pending. The list above is incomplete until measured.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                        Text("Keep work you still need. Agents check its history and dependencies before proposing cleanup.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                if (runs.isEmpty()) Text("No backup runs recorded.")
-                runs.forEach { Text("${if (it.text("state") == "succeeded") "✓" else "✗"} ${it.text("started_at")} · ${bytes(it.number("include_bytes"))}") }
-                Text("Confirmed: ${backup?.text("confirmed_at")?.ifEmpty { "not reported" } ?: "not reported"}")
-                Text("Weekly check: ${backup?.text("weekly_check")?.ifEmpty { "not reported" } ?: "not reported"}")
-                Text("Backup disk use: ${backup?.text("disk_used_bytes")?.ifEmpty { "not reported" } ?: "not reported"}")
-                Text("Holding old versions: ${backup?.text("holding_bytes")?.ifEmpty { "not reported" } ?: "not reported"}")
-                Text("Scope: ${backup?.get("scope_roots") ?: "not reported"} · skipped: ${backup?.text("skipped_count")?.ifEmpty { "not reported" } ?: "not reported"}")
-                Text("Download, disk write, restore rates: unmeasured. Rate in force: ${backup?.text("rate_default")} /s (default)")
-            } } }
-            item { OutlinedTextField(value = epic, onValueChange = { epic = it }, label = { Text("Epic (empty for all)") }, modifier = Modifier.fillMaxWidth()) }
-            artifactGroups(data?.rows("artifacts").orEmpty(),epic).forEach { (title, rows) ->
-                item { SectionHeader("$title · ${rows.size} · ${bytes(rows.sumOf(::artifactSize))}") }
-                items(rows, key = { it.text("root") + it.text("name") }) { a ->
-                    var expanded by remember(a.text("name"), ArtifactsNavigation.name) { mutableStateOf(ArtifactsNavigation.name == a.text("name")) }
-                    Surface(color = Panel) { Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                        Text(a.text("name"), color = Cyan, modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded })
-                        Text("${bytes(a.number("disk_bytes"))}${if(a.text("state") == "frozen") " → ${bytes(a.number("frozen_bytes"))}" else ""} · ${a.text("location")} · ${a.text("state")}")
-                        if (a.text("gpu_hours").isNotEmpty() || a.text("gpu_cost_usd").isNotEmpty()) Text("GPU")
-                        Text(a.text("note").ifEmpty { "No note recorded" }, fontStyle = FontStyle.Italic)
-                        (a["needs_you"] as? JsonObject)?.let { Text(it["reasons"].toString().replace('_',' '), color = Cyan) }
-                        Text(a.rows("consumers").joinToString(" · ") { "${it.text("ref")} (${it.text("state")})" })
-                        Text("${a.text("owner_session_name")} · created ${a.text("created_at")} · rebuild ${a.number("rebuild_seconds")}s")
-                        Text(if (!a.flag("backup_due") && a.text("backed_up_at").isNotEmpty()) "backed up${if (!a.flag("rebuildable")) " (not rebuildable)" else ""}" else "not backed up · ${if (a.flag("rebuildable")) "rebuilds in ${a.number("rebuild_seconds")}s; return time not measured" else "not rebuildable"}")
-                        if (a.text("backup_return_seconds").isNotEmpty()) Text("Estimated packed size ${bytes(a.number("backup_ship_bytes"))} · return ${a.number("backup_return_seconds")}s versus rebuild ${a.number("rebuild_seconds")}s")
-                        if(a.text("investigating").isNotEmpty()) Text("investigating · ${a.text("investigating")}")
-                        (a["report"] as? JsonObject)?.let { Text(it.text("detail_json")) }
-                        if (expanded) {
-                            Text(a.text("description")); Text("Recent use: ${a.text("last_used_at")}")
-                            Text("Recipe"); a.rows("jobs").forEach { Text(it.toString()) }
-                            a.rows("events").take(10).forEach { Text("${it.text("at")} · ${it.text("kind")} · ${it.text("detail_json")}") }
-                            if(data?.flag("can_act") == true) {
-                                (listOf("delete") + when(a.text("state")) { "frozen" -> listOf("thaw","keep_live"); "live" -> listOf("keep_live"); else -> emptyList() } + listOf("investigate")).forEach { action ->
-                                    TextButton(enabled = !state.busy && (action != "investigate" || a.text("investigating").isEmpty()), onClick = { confirmation = a to action }) {
-                                        Text(when(action) { "keep_live" -> "Keep live ${data.number("keep_live_days")} days"; else -> action.replaceFirstChar { it.uppercase() } })
-                                    }
-                                }
-                            }
-                        }
-                    } }
+            }
+        }
+        AppBottomNav(currentRoute = Routes.ARTIFACTS, onInbox = { onNavigate(Routes.INBOX) }, onWatch = { onNavigate(Routes.WATCH) },
+            onBoard = { onNavigate(Routes.BOARD) }, onQueue = { onNavigate(Routes.QUEUE) }, modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp))
+    }
+    selected?.let { previous ->
+        val a = rows.firstOrNull { it.text("root") == previous.text("root") && it.text("name") == previous.text("name") } ?: previous
+        ArtifactSheet(a, data?.flag("can_act") == true, state.busy, data?.number("keep_live_days") ?: 30,
+            onClose = { selected = null }, onAction = { action -> confirmation = a to action })
+    }
+    confirmation?.let { (a, action) ->
+        AlertDialog(onDismissRequest = { confirmation = null }, title = { Text("${actionLabel(action)}?") },
+            text = { Text("${a.text("name")} · ${storageSize(measuredArtifactBytes(a))}\n" +
+                when (action) {
+                    "delete" -> "Deletes this saved work. " + (if (!a.flag("rebuildable")) "No complete rebuild recipe is recorded. " else "A rebuild recipe is recorded. ") +
+                        a.rows("dependents").joinToString(prefix = if (a.rows("dependents").isEmpty()) "" else "Used by: ") { it.text("name") }
+                    "investigate" -> "An agent will check files, git history and dependencies, then record a recommendation. It will not delete the folder."
+                    "keep_live" -> "Keeps this work available for ${data?.number("keep_live_days")} days."
+                    else -> "Restores the compressed folder so it can be used again."
+                }) },
+            confirmButton = { TextButton(onClick = { confirmation = null; act(a, action) }) { Text(actionLabel(action), color = if (action == "delete") Rose else Cyan) } },
+            dismissButton = { TextButton(onClick = { confirmation = null }) { Text("Cancel") } })
+    }
+}
+
+@Composable
+private fun StoragePanel(disks: List<JsonObject>) {
+    Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(top = 10.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+            disks.forEach { f ->
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(diskName(f), style = MaterialTheme.typography.titleSmall)
+                        Text(if (f.flag("mounted")) "${storageSize(f.number("free"))} free" else "Unavailable", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (f.flag("mounted") && f.number("bytes") > 0) {
+                        val used = (f.number("bytes") - f.number("free")).coerceAtLeast(0)
+                        val low = f.number("free") < f.number("floor")
+                        Text("${storageSize(used)} of ${storageSize(f.number("bytes"))} used", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                        LinearProgressIndicator(progress = { (used.toFloat() / f.number("bytes")).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().height(6.dp), color = if (low) Amber else Emerald, trackColor = PanelMuted)
+                        if (low) Text("Space is running low", color = Amber, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             }
-            item { Text("Last 7 days: " + data?.rows("recent").orEmpty().joinToString(" · ") { "${it.number("count")} ${it.text("kind")}" }) }
+            if (disks.isEmpty()) Text("Storage information unavailable", color = TextMuted)
         }
-        li.rajeshgo.sm.ui.navigation.AppBottomNav(
-            currentRoute = li.rajeshgo.sm.ui.navigation.Routes.ARTIFACTS,
-            onInbox = { onNavigate(li.rajeshgo.sm.ui.navigation.Routes.INBOX) },
-            onWatch = { onNavigate(li.rajeshgo.sm.ui.navigation.Routes.WATCH) },
-            onBoard = { onNavigate(li.rajeshgo.sm.ui.navigation.Routes.BOARD) },
-            onQueue = { onNavigate(li.rajeshgo.sm.ui.navigation.Routes.QUEUE) },
-            modifier = Modifier.padding(12.dp),
-        )
     }
-    confirmation?.let { (a,action) -> AlertDialog(onDismissRequest = { confirmation = null }, title = { Text(action.replace('_',' ')) },
-        text = { Text("${a.text("name")} · ${bytes(artifactSize(a))}${if(!a.flag("rebuildable")) " · not rebuildable" else ""}${a.rows("dependents").takeIf { it.isNotEmpty() }?.joinToString(prefix = " · input of ") { it.text("name") }.orEmpty()}") },
-        confirmButton = { TextButton(onClick = { confirmation = null; viewModel.act(a,action) }) { Text("Confirm") } },
-        dismissButton = { TextButton(onClick = { confirmation = null }) { Text("Cancel") } }) }
+}
+
+@Composable
+private fun ArtifactRow(a: JsonObject, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp, horizontal = 2.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(a.text("note").ifBlank { a.text("name").replace('_', ' ') }, fontWeight = FontWeight.SemiBold,
+                maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Text(storageSize(measuredArtifactBytes(a)), color = TextSecondary, style = MaterialTheme.typography.bodyMedium)
+        }
+        Text(artifactSummary(a), color = if (artifactNeedsDecision(a)) Amber else TextMuted, style = MaterialTheme.typography.bodySmall)
+    }
+    HorizontalDivider(color = Border.copy(alpha = 0.5f))
+}
+
+private fun actionLabel(action: String) = when (action) {
+    "delete" -> "Delete folder"
+    "keep_live" -> "Keep available"
+    "thaw" -> "Restore folder"
+    else -> "Ask an agent"
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ArtifactSheet(a: JsonObject, canAct: Boolean, busy: Boolean, days: Long, onClose: () -> Unit, onAction: (String) -> Unit) {
+    var technical by remember { mutableStateOf(false) }
+    ModalBottomSheet(onDismissRequest = onClose, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(a.text("name"), style = MaterialTheme.typography.titleLarge)
+            Text("${storageSize(measuredArtifactBytes(a))} · ${artifactSummary(a)}", color = TextSecondary)
+            a.text("description").ifBlank { a.text("note") }.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            if (a.text("state") == "unrecorded") Text("An agent can recover the context from git, saved files and job history. You do not need to reconstruct it.", color = TextSecondary)
+            a.rows("consumers").takeIf { it.isNotEmpty() }?.let { Text("Used by " + it.joinToString { c -> c.text("ref") }, color = TextSecondary) }
+            Text(if (!a.flag("backup_due") && a.text("backed_up_at").isNotBlank()) "Backup confirmed" else "No current backup confirmed", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+            artifactReport(a)?.let { Text(it) }
+            if (canAct) {
+                Button(onClick = { onAction("investigate") }, enabled = !busy && a.text("investigating").isBlank()) { Text(if (a.text("investigating").isBlank()) "Ask an agent to investigate" else "Agent investigating") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (a.text("state") == "frozen") OutlinedButton(onClick = { onAction("thaw") }, enabled = !busy) { Text("Restore") }
+                    if (a.text("state") in listOf("live", "frozen")) OutlinedButton(onClick = { onAction("keep_live") }, enabled = !busy) { Text("Keep $days days") }
+                }
+                TextButton(onClick = { onAction("delete") }, enabled = !busy) { Text("Delete folder…", color = Rose) }
+            }
+            TextButton(onClick = { technical = !technical }) { Text(if (technical) "Hide technical details" else "Technical details") }
+            if (technical) {
+                Text("${a.text("root")}/${a.text("name")}", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                Text("Last used: ${a.text("last_used_at").ifBlank { "Not recorded" }}", color = TextMuted)
+                a.rows("jobs").forEach { Text(it.toString(), style = MaterialTheme.typography.bodySmall) }
+                a.rows("events").take(10).forEach { Text("${it.text("at")} · ${it.text("kind")}", style = MaterialTheme.typography.bodySmall, color = TextMuted) }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
 }

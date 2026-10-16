@@ -9,7 +9,7 @@ const fixture = {
   artifacts:[{name:'research-data',root:'/artifacts',state:'live',location:'root',note:'Retained market data',disk_bytes:1e10,hot:true,needs_owner:true,needs_you:{reasons:['unrecorded']},consumers:[],jobs:[],events:[],rebuildable:false,backup_due:true,created_at:'2026-10-15',dependents:[{name:'simulation'}]},
     {name:'frozen-data',root:'/artifacts',state:'frozen',location:'cold',note:'Completed research',disk_bytes:1e10,frozen_bytes:1e9,hot:false,consumers:[],jobs:[],events:[],backup_due:true}]
 };
-const shell = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="/assets/queue.css"><script type="importmap">{"imports":{"preact":"/assets/vendor/preact.module.js","preact/hooks":"/assets/vendor/hooks.module.js","htm":"/assets/vendor/htm.module.js"}}</script></head><body><div id="fixture"></div><script type="module">import {render,h} from 'preact';import {ArtifactsPage} from '/assets/artifacts.js';render(h(ArtifactsPage),document.getElementById('fixture'));</script></body></html>`;
+const shell = `<!doctype html><html data-theme="dark"><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="/assets/queue.css"><script type="importmap">{"imports":{"preact":"/assets/vendor/preact.module.js","preact/hooks":"/assets/vendor/hooks.module.js","htm":"/assets/vendor/htm.module.js"}}</script></head><body><div id="fixture"></div><script type="module">import {render,h} from 'preact';import {ArtifactsPage} from '/assets/artifacts.js';render(h(ArtifactsPage),document.getElementById('fixture'));</script></body></html>`;
 test('artifact fixture renders on desktop and phone with owner confirmation and errors', async () => {
   const browser = await chromium.launch({channel:'chrome',headless:true});
   try {
@@ -24,19 +24,22 @@ test('artifact fixture renders on desktop and phone with owner confirmation and 
         if(req.method()==='POST') { posts.push(req.postDataJSON()); return route.fulfill({status:409,json:{detail:'artifact is in use'}}); }
         return route.fulfill({json:url.pathname==='/artifacts'?fixture:{}});
       });
-      await page.goto('https://sm.example.com/artifacts?name=research-data');
-      await page.getByText('Retained market data',{exact:true}).waitFor();
+      await page.goto('https://sm.example.com/artifacts');
+      await page.getByRole('heading',{name:'Taking up space'}).waitFor();
+      if(process.env.SHOTS_DIR) {await mkdir(process.env.SHOTS_DIR,{recursive:true}); await page.screenshot({path:`${process.env.SHOTS_DIR}/artifacts-${width}.png`,fullPage:true});}
+      await page.getByRole('button',{name:/Retained market data/}).click();
+      await page.getByRole('region',{name:'Folder details'}).waitFor();
       assert.equal(await page.locator('.artifact-row').count(),2);
-      assert.ok(await page.getByText('Needs you · 1',{exact:false}).isVisible());
-      assert.ok(await page.getByRole('button',{name:'Keep live 30 days',exact:true}).isVisible());
+      assert.equal(await page.getByText('Needs you',{exact:false}).count(),0);
+      assert.ok(await page.getByRole('button',{name:'Keep 30 days',exact:true}).isVisible());
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
-      await page.getByRole('button',{name:'Delete',exact:true}).click();
+      await page.getByRole('button',{name:'Delete folder…',exact:true}).click();
       assert.equal(posts.length,0,'first click must only confirm');
       assert.ok(await page.getByText(/input of simulation/).isVisible());
-      await page.getByRole('button',{name:'Delete',exact:true}).click();
+      await page.getByRole('button',{name:'Delete folder',exact:true}).click();
       await page.getByRole('alert').filter({hasText:'artifact is in use'}).waitFor();
       assert.deepEqual(posts,[{root:'/artifacts',action:'delete'}]);
-      if(process.env.SHOTS_DIR) {await mkdir(process.env.SHOTS_DIR,{recursive:true}); await page.screenshot({path:`${process.env.SHOTS_DIR}/artifacts-${width}.png`,fullPage:true});}
+      if(process.env.SHOTS_DIR) {await mkdir(process.env.SHOTS_DIR,{recursive:true}); await page.screenshot({path:`${process.env.SHOTS_DIR}/artifacts-detail-${width}.png`,fullPage:true});}
       assert.deepEqual(errors,[]);
       await page.close();
     }
