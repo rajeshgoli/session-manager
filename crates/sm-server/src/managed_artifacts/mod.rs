@@ -4,6 +4,7 @@ pub mod archive;
 pub mod attribution;
 pub mod config;
 pub mod delete;
+pub mod hotcold;
 pub mod moves;
 pub mod ops;
 pub mod queue;

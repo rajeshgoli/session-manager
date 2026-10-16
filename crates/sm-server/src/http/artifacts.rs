@@ -246,6 +246,18 @@ fn mutate(
     if matches!(action.as_str(), "freeze" | "thaw") {
         ma::ops::kick(svc.clone());
     }
+    if !state.config.rust_core.fixture_writes_enabled
+        && matches!(action.as_str(), "record" | "consumers" | "marks" | "done")
+    {
+        let manager = svc.clone();
+        let root = root.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = ma::hotcold::evaluate(&manager, &root, &claims::GhCliWorkItemSource)
+            {
+                eprintln!("artifact evaluation deferred: {error:#}");
+            }
+        });
+    }
     if action == "rebuild" {
         ma::rebuild::kick(svc.clone());
     }
@@ -442,6 +454,9 @@ impl AppState {
             if ma::attribution::size_walk_due(previous, now, &svc.config.nightly_time, perf)? {
                 svc.measure_root(root)?;
                 artifact_store::set_meta(&conn, &key, &ma::now())?;
+            }
+            if !self.config.rust_core.fixture_writes_enabled {
+                ma::hotcold::nightly(svc, root, &claims::GhCliWorkItemSource)?;
             }
         }
         self.session_store

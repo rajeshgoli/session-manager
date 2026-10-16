@@ -81,14 +81,27 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         .map(|j| j["wall_seconds"].as_f64().unwrap_or(0.0))
         .sum::<f64>());
     value["rebuildable"] = json!(value["recipe_complete"] == 1 && !has_gpu(&value));
-    // Until the GitHub and named-reference evaluator lands, unknown retention is hot.
-    value["hot"] = json!(true);
+    value["hot"] = json!(super::hotcold::is_hot(
+        conn,
+        root,
+        name,
+        meta(conn, &format!("cold_days:{root}"))?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(14),
+        OffsetDateTime::now_utc()
+    )?);
+    value["consumer_unverifiable"] = json!(value["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["state"] == "UNKNOWN" && c["checked_at"].is_string()));
     value["backup_due"] =
         json!(value["backup_stamp"] != value["content_stamp"] || value["backed_up_at"].is_null());
     value["needs_owner"] = json!(
-        value["op"]
-            .as_str()
-            .is_some_and(|op| op.starts_with("rebuild_failed:"))
+        value["consumer_unverifiable"] == true
+            || value["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("rebuild_failed:"))
             || value["delete_reason"] == "vanished"
             || value["events"].as_array().unwrap().iter().any(|e| matches!(
                 e["kind"].as_str(),
