@@ -790,6 +790,18 @@ fn seed_adopts_plain_copy_confirms_full_scope_and_next_request_is_empty() {
             .manifest_id,
         id
     );
+    let parts: String = f
+        .manager
+        .store
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT parts_json FROM backup_requests WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parts, "[]", "adoption must not stage another payload copy");
     let lifecycle::RequestResult::Open(request) =
         lifecycle::request(&f.manager, "backup-mini", Some(&id)).unwrap()
     else {
@@ -823,7 +835,12 @@ fn seed_rejects_mismatched_adoption_without_moving_original() {
     assert!(confirmed(&f.manager.store.open().unwrap(), "backup-mini")
         .unwrap()
         .is_none());
-    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(f.dir.join("outbox"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0
+    );
 }
 
 #[test]
@@ -835,5 +852,23 @@ fn seed_rejects_managed_adoption_and_cleans_outbox() {
     let source = dest.directory("packed/existing").unwrap();
     assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).is_err());
     assert!(source.exists());
-    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(f.dir.join("outbox"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[test]
+fn reseed_removes_files_absent_from_full_source() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    fs::remove_file(f.dir.join("data/prices")).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    assert!(dest.records().unwrap().is_empty());
+    assert!(!dest.root.join("plain/data/prices").exists());
 }

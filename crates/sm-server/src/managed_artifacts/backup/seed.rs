@@ -44,7 +44,60 @@ pub fn seed(
         time::OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
     let coverage:Vec<_>=scopes.iter().map(|s|Ok(json!({"source":s.source,"prefix":s.prefix(),"stamp":scan::measure(&s.source)?.stamp()}))).collect::<Result<_>>()?;
-    let mut prepared = prepare(manager, &scopes, None, &id)?;
+    // Verified adopted files form a local base: preparation includes their
+    // records but does not spool or transmit a second copy of their payloads.
+    let mut adopted = Manifest::default();
+    if let Some(source) = adopt {
+        let plain: Vec<_> = scopes.iter().filter(|s| s.plain).collect();
+        ensure!(
+            plain.len() == 1,
+            "adopt-plain requires exactly one plain scope"
+        );
+        let scope = plain[0];
+        let source = if source.exists() {
+            source.to_path_buf()
+        } else {
+            dest.root.join(scope.prefix())
+        };
+        for entry in archive::inventory(&source)? {
+            if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
+                continue;
+            }
+            ensure!(
+                entry.kind == "file",
+                "adoption requires ordinary data files"
+            );
+            let original = scope.source.join(&entry.path);
+            let metadata = fs::symlink_metadata(&original)?;
+            use std::os::unix::fs::MetadataExt;
+            ensure!(
+                metadata.is_file() && metadata.len() == entry.size,
+                "adoption size/kind mismatch: {}",
+                entry.path
+            );
+            let mtime_ns =
+                i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+            let adopted_mtime =
+                i128::from(entry.mtime) * 1_000_000_000 + i128::from(entry.mtime_nsec);
+            ensure!(
+                (mtime_ns - adopted_mtime).abs() <= 2_000_000_000,
+                "adoption mtime mismatch: {}",
+                entry.path
+            );
+            let path = format!("{}/{}", scope.prefix(), entry.path);
+            let record = FileRecord {
+                path: path.clone(),
+                size: entry.size,
+                mtime_ns,
+                mode: metadata.mode() & 0o7777,
+                sha256: Some(super::outbox::hash_file(&original)?),
+                target: None,
+            };
+            super::client::verify(&source.join(&entry.path), &record)?;
+            adopted.files.insert(path, record);
+        }
+    }
+    let mut prepared = prepare(manager, &scopes, adopt.map(|_| &adopted), &id)?;
     let _outbox = SeedOutbox(prepared.directory.clone());
     ensure!(
         prepared.deferred.is_empty(),
@@ -111,6 +164,23 @@ pub fn seed(
             ensure!(target.is_dir(), "adoption source is missing");
         }
     }
+    // Register only verified adopted files omitted from the transfer. Changed
+    // files still go through normal apply and history retention.
+    for (path, record) in &adopted.files {
+        if prepared.manifest.files.get(path) == Some(record)
+            && !prepared.transfer.changed.iter().any(|r| &r.path == path)
+        {
+            super::client::verify(&dest.root.join(path), record)?;
+            dest.conn.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body", params![path, serde_json::to_string(record)?])?;
+        }
+    }
+    prepared.transfer.deleted = dest
+        .records()?
+        .keys()
+        .filter(|p| !prepared.manifest.files.contains_key(*p))
+        .cloned()
+        .collect();
+    prepared.transfer.base = previous.clone();
     let staging = dest.unpack(
         &id,
         &prepared.transfer,
