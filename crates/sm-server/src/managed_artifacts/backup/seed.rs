@@ -217,29 +217,41 @@ pub fn seed(
             .context("restore destination after failed seed application")?;
         return Err(error);
     }
-    let destination_tx = dest.conn.transaction()?;
-    // Register only verified adopted files omitted from the transfer. Changed
-    // files still go through normal apply and history retention.
-    for (path, record) in &adopted.files {
-        if prepared.manifest.files.get(path) == Some(record)
-            && !prepared.transfer.changed.iter().any(|r| &r.path == path)
-        {
-            destination_tx.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body", params![path, serde_json::to_string(record)?])?;
-        }
-    }
-    prepared.manifest.base = previous.clone();
-    save_manifest(&tx, device, &prepared.manifest)?;
-    confirm(&tx, device, &id)?;
-    lifecycle::mark_covered(
-        &tx,
-        manager,
-        &json!({"coverage_json":serde_json::to_string(&coverage)?}),
-    )?;
+    let mut source_committed = false;
     let at = time::OffsetDateTime::now_utc().unix_timestamp();
-    tx.execute("INSERT INTO backup_requests(id,device,state,base,created_at,ready_at,acked_at,config_json,outbox,manifest_id,parts_json,transfer_json,ack_json) VALUES(?1,?2,'acked',?3,?4,?4,?4,?5,?6,?1,?7,?8,?9)",params![id,device,previous,at,serde_json::to_string(&manager.config)?,prepared.directory.to_string_lossy(),serde_json::to_string(&prepared.parts)?,serde_json::to_string(&prepared.transfer)?,json!({"applied":true,"seed":true,"fetched_bytes":0}).to_string()])?;
-    tx.commit()?;
-    adoption_move.0 = None;
-    destination_tx.commit()?;
+    let confirmation = (|| -> Result<()> {
+        let destination_tx = dest.conn.transaction()?;
+        // Register only verified adopted files omitted from the transfer. Changed
+        // files still go through normal apply and history retention.
+        for (path, record) in &adopted.files {
+            if prepared.manifest.files.get(path) == Some(record)
+                && !prepared.transfer.changed.iter().any(|r| &r.path == path)
+            {
+                destination_tx.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body", params![path, serde_json::to_string(record)?])?;
+            }
+        }
+        prepared.manifest.base = previous.clone();
+        save_manifest(&tx, device, &prepared.manifest)?;
+        confirm(&tx, device, &id)?;
+        lifecycle::mark_covered(
+            &tx,
+            manager,
+            &json!({"coverage_json":serde_json::to_string(&coverage)?}),
+        )?;
+        tx.execute("INSERT INTO backup_requests(id,device,state,base,created_at,ready_at,acked_at,config_json,outbox,manifest_id,parts_json,transfer_json,ack_json) VALUES(?1,?2,'acked',?3,?4,?4,?4,?5,?6,?1,?7,?8,?9)",params![id,device,previous,at,serde_json::to_string(&manager.config)?,prepared.directory.to_string_lossy(),serde_json::to_string(&prepared.parts)?,serde_json::to_string(&prepared.transfer)?,json!({"applied":true,"seed":true,"fetched_bytes":0}).to_string()])?;
+        tx.commit()?;
+        source_committed = true;
+        adoption_move.0 = None;
+        destination_tx.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = confirmation {
+        if !source_committed {
+            dest.rollback(&id)
+                .context("restore destination after failed seed confirmation")?;
+        }
+        return Err(error);
+    }
     dest.confirm(&id)?;
     lifecycle::expire(manager, at)?;
     if staging.exists() {

@@ -1165,3 +1165,40 @@ fn failed_adoption_returns_original_folder_without_registering_records() {
         0
     );
 }
+
+#[test]
+fn failed_seed_confirmation_rolls_back_applied_destination() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"original").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let original = dest.records().unwrap();
+    f.manager.store.open().unwrap().execute_batch("CREATE TRIGGER fail_seed_confirmation BEFORE INSERT ON backup_requests BEGIN SELECT RAISE(ABORT, 'injected confirmation failure'); END;").unwrap();
+    fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    assert!(
+        error.to_string().contains("injected confirmation failure"),
+        "{error:#}"
+    );
+    assert_eq!(dest.records().unwrap(), original);
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+            .unwrap()
+            .unwrap()
+            .manifest_id,
+        first
+    );
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
+}
