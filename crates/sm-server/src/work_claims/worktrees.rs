@@ -143,6 +143,38 @@ impl WorkClaimStore {
         Ok(())
     }
 
+    /// The caller holds the investigation lock, so no request can still be
+    /// creating these worktrees. Existing sessions always decide lifecycle.
+    pub fn recover_interrupted_investigation_worktrees(
+        &self,
+        session_exists: impl Fn(&str) -> Result<bool>,
+    ) -> Result<()> {
+        let conn = self.open_write()?;
+        let ids = {
+            let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM investigation_worktrees WHERE spawn_failed_at IS NULL")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        for id in ids {
+            if !session_exists(&id)? {
+                self.fail_investigation_worktree(&id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// An empty base records only intent. Authorize Git cleanup only after
+    /// mkdir succeeds, so a pre-existing checkout can never be enrolled.
+    pub fn reserve_investigation_worktree(&self, session_id: &str, base_sha: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE investigation_worktrees SET base_sha = ?2 WHERE session_id = ?1",
+            params![session_id, base_sha],
+        )?;
+        Ok(())
+    }
+
     /// `POST /claims/worktree`: records the managed worktree on the caller's
     /// active claim. A `None` base keeps the recorded one (a rerun reusing
     /// the worktree). `None` when the caller holds no such claim.
@@ -885,6 +917,41 @@ fn decide(
             retryable: true,
         })
     };
+    // Creation can die after mkdir but before Git writes metadata. Such a
+    // reservation is removable only when empty; never recursively delete it.
+    let empty_reservation = candidate.sources.iter().all(|s| s.kind.is_none())
+        && !path.join(".git").exists()
+        && git(path, &["rev-parse", "--show-toplevel"]).is_none();
+    if empty_reservation {
+        if let Some(reason) = load_keeps(conn)?.get(&candidate.path) {
+            return retry_left(format!("kept: {reason}"));
+        }
+        if let Some(reason) = in_use(
+            conn,
+            candidate,
+            request,
+            retired,
+            &mut cache.processes,
+            grace,
+        )? {
+            return retry_left(reason);
+        }
+        return match fs::remove_dir(path) {
+            Ok(()) => Ok(Decision::Removed {
+                reason: "empty investigation reservation".into(),
+                branch: None,
+                git_common_dir: String::new(),
+            }),
+            Err(error) => final_left(format!("reserved directory retained: {error}")),
+        };
+    }
+    if candidate
+        .sources
+        .iter()
+        .any(|s| s.managed_base.as_deref() == Some(""))
+    {
+        return final_left("investigation directory ownership was not confirmed".into());
+    }
     // 1. A linked worktree, never a main checkout.
     let common_dir = match linked_worktree(path, &candidate.path) {
         Ok(common_dir) => common_dir,

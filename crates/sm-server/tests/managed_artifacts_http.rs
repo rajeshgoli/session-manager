@@ -1015,3 +1015,159 @@ async fn managed_artifacts_failed_investigation_worktree_is_cleanup_candidate() 
         assert!(!std::path::Path::new(&path).exists());
     }
 }
+
+#[tokio::test]
+async fn interrupted_investigations_recover_on_startup_without_releasing_live_requests() {
+    use sm_server::managed_artifacts::{investigations, store};
+    use sm_server::work_claims::worktrees::{run_worktree_cleanup, CleanupRequest};
+    for stage in [
+        "reservation",
+        "intent",
+        "mkdir",
+        "git",
+        "spawn",
+        "persisted",
+    ] {
+        let f = Fixture::new();
+        let manager = sm_server::managed_artifacts::ManagedArtifacts::new(
+            &f.state.config().managed_artifacts,
+        )
+        .unwrap();
+        let claims = WorkClaimStore::new(f.dir.join("queue.db"));
+        let path = f.dir.join("investigation");
+        let id = if stage == "persisted" {
+            "holder"
+        } else {
+            "interrupted"
+        };
+        let key = format!("investigating:{}:sample", f.root());
+        store::set_meta(&manager.store.open().unwrap(), &key, id).unwrap();
+        if stage != "reservation" {
+            claims
+                .register_investigation_worktree(id, path.to_str().unwrap(), "owner/research", "")
+                .unwrap();
+        }
+        if matches!(stage, "mkdir" | "git" | "spawn" | "persisted") {
+            fs::create_dir(&path).unwrap();
+        }
+        if matches!(stage, "git" | "spawn" | "persisted") {
+            let repo = f.dir.join("repo");
+            fs::create_dir(&repo).unwrap();
+            for args in [
+                vec!["init"],
+                vec![
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=f@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            ] {
+                assert!(std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
+            }
+            let base = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            claims
+                .reserve_investigation_worktree(id, String::from_utf8_lossy(&base.stdout).trim())
+                .unwrap();
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&path)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        // A second server cannot recover the live request, even with no session.
+        let lock = investigations::try_lock(&manager).unwrap().unwrap();
+        let live = AppState::new(f.state.config().clone());
+        assert_eq!(
+            store::meta(&manager.store.open().unwrap(), &key)
+                .unwrap()
+                .as_deref(),
+            Some(id)
+        );
+        if stage != "reservation" {
+            let failed: Option<String> = rusqlite::Connection::open(f.dir.join("queue.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT spawn_failed_at FROM investigation_worktrees",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(failed.is_none());
+        }
+        drop(lock); // A crash releases the same kernel lock.
+        live.managed_artifacts_pass().unwrap();
+        // Repeated startup and worker recovery must be harmless.
+        let recovered = AppState::new(f.state.config().clone());
+        let reservation = store::meta(&manager.store.open().unwrap(), &key).unwrap();
+        assert_eq!(
+            reservation.as_deref(),
+            (stage == "persisted").then_some(id),
+            "{stage}"
+        );
+        if stage != "reservation" {
+            let failed: Option<String> = rusqlite::Connection::open(f.dir.join("queue.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT spawn_failed_at FROM investigation_worktrees",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed.is_some(), stage != "persisted", "{stage}");
+        }
+        let outcomes = run_worktree_cleanup(&claims, CleanupRequest::default()).unwrap();
+        assert_eq!(path.exists(), stage == "persisted", "{stage}: {outcomes:?}");
+        drop(recovered);
+    }
+}
+
+#[tokio::test]
+async fn investigation_git_child_holds_recovery_lock_after_parent_drops_it() {
+    use sm_server::managed_artifacts::{investigations, ManagedArtifacts};
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let f = Fixture::new();
+    let manager = ManagedArtifacts::new(&f.state.config().managed_artifacts).unwrap();
+    let lock = investigations::try_lock(&manager).unwrap().unwrap();
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "printf ready; read line"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true);
+    investigations::inherit_lock(&mut command, &lock);
+    let mut child = command.spawn().unwrap();
+    let mut ready = [0; 5];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        child.stdout.as_mut().unwrap().read_exact(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(lock);
+    assert!(investigations::try_lock(&manager).unwrap().is_none());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    assert!(investigations::try_lock(&manager).unwrap().is_some());
+}

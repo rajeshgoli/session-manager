@@ -882,6 +882,11 @@ impl AppState {
         let managed_artifacts = if config.managed_artifacts.enabled {
             let manager =
                 crate::managed_artifacts::ManagedArtifacts::new(&config.managed_artifacts)?;
+            crate::managed_artifacts::investigations::recover(
+                &manager,
+                &crate::work_claims::WorkClaimStore::new(expand_home(&config.sm_send.db_path)),
+                &session_store,
+            )?;
             for root in &manager.config.roots {
                 crate::managed_artifacts::queue::install_operations(
                     &root.path,
