@@ -5,7 +5,22 @@ use crate::managed_artifacts::{archive, scan, ManagedArtifacts};
 use anyhow::{ensure, Context};
 use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+// Seeds have no durable request until confirmation, so lifecycle expiry cannot
+// reclaim an outbox left behind by an earlier validation/application error.
+struct SeedOutbox(PathBuf);
+impl Drop for SeedOutbox {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("could not remove seed outbox {}: {error}", self.0.display());
+            }
+        }
+    }
+}
 pub fn seed(
     manager: &ManagedArtifacts,
     device: &str,
@@ -30,6 +45,7 @@ pub fn seed(
     );
     let coverage:Vec<_>=scopes.iter().map(|s|Ok(json!({"source":s.source,"prefix":s.prefix(),"stamp":scan::measure(&s.source)?.stamp()}))).collect::<Result<_>>()?;
     let mut prepared = prepare(manager, &scopes, None, &id)?;
+    let _outbox = SeedOutbox(prepared.directory.clone());
     ensure!(
         prepared.deferred.is_empty(),
         "seed source changed during preparation; retry"
@@ -45,9 +61,23 @@ pub fn seed(
             ensure!(!target.exists(), "plain destination already exists");
             let source = fs::canonicalize(adopt)?;
             ensure!(
-                !source.starts_with(&dest.root),
-                "adoption source is already inside destination"
+                !dest.root.starts_with(&source),
+                "adoption source contains the backup destination"
             );
+            if let Ok(relative) = source.strip_prefix(&dest.root) {
+                let first = relative
+                    .components()
+                    .next()
+                    .context("empty adoption source")?;
+                let name = first.as_os_str().to_string_lossy();
+                ensure!(
+                    !matches!(
+                        name.as_ref(),
+                        "plain" | "packed" | "state.db" | "state.json"
+                    ) && !name.starts_with('.'),
+                    "adoption source overlaps managed backup data"
+                );
+            }
             for entry in archive::inventory(&source)? {
                 if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                     continue;

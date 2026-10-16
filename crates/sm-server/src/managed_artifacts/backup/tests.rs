@@ -760,10 +760,10 @@ fn seed_adopts_plain_copy_confirms_full_scope_and_next_request_is_empty() {
     f.manager.config.backup.enabled = true;
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"prices").unwrap();
-    fs::create_dir(f.dir.join("existing-data")).unwrap();
+    fs::create_dir_all(f.dir.join("remote/existing-data")).unwrap();
     fs::copy(
         f.dir.join("data/prices"),
-        f.dir.join("existing-data/prices"),
+        f.dir.join("remote/existing-data/prices"),
     )
     .unwrap();
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
@@ -771,10 +771,10 @@ fn seed_adopts_plain_copy_confirms_full_scope_and_next_request_is_empty() {
         &f.manager,
         "backup-mini",
         &mut dest,
-        Some(&f.dir.join("existing-data")),
+        Some(&f.dir.join("remote/existing-data")),
     )
     .unwrap();
-    assert!(!f.dir.join("existing-data").exists());
+    assert!(!f.dir.join("remote/existing-data").exists());
     assert_eq!(
         fs::read(dest.root.join("plain/data/prices")).unwrap(),
         b"prices"
@@ -823,4 +823,17 @@ fn seed_rejects_mismatched_adoption_without_moving_original() {
     assert!(confirmed(&f.manager.store.open().unwrap(), "backup-mini")
         .unwrap()
         .is_none());
+    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+}
+
+#[test]
+fn seed_rejects_managed_adoption_and_cleans_outbox() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.directory("packed/existing").unwrap();
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).is_err());
+    assert!(source.exists());
+    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
 }
