@@ -3,7 +3,8 @@
 //!
 //! Deletion is durable by derivation. A retired session's candidates are
 //! every `worktree_path` on its claims, plus its working directory when that
-//! is on the branch of a merged PR it claimed. A candidate stays pending
+//! is on the branch of a merged PR it claimed, and registered artifact
+//! investigation worktrees (including confirmed failed spawns). A candidate stays pending
 //! until a `worktree.removed` event, or a `worktree.left` event saying the
 //! path is absent, is written for its path after the session retired. A
 //! candidate left for a passing reason (a keep, a live session or process)
@@ -112,6 +113,36 @@ fn is_candidates_repo(common_dir: &str, candidate: &Candidate) -> Option<bool> {
 }
 
 impl WorkClaimStore {
+    /// Register before creating an investigation worktree, independently of claims.
+    pub fn register_investigation_worktree(
+        &self,
+        session_id: &str,
+        path: &str,
+        repo: &str,
+        base_sha: &str,
+    ) -> Result<()> {
+        self.open_write()?.execute(
+            "INSERT INTO investigation_worktrees (path, session_id, repo, base_sha)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                path_key(path),
+                session_id,
+                super::canonical_repo(repo),
+                base_sha
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A failed spawn with no session leaves a durable cleanup candidate.
+    pub fn fail_investigation_worktree(&self, session_id: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE investigation_worktrees SET spawn_failed_at = ?2 WHERE session_id = ?1",
+            params![session_id, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// `POST /claims/worktree`: records the managed worktree on the caller's
     /// active claim. A `None` base keeps the recorded one (a rerun reusing
     /// the worktree). `None` when the caller holds no such claim.
@@ -216,7 +247,7 @@ pub struct CleanupRequest<'a> {
 struct Source {
     session_id: String,
     repo: String,
-    kind: WorkKind,
+    kind: Option<WorkKind>,
     number: i64,
     branch: Option<String>,
     managed_base: Option<String>,
@@ -429,6 +460,48 @@ fn gather(
         };
         entry.sources.push(source);
     };
+    let mut statement = conn.prepare(
+        "SELECT path, session_id, repo, base_sha, spawn_failed_at FROM investigation_worktrees",
+    )?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })? {
+        let (path, session_id, repo, base_sha, failed_at) = row?;
+        // A recorded session always decides lifecycle; a failed spawn can
+        // be collected without a session only after failure is confirmed.
+        let at = if request
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            let Some(at) = retired.get(&session_id) else {
+                continue;
+            };
+            *at
+        } else if let Some(at) = failed_at.as_deref().and_then(|at| parse_time(Some(at))) {
+            Some(at)
+        } else {
+            continue;
+        };
+        add(
+            path,
+            Source {
+                session_id,
+                repo,
+                kind: None,
+                number: 0,
+                branch: None,
+                managed_base: Some(base_sha),
+            },
+            at,
+        );
+    }
     for session in request.sessions {
         let Some(at) = retired.get(&session.id) else {
             continue;
@@ -451,7 +524,7 @@ fn gather(
                 Source {
                     session_id: session.id.clone(),
                     repo: claim.repo.clone(),
-                    kind: claim.kind(),
+                    kind: Some(claim.kind()),
                     number: claim.number,
                     branch: claim.branch.clone(),
                     managed_base: claim
@@ -501,7 +574,7 @@ fn working_dir_candidate(
                 Source {
                     session_id: session.id.clone(),
                     repo: repo.clone(),
-                    kind: WorkKind::Pr,
+                    kind: Some(WorkKind::Pr),
                     number: *pr,
                     branch: Some(branch),
                     managed_base: None,
@@ -1098,7 +1171,7 @@ fn expire_keep(conn: &Connection, candidate: &Candidate, reason: &str) -> Result
         params![candidate.path],
     )?;
     let source = event_source(candidate);
-    let (ticket, pr) = item_keys(conn, &source.repo, source.kind, source.number)?;
+    let (ticket, pr) = source_item_keys(conn, source)?;
     write_event(
         conn,
         KEEP_EXPIRED,
@@ -1184,12 +1257,26 @@ fn recorded_branches(candidate: &Candidate) -> Vec<&str> {
     branches
 }
 
+/// Investigations carry no ticket or PR keys.
+fn source_item_keys(conn: &Connection, source: &Source) -> Result<(Option<i64>, Option<i64>)> {
+    match source.kind {
+        Some(kind) => item_keys(conn, &source.repo, kind, source.number),
+        None => Ok((None, None)),
+    }
+}
+
 /// The source that keys the event: a ticket claim before a PR claim.
 fn event_source(candidate: &Candidate) -> &Source {
     candidate
         .sources
         .iter()
-        .filter(|source| source.kind == WorkKind::Ticket)
+        .filter(|source| source.kind == Some(WorkKind::Ticket))
+        .chain(
+            candidate
+                .sources
+                .iter()
+                .filter(|source| source.kind.is_some()),
+        )
         .chain(candidate.sources.iter())
         .next()
         .expect("a candidate has a source")
@@ -1202,7 +1289,7 @@ fn record(
     events: &BTreeMap<String, Vec<PathEvent>>,
 ) -> Result<WorktreeOutcome> {
     let source = event_source(candidate);
-    let (ticket, pr) = item_keys(conn, &source.repo, source.kind, source.number)?;
+    let (ticket, pr) = source_item_keys(conn, source)?;
     let recorded = candidate_branch(candidate);
     let now = now_rfc3339();
     let (kind, reason, removed, payload) = match decision {
@@ -1307,7 +1394,7 @@ pub fn leftover_worktrees(
             continue;
         }
         let source = event_source(&candidate);
-        let (ticket, pr) = item_keys(&conn, &source.repo, source.kind, source.number)?;
+        let (ticket, pr) = source_item_keys(&conn, source)?;
         let latest = latest_after_retire(&candidate, &events);
         let kept = keeps.get(&candidate.path).cloned();
         leftovers.push(Leftover {
@@ -1441,7 +1528,7 @@ pub fn delete_leftover(
     };
     conn.execute("DELETE FROM worktree_keeps WHERE path = ?1", params![key])?;
     let source = event_source(&candidate);
-    let (ticket, pr) = item_keys(&conn, &source.repo, source.kind, source.number)?;
+    let (ticket, pr) = source_item_keys(&conn, source)?;
     let mut payload = json!({"path": key, "branch": branch.as_deref().or(candidate_branch(&candidate)),
         "reason": format!("deleted by {actor}")});
     if let Some(common_dir) = common_dir {
