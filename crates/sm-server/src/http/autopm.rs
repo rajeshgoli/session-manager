@@ -8,6 +8,7 @@
 use super::*;
 pub(super) mod actions;
 pub(super) mod cycles;
+pub(super) mod recovery;
 pub(super) mod role;
 use crate::autopm::budget::{self, ReviewGate, ReviewStep};
 use crate::autopm::experiments::{self, Ctx, Git, Pull};
@@ -175,6 +176,9 @@ pub(super) fn autopm_seat(state: &AppState, store: &AutopmStore) -> Option<Strin
 /// Carries out what a call left to do outside the database. Each failure is
 /// logged; none undoes the call.
 pub(super) fn run_effects(state: &AppState, effects: Vec<Effect>) {
+    let recovery_due = effects
+        .iter()
+        .any(|e| matches!(e, Effect::WakeAutopm { .. }));
     let store = store(state);
     for effect in effects {
         let result: Result<(), String> = match &effect {
@@ -199,6 +203,11 @@ pub(super) fn run_effects(state: &AppState, effects: Vec<Effect>) {
         };
         if let Err(error) = result {
             eprintln!("autopm effect {effect:?} failed: {error}");
+        }
+    }
+    if recovery_due {
+        if let Err(error) = recovery::tick(state) {
+            eprintln!("autopm immediate recovery failed: {error:#}");
         }
     }
 }
@@ -409,9 +418,20 @@ pub(super) async fn patch_experiment(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = role::actor(&state, &request)?;
+    let (actor, restore_only) = match role::actor(&state, &request) {
+        Ok(actor) => (actor, false),
+        Err(error) => {
+            if role::restore_holder(&state, &request, &id).is_err() {
+                return Err(error);
+            }
+            (Actor::Autopm, true)
+        }
+    };
     ensure_core_writes_enabled(&state)?;
     let body = json_body(request).await?;
+    if restore_only {
+        role::restore_body(&body)?;
+    }
     blocking(move || {
         let store = store(&state);
         let settings = settings(&state)?;
@@ -1009,6 +1029,9 @@ pub(super) fn minute(
     run_effects(state, effects);
     if let Err(error) = actions::tick(state) {
         eprintln!("autopm decision upkeep failed: {error:#}");
+    }
+    if let Err(error) = recovery::tick(state) {
+        eprintln!("autopm recovery upkeep failed: {error:#}");
     }
     cycles::tick(state, autopm::now_ms())?;
     Ok(())

@@ -339,8 +339,19 @@ async fn process_auto_starts(
             return started;
         }
     };
-    let (starts, cancellations) =
-        board::auto_start::plan(recomputed, records, settings.auto_start_paused);
+    let mut starts = Vec::new();
+    let mut cancellations = Vec::new();
+    for record in records {
+        let exempt =
+            super::autopm::recovery::is_revert(state, &record.repo, record.number).unwrap_or(false);
+        let (ready, cancelled) = board::auto_start::plan(
+            recomputed,
+            vec![record],
+            settings.auto_start_paused && !exempt,
+        );
+        starts.extend(ready);
+        cancellations.extend(cancelled);
+    }
     for (key, reason) in cancellations {
         if let Err(error) = store.cancel_auto_start(&key, reason, time::OffsetDateTime::now_utc()) {
             eprintln!("auto-start cancel failed: {error:#}");
@@ -446,7 +457,9 @@ fn authorization_current(
     if !super::autopm::actions::may_dispatch(state, record)? {
         return Ok(false);
     }
-    if new_agent_settings(state)?.auto_start_paused {
+    if new_agent_settings(state)?.auto_start_paused
+        && !super::autopm::recovery::is_revert(state, &record.repo, record.number)?
+    {
         return Ok(false);
     }
     Ok(board_store(state)
@@ -2150,6 +2163,42 @@ mod start_tests {
             .unwrap()
             .unwrap();
         assert!(!authorization_current(&state, &fresh).unwrap());
+        let revert_choice = board::auto_start::Choice {
+            repo: crate::autopm::REPO.into(),
+            number: 9000,
+            agent_type: None,
+            provider: "codex-fork".into(),
+            model: Some("gpt-6-sol".into()),
+            reasoning_effort: Some("medium".into()),
+            brief: None,
+        };
+        super::super::autopm::store(&state)
+            .record_fix(9000, "revert", None, Some("rollback"), 1)
+            .unwrap();
+        store
+            .authorize_auto_starts(&[revert_choice], time::OffsetDateTime::now_utc())
+            .unwrap();
+        let revert = store
+            .auto_starts()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.number == 9000)
+            .unwrap();
+        assert!(
+            authorization_current(&state, &revert).unwrap(),
+            "rollback must survive the board pause"
+        );
+        store
+            .cancel_auto_start(
+                &revert.key(),
+                "owner cancelled this launch",
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        assert!(
+            !authorization_current(&state, &revert).unwrap(),
+            "an exemption does not revive a cancelled authorization"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

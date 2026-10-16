@@ -815,9 +815,11 @@ fn reverse(
         _ => cause.to_owned(),
     };
     set_state(conn, &x.id, state, Some(&note), now)?;
-    Ok(vec![Effect::WakeAutopm {
+    let mut effects = cancel_cleanups(conn, &x.id, cause, now)?;
+    effects.push(Effect::WakeAutopm {
         text: format!("[sm autopm] {} {state}: {cause}", x.id),
-    }])
+    });
+    Ok(effects)
 }
 
 /// Live claim holders on autopm tickets that get stop messages: every one
@@ -940,42 +942,48 @@ fn reenable(ctx: &Ctx<'_>, x: &Experiment, key: &str) -> Out<Vec<Effect>> {
          WHERE experiment_id = ?1 AND superseded_at_ms IS NULL",
         params![x.id, ctx.now],
     )?;
+    let mut effects = cancel_cleanups(&tx, &x.id, &reenabled, ctx.now)?;
+    effects.push(Effect::WakeAutopm {
+        text: format!("[sm autopm] {reenabled}: {} is live again", x.id),
+    });
+    tx.commit()?;
+    ctx.switches.reload(&conn)?;
+    Ok(effects)
+}
+
+pub fn cancel_cleanups(conn: &Connection, id: &str, why: &str, now: i64) -> Out<Vec<Effect>> {
     let cleanups: Vec<i64> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT number FROM autopm_fixes WHERE repo = ?1 AND experiment_id = ?2
                AND kind = 'cleanup' AND cancelled_at_ms IS NULL",
         )?;
-        let rows = stmt.query_map(params![super::REPO, x.id], |row| row.get(0))?;
+        let rows = stmt.query_map(params![super::REPO, id], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let mut effects = vec![Effect::WakeAutopm {
-        text: format!("[sm autopm] {reenabled}: {} is live again", x.id),
-    }];
+    let mut effects = Vec::new();
     for number in cleanups {
-        tx.execute(
+        conn.execute(
             "UPDATE autopm_fixes SET cancelled_at_ms = ?3 WHERE repo = ?1 AND number = ?2",
-            params![super::REPO, number, ctx.now],
+            params![super::REPO, number, now],
         )?;
-        effects.extend(cancelled_cleanup_holds(&tx, number, &reenabled)?);
+        effects.extend(cancelled_cleanup_holds(conn, number, why)?);
         effects.push(Effect::CloseIssue {
             number,
-            comment: reenabled.clone(),
+            comment: why.to_owned(),
         });
         effects.push(Effect::CancelAutoStart {
             number,
-            reason: reenabled.clone(),
+            reason: why.to_owned(),
         });
-        for session_id in super::live_holders(&tx, number)? {
+        for session_id in super::live_holders(conn, number)? {
             effects.push(Effect::Message {
                 session_id,
                 text: format!(
-                    "[sm autopm] cleanup cancelled: {reenabled}. Close your PR unmerged and stop"
+                    "[sm autopm] cleanup cancelled: {why}. Close your PR unmerged and stop"
                 ),
             });
         }
     }
-    tx.commit()?;
-    ctx.switches.reload(&conn)?;
     Ok(effects)
 }
 

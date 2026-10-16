@@ -333,21 +333,25 @@ pub(super) fn authorize(state: &AppState, body: &Start) -> Result<(), ApiError> 
     {
         return Err(refused("skipped", "this provider window is skipped"));
     }
-    let existing_reservation = window
-        .as_ref()
-        .map(|w| budget::holds(&conn, provider, &w.window_start))
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .find(|r| r.number == body.number && r.repo == autopm::REPO);
-    if old.is_none()
-        && existing_reservation
-            .as_ref()
-            .is_some_and(|r| (r.original_points - body.points_est).abs() > f64::EPSILON)
-    {
+    // Admission and authorization are separate durable writes. Recover the gap
+    // across providers, including suspended/rolled reservations, before admitting.
+    let incompatible: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM autopm_reservations
+         WHERE repo=?1 AND number=?2 AND released_at_ms IS NULL
+         AND (provider != ?3 OR ABS(COALESCE(original_points,points)-?4) > ?5))",
+        params![
+            autopm::REPO,
+            body.number,
+            provider,
+            body.points_est,
+            f64::EPSILON
+        ],
+        |r| r.get(0),
+    )?;
+    if !revert && old.is_none() && incompatible {
         return Err(refused(
             "reservation",
-            "retry must use the admitted points estimate",
+            "retry must use the admitted provider and points estimate",
         ));
     }
     let reserved = budget::current(&conn, &store.paths.usage_db, provider)?
@@ -423,6 +427,9 @@ pub(in crate::http) fn may_dispatch(
         return Ok(true);
     }
     let fix = autopm::fix(&conn, record.number)?;
+    if !super::recovery::current(state, record.number)? {
+        return Ok(false);
+    }
     if fix.as_ref().is_some_and(|f| f.cancelled_at_ms.is_some()) {
         return Ok(false);
     }
@@ -740,6 +747,33 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn admission_crash_rejects_changed_provider_or_estimate() {
+        let state = setup();
+        let store = store(&state);
+        let settings = settings(&state).unwrap();
+        budget::admit_fix_start(&ctx(&state, &store, &settings), 3001, "codex", 2.0).unwrap();
+        // Crash before autopm_starts exists: no saved authorization to compare.
+        let mut retry = choice(3001, 2.0);
+        retry.provider = "claude".into();
+        retry.model = Some("opus".into());
+        retry.reasoning_effort = Some("high".into());
+        let error = authorize(&state, &retry).unwrap_err();
+        assert!(format!("{error:?}").contains("admitted provider"));
+        assert!(authorize(&state, &choice(3001, 3.0)).is_err());
+        authorize(&state, &choice(3001, 2.0)).unwrap();
+        let count: i64 = store
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM autopm_reservations WHERE number=3001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
