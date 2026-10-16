@@ -16,7 +16,7 @@ pub fn target(parent: &Path, name: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn remove_entry(path: &Path) -> io::Result<()> {
+pub(super) fn remove_entry(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -53,12 +53,29 @@ impl ManagedArtifacts {
         actor: &str,
         reason: &str,
     ) -> Result<Value> {
-        self.delete_inner(root, name, actor, reason, false)
+        self.delete_inner(root, name, actor, reason, false, false)
     }
     /// Called only after the owning session has ended. Rechecks age and use
     /// under the same write transaction as an explicit deletion.
     pub fn delete_orphan(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
-        self.delete_inner(root, name, "sm", "orphan", true)
+        self.delete_inner(root, name, "sm", "orphan", true, false)
+    }
+    pub fn recover_deletions(&self, root: &ArtifactRoot) -> Result<()> {
+        for a in self.store.list(&root.path)? {
+            if a["op"] == "deleting" {
+                let _ = self.delete_inner(
+                    root,
+                    a["name"].as_str().unwrap(),
+                    a["deleted_by"].as_str().unwrap_or("sm"),
+                    a["delete_reason"]
+                        .as_str()
+                        .unwrap_or("interrupted deletion"),
+                    false,
+                    true,
+                );
+            }
+        }
+        Ok(())
     }
     fn delete_inner(
         &self,
@@ -67,6 +84,7 @@ impl ManagedArtifacts {
         actor: &str,
         reason: &str,
         automatic: bool,
+        recovering: bool,
     ) -> Result<Value> {
         validate_name(name)?;
         if reason.trim().is_empty() {
@@ -93,11 +111,15 @@ impl ManagedArtifacts {
                     bail!("{n} is not an expired orphan build");
                 }
             }
-            if member["state"] == "deleted" || !member["op"].is_null() {
+            if member["state"] == "deleted"
+                || !(member["op"].is_null() || recovering && member["op"] == "deleting")
+            {
                 bail!("{n} is deleted or busy");
             }
-            if member["state"] == "frozen" {
-                bail!("frozen deletion requires the freeze implementation");
+            if (member["state"] == "frozen" || member["location"] == "cold")
+                && !super::moves::cold_mounted(root)
+            {
+                bail!("cold store is not connected");
             }
             if member["project"] == 1 {
                 bail!("{n} is kept for the project; remove the mark first");
@@ -131,12 +153,25 @@ impl ManagedArtifacts {
             tx.commit()?;
             return Ok(result);
         }
+        for member in &members {
+            tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if automatic {"orphan"} else {"agent"},recovering])?;
+        }
+        tx.commit()?;
+        // The durable op excludes new submissions. Recheck live use under the
+        // removal transaction, including after recovery of an interrupted delete.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for member in &members {
+            ensure_not_in_use(&tx, &root.path, member["name"].as_str().unwrap())?;
+        }
         let result = (|| {
             for member in &members {
                 let n = member["name"].as_str().unwrap();
                 let path = target(Path::new(&root.path), n)?;
                 let mut paths = Vec::new();
-                if member["location"] == "cold" {
+                if member["state"] == "frozen" {
+                    let frozen = Path::new(&root.cold_store).join(".frozen");
+                    paths.push(target(&frozen, n)?);
+                } else if member["location"] == "cold" {
                     let cold = target(Path::new(&root.cold_store), n)?;
                     if let Ok(meta) = path.symlink_metadata() {
                         if !meta.file_type().is_symlink() || fs::read_link(&path)? != cold {
@@ -182,7 +217,7 @@ impl ManagedArtifacts {
         }
         for member in &members {
             let n = member["name"].as_str().unwrap();
-            tx.execute("UPDATE artifacts SET state='deleted',deleted_at=?3,deleted_by=?4,delete_reason=?6,rebuildable=?5 WHERE root=?1 AND name=?2",params![root.path,n,now(),actor,member["recipe_complete"]==1 && !store::has_gpu(member),if automatic {"orphan"} else {"agent"}])?;
+            tx.execute("UPDATE artifacts SET state='deleted',op=NULL,deleted_at=?3,deleted_by=?4,rebuildable=?5 WHERE root=?1 AND name=?2",params![root.path,n,now(),actor,member["recipe_complete"]==1 && !store::has_gpu(member)])?;
             tx.execute(
                 "DELETE FROM artifact_aliases WHERE root=?1 AND target_name=?2",
                 params![root.path, n],

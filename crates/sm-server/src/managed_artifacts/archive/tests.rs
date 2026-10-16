@@ -255,3 +255,21 @@ fn managed_artifacts_archive_custom_symlink_modes_do_not_change_target() {
     assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o7777, 0o640);
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside target");
 }
+
+#[test]
+fn managed_artifacts_archive_root_metadata_round_trip() {
+    let f = Fixture::new();
+    let source = f.path("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), "data").unwrap();
+    let mut root = root_metadata(&source).unwrap();
+    root.mode = 0o755;
+    root.mtime = 123456789;
+    root.mtime_nsec = 987654321;
+    restore_metadata(&source, &root).unwrap();
+    let archive = f.path("archive");
+    let manifest = pack(&source, &archive, "sample", &config()).unwrap();
+    assert_eq!(manifest.root_metadata, root);
+    extract(&archive, &f.path("dest"), &manifest, 2).unwrap();
+    assert_eq!(root_metadata(&f.path("dest")).unwrap(), root);
+}

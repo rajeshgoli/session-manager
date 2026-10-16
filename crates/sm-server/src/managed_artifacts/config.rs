@@ -111,6 +111,10 @@ impl ManagedArtifactsConfig {
             || !(1..=19).contains(&self.freeze_level)
             || self.scan_seconds == 0
             || self.note_max_chars == 0
+            || self.freeze_part_bytes == 0
+            || self.freeze_parallel_parts == 0
+            || self.thaw_parallel_parts == 0
+            || self.max_concurrent_ops == 0
         {
             bail!("invalid managed_artifacts limits");
         }
