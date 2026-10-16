@@ -854,10 +854,9 @@ async fn old_done_mark_stays_with_the_first_ticket_when_an_agent_changes_tickets
         row(&inbox(&f, "done").await, "ticket:acme/widgets#1782")["done"],
         true
     );
-    assert_eq!(
-        row(&inbox(&f, "open").await, "ticket:acme/widgets#1783")["done"],
-        false
-    );
+    // The second ticket's message is older than the Open window, so check
+    // it is not Done rather than looking for it in Open.
+    assert!(!keys(&inbox(&f, "done").await).contains(&"ticket:acme/widgets#1783".to_owned()));
 }
 
 #[tokio::test]
@@ -1002,6 +1001,80 @@ async fn an_unread_finished_retired_agent_folds_as_ended() {
 }
 
 #[tokio::test]
+async fn a_retired_agents_recent_message_stays_out_of_the_fold() {
+    // sm#2249: a message the owner was pinged about stays findable after its
+    // agent retires, even once viewed.
+    let f = fixture();
+    created_id(&f, "child001", "# Approve a $1 smoke\nx", json!({})).await;
+    let (status, _) = request(
+        &f.app,
+        "GET",
+        "/inbox/thread/agent%3Achild001?format=json",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let retired = row(&inbox(&f, "open").await, "agent:child001");
+    assert_eq!(retired["group"], "earlier", "{retired}");
+    assert_eq!(retired["folded_by"], Value::Null);
+}
+
+#[tokio::test]
+async fn pinged_board_events_collect_in_one_board_row() {
+    use sm_server::owner_push::{NewNotice, OwnerPushStore};
+    let f = fixture();
+    let store = OwnerPushStore::new(f.dir.join("owner_push.db"));
+    let now = time::OffsetDateTime::now_utc();
+    for (subject, via, title) in [
+        ("board:1:1", "push", "Ready in lane 1, Iteration 11"),
+        ("board:1:2", "push", "Lane done: Auto PM"),
+        ("board:1:3", "resolved", "Started #9 as sm-9"),
+    ] {
+        store
+            .create_notice(
+                &NewNotice::message("local_bypass", "board", "sm board", subject, title, false),
+                now,
+            )
+            .unwrap();
+        Connection::open(f.dir.join("owner_push.db"))
+            .unwrap()
+            .execute(
+                "UPDATE owner_notices SET kind = 'board_ready', notified_via = ?2, \
+                 title = ?3, body = '#2 can start', reader_path = '/board#lane-1' \
+                 WHERE subject_id = ?1",
+                params![subject, via, title],
+            )
+            .unwrap();
+    }
+    let listing = inbox(&f, "open").await;
+    let board = row(&listing, "board");
+    assert_eq!(board["kind"], "board");
+    assert_eq!(board["group"], "new", "{board}");
+    assert_eq!(board["url"], "/board#lane-1");
+    // Only the two events that pinged the phone count.
+    assert_eq!(board["message_count"], 2, "{board}");
+    assert_eq!(
+        keys(&listing).iter().filter(|key| *key == "board").count(),
+        1
+    );
+
+    // Reading the row as a thread lists the events and marks it read.
+    let (status, thread) = request(&f.app, "GET", "/inbox/thread/board?format=json", None).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert_eq!(thread["items"].as_array().unwrap().len(), 2, "{thread}");
+    assert_eq!(thread["items"][0]["link"], "/board#lane-1");
+    assert_eq!(row(&inbox(&f, "open").await, "board")["group"], "earlier");
+
+    // Done and Archive, which every client offers on a row, mark it read.
+    for path in ["/inbox/done", "/inbox/archive", "/inbox/unarchive"] {
+        let (status, body) =
+            request(&f.app, "POST", path, Some(json!({"thread_key": "board"}))).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    assert_eq!(row(&inbox(&f, "open").await, "board")["group"], "earlier");
+}
+
+#[tokio::test]
 async fn inbox_groups_threads_by_what_they_need() {
     let f = fixture();
     // Read, so earlier.
@@ -1052,7 +1125,10 @@ async fn inbox_groups_threads_by_what_they_need() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Needs you · 2"), "{page}");
     assert!(page.contains("New · 1"), "{page}");
-    assert!(page.contains("Folded · 1 threads"), "{page}");
+    // child001 retired, but its message is recent, so it stays out of the
+    // fold (sm#2249).
+    assert!(page.contains("Earlier · 1"), "{page}");
+    assert!(!page.contains("Folded ·"), "{page}");
     assert!(page.contains(r#"class="tab on" href="/inbox""#), "{page}");
     let (status, _) = send(&f.app, "GET", "/inbox?filter=bogus", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1510,12 +1586,13 @@ async fn task_complete_puts_the_summary_written_after_it_in_finished() {
     let (status, _) = request(&f.app, "GET", "/sessions/child001/last-turn", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // The Inbox shows it in Finished, ahead of New, with the first line.
+    // The Inbox shows it in Finished, below New (a message the owner was
+    // pinged about), with the first line.
     created_id(&f, "orphan01", "# For your information\nx", json!({})).await;
     let listing = inbox(&f, "open").await;
     assert_eq!(
         keys(&listing),
-        vec!["agent:eng00001".to_owned(), "agent:orphan01".to_owned()]
+        vec!["agent:orphan01".to_owned(), "agent:eng00001".to_owned()]
     );
     let finished = row(&listing, "agent:eng00001");
     assert_eq!(finished["group"], "finished");

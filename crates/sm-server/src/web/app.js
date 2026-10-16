@@ -27,9 +27,9 @@ import { BugButton } from './bug.js';
 const PAGES = [
   { key: 'agents', label: 'Agents', icon: 'agents', path: '/', key_hint: 'a' },
   { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
+  { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
   { key: 'artifacts', label: 'Artifacts', icon: 'history', path: '/artifacts' },
-  { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
   { key: 'notes', label: 'Notes', icon: 'history', path: '/notes', key_hint: 'n' },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
   { key: 'history', label: 'History', icon: 'history', path: '/history', minor: true },

@@ -64,7 +64,7 @@ class InboxModelsTest {
             InboxRow(threadKey = "e", group = "finished"),
         )
         val sections = inboxSections(InboxFilter.Open, rows)
-        assertEquals(listOf("NEEDS YOU · 2", "FINISHED · 1", "NEW · 1", "EARLIER · 1"), sections.map { it.first })
+        assertEquals(listOf("NEEDS YOU · 2", "NEW · 1", "FINISHED · 1", "EARLIER · 1"), sections.map { it.first })
         assertEquals(listOf("b", "d"), sections[0].second.map { it.threadKey })
         assertEquals(listOf<String?>(null), inboxSections(InboxFilter.Docs, rows).map { it.first })
         assertTrue(inboxSections(InboxFilter.Done, emptyList()).isEmpty())
