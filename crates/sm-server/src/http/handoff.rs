@@ -451,13 +451,18 @@ pub(super) async fn start_retired_autopm_successor(
         kind: crate::handoff::execute::NoteKind::Path,
         value: note_path,
     };
-    super::auto_retire::rebuild_retired_worktree(state, predecessor)?;
     let Some(plan) = state
         .session_store
         .claim_retired_handoff_start(&predecessor.id, &note)?
     else {
         return Ok(None);
     };
+    if let Err(error) = super::auto_retire::rebuild_retired_worktree(state, predecessor) {
+        state
+            .session_store
+            .fail_handoff(&predecessor.id, &format!("{error:#}"))?;
+        return Err(error);
+    }
     let successor = match create_successor(state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {
