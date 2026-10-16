@@ -132,7 +132,7 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
     safe_relative(id)?;
     ensure!(!id.contains('/'), "invalid backup request id");
     let download = dest.directory(&format!(".downloads/{id}"))?;
-    let fetch = Instant::now();
+    let mut fetch_seconds = 0.0;
     let mut fetched = 0u64;
     for part in &status.parts {
         safe_relative(&part.file)?;
@@ -154,7 +154,9 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         }
         let offset = output.metadata()?.len();
         if offset < part.bytes {
+            let fetch = Instant::now();
             remote.download(id, part, offset, &mut output)?;
+            fetch_seconds += fetch.elapsed().as_secs_f64();
             output.sync_all()?;
             fetched = fetched.saturating_add(part.bytes - offset);
         }
@@ -165,7 +167,7 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
             part.file
         );
     }
-    let fetch_seconds = fetch.elapsed().as_secs_f64().max(0.001);
+    let fetch_seconds = fetch_seconds.max(0.001);
     let apply = Instant::now();
     let staging = dest.unpack(id, manifest, &status.parts, &download)?;
     let applied = dest.apply(

@@ -350,6 +350,7 @@ fn request_lifecycle_is_device_scoped_and_reuses_open_requests() {
             .unwrap()
             .allow_deletes
     );
+    let full_part_bytes: u64 = ready.parts.iter().map(|part| part.bytes).sum();
     let ack = l::Ack {
         applied: true,
         fetched_bytes: 6,
@@ -360,6 +361,25 @@ fn request_lifecycle_is_device_scoped_and_reuses_open_requests() {
         error: None,
     };
     l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
+    let conn = f.manager.store.open().unwrap();
+    let apply_bytes: u64 = conn
+        .query_row(
+            "SELECT bytes FROM backup_rate_samples WHERE device='mini' AND kind='apply'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let fetch_bytes: u64 = conn
+        .query_row(
+            "SELECT bytes FROM backup_rate_samples WHERE device='mini' AND kind='fetch'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(apply_bytes, full_part_bytes);
+    assert_eq!(fetch_bytes, ack.fetched_bytes);
+    assert_ne!(apply_bytes, fetch_bytes);
+
     l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
     assert!(!f.dir.join("outbox").join(&first.id).exists());
     assert_eq!(

@@ -359,7 +359,22 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
         mark_covered(&tx, manager, &r)?;
         if ack.fetched_bytes > 0 {
             record_rate(&tx, device, "fetch", ack.fetched_bytes, ack.fetch_seconds)?;
-            record_rate(&tx, device, "apply", ack.fetched_bytes, ack.apply_seconds)?;
+        }
+        // Application processes every request part, including cached bytes from
+        // previous download attempts. Use the server's immutable part sizes.
+        let parts: Vec<Part> =
+            serde_json::from_str(r["parts_json"].as_str().context("request parts missing")?)?;
+        let applied_bytes = parts.iter().try_fold(0u64, |total, part| {
+            total
+                .checked_add(part.bytes)
+                .context("backup part size overflow")
+        })?;
+        if applied_bytes > 0 {
+            ensure!(
+                ack.apply_seconds > 0.0,
+                "nonempty application needs positive timing"
+            );
+            record_rate(&tx, device, "apply", applied_bytes, ack.apply_seconds)?;
         }
     }
     tx.execute(
