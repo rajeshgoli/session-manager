@@ -2,8 +2,11 @@
 // Preact here, so the choice can be tested in node.
 
 const ROUTE_KEY = 'sm-term-route';
+const DIRECT_KEY = 'sm-term-direct-at';
 const ROUTE_MS = 10 * 60 * 1000;
 export const PROBE_MS = 700;
+// On the relay after this tab was on a direct socket, look for it again at these times after attaching (#2242).
+export const DIRECT_RETRY_MS = [2000, 5000, 15000, 30000, 60000];
 
 const loopback = (host) => host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
 
@@ -32,6 +35,20 @@ export function rememberRoute(storage, url, instance, now) {
   } catch (e) {
     /* private window: probe again next time */
   }
+}
+
+/** Note that this tab is on a direct socket now. */
+export function markDirect(storage, now) {
+  try { storage.setItem(DIRECT_KEY, String(now)); } catch (e) { /* private window */ }
+}
+
+/**
+ * True when this tab was on a direct socket in the last ten minutes: a relay
+ * route then most likely came from a server restart, not from being away from
+ * this machine's network, so probing for the direct path again is worth it.
+ */
+export function recentlyDirect(storage, now) {
+  try { return now - Number(storage.getItem(DIRECT_KEY)) < ROUTE_MS; } catch (e) { return false; }
 }
 
 /** True when the probe answers with this server's instance within the timeout. */
@@ -64,11 +81,19 @@ export async function chooseRoute(ticket, { location, fetchImpl, storage, now = 
   const known = remembered(storage, ticket.server_instance, now);
   if (known === 'relay') return relay;
   if (known && direct.some((entry) => entry.url === known)) return { url: known, direct: true, label: 'Direct' };
-  const answers = await Promise.all(direct.map((entry) => probe(fetchImpl, entry.probe, ticket.server_instance, ms)));
-  const index = answers.indexOf(true);
-  const chosen = index < 0 ? relay : { url: direct[index].url, direct: true, label: 'Direct' };
+  const found = await findDirect(ticket, { fetchImpl, ms });
+  const chosen = found ? { url: found, direct: true, label: 'Direct' } : relay;
   rememberRoute(storage, chosen.direct ? chosen.url : 'relay', ticket.server_instance, now);
   return chosen;
+}
+
+/** The first direct url, in list order, whose probe answers with the ticket's instance; else null. */
+export async function findDirect(ticket, { fetchImpl, ms = PROBE_MS }) {
+  const direct = Array.isArray(ticket.direct) ? ticket.direct : [];
+  if (!ticket.server_instance || !direct.length) return null;
+  const answers = await Promise.all(direct.map((entry) => probe(fetchImpl, entry.probe, ticket.server_instance, ms)));
+  const index = answers.indexOf(true);
+  return index < 0 ? null : direct[index].url;
 }
 
 /** The median of the last three round trips, in whole ms. */
