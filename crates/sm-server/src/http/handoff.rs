@@ -635,7 +635,13 @@ async fn complete_handoff(
         .hand_off_pending_messages(predecessor_id, successor_id)?;
     // Step 4. Sends resolve to the successor once the predecessor has
     // stopped; anything that reached it before then moves now.
-    retire_predecessor(state, predecessor_id, successor_id).await?;
+    if state
+        .session_store
+        .get_session(predecessor_id)?
+        .is_none_or(|predecessor| !predecessor.auto_retired())
+    {
+        retire_predecessor(state, predecessor_id, successor_id).await?;
+    }
     state
         .session_store
         .hand_off_pending_messages(predecessor_id, successor_id)?;

@@ -248,6 +248,9 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
+        if raw_handoff_record(session).is_some_and(|record| record.state != HandoffPhase::Failed) {
+            return Ok(None);
+        }
         let now = now_rfc3339();
         let mut record = HandoffRecord::asked(
             HandoffTrigger::Context,
@@ -950,6 +953,24 @@ mod tests {
         store.write_raw_json_value(&state).unwrap();
     }
 
+    fn set_auto_retired(store: &SessionStore, session_id: &str) {
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        let session = session_object_mut(sessions, session_id).unwrap();
+        session.insert("status".to_owned(), json!("stopped"));
+        session.insert("completion_status".to_owned(), json!("retired"));
+        session.insert(
+            "terminal_provenance".to_owned(),
+            json!({
+                "cause": "explicit_retire",
+                "observed_at": "2026-09-29T00:02:00Z",
+                "authority": "server_lifecycle",
+                "source": "auto_retire",
+            }),
+        );
+        store.write_raw_json_value(&state).unwrap();
+    }
+
     fn queued(store: &SessionStore, session_id: &str) -> Vec<String> {
         store
             .queue_store
@@ -1067,6 +1088,35 @@ mod tests {
             HandoffPhase::Spawning
         );
         assert_eq!(store.claim_handoff_start("pred0001").unwrap(), None);
+    }
+
+    #[test]
+    fn retired_auto_pm_start_is_claimed_once_until_it_fails() {
+        let store = store("retired-start", "stopped");
+        set_auto_retired(&store, "pred0001");
+
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            record(&store, "pred0001").unwrap().state,
+            HandoffPhase::Spawning
+        );
+        assert_eq!(
+            store
+                .claim_retired_handoff_start("pred0001", &note())
+                .unwrap(),
+            None
+        );
+
+        store
+            .fail_handoff("pred0001", "worktree unavailable")
+            .unwrap();
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
