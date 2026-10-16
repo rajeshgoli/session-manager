@@ -1140,3 +1140,28 @@ fn failed_weekly_integrity_check_never_confirms_and_blocks_unrepaired_retry() {
     );
     assert_eq!(dest.state().unwrap().confirmed.as_deref(), Some("weekly"));
 }
+
+#[test]
+fn failed_adoption_returns_original_folder_without_registering_records() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![
+        f.dir.join("data").display().to_string(),
+        f.dir.join("projects").display().to_string(),
+    ];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::write(f.dir.join("projects/code"), b"source").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.directory("existing-data").unwrap();
+    fs::copy(f.dir.join("data/prices"), source.join("prices")).unwrap();
+    let packed = dest.directory("packed/projects").unwrap();
+    fs::write(packed.join("code.zst"), b"untracked").unwrap();
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).is_err());
+    assert!(dest.records().unwrap().is_empty());
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
+    assert!(!dest.root.join("plain/data").exists());
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
+}
