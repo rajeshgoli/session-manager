@@ -63,7 +63,38 @@ pub async fn sweep_auto_retire(
     if !retired.is_empty() {
         board::request_recompute(&state);
     }
+    restore_queued_autopm_messages(&state).await?;
     Ok(retired)
+}
+
+/// A reminder, review result, queue completion, or claim check can already be
+/// in the durable queue when an Auto PM seat is retired. Those producers do
+/// not all pass through an HTTP send route, so restore the retired role holder
+/// before the delivery loop can attempt its queued message.
+async fn restore_queued_autopm_messages(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+    for id in queue.undelivered_targets()? {
+        let Some(session) = state.session_store.get_session(&id)? else {
+            continue;
+        };
+        if !messages::restores(&session)
+            || state
+                .session_store
+                .lookup_agent_registration(crate::autopm::ROLE)?
+                .is_none_or(|holder| holder.session_id != id)
+        {
+            continue;
+        }
+        if let Some(restored) = ready_for_message_async(state, session).await {
+            if state.config.rust_core.runtime_enabled {
+                let runtime = TmuxRuntime::from_app_config(&state.config);
+                state
+                    .session_store
+                    .drain_runtime_pending_messages_for_session(&restored.id, &runtime)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Retire, re-checking finished and idle under the store's lock.
@@ -113,10 +144,14 @@ fn due_sessions(state: &AppState, now: OffsetDateTime) -> anyhow::Result<Vec<(St
         .map_err(|error| anyhow::anyhow!("watch state: {error:?}"))?;
     let context = Context {
         spawned: state.session_store.spawn_intent_session_ids()?,
+        // A retired Auto PM seat keeps its `autopm` registration so the next
+        // role-addressed message can find and restore it. Every other role
+        // remains an auto-retire exemption.
         roles: state
             .session_store
             .list_agent_registrations()?
             .into_iter()
+            .filter(|registration| registration.role != crate::autopm::ROLE)
             .map(|registration| registration.session_id)
             .collect(),
         followed: crate::owner_push::OwnerPushStore::new(crate::owner_push::push_db_path(
@@ -363,6 +398,54 @@ pub(super) fn ready_for_message(
     }
 }
 
+/// Async message readiness adds the Auto PM context handoff decision. Ordinary
+/// auto-retired seats keep the existing synchronous restore path; only the
+/// standing Auto PM role may turn its next message into a successor handoff.
+pub(super) async fn ready_for_message_async(
+    state: &Arc<AppState>,
+    recipient: SessionRecord,
+) -> Option<SessionRecord> {
+    if retired_autopm_needs_successor(state, &recipient) {
+        match super::handoff::start_retired_autopm_successor(state, &recipient).await {
+            Ok(Some(successor)) => return Some(successor),
+            Ok(None) => return messages::live_recipient(state, &recipient.id),
+            Err(error) => {
+                eprintln!(
+                    "starting a successor for retired Auto PM {} failed: {error:#}",
+                    recipient.id
+                );
+                return None;
+            }
+        }
+    }
+    let work = state.clone();
+    tokio::task::spawn_blocking(move || ready_for_message(&work, recipient))
+        .await
+        .ok()
+        .flatten()
+}
+
+pub(super) fn retired_autopm_needs_successor(state: &AppState, session: &SessionRecord) -> bool {
+    if !messages::restores(session)
+        || state
+            .session_store
+            .lookup_agent_registration(crate::autopm::ROLE)
+            .ok()
+            .flatten()
+            .is_none_or(|holder| holder.session_id != session.id)
+    {
+        return false;
+    }
+    let Some(used) = session.context_used_percentage else {
+        return false;
+    };
+    let handoff = session.handoff_view.as_ref().unwrap_or(&Value::Null);
+    handoff["enabled"].as_bool() == Some(true)
+        && handoff["threshold_percent"]
+            .as_f64()
+            .is_some_and(|threshold| used >= threshold)
+}
+
 /// `sm send` to an auto-retired agent restores it before the send, which
 /// then queues as for any live agent. When the restore fails, the send goes
 /// where a reply would: its successor, else its parent (spec 1821 E3).
@@ -378,11 +461,8 @@ pub(super) async fn restore_send_target(
     if !messages::restores(&session) {
         return Ok(None);
     }
-    let work = state.clone();
     let id = session.id.clone();
-    let restored = tokio::task::spawn_blocking(move || ready_for_message(&work, session))
-        .await
-        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+    let restored = ready_for_message_async(state, session).await;
     Ok(match restored {
         Some(_) => None,
         None => messages::live_recipient(state, &id).map(|fallback| fallback.id),

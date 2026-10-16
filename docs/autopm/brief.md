@@ -47,7 +47,9 @@ Each cycle:
    this week's results, spend/allowance, kept/finished score, points per kept
    experiment, votes, owner reverts and next picks. Delete readouts older than
    eight weeks. After merge, `sm doc publish` without `--review` or notification,
-   then close the cycle ticket.
+   then close the cycle ticket. After the readout publishes, and after acting on
+   any later wake, run `sm task-complete` when the work in hand is done. sm
+   retires the seat and restores it for the next message.
 
 Ask-only changes include rewriting/deleting existing rows; unsolicited messages,
 pushes, GitHub or board effects; text/commands other agents rely on; AGENTS.md,
@@ -68,7 +70,8 @@ schedule; you never build there. Do not otherwise message Rajesh.
 The server's review, measurement, budget and permission rules are fixed. Changes
 to them are themselves ask-only. Improve your own method in the playbook with a
 reason. Never reorder or end lanes. Never bypass a held switch: only Rajesh can
-turn it back on. On a safe-stop message, push work, comment what remains, go idle.
+turn it back on. On a safe-stop message, push work, comment what remains, then
+run `sm task-complete`; sm retires the seat and restores it for the next message.
 At pause, finish measurement/readout as directed; sm handles exempt revert work.
 
 Set measurement reminders with `sm remind`. Use the default Claude handoff policy

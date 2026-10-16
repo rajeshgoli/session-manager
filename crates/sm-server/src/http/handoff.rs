@@ -430,6 +430,59 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     complete_handoff(&state, predecessor_id, &successor.id).await
 }
 
+/// A retired Auto PM seat at its handoff threshold must not be relaunched just
+/// to receive one wake. Create and transfer to its successor directly, using
+/// the ordinary handoff transfer table, while the predecessor stays retired.
+pub(super) async fn start_retired_autopm_successor(
+    state: &Arc<AppState>,
+    predecessor: &SessionRecord,
+) -> anyhow::Result<Option<SessionRecord>> {
+    let note_path = predecessor
+        .last_handoff_path
+        .clone()
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .unwrap_or_else(|| {
+            expand_home(&predecessor.working_dir)
+                .join("docs/autopm/brief.md")
+                .display()
+                .to_string()
+        });
+    let note = HandoffNote {
+        kind: crate::handoff::execute::NoteKind::Path,
+        value: note_path,
+    };
+    let Some(plan) = state
+        .session_store
+        .claim_retired_handoff_start(&predecessor.id, &note)?
+    else {
+        return Ok(None);
+    };
+    let successor = match create_successor(state, &plan).await {
+        Ok(successor) => successor,
+        Err(error) => {
+            state.session_store.fail_handoff(&predecessor.id, &error)?;
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+    if let Some(retired_at) = predecessor.completed_at.as_deref() {
+        super::claims::work_claim_store(state)
+            .reopen_retired_claims(&predecessor.id, retired_at)?;
+    }
+    let brief = move_work(state, &state.session_store, &predecessor.id, &successor.id)?;
+    state.session_store.queue_handoff_notice(
+        &predecessor.id,
+        &successor.id,
+        &brief.text,
+        &execute::brief_message_id(&predecessor.id),
+        &[&successor.id, &predecessor.id],
+    )?;
+    state
+        .session_store
+        .hand_off_pending_messages(&predecessor.id, &successor.id)?;
+    state.session_store.finish_handoff(&predecessor.id)?;
+    Ok(Some(successor))
+}
+
 /// F.2: the same provider, model, effort, worktree, machine and parent,
 /// through the core create path. No initial prompt: the brief follows the
 /// transfer. The error is the D.6 reason.

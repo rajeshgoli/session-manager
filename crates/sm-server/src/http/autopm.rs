@@ -140,9 +140,21 @@ fn api_error(fail: Fail) -> ApiError {
 }
 
 fn send(state: &AppState, session_id: &str, text: &str) -> anyhow::Result<()> {
+    // Auto PM may be deliberately retired between cycles. Resolve it through
+    // the same restore-before-delivery path as an ordinary message instead of
+    // leaving a wake stranded in its stopped queue.
+    let target = match state.session_store.get_session(session_id)? {
+        Some(session) if super::auto_retire::retired_autopm_needs_successor(state, &session) => {
+            session.id
+        }
+        Some(session) => super::auto_retire::ready_for_message(state, session)
+            .map(|session| session.id)
+            .unwrap_or_else(|| session_id.to_owned()),
+        None => session_id.to_owned(),
+    };
     RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
         .enqueue_message_with_metadata(
-            session_id,
+            &target,
             text,
             "sequential",
             QueueMessageMetadata::default(),
@@ -151,9 +163,9 @@ fn send(state: &AppState, session_id: &str, text: &str) -> anyhow::Result<()> {
         let runtime = TmuxRuntime::from_app_config(&state.config);
         if let Err(error) = state
             .session_store
-            .drain_runtime_pending_messages_for_session(session_id, &runtime)
+            .drain_runtime_pending_messages_for_session(&target, &runtime)
         {
-            eprintln!("autopm message to {session_id} not delivered yet: {error:#}");
+            eprintln!("autopm message to {target} not delivered yet: {error:#}");
         }
     }
     Ok(())

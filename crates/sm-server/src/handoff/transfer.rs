@@ -222,6 +222,61 @@ impl SessionStore {
         Ok(Some(plan))
     }
 
+    /// Starts the transfer of an auto-retired seat without restoring its
+    /// process. This is the context-limit counterpart of `claim_handoff_start`:
+    /// it creates the same successor plan and leaves the predecessor retired.
+    pub fn claim_retired_handoff_start(
+        &self,
+        session_id: &str,
+        note: &HandoffNote,
+    ) -> Result<Option<SuccessorPlan>> {
+        let _submission = self.lock_opencode_submission(session_id)?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let Some(existing) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Ok(None);
+        };
+        if !existing.auto_retired() || existing.successor_session_id.is_some() {
+            return Ok(None);
+        }
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        let mut record = HandoffRecord::asked(
+            HandoffTrigger::Context,
+            &now,
+            session
+                .get("context_used_percentage")
+                .and_then(Value::as_f64),
+        );
+        record.state = HandoffPhase::Spawning;
+        record.note = Some(note.to_json());
+        record.accepted_at = Some(now);
+        write_handoff_record(session, &record);
+        let predecessor_name = raw_session_display_name(session, session_id);
+        let text = |key: &str| json_text(session.get(key)).filter(|value| !value.is_empty());
+        let plan = SuccessorPlan {
+            predecessor_id: session_id.to_owned(),
+            successor_name: execute::successor_name(&predecessor_name),
+            predecessor_name,
+            provider: text("provider").unwrap_or_else(default_provider),
+            model: text("model"),
+            reasoning_effort: text("reasoning_effort"),
+            working_dir: text("working_dir").unwrap_or_default(),
+            node: text("node").unwrap_or_else(default_node),
+            parent_session_id: text("parent_session_id"),
+        };
+        self.write_raw_json_value(&state)?;
+        Ok(Some(plan))
+    }
+
     /// The successor exists but no work has moved yet. Persist recovery before
     /// any wait or delivery-resolution gate can defer the driver.
     pub(crate) fn record_opencode_handoff_successor(
