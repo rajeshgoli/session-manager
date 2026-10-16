@@ -457,12 +457,15 @@ pub(super) async fn start_retired_autopm_successor(
     else {
         return Ok(None);
     };
-    if let Err(error) = super::auto_retire::rebuild_retired_worktree(state, predecessor) {
-        state
-            .session_store
-            .fail_handoff(&predecessor.id, &format!("{error:#}"))?;
-        return Err(error);
-    }
+    let detached_worktree = match super::auto_retire::rebuild_retired_worktree(state, predecessor) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state
+                .session_store
+                .fail_handoff(&predecessor.id, &format!("{error:#}"))?;
+            return Err(error);
+        }
+    };
     let successor = match create_successor(state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {
@@ -483,6 +486,20 @@ pub(super) async fn start_retired_autopm_successor(
         &execute::brief_message_id(&predecessor.id),
         &[&successor.id, &predecessor.id],
     )?;
+    if let Some((branch, base)) = detached_worktree {
+        let working_dir = expand_home(&predecessor.working_dir).display().to_string();
+        let text = format!(
+            "[sm] Branch {branch} is gone (merged and deleted), so your worktree {working_dir} \
+             was rebuilt detached at {base}."
+        );
+        state.session_store.queue_handoff_notice(
+            &predecessor.id,
+            &successor.id,
+            &text,
+            &execute::detached_worktree_message_id(&predecessor.id),
+            &[&successor.id, &predecessor.id],
+        )?;
+    }
     state
         .session_store
         .hand_off_pending_messages(&predecessor.id, &successor.id)?;

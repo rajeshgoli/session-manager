@@ -25,6 +25,10 @@ pub fn brief_message_id(predecessor_id: &str) -> String {
 pub fn parent_notice_message_id(predecessor_id: &str) -> String {
     format!("handoff-notice-{predecessor_id}")
 }
+
+pub fn detached_worktree_message_id(predecessor_id: &str) -> String {
+    format!("handoff-detached-worktree-{predecessor_id}")
+}
 /// The chain walk of H.2 stops after this many hops.
 pub const MAX_FORWARD_HOPS: usize = 32;
 

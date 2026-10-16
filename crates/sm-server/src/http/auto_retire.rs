@@ -284,7 +284,7 @@ fn repo_dirs(state: &AppState) -> Vec<String> {
 pub(super) fn rebuild_retired_worktree(
     state: &AppState,
     session: &SessionRecord,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(String, String)>> {
     let working_dir = expand_home(&session.working_dir).display().to_string();
     match rebuild_worktree(
         &work_claim_store(state),
@@ -292,9 +292,10 @@ pub(super) fn rebuild_retired_worktree(
         &working_dir,
         &repo_dirs(state),
     ) {
-        Ok(_) => Ok(()),
+        Ok(WorktreeRebuild::Detached { branch, base }) => Ok(Some((branch, base))),
+        Ok(WorktreeRebuild::Present | WorktreeRebuild::Rebuilt { .. }) => Ok(None),
         Err(reason) if state.config.rust_core.runtime_enabled => anyhow::bail!(reason),
-        Err(_) => Ok(()),
+        Err(_) => Ok(None),
     }
 }
 
