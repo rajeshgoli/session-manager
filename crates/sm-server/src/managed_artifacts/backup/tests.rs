@@ -1020,3 +1020,44 @@ fn failed_seed_application_removes_destination_staging() {
     assert_eq!(fs::read(plain.join("prices")).unwrap(), b"untracked");
     assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
 }
+
+#[test]
+fn failed_seed_rolls_back_files_already_replaced() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"original").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let original = dest.records().unwrap();
+    fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
+    fs::write(f.dir.join("data/zzz"), b"source").unwrap();
+    fs::write(dest.root.join("plain/data/zzz"), b"untracked").unwrap();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("untracked destination file differs"));
+    assert_eq!(dest.records().unwrap(), original);
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/zzz")).unwrap(),
+        b"untracked"
+    );
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+            .unwrap()
+            .unwrap()
+            .manifest_id,
+        first
+    );
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
+}

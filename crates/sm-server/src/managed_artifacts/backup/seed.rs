@@ -204,7 +204,11 @@ pub fn seed(
         &prepared.parts,
         &prepared.directory,
     )?;
-    dest.apply(&id, &prepared.transfer, &staging, true, 1.0)?;
+    if let Err(error) = dest.apply(&id, &prepared.transfer, &staging, true, 1.0) {
+        dest.rollback(&id)
+            .context("restore destination after failed seed application")?;
+        return Err(error);
+    }
     prepared.manifest.base = previous.clone();
     save_manifest(&tx, device, &prepared.manifest)?;
     confirm(&tx, device, &id)?;
