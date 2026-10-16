@@ -277,7 +277,7 @@ export function TerminalPage({ id, open }) {
           socket = null; live = false; stopPing(); switching = true;
           ws.close();
           connect();
-        }, DIRECT_RETRY_MS[i]);
+        }, DIRECT_RETRY_MS[i] - (i ? DIRECT_RETRY_MS[i - 1] : 0));
       };
       next(0);
     };
@@ -344,6 +344,8 @@ export function TerminalPage({ id, open }) {
           }
         };
         ws.onclose = (event) => {
+          // A direct socket ending (a restart, say) is the moment the tab last used it.
+          if (chosen.direct && attached) markDirect(session(), Date.now());
           if (stopped || socket !== ws) return;
           if (chosen.direct && !attached) { fallback(ws, ticket.server_instance); return; }
           clearTimeout(handshakeTimer);

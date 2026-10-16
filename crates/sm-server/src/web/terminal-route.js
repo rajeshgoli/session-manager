@@ -5,7 +5,7 @@ const ROUTE_KEY = 'sm-term-route';
 const DIRECT_KEY = 'sm-term-direct-at';
 const ROUTE_MS = 10 * 60 * 1000;
 export const PROBE_MS = 700;
-// On the relay after this tab was on a direct socket, look for it again this long after attaching (#2242).
+// On the relay after this tab was on a direct socket, look for it again at these times after attaching (#2242).
 export const DIRECT_RETRY_MS = [2000, 5000, 15000, 30000, 60000];
 
 const loopback = (host) => host === 'localhost' || host === '127.0.0.1' || host === '[::1]';

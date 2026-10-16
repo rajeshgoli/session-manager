@@ -116,3 +116,12 @@ test('a switch back to direct that fails returns to the relay and stops probing 
   assert.equal(f.sockets[2].url,'wss://sm.example.com/client/terminal');
   f.sockets[2].attach();assert.equal(f.states[0],'Live');assert.equal(f.timers.size,0);f.cleanup();
 });
+test('a direct socket open longer than ten minutes still counts as recent when it drops',async()=>{
+  const storage=memory();
+  const f=fixture(DIRECT,{storage});await f.settle();
+  f.sockets[0].attach();
+  // Long before the restart.
+  storage.items['sm-term-direct-at']=String(Date.now()-60*60000);
+  f.sockets[0].fail();
+  assert.ok(Date.now()-Number(storage.items['sm-term-direct-at'])<1000);f.cleanup();
+});
