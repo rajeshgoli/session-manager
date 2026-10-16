@@ -31,16 +31,30 @@ const docRevision = item => {
   const link = new DOMParser().parseFromString(item.html, 'text/html').querySelector('a[href]');
   return link ? { path: readerPath(link.getAttribute('href')), title: link.textContent.trim() } : null;
 };
+// What reached the owner's phone (Needs you, New) comes before agents that
+// merely finished a turn (sm#2249).
+const GROUPS = ['needs_you','new','finished','earlier'];
+const GROUP_LABELS = {needs_you:'Needs you', new:'New', finished:'Finished', earlier:'Earlier'};
 /** Rows in the order the list shows them; Folded rows only while the fold is open. */
 export function shownRows(rows, filter, foldOpen) {
   if (filter !== 'open') return rows;
-  return [...['needs_you','finished','new','earlier'].flatMap(group => rows.filter(r => r.group === group)),
+  return [...GROUPS.flatMap(group => rows.filter(r => r.group === group)),
     ...(foldOpen ? rows.filter(r => r.group === 'folded') : [])];
 }
 /** After Done or Archive (sm#1981): the row below, else the row above, else none. */
 export function nextRow(rows, key) {
   const i = rows.findIndex(r => r.thread_key === key);
   return i < 0 ? null : rows[i + 1] || rows[i - 1] || null;
+}
+/** "8m", "16h", "2d", then a date: how mail lists date a row. */
+export function rowAge(iso, now = Date.now()) {
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return '';
+  const minutes = Math.max(0, Math.floor((now - at) / 60000));
+  if (minutes < 60) return minutes < 1 ? 'now' : `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h`;
+  if (minutes < 7 * 1440) return `${Math.floor(minutes / 1440)}d`;
+  return new Date(at).toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 const replyTime = value => value ? new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'its last turn';
 
@@ -101,12 +115,22 @@ export function InboxPage({ openRef }) {
     const off = bus.on('inbox-done', done);
     return () => { document.removeEventListener('keydown', key); off(); };
   }, [selected, busy, data, filter, foldOpen]);
-  const row = item => html`<div class="inbox-entry" key=${item.thread_key}>
-    <button class=${`inbox-row ${rowRef(item) === openRef ? 'selected' : ''}`} onClick=${() => openPanel(rowRef(item))}>
-      <strong>${item.title}</strong><span>${item.preview}</span>
-      <small>${[...item.agents, ...(item.doc_count ? [`${item.doc_count} docs, ${item.revision_count} revisions`] : [])].join(' · ') || item.repo}</small>
+  // Reading the newest revision is what a doc row is for, so it is one click;
+  // in the Docs list the row itself opens it (sm#2249).
+  const readLatest = item => openPanel(`doc:${readerPath(item.doc_url)}`);
+  const latest = item => item.doc_url && readerPath(item.doc_url);
+  const row = item => html`<div class=${`inbox-entry ${item.group === 'earlier' || item.group === 'folded' || item.done ? 'read' : ''}`} key=${item.thread_key}>
+    <button class=${`inbox-row ${rowRef(item) === openRef || (latest(item) && openRef === `doc:${latest(item)}`) ? 'selected' : ''}`}
+      onClick=${() => item.kind === 'board' ? navigate(item.url) : filter === 'docs' && latest(item) ? readLatest(item) : openPanel(rowRef(item))}>
+      <span class="inbox-row-head"><strong>${item.title}</strong><time datetime=${item.newest_at} title=${new Date(item.newest_at).toLocaleString()}>${rowAge(item.newest_at)}</time></span>
+      <span class="inbox-row-preview">${item.preview}</span>
+      <small>${[...item.agents, ...(item.doc_count ? [`${item.doc_count} ${item.doc_count === 1 ? 'doc' : 'docs'}, ${item.revision_count} ${item.revision_count === 1 ? 'revision' : 'revisions'}`] : [])].join(' · ') || item.repo}</small>
     </button>
-    <button class="inbox-entry-action" disabled=${busy} onClick=${() => archive(item)}>${item.folded_by === 'archived' ? 'Unarchive' : 'Archive'}</button>
+    <span class="inbox-entry-actions">
+      ${latest(item) && filter !== 'docs' ? html`<button class="btn sm pri" onClick=${() => readLatest(item)}>Read latest</button>` : null}
+      ${filter === 'docs' && latest(item) ? html`<button class="btn sm" onClick=${() => openPanel(rowRef(item))}>Thread</button>` : null}
+      ${item.kind === 'board' ? null : html`<button class="inbox-entry-action" disabled=${busy} onClick=${() => archive(item)}>${item.folded_by === 'archived' ? 'Unarchive' : 'Archive'}</button>`}
+    </span>
   </div>`;
   const folded = (data?.rows || []).filter(item => item.group === 'folded');
   const foldNames = folded.slice(0, 3).map(item => item.title).join(', ');
@@ -116,10 +140,10 @@ export function InboxPage({ openRef }) {
       <div class="inbox-filters"><${Seg} label="Inbox filter" value=${filter} onChange=${setFilter}
         options=${['open','docs','done'].map(value => ({value, label: value[0].toUpperCase()+value.slice(1)}))} /></div>
       ${error ? html`<p role="alert">${error.message}</p>` : null}
-      ${!data ? html`<p class="empty">Loading…</p>` : data.rows.length === 0 ? html`<p class="empty">Nothing here.</p>` : null}
-      ${(filter === 'open' ? ['needs_you','finished','new','earlier'] : ['all']).map(group => {
+      ${!data ? html`<p class="empty">Loading…</p>` : data.rows.length === 0 ? html`<p class="empty">${filter === 'open' ? 'You are caught up.' : 'Nothing here.'}</p>` : null}
+      ${(filter === 'open' ? GROUPS : ['all']).map(group => {
         const rows = (data?.rows || []).filter(r => group === 'all' || r.group === group);
-        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',finished:'cyan'})[group] || ''}>${({needs_you:'Needs you',finished:'Finished',new:'New',earlier:'Earlier',folded:'Folded'})[group]}</h2>` : null}
+        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',new:'cyan'})[group] || ''}>${GROUP_LABELS[group]} <span class="count">${rows.length}</span></h2>` : null}
           ${rows.map(row)}</div>` : null;
       })}
       ${filter === 'open' && folded.length ? html`<div class="inbox-fold">
@@ -128,8 +152,8 @@ export function InboxPage({ openRef }) {
         </button>${foldOpen ? folded.map(row) : null}
       </div>` : null}
     </section>
-    <section class="inbox-reader">
-      ${inline ? html`<div class="inbox-actions"><button class="btn sm" onClick=${closePanel}>← Inbox</button><span></span>
+    ${inline ? html`<section class="inbox-reader">
+      <div class="inbox-actions"><button class="btn sm" onClick=${closePanel}>← Inbox</button><span></span>
         ${agent?.facts?.you?.dismissible ? html`<button class="btn sm" disabled=${busy} title="You answered elsewhere; clear the question" onClick=${answered}>✓ Answered</button>` : null}
         ${selected ? html`<button class="btn sm" disabled=${busy} onClick=${done}>Done <kbd>e</kbd></button>` : null}
         ${selected ? html`<button class="btn sm" disabled=${busy} onClick=${() => archive()}>${selected.folded_by === 'archived' ? 'Unarchive' : 'Archive'} <kbd>y</kbd></button>` : null}
@@ -137,11 +161,10 @@ export function InboxPage({ openRef }) {
           ? html`<span class="confirm">Retire ${agent.name}?
               <button class="btn sm danger" disabled=${busy} onClick=${retire}>Retire</button>
               <button class="btn sm" onClick=${() => setRetiring(false)}>Cancel</button></span>`
-          : html`<button class="btn sm" onClick=${() => setRetiring(true)}>Retire…</button>` : null}</div>` : null}
+          : html`<button class="btn sm" onClick=${() => setRetiring(true)}>Retire…</button>` : null}</div>
       ${openRef?.startsWith('doc:') ? html`<${Reader} key=${openRef} id=${openRef.slice(4)} />`
-        : workKey || threadId ? html`<${Thread} key=${openRef} id=${threadId} workKey=${workKey} agent=${agent} />`
-        : html`<div class="empty">Choose a thread or document to read.</div>`}
-    </section>
+        : html`<${Thread} key=${openRef} id=${threadId} workKey=${workKey} agent=${agent} />`}
+    </section>` : null}
   </div>`;
 }
 
@@ -158,6 +181,15 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
   const scrollOnLoad = useRef(true);
   const pinned = useRef(false);
   const options = data?.reply_options || [];
+  const revisionItems = (data?.items || []).filter(item => item.type === 'doc_revision');
+  const newestItem = revisionItems[revisionItems.length - 1];
+  const newestDoc = newestItem && docRevision(newestItem);
+  const docOf = item => docRevision(item)?.path?.split('?')[0];
+  const revisions = newestDoc ? revisionItems.filter(item => docOf(item) === newestDoc.path?.split('?')[0]).length : 0;
+  const newest = newestDoc?.path ? { item: newestItem, doc: newestDoc } : null;
+  // A card keeps the flag it was published with; the thread's status says
+  // whether the request is still open (dismissed or reviewed clears it).
+  const reviewOpen = data?.status === 'review_requested';
   const defaultTarget = options.find(option => option.status === 'live' && option.can_send)
     || options.find(option => option.can_send);
   const target = options.find(option => option.id === targetId && option.can_send) || defaultTarget;
@@ -225,6 +257,10 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
       prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
       agent=${{ id: agent.id, name: agent.name, provider: agent.provider, fact: factText(agent.facts) }}
       jobs=${agent.jobs || []} /></div>` : null}
+    ${newest ? html`<div class="thread-latest"><span><strong>${newest.doc.title}</strong>
+        <small>Revision ${revisions} · ${reviewOpen ? 'review requested' : 'published'} ${rowAge(newest.item.at)} ago</small></span>
+        <button class="btn pri" onClick=${() => openPanel(`doc:${newest.doc.path}`)}>Read latest</button>
+        ${reviewOpen ? html`<button class="btn" onClick=${() => openPanel(`doc:${newest.doc.path}#sm-review`)}>Review</button>` : null}</div>` : null}
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => {
       if (item.type === 'doc_revision') {

@@ -12,6 +12,7 @@ use super::messages::{
     valid_submission_id, NO_RECIPIENT,
 };
 use super::*;
+pub(super) mod board_pings;
 pub(super) mod work_threads;
 use crate::owner_doc_render::{inline_json, render_markdown_with_lines};
 use crate::owner_docs::{
@@ -30,8 +31,8 @@ use crate::turn_messages::{FinishedRow, ThreadReply};
 use work_threads::ThreadCatalog;
 
 /// The Open list holds threads with activity this recent, plus every thread
-/// that needs the owner.
-const OPEN_WINDOW: time::Duration = time::Duration::days(30);
+/// that needs the owner or holds an unread Finished turn.
+const OPEN_WINDOW: time::Duration = time::Duration::days(7);
 /// Rows the Docs and Done lists return, newest first.
 const LIST_LIMIT: usize = 200;
 /// Quoted passages one send may carry.
@@ -125,8 +126,8 @@ pub(super) struct InboxRow {
 fn group_rank(group: &str) -> u8 {
     match group {
         "needs_you" => 0,
-        "finished" => 1,
-        "new" => 2,
+        "new" => 1,
+        "finished" => 2,
         _ => 3,
     }
 }
@@ -355,15 +356,16 @@ pub(super) struct InboxQuery {
 /// The rows a filter shows, in order, plus the badge values (which always
 /// count the Open list).
 fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize, bool), ApiError> {
-    let rows = ThreadCatalog::load(state)?.rows(state)?;
+    let mut rows = ThreadCatalog::load(state)?.rows(state)?;
+    rows.extend(board_pings::board_row(state)?);
     let cutoff = format_ts(OffsetDateTime::now_utc() - OPEN_WINDOW);
-    // Needs-you and unread Finished threads stay open until dealt with.
+    // Needs-you and unread Finished threads stay open until dealt with; an
+    // unread doc or message older than the window leaves Open (the Docs list
+    // keeps every doc).
     let open = |row: &InboxRow| {
         row.group == "folded"
             || (!row.done
-                && (row.doc_id.is_some()
-                    || matches!(row.group, "needs_you" | "finished")
-                    || row.newest_at >= cutoff))
+                && (matches!(row.group, "needs_you" | "finished") || row.newest_at >= cutoff))
     };
     let needs_you_count = rows
         .iter()
@@ -535,8 +537,8 @@ fn render_inbox_page(
     } else if filter == "open" {
         for (group, label, class) in [
             ("needs_you", "Needs you", "a"),
-            ("finished", "Finished", "fin"),
             ("new", "New", "nw"),
+            ("finished", "Finished", "fin"),
             ("earlier", "Earlier", ""),
         ] {
             let group_rows: Vec<&InboxRow> = rows.iter().filter(|r| r.group == group).collect();
