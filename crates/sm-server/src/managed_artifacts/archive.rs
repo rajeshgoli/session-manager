@@ -498,6 +498,22 @@ fn restore_metadata(path: &Path, entry: &Entry) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
     }
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    #[cfg(target_os = "macos")]
+    if entry.kind == "symlink" {
+        // SAFETY: path is a live NUL-terminated string; NOFOLLOW changes only
+        // the symlink's mode, including when its target is outside staging.
+        if unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                entry.mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
     let times = [libc::timespec {
         tv_sec: entry.mtime,
         tv_nsec: entry.mtime_nsec,

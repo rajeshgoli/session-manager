@@ -216,3 +216,42 @@ fn managed_artifacts_archive_pax_timestamps_verified_including_before_epoch() {
     manifest.entries[0].mtime_nsec += 1;
     assert!(verify(&archive, &manifest, 2).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_artifacts_archive_custom_symlink_modes_do_not_change_target() {
+    let f = Fixture::new();
+    let source = f.path("source");
+    fs::create_dir(&source).unwrap();
+    let outside = f.path("outside");
+    fs::write(&outside, "outside target").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o640)).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("link")).unwrap();
+    let link = std::ffi::CString::new(source.join("link").as_os_str().as_bytes()).unwrap();
+    // SAFETY: link is a live C string; NOFOLLOW leaves the target unchanged.
+    assert_eq!(
+        unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                link.as_ptr(),
+                0o700,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        fs::symlink_metadata(source.join("link")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    let archive = f.path("archive");
+    let manifest = pack(&source, &archive, "sample", &config()).unwrap();
+    let dest = f.path("dest");
+    extract(&archive, &dest, &manifest, 2).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(dest.join("link")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside target");
+}
