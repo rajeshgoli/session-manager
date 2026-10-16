@@ -357,8 +357,9 @@ function usageMeter(spec, meter) {
 }
 
 function Dash() {
-  const [host] = usePoll(() => api('/client/host-status'), 10000);
-  const [usage] = usePoll(() => api('/client/usage/meters'), 30000);
+  // The rail's meters are the shell's own reads, never the owner's (spec 2170 A.5).
+  const [host] = usePoll(() => api('/client/host-status'), 10000, [], { background: true });
+  const [usage] = usePoll(() => api('/client/usage/meters'), 30000, [], { background: true });
   const mac = host && host.available !== false ? host : null;
   const memTotal = mac && mac.memory_total_bytes;
   const memPct = (bytes) => (memTotal ? (100 * bytes) / memTotal : 0);
