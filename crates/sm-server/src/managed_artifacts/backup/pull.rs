@@ -129,6 +129,10 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         manifest.manifest_id == *id,
         "backup manifest/request mismatch"
     );
+    ensure!(
+        manifest.base == dest.state()?.confirmed,
+        "backup delta base does not match this destination's confirmed manifest"
+    );
     safe_relative(id)?;
     ensure!(!id.contains('/'), "invalid backup request id");
     let download = dest.directory(&format!(".downloads/{id}"))?;
@@ -177,6 +181,7 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         status.allow_deletes,
         status.max_delete_fraction,
     )?;
+    let apply_seconds = apply.elapsed().as_secs_f64().max(0.001);
     let local =
         time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     let sunday = local.weekday() == time::Weekday::Sunday;
@@ -194,7 +199,7 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         applied: true,
         fetched_bytes: fetched,
         fetch_seconds,
-        apply_seconds: apply.elapsed().as_secs_f64().max(0.001),
+        apply_seconds,
         held_deletions: applied.held_deletions,
         check,
         error: None,

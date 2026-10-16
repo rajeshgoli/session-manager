@@ -749,6 +749,13 @@ fn client_resumes_interrupted_download_and_recovers_a_lost_ack_response() {
         offsets: vec![],
     };
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    fake.status.manifest.as_mut().unwrap().base = Some("another-disk".into());
+    let error = pull::pull(&mut dest, &mut fake).unwrap_err();
+    assert!(error.to_string().contains("delta base does not match"));
+    assert!(fake.offsets.is_empty());
+    assert!(dest.records().unwrap().is_empty());
+    assert!(!fake.acked);
+    fake.status.manifest.as_mut().unwrap().base = None;
     assert!(pull::pull(&mut dest, &mut fake).is_err());
     assert!(dest.state().unwrap().confirmed.is_none());
     assert!(pull::pull(&mut dest, &mut fake).is_err());
