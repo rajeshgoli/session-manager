@@ -427,7 +427,25 @@ pub(super) async fn ready_for_message_async(
     if retired_autopm_needs_successor(state, &recipient) {
         match super::handoff::start_retired_autopm_successor(state, &recipient).await {
             Ok(Some(successor)) => return Some(successor),
-            Ok(None) => return messages::live_recipient(state, &recipient.id),
+            // Another wake won the durable start claim. Its transfer will
+            // publish the successor id; wait for that instead of forwarding
+            // this wake to the retired seat's parent.
+            Ok(None) => {
+                for _ in 0..60 {
+                    if let Some(successor) = state
+                        .session_store
+                        .get_session(&recipient.id)
+                        .ok()
+                        .flatten()
+                        .and_then(|predecessor| predecessor.successor_session_id)
+                        .and_then(|_| messages::live_recipient(state, &recipient.id))
+                    {
+                        return Some(successor);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                return None;
+            }
             Err(error) => {
                 eprintln!(
                     "starting a successor for retired Auto PM {} failed: {error:#}",
