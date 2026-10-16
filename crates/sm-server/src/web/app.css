@@ -305,17 +305,16 @@ div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
 .term-bar { position: relative; z-index: 32; height: 40px; flex: 0 0 40px; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
 .term-bar .t { font-weight: 650; }
 .term-home { font: 700 1.133rem var(--mono); color: var(--accent); text-decoration: none; }
-.term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); }
-.term-main.with-switch { grid-template-columns: 15.5rem minmax(0, 1fr); }
+.term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "side term"; }
 /* Details and Notes sit beside the terminal, which refits to the space left. */
-.term-main.with-panel { grid-template-columns: minmax(0, 1fr) min(28rem, 40vw); }
-.term-main.with-switch.with-panel { grid-template-columns: 15.5rem minmax(0, 1fr) min(28rem, 40vw); }
-.term-body { min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }
-/* The folded switcher is a thin line at the left edge; clicking it unfolds the list (#2242). */
-.term-main:not(.with-switch) { padding-left: 6px; }
-.term-switch-strip { position: absolute; top: 0; bottom: 0; left: 0; width: 6px; padding: 0; border: 0; border-right: 1px solid var(--line); background: var(--panel); cursor: pointer; }
-.term-switch-strip:hover, .term-switch-strip:focus-visible { background: var(--accent); outline: none; }
-.term-switch-wrap { min-height: 0; overflow-y: auto; background: var(--panel); color: var(--ink); border-right: 1px solid var(--line); }
+.term-main.with-panel { grid-template-columns: auto minmax(0, 1fr) min(28rem, 40vw); grid-template-areas: "side term panel"; }
+.term-body { grid-area: term; min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }
+.term-page .term-main > .term-panel { grid-area: panel; }
+/* The agent list ends in an edge bar that folds it; folded, only the bar stays (#2242). */
+.term-side { grid-area: side; display: flex; min-height: 0; }
+.term-switch-wrap { width: 15.5rem; min-height: 0; overflow-y: auto; background: var(--panel); color: var(--ink); }
+.term-edge { flex: 0 0 14px; width: 14px; padding: 0; border: 0; border-left: 1px solid var(--line); border-right: 1px solid var(--line); background: var(--panel); color: var(--ink-2); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.term-edge:hover, .term-edge:focus-visible { background: var(--panel-2); color: var(--accent); outline: none; }
 .term-switch { display: flex; flex-direction: column; padding: 4px 0 12px; }
 .sw-sec { font: 600 .8rem var(--ui); letter-spacing: .06em; text-transform: uppercase; padding: 10px 12px 3px; text-align: left; border: 0; background: none; color: var(--ink-3); }
 .sw-sec.magenta { color: var(--magenta); } .sw-sec.cyan { color: var(--cyan); } .sw-sec.amber { color: var(--amber); } .sw-sec.green { color: var(--green); }
@@ -346,14 +345,10 @@ button.sw-sec { cursor: pointer; }
 }
 /* Below 900 px the switcher covers the terminal instead of squeezing it. */
 @media (max-width: 899.98px) {
-  .term-main.with-switch, .term-main.with-panel, .term-main.with-switch.with-panel { grid-template-columns: minmax(0, 1fr); }
   /* Below 900 px the panel takes the lower half, under the terminal. */
-  .term-main.with-panel { grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .term-main.with-panel { grid-template-columns: auto minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); grid-template-areas: "side term" "side panel"; }
   .term-page .term-panel { border-left: 0; border-top: 1px solid var(--line); }
-  .term-switch-wrap { position: absolute; top: 0; bottom: 0; left: 0; z-index: 2; width: min(15.5rem, 85vw); box-shadow: var(--shadow); }
-  /* A phone keeps every column; the bar's Agents button opens the list. */
-  .term-main:not(.with-switch) { padding-left: 0; }
-  .term-switch-strip { display: none; }
+  .term-switch-wrap { position: absolute; top: 0; bottom: 0; left: 14px; z-index: 2; width: min(15.5rem, 80vw); box-shadow: var(--shadow); }
 }
 
 /* Notes page and the same view in the right pane. */

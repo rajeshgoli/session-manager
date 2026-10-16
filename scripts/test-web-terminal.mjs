@@ -139,9 +139,9 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
           // G2: key buttons on phones only.
           assert.equal(await page.locator('.term-keys').count(), phone ? 1 : 0);
           if (phone) {
-            // G1: hidden by default below 900 px; the bar button opens it over the terminal.
+            // G1: hidden by default below 900 px; the edge bar opens it over the terminal.
             assert.equal(await page.locator('.term-switch').count(), 0);
-            await page.getByRole('button', { name: 'Agents' }).click();
+            await page.getByRole('button', { name: 'Unfold agent list' }).click();
           }
           await page.locator('.sw-row').first().waitFor();
           assert.deepEqual(await page.locator('.sw-sec').allInnerTexts(), ['NEEDS YOU', 'FINISHED', 'MOVING', 'WAITING', 'IDLE · 3 ›']);
@@ -204,13 +204,26 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     await page.keyboard.press('Meta+Backslash');
     await page.waitForFunction(() => !document.querySelector('.term-switch'));
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'false');
-    // Folded, the list leaves a thin line at the left edge; clicking it unfolds the list (#2242).
-    const strip = page.getByRole('button', { name: 'Unfold agent list' });
-    assert.ok((await strip.boundingBox()).width <= 8);
-    await strip.click();
-    await page.locator('.term-switch').waitFor();
-    assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'true');
-    assert.equal(await strip.count(), 0);
+    // The fold control is the list's own edge bar, not a bar button by Back (#2242).
+    assert.equal(await page.locator('.term-bar').getByRole('button', { name: /agent/i }).count(), 0);
+    // Folded, only the edge bar stays, and the terminal starts right after it.
+    const box = (q) => page.locator(q).boundingBox();
+    const edge = await box('.term-edge');
+    assert.ok(edge.x === 0 && edge.width <= 16 && edge.height > 800, JSON.stringify(edge));
+    assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
+    // Unfold and fold by the edge bar, twice: the terminal is always right of the list.
+    for (let round = 0; round < 2; round += 1) {
+      await page.getByRole('button', { name: 'Unfold agent list' }).click();
+      await page.locator('.term-switch').waitFor();
+      assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'true');
+      const list = await box('.term-switch-wrap'), open = await box('.term-edge');
+      assert.ok(Math.abs(open.x - list.width) <= 1, 'the edge bar sits at the list\'s right edge');
+      assert.ok(Math.abs((await box('.term-body')).x - (open.x + open.width)) <= 1, 'the terminal sits right of the list');
+      await page.getByRole('button', { name: 'Fold agent list' }).click();
+      await page.waitForFunction(() => !document.querySelector('.term-switch'));
+      assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
+    }
+    if (process.env.SHOTS_DIR) await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-folded-1440.png` });
     // After all that switching, sm at the top left goes home in one click.
     await page.locator('.term-bar').getByRole('link', { name: 'sm', exact: true }).click();
     await page.waitForFunction(() => location.pathname === '/' && !document.querySelector('.term-bar'));
