@@ -275,6 +275,74 @@ fn temp_store() -> (BoardStore, PathBuf) {
     (store, dir)
 }
 
+#[test]
+fn fresh_board_schema_supports_concurrent_reads() {
+    // Read as soon as open_read considers the board available, including while
+    // initialization is still executing the remaining CREATE statements.
+    let (store, dir) = temp_store();
+    for _ in 0..50 {
+        fs::remove_file(&store.db_path).unwrap();
+        let writer = Connection::open(&store.db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                init_board_schema(&writer).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            loop {
+                store.board(&Outside::default(), now()).unwrap();
+                if done_rx.try_recv().is_ok() {
+                    break;
+                }
+            }
+        });
+        store.board(&Outside::default(), now()).unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn board_schema_upgrades_old_columns_without_losing_data() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_board_schema(&conn).unwrap();
+    // Reconstruct the older table shape and leave real rows to migrate.
+    conn.execute_batch(
+        "ALTER TABLE board_items DROP COLUMN tier;
+         ALTER TABLE board_members DROP COLUMN waits_on;
+         INSERT INTO board_items
+             (repo, number, title, url, state, first_seen_at, synced_at)
+             VALUES ('acme/widgets', 1, 'Old ticket', 'url', 'open', 'then', 'then');
+         INSERT INTO board_members (lane_id, repo, number, state, joined_at)
+             VALUES (1, 'acme/widgets', 1, 'blocked', 'then');",
+    )
+    .unwrap();
+    init_board_schema(&conn).unwrap();
+    let item: (String, Option<String>) = conn
+        .query_row("SELECT title, tier FROM board_items", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(item, ("Old ticket".into(), None));
+    let waits_on: String = conn
+        .query_row("SELECT waits_on FROM board_members", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(waits_on, "[]");
+    conn.execute("UPDATE board_items SET tier = 'top'", [])
+        .unwrap();
+    conn.execute("UPDATE board_members SET waits_on = '[1]'", [])
+        .unwrap();
+    init_board_schema(&conn).unwrap();
+    let tier: String = conn
+        .query_row("SELECT tier FROM board_items", [], |row| row.get(0))
+        .unwrap();
+    let waits_on: String = conn
+        .query_row("SELECT waits_on FROM board_members", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tier, "top");
+    assert_eq!(waits_on, "[1]");
+}
+
 fn outside() -> Outside {
     Outside {
         sessions: SessionDirectory::new([SessionInfo {

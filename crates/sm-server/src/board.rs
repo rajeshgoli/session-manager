@@ -72,6 +72,7 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT,
             first_seen_at TEXT NOT NULL,
             synced_at TEXT NOT NULL,
+            tier TEXT,
             PRIMARY KEY (repo, number)
         );
         CREATE TABLE IF NOT EXISTS board_edges (
@@ -101,6 +102,7 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
             number INTEGER NOT NULL,
             state TEXT,
             joined_at TEXT NOT NULL,
+            waits_on TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (lane_id, repo, number)
         );
         CREATE TABLE IF NOT EXISTS board_ticket_ranks (
@@ -166,6 +168,8 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Fresh tables already have these columns so concurrent readers never see
+    // an incomplete shape. Keep these migrations for databases from older builds.
     if conn
         .prepare("SELECT tier FROM board_items LIMIT 0")
         .is_err()
