@@ -76,3 +76,21 @@ Set measurement reminders with `sm remind`. Use the default Claude handoff polic
 lists live experiments and dates, current cycle ticket and playbook path. Read the
 playbook once per cycle and once per handoff. Only readout PRs change it; keep its
 six sections, entries of at most three lines with dated evidence, and 1,500-line cap.
+
+
+## Command payloads
+
+Pass a JSON file, or `-` for stdin, to each command. Retry the same payload when
+a response is lost; do not invent a new request id to retry a ticket filing.
+
+- `sm autopm issue file.json`: `{"request_id":"unique-id-8-to-64-chars","title":"...","body":"Tier: Mid\n...experiment id...","experiment_id":"..."}`.
+  For an ordinary bug fix, replace `experiment_id` with `"kind":"fix"` and include
+  `side effects: none` in the body. The server files in session-manager, labels it
+  `autopm`, attaches it to the current cycle, and records the experiment ticket.
+- `sm autopm start file.json`: `{"number":1234,"experiment_id":"...","provider":"codex-fork","model":"gpt-6-sol","reasoning_effort":"medium","points_est":2}`.
+  Omit `experiment_id` for a recorded fix. `brief` is optional. The server checks
+  the plan, lane and budget, reserves points, and queues the ticket for readiness.
+- `sm autopm ask file.json`: `{"decisions":[{"experiment_id":"...","text":"What changes, evidence, what yes does, what no does."}]}`.
+  Each experiment must be awaiting the owner. The server sends one nonblocking
+  thread per cycle, accepts numbered replies, and abandons unanswered items after
+  14 days. Reuse that thread; an experiment cannot be asked in another cycle.

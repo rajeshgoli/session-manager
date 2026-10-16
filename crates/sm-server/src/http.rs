@@ -2372,6 +2372,9 @@ pub fn router(state: AppState) -> Router {
             post(autopm::experiment_live),
         )
         .route("/autopm/budget", get(autopm::get_budget))
+        .route("/autopm/issues", post(autopm::actions::issue))
+        .route("/autopm/auto-start", put(autopm::actions::start))
+        .route("/autopm/ask", post(autopm::actions::ask))
         .route("/client/autopm", get(autopm::client_view))
         .route("/client/autopm/feedback", post(autopm::feedback))
         .fallback(not_found);

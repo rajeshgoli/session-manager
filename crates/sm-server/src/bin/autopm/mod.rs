@@ -13,6 +13,12 @@ pub(super) struct AutopmArgs {
 
 #[derive(Subcommand)]
 enum AutopmCommand {
+    /// File a build/fix ticket from JSON (- reads stdin); request_id makes retries safe
+    Issue { file: String },
+    /// Authorize a ticket from JSON with number, provider and points_est
+    Start { file: String },
+    /// Send this cycle's 1–3 decisions from JSON: {decisions:[{experiment_id,text}]}
+    Ask { file: String },
     /// The owner activity log: one row per owner action
     Events {
         /// How far back, for example 7d or 12h
@@ -105,6 +111,15 @@ fn print_json(value: &Value) -> Result<()> {
 
 pub(super) fn run(client: &ApiClient, args: AutopmArgs) -> Result<()> {
     match args.command {
+        AutopmCommand::Issue { file } => {
+            print_json(&client.post_json("/autopm/issues", read_json(&file)?)?)
+        }
+        AutopmCommand::Start { file } => {
+            print_json(&client.put_json("/autopm/auto-start", read_json(&file)?)?)
+        }
+        AutopmCommand::Ask { file } => {
+            print_json(&client.post_json("/autopm/ask", read_json(&file)?)?)
+        }
         AutopmCommand::Events {
             since,
             surface,
@@ -362,6 +377,14 @@ fn event_line(event: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_commands_parse_file_and_stdin_payloads() {
+        for command in ["issue", "start", "ask"] {
+            let parsed = Cli::try_parse_from(["sm", "autopm", command, "-"]).unwrap();
+            assert!(matches!(parsed.command, Command::Autopm(_)));
+        }
+    }
 
     #[test]
     fn event_line_shows_target_screen_nav_and_status() {

@@ -134,7 +134,7 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     Ok(true)
 }
 
-fn once(state: &AppState, key: &str, target: &str, text: &str) -> anyhow::Result<()> {
+pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> anyhow::Result<()> {
     // Handoff may have repointed an already queued message to its successor.
     let conn = store(state).open()?;
     let initialized: bool = conn.query_row(

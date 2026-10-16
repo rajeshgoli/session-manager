@@ -10,6 +10,7 @@ use super::*;
 use serde_json::json;
 use std::sync::Mutex;
 
+mod ask_tests;
 mod budget_tests;
 mod cycle_tests;
 mod measure_tests;
