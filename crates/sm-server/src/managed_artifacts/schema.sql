@@ -66,3 +66,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS artifact_rebuild_active
 CREATE TABLE IF NOT EXISTS artifact_rebuild_steps (
  run_id TEXT NOT NULL, position INTEGER NOT NULL, job_id TEXT UNIQUE, error TEXT,
  PRIMARY KEY(run_id,position));
+
+-- The journal is retained after completion for status and recovery diagnostics.
+CREATE TABLE IF NOT EXISTS artifact_operations (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT NOT NULL, set_id TEXT NOT NULL,
+ kind TEXT NOT NULL, phase TEXT NOT NULL, members_json TEXT NOT NULL,
+ actor TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, error TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS artifact_operation_active
+ ON artifact_operations(root,set_id) WHERE phase NOT IN ('done','failed');

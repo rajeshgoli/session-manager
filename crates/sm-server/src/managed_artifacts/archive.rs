@@ -44,6 +44,7 @@ pub struct Manifest {
     pub content_stamp: String,
     pub parts: Vec<Part>,
     pub entries: Vec<Entry>,
+    pub root_metadata: Entry,
 }
 
 fn safe_path(value: &str) -> Result<()> {
@@ -65,6 +66,20 @@ fn safe_path(value: &str) -> Result<()> {
         "unsafe archive path: {value}"
     );
     Ok(())
+}
+
+pub(super) fn root_metadata(path: &Path) -> Result<Entry> {
+    let m = fs::symlink_metadata(path)?;
+    ensure!(m.is_dir(), "artifact root must be a real directory");
+    Ok(Entry {
+        path: String::new(),
+        kind: "directory".into(),
+        size: 0,
+        mtime: m.mtime(),
+        mtime_nsec: m.mtime_nsec(),
+        mode: m.mode() & 0o7777,
+        target: None,
+    })
 }
 
 /// No symlink traversal, no device crossings, and no lossy filename conversion.
@@ -265,6 +280,7 @@ pub fn pack(
         config.freeze_parallel_parts > 0,
         "archive parallelism must be positive"
     );
+    let root_entry = root_metadata(source)?;
     let entries = inventory(source)?;
     let ranges = plan(&entries, config.freeze_part_bytes)?;
     fs::create_dir(staging)?;
@@ -300,9 +316,14 @@ pub fn pack(
         content_stamp: scan::measure(source)?.stamp(),
         parts,
         entries,
+        root_metadata: root_entry,
     };
     verify(staging, &manifest, config.freeze_parallel_parts)?;
     verify_source(source, &manifest.entries)?;
+    ensure!(
+        root_metadata(source)? == manifest.root_metadata,
+        "root changed during freeze"
+    );
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -322,6 +343,15 @@ impl Manifest {
     }
     fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
+        ensure!(
+            self.root_metadata.kind == "directory"
+                && self.root_metadata.path.is_empty()
+                && self.root_metadata.target.is_none()
+                && self.root_metadata.size == 0
+                && self.root_metadata.mode <= 0o7777
+                && (0..1_000_000_000).contains(&self.root_metadata.mtime_nsec),
+            "invalid root metadata"
+        );
         let mut seen = BTreeMap::new();
         let mut previous: Option<&str> = None;
         let mut bytes = 0u64;
@@ -493,7 +523,7 @@ pub fn verify(directory: &Path, manifest: &Manifest, parallelism: usize) -> Resu
     Ok(())
 }
 
-fn restore_metadata(path: &Path, entry: &Entry) -> Result<()> {
+pub(super) fn restore_metadata(path: &Path, entry: &Entry) -> Result<()> {
     if entry.kind != "symlink" {
         fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
     }
@@ -565,7 +595,9 @@ pub fn extract(
         inventory(staging)? == manifest.entries,
         "extracted tree differs from manifest"
     );
-    File::open(staging)?.sync_all()?;
+    let root_handle = File::open(staging)?;
+    restore_metadata(staging, &manifest.root_metadata)?;
+    root_handle.sync_all()?;
     Ok(())
 }
 

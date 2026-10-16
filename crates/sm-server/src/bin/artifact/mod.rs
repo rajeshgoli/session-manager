@@ -19,6 +19,14 @@ enum ArtifactCommand {
         #[command(flatten)]
         flags: Flags,
     },
+    Freeze {
+        name: String,
+    },
+    Thaw {
+        name: String,
+        #[arg(long)]
+        wait: bool,
+    },
     Rebuild {
         name: String,
     },
@@ -115,6 +123,7 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
         }
     }
     let mut create = false;
+    let mut wait_for_thaw = false;
     let (name, action, mut body) = match args.command {
         ArtifactCommand::List { state, epic, json } => {
             for (key, value) in [("state", state), ("epic", epic)] {
@@ -154,6 +163,11 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
             let mut b = flags.body()?;
             b["names"] = json!(names);
             (names[0].clone(), "record", b)
+        }
+        ArtifactCommand::Freeze { name } => (name, "freeze", json!({})),
+        ArtifactCommand::Thaw { name, wait } => {
+            wait_for_thaw = wait;
+            (name, "thaw", json!({}))
         }
         ArtifactCommand::Rebuild { name } => (name, "rebuild", json!({})),
         ArtifactCommand::Done { name } => (name, "done", json!({})),
@@ -201,9 +215,26 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
     } else {
         format!("/artifacts/{}/{action}", encode(&name))
     };
-    let v = client
+    let mut v = client
         .request_with_headers("POST", &path, Some(body), &[("X-SM-Session-ID", &id)])?
         .into_json()?;
+    if wait_for_thaw {
+        let operation_id = v["operation"]["id"].clone();
+        loop {
+            let status = client.get_json(&format!("/artifacts/{}{query}", encode(&name)))?;
+            if status["operation"]["id"] != operation_id {
+                bail!("artifact operation changed while waiting");
+            }
+            if status["operation"]["phase"] == "failed" {
+                bail!("thaw failed: {}", status["operation"]["error"]);
+            }
+            if status["state"] == "live" && status["op"].is_null() {
+                v = status;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
     if create {
         println!("{}/{}", json_string(&v, "root"), json_string(&v, "name"));
     } else {

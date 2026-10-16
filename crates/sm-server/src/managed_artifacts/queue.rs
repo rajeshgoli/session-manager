@@ -877,7 +877,7 @@ pub fn disk_status(manager: &ManagedArtifacts, root: &ArtifactRoot) -> Result<Ve
     let mut result = Vec::new();
     for (role, path) in [("root", &root.path), ("cold", &root.cold_store)] {
         match fs_stats(path,manager.config.floor_percent) {
-            Ok((free,floor,device)) if role=="root" || std::fs::metadata(&root.path)?.dev()!=device => {
+            Ok((free,floor,device)) if role=="root" || super::moves::cold_mounted(root) => {
                 let stat=nix::sys::statvfs::statvfs(Path::new(path))?;
                 result.push(json!({"path":path,"role":role,"mounted":true,"bytes":u64::from(stat.blocks())*stat.fragment_size(),"free":free,"floor":floor,"enough":floor,"outstanding":outstanding(&conn,manager,device)?,"waiting_jobs":waiting}));
             }

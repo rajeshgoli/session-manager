@@ -857,9 +857,15 @@ impl AppState {
             .map(|root| root.join("local-egress"))
             .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
         let managed_artifacts = if config.managed_artifacts.enabled {
-            Some(crate::managed_artifacts::ManagedArtifacts::new(
-                &config.managed_artifacts,
-            )?)
+            let manager =
+                crate::managed_artifacts::ManagedArtifacts::new(&config.managed_artifacts)?;
+            for root in &manager.config.roots {
+                crate::managed_artifacts::queue::install_operations(
+                    &root.path,
+                    Arc::new(crate::managed_artifacts::ops::QueueOperations),
+                );
+            }
+            Some(manager)
         } else {
             None
         };

@@ -112,9 +112,7 @@ impl ManagedArtifacts {
             &[&root.path],
         )? {
             let name = a["name"].as_str().unwrap();
-            if a["op"].as_str().is_some_and(|op| {
-                op.starts_with("rebuilding:") || op.starts_with("rebuild_failed:")
-            }) {
+            if !a["op"].is_null() {
                 continue;
             }
             match fs::symlink_metadata(Path::new(&root.path).join(name)) {

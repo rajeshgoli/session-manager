@@ -183,6 +183,17 @@ fn mutate(
                     cancel_grace: state.config.queue_runner.cancel_grace_seconds,
                 },
             ),
+            "freeze" | "thaw" => ma::ops::request(
+                svc,
+                root,
+                &name,
+                if action == "freeze" {
+                    "freezing"
+                } else {
+                    "thawing"
+                },
+                &actor.id,
+            ),
             "done" => svc.done(root, &name, &actor.id),
             "consumers" | "marks" => svc.edit(root, &name, &action, &body, &actor.id),
             "delete" => svc.delete(
@@ -232,6 +243,9 @@ fn mutate(
         }
     })()
     .map_err(refusal)?;
+    if matches!(action.as_str(), "freeze" | "thaw") {
+        ma::ops::kick(svc.clone());
+    }
     if action == "rebuild" {
         ma::rebuild::kick(svc.clone());
     }
@@ -242,6 +256,7 @@ impl AppState {
         let Some(svc) = &self.managed_artifacts else {
             return Ok(());
         };
+        ma::ops::kick(svc.clone());
         ma::rebuild::kick(svc.clone());
         let jobs = RetainedQueueStore::list_queue_jobs_from_path(
             &expand_home(&self.config.sm_send.db_path),
@@ -254,6 +269,25 @@ impl AppState {
             }))
         };
         for root in &svc.config.roots {
+            ma::ops::notify_missing(svc, root, time::OffsetDateTime::now_utc(), |key, body| {
+                let result = messages::owner_message_store(self).create_once(
+                    crate::owner_messages::NewOwnerMessage {
+                        human: self.config.owner_name.clone(),
+                        sender_session_id: "sm".into(),
+                        sender_session_name: "Session Manager".into(),
+                        title: "Artifact cold store is disconnected".into(),
+                        body_markdown: body.into(),
+                        blocking: false,
+                    },
+                    Some(key),
+                )?;
+                if let crate::owner_messages::CreateOwnerMessage::Created(message) = result {
+                    follows::notice_new_message(self, &message);
+                    Ok(())
+                } else {
+                    anyhow::bail!("owner message unread cap reached")
+                }
+            })?;
             svc.scan(root)?;
             for a in svc.store.list(&root.path)? {
                 let name = a["name"].as_str().unwrap();

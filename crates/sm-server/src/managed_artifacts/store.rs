@@ -71,6 +71,9 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         ("aliases","SELECT * FROM artifact_aliases WHERE root=?1 AND target_name=?2"),
         ("events","SELECT * FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE ORDER BY id DESC LIMIT 50"),
     ] {value[key]=json!(query(conn,sql,&[&root,&name])?);}
+    value["operation"] = query(conn, "SELECT id,kind,phase,created_at,finished_at,error FROM artifact_operations WHERE root=?1 AND set_id=?2 ORDER BY id DESC LIMIT 1", &[&root, &value["set_id"].as_str().unwrap_or(name)])?.pop().unwrap_or(Value::Null);
+    value["thaw_eta_seconds"] =
+        json!(value["data_bytes"].as_u64().unwrap_or(0) as f64 / thaw_rate(conn, root)?);
     let jobs = value["jobs"].as_array().unwrap();
     value["rebuild_seconds"] = json!(jobs
         .iter()
@@ -95,6 +98,24 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
     );
     Ok(value)
 }
+pub fn thaw_rate(conn: &Connection, root: &str) -> Result<f64> {
+    let samples = query(conn,"SELECT detail_json FROM artifact_events WHERE root=?1 AND kind='thaw_measured' ORDER BY id DESC LIMIT 5",&[&root])?;
+    let mut rates = Vec::new();
+    for sample in samples {
+        let v: Value = serde_json::from_str(sample["detail_json"].as_str().unwrap_or("{}"))?;
+        let seconds = v["seconds"].as_f64().unwrap_or(0.0);
+        let bytes = v["data_bytes"].as_f64().unwrap_or(0.0);
+        if seconds > 0.0 && bytes > 0.0 {
+            rates.push(bytes / seconds);
+        }
+    }
+    if rates.len() < 5 {
+        return Ok(100_000_000_000.0 / 60.0);
+    }
+    rates.sort_by(f64::total_cmp);
+    Ok(rates[2])
+}
+
 pub fn has_gpu(a: &Value) -> bool {
     a["gpu_hours"].as_f64().unwrap_or(0.0) > 0.0 || a["gpu_cost_usd"].as_f64().unwrap_or(0.0) > 0.0
 }
