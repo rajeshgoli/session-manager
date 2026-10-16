@@ -79,7 +79,7 @@ pub trait Runtime {
     fn attach(&self, number: i64, parent: i64) -> Result<()>;
     fn start(&self, number: i64, job: &Job) -> Result<()>;
     fn merged(&self, number: i64) -> Result<bool>;
-    fn effects(&self, effects: Vec<Effect>);
+    fn effects(&self, effects: Vec<Effect>) -> Result<()>;
 }
 
 /// Whether a previously filed recovery ticket still describes the required work.
@@ -203,6 +203,5 @@ fn cancel(conn: &Connection, number: i64, now: i64, runtime: &dyn Runtime) -> Re
             ),
         });
     }
-    runtime.effects(effects);
-    Ok(())
+    runtime.effects(effects)
 }

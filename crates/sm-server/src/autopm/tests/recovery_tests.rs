@@ -8,6 +8,7 @@ struct Effects {
     starts: RefCell<BTreeSet<i64>>,
     fail_start: Cell<bool>,
     merged: Cell<bool>,
+    fail_effects: Cell<bool>,
     messages: RefCell<Vec<Effect>>,
 }
 impl Runtime for Effects {
@@ -27,8 +28,10 @@ impl Runtime for Effects {
     fn merged(&self, _: i64) -> Result<bool> {
         Ok(self.merged.get())
     }
-    fn effects(&self, effects: Vec<Effect>) {
+    fn effects(&self, effects: Vec<Effect>) -> Result<()> {
+        anyhow::ensure!(!self.fail_effects.get(), "injected cancellation failure");
         self.messages.borrow_mut().extend(effects);
+        Ok(())
     }
 }
 
@@ -99,6 +102,18 @@ fn recovery_reenabled_cleanup_is_cancelled_and_later_revert_gets_new_ticket() {
             [],
         )
         .unwrap();
+    effects.fail_effects.set(true);
+    assert!(recovery::tick(&f.store, T0 + 1, &effects).is_err());
+    let pending: i64 = f
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM autopm_recovery WHERE done=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1);
+    effects.fail_effects.set(false);
     recovery::tick(&f.store, T0 + 1, &effects).unwrap();
     assert!(fix(&f.conn(), 9000)
         .unwrap()

@@ -18,6 +18,15 @@ impl recovery::Runtime for Runtime<'_> {
         actions::attach(self.0, number, parent).map_err(|e| anyhow::anyhow!("{e:?}"))
     }
     fn start(&self, number: i64, job: &Job) -> anyhow::Result<()> {
+        // Acceptance is durable in the board row. Never reset its attempts or
+        // revive a failed/cancelled launch on a subsequent recovery tick.
+        if board::board_store(self.0)
+            .auto_starts()?
+            .iter()
+            .any(|r| r.repo == autopm::REPO && r.number == number)
+        {
+            return Ok(());
+        }
         actions::authorize(
             self.0,
             &actions::Start {
@@ -43,8 +52,8 @@ impl recovery::Runtime for Runtime<'_> {
         }
         Ok(false)
     }
-    fn effects(&self, effects: Vec<Effect>) {
-        run_effects(self.0, effects);
+    fn effects(&self, effects: Vec<Effect>) -> anyhow::Result<()> {
+        run_effects_checked(self.0, effects)
     }
 }
 
@@ -90,5 +99,54 @@ pub(super) fn current(state: &AppState, number: i64) -> anyhow::Result<bool> {
                 && recovery::current(&conn, &serde_json::from_str(&payload)?, autopm::now_ms())?)
         }
         None => Ok(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autopm::recovery::Runtime as _;
+
+    #[test]
+    fn recovery_does_not_reset_accepted_failed_or_cancelled_launches() {
+        let state = super::super::tests::role_state();
+        let board = board::board_store(&state);
+        board.ensure_schema().unwrap();
+        board
+            .authorize_auto_starts(
+                &[crate::board::auto_start::Choice {
+                    repo: autopm::REPO.into(),
+                    number: 9000,
+                    agent_type: None,
+                    provider: "codex-fork".into(),
+                    model: Some("gpt-6-sol".into()),
+                    reasoning_effort: Some("medium".into()),
+                    brief: None,
+                }],
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let job = Job {
+            key: "test".into(),
+            experiment: "test".into(),
+            mode: "revert".into(),
+            epoch: 1,
+            parent: 3000,
+            title: "test".into(),
+            body: "test".into(),
+        };
+        for status in ["waiting", "started", "failed", "cancelled"] {
+            store(&state)
+                .open()
+                .unwrap()
+                .execute(
+                    "UPDATE auto_starts SET state=?1,attempts=3 WHERE number=9000",
+                    [status],
+                )
+                .unwrap();
+            let before = board.auto_starts().unwrap();
+            Runtime(&state).start(9000, &job).unwrap();
+            assert_eq!(board.auto_starts().unwrap(), before);
+        }
     }
 }

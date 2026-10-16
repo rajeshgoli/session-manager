@@ -176,6 +176,13 @@ pub(super) fn autopm_seat(state: &AppState, store: &AutopmStore) -> Option<Strin
 /// Carries out what a call left to do outside the database. Each failure is
 /// logged; none undoes the call.
 pub(super) fn run_effects(state: &AppState, effects: Vec<Effect>) {
+    if let Err(error) = run_effects_checked(state, effects) {
+        eprintln!("autopm effects failed: {error:#}");
+    }
+}
+
+fn run_effects_checked(state: &AppState, effects: Vec<Effect>) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
     let recovery_due = effects
         .iter()
         .any(|e| matches!(e, Effect::WakeAutopm { .. }));
@@ -202,7 +209,7 @@ pub(super) fn run_effects(state: &AppState, effects: Vec<Effect>) {
                 .map_err(|e| format!("{e:#}")),
         };
         if let Err(error) = result {
-            eprintln!("autopm effect {effect:?} failed: {error}");
+            errors.push(format!("autopm effect {effect:?} failed: {error}"));
         }
     }
     if recovery_due {
@@ -210,6 +217,8 @@ pub(super) fn run_effects(state: &AppState, effects: Vec<Effect>) {
             eprintln!("autopm immediate recovery failed: {error:#}");
         }
     }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
 }
 
 /// One merge hold per PR, placed once: a closed PR is not asked again.
