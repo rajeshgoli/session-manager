@@ -14,6 +14,7 @@ mod ask_tests;
 mod budget_tests;
 mod cycle_tests;
 mod measure_tests;
+mod recovery_tests;
 
 const COMMIT: &str = "c0ffee0000000000000000000000000000000000";
 const HEAD: &str = "feed000000000000000000000000000000000000";

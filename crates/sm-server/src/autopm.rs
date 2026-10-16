@@ -22,6 +22,7 @@ pub mod cycle;
 pub mod experiments;
 pub mod guard;
 pub mod metrics;
+pub mod recovery;
 pub mod switches;
 
 #[cfg(test)]

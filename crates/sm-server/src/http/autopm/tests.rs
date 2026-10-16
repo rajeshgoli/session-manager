@@ -610,3 +610,85 @@ async fn autopm_action_routes_refuse_other_callers_and_validate_before_effects()
         json!({"request_id":"request1","title":"x","body":"Tier: Mid\nside effects: none","kind":"fix"}))).await.unwrap()).await;
     assert_eq!(status, StatusCode::CONFLICT, "disabled Auto PM cannot file");
 }
+
+#[tokio::test]
+async fn revert_holder_can_only_record_its_own_restore_evidence() {
+    let state = role_state();
+    seed_live(&state);
+    let conn = store(&state).open().unwrap();
+    conn.execute(
+        "UPDATE autopm_experiments SET state='rolling_back',change_class='rows'",
+        [],
+    )
+    .unwrap();
+    crate::work_claims::init_work_claims_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO work_claims(id,repo,number,kind,session_id,source,claimed_at)
+        VALUES('restore',?1,9000,'ticket','other','test','now')",
+        [autopm::REPO],
+    )
+    .unwrap();
+    store(&state)
+        .record_fix(9000, "revert", Some(3001), Some("x-2026w43-card"), 1)
+        .unwrap();
+    let app = router(state.clone());
+    for (id, secret, body, expected) in [
+        (
+            "pm",
+            "pm-secret",
+            json!({"restore_ok":true,"decision_note":"restored"}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "other",
+            "wrong",
+            json!({"restore_ok":true,"decision_note":"restored"}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "other",
+            "other-secret",
+            json!({"state":"reverted","restore_ok":true,"decision_note":"restored"}),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "other",
+            "other-secret",
+            json!({"restore_ok":true,"decision_note":"restore script succeeded; row checks match shadow baseline"}),
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, result) = response_json(
+            app.clone()
+                .oneshot(role_request(
+                    Method::PATCH,
+                    "/autopm/experiments/x-2026w43-card",
+                    id,
+                    secret,
+                    body,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "{result}");
+    }
+    conn.execute("UPDATE work_claims SET ended_at='done'", [])
+        .unwrap();
+    let response = app
+        .oneshot(role_request(
+            Method::PATCH,
+            "/autopm/experiments/x-2026w43-card",
+            "other",
+            "other-secret",
+            json!({"restore_ok":true,"decision_note":"again"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(experiments::get(&conn, "x-2026w43-card")
+        .unwrap()
+        .unwrap()
+        .restore_ok_at_ms
+        .is_some());
+}
