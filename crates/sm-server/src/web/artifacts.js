@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { html, api, usePoll, config, ConfirmButton, bus } from './ui.js';
-import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupLabel } from './artifacts-model.js';
+import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupLabel } from './artifacts-model.js';
 
 function Row({ row: a, open, select }) {
   return html`<button class="artifact-row" onClick=${() => select(a)} aria-expanded=${open}>
@@ -23,9 +23,9 @@ function Detail({ a, data, close, act, busy }) {
       ${!a.investigating ? html`<button class="btn artifact-primary" onClick=${() => act(a,'investigate')}>Ask an agent to investigate</button>` : html`<p>Agent investigating</p>`}
       ${a.state === 'frozen' ? html`<${ConfirmButton} label="Restore" confirmLabel="Restore" className="btn sm" prompt=${`Restore ${prompt}`} onConfirm=${() => act(a,'thaw')} />` : null}
       ${['live','frozen'].includes(a.state) ? html`<${ConfirmButton} label=${`Keep ${data.keep_live_days || 30} days`} confirmLabel="Keep available" className="btn sm" prompt=${`Keep available: ${prompt}`} onConfirm=${() => act(a,'keep_live')} />` : null}
-      <${ConfirmButton} label="Delete folder…" confirmLabel="Delete folder" className="btn sm danger" prompt=${`Delete ${prompt}`} onConfirm=${() => act(a,'delete')} />
+      ${a.state !== 'deleted' ? html`<${ConfirmButton} label="Delete folder…" confirmLabel="Delete folder" className="btn sm danger" prompt=${`Delete ${prompt}`} onConfirm=${() => act(a,'delete')} />` : null}
     </fieldset>` : null}
-    <details><summary>Technical details</summary><p>${a.root}/${a.name}</p><p>Last used: ${a.last_used_at || 'Not recorded'}</p>
+    <details><summary>Technical details</summary><p>${a.root}/${a.name}</p>${a.size_error ? html`<p>Measurement: ${a.size_error}</p>` : null}<p>Last used: ${a.last_used_at || 'Not recorded'}</p>
       <h3>Recipe</h3><pre>${JSON.stringify(a.jobs || [],null,2)}</pre><h3>Recent events</h3>
       <ul>${(a.events || []).slice(0,10).map(e=>html`<li>${e.at} · ${e.kind} · ${e.detail_json}</li>`)}</ul>
     </details>
@@ -42,6 +42,7 @@ export function ArtifactsPage() {
   const rows = data?.artifacts || [];
   const inventory = artifactInventory(rows);
   const decisions = inventory.filter(needsDecision);
+  const followup = inventory.filter(a => needsAgentFollowup(a) && !needsDecision(a));
   const filtered = artifactInventory(rows,query);
   const unmeasured = inventory.filter(a => artifactBytes(a) == null).length;
   const unrecorded = inventory.filter(a => a.state === 'unrecorded').length;
@@ -55,7 +56,7 @@ export function ArtifactsPage() {
   };
   const renderRows = list => list.map(a=>html`<div key=${a.root+a.name}><${Row} row=${a} select=${setSelected} open=${current === a}/>${current === a ? html`<${Detail} a=${a} data=${data} close=${()=>setSelected(null)} act=${act} busy=${busy}/>` : null}</div>`);
   const shown = browse ? filtered.slice(0,limit) : largestArtifacts(rows);
-  const currentShown = shown.includes(current) || (!browse && decisions.slice(0,5).includes(current));
+  const currentShown = shown.includes(current) || (!browse && (decisions.slice(0,5).includes(current) || followup.slice(0,5).includes(current)));
   return html`<main class="artifacts-page">
     <link rel="stylesheet" href=${`/assets/artifacts.css?v=${config.build_id}`} />
     <header class="artifact-header"><div><h1>${browse ? 'All artifacts' : 'Artifacts'}</h1><p>Storage & saved work</p></div><button class="btn sm" onClick=${browse ? ()=>setBrowse(false) : reload}>${browse ? 'Overview' : 'Refresh'}</button></header>
@@ -78,9 +79,10 @@ export function ArtifactsPage() {
       ${browse ? filtered.length > limit ? html`<button class="btn sm" onClick=${()=>setLimit(limit+25)}>Show 25 more · ${filtered.length-limit} remaining</button>` : null : html`
         <button class="artifact-browse" onClick=${()=>setBrowse(true)}>Browse all ${inventory.length} folders <span>›</span></button>
         <section class="artifact-background"><h2 class="artifact-heading">Managed in the background</h2>
+          ${followup.length ? html`<p>${followup.length} storage issues need agent follow-up.</p>${renderRows(followup.slice(0,5))}` : null}
           ${frozen.length ? html`<p>${frozen.length} compressed folders · ${size(frozen.reduce((n,a)=>n+(artifactBytes(a)||0),0))}</p>` : null}
           ${unrecorded ? html`<p>${unrecorded} folders need an agent’s record. This is bookkeeping, not a decision for you.</p>` : null}
-          ${unmeasured ? html`<p>${unmeasured} folder sizes pending. The list above is incomplete until measured.</p>` : null}
+          ${unmeasured ? html`<p>${unmeasured} folder sizes unavailable. The list above is incomplete until measured.</p>` : null}
           <p>Keep work you still need. Agents check its history and dependencies before proposing cleanup.</p>
         </section>
       `}

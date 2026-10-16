@@ -26,3 +26,13 @@ test('backup status does not claim an unconfirmed copy is backed up', () => {
   assert.match(backupLabel({backup_due:true,rebuildable:false}),/^not backed up/);
   assert.equal(backupLabel({backup_due:false,backed_up_at:'today',rebuildable:false}),'backed up (not rebuildable)');
 });
+
+test('failed operations and vanished folders remain agent follow-up, not owner decisions', async () => {
+  const {needsAgentFollowup} = await import('../../crates/sm-server/src/web/artifacts-model.js');
+  const rows = ['operation_failed','consumer_unverifiable','vanished'].map((reason,i)=>({name:`issue-${i}`,state:reason==='vanished'?'deleted':'live',disk_bytes:2e9,needs_you:{reasons:[reason]}}));
+  assert.ok(rows.every(needsAgentFollowup));
+  assert.ok(rows.every(a=>!needsDecision(a)));
+  assert.equal(artifactInventory(rows).length,3);
+  assert.equal(largestArtifacts(rows).length,0);
+  assert.equal(artifactInventory(rows,'issue-2').length,1);
+});

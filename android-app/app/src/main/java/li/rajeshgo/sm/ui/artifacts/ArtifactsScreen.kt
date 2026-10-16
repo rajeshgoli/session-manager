@@ -33,6 +33,7 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
     val rows = data?.rows("artifacts").orEmpty()
     val inventory = artifactInventory(rows)
     val decisions = inventory.filter(::artifactNeedsDecision)
+    val followup = inventory.filter { artifactNeedsAgent(it) && !artifactNeedsDecision(it) }
     var browse by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var limit by remember(query) { mutableIntStateOf(25) }
@@ -90,13 +91,15 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
                 }
                 item {
                     SectionHeader("MANAGED IN THE BACKGROUND")
+                    if (followup.isNotEmpty()) Text("${followup.size} storage issues need agent follow-up.", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                    followup.take(5).forEach { a -> ArtifactRow(a) { selected = a } }
                     val compressed = inventory.filter { it.text("state") == "frozen" }
                     val unmeasured = inventory.count { measuredArtifactBytes(it) == null }
                     val missing = inventory.count { it.text("state") == "unrecorded" }
                     Column(Modifier.padding(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (compressed.isNotEmpty()) Text("${compressed.size} compressed folders · ${storageSize(compressed.sumOf(::artifactSize))}", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                         if (missing > 0) Text("$missing folders need an agent's record. This is bookkeeping, not a decision for you.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
-                        if (unmeasured > 0) Text("$unmeasured folder sizes pending. The list above is incomplete until measured.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                        if (unmeasured > 0) Text("$unmeasured folder sizes unavailable. The list above is incomplete until measured.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                         Text("Keep work you still need. Agents check its history and dependencies before proposing cleanup.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -189,11 +192,12 @@ private fun ArtifactSheet(a: JsonObject, canAct: Boolean, busy: Boolean, days: L
                     if (a.text("state") == "frozen") OutlinedButton(onClick = { onAction("thaw") }, enabled = !busy) { Text("Restore") }
                     if (a.text("state") in listOf("live", "frozen")) OutlinedButton(onClick = { onAction("keep_live") }, enabled = !busy) { Text("Keep $days days") }
                 }
-                TextButton(onClick = { onAction("delete") }, enabled = !busy) { Text("Delete folder…", color = Rose) }
+                if (a.text("state") != "deleted") TextButton(onClick = { onAction("delete") }, enabled = !busy) { Text("Delete folder…", color = Rose) }
             }
             TextButton(onClick = { technical = !technical }) { Text(if (technical) "Hide technical details" else "Technical details") }
             if (technical) {
                 Text("${a.text("root")}/${a.text("name")}", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                a.text("size_error").takeIf { it.isNotBlank() }?.let { Text("Measurement: $it", color = TextMuted) }
                 Text("Last used: ${a.text("last_used_at").ifBlank { "Not recorded" }}", color = TextMuted)
                 a.rows("jobs").forEach { Text(it.toString(), style = MaterialTheme.typography.bodySmall) }
                 a.rows("events").take(10).forEach { Text("${it.text("at")} · ${it.text("kind")}", style = MaterialTheme.typography.bodySmall, color = TextMuted) }

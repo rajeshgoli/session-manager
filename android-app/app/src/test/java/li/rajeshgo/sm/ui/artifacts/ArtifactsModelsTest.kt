@@ -34,4 +34,17 @@ class ArtifactsModelsTest {
         assertEquals("<1 MB",storageSize(100_000))
         assertEquals("26 GB",storageSize(25_600_427_493))
     }
+    @Test fun operationalProblemsRemainVisibleForAgentFollowup() {
+        val items = listOf("operation_failed", "consumer_unverifiable", "vanished").map { reason ->
+            buildJsonObject {
+                put("name",reason); put("state",if (reason == "vanished") "deleted" else "live"); put("disk_bytes",2_000_000_000L)
+                put("needs_you",buildJsonObject { put("reasons",buildJsonArray { add(reason) }) })
+            }
+        }
+        assertTrue(items.all(::artifactNeedsAgent))
+        assertFalse(items.any(::artifactNeedsDecision))
+        assertEquals(3,artifactInventory(items).size)
+        assertTrue(largestArtifacts(items).isEmpty())
+        assertEquals(1,artifactInventory(items,"vanished").size)
+    }
 }

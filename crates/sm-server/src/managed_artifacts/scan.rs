@@ -151,10 +151,13 @@ impl ManagedArtifacts {
         // measure() never follows symlinks or crosses filesystem boundaries.
         let size = measure(&path)?;
         self.store.open()?.execute("UPDATE artifacts SET disk_bytes=?3,data_bytes=?4,content_stamp=?5,size_measured_at=?6 WHERE root=?1 AND name=?2 AND state IN ('live','unrecorded') AND op IS NULL",params![root.path,name,size.disk_bytes,size.data_bytes,size.stamp(),now()])?;
+        self.store.open()?.execute(
+            "DELETE FROM artifact_meta WHERE key=?1",
+            [format!("size_error:{}:{name}", root.path)],
+        )?;
         self.store.detail(&root.path, name)
     }
     pub fn measure_root(&self, root: &ArtifactRoot) -> Result<()> {
-        let mut failures = Vec::new();
         for a in self.store.list(&root.path)? {
             if !matches!(a["state"].as_str(), Some("live" | "unrecorded")) || !a["op"].is_null() {
                 continue;
@@ -162,11 +165,17 @@ impl ManagedArtifacts {
             let name = a["name"].as_str().unwrap();
             if let Err(error) = self.measure_one(root, name) {
                 // One missing or unreadable folder must not starve the rest.
-                failures.push(format!("{name}: {error}"));
+                let conn = self.store.open()?;
+                store::set_meta(
+                    &conn,
+                    &format!("size_error:{}:{name}", root.path),
+                    &error.to_string(),
+                )?;
+                eprintln!(
+                    "artifact size unavailable for {}/{name}; continuing management: {error:#}",
+                    root.path
+                );
             }
-        }
-        if !failures.is_empty() {
-            bail!("size walk incomplete: {}", failures.join("; "));
         }
         Ok(())
     }

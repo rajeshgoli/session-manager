@@ -496,11 +496,14 @@ fn measurement_includes_unrecorded_and_continues_after_missing_folder() {
     fs::write(f.path("200_saved/data"), vec![1; 8192]).unwrap();
     f.svc.scan(&f.root).unwrap();
     fs::remove_dir(f.path("100_missing")).unwrap();
-    assert!(f.svc.measure_root(&f.root).is_err());
+    f.svc.measure_root(&f.root).unwrap();
     let saved = f.svc.store.detail(&f.root.path, "200_saved").unwrap();
     assert_eq!(saved["state"], "unrecorded");
     assert_eq!(saved["data_bytes"], 8192);
     assert!(saved["size_measured_at"].is_string());
     assert!(f.svc.measure_one(&f.root, "../escape").is_err());
-    assert!(f.svc.store.detail(&f.root.path, "100_missing").unwrap()["disk_bytes"].is_null());
+    assert!(f.svc.store.detail(&f.root.path, "100_missing").unwrap()["size_error"].is_string());
+    fs::create_dir(f.path("100_missing")).unwrap();
+    f.svc.measure_one(&f.root, "100_missing").unwrap();
+    assert!(f.svc.store.detail(&f.root.path, "100_missing").unwrap()["size_error"].is_null());
 }

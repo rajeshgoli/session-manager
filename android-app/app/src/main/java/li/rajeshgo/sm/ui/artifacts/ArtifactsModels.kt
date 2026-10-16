@@ -25,13 +25,17 @@ fun diskName(f: JsonObject): String = f.text("path").let {
 fun artifactNeedsDecision(a: JsonObject): Boolean =
     (a["needs_you"] as? JsonObject)?.get("reasons")?.jsonArray?.any { it.jsonPrimitive.content == "would_delete" } == true
 
+fun artifactNeedsAgent(a: JsonObject): Boolean =
+    (a["needs_you"] as? JsonObject)?.get("reasons")?.jsonArray?.any { it.jsonPrimitive.content in listOf("operation_failed", "consumer_unverifiable", "vanished") } == true
+
 fun artifactInventory(rows: List<JsonObject>, query: String = ""): List<JsonObject> = rows
-    .filter { it.text("state") != "deleted" && (query.isBlank() || listOf("name", "note", "epic", "repo").any { key -> it.text(key).contains(query, ignoreCase = true) }) }
+    .filter { (it.text("state") != "deleted" || artifactNeedsAgent(it)) && (query.isBlank() || listOf("name", "note", "epic", "repo").any { key -> it.text(key).contains(query, ignoreCase = true) }) }
     .sortedWith(compareByDescending<JsonObject> { measuredArtifactBytes(it) ?: -1L }.thenBy { it.text("name") })
 fun largestArtifacts(rows: List<JsonObject>): List<JsonObject> = artifactInventory(rows)
-    .filter { !artifactNeedsDecision(it) && (measuredArtifactBytes(it) ?: -1L) >= GB }.take(5)
+    .filter { !artifactNeedsDecision(it) && !artifactNeedsAgent(it) && (measuredArtifactBytes(it) ?: -1L) >= GB }.take(5)
 fun artifactSummary(a: JsonObject): String = when {
     a.text("investigating").isNotEmpty() -> "Agent investigating"
+    artifactNeedsAgent(a) -> if (a.text("state") == "deleted") "Folder missing · agent follow-up needed" else "Storage issue · agent follow-up needed"
     artifactNeedsDecision(a) -> "Cleanup proposed · review before deleting"
     a.text("state") == "unrecorded" -> "Needs an agent's record"
     a.text("state") == "frozen" -> "Compressed · restored when needed"

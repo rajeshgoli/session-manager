@@ -9,10 +9,11 @@ export function storageSize(bytes) {
 }
 export const diskName = f => f.path.startsWith('/Volumes/') ? f.path.slice(9).split('/')[0] : 'Mac storage';
 export const needsDecision = a => a.needs_you?.reasons?.includes('would_delete') || false;
-export const artifactInventory = (rows, query = '') => rows.filter(a => a.state !== 'deleted' && (!query.trim() || [a.name,a.note,a.epic,a.repo].some(s => s?.toLowerCase().includes(query.toLowerCase()))))
+export const needsAgentFollowup = a => a.needs_you?.reasons?.some(r => ['operation_failed','consumer_unverifiable','vanished'].includes(r)) || false;
+export const artifactInventory = (rows, query = '') => rows.filter(a => (a.state !== 'deleted' || needsAgentFollowup(a)) && (!query.trim() || [a.name,a.note,a.epic,a.repo].some(s => s?.toLowerCase().includes(query.toLowerCase()))))
   .sort((a,b) => (artifactBytes(b) ?? -1) - (artifactBytes(a) ?? -1) || a.name.localeCompare(b.name));
-export const largestArtifacts = rows => artifactInventory(rows).filter(a => !needsDecision(a) && artifactBytes(a) >= 1e9).slice(0,5);
-export const artifactSummary = a => a.investigating ? 'Agent investigating' : needsDecision(a) ? 'Cleanup proposed · review before deleting' : a.state === 'unrecorded' ? "Needs an agent’s record" : a.state === 'frozen' ? 'Compressed · restored when needed' : a.hot ? 'In recent use' : 'Saved work';
+export const largestArtifacts = rows => artifactInventory(rows).filter(a => !needsDecision(a) && !needsAgentFollowup(a) && artifactBytes(a) >= 1e9).slice(0,5);
+export const artifactSummary = a => a.investigating ? 'Agent investigating' : needsAgentFollowup(a) ? (a.state === 'deleted' ? 'Folder missing · agent follow-up needed' : 'Storage issue · agent follow-up needed') : needsDecision(a) ? 'Cleanup proposed · review before deleting' : a.state === 'unrecorded' ? "Needs an agent’s record" : a.state === 'frozen' ? 'Compressed · restored when needed' : a.hot ? 'In recent use' : 'Saved work';
 export const backupSummary = b => !b ? 'Backup status unavailable' : !b.enabled ? 'Backup is off' : b.confirmed_at ? `Backup confirmed ${b.confirmed_at.slice(0,10)}` : 'No confirmed backup yet';
 export const duration = seconds => seconds == null || !Number.isFinite(seconds) ? 'unknown' : seconds < 60 ? `${Math.ceil(seconds)}s` : `${Math.ceil(seconds / 60)} min`;
 export function backupLabel(a) {
