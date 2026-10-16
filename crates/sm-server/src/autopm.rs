@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod budget;
+pub mod cycle;
 pub mod experiments;
 pub mod guard;
 pub mod metrics;
