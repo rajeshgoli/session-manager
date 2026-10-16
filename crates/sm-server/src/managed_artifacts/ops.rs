@@ -200,7 +200,7 @@ pub fn request(
     Ok(result)
 }
 
-fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
+fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
     let conn = manager.store.open()?;
     let mut required = 0u64;
     for m in &op.members {
@@ -234,21 +234,20 @@ fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
         .unwrap_or(0)
         .saturating_sub(cold["floor"].as_u64().unwrap_or(0))
         .saturating_sub(cold["outstanding"].as_u64().unwrap_or(0));
-    ensure!(
-        available >= required,
-        "cold store needs {required} bytes above its floor and reservations"
-    );
-    Ok(())
+    Ok(available >= required)
 }
 fn set_phase(manager: &ManagedArtifacts, id: i64, phase: &str) -> Result<()> {
     manager.store.open()?.execute(
-        "UPDATE artifact_operations SET phase=?2 WHERE id=?1",
+        "UPDATE artifact_operations SET phase=?2,error=NULL WHERE id=?1",
         params![id, phase],
     )?;
     Ok(())
 }
-fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
-    space(manager, op)?;
+fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
+    if !space(manager, op)? {
+        manager.store.open()?.execute("UPDATE artifact_operations SET error='Waiting for cold-store capacity above the floor and reservations' WHERE id=?1",[op.id])?;
+        return Ok(false);
+    }
     store::set_meta(
         &manager.store.open()?,
         &format!("operation_started:{}", op.id),
@@ -325,7 +324,7 @@ fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
         [op.id],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 fn valid_published(path: &Path, target: Option<&Path>) -> bool {
@@ -498,8 +497,11 @@ fn run(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
             if op.phase == "copying" {
                 discard_staging(op)?;
             }
-            stage(manager, op)?;
-            publish(manager, op)
+            if stage(manager, op)? {
+                publish(manager, op)
+            } else {
+                Ok(())
+            }
         }
         "prepared" => publish(manager, op),
         "cleanup" => cleanup(manager, op),

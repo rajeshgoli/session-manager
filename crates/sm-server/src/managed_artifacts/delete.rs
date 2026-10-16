@@ -5,6 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+thread_local! { static BEFORE_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+
 pub fn target(parent: &Path, name: &str) -> Result<PathBuf> {
     validate_name(name)?;
     if fs::canonicalize(parent)? != parent {
@@ -157,13 +160,35 @@ impl ManagedArtifacts {
             tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if automatic {"orphan"} else {"agent"},recovering])?;
         }
         tx.commit()?;
-        // The durable op excludes new submissions. Recheck live use under the
-        // removal transaction, including after recovery of an interrupted delete.
+        #[cfg(test)]
+        BEFORE_REMOVAL.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        // Marks may change after the durable intent commits. Reload every
+        // member and recheck every protection before removing any set member.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for member in &members {
-            ensure_not_in_use(&tx, &root.path, member["name"].as_str().unwrap())?;
-        }
+        let members = store::query(
+            &tx,
+            "SELECT * FROM artifacts WHERE root=?1 AND set_id=?2",
+            &[&root.path, &a["set_id"].as_str().unwrap_or(name)],
+        )?;
         let result = (|| {
+            for member in &members {
+                let n = member["name"].as_str().unwrap();
+                if member["op"] != "deleting" || member["state"] == "deleted" {
+                    bail!("{n} deletion state changed");
+                }
+                if member["project"] == 1 {
+                    bail!("{n} is kept for the project; remove the mark first");
+                }
+                ensure_not_in_use(&tx, &root.path, n)?;
+                let dependents = store::query(&tx,"SELECT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted'",&[&root.path,&n])?;
+                if !dependents.is_empty() {
+                    bail!("{n} is an input of {}", json!(dependents));
+                }
+            }
             for member in &members {
                 let n = member["name"].as_str().unwrap();
                 let path = target(Path::new(&root.path), n)?;
@@ -240,6 +265,65 @@ impl ManagedArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_artifacts_delete_rechecks_project_mark_between_transactions() {
+        let f = crate::managed_artifacts::tests::Fixture::new();
+        let path = f.path("sample");
+        let config = ManagedArtifactsConfig {
+            db_path: f.path("db").display().to_string(),
+            roots: vec![ArtifactRoot {
+                path: f.path("").display().to_string(),
+                repo: "owner/repo".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let manager = ManagedArtifacts::new(&config).unwrap();
+        let root = manager.config.roots[0].clone();
+        manager
+            .create(
+                &root,
+                "sample",
+                &RecordFlags {
+                    note: "data".into(),
+                    consumers: vec!["#1".into()],
+                    ..Default::default()
+                },
+                "maker",
+                "Maker",
+            )
+            .unwrap();
+        fs::write(path.join("data"), "preserve me").unwrap();
+        manager.done(&root, "sample", "maker").unwrap();
+        let other = manager.clone();
+        let other_root = root.clone();
+        BEFORE_REMOVAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other
+                    .edit(
+                        &other_root,
+                        "sample",
+                        "marks",
+                        &json!({"project":true}),
+                        "maker",
+                    )
+                    .unwrap();
+            }))
+        });
+        assert!(manager
+            .delete(&root, "sample", "maker", "test")
+            .unwrap_err()
+            .to_string()
+            .contains("kept for the project"));
+        assert_eq!(
+            fs::read_to_string(path.join("data")).unwrap(),
+            "preserve me"
+        );
+        assert_eq!(
+            manager.store.detail(&root.path, "sample").unwrap()["project"],
+            1
+        );
+    }
     #[test]
     fn managed_artifacts_ds_store_retry_removes_only_finder_residue() {
         let f = crate::managed_artifacts::tests::Fixture::new();

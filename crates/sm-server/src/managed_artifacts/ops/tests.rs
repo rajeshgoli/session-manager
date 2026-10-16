@@ -346,3 +346,31 @@ fn managed_artifacts_ops_rechecks_keep_mark_and_rejects_archive_parent_symlink()
     assert!(request(&f.manager, &f.root, "sample", "freezing", "maker").is_err());
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+#[test]
+fn managed_artifacts_ops_low_space_thaw_retains_one_pending_operation() {
+    let mut f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    let op = f.op("sample", "thawing");
+    f.manager.config.floor_percent = 100;
+    for _ in 0..3 {
+        resume(&f.manager).unwrap();
+    }
+    assert_eq!(f.detail("sample")["op"], "thawing");
+    assert_eq!(f.detail("sample")["operation"]["id"], op.id);
+    assert_eq!(f.detail("sample")["operation"]["phase"], "queued");
+    let conn = f.manager.store.open().unwrap();
+    let failures: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_events WHERE kind='op_failed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failures, 0);
+    f.manager.config.floor_percent = 5;
+    resume(&f.manager).unwrap();
+    f.assert_bytes("sample");
+}
