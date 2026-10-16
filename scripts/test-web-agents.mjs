@@ -122,6 +122,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
               return route.fulfill({ json: {} });
             }
             if (url.pathname.endsWith('/last-turn')) return route.fulfill({ status: 404, json: { detail: 'none' } });
+            if (url.pathname.startsWith('/inbox/agent/')) return route.fulfill({ json: { title: 'Thread', can_send: false, items: [] } });
             if (url.pathname === '/watch/state') {
               const only = url.searchParams.get('session');
               const list = only ? sessions.filter((s) => s.id === only) : sessions;
@@ -300,5 +301,58 @@ test('long agent name keeps the Agents confirmation and Cancel in a phone viewpo
     assert.ok(box.x >= 0 && box.x + box.width <= 390, 'confirmation fits inside the phone viewport');
     assert.ok(cancelBox.x >= 0 && cancelBox.x + cancelBox.width <= 390, 'Cancel stays in view');
     await cancel.click();
+  } finally { await browser.close(); }
+});
+
+test('agent details answer a question in place: Inbox tab shows messages and docs, Reply stays here', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const errors = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    const sent = [];
+    await page.route('http://localhost/**', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.pathname.startsWith('/assets/')) {
+        const file = url.pathname.slice('/assets/'.length);
+        return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
+      }
+      if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/watch/state') {
+        const only = url.searchParams.get('session');
+        const list = only ? fixture().filter((s) => s.id === only) : fixture();
+        return route.fulfill({ json: { generated_at: NOW, sessions: list, counts: {} } });
+      }
+      if (url.pathname.endsWith('/last-turn')) return route.fulfill({ json: { at: NOW, html: '<p>Done; one question left.</p>' } });
+      if (url.pathname === '/inbox/agent/sm-1726-engineer/send' && request.method() === 'POST') {
+        sent.push(JSON.parse(request.postData()));
+        return route.fulfill({ json: {} });
+      }
+      if (url.pathname === '/inbox/agent/sm-1726-engineer') {
+        return route.fulfill({ json: { title: 'sm-1726-engineer', status: 'idle', can_send: true, reply_to: { name: 'sm-1726-engineer' }, items: [
+          { type: 'doc_revision', at: NOW, sender: { name: 'sm-1726-engineer' }, sha: 'abcdef1234', review_state: 'requested',
+            html: '<a href="/docs/session-manager/docs/working/1726.html">1726 memo</a>' },
+          { html: '<div class="b ask" data-msg="m1"><p data-sm-line="1">Can you run one manual Chrome check?</p></div>' },
+        ] } });
+      }
+      return route.fulfill({ json: {} });
+    });
+    // An agent with an open question opens on its Inbox thread.
+    await page.goto('http://localhost/?open=agent:sm-1726-engineer');
+    await page.locator('.details-band .tabs button.on', { hasText: 'Inbox' }).waitFor();
+    await page.locator('.details-band .thread-items', { hasText: 'Can you run one manual Chrome check?' }).waitFor();
+    assert.equal(await page.locator('.details-band .thread-doc-card strong').innerText(), '1726 memo');
+    assert.equal(await page.locator('.details-band .msgbox').count(), 0, 'one compose box, the thread\'s');
+    await page.getByRole('textbox', { name: 'Reply' }).fill('Ran it, passes');
+    await page.getByRole('button', { name: 'Send' }).click();
+    await page.waitForFunction(() => document.querySelector('textarea[aria-label="Reply"]')?.value === '');
+    assert.equal(sent[0].body, 'Ran it, passes');
+    // Work tab's Last turn Reply comes back to the Inbox tab without leaving the page.
+    await page.locator('.details-band .tabs button', { hasText: 'Work' }).click();
+    await page.locator('.details-band .last-turn-foot button', { hasText: 'Reply' }).click();
+    await page.locator('.details-band .tabs button.on', { hasText: 'Inbox' }).waitFor();
+    assert.equal(new URL(page.url()).pathname, '/');
+    assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

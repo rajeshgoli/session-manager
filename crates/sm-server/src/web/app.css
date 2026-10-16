@@ -655,6 +655,9 @@ button.sw-sec { cursor: pointer; }
 .history-meta { margin:6px 0; }
 .history-card > .links { margin-top:2px; }
 .thread-links { padding:7px 12px; border-bottom:1px solid var(--line); }
+/* The agent panel's Inbox tab (sm#2245): the thread fills the panel; in the band it scrolls on its own. */
+.thread-reader.embedded .thread-items { padding:6px 12px; }
+.details-band .thread-reader.embedded .thread-items { max-height:min(50vh, 32rem); }
 .handoff-pop .handoff-at { display:flex; gap:6px; align-items:center; flex-wrap:wrap; color:var(--ink-2); font-size:.9rem; }
 .handoff-pop .handoff-at b { color:var(--ink); }
 .handoff-pop .handoff-at input { width:5rem; }

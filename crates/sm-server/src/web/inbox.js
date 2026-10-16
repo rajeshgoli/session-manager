@@ -145,7 +145,7 @@ export function InboxPage({ openRef }) {
   </div>`;
 }
 
-export function Thread({ id, workKey, controls, agent }) {
+export function Thread({ id, workKey, controls, agent, embedded = false }) {
   const endpoint = workKey ? `/inbox/thread/${encodeURIComponent(workKey)}` : `/inbox/agent/${encodeURIComponent(id)}`;
   const [data, error, reload] = usePoll(() => api(`${endpoint}?format=json`), 30000, [endpoint]);
   const [body, setBody] = useState('');
@@ -215,8 +215,8 @@ export function Thread({ id, workKey, controls, agent }) {
     } catch (e) { setFailure(e.message); }
     finally { setBusy(false); }
   };
-  return html`<section class="thread-reader">
-    <div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>
+  return html`<section class=${`thread-reader${embedded ? ' embedded' : ''}`}>
+    ${embedded ? null : html`<div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>`}
     ${agent ? html`<div class="thread-links"><${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
       prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
       agent=${{ id: agent.id, name: agent.name, provider: agent.provider, fact: factText(agent.facts) }}
