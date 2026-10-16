@@ -51,14 +51,21 @@ fn complete_local(dest: &Destination, id: &str) -> Result<()> {
     safe_relative(id)?;
     ensure!(!id.contains('/'), "invalid backup request id");
     dest.confirm(id)?;
-    // Keep no confirmed transit/staging copy on the remote disk.
+    cleanup_staging(dest, id)?;
+    clear_pending(dest)?;
+    dest.expire_history(time::OffsetDateTime::now_utc().unix_timestamp())
+}
+fn cleanup_staging(dest: &Destination, id: &str) -> Result<()> {
+    safe_relative(id)?;
+    ensure!(!id.contains('/'), "invalid backup request id");
+    // Keep no obsolete transit/staging copy on the remote disk.
     for base in [".downloads", ".incoming"] {
         let path = dest.root.join(base).join(id);
         if path.exists() {
             fs::remove_dir_all(path)?;
         }
     }
-    clear_pending(dest)
+    Ok(())
 }
 pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
     let deadline = Instant::now() + Duration::from_secs(3 * 3600);
@@ -79,6 +86,8 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
             return Ok(ack);
         }
         if matches!(status.state.as_str(), "failed" | "expired") {
+            dest.rollback(&id)?;
+            cleanup_staging(dest, &id)?;
             clear_pending(dest)?;
             new_request(dest, remote)?
         } else {
@@ -166,7 +175,6 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         status.allow_deletes,
         status.max_delete_fraction,
     )?;
-    dest.expire_history(time::OffsetDateTime::now_utc().unix_timestamp())?;
     let local =
         time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     let sunday = local.weekday() == time::Weekday::Sunday;

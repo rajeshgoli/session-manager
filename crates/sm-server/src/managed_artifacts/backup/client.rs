@@ -295,6 +295,15 @@ impl Destination {
         );
         safe_relative(id)?;
         ensure!(!id.contains('/'), "invalid request id");
+        let pending_key = format!("deletes:{id}");
+        if self.meta(&pending_key)?.is_none() {
+            let pending = self
+                .conn
+                .prepare("SELECT path FROM pending_deletes")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.set_meta(&pending_key, &serde_json::to_string(&pending)?)?;
+        }
         let records = self.records()?;
         let mut deletes: BTreeSet<String> = manifest.deleted.iter().cloned().collect();
         let mut stmt = self.conn.prepare("SELECT path FROM pending_deletes")?;
@@ -397,6 +406,21 @@ impl Destination {
         if same {
             return Ok(());
         }
+        let days = manifest
+            .holding_days
+            .get(&prefix(path)?)
+            .copied()
+            .unwrap_or(30);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO history(run,path,held_at,days,body) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                run,
+                path,
+                stamp(),
+                days,
+                old.map(serde_json::to_string).transpose()?
+            ],
+        )?;
         // A deterministic holding path makes the filesystem half of the journal
         // repeatable when a process dies between rename and SQLite commit.
         if old.is_some_and(|r| r.target.is_none()) && !holding.exists() {
@@ -418,21 +442,6 @@ impl Destination {
         for parent in [current.parent(), holding.parent()].into_iter().flatten() {
             File::open(parent)?.sync_all()?;
         }
-        let days = manifest
-            .holding_days
-            .get(&prefix(path)?)
-            .copied()
-            .unwrap_or(30);
-        self.conn.execute(
-            "INSERT OR IGNORE INTO history(run,path,held_at,days,body) VALUES(?1,?2,?3,?4,?5)",
-            params![
-                run,
-                path,
-                stamp(),
-                days,
-                old.map(serde_json::to_string).transpose()?
-            ],
-        )?;
         if let Some(record) = new {
             self.conn.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body",params![path,serde_json::to_string(record)?])?;
         } else {
@@ -441,6 +450,72 @@ impl Destination {
         }
         if let Some(parent) = current.parent() {
             File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+    /// Reverse every journaled change before requesting a delta from the still
+    /// confirmed head. Keep history intact until all file repairs are durable.
+    pub fn rollback(&mut self, id: &str) -> Result<()> {
+        safe_relative(id)?;
+        ensure!(!id.contains('/'), "invalid backup request id");
+        if let Some(run) = self.meta(&format!("holding:{id}"))? {
+            let rows = self
+                .conn
+                .prepare("SELECT path,body FROM history WHERE run=?1")?
+                .query_map([&run], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (path, body) in &rows {
+                let current = safe_path(&self.root, path, true)?;
+                let old: Option<FileRecord> =
+                    body.as_ref().map(|b| serde_json::from_str(b)).transpose()?;
+                if let Some(record) = old.as_ref().filter(|r| r.target.is_none()) {
+                    let held = safe_path(&self.root, &format!(".holding/{run}/{path}"), false)?;
+                    if held.exists() {
+                        verify(&held, record)?;
+                        let temp = safe_path(
+                            &self.root,
+                            &format!(".incoming/{id}/rollback/{path}"),
+                            true,
+                        )?;
+                        fs::copy(held, &temp)?;
+                        File::open(&temp)?.sync_all()?;
+                        fs::rename(temp, &current)?;
+                    } else {
+                        // The process may have stopped after journaling but
+                        // before moving the old file into holding.
+                        verify(&current, record)?;
+                    }
+                } else if current.exists() {
+                    fs::remove_file(&current)?;
+                }
+                File::open(current.parent().context("missing backup parent")?)?.sync_all()?;
+            }
+            let tx = self.conn.transaction()?;
+            for (path, body) in rows {
+                if let Some(body) = body {
+                    tx.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body", params![path, body])?;
+                } else {
+                    tx.execute("DELETE FROM files WHERE path=?1", [path])?;
+                }
+            }
+            tx.execute("DELETE FROM history WHERE run=?1", [&run])?;
+            tx.execute("DELETE FROM applied WHERE request=?1", [id])?;
+            tx.commit()?;
+            let held = safe_path(&self.root, &format!(".holding/{run}"), false)?;
+            if held.exists() {
+                fs::remove_dir_all(held)?;
+            }
+        }
+        if let Some(body) = self.meta(&format!("deletes:{id}"))? {
+            let pending: Vec<String> = serde_json::from_str(&body)?;
+            let tx = self.conn.transaction()?;
+            tx.execute("DELETE FROM pending_deletes", [])?;
+            for path in pending {
+                tx.execute("INSERT INTO pending_deletes(path) VALUES(?1)", [path])?;
+            }
+            tx.commit()?;
         }
         Ok(())
     }

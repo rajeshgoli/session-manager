@@ -872,3 +872,83 @@ fn reseed_removes_files_absent_from_full_source() {
     assert!(dest.records().unwrap().is_empty());
     assert!(!dest.root.join("plain/data/prices").exists());
 }
+
+#[test]
+fn expired_applied_request_rolls_back_before_requesting_another_delta() {
+    use super::{
+        client::Destination,
+        pull::{self, Remote},
+    };
+    struct Expired;
+    impl Remote for Expired {
+        fn json(
+            &mut self,
+            method: &str,
+            _path: &str,
+            body: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            if method == "POST" {
+                assert_eq!(body.unwrap()["have"], "confirmed");
+                anyhow::bail!("stop after rollback before next download");
+            }
+            Ok((
+                200,
+                serde_json::json!({"id":"expired","state":"expired","estimate_bytes":0,"parts":[],"deletions":[],"allow_deletes":false,"max_delete_fraction":0.1}),
+            ))
+        }
+        fn download(
+            &mut self,
+            _: &str,
+            _: &Part,
+            _: u64,
+            _: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            panic!("no download expected")
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            panic!("no probe expected")
+        }
+    }
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"A").unwrap();
+    fs::write(f.dir.join("data/deleted"), b"keep").unwrap();
+    let first = f.prepare("confirmed", None);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("confirmed", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("confirmed", &first.transfer, &staging, true, 1.0)
+        .unwrap();
+    dest.confirm("confirmed").unwrap();
+    let original = dest.records().unwrap();
+    fs::write(f.dir.join("data/prices"), b"BBBB").unwrap();
+    fs::remove_file(f.dir.join("data/deleted")).unwrap();
+    fs::write(f.dir.join("data/created"), b"new").unwrap();
+    let next = f.prepare("expired", Some(&first.manifest));
+    let staging = dest
+        .unpack("expired", &next.transfer, &next.parts, &next.directory)
+        .unwrap();
+    dest.apply("expired", &next.transfer, &staging, true, 1.0)
+        .unwrap();
+    dest.set_meta("pending_request", "expired").unwrap();
+    let downloads = dest.directory(".downloads/expired").unwrap();
+    fs::write(downloads.join("partial"), b"partial").unwrap();
+    let error = pull::pull(&mut dest, &mut Expired).unwrap_err();
+    assert!(
+        error.to_string().contains("stop after rollback"),
+        "{error:#}"
+    );
+    assert_eq!(dest.records().unwrap(), original);
+    assert_eq!(fs::read(dest.root.join("plain/data/prices")).unwrap(), b"A");
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/deleted")).unwrap(),
+        b"keep"
+    );
+    assert!(!dest.root.join("plain/data/created").exists());
+    assert!(!dest.root.join(".incoming/expired").exists());
+    assert!(!downloads.exists());
+    assert!(dest.meta("pending_request").unwrap().is_none());
+    // A crash after rollback but before clearing pending must be repeatable.
+    dest.rollback("expired").unwrap();
+    assert_eq!(dest.records().unwrap(), original);
+}
