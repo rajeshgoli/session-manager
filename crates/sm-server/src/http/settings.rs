@@ -19,6 +19,7 @@ pub(super) async fn get_settings(
             .session_store
             .owner_settings()
             .map(|settings| with_config_limits(settings, config_limits))
+            .map(|settings| with_switches(&state, settings))
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
@@ -43,6 +44,11 @@ pub(super) async fn put_settings(
     let work_state = state.clone();
     let settings = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
         let state = work_state;
+        let autopm_before = body
+            .get("autopm")
+            .map(|_| state.session_store.owner_settings())
+            .transpose()?
+            .map(|settings| autopm::typed(&state, &settings));
         let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
         // Store and apply under the live policy's lock, so overlapping PUTs
         // cannot leave admission on older limits than the stored ones.
@@ -83,11 +89,25 @@ pub(super) async fn put_settings(
         if body.get("new_agent").is_some() {
             board::request_recompute(&state);
         }
-        Ok(with_config_limits(settings, config_limits))
+        if let Some(before) = autopm_before {
+            let after = autopm::typed(&state, &settings);
+            autopm::on_settings_change(&state, &before, &after);
+        }
+        Ok(with_switches(
+            &state,
+            with_config_limits(settings, config_limits),
+        ))
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
     Ok(Json(settings))
+}
+
+/// The auto PM switches as `{key: on}`, as `/client/bootstrap` has them
+/// (spec 2170 B.1).
+fn with_switches(state: &AppState, mut settings: Value) -> Value {
+    settings["switches"] = json!(state.autopm_switches.effective());
+    settings
 }
 
 /// Config's terminal limits, which a `null` owner value falls back to.

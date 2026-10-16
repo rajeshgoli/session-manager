@@ -9589,7 +9589,8 @@ async fn bootstrap_preserves_native_schema_without_termux_or_terminal_when_disab
             "session_open_defaults": {
                 "preferred_action": "details",
                 "termux_package": "com.termux"
-            }
+            },
+            "switches": {}
         })
     );
     assert!(payload["external_access"]

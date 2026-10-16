@@ -30,6 +30,7 @@ pub mod agent_notes;
 pub mod analytics_spend;
 pub mod analytics_time;
 pub mod app_artifacts;
+pub mod autopm;
 pub mod board;
 pub mod btw;
 pub mod bug_reports;

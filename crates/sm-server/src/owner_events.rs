@@ -688,6 +688,15 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/client/sessions/{session_id}/browser-attach-ticket", "terminal.ticket", Some("session")),
     ("GET", "/client/sessions/{session_id}", "session.open", Some("session")),
     ("GET", "/autopm/events", "autopm.events", None),
+    ("GET", "/autopm/switches", "autopm.switches", None),
+    ("PUT", "/autopm/switches/{key}", "autopm.switch", Some("setting")),
+    ("GET", "/autopm/experiments", "autopm.experiments", None),
+    ("POST", "/autopm/experiments", "autopm.experiment_create", None),
+    ("GET", "/autopm/experiments/{id}", "autopm.experiment", Some("experiment")),
+    ("PATCH", "/autopm/experiments/{id}", "autopm.experiment_set", Some("experiment")),
+    ("POST", "/autopm/experiments/{id}/live", "autopm.experiment_live", Some("experiment")),
+    ("GET", "/autopm/budget", "autopm.budget", None),
+    ("POST", "/client/autopm/feedback", "autopm.feedback", None),
 ];
 
 /// The action for a request: the mapped name, else its template (A.3).

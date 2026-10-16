@@ -21,16 +21,17 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 6] = [
+const KEYS: [&str; 7] = [
     "new_agent",
     "queue_limits",
     "terminal_limits",
     "reviews",
     "auto_retire",
     "host_restart",
+    "autopm",
 ];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
-const WHOLE_VALUES: [&str; 3] = ["repo_short", "reviewer", "agent_types"];
+const WHOLE_VALUES: [&str; 4] = ["repo_short", "reviewer", "agent_types", "agent"];
 const PLACEHOLDERS: [&str; 7] = [
     "ticket",
     "number",
@@ -121,6 +122,21 @@ pub fn defaults() -> Value {
         },
         "host_restart": {
             "restore_agents": true,
+        },
+        // Auto PM (sm#2174; spec 2170 appendix C.1). Off until the owner
+        // turns it on; turning it off is the kill switch (B.5).
+        "autopm": {
+            "enabled": false,
+            "agent": {"provider": "claude", "model": "opus[1m]", "effort": "high"},
+            "dedicated_points": {"claude": 5, "codex": 20},
+            "surplus_cap_points": {"claude": 15, "codex": 30},
+            "surplus_margin_points": 20,
+            "skip_window_starting": null,
+            "max_live": 3,
+            "paused_at": null,
+            "pm_points": {"claude": 4, "codex": 0},
+            "review_points": {"claude": 1, "codex": 5},
+            "app_updates_per_week": 1,
         },
     })
 }
@@ -282,8 +298,86 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
             }
             Ok(())
         }
+        "autopm" => validate_autopm(value),
         other => Err(format!("unknown field {other}")),
     }
+}
+
+fn validate_autopm(value: &Value) -> Result<(), String> {
+    if !value["enabled"].is_boolean() {
+        return Err("autopm.enabled must be a boolean".to_owned());
+    }
+    let agent = &value["agent"];
+    let provider = agent["provider"].as_str().unwrap_or_default();
+    let efforts = match provider {
+        "claude" => &CLAUDE_EFFORTS[..],
+        "codex-fork" => &CODEX_EFFORTS[..],
+        _ => return Err("autopm.agent.provider must be claude or codex-fork".to_owned()),
+    };
+    if agent.as_object().is_none_or(|a| a.len() != 3)
+        || agent["model"].as_str().is_none_or(|m| m.trim().is_empty())
+        || !agent["effort"]
+            .as_str()
+            .is_some_and(|e| efforts.contains(&e))
+    {
+        return Err("autopm.agent needs provider, model and a valid effort".to_owned());
+    }
+    for key in [
+        "dedicated_points",
+        "surplus_cap_points",
+        "pm_points",
+        "review_points",
+    ] {
+        let points = value[key].as_object();
+        let valid = points.is_some_and(|points| {
+            points.len() == 2
+                && ["claude", "codex"].iter().all(|provider| {
+                    points
+                        .get(*provider)
+                        .and_then(Value::as_f64)
+                        .is_some_and(|p| (0.0..=100.0).contains(&p))
+                })
+        });
+        if !valid {
+            return Err(format!(
+                "autopm.{key} must give claude and codex 0-100 points"
+            ));
+        }
+    }
+    if !value["surplus_margin_points"]
+        .as_f64()
+        .is_some_and(|p| (0.0..=100.0).contains(&p))
+    {
+        return Err("autopm.surplus_margin_points must be 0-100".to_owned());
+    }
+    let skip = &value["skip_window_starting"];
+    if !skip.is_null()
+        && skip
+            .as_str()
+            .and_then(crate::autopm::budget::skip_instant)
+            .is_none()
+    {
+        return Err(
+            "autopm.skip_window_starting must be an ISO date or RFC 3339 time, or null".to_owned(),
+        );
+    }
+    if !value["max_live"]
+        .as_i64()
+        .is_some_and(|n| (0..=10).contains(&n))
+    {
+        return Err("autopm.max_live must be 0-10".to_owned());
+    }
+    let paused = &value["paused_at"];
+    if !paused.is_null() && paused.as_str().is_none_or(|p| p.trim().is_empty()) {
+        return Err("autopm.paused_at must be a time or null".to_owned());
+    }
+    if !value["app_updates_per_week"]
+        .as_i64()
+        .is_some_and(|n| (0..=7).contains(&n))
+    {
+        return Err("autopm.app_updates_per_week must be 0-7".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_new_agent(value: &Value) -> Result<(), String> {
