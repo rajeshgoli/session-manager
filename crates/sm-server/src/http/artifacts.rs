@@ -95,16 +95,12 @@ pub(super) async fn list(
         .collect();
     disks.sort_by_key(|d| d["path"].as_str().unwrap_or_default().to_owned());
     disks.dedup_by(|a, b| a["path"] == b["path"]);
-    let backup = artifact_store::query(
-        &conn,
-        "SELECT * FROM backup_runs ORDER BY id DESC LIMIT 7",
-        &[],
-    )?;
+    let backup = ma::backup::lifecycle::owner_summary(svc)?;
     let can_act = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .is_some_and(|p| owner_email(&state, request.headers(), p.0, "GET").is_ok());
-    Ok(Json(json!({"can_act":can_act,"keep_live_days":svc.config.keep_live_days,"backup":{"runs":backup,"enabled":svc.config.backup.enabled,"rate_default":svc.config.backup.backup_rate_default,"scope_roots":svc.config.backup.static_paths},"recent":recent,"needs_you_count":needs_you.len(),"needs_you":needs_you,"artifacts":artifacts,"filesystems":disks,"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
+    Ok(Json(json!({"can_act":can_act,"keep_live_days":svc.config.keep_live_days,"backup":backup,"recent":recent,"needs_you_count":needs_you.len(),"needs_you":needs_you,"artifacts":artifacts,"filesystems":disks,"epics":epics.into_iter().map(|(label,(bytes,count))|json!({"label":label,"bytes":bytes,"count":count})).collect::<Vec<_>>(),"mode":svc.config.deletion_mode})).into_response())
 }
 pub(super) async fn show(
     State(state): State<Arc<AppState>>,

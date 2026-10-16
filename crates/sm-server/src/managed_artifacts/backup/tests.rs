@@ -318,3 +318,178 @@ fn scope_counts_each_job_once_across_overlapping_output_sets() {
     f.manager.config.backup.backup_rate_default = "0.5B".into();
     assert!(collect_scope(&f.manager, "mini").unwrap().is_empty());
 }
+
+#[test]
+fn request_lifecycle_is_device_scoped_and_reuses_open_requests() {
+    use super::lifecycle::{self as l, RequestResult};
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let RequestResult::Open(first) = l::request(&f.manager, "mini", None).unwrap() else {
+        panic!()
+    };
+    let RequestResult::Open(repeated) = l::request(&f.manager, "mini", Some("stale")).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.id, repeated.id);
+    assert!(l::status(&f.manager, "other", &first.id).is_err());
+    l::prepare_request(&f.manager, &first.id).unwrap();
+    let ready = l::status(&f.manager, "mini", &first.id).unwrap();
+    assert_eq!(ready.state, "ready");
+    assert_eq!(ready.manifest.as_ref().unwrap().changed.len(), 1);
+    l::allow_deletes(&f.manager, "mini").unwrap();
+    assert!(
+        l::status(&f.manager, "mini", &first.id)
+            .unwrap()
+            .allow_deletes
+    );
+    assert!(
+        l::status(&f.manager, "mini", &first.id)
+            .unwrap()
+            .allow_deletes
+    );
+    let ack = l::Ack {
+        applied: true,
+        fetched_bytes: 6,
+        fetch_seconds: 1.0,
+        apply_seconds: 1.0,
+        held_deletions: 0,
+        check: None,
+        error: None,
+    };
+    l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
+    l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
+    assert!(!f.dir.join("outbox").join(&first.id).exists());
+    assert_eq!(
+        l::status(&f.manager, "mini", &first.id).unwrap().state,
+        "acked"
+    );
+    assert!(matches!(
+        l::request(&f.manager, "mini", None).unwrap(),
+        RequestResult::Mismatch(Some(_))
+    ));
+    let RequestResult::Open(next) = l::request(&f.manager, "mini", Some(&first.id)).unwrap() else {
+        panic!()
+    };
+    l::prepare_request(&f.manager, &next.id).unwrap();
+    let ready = l::status(&f.manager, "mini", &next.id).unwrap();
+    assert!(ready.manifest.unwrap().changed.is_empty());
+    assert!(!ready.allow_deletes);
+    let failed = l::Ack {
+        applied: false,
+        error: Some("disk disconnected".into()),
+        ..ack
+    };
+    l::acknowledge(&f.manager, "mini", &next.id, &failed).unwrap();
+    assert_eq!(
+        confirmed(&f.manager.store.open().unwrap(), "mini")
+            .unwrap()
+            .unwrap()
+            .manifest_id,
+        first.id
+    );
+}
+
+#[test]
+fn expired_request_retries_delta_and_alerts_recover_after_confirmation() {
+    use super::lifecycle::{self as l, RequestResult};
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    l::missed_alerts(&f.manager, now - 3 * 86400).unwrap();
+    l::missed_alerts(&f.manager, now).unwrap();
+    l::missed_alerts(&f.manager, now).unwrap();
+    let conn = f.manager.store.open().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM backup_alerts", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let RequestResult::Open(first) = l::request(&f.manager, "mini", None).unwrap() else {
+        panic!()
+    };
+    l::prepare_request(&f.manager, &first.id).unwrap();
+    l::expire(&f.manager, now + 49 * 3600).unwrap();
+    assert_eq!(
+        l::status(&f.manager, "mini", &first.id).unwrap().state,
+        "expired"
+    );
+    assert!(!f.dir.join("outbox").join(&first.id).exists());
+    let RequestResult::Open(next) = l::request(&f.manager, "mini", None).unwrap() else {
+        panic!()
+    };
+    l::prepare_request(&f.manager, &next.id).unwrap();
+    assert_eq!(
+        l::status(&f.manager, "mini", &next.id)
+            .unwrap()
+            .manifest
+            .unwrap()
+            .changed
+            .len(),
+        1
+    );
+    let ack = l::Ack {
+        applied: true,
+        fetched_bytes: 6,
+        fetch_seconds: 1.0,
+        apply_seconds: 1.0,
+        held_deletions: 1,
+        check: Some(l::Check {
+            ok: false,
+            files_checked: 1,
+            bad: vec!["plain/data/prices".into()],
+        }),
+        error: None,
+    };
+    // The fixture's configured device is backup-mini; recovery is per device.
+    crate::managed_artifacts::store::set_meta(&conn, "backup_missed:mini", "1").unwrap();
+    l::acknowledge(&f.manager, "mini", &next.id, &ack).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM backup_alerts WHERE blocking=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM backup_alerts WHERE title='Backup is confirming again'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn incremental_capacity_estimate_counts_only_changed_files() {
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let first = f.prepare("first", None);
+    let mut scopes = f.scopes();
+    scopes[0].estimated_bytes = u64::MAX;
+    assert_eq!(
+        outbox::pending_input(&scopes, Some(&first.manifest)).unwrap(),
+        (0, 0)
+    );
+    assert!(
+        prepare(&f.manager, &scopes, Some(&first.manifest), "unchanged")
+            .unwrap()
+            .parts
+            .is_empty()
+    );
+    fs::write(f.dir.join("data/new"), b"new").unwrap();
+    scopes[0].estimated_bytes = 90;
+    assert_eq!(
+        outbox::pending_input(&scopes, Some(&first.manifest)).unwrap(),
+        (3, 30)
+    );
+}

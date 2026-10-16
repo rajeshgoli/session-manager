@@ -1,0 +1,541 @@
+//! Durable per-device request state. HTTP authenticates the device; the queue
+//! owns preparation processes. Only a successful acknowledgement advances head.
+use super::*;
+use crate::managed_artifacts::{
+    config::ManagedArtifactsConfig, now, store as artifact_store, ManagedArtifacts,
+};
+use anyhow::{ensure, Context};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde_json::{json, Value};
+use std::{fs, path::PathBuf};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Check {
+    pub ok: bool,
+    pub files_checked: u64,
+    #[serde(default)]
+    pub bad: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Ack {
+    pub applied: bool,
+    pub fetched_bytes: u64,
+    pub fetch_seconds: f64,
+    pub apply_seconds: f64,
+    pub held_deletions: u64,
+    pub check: Option<Check>,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestStatus {
+    pub id: String,
+    pub state: String,
+    pub retry_after_seconds: Option<u64>,
+    pub estimate_bytes: u64,
+    pub manifest_id: Option<String>,
+    pub parts: Vec<Part>,
+    pub manifest: Option<TransferManifest>,
+    pub deletions: Vec<String>,
+    pub allow_deletes: bool,
+    pub max_delete_fraction: f64,
+    pub error: Option<String>,
+}
+#[derive(Debug)]
+pub enum RequestResult {
+    Open(Box<RequestStatus>),
+    Mismatch(Option<String>),
+}
+fn epoch() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+fn request_id() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    format!(
+        "backup-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+fn row(conn: &Connection, device: &str, id: &str) -> Result<Value> {
+    artifact_store::query(
+        conn,
+        "SELECT * FROM backup_requests WHERE device=?1 AND id=?2",
+        &[&device, &id],
+    )?
+    .pop()
+    .context("backup request not found")
+}
+fn status_row(r: &Value) -> Result<RequestStatus> {
+    let state = r["state"].as_str().context("request state")?.to_owned();
+    let ready = state == "ready";
+    let manifest: Option<TransferManifest> = if ready {
+        r["transfer_json"]
+            .as_str()
+            .map(serde_json::from_str)
+            .transpose()?
+    } else {
+        None
+    };
+    let estimate = r["estimate_bytes"].as_u64().unwrap_or(0);
+    Ok(RequestStatus {
+        id: r["id"].as_str().context("request id")?.into(),
+        retry_after_seconds: if state == "preparing" {
+            Some(
+                ((r["remaining_input"].as_f64().unwrap_or(0.0)
+                    / r["packing_rate"].as_f64().unwrap_or(1e9))
+                .ceil() as u64)
+                    .saturating_add(30),
+            )
+        } else {
+            None
+        },
+        state,
+        estimate_bytes: estimate,
+        manifest_id: r["manifest_id"].as_str().map(str::to_owned),
+        parts: if ready {
+            serde_json::from_str(r["parts_json"].as_str().unwrap_or("[]"))?
+        } else {
+            vec![]
+        },
+        deletions: manifest
+            .as_ref()
+            .map(|m| m.deleted.clone())
+            .unwrap_or_default(),
+        manifest,
+        allow_deletes: r["allow_deletes"] == 1,
+        max_delete_fraction: r["max_delete_fraction"].as_f64().unwrap_or(0.1),
+        error: r["error"].as_str().map(str::to_owned),
+    })
+}
+fn packing_rate(conn: &Connection) -> Result<f64> {
+    let mut stmt=conn.prepare("SELECT packed_input_bytes/packing_seconds FROM backup_requests WHERE packing_seconds>0 AND packed_input_bytes>0 ORDER BY ready_at DESC LIMIT 5")?;
+    let mut values = stmt
+        .query_map([], |r| r.get::<_, f64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    values.sort_by(f64::total_cmp);
+    Ok(if values.is_empty() {
+        1e9
+    } else {
+        (values[(values.len() - 1) / 2] + values[values.len() / 2]) / 2.0
+    })
+}
+pub fn request(
+    manager: &ManagedArtifacts,
+    device: &str,
+    have: Option<&str>,
+) -> Result<RequestResult> {
+    ensure!(manager.config.backup.enabled, "backup is disabled");
+    expire(manager, epoch())?;
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(r) = artifact_store::query(
+        &tx,
+        "SELECT * FROM backup_requests WHERE device=?1 AND state IN ('preparing','ready')",
+        &[&device],
+    )?
+    .pop()
+    {
+        return Ok(RequestResult::Open(Box::new(status_row(&r)?)));
+    }
+    let head = confirmed(&tx, device)?.map(|m| m.manifest_id);
+    if have != head.as_deref() {
+        return Ok(RequestResult::Mismatch(head));
+    }
+    let id = request_id();
+    let config = serde_json::to_string(&manager.config)?;
+    let outbox = crate::sessions::expand_home(&manager.config.backup.outbox).join(&id);
+    tx.execute("INSERT INTO backup_requests(id,device,state,base,created_at,config_json,outbox,packing_rate,max_delete_fraction) VALUES(?1,?2,'preparing',?3,?4,?5,?6,?7,?8)",params![id,device,have,epoch(),config,outbox.to_string_lossy(),packing_rate(&tx)?,manager.config.backup.max_delete_fraction])?;
+    let result = status_row(&row(&tx, device, &id)?)?;
+    tx.commit()?;
+    Ok(RequestResult::Open(Box::new(result)))
+}
+pub fn status(manager: &ManagedArtifacts, device: &str, id: &str) -> Result<RequestStatus> {
+    expire(manager, epoch())?;
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let r = row(&tx, device, id)?;
+    // Consume approval into this request, not into a single GET response: retries
+    // must see the same approval, but a subsequent request must not inherit it.
+    if r["state"] == "ready" {
+        let key = format!("backup_allow_deletes:{device}");
+        if artifact_store::meta(&tx, &key)?.as_deref() == Some("1") {
+            tx.execute(
+                "UPDATE backup_requests SET allow_deletes=1 WHERE id=?1",
+                [id],
+            )?;
+            artifact_store::set_meta(&tx, &key, "0")?;
+        }
+    }
+    let result = status_row(&row(&tx, device, id)?)?;
+    tx.commit()?;
+    Ok(result)
+}
+pub fn allow_deletes(manager: &ManagedArtifacts, device: &str) -> Result<()> {
+    artifact_store::set_meta(
+        &manager.store.open()?,
+        &format!("backup_allow_deletes:{device}"),
+        "1",
+    )
+}
+
+/// Reconcile after restart as well as immediately after request creation. Holding
+/// the artifact write lock serializes duplicate request/reconciliation calls.
+pub fn schedule(manager: &ManagedArtifacts, queue_dir: &Path, executable: &Path) -> Result<()> {
+    use crate::queue::{CreateQueueJob, RetainedQueueStore};
+    fs::create_dir_all(queue_dir)?;
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for r in artifact_store::query(
+        &tx,
+        "SELECT * FROM backup_requests WHERE state='preparing'",
+        &[],
+    )? {
+        let id = r["id"].as_str().context("request id")?;
+        let owner = format!("backup:{id}");
+        let existing = RetainedQueueStore::owned_queue_job(queue_dir, &owner)?;
+        let job = if let Some(job) = existing {
+            job
+        } else {
+            RetainedQueueStore::create_owned_queue_job(
+                queue_dir,
+                CreateQueueJob {
+                    local_submitter: None,
+                    job_type: "background".into(),
+                    label: format!("Backup preparation {id}"),
+                    requester_session_id: None,
+                    notify_session_id: String::new(),
+                    cwd: queue_dir.display().to_string(),
+                    argv: Some(vec![
+                        executable.display().to_string(),
+                        "--backup-prepare".into(),
+                        id.into(),
+                        "--backup-db".into(),
+                        manager.store.path.display().to_string(),
+                    ]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 3 * 3600,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                    rank_tickets: None,
+                },
+                &owner,
+            )?
+        };
+        tx.execute(
+            "UPDATE backup_requests SET queue_job_id=?2 WHERE id=?1",
+            params![id, job.id],
+        )?;
+        if matches!(
+            job.state.as_str(),
+            "succeeded" | "failed" | "cancelled" | "timed_out" | "interrupted"
+        ) {
+            tx.execute("UPDATE backup_requests SET state='failed',error=?2 WHERE id=?1 AND state='preparing'",params![id,format!("preparation job ended {} before publishing ready",job.state)])?;
+        }
+    }
+    tx.commit()?;
+    cleanup(manager)
+}
+
+/// Invoked only by the queue's application-owned worker, before server startup.
+pub fn run_worker(db: PathBuf, id: &str) -> Result<()> {
+    let store = artifact_store::ArtifactStore::new(db);
+    let conn = store.open()?;
+    let config: String = conn.query_row(
+        "SELECT config_json FROM backup_requests WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let config: ManagedArtifactsConfig = serde_json::from_str(&config)?;
+    ensure!(
+        crate::sessions::expand_home(&config.db_path) == store.path,
+        "backup worker database mismatch"
+    );
+    let manager = ManagedArtifacts::new(&config)?;
+    prepare_request(&manager, id)
+}
+pub fn prepare_request(manager: &ManagedArtifacts, id: &str) -> Result<()> {
+    let conn = manager.store.open()?;
+    let r = artifact_store::query(&conn, "SELECT * FROM backup_requests WHERE id=?1", &[&id])?
+        .pop()
+        .context("backup request not found")?;
+    ensure!(
+        r["state"] == "preparing",
+        "backup request is no longer preparing"
+    );
+    let device = r["device"].as_str().context("device")?;
+    let started = std::time::Instant::now();
+    let result = (|| -> Result<()> {
+        let scopes = collect_scope(manager, device)?;
+        let base = r["base"]
+            .as_str()
+            .map(|base| load_manifest(&conn, device, base))
+            .transpose()?;
+        let (mut remaining, estimate) = super::outbox::pending_input(&scopes, base.as_ref())?;
+        conn.execute(
+            "UPDATE backup_requests SET estimate_bytes=?2,remaining_input=?3 WHERE id=?1",
+            params![id, estimate, remaining],
+        )?;
+        let mut coverage = Vec::new();
+        for scope in &scopes {
+            coverage.push(json!({"source":scope.source,"prefix":scope.prefix(),"stamp":crate::managed_artifacts::scan::measure(&scope.source)?.stamp()}));
+        }
+        let mut progress_at = std::time::Instant::now();
+        let prepared =
+            super::outbox::prepare_with_progress(manager, &scopes, base.as_ref(), id, |bytes| {
+                remaining = remaining.saturating_sub(bytes);
+                if remaining == 0 || progress_at.elapsed().as_secs() >= 1 {
+                    conn.execute(
+                        "UPDATE backup_requests SET remaining_input=?2 WHERE id=?1",
+                        params![id, remaining],
+                    )?;
+                    progress_at = std::time::Instant::now();
+                }
+                Ok(())
+            })?;
+        coverage.retain(|scope| {
+            !prepared
+                .deferred
+                .iter()
+                .any(|path| path.starts_with(&format!("{}/", scope["prefix"].as_str().unwrap())))
+        });
+        let mut conn = manager.store.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            row(&tx, device, id)?["state"] == "preparing",
+            "backup request changed during preparation"
+        );
+        save_manifest(&tx, device, &prepared.manifest)?;
+        tx.execute(
+            "UPDATE backup_requests SET coverage_json=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&coverage)?],
+        )?;
+        let input: u64 = prepared.transfer.changed.iter().map(|f| f.size).sum();
+        tx.execute("UPDATE backup_requests SET state='ready',ready_at=?2,manifest_id=?1,parts_json=?3,transfer_json=?4,packed_input_bytes=?5,packing_seconds=?6 WHERE id=?1",params![id,epoch(),serde_json::to_string(&prepared.parts)?,serde_json::to_string(&prepared.transfer)?,input,started.elapsed().as_secs_f64()])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        conn.execute(
+            "UPDATE backup_requests SET state='failed',error=?2 WHERE id=?1 AND state='preparing'",
+            params![id, format!("{error:#}")],
+        )?;
+        cleanup(manager)?;
+    }
+    result
+}
+
+pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack) -> Result<()> {
+    ensure!(
+        ack.fetch_seconds.is_finite()
+            && ack.fetch_seconds >= 0.0
+            && ack.apply_seconds.is_finite()
+            && ack.apply_seconds >= 0.0,
+        "invalid backup timing"
+    );
+    ensure!(
+        ack.fetched_bytes <= i64::MAX as u64 && ack.held_deletions <= i64::MAX as u64,
+        "invalid backup count"
+    );
+    if ack.applied && ack.fetched_bytes > 0 {
+        ensure!(
+            ack.fetch_seconds > 0.0 && ack.apply_seconds > 0.0,
+            "nonempty backup needs positive timings"
+        );
+    }
+    expire(manager, epoch())?;
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let r = row(&tx, device, id)?;
+    let body = serde_json::to_string(ack)?;
+    if r["ack_json"].as_str() == Some(&body) {
+        return Ok(());
+    }
+    ensure!(r["state"] == "ready", "backup request is not ready");
+    if ack.applied {
+        confirm(&tx, device, id)?;
+        mark_covered(&tx, manager, &r)?;
+        if ack.fetched_bytes > 0 {
+            record_rate(&tx, device, "fetch", ack.fetched_bytes, ack.fetch_seconds)?;
+            record_rate(&tx, device, "apply", ack.fetched_bytes, ack.apply_seconds)?;
+        }
+    }
+    tx.execute(
+        "UPDATE backup_requests SET state=?2,acked_at=?3,ack_json=?4,error=?5 WHERE id=?1",
+        params![
+            id,
+            if ack.applied { "acked" } else { "failed" },
+            epoch(),
+            body,
+            ack.error
+        ],
+    )?;
+    tx.execute("INSERT INTO backup_runs(queue_job_id,started_at,finished_at,state,include_count,include_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![r["queue_job_id"].as_str(),time::OffsetDateTime::from_unix_timestamp(r["created_at"].as_i64().context("request creation time")?)?.format(&time::format_description::well_known::Rfc3339)?,now(),if ack.applied {"acked"}else{"failed"},load_manifest(&tx,device,id)?.files.len() as i64,ack.fetched_bytes])?;
+    if ack.check.as_ref().is_some_and(|c| !c.ok) {
+        alert(
+            &tx,
+            &format!("backup-check:{id}"),
+            "Backup integrity check failed",
+            &format!(
+                "The remote disk reported files that failed its integrity check: {}",
+                ack.check.as_ref().unwrap().bad.join(", ")
+            ),
+            true,
+        )?;
+    }
+    if ack.held_deletions > 0 {
+        let total = load_manifest(&tx, device, id)?.files.len() as u64 + ack.held_deletions;
+        alert(&tx,&format!("backup-held:{id}"),"Backup deletions need confirmation",&format!("The remote disk held back {} deletions ({:.1}% of its files). If you meant this, run `sm backup allow-deletes`.",ack.held_deletions,100.0*ack.held_deletions as f64/total.max(1) as f64),true)?;
+    }
+    if ack.applied {
+        let key = format!("backup_missed:{device}");
+        if artifact_store::meta(&tx, &key)?.as_deref() == Some("1") {
+            alert(
+                &tx,
+                &format!("backup-recovered:{id}"),
+                "Backup is confirming again",
+                "The remote disk is confirming again.",
+                false,
+            )?;
+            artifact_store::set_meta(&tx, &key, "0")?;
+        }
+    }
+    tx.commit()?;
+    cleanup(manager)
+}
+pub fn expire(manager: &ManagedArtifacts, at: i64) -> Result<()> {
+    let ttl = i64::try_from(manager.config.backup.ready_ttl_hours)?
+        .checked_mul(3600)
+        .context("invalid backup TTL")?;
+    manager.store.open()?.execute("UPDATE backup_requests SET state='expired',error='outbox expired without acknowledgement' WHERE state='ready' AND ready_at<=?1",[at.saturating_sub(ttl)])?;
+    cleanup(manager)
+}
+fn cleanup(manager: &ManagedArtifacts) -> Result<()> {
+    let conn = manager.store.open()?;
+    for r in artifact_store::query(&conn,"SELECT id,outbox FROM backup_requests WHERE state IN ('acked','failed','expired') AND cleaned=0",&[])? {
+        let path=PathBuf::from(r["outbox"].as_str().context("outbox path")?);
+        match fs::remove_dir_all(&path) {Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.into())}
+        conn.execute("UPDATE backup_requests SET cleaned=1 WHERE id=?1",[r["id"].as_str()])?;
+    }
+    Ok(())
+}
+fn alert(conn: &Connection, key: &str, title: &str, body: &str, blocking: bool) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO backup_alerts(key,title,body,blocking) VALUES(?1,?2,?3,?4)",
+        params![key, title, body, blocking],
+    )?;
+    Ok(())
+}
+pub fn missed_alerts(manager: &ManagedArtifacts, at: i64) -> Result<()> {
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for device in &manager.config.backup.puller_devices {
+        let enabled_key = format!("backup_enabled:{device}");
+        let enabled = artifact_store::meta(&tx, &enabled_key)?
+            .map(|s| s.parse::<i64>())
+            .transpose()?
+            .unwrap_or(at);
+        artifact_store::set_meta(&tx, &enabled_key, &enabled.to_string())?;
+        let last: Option<i64> = tx.query_row(
+            "SELECT MAX(acked_at) FROM backup_requests WHERE device=?1 AND state='acked'",
+            [device],
+            |r| r.get(0),
+        )?;
+        let since = last.unwrap_or(enabled);
+        let days = at.saturating_sub(since) / 86400;
+        if days >= manager.config.backup.alert_after_missed_nights as i64 {
+            let last_state:Option<String>=tx.query_row("SELECT state || COALESCE(': ' || error,'') FROM backup_requests WHERE device=?1 ORDER BY created_at DESC LIMIT 1",[device],|r|r.get(0)).optional()?;
+            let date = time::OffsetDateTime::from_unix_timestamp(since)?
+                .to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC))
+                .format(&time::format_description::well_known::Rfc3339)?;
+            alert(&tx,&format!("backup-missed:{device}:{}",at/86400),"Backup confirmation is overdue",&format!("Backup: the remote disk has not confirmed since {date} ({days} nights). Last state: {}. Nothing is lost yet.",last_state.as_deref().unwrap_or("no request")),false)?;
+            artifact_store::set_meta(&tx, &format!("backup_missed:{device}"), "1")?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+// Update display stamps only for scope roots that are still unchanged. Missing
+// or modified local data never invalidates a remote confirmation.
+fn mark_covered(conn: &Connection, manager: &ManagedArtifacts, request: &Value) -> Result<()> {
+    let covered: Vec<Value> =
+        serde_json::from_str(request["coverage_json"].as_str().unwrap_or("[]"))?;
+    for scope in covered {
+        let source = PathBuf::from(scope["source"].as_str().context("coverage source")?);
+        let stamp = scope["stamp"].as_str().context("coverage stamp")?;
+        if !crate::managed_artifacts::scan::measure(&source).is_ok_and(|size| size.stamp() == stamp)
+        {
+            continue;
+        }
+        for path in &manager.config.backup.static_paths {
+            let path = crate::sessions::expand_home(path);
+            if fs::canonicalize(&path).is_ok_and(|p| p == source) {
+                conn.execute(
+                    "UPDATE backup_static SET backed_up_at=?2,backup_stamp=?3 WHERE path=?1",
+                    params![path.to_string_lossy(), now(), stamp],
+                )?;
+            }
+        }
+        for root in &manager.config.roots {
+            for a in artifact_store::query(conn,"SELECT name,state,content_stamp FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
+                let name=a["name"].as_str().context("artifact name")?;
+                let path=if a["state"]=="frozen" {PathBuf::from(&root.cold_store).join(".frozen").join(name)} else {PathBuf::from(&root.path).join(name)};
+                if fs::canonicalize(path).is_ok_and(|p|p==source) {
+                    conn.execute("UPDATE artifacts SET backed_up_at=?3,backup_stamp=content_stamp WHERE root=?1 AND name=?2",params![root.path,name,now()])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
+    let conn = manager.store.open()?;
+    let mut devices = Vec::new();
+    for device in &manager.config.backup.puller_devices {
+        let runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests WHERE device=?1 ORDER BY created_at DESC,id DESC LIMIT 7",&[device])?;
+        devices.push(json!({"device":device,"confirmed":confirmed(&conn,device)?.map(|m|m.manifest_id),"runs":runs,"rates":rates(&conn,device,parse_rate(&manager.config.backup.backup_rate_default)?)?}));
+    }
+    let mut runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests ORDER BY created_at DESC,id DESC LIMIT 7",&[])?;
+    for run in &mut runs {
+        for (source, target) in [("created_at", "started_at"), ("acked_at", "finished_at")] {
+            run[target] = run[source]
+                .as_i64()
+                .map(|at| {
+                    time::OffsetDateTime::from_unix_timestamp(at).map(|at| {
+                        at.format(&time::format_description::well_known::Rfc3339)
+                            .expect("UTC timestamp formats")
+                    })
+                })
+                .transpose()?
+                .map(Value::String)
+                .unwrap_or(Value::Null);
+        }
+        let ack: Value = serde_json::from_str(run["ack_json"].as_str().unwrap_or("{}"))?;
+        run["include_bytes"] = ack
+            .get("fetched_bytes")
+            .cloned()
+            .unwrap_or_else(|| run["estimate_bytes"].clone());
+    }
+    let rates = devices
+        .first()
+        .map(|d| d["rates"].clone())
+        .unwrap_or(Value::Null);
+    let confirmed_at = artifact_store::query(
+        &conn,
+        "SELECT acked_at FROM backup_requests WHERE state='acked' ORDER BY acked_at DESC LIMIT 1",
+        &[],
+    )?
+    .first()
+    .and_then(|r| r["acked_at"].as_i64())
+    .map(time::OffsetDateTime::from_unix_timestamp)
+    .transpose()?
+    .map(|at| at.format(&time::format_description::well_known::Rfc3339))
+    .transpose()?;
+    Ok(
+        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"]}),
+    )
+}

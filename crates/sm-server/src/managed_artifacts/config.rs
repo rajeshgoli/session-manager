@@ -118,6 +118,21 @@ impl ManagedArtifactsConfig {
         {
             bail!("invalid managed_artifacts limits");
         }
+        if self.backup.enabled {
+            super::backup::parse_rate(&self.backup.backup_rate_default)?;
+            if self.backup.outbox_part_bytes == 0
+                || self.backup.ready_ttl_hours == 0
+                || self.backup.ready_ttl_hours > 87600
+                || self.backup.alert_after_missed_nights == 0
+                || self.backup.alert_after_missed_nights > 3650
+                || !self.backup.max_delete_fraction.is_finite()
+                || !(0.0..=1.0).contains(&self.backup.max_delete_fraction)
+                || self.backup.puller_devices.is_empty()
+                || self.roots.is_empty()
+            {
+                bail!("invalid managed_artifacts backup limits or cold store");
+            }
+        }
         let mut paths = std::collections::BTreeSet::new();
         for root in &self.roots {
             let path = fs::canonicalize(expand_home(&root.path))?;
