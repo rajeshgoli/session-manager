@@ -1,6 +1,6 @@
 // Notes page and pane (1821 B3). The same view renders at both widths.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, bus, toast, navigate, openPanel, stored, store } from './ui.js';
+import { html, api, bus, toast, navigate, openPanel, stored, store, clientNav } from './ui.js';
 import { EFFORTS } from './start.js';
 
 const notePath = id => `/notes/${encodeURIComponent(id)}`;
@@ -214,7 +214,7 @@ export function NotesView({ pane = false, onClose, onType }) {
       const version = forceVersion ?? current.current.open?.version;
       if (!version) return false;
       const response = await fetch(notePath(note.id), { method: 'PUT', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ body: text, if_version: version }) });
+        headers: { ...clientNav.headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: text, if_version: version }) });
       const result = await response.json();
       if (response.status === 409) { setConflict(result); setStatus('Conflict'); return false; }
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
@@ -271,7 +271,7 @@ export function NotesView({ pane = false, onClose, onType }) {
     if (await save() === false) { e.target.value = ''; return; }
     const form = new FormData(); form.append('file', picked);
     try {
-      const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', body: form });
+      const response = await fetch('/notes/import', { method: 'POST', credentials: 'same-origin', headers: clientNav.headers(), body: form });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
       changeQuery(''); await search(''); if (result.ids?.[0]) load(result.ids[0]); toast(`Imported ${result.ids.length} notes`);
