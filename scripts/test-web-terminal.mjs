@@ -120,7 +120,11 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
 }
 
 const rows = (page) => page.locator('.sw-row .sw-nm').allInnerTexts();
-const routeShown = (page) => page.locator('.term-route').innerText();
+// The phone bar prints the route; the desktop bar keeps it in the name's tooltip (#2242).
+const routeShown = (page) => page.evaluate(() => document.querySelector('.term-route')?.textContent
+  ?? (document.querySelector('.term-who')?.title || '').split(' · ').slice(-2).join(' · '));
+const routeTimed = (page) => page.waitForFunction(() => /ms$/.test(document.querySelector('.term-route')?.textContent
+  ?? document.querySelector('.term-who')?.title ?? ''));
 
 test('switcher, keys and route at desktop and phone sizes', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -133,11 +137,19 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
           const phone = viewport.width < 900;
           const { context, page, errors } = await open(browser, { viewport, colorScheme, size, touch: phone });
           await page.goto(`${ORIGIN}/terminal/iter8-run`);
-          await page.getByText('Live', { exact: true }).waitFor();
-          await page.waitForFunction(() => /ms$/.test(document.querySelector('.term-route')?.textContent || ''));
+          await page.locator('.term-page[data-connection="Live"]').waitFor();
+          await routeTimed(page);
           assert.match(await routeShown(page), /^Direct · \d+ ms$/);
           // G2: key buttons on phones only.
           assert.equal(await page.locator('.term-keys').count(), phone ? 1 : 0);
+          if (!phone) {
+            // The desktop bar (#2242): who and how full on the left, actions on the right, Retire last;
+            // no Back button and no "Live" while live.
+            assert.deepEqual(await page.locator('.term-bar button').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label') || x.textContent.trim())),
+              ['Notes ⌘J', 'Details', 'Open in Claude', 'Redraw', 'Report a bug', 'Retire']);
+            assert.equal(await page.locator('.term-bar .term-connection').count(), 0);
+            assert.equal(await page.locator('.term-who .t').innerText(), 'iter8-run');
+          }
           if (phone) {
             // G1: hidden by default below 900 px; the edge bar opens it over the terminal.
             assert.equal(await page.locator('.term-switch').count(), 0);
@@ -169,7 +181,7 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
   try {
     const { page, errors, state } = await open(browser, { viewport: { width: 1440, height: 900 } });
     await page.goto(`${ORIGIN}/terminal/sm-reviewer`);
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     // sm-reviewer is the last row: ⌘⌥↓ stays, ⌘⌥↑ goes to the row above and reattaches.
     await page.keyboard.press('Meta+Alt+ArrowDown');
     assert.equal(new URL(page.url()).pathname, '/terminal/sm-reviewer');
@@ -179,7 +191,7 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     assert.ok(await page.evaluate(() => window.sockets[0].sent.some((f) => f.type === 'detach')), 'the old socket detaches');
     assert.equal(await page.evaluate(() => window.sockets[1].sent.find((f) => f.type === 'auth').ticket_id), 't2');
     assert.equal(await page.locator('.sw-row.cur .sw-nm').innerText(), 'iter8-run');
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.keyboard.press('Meta+Alt+ArrowUp');
     await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
     await page.keyboard.press('Meta+Alt+ArrowUp');
@@ -189,7 +201,7 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     // A click on a row switches too, and focus goes back to the terminal.
     await page.locator('.sw-row', { hasText: 'iter8-run' }).click();
     await page.waitForFunction(() => location.pathname === '/terminal/iter8-run');
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.waitForFunction(() => document.activeElement?.classList.contains('xterm-helper-textarea'));
     // The idle section opens and is remembered.
     await page.getByRole('button', { name: /Idle · 3/ }).click();
@@ -236,7 +248,7 @@ test('a burst of window sizes reaches the PTY once, then a one-column nudge repa
   try {
     const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
     await page.goto(`${ORIGIN}/terminal/iter8-run`);
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     const sizes = () => page.evaluate(() => window.sockets[0].sent.filter((f) => f.type === 'resize').map((f) => `${f.cols}x${f.rows}`));
     const [first] = await sizes();
     assert.equal((await sizes()).length, 1, 'one size on attach');
@@ -265,7 +277,7 @@ test('Retire in the bar: a finished agent retires at once and the page moves to 
     const { page, errors, state } = await open(browser, { viewport: { width: 1440, height: 900 } });
     // A working agent asks first; Cancel leaves it alone.
     await page.goto(`${ORIGIN}/terminal/sm-1776`);
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.locator('.term-bar').getByRole('button', { name: 'Retire', exact: true }).click();
     assert.equal((await page.locator('.term-bar .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Cancel');
     assert.equal(await page.locator('.term-bar').evaluate((bar) => bar.scrollHeight <= bar.clientHeight), true, 'the confirmation stays on one line');
@@ -274,7 +286,7 @@ test('Retire in the bar: a finished agent retires at once and the page moves to 
     // The finished, idle agent retires on one click and the terminal moves to the row below it.
     await page.locator('.sw-row', { hasText: 'far-1855' }).click();
     await page.waitForFunction(() => location.pathname === '/terminal/far-1855');
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.locator('.term-bar').getByRole('button', { name: 'Retire', exact: true }).click();
     await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
     assert.deepEqual(state.retired, [{ id: 'far-1855', body: { if_finished_idle: true } }]);
@@ -318,7 +330,7 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
         ? { ...agent, claims: [{ kind: 'ticket', repo: 'owner/repo', number: 2200, title: 'Three issues' }] } : agent);
       await page.route(`${ORIGIN}/claims?**`, (route) => route.fulfill({ json: { claims: [] } }));
       await page.goto(`${ORIGIN}/terminal/sm-1776`);
-      await page.locator('.term-connection', { hasText: 'Live' }).waitFor();
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
       const before = await page.locator('.term-body').boundingBox();
       await page.locator('.term-bar').getByRole('button', { name: 'Details' }).click();
       const panel = page.locator('.term-panel');
@@ -351,7 +363,7 @@ test('Report a bug: typing goes to the dialog, not the terminal', async () => {
   try {
     const { page } = await open(browser, { viewport: { width: 1440, height: 900 } });
     await page.goto(`${ORIGIN}/terminal/sm-1776`);
-    await page.locator('.term-connection', { hasText: 'Live' }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.locator('.term-bar .bug-btn').click();
     const field = page.locator('.board-start-overlay').locator('textarea, input[type="text"], input:not([type])').first();
     await field.waitFor();
@@ -371,7 +383,7 @@ test('route: another server on localhost and a failed direct socket both use Clo
     // The probe answers with another instance (say the MacBook's own server): skipped.
     const other = await open(browser, { viewport: { width: 1440, height: 900 }, instance: 'macbook' });
     await other.page.goto(`${ORIGIN}/terminal/iter8-run`);
-    await other.page.waitForFunction(() => /ms$/.test(document.querySelector('.term-route')?.textContent || ''));
+    await routeTimed(other.page);
     assert.match(await routeShown(other.page), /^Cloudflare · \d+ ms$/);
     assert.deepEqual(await other.page.evaluate(() => window.sockets.map((s) => s.url)), ['wss://sm.example.com/client/terminal']);
     assert.equal(other.state.tickets, 1);
@@ -379,7 +391,7 @@ test('route: another server on localhost and a failed direct socket both use Clo
     // The probe matches but the direct socket closes before attaching: a new ticket, through Cloudflare.
     const failed = await open(browser, { viewport: { width: 1440, height: 900 }, failDirect: true });
     await failed.page.goto(`${ORIGIN}/terminal/iter8-run`);
-    await failed.page.getByText('Live', { exact: true }).waitFor();
+    await failed.page.locator('.term-page[data-connection="Live"]').waitFor();
     assert.deepEqual(await failed.page.evaluate(() => window.sockets.map((s) => s.url)),
       ['ws://localhost:8420/client/terminal', 'wss://sm.example.com/client/terminal']);
     assert.equal(failed.state.tickets, 2);
@@ -402,7 +414,7 @@ test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse 
       window.open = (url, target, features) => { window.opened.push([url, target, features]); return null; };
     });
     await page.goto(`${ORIGIN}/terminal/iter8-run`);
-    await page.getByText('Live', { exact: true }).waitFor();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.locator('.xterm-rows', { hasText: 'the memo' }).waitFor();
     const cell = await page.evaluate(() => {
       const rows = document.querySelector('.xterm-rows').getBoundingClientRect();

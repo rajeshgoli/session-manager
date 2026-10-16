@@ -71,10 +71,10 @@ const narrow = () => window.innerWidth < 900;
 // Key buttons only where there is no keyboard to send them (G2).
 const touchKeys = () => window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 720;
 
-function useTouchKeys() {
-  const [on, setOn] = useState(touchKeys);
+function useWidth(test) {
+  const [on, setOn] = useState(test);
   useEffect(() => {
-    const update = () => setOn(touchKeys());
+    const update = () => setOn(test());
     window.addEventListener('resize', update);
     return () => window.removeEventListener('resize', update);
   }, []);
@@ -116,7 +116,9 @@ export function TerminalPage({ id, open }) {
   const [route, setRoute] = useState({ label: '', samples: [] });
   const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
   const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
-  const showKeys = useTouchKeys();
+  const showKeys = useWidth(touchKeys);
+  // Touch screens keep the phone bar and its keys, even a tablet held wide.
+  const wide = !useWidth(narrow) && !showKeys;
   const [doc, , reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
   const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
@@ -354,11 +356,38 @@ export function TerminalPage({ id, open }) {
     };
   }, [id, attempt]);
 
-  return html`<div class="term-page">
-    <div class="term-bar" onClick=${refocus}>
+  const linked = agent?.remote_control?.url?.startsWith('https://claude.ai/code/');
+  const live = connection === 'Live';
+  const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
+  const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
+  const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
+  // Desktop (#2242): who and how full on the left; connection words only when not live,
+  // with the route in the dot's tooltip; actions on the right, Retire last.
+  const desktopBar = () => html`<div class="term-bar wide" onClick=${refocus}>
+      <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
+      <span class="term-who" title=${[agent?.state, connection, live && route.label ? routeText(route.label, route.samples) : ''].filter(Boolean).join(' · ')}>
+        <i class=${`sw-dot ${SECTION_TONE[agent?.attention?.section] || 'muted'}`}></i>
+        <span class="t">${agent ? agent.name : id}</span>
+        ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
+      </span>
+      ${live ? null : html`<span class="term-connection" role="status">${connection}</span>`}
+      <span class="sp"></span>
+      ${notes}${details}
+      <span class="term-icons">
+        ${linked ? html`<button type="button" class="icon-btn" title="Open in Claude" aria-label="Open in Claude"
+          onClick=${() => openInClaude(agent)}><${Icon} name="external" /></button>` : null}
+        <button type="button" class="icon-btn" disabled=${!live} title="Redraw the agent's screen" aria-label="Redraw"
+          onClick=${() => control.current?.redraw()}><${Icon} name="redraw" /></button>
+        <${BugButton} page="Terminal" />
+      </span>
+      ${retire}
+    </div>`;
+
+  return html`<div class="term-page" data-connection=${connection}>
+    ${wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
-      <button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>
+      ${notes}
       ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
       <span class="t">${agent ? agent.name : id}</span><span class="sub term-state">${agent ? agent.state : ''}</span>
       <span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>
@@ -368,13 +397,13 @@ export function TerminalPage({ id, open }) {
         onClick=${() => control.current?.key(key)}>${label}</button>`)}
         <button type="button" class="btn sm" disabled=${connection !== 'Live'} onClick=${() => control.current?.model()}>/model</button></span>` : null}
       <span class="sp"></span>
-      ${agent?.remote_control?.url?.startsWith('https://claude.ai/code/') ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
-      ${agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null}
+      ${linked ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
+      ${retire}
       <${BugButton} page="Terminal" />
-      <button type="button" class="btn sm" disabled=${connection !== 'Live'} title="Repaint the agent's screen"
+      <button type="button" class="btn sm" disabled=${!live} title="Repaint the agent's screen"
         onClick=${() => control.current?.redraw()}>Redraw</button>
-      <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
-    </div>
+      ${details}
+    </div>`}
     <div class=${`term-main${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
       <div class="term-side">
         ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}

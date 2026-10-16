@@ -565,6 +565,7 @@ const ICONS = {
   wide: '<path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9"/>',
   narrow: '<path d="M13.5 6.5h-4v-4M2.5 9.5h4v4M9.5 6.5l4-4M6.5 9.5l-4 4"/>',
   back: '<path d="M13 8H3M7 4 3 8l4 4"/>',
+  redraw: '<path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3"/>',
   external: '<path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/>',
   terminal: '<rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/>',
   more: '<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>',

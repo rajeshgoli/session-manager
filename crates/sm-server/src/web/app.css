@@ -330,6 +330,10 @@ button.sw-sec { cursor: pointer; }
 .sw-fact.muted { color: var(--ink-2); }
 .term-route { white-space: nowrap; font-size: .9rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .term-bar .icon-btn.on { color: var(--accent); }
+.term-bar.wide .sp { flex: 1; }
+.term-who { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.term-icons { display: flex; align-items: center; gap: 2px; }
+.term-bar.wide .term-connection { color: var(--amber); }
 .term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-keys { display: flex; gap: 4px; white-space: nowrap; }
 .term-connection { white-space: nowrap; font-size: .9rem; }
