@@ -33,6 +33,11 @@ curl_args=(
   --form-string "release_notes=$RELEASE_NOTES"
 )
 
+# The auto PM's weekly app-update cap counts deploys by the agent's session.
+if [[ -n "${CLAUDE_SESSION_MANAGER_ID:-}" ]]; then
+  curl_args+=(-H "x-sm-session-id: $CLAUDE_SESSION_MANAGER_ID")
+fi
+
 if [[ -n "$VERSION_CODE" ]]; then
   curl_args+=(-F "version_code=$VERSION_CODE")
 fi

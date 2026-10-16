@@ -356,6 +356,7 @@ mod analytics;
 mod artifacts;
 mod ask;
 mod auto_retire;
+mod autopm;
 mod board;
 mod board_clock;
 mod board_launch;
@@ -726,6 +727,12 @@ pub struct AppState {
     /// Terminal attach limits in force; `PUT /client/settings` changes them
     /// and the next attach reads them (sm#1763).
     terminal_limits: Arc<std::sync::RwLock<crate::owner_settings::TerminalLimits>>,
+    /// Auto PM switches, read live (sm#2174, spec 2170 B.1).
+    autopm_switches: Arc<crate::autopm::switches::Switches>,
+    /// The health guard's in-memory counts since the last minute (B.4).
+    autopm_counters: Arc<crate::autopm::guard::Counters>,
+    /// GitHub for the auto PM's gates.
+    autopm_git: Arc<dyn crate::autopm::experiments::Git>,
 }
 
 impl AppState {
@@ -853,6 +860,17 @@ impl AppState {
         let terminal_limits = Arc::new(std::sync::RwLock::new(
             crate::owner_settings::terminal_limits(&config, &settings),
         ));
+        let autopm_switches = Arc::new(crate::autopm::switches::Switches::new(
+            crate::autopm::Settings::from_owner(&settings).enabled,
+        ));
+        if let Ok(Some(conn)) = crate::autopm::open_read_only(&expand_home(&config.sm_send.db_path))
+        {
+            if let Err(error) = autopm_switches.reload(&conn) {
+                if !error.to_string().contains("no such table") {
+                    eprintln!("autopm switches unreadable: {error:#}");
+                }
+            }
+        }
         let gateway_directory = test_isolation_root_from_environment()?
             .map(|root| root.join("local-egress"))
             .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
@@ -910,7 +928,15 @@ impl AppState {
             push_sender,
             queue_admission,
             terminal_limits,
+            autopm_switches,
+            autopm_counters: Arc::new(crate::autopm::guard::Counters::default()),
+            autopm_git: Arc::new(autopm::GhGit),
         })
+    }
+
+    pub fn with_autopm_git(mut self, git: Arc<dyn crate::autopm::experiments::Git>) -> Self {
+        self.autopm_git = git;
+        self
     }
 
     pub fn with_shutdown(mut self, shutdown: crate::handover::Shutdown) -> Self {
@@ -1845,6 +1871,10 @@ pub fn router(state: AppState) -> Router {
     }
     handoff::spawn_handoff_sweeper(state.clone());
     owner_events::spawn_prune(state.clone());
+    crate::autopm::switches::install(state.autopm_switches.clone());
+    if state.config.rust_core.runtime_enabled {
+        autopm::spawn_ticker(state.clone());
+    }
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -2321,6 +2351,22 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/client/sessions/{session_id}", get(get_client_session))
         .route("/autopm/events", get(owner_events::list_events))
+        .route("/autopm/switches", get(autopm::list_switches))
+        .route("/autopm/switches/{key}", put(autopm::put_switch))
+        .route(
+            "/autopm/experiments",
+            get(autopm::list_experiments).post(autopm::create_experiment),
+        )
+        .route(
+            "/autopm/experiments/{id}",
+            get(autopm::get_experiment).patch(autopm::patch_experiment),
+        )
+        .route(
+            "/autopm/experiments/{id}/live",
+            post(autopm::experiment_live),
+        )
+        .route("/autopm/budget", get(autopm::get_budget))
+        .route("/client/autopm/feedback", post(autopm::feedback))
         .fallback(not_found);
     if inbound_email_alias != DEFAULT_EMAIL_WEBHOOK_PATH {
         app = app.route(&inbound_email_alias, post(inbound_email_webhook));
@@ -2329,6 +2375,14 @@ pub fn router(state: AppState) -> Router {
         APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
     ))
     .layer(axum::middleware::map_response(stamp_build))
+    .layer(axum::middleware::map_response_with_state(
+        state.clone(),
+        autopm::stamp_switches,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        autopm::count_errors,
+    ))
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         mark_in_app,
@@ -3163,11 +3217,13 @@ async fn client_bootstrap(
         CloudflareAccessApplication::MobileApp,
     )?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
-    Ok(Json(client_bootstrap_response(
+    let mut response = client_bootstrap_response(
         &state.config,
         mobile_terminal_runtime_disabled(&state),
         state.studio_ssh_enabled.load(Ordering::SeqCst),
-    )))
+    );
+    response.switches = state.autopm_switches.effective();
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -3762,6 +3818,14 @@ async fn deploy_app_artifact(
             login_url: None,
         });
     };
+    let autopm_ticket = {
+        let state = state.clone();
+        let app_name = app_name.clone();
+        let headers = headers.clone();
+        tokio::task::spawn_blocking(move || autopm::app_deploy_cap(&state, &app_name, &headers))
+            .await
+            .map_err(|error| ApiError::Internal(error.into()))??
+    };
 
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut version_code: Option<i64> = None;
@@ -3837,6 +3901,7 @@ async fn deploy_app_artifact(
     }
 
     let root = expand_home(&state.config.app_artifacts.root_dir);
+    let stored_version_name = version_name.clone();
     let stored = store_artifact(
         &root,
         &app_name,
@@ -3850,6 +3915,14 @@ async fn deploy_app_artifact(
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail: format!("Failed to store artifact: {error}"),
     })?;
+    if let Some(ticket) = autopm_ticket {
+        autopm::record_app_deploy(
+            &state,
+            ticket,
+            &stored.artifact_hash,
+            stored_version_name.as_deref(),
+        );
+    }
     Ok(Json(AppArtifactDeployResponse {
         ok: true,
         app: app_name.clone(),
@@ -5413,8 +5486,13 @@ async fn create_review_request_core(
             &registration.id,
         )?
         .unwrap_or(registration.clone());
-        if review_runs::current_step(&initialized).map_err(anyhow::Error::msg)?["kind"]
-            == "github_codex"
+        let first_step = review_runs::current_step(&initialized).map_err(anyhow::Error::msg)?;
+        // An autopm review the budget holds or skips starts from the watcher.
+        if first_step["kind"] == "github_codex"
+            && autopm_review_gate(&state, &initialized, &first_step)
+                .await
+                .map_err(anyhow::Error::msg)?
+                == crate::autopm::budget::ReviewGate::Proceed
         {
             review_runs::start_github(&state, &queue_db_path, &initialized)
                 .await
@@ -5976,6 +6054,18 @@ fn push_review_notice(state: &AppState, kind: &str, title: &str, body: &str, rea
 }
 
 /// One poll of a durable review chain, including any late GitHub result.
+/// The auto PM's review budget rules for one step (spec 2170 C.4).
+async fn autopm_review_gate(
+    state: &Arc<AppState>,
+    request: &CodexReviewRequestRegistration,
+    step: &Value,
+) -> Result<crate::autopm::budget::ReviewGate, String> {
+    let (state, request, step) = (state.clone(), request.clone(), step.clone());
+    tokio::task::spawn_blocking(move || autopm::review_gate(&state, &request, &step))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn poll_github_review_step(
     state: &Arc<AppState>,
     db_path: &StdPath,
@@ -6054,6 +6144,14 @@ async fn poll_github_review_step(
         }
     }
     let step = review_runs::current_step(request)?;
+    match autopm_review_gate(state, request, &step).await? {
+        crate::autopm::budget::ReviewGate::Proceed => {}
+        crate::autopm::budget::ReviewGate::Skip(reason) => {
+            finish_github_review_step(state, db_path, request, &reason, &now)?;
+            return Ok(true);
+        }
+        crate::autopm::budget::ReviewGate::Wait(_) => return Ok(false),
+    }
     if step["kind"] == "paired" {
         return review_paired::poll(state, db_path, request, &step).await;
     }
@@ -13067,6 +13165,7 @@ fn client_bootstrap_response(
             },
             termux_package: "com.termux",
         },
+        switches: BTreeMap::new(),
     }
 }
 
@@ -17601,6 +17700,8 @@ struct ClientBootstrapResponse {
     auth: BootstrapAuth,
     external_access: BootstrapExternalAccess,
     session_open_defaults: SessionOpenDefaults,
+    /// Auto PM switches as `{key: on}` (spec 2170 B.1).
+    switches: BTreeMap<String, bool>,
 }
 
 #[derive(Serialize)]
@@ -20699,7 +20800,7 @@ mod tests {
         router(state)
     }
 
-    async fn browser_host_get(
+    pub(super) async fn browser_host_get(
         app: &Router,
         uri: &str,
         assertion: Option<&str>,
@@ -21021,7 +21122,7 @@ mod tests {
         request
     }
 
-    async fn response_json(response: Response) -> (StatusCode, Value) {
+    pub(super) async fn response_json(response: Response) -> (StatusCode, Value) {
         let status = response.status();
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
@@ -25489,7 +25590,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert!(!codex_comment_is_bound(&stale_abbreviated, head, Some(77)));
     }
 
-    fn handoff_json_request(
+    pub(super) fn handoff_json_request(
         mut request: axum::http::Request<Body>,
         headers: &[(&str, &str)],
     ) -> axum::http::Request<Body> {

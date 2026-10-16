@@ -11408,6 +11408,11 @@ fn deliver_runtime_text_to_session_with_ready_fence_raw(
         }
         (status, delivered, !delivered && mark_stopped_on_failure)
     };
+    if !delivered {
+        // A delivery that was attempted and failed counts toward the auto PM's
+        // health guard (sm#2174, spec 2170 B.4).
+        crate::autopm::guard::record_delivery_failure();
+    }
     if terminal_delivery_failure {
         finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
         let sessions = ensure_sessions_array_mut(state)?;
@@ -11477,6 +11482,11 @@ fn deliver_urgent_runtime_text_to_session_raw(
         }
         (status, delivered, !delivered && mark_stopped_on_failure)
     };
+    if !delivered {
+        // A delivery that was attempted and failed counts toward the auto PM's
+        // health guard (sm#2174, spec 2170 B.4).
+        crate::autopm::guard::record_delivery_failure();
+    }
     if terminal_delivery_failure {
         finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
         let sessions = ensure_sessions_array_mut(state)?;

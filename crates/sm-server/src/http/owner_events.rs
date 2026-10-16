@@ -51,7 +51,7 @@ fn is_owner_device(state: &AppState, device: &str) -> bool {
 
 /// The surface and device of a request carrying owner auth (A.2), or `None`
 /// for agents, loopback without owner auth, and everyone else.
-fn owner_surface(
+pub(super) fn owner_surface(
     state: &AppState,
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
@@ -108,7 +108,7 @@ fn owner_surface(
         .map(|_| ("web", None))
 }
 
-fn from_agent(headers: &HeaderMap) -> bool {
+pub(super) fn from_agent(headers: &HeaderMap) -> bool {
     crate::local_identity::current().is_some()
         || [handoff::SESSION_HEADER, "x-sm-session-id"]
             .into_iter()
