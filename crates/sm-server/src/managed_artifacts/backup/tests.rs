@@ -1061,3 +1061,82 @@ fn failed_seed_rolls_back_files_already_replaced() {
         0
     );
 }
+
+#[test]
+fn failed_weekly_integrity_check_never_confirms_and_blocks_unrepaired_retry() {
+    use super::{
+        client::Destination,
+        pull::{self, Remote},
+    };
+    struct Fake {
+        transfer: outbox::TransferManifest,
+        ack: Option<lifecycle::Ack>,
+        requests: usize,
+    }
+    impl Remote for Fake {
+        fn json(
+            &mut self,
+            _: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            if path.ends_with("/ack") {
+                self.ack = Some(serde_json::from_value(body.unwrap())?);
+                return Ok((200, serde_json::json!({})));
+            }
+            self.requests += 1;
+            Ok((
+                200,
+                serde_json::json!({"id":"weekly","state":"ready","estimate_bytes":0,"parts":[],"manifest":self.transfer,"deletions":[],"allow_deletes":false,"max_delete_fraction":0.1}),
+            ))
+        }
+        fn download(
+            &mut self,
+            _: &str,
+            _: &Part,
+            _: u64,
+            _: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            panic!("empty delta")
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"original").unwrap();
+    let first = f.prepare("confirmed", None);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("confirmed", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("confirmed", &first.transfer, &staging, true, 1.0)
+        .unwrap();
+    dest.confirm("confirmed").unwrap();
+    fs::write(dest.root.join("plain/data/prices"), b"damaged").unwrap();
+    let next = f.prepare("weekly", Some(&first.manifest));
+    let mut fake = Fake {
+        transfer: next.transfer,
+        ack: None,
+        requests: 0,
+    };
+    assert!(pull::pull_with_check(&mut dest, &mut fake, true).is_err());
+    let ack = fake.ack.as_ref().unwrap();
+    assert!(!ack.applied);
+    assert!(!ack.check.as_ref().unwrap().ok);
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some("confirmed")
+    );
+    assert!(dest.meta("pending_request").unwrap().is_none());
+    let requests = fake.requests;
+    assert!(pull::pull_with_check(&mut dest, &mut fake, false).is_err());
+    assert_eq!(fake.requests, requests);
+    fs::write(dest.root.join("plain/data/prices"), b"original").unwrap();
+    assert!(
+        pull::pull_with_check(&mut dest, &mut fake, true)
+            .unwrap()
+            .applied
+    );
+    assert_eq!(dest.state().unwrap().confirmed.as_deref(), Some("weekly"));
+}

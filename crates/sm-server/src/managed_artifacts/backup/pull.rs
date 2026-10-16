@@ -39,12 +39,18 @@ fn clear_pending(dest: &Destination) -> Result<()> {
     )?;
     Ok(())
 }
-fn finish(dest: &Destination, remote: &mut impl Remote, id: &str, ack: &Ack) -> Result<()> {
+fn finish(dest: &mut Destination, remote: &mut impl Remote, id: &str, ack: &Ack) -> Result<()> {
     successful(remote.json(
         "POST",
         &format!("/backup/requests/{id}/ack"),
         Some(serde_json::to_value(ack)?),
     )?)?;
+    if !ack.applied {
+        dest.rollback(id)?;
+        cleanup_staging(dest, id)?;
+        clear_pending(dest)?;
+        bail!("backup integrity check failed; repair the reported files or reseed the destination");
+    }
     complete_local(dest, id)
 }
 fn complete_local(dest: &Destination, id: &str) -> Result<()> {
@@ -68,6 +74,15 @@ fn cleanup_staging(dest: &Destination, id: &str) -> Result<()> {
     Ok(())
 }
 pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
+    let local =
+        time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    pull_with_check(dest, remote, local.weekday() == time::Weekday::Sunday)
+}
+pub(super) fn pull_with_check(
+    dest: &mut Destination,
+    remote: &mut impl Remote,
+    sunday: bool,
+) -> Result<Ack> {
     let deadline = Instant::now() + Duration::from_secs(3 * 3600);
     let pending = dest.meta("pending_request")?.filter(|s| !s.is_empty());
     let mut status = if let Some(id) = pending {
@@ -184,7 +199,6 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
     let apply_seconds = apply.elapsed().as_secs_f64().max(0.001);
     let local =
         time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let sunday = local.weekday() == time::Weekday::Sunday;
     let week = local.date().to_string();
     let check = if sunday && dest.meta("checked_sunday")?.as_deref() != Some(&week) {
         Some(dest.check()?)
@@ -195,25 +209,41 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         remote.probe()?;
         dest.set_meta("probed_sunday", &week)?;
     }
+    let healthy = check.as_ref().is_none_or(|check| check.ok);
+    if let Some(check) = check.as_ref().filter(|check| !check.ok) {
+        dest.set_meta("integrity_bad", &serde_json::to_string(&check.bad)?)?;
+    }
     let ack = Ack {
-        applied: true,
+        applied: healthy,
         fetched_bytes: fetched,
         fetch_seconds,
         apply_seconds,
         held_deletions: applied.held_deletions,
         check,
-        error: None,
+        error: (!healthy).then(|| "destination integrity check failed".into()),
     };
     // Persist the exact ack before sending it: a lost response can be retried
     // without changing timings, rechecking different files, or moving history.
     dest.set_meta("pending_ack", &serde_json::to_string(&ack)?)?;
-    if ack.check.is_some() {
+    if healthy && ack.check.is_some() {
         dest.set_meta("checked_sunday", &week)?;
     }
     finish(dest, remote, id, &ack)?;
     Ok(ack)
 }
 fn new_request(dest: &Destination, remote: &mut impl Remote) -> Result<RequestStatus> {
+    if let Some(body) = dest.meta("integrity_bad")? {
+        let paths: Vec<String> = serde_json::from_str(&body)?;
+        let records = dest.records()?;
+        for path in paths {
+            if let Some(record) = records.get(&path) {
+                super::client::verify(&dest.root.join(&path), record)
+                    .with_context(|| format!("backup integrity failure remains at {path}; repair or reseed before pulling"))?;
+            }
+        }
+        dest.conn
+            .execute("DELETE FROM metadata WHERE key='integrity_bad'", [])?;
+    }
     let (code, body) = remote.json(
         "POST",
         "/backup/requests",
