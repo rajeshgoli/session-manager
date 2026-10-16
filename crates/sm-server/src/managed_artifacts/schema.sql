@@ -81,3 +81,15 @@ CREATE TABLE IF NOT EXISTS artifact_operations (
  actor TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, error TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS artifact_operation_active
  ON artifact_operations(root,set_id) WHERE phase NOT IN ('done','failed');
+
+-- Backup candidates are immutable; only acknowledgement moves the device head.
+CREATE TABLE IF NOT EXISTS backup_manifests (
+ device TEXT NOT NULL, manifest_id TEXT NOT NULL, created_at TEXT NOT NULL,
+ acked_at TEXT, body BLOB NOT NULL, PRIMARY KEY(device,manifest_id));
+CREATE TABLE IF NOT EXISTS backup_confirmed (
+ device TEXT PRIMARY KEY, manifest_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backup_rate_samples (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, device TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('fetch','apply','probe')),
+ bytes INTEGER NOT NULL CHECK(bytes>0), seconds REAL NOT NULL CHECK(seconds>0));
+CREATE INDEX IF NOT EXISTS backup_rate_window ON backup_rate_samples(device,kind,id);
