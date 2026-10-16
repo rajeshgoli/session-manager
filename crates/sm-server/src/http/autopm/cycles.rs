@@ -140,6 +140,11 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
         return Ok(true);
     }
     if super::super::messages::restores(&session) {
+        let Some(session) = super::super::auto_retire::ready_for_message(state, session) else {
+            return Ok(false);
+        };
+        state.session_store.authorize_autopm_seat(&session.id)?;
+        store(state).record_seat(&session.id, autopm::now_ms())?;
         once(state, &key, &id, &brief)?;
         return Ok(true);
     }
@@ -583,6 +588,32 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1);
         }
+    }
+
+    #[test]
+    fn durable_brief_authorizes_a_restored_cycle_seat_before_delivery() {
+        let state = role_state();
+        prepare(&state, 3001, "pm", "register autopm").unwrap();
+        state
+            .session_store
+            .update_owner_settings(&json!({"autopm":{"enabled":true}}), |_| Ok(Ok(())))
+            .unwrap()
+            .unwrap();
+        retire_pm(&state);
+        assert!(deliver(&state, 3001).unwrap());
+        assert!(state.session_store.is_authorized_autopm_seat("pm").unwrap());
+        assert_eq!(
+            store(&state)
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM message_queue WHERE id='autopm-brief-pm'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
