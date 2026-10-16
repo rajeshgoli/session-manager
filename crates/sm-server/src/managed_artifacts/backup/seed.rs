@@ -28,7 +28,7 @@ struct AdoptionMove(Option<(PathBuf, PathBuf)>);
 impl Drop for AdoptionMove {
     fn drop(&mut self) {
         if let Some((source, target)) = &self.0 {
-            if let Err(error) = fs::rename(target, source) {
+            if let Err(error) = restore_adoption(source, target) {
                 eprintln!(
                     "could not return adopted folder {}: {error}",
                     source.display()
@@ -36,6 +36,21 @@ impl Drop for AdoptionMove {
             }
         }
     }
+}
+fn sync_adoption(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_ADOPTION_SYNC.get() {
+        anyhow::bail!("injected adoption directory sync failure");
+    }
+    crate::managed_artifacts::ops::sync_rename_parents(from, to)
+}
+fn restore_adoption(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() && !source.exists() {
+        fs::rename(target, source)?;
+    }
+    // A previous attempt may have renamed successfully but failed to sync.
+    // Retry both parents before allowing recovery to discard the journal.
+    sync_adoption(target, source)
 }
 #[derive(Serialize, Deserialize)]
 struct Journal {
@@ -45,6 +60,8 @@ struct Journal {
 }
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_AFTER_SOURCE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_ADOPTION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 fn pending(dest: &Destination) -> Result<Option<Journal>> {
     dest.meta("pending_seed")?
         .map(|body| serde_json::from_str(&body).map_err(Into::into))
@@ -75,9 +92,7 @@ fn resolve(dest: &mut Destination, journal: &Journal, committed: bool) -> Result
     } else {
         dest.rollback(&journal.id)?;
         if let Some((source, target)) = &journal.adoption {
-            if target.exists() && !source.exists() {
-                fs::rename(target, source)?;
-            }
+            restore_adoption(source, target)?;
         }
     }
     let incoming = dest.root.join(".incoming").join(&journal.id);
@@ -290,7 +305,8 @@ pub(super) fn seed_inner(
             dest.set_meta("pending_seed", &serde_json::to_string(&journal)?)?;
             fs::rename(&source, &target)
                 .context("adopt-plain must be on the destination filesystem")?;
-            adoption_move.0 = Some((source, target));
+            adoption_move.0 = Some((source.clone(), target.clone()));
+            sync_adoption(&source, &target)?;
         } else {
             ensure!(target.is_dir(), "adoption source is missing");
         }

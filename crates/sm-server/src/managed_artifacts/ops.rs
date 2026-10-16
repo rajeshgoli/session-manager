@@ -51,6 +51,9 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
         to.display()
     );
     fs::rename(from, to)?;
+    sync_rename_parents(from, to)
+}
+pub(super) fn sync_rename_parents(from: &Path, to: &Path) -> Result<()> {
     sync_dir(to.parent().context("destination parent")?)?;
     if from.parent() != to.parent() {
         sync_dir(from.parent().context("source parent")?)?;
