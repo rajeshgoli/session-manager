@@ -56,15 +56,19 @@ impl ManagedArtifacts {
         actor: &str,
         reason: &str,
     ) -> Result<Value> {
-        self.delete_inner(root, name, actor, reason, false, false)
+        self.delete_inner(root, name, actor, reason, false, false, false)
+    }
+    /// HTTP callers must authenticate the owner before using this override.
+    pub fn delete_owner(&self, root: &ArtifactRoot, name: &str, actor: &str) -> Result<Value> {
+        self.delete_inner(root, name, actor, "owner", false, false, true)
     }
     /// Called only after the owning session has ended. Rechecks age and use
     /// under the same write transaction as an explicit deletion.
     pub fn delete_orphan(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
-        self.delete_inner(root, name, "sm", "orphan", true, false)
+        self.delete_inner(root, name, "sm", "orphan", true, false, false)
     }
     pub fn delete_pressure(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
-        self.delete_inner(root, name, "sm", "pressure", true, false)
+        self.delete_inner(root, name, "sm", "pressure", true, false, false)
     }
     pub fn recover_deletions(&self, root: &ArtifactRoot) -> Result<()> {
         for a in self.store.list(&root.path)? {
@@ -78,11 +82,13 @@ impl ManagedArtifacts {
                         .unwrap_or("interrupted deletion"),
                     false,
                     true,
+                    a["delete_reason"] == "owner",
                 );
             }
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)] // Authority and recovery are separate from the caller's reason.
     fn delete_inner(
         &self,
         root: &ArtifactRoot,
@@ -91,6 +97,7 @@ impl ManagedArtifacts {
         reason: &str,
         automatic: bool,
         recovering: bool,
+        owner: bool,
     ) -> Result<Value> {
         validate_name(name)?;
         if reason.trim().is_empty() {
@@ -131,16 +138,16 @@ impl ManagedArtifacts {
             {
                 bail!("cold store is not connected");
             }
-            if member["project"] == 1 {
+            if !owner && member["project"] == 1 {
                 bail!("{n} is kept for the project; remove the mark first");
             }
             ensure_not_in_use(&tx, &root.path, n)?;
             let dependents=store::query(&tx,"SELECT DISTINCT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
-            if !dependents.is_empty() {
+            if !owner && !dependents.is_empty() {
                 bail!("{n} is an input of {}", json!(dependents));
             }
             let failed=store::query(&tx,"SELECT at FROM artifact_events WHERE root=?1 AND name=?2 AND kind='op_failed' AND at>=?3",&[&root.path,&n,&format!("{}T00:00:00Z",OffsetDateTime::now_utc().date())])?;
-            if !failed.is_empty() {
+            if !owner && !failed.is_empty() {
                 bail!("{n} deletion failed today; inspect the failure before retrying tomorrow");
             }
         }
@@ -163,7 +170,7 @@ impl ManagedArtifacts {
             return Ok(result);
         }
         for member in &members {
-            tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if pressure {"pressure"} else if automatic {"orphan"} else {"agent"},recovering])?;
+            tx.execute("UPDATE artifacts SET op='deleting',deleted_by=?3,delete_reason=COALESCE(CASE WHEN ?5 THEN delete_reason END,?4) WHERE root=?1 AND name=?2",params![root.path,member["name"].as_str().unwrap(),actor,if owner {"owner"} else if pressure {"pressure"} else if automatic {"orphan"} else {"agent"},recovering])?;
         }
         tx.commit()?;
         #[cfg(test)]
@@ -190,12 +197,12 @@ impl ManagedArtifacts {
                 if member["op"] != "deleting" || member["state"] == "deleted" {
                     bail!("{n} deletion state changed");
                 }
-                if member["project"] == 1 {
+                if !owner && member["project"] == 1 {
                     bail!("{n} is kept for the project; remove the mark first");
                 }
                 ensure_not_in_use(&tx, &root.path, n)?;
                 let dependents = store::query(&tx,"SELECT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
-                if !dependents.is_empty() {
+                if !owner && !dependents.is_empty() {
                     bail!("{n} is an input of {}", json!(dependents));
                 }
             }

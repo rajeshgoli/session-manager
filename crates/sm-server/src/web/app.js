@@ -14,6 +14,7 @@ import { HistoryPage } from './history.js';
 import { GuestbookPage } from './guestbook.js';
 import { AgentsPage } from './agents.js';
 import { QueuePage } from './queue.js';
+import { ArtifactsPage } from './artifacts.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
@@ -27,6 +28,7 @@ const PAGES = [
   { key: 'agents', label: 'Agents', icon: 'agents', path: '/', key_hint: 'a' },
   { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
+  { key: 'artifacts', label: 'Artifacts', icon: 'history', path: '/artifacts' },
   { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
   { key: 'notes', label: 'Notes', icon: 'history', path: '/notes', key_hint: 'n' },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
@@ -238,6 +240,7 @@ function useDetailsBand(openRef, page) {
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
   if (page === 'queue') return html`<${QueuePage} />`;
+  if (page === 'artifacts') return html`<${ArtifactsPage} />`;
   if (page === 'analytics') return html`<${AnalyticsPage} path=${loc.path} />`;
   if (page === 'settings') return html`<${SettingsPage} />`;
   if (page === 'board') return html`<${BoardPage} />`;
@@ -256,6 +259,8 @@ function Page({ page, loc }) {
 
 /** The rail's badges, polled every 30 s (D2), shared with pages that need them. */
 function useRailData() {
+  const [, , reloadArtifacts] = usePoll(async () => setShared('artifacts', await api('/artifacts')), 60000, [], { background: true });
+  useEffect(() => bus.on('artifacts-changed', reloadArtifacts), [reloadArtifacts]);
   // The rail's counters are the shell's own reads, never the owner's (spec 2170 A.5).
   const [, , reloadQueue] = usePoll(async () => setShared('queue', await api('/client/queue')), 30000, [], { background: true });
   useEffect(() => bus.on('queue-changed', reloadQueue), [reloadQueue]);
@@ -280,6 +285,8 @@ function Rail({ page, layout, updateLayout }) {
   const inbox = useShared('inbox');
   const board = useShared('board_badge');
   const counts = badges(queue, inbox, board);
+  const artifacts = useShared('artifacts');
+  counts.artifacts = { count: artifacts?.needs_you_count || 0, tone: 'magenta' };
   const folded = layout.rail === 'folded';
   const item = (p) => {
     const badge = counts[p.key];

@@ -64,6 +64,43 @@ impl Fixture {
     }
 }
 #[test]
+fn owner_delete_preserves_recipes_reports_dependents_and_refuses_in_use() {
+    let f = Fixture::new();
+    f.create("input");
+    f.create("output");
+    let conn = f.svc.store.open().unwrap();
+    conn.execute("UPDATE artifacts SET project=1 WHERE name='input'", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE artifacts SET recipe_complete=1 WHERE name='output'",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO artifact_inputs(root,name,input,source,job_id) VALUES(?1,'output','input','declared','job')", [&f.root.path]).unwrap();
+    conn.execute(
+        "INSERT INTO artifact_signals(root,name,kind,evidence) VALUES(?1,'input','in_use','job')",
+        [&f.root.path],
+    )
+    .unwrap();
+    assert!(f
+        .svc
+        .delete_owner(&f.root, "input", "owner@example.com")
+        .is_err());
+    conn.execute("DELETE FROM artifact_signals", []).unwrap();
+    assert!(f.svc.delete(&f.root, "input", "maker", "owner").is_err());
+    let result = f
+        .svc
+        .delete_owner(&f.root, "input", "owner@example.com")
+        .unwrap();
+    assert_eq!(result["dependents"][0]["name"], "output");
+    assert!(!f.path("input").exists());
+    let output = f.svc.store.detail(&f.root.path, "output").unwrap();
+    assert_eq!(output["recipe_complete"], 1);
+    assert_eq!(output["rebuildable"], false);
+    assert_eq!(result["delete_reason"], "owner");
+}
+
+#[test]
 fn names_and_notes() {
     for name in ["a", "123_data", "a.b-c_9"] {
         validate_name(name).unwrap();

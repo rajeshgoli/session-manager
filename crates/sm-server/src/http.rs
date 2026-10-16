@@ -2038,6 +2038,10 @@ pub fn router(state: AppState) -> Router {
         .route("/merge-holds/release", post(merge_holds::release))
         .route("/artifacts", get(artifacts::list).post(artifacts::create))
         .route("/artifacts/{name}", get(artifacts::show))
+        .route(
+            "/artifacts/{name}/owner-action",
+            post(artifacts::owner_action),
+        )
         .route("/artifacts/{name}/{action}", post(artifacts::action))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/board", get(board::get_board))
@@ -4761,6 +4765,14 @@ async fn spawn_session(
     Json(payload): Json<SpawnCoreSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions/spawn")?;
+    spawn_session_authorized(state, payload).await
+}
+
+/// The shared spawn path after the caller's route-specific authorization.
+async fn spawn_session_authorized(
+    state: Arc<AppState>,
+    payload: SpawnCoreSessionRequest,
+) -> Result<Json<Value>, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let Some(parent) = state
         .session_store

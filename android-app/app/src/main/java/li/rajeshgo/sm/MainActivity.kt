@@ -31,6 +31,8 @@ class MainActivity : ComponentActivity() {
         EnrollmentLinkRequests.pending = null
         ReaderLinkRequests.pending = null
         BoardLinkRequests.pending = null
+        li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open = false
+        li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.name = null
         // The first owner request says how the app opened (spec 2170 A.5); a tap or link below overrides it.
         if (savedInstanceState == null) ClientNav.arrived("launch")
         takeEnrollmentLink(intent)
@@ -82,6 +84,10 @@ class MainActivity : ComponentActivity() {
         ClientNav.arrived(ClientNavState.pushNav(intent?.getStringExtra(FollowPush.EXTRA_NOTICE_ID)))
         val lane = open.readerPath?.let(::boardLaneFromPath)
         when {
+            open.readerPath?.substringBefore('?') == "/artifacts" -> {
+                li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.name = android.net.Uri.parse(open.readerPath).getQueryParameter("name")
+                li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open = true
+            }
             open.readerPath?.startsWith("/settings") == true ->
                 li.rajeshgo.sm.ui.navigation.ReviewSettingsRequests.pending = true
             lane != null -> BoardLinkRequests.pending = lane
@@ -94,6 +100,14 @@ class MainActivity : ComponentActivity() {
     private fun takeReaderLink(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
         val url = intent.dataString ?: return
+        val artifactUri = android.net.Uri.parse(url)
+        if (artifactUri.scheme == "https" && artifactUri.host == BuildConfig.SM_LINK_HOST && artifactUri.path == "/artifacts") {
+            ClientNav.arrived("link")
+            li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.name = artifactUri.getQueryParameter("name")
+            li.rajeshgo.sm.ui.artifacts.ArtifactsNavigation.open = true
+            setIntent(Intent(this, MainActivity::class.java))
+            return
+        }
         boardLaneForLink(url, BuildConfig.SM_LINK_HOST)?.let { lane ->
             ClientNav.arrived("link")
             BoardLinkRequests.pending = lane
