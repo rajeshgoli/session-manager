@@ -51,7 +51,7 @@ fn waiting(conn: &Connection, manager: &ManagedArtifacts, device: u64) -> Result
         } else {
             "cold"
         };
-        let n:u64=conn.query_row("SELECT COALESCE(MAX(r.disk_bytes),0) FROM artifact_job_reservations r JOIN artifact_disk_holds h USING(job_id) WHERE r.root=?1 AND r.start_bytes IS NULL AND h.role IN ('either',?2)",params![root.path,role],|r|r.get(0))?;
+        let n:u64=conn.query_row("SELECT COALESCE(MAX(r.disk_bytes),0) FROM artifact_job_reservations r JOIN artifact_disk_holds h USING(job_id) WHERE r.root=?1 AND r.start_bytes IS NULL AND (h.role=?2 OR (h.role='either' AND ?2='root'))",params![root.path,role],|r|r.get(0))?;
         largest = largest.max(n);
     }
     Ok(largest)
@@ -160,7 +160,7 @@ pub fn pass(manager: &ManagedArtifacts, path: &str, needed: u64) -> Result<()> {
                         } else {
                             continue;
                         };
-                    if h["role"] == role || h["role"] == "either" {
+                    if h["role"] == role || (h["role"] == "either" && role == "root") {
                         labels.push(format!(
                             "job {} ({:.1} GB)",
                             h["label"],

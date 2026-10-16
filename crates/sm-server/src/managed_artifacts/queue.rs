@@ -354,6 +354,7 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         let reader_conflict = active_outputs.iter()
             .any(|other| inputs.iter().any(|name| name.eq_ignore_ascii_case(other)));
         if writer_conflict || reader_conflict {
+            conn.execute("DELETE FROM artifact_disk_holds WHERE job_id=?1",[id])?;
             return Ok(Some("artifact_writer".into()));
         }
     }
@@ -451,7 +452,7 @@ pub fn admit(conn: &Connection, id: &str) -> Result<Option<String>> {
         }
     }
     let Some(location) = placement else {
-        conn.execute("INSERT INTO artifact_disk_holds(job_id,root,role,label) VALUES(?1,?2,?3,?4) ON CONFLICT(job_id) DO UPDATE SET role=excluded.role,label=excluded.label",params![id,p.root.path,existing.as_deref().unwrap_or("either"),p.request.label])?;
+        conn.execute("INSERT INTO artifact_disk_holds(job_id,root,role,label) VALUES(?1,?2,?3,?4) ON CONFLICT(job_id) DO UPDATE SET role=excluded.role,label=excluded.label",params![id,p.root.path,existing.as_deref().unwrap_or("root"),p.request.label])?;
         return hold(conn, id, "disk_space");
     };
     let tx = conn.unchecked_transaction()?;

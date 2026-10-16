@@ -606,3 +606,24 @@ fn report_only_renews_acknowledged_warning_without_repeating_current_warning() {
         "frozen"
     );
 }
+
+#[test]
+fn flexible_disk_hold_targets_only_root_even_before_readmission() {
+    let f = Fixture::new();
+    f.disks(100, 100);
+    f.conn().execute("INSERT INTO artifact_job_reservations(job_id,root,outputs_json,inputs_json,disk_bytes,first_disk_hold_at) VALUES('job',?1,'[]','[]',300,?2)",params![f.root.path,now()]).unwrap();
+    // Read compatibility for a hold persisted by the earlier build.
+    for role in ["either", "root"] {
+        f.conn()
+            .execute(
+                "INSERT OR REPLACE INTO artifact_disk_holds VALUES('job',?1,?2,'flexible job')",
+                params![f.root.path, role],
+            )
+            .unwrap();
+        assert_eq!(waiting(&f.conn(), &f.manager, 1).unwrap(), 300);
+        assert_eq!(waiting(&f.conn(), &f.manager, 2).unwrap(), 0);
+        // Root is now large enough, but the job has not been re-admitted yet.
+        f.disks(1000, 100);
+        assert_eq!(waiting(&f.conn(), &f.manager, 2).unwrap(), 0);
+    }
+}
