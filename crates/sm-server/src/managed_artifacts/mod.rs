@@ -2,6 +2,7 @@
 //! transaction so a competing mutation cannot invalidate a deletion's checks.
 pub mod archive;
 pub mod attribution;
+pub mod backup;
 pub mod config;
 pub mod delete;
 pub mod hotcold;
