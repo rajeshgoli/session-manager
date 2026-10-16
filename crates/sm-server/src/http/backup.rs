@@ -237,11 +237,12 @@ pub(super) async fn part(
             .iter()
             .find(|p| p.n == n)
             .ok_or_else(|| error(StatusCode::NOT_FOUND, "backup part not found"))?;
-        let file = fs::File::open(
-            expand_home(&manager.config.backup.outbox)
-                .join(&id)
-                .join(&part.file),
+        let directory: String = manager.store.open()?.query_row(
+            "SELECT outbox FROM backup_requests WHERE id=?1 AND device=?2",
+            rusqlite::params![id, device],
+            |row| row.get(0),
         )?;
+        let file = fs::File::open(PathBuf::from(directory).join(&part.file))?;
         Ok((file, part.bytes))
     })
     .await??;
@@ -369,8 +370,8 @@ fn deliver_alerts(state: &AppState, manager: &ManagedArtifacts) -> anyhow::Resul
         let result = messages::owner_message_store(state).create_once(
             crate::owner_messages::NewOwnerMessage {
                 human: state.config.owner_name.clone(),
-                sender_session_id: "sm-backup".into(),
-                sender_session_name: "sm backup".into(),
+                sender_session_id: "sm-artifacts".into(),
+                sender_session_name: "sm artifacts".into(),
                 title: r["title"].as_str().unwrap_or("Backup").into(),
                 body_markdown: r["body"].as_str().unwrap_or("").into(),
                 blocking: r["blocking"] == 1,

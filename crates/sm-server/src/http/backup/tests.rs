@@ -333,3 +333,70 @@ fn reconciliation_recovers_job_creation_and_terminal_failure_without_duplicates(
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn viewed_blocking_backup_alert_remains_actionable() {
+    let f = Fixture::new();
+    let manager = f.state.managed_artifacts.as_ref().unwrap();
+    manager.store.open().unwrap().execute("INSERT INTO backup_alerts(key,title,body,blocking) VALUES('test-corruption','Backup integrity check failed','Bad file: prices',1)",[]).unwrap();
+    deliver_alerts(&f.state, manager).unwrap();
+    let store = messages::owner_message_store(&f.state);
+    let message = store
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.title == "Backup integrity check failed")
+        .unwrap();
+    assert_eq!(message.sender_session_id, "sm-artifacts");
+    let viewed = store.mark_viewed(&message.id).unwrap().unwrap();
+    assert_eq!(
+        crate::owner_messages::derive_message_state(&viewed, false, true),
+        crate::owner_messages::OwnerMessageState::NeedsYou
+    );
+}
+
+#[tokio::test]
+async fn ready_parts_use_persisted_outbox_after_configuration_change() {
+    let mut f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let manager = f.state.managed_artifacts.as_ref().unwrap();
+    let life::RequestResult::Open(request) = life::request(manager, "backup-mini", None).unwrap()
+    else {
+        panic!()
+    };
+    moves::TEST_MOUNTED.set(true);
+    life::prepare_request(manager, &request.id).unwrap();
+    let original = fs::read(
+        f.dir
+            .join("outbox")
+            .join(&request.id)
+            .join("part-0000.tar.zst"),
+    )
+    .unwrap();
+    // A restarted server uses the new config while the ready request keeps its old directory.
+    f.state
+        .managed_artifacts
+        .as_mut()
+        .unwrap()
+        .config
+        .backup
+        .outbox = f.dir.join("new-outbox").display().to_string();
+    let response = router(f.state.clone())
+        .oneshot(f.req(
+            "GET",
+            &format!("/backup/requests/{}/parts/0", request.id),
+            Some("backup-mini"),
+            "sm-app.example.com",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        original.as_slice()
+    );
+}
