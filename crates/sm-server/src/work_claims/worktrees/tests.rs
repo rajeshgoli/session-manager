@@ -1564,3 +1564,61 @@ fn investigation_worktree_is_preserved_while_another_session_uses_it() {
     );
     assert!(Path::new(&path).exists());
 }
+
+#[test]
+fn interrupted_investigation_directory_cleanup_preserves_work_keeps_and_processes() {
+    let repo = Repo::new();
+    for scenario in [
+        "empty",
+        "saved",
+        "kept",
+        "process",
+        "session",
+        "unowned_git",
+    ] {
+        let path = repo.dir.join(scenario);
+        let path = path.to_str().unwrap();
+        if scenario == "unowned_git" {
+            repo.worktree(scenario, scenario);
+        } else {
+            fs::create_dir(path).unwrap();
+        }
+        let id = format!("interrupted-{scenario}");
+        repo.store
+            .register_investigation_worktree(&id, path, REPO, "")
+            .unwrap();
+        repo.store
+            .recover_interrupted_investigation_worktrees(|_| Ok(false))
+            .unwrap();
+        if scenario == "saved" {
+            fs::write(Path::new(path).join("evidence"), "retain me").unwrap();
+        }
+        if scenario == "kept" {
+            repo.keep(path, "retain reserved directory");
+        }
+        let mut process = (scenario == "process").then(|| {
+            Command::new("sleep")
+                .arg("60")
+                .current_dir(path)
+                .spawn()
+                .unwrap()
+        });
+        let sessions = if scenario == "session" {
+            vec![session("other", path, false)]
+        } else {
+            vec![]
+        };
+        let outcomes = repo.recheck(&sessions);
+        assert_eq!(
+            Path::new(path).exists(),
+            scenario != "empty",
+            "{scenario}: {outcomes:?}"
+        );
+        if let Some(child) = process.as_mut() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let outcomes = repo.recheck(&[]);
+            assert!(!Path::new(path).exists(), "{outcomes:?}");
+        }
+    }
+}

@@ -273,6 +273,23 @@ async fn investigate(
 ) -> Result<Response, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let svc = service(&state)?;
+    let lock = ma::investigations::try_lock(svc)?.ok_or(ApiError::Status {
+        status: StatusCode::CONFLICT,
+        detail: "artifact investigation creation is busy; retry shortly".into(),
+    })?;
+    // Client disconnects must not release the lock while a blocking spawn
+    // worker can still persist a session. The task owns creation to completion.
+    tokio::spawn(async move { investigate_locked(state, name, body, email, lock).await }).await?
+}
+
+async fn investigate_locked(
+    state: Arc<AppState>,
+    name: String,
+    body: Value,
+    email: String,
+    lock: std::fs::File,
+) -> Result<Response, ApiError> {
+    let svc = service(&state)?;
     let root = svc
         .config
         .resolve_root(body["root"].as_str(), body["repo"].as_str())
@@ -318,11 +335,17 @@ async fn investigate(
         // Reserve a new directory so a failed git add cannot enroll an
         // unrelated existing worktree in cleanup.
         tokio::fs::create_dir_all(worktree.parent().expect("worktree parent")).await?;
+        let registered_path = tokio::fs::canonicalize(worktree.parent().expect("worktree parent")).await?
+            .join(worktree.file_name().expect("worktree name"));
+        claims.register_investigation_worktree(&id, &registered_path.to_string_lossy(), &root.repo, "")?;
         tokio::fs::create_dir(&worktree).await?;
         reserved = true;
-        claims.register_investigation_worktree(&id, &worktree.to_string_lossy(), &root.repo, &base)?;
-        let output = tokio::process::Command::new("git").arg("-C").arg(&root.repo_checkout)
-            .args(["worktree", "add", "--detach"]).arg(&worktree).arg(&base).output().await?;
+        claims.reserve_investigation_worktree(&id, &base)?;
+        let mut git = tokio::process::Command::new("git");
+        git.arg("-C").arg(&root.repo_checkout)
+            .args(["worktree", "add", "--detach"]).arg(&worktree).arg(&base);
+        ma::investigations::inherit_lock(&mut git, &lock);
+        let output = git.output().await?;
         if !output.status.success() {
             return Err(ApiError::Status { status: StatusCode::CONFLICT, detail: String::from_utf8_lossy(&output.stderr).into_owned() });
         }
@@ -548,6 +571,7 @@ impl AppState {
         let Some(svc) = &self.managed_artifacts else {
             return Ok(());
         };
+        ma::investigations::recover(svc, &claims::work_claim_store(self), &self.session_store)?;
         ma::ops::kick(svc.clone());
         ma::rebuild::kick(svc.clone());
         let jobs = RetainedQueueStore::list_queue_jobs_from_path(

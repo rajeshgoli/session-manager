@@ -6,6 +6,7 @@ pub mod backup;
 pub mod config;
 pub mod delete;
 pub mod hotcold;
+pub mod investigations;
 pub mod moves;
 pub mod needs_you;
 pub mod ops;
