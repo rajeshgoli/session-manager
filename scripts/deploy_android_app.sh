@@ -23,8 +23,23 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$SCRIPT_DIR/verify_android_apk.py" "$APK_PATH"
 
+# Publish the version Android will compare on install, read from the APK itself.
+# The server refuses a version code that is not higher than the published one.
+read -r APK_VERSION_CODE APK_VERSION_NAME < <(python3 "$SCRIPT_DIR/verify_android_apk.py" --print-version "$APK_PATH")
+if [[ -n "$VERSION_CODE" && "$VERSION_CODE" != "$APK_VERSION_CODE" ]]; then
+  echo "VERSION_CODE=$VERSION_CODE but the APK has versionCode $APK_VERSION_CODE. Rebuild with SM_VERSION_CODE=$VERSION_CODE." >&2
+  exit 1
+fi
+if [[ -n "$VERSION_NAME" && "$VERSION_NAME" != "$APK_VERSION_NAME" ]]; then
+  echo "VERSION_NAME=$VERSION_NAME but the APK has versionName $APK_VERSION_NAME. Rebuild with SM_VERSION_NAME=$VERSION_NAME." >&2
+  exit 1
+fi
+VERSION_CODE="$APK_VERSION_CODE"
+VERSION_NAME="$APK_VERSION_NAME"
+echo "APK version: $VERSION_NAME ($VERSION_CODE)"
+
 curl_args=(
-  --fail
+  --fail-with-body
   --show-error
   --silent
   -X POST
@@ -38,13 +53,7 @@ if [[ -n "${CLAUDE_SESSION_MANAGER_ID:-}" ]]; then
   curl_args+=(-H "x-sm-session-id: $CLAUDE_SESSION_MANAGER_ID")
 fi
 
-if [[ -n "$VERSION_CODE" ]]; then
-  curl_args+=(-F "version_code=$VERSION_CODE")
-fi
-
-if [[ -n "$VERSION_NAME" ]]; then
-  curl_args+=(-F "version_name=$VERSION_NAME")
-fi
+curl_args+=(-F "version_code=$VERSION_CODE" --form-string "version_name=$VERSION_NAME")
 
 curl "${curl_args[@]}"
 printf '\n'

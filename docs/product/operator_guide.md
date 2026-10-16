@@ -343,11 +343,13 @@ cd ..
 ### Publish and install
 
 ```bash
-VERSION_CODE=2 VERSION_NAME=0.1.1 RELEASE_NOTES="What changed and what to try." ./scripts/deploy_android_app.sh
+RELEASE_NOTES="What changed and what to try." ./scripts/deploy_android_app.sh
 ```
 
 The script checks the build carries every value above (it refuses one that
-would ship without sign-in or push), then uploads it to the local server. The
+would ship without sign-in or push), reads the APK's version code, then uploads
+it to the local server. The server refuses a version code that is not higher
+than the published one, since Android cannot install a downgrade. The
 server keeps it under `paths.app_artifacts_dir` and serves
 `/apps/session-manager-android/meta.json` and `/apps/session-manager-android/latest.apk`.
 Release notes are required, up to 1,000 characters.

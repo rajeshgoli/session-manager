@@ -51,6 +51,11 @@ class AppUpdateRepository(
         if (settingsRepository.dismissedUpdateArtifactHash.first() == serverArtifactHash) {
             return null
         }
+        // Android refuses to install an older versionCode ("App not installed"),
+        // so never offer one.
+        if (metadata.versionCode != null && metadata.versionCode < BuildConfig.VERSION_CODE) {
+            return null
+        }
         return AvailableAppUpdate(
             artifactHash = serverArtifactHash,
             versionName = metadata.versionName ?: serverArtifactHash,

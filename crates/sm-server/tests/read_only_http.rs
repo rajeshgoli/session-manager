@@ -1819,6 +1819,61 @@ async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
 }
 
 #[tokio::test]
+async fn app_artifact_upload_refuses_version_code_that_does_not_advance() {
+    let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-version");
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
+        },
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let boundary = "sm-rust-boundary-version";
+    let deploy = |bytes: &'static [u8], code: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let body = multipart_app_upload(boundary, bytes, code, Some("0.5.0"));
+            let (status, _headers, body) = post_multipart_with_host_and_peer(
+                app,
+                "/deploy/session-manager-android",
+                "localhost",
+                body,
+                boundary,
+                &[],
+                Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+            )
+            .await;
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        }
+    };
+
+    let (status, payload) = deploy(b"apk-1155", Some("1155")).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    for (bytes, code) in [
+        (b"apk-1".as_slice(), Some("1")),
+        (b"apk-same".as_slice(), Some("1155")),
+        (b"apk-none".as_slice(), None),
+    ] {
+        let (status, payload) = deploy(bytes, code).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+    }
+    let metadata: Value = serde_json::from_str(
+        &fs::read_to_string(artifact_root.join("session-manager-android/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["version_code"], 1155);
+
+    let (status, payload) = deploy(b"apk-1156", Some("1156")).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
 async fn app_artifact_upload_rejects_encoded_whitespace_app_name() {
     let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-invalid");
     let state_file = unique_temp_path();
