@@ -126,11 +126,27 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     if !settings.enabled || settings.paused_at.is_some() || skipped(state, &settings)? {
         return Ok(true);
     }
+    let key = format!("autopm-brief-{id}");
+    if RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
+        .message_delivered(&key)?
+    {
+        // A historical stopped seat must not satisfy start() for a new cycle.
+        return Ok(!session.is_stopped());
+    }
     if super::super::auto_retire::retired_autopm_needs_successor(state, &session) {
         // The cycle wake below remains durably addressed to the retired
         // holder; the message-ready path creates its successor before it is
         // delivered.
-        once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
+        once(state, &key, &id, &brief)?;
+        return Ok(true);
+    }
+    if super::super::messages::restores(&session) {
+        let Some(session) = super::super::auto_retire::ready_for_message(state, session) else {
+            return Ok(false);
+        };
+        state.session_store.authorize_autopm_seat(&session.id)?;
+        store(state).record_seat(&session.id, autopm::now_ms())?;
+        once(state, &key, &id, &brief)?;
         return Ok(true);
     }
     if session.is_stopped() {
@@ -142,13 +158,33 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     let id = session.id;
     state.session_store.authorize_autopm_seat(&id)?;
     store(state).record_seat(&id, autopm::now_ms())?;
-    once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
+    once(state, &key, &id, &brief)?;
     Ok(true)
 }
 
 pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> anyhow::Result<()> {
-    // Every Auto PM wake is also the next-message restore trigger. The
-    // once-only id continues to deduplicate the wake after a retry.
+    // A delivered once-keyed wake must never reopen a retired seat. An
+    // undelivered wake still needs its existing queue target made ready.
+    let conn = store(state).open()?;
+    let initialized: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+        ["table", "message_queue"],
+        |r| r.get(0),
+    )?;
+    let existing: Option<(String, bool)> = if initialized {
+        conn.query_row(
+            "SELECT target_session_id, delivered_at IS NOT NULL FROM message_queue WHERE id=?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    if existing.as_ref().is_some_and(|(_, delivered)| *delivered) {
+        return Ok(());
+    }
+    let target = existing.as_ref().map_or(target, |(id, _)| id.as_str());
     let target = match state.session_store.get_session(target)? {
         Some(session)
             if super::super::auto_retire::retired_autopm_needs_successor(state, &session) =>
@@ -160,20 +196,7 @@ pub(super) fn once(state: &AppState, key: &str, target: &str, text: &str) -> any
             .unwrap_or_else(|| target.to_owned()),
         None => target.to_owned(),
     };
-    // Handoff may have repointed an already queued message to its successor.
-    let conn = store(state).open()?;
-    let initialized: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
-        ["table", "message_queue"],
-        |r| r.get(0),
-    )?;
-    let exists: bool = initialized
-        && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_queue WHERE id=?1)",
-            [key],
-            |r| r.get(0),
-        )?;
-    if !exists {
+    if existing.is_none() {
         RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
             .enqueue_message_once_with_metadata(
                 key,
@@ -444,6 +467,187 @@ pub(in crate::http) fn tick(state: &AppState, now: i64) -> anyhow::Result<()> {
 mod tests {
     use super::super::tests::role_state;
     use super::*;
+
+    fn registered_pm() -> AppState {
+        let state = role_state();
+        state.session_store.authorize_autopm_seat("pm").unwrap();
+        state
+            .session_store
+            .register_agent_role(
+                "pm",
+                crate::sessions::RoleRegistrationRequest {
+                    requester_session_id: "pm".into(),
+                    role: autopm::ROLE.into(),
+                },
+            )
+            .unwrap();
+        state
+    }
+
+    fn retire_pm(state: &AppState) {
+        let path = &state.config.paths.state_file;
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let pm = raw["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|session| session["id"] == "pm")
+            .unwrap();
+        pm["status"] = json!("stopped");
+        pm["completion_status"] = json!("retired");
+        pm["completed_at"] = json!("2026-10-16T00:00:00Z");
+        pm["terminal_provenance"] = json!({
+            "cause":"explicit_retire", "observed_at":"2026-10-16T00:00:00Z",
+            "authority":"server_lifecycle", "source":"auto_retire"
+        });
+        std::fs::write(path, raw.to_string()).unwrap();
+        assert!(state
+            .session_store
+            .get_session("pm")
+            .unwrap()
+            .unwrap()
+            .auto_retired());
+    }
+
+    #[test]
+    fn repeated_cycle_tick_does_not_restore_a_delivered_wake() {
+        let state = registered_pm();
+        let now = 1_760_659_200_000;
+        let week = cycle::due_week(now, time::UtcOffset::UTC, true);
+        let key = format!("autopm-cycle:{week}");
+        let actions = Runtime(&state);
+        actions
+            .wake(&format!("cycle:{week}"), "already sent")
+            .unwrap();
+        let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+        queue.mark_delivered(&key).unwrap();
+        let conn = store(&state).open().unwrap();
+        schema(&conn).unwrap();
+        conn.execute("UPDATE autopm_cycle_control SET enabled=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO autopm_cycles(week,ticket,opened_ms,ready) VALUES(?1,3001,?2,1)",
+            params![week, now],
+        )
+        .unwrap();
+        state
+            .session_store
+            .update_owner_settings(&json!({"autopm":{"enabled":true}}), |_| Ok(Ok(())))
+            .unwrap()
+            .unwrap();
+        retire_pm(&state);
+        let settings = typed(&state, &state.session_store.owner_settings().unwrap());
+        for _ in 0..2 {
+            cycle::tick(
+                &store(&state),
+                &settings,
+                now,
+                time::UtcOffset::UTC,
+                false,
+                &actions,
+            )
+            .unwrap();
+        }
+        assert!(state
+            .session_store
+            .get_session("pm")
+            .unwrap()
+            .unwrap()
+            .auto_retired());
+        assert!(state
+            .session_store
+            .get_session("pm")
+            .unwrap()
+            .unwrap()
+            .successor_session_id
+            .is_none());
+    }
+
+    #[test]
+    fn new_and_undelivered_once_wakes_restore_the_retired_holder() {
+        for already_queued in [false, true] {
+            let state = registered_pm();
+            if already_queued {
+                once(&state, "autopm-test", "pm", "wake").unwrap();
+            }
+            retire_pm(&state);
+            once(&state, "autopm-test", "pm", "wake").unwrap();
+            assert!(!state
+                .session_store
+                .get_session("pm")
+                .unwrap()
+                .unwrap()
+                .is_stopped());
+            let conn = store(&state).open().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM message_queue WHERE id='autopm-test' AND target_session_id='pm'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn durable_brief_authorizes_a_restored_cycle_seat_before_delivery() {
+        let state = role_state();
+        prepare(&state, 3001, "pm", "register autopm").unwrap();
+        state
+            .session_store
+            .update_owner_settings(&json!({"autopm":{"enabled":true}}), |_| Ok(Ok(())))
+            .unwrap()
+            .unwrap();
+        retire_pm(&state);
+        assert!(deliver(&state, 3001).unwrap());
+        assert!(state.session_store.is_authorized_autopm_seat("pm").unwrap());
+        assert_eq!(
+            store(&state)
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM message_queue WHERE id='autopm-brief-pm'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn delivered_brief_for_stopped_historical_seat_does_not_satisfy_start() {
+        let state = role_state();
+        prepare(&state, 3001, "pm", "old brief").unwrap();
+        state
+            .session_store
+            .update_owner_settings(&json!({"autopm":{"enabled":true}}), |_| Ok(Ok(())))
+            .unwrap()
+            .unwrap();
+        assert!(deliver(&state, 3001).unwrap());
+        let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+        queue.mark_delivered("autopm-brief-pm").unwrap();
+        let path = &state.config.paths.state_file;
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let pm = raw["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|session| session["id"] == "pm")
+            .unwrap();
+        pm["status"] = json!("stopped");
+        std::fs::write(path, raw.to_string()).unwrap();
+        assert!(!deliver(&state, 3001).unwrap());
+        assert!(state
+            .session_store
+            .get_session("pm")
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+    }
 
     #[test]
     fn runtime_enable_policy_and_durable_brief_recovery() {
