@@ -6,7 +6,7 @@ use std::{
 };
 
 #[cfg(test)]
-thread_local! { static BEFORE_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { pub(super) static BEFORE_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 
 pub fn target(parent: &Path, name: &str) -> Result<PathBuf> {
     validate_name(name)?;
@@ -180,6 +180,7 @@ impl ManagedArtifacts {
             "SELECT * FROM artifacts WHERE root=?1 AND set_id=?2",
             &[&root.path, &a["set_id"].as_str().unwrap_or(name)],
         )?;
+        let mut removal_started = false;
         let result = (|| {
             if pressure {
                 score::deletion_eligible(&tx, &root.path, &members)?;
@@ -230,12 +231,20 @@ impl ManagedArtifacts {
                     }
                 }
                 for path in paths {
+                    removal_started = true;
                     remove_entry(&path)?;
                 }
             }
             Ok::<_, anyhow::Error>(())
         })();
         if let Err(error) = result {
+            if pressure && !removal_started {
+                // A rejected pre-removal check cancels the intent. Only a
+                // partially executed deletion belongs to crash recovery.
+                for member in &members {
+                    tx.execute("UPDATE artifacts SET op=NULL,deleted_by=NULL,delete_reason=NULL WHERE root=?1 AND name=?2 AND op='deleting'",params![root.path,member["name"].as_str().unwrap()])?;
+                }
+            }
             for member in &members {
                 event(
                     &tx,

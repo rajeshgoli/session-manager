@@ -627,3 +627,81 @@ fn flexible_disk_hold_targets_only_root_even_before_readmission() {
         assert_eq!(waiting(&f.conn(), &f.manager, 2).unwrap(), 0);
     }
 }
+
+#[test]
+fn rejected_final_delete_check_cancels_intent_and_cannot_recover_later() {
+    for protection in ["project=1", "keep_live_until='2999-01-01'"] {
+        let mut f = Fixture::new();
+        f.live("a", 4096);
+        f.manager.config.deletion_mode = "enforcing".into();
+        let db = f.manager.store.clone();
+        delete::BEFORE_REMOVAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                db.open()
+                    .unwrap()
+                    .execute(
+                        &format!("UPDATE artifacts SET {protection} WHERE name='a'"),
+                        [],
+                    )
+                    .unwrap();
+            }))
+        });
+        assert!(f.manager.delete_pressure(&f.root, "a").is_err());
+        let a = artifact(&f.conn(), &f.root.path, "a").unwrap();
+        assert!(a["op"].is_null());
+        assert!(a["delete_reason"].is_null());
+        f.conn()
+            .execute("UPDATE artifacts SET project=0,keep_live_until=NULL", [])
+            .unwrap();
+        f.conn()
+            .execute(
+                "UPDATE artifact_events SET at='2000-01-01T00:00:00Z' WHERE kind='op_failed'",
+                [],
+            )
+            .unwrap();
+        f.manager.recover_deletions(&f.root).unwrap();
+        assert_eq!(
+            artifact(&f.conn(), &f.root.path, "a").unwrap()["state"],
+            "live"
+        );
+        assert_eq!(
+            fs::read(Path::new(&f.root.path).join("a/data")).unwrap(),
+            vec![b'a'; 4096]
+        );
+    }
+}
+
+#[test]
+fn disappeared_device_notices_are_resolved_and_never_republished() {
+    let f = Fixture::new();
+    f.disks(1000, 1000);
+    for device in [2, 999] {
+        store::set_meta(
+            &f.conn(),
+            &format!("pressure_pending:{device}"),
+            &json!({"body":"old pressure"}).to_string(),
+        )
+        .unwrap();
+    }
+    moves::TEST_MOUNTED.set(false);
+    periodic(&f.manager).unwrap();
+    let mut resolved = Vec::new();
+    resolve_notices(&f.manager, |key| {
+        resolved.push(key.to_owned());
+        Ok(())
+    })
+    .unwrap();
+    assert!(resolved.contains(&"pressure_pending:2:".into()));
+    assert!(resolved.contains(&"pressure_pending:999:".into()));
+    let mut sent = 0;
+    notify(
+        &f.manager,
+        OffsetDateTime::now_utc() + time::Duration::hours(7),
+        |_, _| {
+            sent += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(sent, 0);
+}

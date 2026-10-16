@@ -254,6 +254,20 @@ pub fn periodic(manager: &ManagedArtifacts) -> Result<()> {
             }
         }
     }
+    for row in store::query(
+        &conn,
+        "SELECT key FROM artifact_meta WHERE key LIKE 'pressure_pending:%'",
+        &[],
+    )? {
+        let key = row["key"].as_str().context("pressure key")?;
+        if key
+            .strip_prefix("pressure_pending:")
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some_and(|device| !seen.contains(&device))
+        {
+            store::set_meta(&conn, key, "null")?;
+        }
+    }
     Ok(())
 }
 pub fn kick(manager: ManagedArtifacts, root: ArtifactRoot, needed: u64) {
