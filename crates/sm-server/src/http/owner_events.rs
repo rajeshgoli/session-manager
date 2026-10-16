@@ -107,6 +107,26 @@ pub(super) fn owner_surface(
         .map(|_| ("web", None))
 }
 
+/// Which app an owner write came from, named on the reply it delivers (sm#2250).
+pub(super) async fn owner_app(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+) -> crate::owner_messages::OwnerApp {
+    use crate::owner_messages::OwnerApp;
+    let (state, headers) = (Arc::clone(state), headers.clone());
+    // A cold JWKS cache fetches, so the classification runs off the async threads.
+    tokio::task::spawn_blocking(
+        move || match owner_surface(&state, &headers, Some(peer_addr)) {
+            Some(("android", _)) => OwnerApp::Phone,
+            Some(("web", _)) => OwnerApp::Web,
+            _ => OwnerApp::Unknown,
+        },
+    )
+    .await
+    .unwrap_or(OwnerApp::Unknown)
+}
+
 pub(super) fn from_agent(headers: &HeaderMap) -> bool {
     crate::local_identity::current().is_some()
         || [handoff::SESSION_HEADER, "x-sm-session-id"]

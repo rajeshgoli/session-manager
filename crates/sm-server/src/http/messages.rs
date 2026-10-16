@@ -668,8 +668,8 @@ pub(super) async fn reply_to_owner_message(
     if overall.is_empty() && comments.is_empty() {
         return Err(bad_request("Nothing to send"));
     }
-    let delivered_text =
-        render_delivered_text(&state.config.owner_name, &message, &overall, &comments);
+    let app = super::owner_events::owner_app(&state, &headers, peer_addr).await;
+    let delivered_text = render_delivered_text(app, &overall, &comments);
     let (reply, inserted) = store.record_reply(&RecordReply {
         submission_id,
         message_id: message.id.clone(),
@@ -822,7 +822,11 @@ mod tests {
         ));
         assert!(!crate::owner_messages::is_owner_typed_prompt("  ", false));
         assert!(!crate::owner_messages::is_owner_typed_prompt(
-            "[Input from: Rajesh via sm app] Re: \"Check\" (msg_3f9a2c1d)\nYes.",
+            "Yes.\n\n[sent from sm phone app]",
+            false
+        ));
+        assert!(!crate::owner_messages::is_owner_typed_prompt(
+            "> quoted\nYes.\n\n[sent from sm web app]",
             false
         ));
         assert!(!crate::owner_messages::is_owner_typed_prompt(

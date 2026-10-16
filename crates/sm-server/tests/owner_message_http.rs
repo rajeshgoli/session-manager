@@ -417,16 +417,15 @@ async fn reply_is_idempotent_and_delivers_once() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let expected = format!(
-        "[Input from: Rajesh via sm app] Re: \"Keep the old fills table or drop it?\" ({id})\n\
-         Otherwise yes, drop it.\n\
+    let expected = "Otherwise yes, drop it.\n\
          \n\
          > The migration copies every row.\n\
          Every row?\n\
          \n\
          > Nothing reads `fills` after the cutover.\n\
-         The month-end recon does. Check it first."
-    );
+         The month-end recon does. Check it first.\n\
+         \n\
+         [sent from sm app]";
     assert_eq!(first["delivered_text"], expected);
     assert_eq!(first["delivered_to_session_id"], "eng00001");
     assert_eq!(first["delivered_to_session_name"], "eng00001-agent");
@@ -445,7 +444,7 @@ async fn reply_is_idempotent_and_delivers_once() {
         delivered,
         vec![(
             "eng00001".to_owned(),
-            expected.clone(),
+            expected.to_owned(),
             "sequential".to_owned(),
             None
         )]
@@ -485,10 +484,7 @@ async fn reply_is_idempotent_and_delivers_once() {
         Some(json!({"submission_id": "sub-00000003", "body": "Yes."})),
     )
     .await;
-    assert_eq!(
-        body["delivered_text"],
-        format!("[Input from: Rajesh via sm app] Re: \"other\" ({other})\nYes.")
-    );
+    assert_eq!(body["delivered_text"], "Yes.\n\n[sent from sm app]");
     assert_eq!(queued(&f, "owner-reply-").len(), 2);
 }
 
@@ -1168,10 +1164,7 @@ async fn thread_send_answers_the_open_question_once() {
     assert_eq!(queued.len(), 1);
     assert_eq!(
         queued[0].1,
-        format!(
-            "[Input from: Rajesh via sm app] Re: \"Keep it?\" ({ask})\n\
-             > Nothing reads fills.\n\nThe month-end recon does."
-        )
+        "> Nothing reads fills.\n\nThe month-end recon does.\n\n[sent from sm app]"
     );
     let (_, message) = request(&f.app, "GET", &format!("/messages/{ask}?format=json"), None).await;
     assert_eq!(message["state"], "replied");
@@ -1229,10 +1222,7 @@ async fn writing_first_sends_a_note_without_a_re_line() {
     let queued = queued(&f, "owner-note-");
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].0, "eng00001");
-    assert_eq!(
-        queued[0].1,
-        "[Input from: Rajesh via sm app]\nPause the copy."
-    );
+    assert_eq!(queued[0].1, "Pause the copy.\n\n[sent from sm app]");
     let listing = inbox(&f, "open").await;
     let thread = row(&listing, "agent:eng00001");
     assert_eq!(thread["preview"], "You: Pause the copy.");
@@ -1657,7 +1647,7 @@ async fn the_agents_answer_to_an_inbox_send_appears_in_its_thread() {
         "/hooks/claude",
         Some(json!({"hook_event_name": "UserPromptSubmit",
                     "session_manager_id": "eng00001",
-                    "prompt": "[Input from: Rajesh via sm app] Is the run healthy?"})),
+                    "prompt": "Is the run healthy?\n\n[sent from sm app]"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

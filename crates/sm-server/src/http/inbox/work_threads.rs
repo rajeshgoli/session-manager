@@ -1294,5 +1294,6 @@ pub(crate) async fn post_thread_send(
         .as_str()
         .ok_or_else(|| conflict(NO_RECIPIENT))?;
     let payload: SendRequest = docs::parse_json_body(&body)?;
-    send_to_agent(&state, id, payload, Some(&key)).await
+    let app = super::super::owner_events::owner_app(&state, &headers, peer_addr).await;
+    send_to_agent(&state, id, payload, Some(&key), app).await
 }

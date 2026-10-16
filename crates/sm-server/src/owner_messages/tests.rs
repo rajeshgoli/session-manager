@@ -209,14 +209,15 @@ fn delivered_text_format() {
     }];
     // The memo's example, byte for byte.
     assert_eq!(
-        render_delivered_text("Rajesh", &message(true), "  Otherwise yes, drop it.\n", &comments),
-        "[Input from: Rajesh via sm app] Re: \"Keep the old fills table or drop it?\" (msg_3f9a2c1d)\n\
-         Otherwise yes, drop it.\n\
+        render_delivered_text(OwnerApp::Phone, "  Otherwise yes, drop it.\n", &comments),
+        "Otherwise yes, drop it.\n\
          \n\
          > Nothing reads `fills` after the cutover.\n\
-         The month-end recon does. Check it first."
+         The month-end recon does. Check it first.\n\
+         \n\
+         [sent from sm phone app]"
     );
-    // No overall text: the first comment follows the header directly;
+    // No overall text: the first comment leads;
     // multi-line quotes quote each line; comments are a blank line apart;
     // a comment with no quote is its body alone.
     let comments = vec![
@@ -232,18 +233,19 @@ fn delivered_text_format() {
         },
     ];
     assert_eq!(
-        render_delivered_text("Owner", &message(false), "", &comments),
-        "[Input from: Owner via sm app] Re: \"Keep the old fills table or drop it?\" (msg_3f9a2c1d)\n\
-         > first line\n\
+        render_delivered_text(OwnerApp::Web, "", &comments),
+        "> first line\n\
          > second line\n\
          Why?\n\
          \n\
-         General note."
+         General note.\n\
+         \n\
+         [sent from sm web app]"
     );
     // Only overall text.
     assert_eq!(
-        render_delivered_text("Owner", &message(false), "Yes.", &[]),
-        "[Input from: Owner via sm app] Re: \"Keep the old fills table or drop it?\" (msg_3f9a2c1d)\nYes."
+        render_delivered_text(OwnerApp::Unknown, "Yes.", &[]),
+        "Yes.\n\n[sent from sm app]"
     );
     // Quotes are cut at 300 characters.
     let long = vec![ReplyComment {
@@ -251,8 +253,12 @@ fn delivered_text_format() {
         quote: format!("  {}  ", "é".repeat(301)),
         body: "Too long.".into(),
     }];
-    assert!(render_delivered_text("Owner", &message(false), "", &long)
-        .ends_with(&format!("> {}…\nToo long.", "é".repeat(300))));
+    assert!(
+        render_delivered_text(OwnerApp::Phone, "", &long).ends_with(&format!(
+            "> {}…\nToo long.\n\n[sent from sm phone app]",
+            "é".repeat(300)
+        ))
+    );
 }
 
 #[test]
@@ -317,7 +323,7 @@ fn recording_a_reply_deletes_drafts_marks_viewed_and_queues_once() {
         message_id: message.id.clone(),
         body: "Yes.".into(),
         comments: order_reply_comments(std::slice::from_ref(&edited)),
-        delivered_text: "[Input from: Owner via sm app] ...".into(),
+        delivered_text: "Yes.\n\n[sent from sm app]".into(),
         recipient_session_id: "eng00001".into(),
         draft_ids: vec![draft.id.clone()],
     };

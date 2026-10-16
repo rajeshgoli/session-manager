@@ -133,6 +133,7 @@ pub fn is_owner_typed_prompt(prompt: &str, recently_delivered: bool) -> bool {
     !prompt.is_empty()
         && !prompt.starts_with("[Input from:")
         && !prompt.starts_with("[sm")
+        && !ends_with_app_trailer(prompt)
         && !recently_delivered
 }
 
@@ -249,14 +250,38 @@ fn strip_inline_markup(text: &str) -> String {
         .collect()
 }
 
-/// What the agent receives for a reply (appendix D4). `comments` are in
-/// delivered order.
-pub fn render_delivered_text(
-    owner_name: &str,
-    message: &OwnerMessage,
-    body: &str,
-    comments: &[ReplyComment],
-) -> String {
+/// The app an owner reply was sent from, named on the reply's last line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerApp {
+    Phone,
+    Web,
+    /// Neither could be told, e.g. a local request that bypassed sign-in.
+    Unknown,
+}
+
+impl OwnerApp {
+    /// The reply's last line (sm#2250): the owner's words arrive as typed,
+    /// and only this says they came through the app.
+    pub fn trailer(self) -> &'static str {
+        match self {
+            Self::Phone => "[sent from sm phone app]",
+            Self::Web => "[sent from sm web app]",
+            Self::Unknown => "[sent from sm app]",
+        }
+    }
+}
+
+/// Whether a prompt's last line is an [`OwnerApp::trailer`].
+fn ends_with_app_trailer(prompt: &str) -> bool {
+    prompt
+        .lines()
+        .last()
+        .is_some_and(|line| line.starts_with("[sent from sm ") && line.ends_with("app]"))
+}
+
+/// What the agent receives for a reply (appendix D4): the text as the owner
+/// wrote it, then the app trailer. `comments` are in delivered order.
+pub fn render_delivered_text(app: OwnerApp, body: &str, comments: &[ReplyComment]) -> String {
     let mut sections = Vec::new();
     let body = body.trim();
     if !body.is_empty() {
@@ -270,23 +295,12 @@ pub fn render_delivered_text(
         }
         sections.push(format!("{}\n{}", quote_block(quote), comment.body));
     }
-    format!(
-        "[Input from: {owner_name} via sm app] Re: \"{}\" ({})\n{}",
-        message.title,
-        message.id,
-        sections.join("\n\n")
-    )
+    format!("{}\n\n{}", sections.join("\n\n"), app.trailer())
 }
 
 /// What the agent receives for a send from its Inbox thread (sm#1647): the
-/// quoted passages, then the text. `message` is the message the send answers;
-/// `None` is a note the owner wrote first, which has no `Re:` part.
-pub fn render_thread_text(
-    owner_name: &str,
-    message: Option<&OwnerMessage>,
-    body: &str,
-    quotes: &[String],
-) -> String {
+/// quoted passages, then the text, then the app trailer.
+pub fn render_thread_text(app: OwnerApp, body: &str, quotes: &[String]) -> String {
     let mut sections: Vec<String> = quotes
         .iter()
         .map(|quote| quote.trim())
@@ -297,14 +311,7 @@ pub fn render_thread_text(
     if !body.is_empty() {
         sections.push(body.to_owned());
     }
-    let header = match message {
-        Some(message) => format!(
-            "[Input from: {owner_name} via sm app] Re: \"{}\" ({})",
-            message.title, message.id
-        ),
-        None => format!("[Input from: {owner_name} via sm app]"),
-    };
-    format!("{header}\n{}", sections.join("\n\n"))
+    format!("{}\n\n{}", sections.join("\n\n"), app.trailer())
 }
 
 /// `> `-prefixed lines, cut at [`MAX_REPLY_QUOTE_CHARS`].

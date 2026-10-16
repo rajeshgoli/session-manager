@@ -172,12 +172,13 @@ Nothing reads `fills` after the cutover.
 EOF
 # prints: Sent to rajesh in the sm app (blocking) → https://sm.rajeshgo.li/messages/msg_3f9a2c1d</code></pre>
 <p>You comment on the last sentence and type "Otherwise yes, drop it." The agent receives:</p>
-<pre><code>[Input from: Rajesh via sm app] Re: "Keep the old fills table or drop it?" (msg_3f9a2c1d)
-Otherwise yes, drop it.
+<pre><code>Otherwise yes, drop it.
 
 &gt; Nothing reads `fills` after the cutover.
-The month-end recon does. Check it first.</code></pre>
-<p>The first line has the same shape as the header an agent sees on a message from another agent (<code>[Input from: &lt;name&gt; (&lt;id&gt;) via sm send]</code>),<sup>2</sup> so the agent treats it as conversation and answers with <code>sm send rajesh</code>. Each comment carries the passage it refers to, as review comments do. "Rajesh" in the header is your <code>owner_name</code> setting.</p>
+The month-end recon does. Check it first.
+
+[sent from sm phone app]</code></pre>
+<p>Your words arrive as you typed them, as they would at the terminal; only the last line says which app sent them: <code>[sent from sm phone app]</code>, <code>[sent from sm web app]</code>, or <code>[sent from sm app]</code> when sm cannot tell (sm#2250). A message from another agent keeps its <code>[Input from: &lt;name&gt; (&lt;id&gt;) via sm send]</code> header,<sup>2</sup> so an agent can tell the two apart. Each comment carries the passage it refers to, as review comments do.</p>
 
 <h3>What you see</h3>
 
@@ -259,7 +260,7 @@ The month-end recon does. Check it first.</code></pre>
 <tbody>
 <tr><td>1. Where <code>sm send rajesh</code> goes</td><td><b>The app, with email only as the fallback</b>, sent when the phone does not confirm within 15 minutes, or at once when phone notifications are not set up. The email subject is the agent name and the message title.</td><td>It is the ticket's goal, and the fallback is the rule that already protects follow notifications.</td></tr>
 <tr><td>2. <code>sm email rajesh</code></td><td><b>Deprecate it:</b> it becomes an alias of <code>sm send rajesh</code> that prints a deprecation note. <code>sm email</code> to addresses that are not you is unchanged.</td><td>The fallback already emails when email is the only way through, and the title gives the subject.</td></tr>
-<tr><td>3. How your reply reaches the agent</td><td><b>As a message headed <code>[Input from: Rajesh via sm app]</code></b>, carrying your overall text and every passage comment together, delivered at the agent's next tool call.</td><td>Agents answer that header with <code>sm send</code>, and one coherent message beats a trickle.</td></tr>
+<tr><td>3. How your reply reaches the agent</td><td><b>As your text, ending with <code>[sent from sm phone app]</code> or <code>[sent from sm web app]</code></b>, carrying your overall text and every passage comment together, delivered at the agent's next tool call.</td><td>You are the same person who types at the terminal, so the reply reads as typed; one coherent message beats a trickle.</td></tr>
 <tr><td>4. Doc reviews</td><td><b>Unchanged: <code>--review</code> requires an open pull request, the review goes to GitHub, and the agent is woken with <code>[sm review]</code>.</b> Docs without an open PR stay read-only.</td><td>GitHub is the review system, and a review kept on the PR outlives any agent.</td></tr>
 <tr><td>5. Doc notifications</td><td><b><code>--review</code> notifies you; there is no <code>--notify</code>.</b> <b>No review needed</b> clears a request, and a retired agent's request clears on its own. A plain publish does not notify.</td><td>One flag with one meaning; the clear button covers requests you won't act on.</td></tr>
 <tr><td>6. Nobody left to answer</td><td><b>A message reply with no live sender or parent is not allowed</b>: the reply box is replaced by "No agent is left to reply to". <b>A GitHub review with no one to wake offers Assign to a new agent</b>: same type and model as the agent that ended, started in the repo's checkout with your review as its task.</td><td>A reply with nowhere to go is lost; a review is kept on the PR, and one tap puts an agent on it.</td></tr>
@@ -474,15 +475,17 @@ CREATE UNIQUE INDEX owner_notices_subject ON owner_notices(kind, subject_id);</c
 </ol>
 
 <h4>D4. Delivered text</h4>
-<pre><code>[Input from: OWNER via sm app] Re: "&lt;title&gt;" (&lt;message id&gt;)
-&lt;overall body, if non-empty&gt;
+<pre><code>&lt;overall body, if non-empty&gt;
 
 &gt; &lt;quote line 1&gt;
 &gt; &lt;quote line 2&gt;
 &lt;comment body&gt;
 
 &gt; &lt;next quote&gt;
-&lt;next comment body&gt;</code></pre>
+&lt;next comment body&gt;
+
+[sent from sm APP app]</code></pre>
+<p><code>APP</code> is <code>phone</code> when the request signed in as the owner's phone (device token or mobile Cloudflare Access), <code>web</code> when it signed in through the browser, and the trailer is <code>[sent from sm app]</code> otherwise.</p>
 <p>One blank line between the overall body and the first comment, and between comments; no blank line after the header. Each quote is trimmed, capped at 300 characters (<code>…</code> appended when cut) and prefixed <code>&gt; </code> per line.</p>
 
 <h4>D5. Assigning a GitHub review to a new agent</h4>
