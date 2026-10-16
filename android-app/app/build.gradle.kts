@@ -115,6 +115,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("io.noties.markwon:core:4.6.2")
+    implementation("io.noties.markwon:ext-tables:4.6.2")
+    implementation("io.noties.markwon:linkify:4.6.2")
 
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))

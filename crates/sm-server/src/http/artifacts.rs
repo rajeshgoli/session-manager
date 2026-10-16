@@ -77,6 +77,7 @@ pub(super) async fn list(
             }
             let mut value = svc.store.detail(&root.path, a["name"].as_str().unwrap())?;
             backup_estimate(svc, &mut value);
+            markdown_fields(&mut value);
             if let Some(epic) = value["epic"].as_str() {
                 let e = epics.entry(epic.into()).or_default();
                 e.0 += value["disk_bytes"].as_u64().unwrap_or(0);
@@ -116,7 +117,25 @@ pub(super) async fn show(
         .map_err(refusal)?;
     let mut detail = svc.store.detail(&root.path, &name).map_err(refusal)?;
     backup_estimate(svc, &mut detail);
+    markdown_fields(&mut detail);
     Ok(Json(detail).into_response())
+}
+
+/// Reuse the guestbook renderer: no raw HTML or remote images, safe link targets.
+fn markdown_fields(a: &mut Value) {
+    let description = a["description"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| a["note"].as_str())
+        .unwrap_or_default();
+    a["description_html"] = json!(crate::guestbook::render_entry_html(description));
+    let raw = a["report"]["detail_json"].as_str().unwrap_or_default();
+    let report = serde_json::from_str::<Value>(raw).ok();
+    let note = report
+        .as_ref()
+        .and_then(|r| r["note"].as_str())
+        .unwrap_or(raw);
+    a["report_html"] = json!(crate::guestbook::render_entry_html(note));
 }
 
 /// Until the backup worker supplies measured rates, label estimates with the
@@ -744,5 +763,26 @@ impl AppState {
         self.session_store
             .drain_runtime_pending_message_targets_by_category("artifact")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+    #[test]
+    fn artifact_cards_render_markdown_and_reject_active_content() {
+        let mut a = json!({"description":"## Saved work\n\n**Keep** [source](https://example.com)\n\n| File | Use |\n| --- | --- |\n| data | training |\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))", "report":{"detail_json":"{\"note\":\"- Retain `data`\"}"}});
+        markdown_fields(&mut a);
+        let html = a["description_html"].as_str().unwrap();
+        assert!(html.contains("<h2>Saved work</h2>"));
+        assert!(html.contains("<strong>Keep</strong>"));
+        assert!(html.contains("<table>"));
+        assert!(html.contains("href=\"https://example.com\""));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(a["report_html"]
+            .as_str()
+            .unwrap()
+            .contains("<code>data</code>"));
     }
 }
