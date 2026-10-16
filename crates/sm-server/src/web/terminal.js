@@ -14,6 +14,11 @@ const back = () => history.length > 1 ? history.back() : navigate('/');
 const PING_MS = 5000;
 // A direct path that answered its probe attaches in well under this; past it, use the relay.
 const DIRECT_HANDSHAKE_MS = 5000;
+// A window resize reaches the PTY once the window has been still this long (#2242)...
+const RESIZE_SETTLE_MS = 150;
+// ...and once the agent has redrawn at that size, a one-column nudge makes it repaint every cell.
+const REDRAW_SETTLE_MS = 400;
+const REDRAW_NUDGE_MS = 120;
 const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 // Terminal links open in a new tab; web URLs only.
 const openLink = (event, uri) => {
@@ -178,11 +183,34 @@ export function TerminalPage({ id, open }) {
     const send = (frame) => {
       if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
     };
-    const resize = () => {
+    // Dragging a window edge fires dozens of sizes a second, and each one makes the agent
+    // redraw. Claude's renderer rewrites only the cells it thinks changed, so a redraw cut
+    // short by the next size leaves stale cells that no later redraw clears (#2242). Only
+    // the size the window settles on goes to the PTY; a one-column nudge then repaints it all.
+    let resizeTimer = null, nudgeTimer = null, sentSize = '';
+    const fitNow = () => {
+      clearTimeout(resizeTimer);
       const size = fit.proposeDimensions();
-      if (!size) return;
-      terminal.resize(Math.max(10, Math.min(300, size.cols)), Math.max(2, Math.min(120, size.rows)));
+      if (!size) return false;
+      // At least 11 columns, so the nudge stays within the bridge's 10-column floor.
+      terminal.resize(Math.max(11, Math.min(300, size.cols)), Math.max(2, Math.min(120, size.rows)));
+      const now = `${terminal.cols}x${terminal.rows}`;
+      if (now === sentSize || !socket || socket.readyState !== WebSocket.OPEN) return false;
+      sentSize = now;
       send({ type: 'resize', cols: terminal.cols, rows: terminal.rows });
+      return true;
+    };
+    const redraw = () => {
+      clearTimeout(nudgeTimer);
+      if (!live) return;
+      send({ type: 'resize', cols: terminal.cols - 1, rows: terminal.rows });
+      nudgeTimer = setTimeout(() => send({ type: 'resize', cols: terminal.cols, rows: terminal.rows }), REDRAW_NUDGE_MS);
+    };
+    const resize = () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (fitNow() && live) { clearTimeout(nudgeTimer); nudgeTimer = setTimeout(redraw, REDRAW_SETTLE_MS); }
+      }, RESIZE_SETTLE_MS);
     };
     const input = (data) => {
       if (!live) return;
@@ -195,6 +223,7 @@ export function TerminalPage({ id, open }) {
       paste: (text) => { if (!live) return false; input(`\x1b[200~${text}\x1b[201~`); terminal.focus(); return true; },
       model: () => { input('\x1b[200~/model\x1b[201~\r'); terminal.focus(); },
       focus: () => terminal.focus(),
+      redraw: () => { redraw(); terminal.focus(); },
     };
     // Round trips (G3): the bridge answers each ping from its loop, without the PTY.
     const ping = () => {
@@ -253,7 +282,8 @@ export function TerminalPage({ id, open }) {
           if (stopped || socket !== ws) { ws.close(); return; }
           terminal.reset();
           send({ type: 'auth', ticket_id: ticket.ticket_id, ticket_secret: ticket.ticket_secret, output_ack: true });
-          resize();
+          sentSize = '';
+          fitNow();
         };
         ws.onmessage = (event) => {
           if (stopped || socket !== ws) return;
@@ -316,10 +346,10 @@ export function TerminalPage({ id, open }) {
     window.addEventListener('pagehide', pagehide);
     window.addEventListener('pageshow', pageshow);
     setConnection('Connecting');
-    resize();
+    fitNow();
     connect();
     return () => {
-      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
+      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
   }, [id, attempt]);
@@ -343,11 +373,15 @@ export function TerminalPage({ id, open }) {
       ${agent?.remote_control?.url?.startsWith('https://claude.ai/code/') ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
       ${agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null}
       <${BugButton} page="Terminal" />
+      <button type="button" class="btn sm" disabled=${connection !== 'Live'} title="Repaint the agent's screen"
+        onClick=${() => control.current?.redraw()}>Redraw</button>
       <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
     </div>
     <div class=${`term-main${switcher ? ' with-switch' : ''}${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
       ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
-        idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
+        idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>`
+        : html`<button type="button" class="term-switch-strip" title="Show agents (⌘\\)" aria-label="Unfold agent list"
+            onClick=${() => { toggleSwitcher(); refocus(); }}></button>`}
       <div class="term-body" ref=${host}></div>
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
