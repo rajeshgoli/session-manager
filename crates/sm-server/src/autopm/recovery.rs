@@ -84,6 +84,16 @@ pub trait Runtime {
 
 /// Whether a previously filed recovery ticket still describes the required work.
 pub fn current(conn: &Connection, job: &Job, now: i64) -> Result<bool> {
+    let cancelled: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM autopm_recovery r
+         LEFT JOIN autopm_fixes f ON f.repo=?2 AND f.number=r.number
+         WHERE r.key=?1 AND (r.done=1 OR f.cancelled_at_ms IS NOT NULL))",
+        params![job.key, REPO],
+        |r| r.get(0),
+    )?;
+    if cancelled {
+        return Ok(false);
+    }
     let Some(x) = experiments::get(conn, &job.experiment)? else {
         return Ok(false);
     };
@@ -91,17 +101,34 @@ pub fn current(conn: &Connection, job: &Job, now: i64) -> Result<bool> {
 }
 
 pub fn tick(store: &AutopmStore, now: i64, runtime: &dyn Runtime) -> Result<()> {
-    let conn = store.open()?;
+    let mut conn = store.open()?;
     schema(&conn)?;
-    for x in experiments::list(&conn)? {
-        if let Some((mode, epoch)) = due(&conn, &x, now)? {
-            let job = job(&x, mode, epoch);
-            conn.execute(
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for x in experiments::list(&tx)? {
+        if let Some((mode, epoch)) = due(&tx, &x, now)? {
+            let mut job = job(&x, mode, epoch);
+            // Keep old tickets cancelled. A returning obligation gets a fresh
+            // filing key only after the previous cancellation has finished.
+            let prefix = format!("{}:activation:", job.key);
+            let (count, pending): (i64, i64) = tx.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(done=0),0) FROM autopm_recovery
+                 WHERE key=?1 OR substr(key,1,length(?2))=?2",
+                params![job.key, prefix],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if pending > 0 {
+                continue;
+            }
+            if count > 0 {
+                job.key = format!("{prefix}{count}");
+            }
+            tx.execute(
                 "INSERT OR IGNORE INTO autopm_recovery(key,payload) VALUES(?1,?2)",
                 params![job.key, serde_json::to_string(&job)?],
             )?;
         }
     }
+    tx.commit()?;
     let jobs: Vec<(String, Option<i64>)> = conn
         .prepare("SELECT payload,number FROM autopm_recovery WHERE done=0 ORDER BY key")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -203,5 +230,30 @@ fn cancel(conn: &Connection, number: i64, now: i64, runtime: &dyn Runtime) -> Re
             ),
         });
     }
-    runtime.effects(effects)
+    let mut errors = Vec::new();
+    for effect in effects {
+        let action = match &effect {
+            Effect::CloseIssue { .. } => "close".to_owned(),
+            Effect::CancelAutoStart { .. } => "auto-start".to_owned(),
+            Effect::MergeHold { pr, .. } => format!("hold:{pr}"),
+            Effect::Message { session_id, .. } => format!("message:{session_id}"),
+            Effect::WakeAutopm { .. } => unreachable!("cancellation never wakes Auto PM"),
+        };
+        let key = format!("recovery-cancel:{number}:{action}");
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM autopm_notices WHERE key=?1)",
+            [&key],
+            |r| r.get::<_, bool>(0),
+        )? {
+            continue;
+        }
+        match runtime.effects(vec![effect]) {
+            Ok(()) => {
+                AutopmStore::first_notice(conn, &key, now)?;
+            }
+            Err(error) => errors.push(format!("{action}: {error:#}")),
+        }
+    }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
 }

@@ -9,6 +9,7 @@ struct Effects {
     fail_start: Cell<bool>,
     merged: Cell<bool>,
     fail_effects: Cell<bool>,
+    fail_close: Cell<bool>,
     messages: RefCell<Vec<Effect>>,
 }
 impl Runtime for Effects {
@@ -30,6 +31,13 @@ impl Runtime for Effects {
     }
     fn effects(&self, effects: Vec<Effect>) -> Result<()> {
         anyhow::ensure!(!self.fail_effects.get(), "injected cancellation failure");
+        anyhow::ensure!(
+            !self.fail_close.get()
+                || !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CloseIssue { .. })),
+            "injected close failure"
+        );
         self.messages.borrow_mut().extend(effects);
         Ok(())
     }
@@ -127,6 +135,117 @@ fn recovery_reenabled_cleanup_is_cancelled_and_later_revert_gets_new_ticket() {
         .any(|e| matches!(e, Effect::CancelAutoStart { number: 9000, .. })));
     f.set_state("recovery", "reverted");
     recovery::tick(&f.store, T0 + 2, &effects).unwrap();
+    assert_eq!(effects.filed.borrow().len(), 2);
+    assert!(fix(&f.conn(), 9000)
+        .unwrap()
+        .unwrap()
+        .cancelled_at_ms
+        .is_some());
+    assert!(fix(&f.conn(), 9001)
+        .unwrap()
+        .unwrap()
+        .cancelled_at_ms
+        .is_none());
+}
+
+#[test]
+fn recovery_kept_off_on_files_fresh_cleanup_after_cancellation_retries() {
+    let f = Fixture::new("recovery-kept-resume");
+    seed(&f, "kept", true);
+    let effects = Effects::default();
+    let now = T0 + 30 * DAY_MS;
+    recovery::tick(&f.store, now, &effects).unwrap();
+    f.claim(9000, "worker", now, true);
+    f.conn()
+        .execute("UPDATE experiment_switches SET on_=0", [])
+        .unwrap();
+    effects.fail_close.set(true);
+    assert!(recovery::tick(&f.store, now + 1, &effects).is_err());
+    assert_eq!(
+        effects
+            .messages
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Effect::Message { .. }))
+            .count(),
+        1
+    );
+    // Return before the failed close succeeds: cancellation must still finish.
+    f.conn()
+        .execute("UPDATE experiment_switches SET on_=1", [])
+        .unwrap();
+    assert!(recovery::tick(&f.store, now + 2, &effects).is_err());
+    assert_eq!(effects.filed.borrow().len(), 1);
+    effects.fail_close.set(false);
+    recovery::tick(&f.store, now + 3, &effects).unwrap();
+    recovery::tick(&f.store, now + 4, &effects).unwrap();
+    recovery::tick(&f.store, now + 5, &effects).unwrap();
+    assert_eq!(effects.filed.borrow().len(), 2);
+    assert!(fix(&f.conn(), 9000)
+        .unwrap()
+        .unwrap()
+        .cancelled_at_ms
+        .is_some());
+    assert!(fix(&f.conn(), 9001)
+        .unwrap()
+        .unwrap()
+        .cancelled_at_ms
+        .is_none());
+    assert_eq!(
+        effects
+            .messages
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Effect::Message { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        effects
+            .messages
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Effect::CancelAutoStart { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        effects
+            .messages
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, Effect::CloseIssue { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn recovery_kept_off_on_revives_completed_obligation_with_same_kept_time() {
+    let f = Fixture::new("recovery-kept-completed");
+    seed(&f, "kept", true);
+    let effects = Effects::default();
+    let now = T0 + 30 * DAY_MS;
+    recovery::tick(&f.store, now, &effects).unwrap();
+    f.conn()
+        .execute("UPDATE experiment_switches SET on_=0", [])
+        .unwrap();
+    recovery::tick(&f.store, now + 1, &effects).unwrap();
+    let done: bool = f
+        .conn()
+        .query_row(
+            "SELECT done FROM autopm_recovery WHERE number=9000",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(done);
+    f.conn()
+        .execute("UPDATE experiment_switches SET on_=1", [])
+        .unwrap();
+    recovery::tick(&f.store, now + 2, &effects).unwrap();
+    recovery::tick(&f.store, now + 3, &effects).unwrap();
+    assert_eq!(f.get("recovery").kept_at_ms, Some(T0));
     assert_eq!(effects.filed.borrow().len(), 2);
     assert!(fix(&f.conn(), 9000)
         .unwrap()
