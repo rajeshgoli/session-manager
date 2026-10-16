@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto PM readout 2026-W42</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>Auto PM readout — week 42, 2026</h1>
+<p class="sans"><small>Author: Auto PM, Claude Opus 5.5 <code>9d6ee0e7</code> · Cycle ticket #2232 · Goal #2170 · 2026-10-15</small></p>
+
+<p><b>I shipped nothing this week, on purpose.</b> The record of what you do on each surface (Android app, web, typing to agents) is one day old, and a measured change needs 14 days of it as a baseline. The one idea with prior evidence, decision cards on asks that need your judgment, is not yet supported by sm's history. No change is live or being measured, no switch was flipped, and nothing waits on you.</p>
+
+<h3>What the data says about asks that need your judgment</h3>
+<p>An <i>ask</i> here is an agent's request for your review of a doc (<code>sm doc publish --review</code>) or a message that waits for your reply (<code>sm send rajesh --blocking</code>). I measured the time from each ask to your answer from sm's records, which start on Sep 24:</p>
+<figure>
+<svg viewBox="0 0 640 170" role="img" aria-label="Hours to answer an ask, median and 75th percentile, per week">
+  <g font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" fill="currentColor">
+    <line x1="150" y1="10" x2="150" y2="150" stroke="#8a8880"/>
+    <text x="150" y="165" text-anchor="middle">0 h</text><text x="290" y="165" text-anchor="middle">3 h</text>
+    <text x="430" y="165" text-anchor="middle">6 h</text><text x="570" y="165" text-anchor="middle">9 h</text>
+    <text x="0" y="28">Doc reviews, Sep 25–Oct 1</text>
+    <rect x="150" y="18" width="9" height="7" fill="#2a78d6"/><rect x="150" y="27" width="26" height="7" fill="#eb6834"/>
+    <text x="0" y="50">Doc reviews, Oct 2–8</text>
+    <rect x="150" y="40" width="27" height="7" fill="#2a78d6"/><rect x="150" y="49" width="128" height="7" fill="#eb6834"/>
+    <text x="0" y="72">Doc reviews, Oct 9–15</text>
+    <rect x="150" y="62" width="15" height="7" fill="#2a78d6"/><rect x="150" y="71" width="30" height="7" fill="#eb6834"/>
+    <text x="0" y="96">Replies to asks, Sep 25–Oct 1</text>
+    <rect x="150" y="86" width="12" height="7" fill="#2a78d6"/><rect x="150" y="95" width="32" height="7" fill="#eb6834"/>
+    <text x="0" y="118">Replies to asks, Oct 2–8</text>
+    <rect x="150" y="108" width="49" height="7" fill="#2a78d6"/><rect x="150" y="117" width="420" height="7" fill="#eb6834"/>
+    <text x="574" y="124">12 h</text>
+    <text x="0" y="140">Replies to asks, Oct 9–15</text>
+    <rect x="150" y="130" width="10" height="7" fill="#2a78d6"/><rect x="150" y="139" width="45" height="7" fill="#eb6834"/>
+  </g>
+</svg>
+<figcaption>Hours from ask to your answer. Blue: median ask. Orange: the ask slower than three in four (75th percentile). 92 doc-review asks and 82 reply asks in total. The week of Oct 2–8 had a slow tail; the other weeks did not.</figcaption>
+</figure>
+<p>The median ask is answered within an hour every week, usually within 20 minutes, so most asks do not stall. A card is meant for the few that do, like the day plan in fractal-algo-rust #2114, open since Oct 14. These figures pool all asks, so they neither support nor rule out the card; I first need to find what the stalled asks share and measure that subset. A card also needs agents to supply the choices, which changes text agents rely on and needs your yes; I will not ask before the evidence is better.</p>
+<p><b>A data trap, avoided.</b> Until 21:42 on Oct 15 the web log shows you opening the inbox and queue every minute. That was a tab loaded before the web client marked its background polls; it stopped on reload. I filed no fix, and my queries exclude web rows before 22:00 that day.</p>
+
+<h3>Spend and score</h3>
+<table>
+<thead><tr><th>Provider</th><th>Weekly allowance</th><th>Spent</th><th>Standing holds</th><th>Left for new builds</th></tr></thead>
+<tbody>
+<tr><td>Claude (resets Oct 18)</td><td>20 points</td><td>2.6: 2.5 building the Auto PM itself, 0.1 this seat</td><td>4.9 (my seat, reviews)</td><td>12.5</td></tr>
+<tr><td>Codex (resets Oct 22)</td><td>20 points</td><td>2.0 building the Auto PM itself</td><td>5.0 (reviews)</td><td>12.9</td></tr>
+</tbody>
+</table>
+<p>A <i>point</i> is 1% of a provider's weekly quota, as on the app's usage meter. Score: 0 kept of 0 finished; no votes, no owner reverts. With nothing measured, this cycle does not count toward the four-cycle auto-pause.</p>
+
+<h3>Next week's picks</h3>
+<ol>
+<li>Find what stalled asks share: doc length, number of choices, your surface, whether a push reached you. This decides whether decision cards earn a plan.</li>
+<li>Check whether Android inbox opens follow pushes about things you asked for. Today had 2 push-tagged opens.</li>
+<li>Plan the first switched change when the activity record reaches 14 days, on Oct 29.</li>
+</ol>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
