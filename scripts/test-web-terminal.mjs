@@ -204,9 +204,44 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     await page.keyboard.press('Meta+Backslash');
     await page.waitForFunction(() => !document.querySelector('.term-switch'));
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'false');
+    // Folded, the list leaves a thin line at the left edge; clicking it unfolds the list (#2242).
+    const strip = page.getByRole('button', { name: 'Unfold agent list' });
+    assert.ok((await strip.boundingBox()).width <= 8);
+    await strip.click();
+    await page.locator('.term-switch').waitFor();
+    assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'true');
+    assert.equal(await strip.count(), 0);
     // After all that switching, sm at the top left goes home in one click.
     await page.locator('.term-bar').getByRole('link', { name: 'sm', exact: true }).click();
     await page.waitForFunction(() => location.pathname === '/' && !document.querySelector('.term-bar'));
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('a burst of window sizes reaches the PTY once, then a one-column nudge repaints it; Redraw nudges too', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.getByText('Live', { exact: true }).waitFor();
+    const sizes = () => page.evaluate(() => window.sockets[0].sent.filter((f) => f.type === 'resize').map((f) => `${f.cols}x${f.rows}`));
+    const [first] = await sizes();
+    assert.equal((await sizes()).length, 1, 'one size on attach');
+    // Twenty sizes in quick succession, as dragging a window edge produces (#2242).
+    for (let i = 0; i < 20; i += 1) {
+      await page.setViewportSize({ width: 1400 - i * 20, height: 900 - i * 5 });
+      await page.waitForTimeout(30);
+    }
+    await page.waitForFunction(() => window.sockets[0].sent.filter((f) => f.type === 'resize').length >= 4);
+    await page.waitForTimeout(600);
+    const after = (await sizes()).slice(1);
+    assert.equal(after.length, 3, `only the settled size and the nudge pair: ${after}`);
+    const [cols, rows] = after[0].split('x').map(Number);
+    assert.notEqual(after[0], first);
+    assert.deepEqual(after.slice(1), [`${cols - 1}x${rows}`, `${cols}x${rows}`]);
+    await page.getByRole('button', { name: 'Redraw' }).click();
+    await page.waitForFunction(() => window.sockets[0].sent.filter((f) => f.type === 'resize').length === 6);
+    assert.deepEqual((await sizes()).slice(4), [`${cols - 1}x${rows}`, `${cols}x${rows}`]);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
