@@ -451,6 +451,21 @@ button.sw-sec { cursor: pointer; }
 .settings-preview .sub, .settings-preview code { display: block; }
 .settings-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9rem; margin-bottom: 0; }
 .settings-device { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+/* Settings › Auto PM and What changed (spec 2170 F.3) */
+.autopm-budget { display: grid; grid-template-columns: auto 1fr; gap: 6px 20px; margin: 0 0 18px; }
+.autopm-waiting { display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left; margin: 0 0 14px;
+  padding: 12px; border-radius: 7px; border: 1px solid var(--amber); background: var(--panel); color: var(--ink); cursor: pointer; }
+.autopm-card { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 12px 14px; margin: 18px 0; }
+.autopm-card h3 { margin: 0 0 10px; display: flex; gap: 10px; align-items: baseline; }
+.autopm-card h4 { margin: 16px 0 6px; font-size: .867rem; color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; }
+.autopm-change { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.autopm-change-text { min-width: 0; }
+.autopm-change-text .sub { margin: 3px 0 0; overflow-wrap: anywhere; }
+.autopm-change.ended strong { color: var(--ink-2); }
+.autopm-thumbs { display: inline-flex; gap: 6px; flex: none; }
+.autopm-chip { display: flex; gap: 8px; align-items: center; padding: 6px 10px; margin: 0 0 10px; border-radius: 7px;
+  border: 1px solid var(--accent); background: var(--panel); }
+.autopm-chip > span:first-child { flex: 1; min-width: 0; }
 .settings-about { display: grid; grid-template-columns: auto 1fr; gap: 10px 20px; }
 .settings-about dd { margin: 0; overflow-wrap: anywhere; }
 @media (max-width: 700px) {

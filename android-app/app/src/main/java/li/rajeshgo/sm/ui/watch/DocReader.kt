@@ -314,7 +314,8 @@ private class ReaderLoad {
 
 private fun WebView.loadOwnerPage(url: String, auth: DocReaderAuth, load: ReaderLoad) {
     load.failed = false
-    loadUrl(url, auth.headers)
+    // The page load carries the screen and nav headers as the app's own requests do (spec 2170 A.5).
+    loadUrl(url, auth.headers + li.rajeshgo.sm.data.remote.ClientNav.headers())
 }
 
 @Composable
@@ -326,6 +327,7 @@ fun DocReaderOverlay(
     /** Extra buttons before Close, such as the Inbox's Agent (sm#1647). */
     actions: (@Composable () -> Unit)? = null,
 ) {
+    li.rajeshgo.sm.ui.navigation.ScreenName("doc")
     val auth by produceState<Result<DocReaderAuth?>?>(null, page) { value = runCatching { loadAuth() } }
     // Our own back stack: WebView history navigation would re-request pages
     // without the auth headers, so back reloads the previous URL with them.

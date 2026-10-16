@@ -30,6 +30,8 @@ object FollowPush {
     const val CHANNEL_ID = "agent_follow"
     const val ACTION_OPEN_FOLLOW = "li.rajeshgo.sm.OPEN_FOLLOW"
     const val EXTRA_FOLLOW_ID = "follow_id"
+    /** The push's notice id (a follow's id for follow pushes), sent as `x-sm-nav: push:<id>` (spec 2170 A.5). */
+    const val EXTRA_NOTICE_ID = "notice_id"
     const val EXTRA_SESSION_ID = "session_id"
     const val EXTRA_READER_PATH = "reader_path"
     const val EXTRA_TITLE = "title"
@@ -140,6 +142,7 @@ object FollowPush {
             action = ACTION_OPEN_FOLLOW
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_FOLLOW_ID, message.followId)
+            putExtra(EXTRA_NOTICE_ID, message.followId)
             putExtra(EXTRA_SESSION_ID, message.sessionId)
             putExtra(EXTRA_READER_PATH, message.readerPath)
             putExtra(EXTRA_TITLE, message.title)

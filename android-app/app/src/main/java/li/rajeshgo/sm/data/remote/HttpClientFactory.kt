@@ -61,7 +61,7 @@ class HttpClientFactory(
             .followSslRedirects(false)
             .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
             .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
-            .addInterceptor(AuthInterceptor { token })
+            .addInterceptor(AuthInterceptor(getToken = { token }))
             .addInterceptor(PageDataRecorder(PageDataRecorder.pages))
 
         if (includeLogging) {

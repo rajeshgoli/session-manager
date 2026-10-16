@@ -5,7 +5,7 @@
 import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  html, api, bus, build, network, pageData, usePoll, useShared, setShared, stored, store, panels,
+  html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, stored, store, panels,
   openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
@@ -125,6 +125,7 @@ function App() {
     window.addEventListener('popstate', pop);
     const offs = [
       bus.on('navigate', async (path) => {
+        clientNav.acted();
         if (!(await canLeaveNotes())) return;
         openOrigin = null;
         const target = PAGES.find((p) => p.path === path);
@@ -136,6 +137,7 @@ function App() {
         setLoc(readLocation());
       }),
       bus.on('open', async (ref) => {
+        clientNav.acted();
         const current = readLocation();
         if (current.open === ref) return;
         if (!(await canLeaveNotes())) return;
@@ -162,6 +164,8 @@ function App() {
   }, []);
 
   const page = pageFor(loc.path);
+  // Every owner request names the screen it came from (spec 2170 A.5).
+  clientNav.setScreen(() => screenFor(page, loc.open, `${location.pathname}${location.hash}`));
   // Page data for a bug report is what this page fetched since it opened.
   const marked = useRef(null);
   if (marked.current !== page) { marked.current = page; pageData.markPage(); }

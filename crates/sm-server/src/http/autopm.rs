@@ -498,6 +498,135 @@ pub(super) async fn feedback(
     .await
 }
 
+/// How long a reverted change stays under "Recently ended" (F.3).
+const ENDED_SHOWN_MS: i64 = 14 * 86_400_000;
+const ENDED_SHOWN: usize = 5;
+
+/// `GET /client/autopm`: what Settings › Auto PM and the What changed card
+/// show on Android and the web (F.3, sm#2176): the on/off, skip and pause
+/// state, this week's budget, live and recently ended changes with the
+/// owner's latest vote, decisions waiting on the owner, and the latest
+/// readout.
+pub(super) async fn client_view(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
+    blocking(move || {
+        let store = store(&state);
+        let settings = settings(&state)?;
+        let now = autopm::now_ms();
+        let conn = store.open()?;
+        let all = experiments::list(&conn).map_err(|e| ApiError::Internal(e.into()))?;
+        let votes = latest_votes(&conn).map_err(|e| ApiError::Internal(e.into()))?;
+        let card = |x: &experiments::Experiment| {
+            json!({
+                "id": x.id,
+                "title": x.title,
+                "line": x.hypothesis,
+                "state": x.state,
+                "switch_key": x.switch_key,
+                "live_at_ms": x.live_at_ms,
+                "measure_at_ms": x.measure_at_ms,
+                "kept_at_ms": x.kept_at_ms,
+                "ended_at_ms": (x.state == "reverted").then_some(x.updated_at_ms),
+                "decision_note": x.decision_note,
+                "vote": votes.get(&x.id),
+            })
+        };
+        let changes: Vec<Value> = all
+            .iter()
+            .filter(|x| {
+                experiments::counts_live(&x.state)
+                    || (x.state == "kept" && experiments::in_kept_period(x, now))
+            })
+            .map(card)
+            .collect();
+        let mut ended: Vec<&experiments::Experiment> = all
+            .iter()
+            .filter(|x| {
+                x.state == "reverted"
+                    && x.live_at_ms.is_some()
+                    && now - x.updated_at_ms < ENDED_SHOWN_MS
+            })
+            .collect();
+        ended.sort_by_key(|x| std::cmp::Reverse(x.updated_at_ms));
+        let waiting: Vec<Value> = all
+            .iter()
+            .filter(|x| x.state == "awaiting_owner")
+            .map(|x| json!({"id": x.id, "title": x.title, "path": x.path}))
+            .collect();
+        let budget = budget::status(&store, &settings, now)
+            .map(|status| status["providers"].clone())
+            .unwrap_or(Value::Null);
+        Ok(Json(json!({
+            "enabled": settings.enabled,
+            "paused_at": settings.paused_at,
+            "skip_window_starting": settings.skip_window_starting,
+            "skipped": budget.as_object().is_some_and(|providers| providers
+                .values()
+                .any(|provider| provider["skipped"] == true)),
+            "budget": budget,
+            "changes": changes,
+            "ended": ended.into_iter().take(ENDED_SHOWN).map(card).collect::<Vec<_>>(),
+            "waiting": waiting,
+            "readout": latest_readout(&conn).map_err(|e| ApiError::Internal(e.into()))?,
+            "switches": state.autopm_switches.effective(),
+            "switches_version": state.autopm_switches.version(),
+        })))
+    })
+    .await
+}
+
+/// Each experiment's latest owner vote, `up` or `down`.
+fn latest_votes(conn: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT experiment_id, vote FROM autopm_votes v WHERE id =
+           (SELECT MAX(id) FROM autopm_votes w WHERE w.experiment_id = v.experiment_id)",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
+/// The newest published readout (G.2), as the doc reader opens it.
+fn latest_readout(conn: &rusqlite::Connection) -> rusqlite::Result<Option<Value>> {
+    let has_docs = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'owner_docs'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_docs {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT repo, path, title FROM owner_docs
+         WHERE path LIKE 'docs/autopm/readouts/%' AND pr_number IS NULL AND retracted_at IS NULL
+           AND (repo = ?1 OR repo LIKE '%/' || ?1)
+         ORDER BY path DESC LIMIT 1",
+        [crate::owner_docs::repo_name(autopm::REPO)],
+        |row| {
+            let (repo, path, title): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            let week = path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".html"))
+                .and_then(|name| name.split_once('-').map(|(_, week)| week.to_owned()));
+            Ok(json!({
+                "title": title,
+                "week": week,
+                "reader_path": format!("/docs/{}", crate::owner_docs::doc_name(&repo, &path)),
+            }))
+        },
+    )
+    .optional()
+}
+
 /// Applies an owner settings change to the auto PM: the kill switch (B.5),
 /// enable (C.4 standing reservations), and skip (C.1).
 pub(super) fn on_settings_change(state: &AppState, before: &Settings, after: &Settings) {

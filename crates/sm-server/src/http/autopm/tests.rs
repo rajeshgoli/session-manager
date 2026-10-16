@@ -246,6 +246,63 @@ async fn feedback_is_owner_only_and_a_thumbs_down_switches_the_change_off() {
     assert!(status.is_client_error(), "{status}");
 }
 
+#[tokio::test]
+async fn client_view_lists_live_changes_votes_waiting_decisions_and_the_latest_readout() {
+    let state = state();
+    seed_live(&state);
+    let conn = store(&state).open().unwrap();
+    crate::owner_docs::init_owner_docs_schema(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO autopm_experiments (id, cycle_ticket, title, hypothesis, path,
+           window_days, state, created_at_ms, updated_at_ms)
+         VALUES ('x-2026w43-rows', 3001, 'Prune rows', 'h', 'shadow', 14, 'awaiting_owner', 1, 1);
+         INSERT INTO owner_docs (id, repo, path, author_session_id, title, created_at, updated_at)
+         VALUES ('d1', 'rajeshgoli/session-manager', 'docs/autopm/readouts/2026-W42.html', 's',
+                 'Readout W42', 't', 't'),
+                ('d2', 'rajeshgoli/session-manager', 'docs/autopm/readouts/2026-W43.html', 's',
+                 'Readout W43', 't', 't');",
+    )
+    .unwrap();
+    let app = router(state.clone());
+    let owner =
+        test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+    let (status, body) = browser_host_get(&app, "/client/autopm", Some(&owner)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["changes"][0]["id"], "x-2026w43-card");
+    assert_eq!(body["changes"][0]["switch_key"], "autopm.card");
+    assert_eq!(body["changes"][0]["vote"], Value::Null);
+    assert_eq!(body["ended"], json!([]));
+    assert_eq!(body["waiting"][0]["id"], "x-2026w43-rows");
+    assert_eq!(body["readout"]["week"], "W43");
+    assert_eq!(
+        body["readout"]["reader_path"],
+        "/docs/session-manager/docs/autopm/readouts/2026-W43.html"
+    );
+    let ctx_settings = settings(&state).unwrap();
+    let autopm_store = store(&state);
+    experiments::vote(
+        &ctx(&state, &autopm_store, &ctx_settings),
+        "x-2026w43-card",
+        false,
+        None,
+    )
+    .unwrap();
+    let (_, body) = browser_host_get(&app, "/client/autopm", Some(&owner)).await;
+    assert_eq!(body["changes"], json!([]), "a 👎 ends the change");
+    assert_eq!(body["ended"][0]["id"], "x-2026w43-card");
+    assert_eq!(body["ended"][0]["vote"], "down");
+    assert!(body["ended"][0]["ended_at_ms"].is_i64());
+    let anonymous = public_request_with_host(
+        Method::GET,
+        "/client/autopm",
+        Body::empty(),
+        "sm.example.com",
+    );
+    let status = app.clone().oneshot(anonymous).await.unwrap().status();
+    assert!(status.is_client_error(), "{status}");
+}
+
 #[test]
 fn review_run_tokens_come_from_the_runs_own_output() {
     let codex = [

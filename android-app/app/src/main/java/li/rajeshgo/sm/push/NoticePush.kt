@@ -56,6 +56,7 @@ object NoticePush {
             action = FollowPush.ACTION_OPEN_FOLLOW
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(FollowPush.EXTRA_SESSION_ID, message.sessionId)
+            putExtra(FollowPush.EXTRA_NOTICE_ID, message.noticeId)
             if (message.kind == KIND_APPROVAL_NEEDED) {
                 putExtra(FollowPush.EXTRA_TITLE, message.title)
             } else {

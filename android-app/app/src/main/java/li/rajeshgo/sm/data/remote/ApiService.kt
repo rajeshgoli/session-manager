@@ -146,6 +146,19 @@ interface ApiService {
     @GET("client/settings")
     suspend fun getOwnerSettings(): kotlinx.serialization.json.JsonObject
 
+    /** The app's own switch re-read (spec 2170 B.1): background, never the owner's action. */
+    @GET("client/settings")
+    suspend fun getSwitchSettings(@Header("x-sm-bg") background: String = "1"): kotlinx.serialization.json.JsonObject
+
+    @GET("client/autopm")
+    suspend fun getAutopm(@Header("x-sm-bg") background: String?): li.rajeshgo.sm.data.model.AutopmView
+
+    @POST("client/autopm/feedback")
+    suspend fun sendAutopmFeedback(@Body feedback: li.rajeshgo.sm.data.model.AutopmFeedback): kotlinx.serialization.json.JsonObject
+
+    @PUT("autopm/switches/{key}")
+    suspend fun setAutopmSwitch(@Path("key") key: String, @Body write: li.rajeshgo.sm.data.model.AutopmSwitchWrite): kotlinx.serialization.json.JsonObject
+
     @retrofit2.http.PUT("client/settings")
     suspend fun setOwnerSettings(@Body patch: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 
