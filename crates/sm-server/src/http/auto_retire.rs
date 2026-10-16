@@ -279,6 +279,25 @@ fn repo_dirs(state: &AppState) -> Vec<String> {
     dirs
 }
 
+/// Prepare a retired seat's checkout for either a restore or a successor
+/// handoff. Auto-retire cleanup may already have removed its worktree.
+pub(super) fn rebuild_retired_worktree(
+    state: &AppState,
+    session: &SessionRecord,
+) -> anyhow::Result<()> {
+    let working_dir = expand_home(&session.working_dir).display().to_string();
+    match rebuild_worktree(
+        &work_claim_store(state),
+        &session.id,
+        &working_dir,
+        &repo_dirs(state),
+    ) {
+        Ok(_) => Ok(()),
+        Err(reason) if state.config.rust_core.runtime_enabled => anyhow::bail!(reason),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Restore a stopped or retired session (sm#1839, spec 1821 E3): rebuild its
 /// worktree when it is gone, relaunch it, reopen the claims its retire ended,
 /// and tell it when its branch was gone. History's Restore, the retire

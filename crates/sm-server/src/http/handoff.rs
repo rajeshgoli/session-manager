@@ -451,6 +451,7 @@ pub(super) async fn start_retired_autopm_successor(
         kind: crate::handoff::execute::NoteKind::Path,
         value: note_path,
     };
+    super::auto_retire::rebuild_retired_worktree(state, predecessor)?;
     let Some(plan) = state
         .session_store
         .claim_retired_handoff_start(&predecessor.id, &note)?
@@ -464,6 +465,7 @@ pub(super) async fn start_retired_autopm_successor(
             return Err(anyhow::anyhow!(error));
         }
     };
+    wait_for_successor_readiness(state, &successor).await;
     if let Some(retired_at) = predecessor.completed_at.as_deref() {
         super::claims::work_claim_store(state)
             .reopen_retired_claims(&predecessor.id, retired_at)?;
@@ -481,6 +483,39 @@ pub(super) async fn start_retired_autopm_successor(
         .hand_off_pending_messages(&predecessor.id, &successor.id)?;
     state.session_store.finish_handoff(&predecessor.id)?;
     Ok(Some(successor))
+}
+
+async fn wait_for_successor_readiness(state: &Arc<AppState>, successor: &SessionRecord) {
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let runtime = state
+        .runtime()
+        .for_socket_name(successor.tmux_socket_name.as_deref());
+    let (tmux_session, provider, store, successor_id) = (
+        successor.tmux_session.clone(),
+        successor.provider.clone(),
+        state.session_store.clone(),
+        successor.id.clone(),
+    );
+    let ready = tokio::task::spawn_blocking(move || {
+        if provider == "opencode" {
+            if store.opencode_http_ready(&successor_id)? {
+                Ok(())
+            } else {
+                anyhow::bail!("Opencode successor is not ready")
+            }
+        } else {
+            runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
+        }
+    })
+    .await;
+    if let Ok(Err(error)) = ready {
+        eprintln!(
+            "handoff successor {} not ready for its brief: {error:#}",
+            successor.id
+        );
+    }
 }
 
 /// F.2: the same provider, model, effort, worktree, machine and parent,

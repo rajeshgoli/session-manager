@@ -122,6 +122,10 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     let Some(session) = state.session_store.get_session(&id)? else {
         return Ok(false);
     };
+    let settings = typed(state, &state.session_store.owner_settings()?);
+    if !settings.enabled || settings.paused_at.is_some() || skipped(state, &settings)? {
+        return Ok(true);
+    }
     if super::super::auto_retire::retired_autopm_needs_successor(state, &session) {
         // The cycle wake below remains durably addressed to the retired
         // holder; the message-ready path creates its successor before it is
@@ -133,12 +137,9 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
         return Ok(false);
     };
     let id = session.id;
-    let settings = typed(state, &state.session_store.owner_settings()?);
-    if settings.enabled && settings.paused_at.is_none() && !skipped(state, &settings)? {
-        state.session_store.authorize_autopm_seat(&id)?;
-        store(state).record_seat(&id, autopm::now_ms())?;
-        once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
-    }
+    state.session_store.authorize_autopm_seat(&id)?;
+    store(state).record_seat(&id, autopm::now_ms())?;
+    once(state, &format!("autopm-brief-{id}"), &id, &brief)?;
     Ok(true)
 }
 
