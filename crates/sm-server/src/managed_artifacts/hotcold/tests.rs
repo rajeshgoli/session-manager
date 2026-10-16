@@ -255,3 +255,31 @@ fn managed_artifacts_hotcold_whole_sets_order_and_grace() {
     store::set_meta(&conn, &format!("cold_night:{}", f.root.path), &today).unwrap();
     assert!(!nightly_due(&f.manager, &f.root, OffsetDateTime::now_utc()).unwrap());
 }
+
+#[test]
+fn restart_uses_active_cold_threshold_before_evaluation() {
+    let mut f = Fixture::new();
+    f.root = f.manager.config.roots[0].clone();
+    f.add("data");
+    f.evaluate();
+    let conn = f.manager.store.open().unwrap();
+    let used = (OffsetDateTime::now_utc() - time::Duration::days(10))
+        .format(&Rfc3339)
+        .unwrap();
+    conn.execute(
+        "UPDATE artifacts SET last_used_at=?1 WHERE name='data'",
+        [&used],
+    )
+    .unwrap();
+    assert_eq!(
+        f.manager.store.detail(&f.root.path, "data").unwrap()["hot"],
+        true
+    );
+    let mut config = f.manager.config.clone();
+    config.cold_after_days = 7;
+    let restarted = ManagedArtifacts::new(&config).unwrap();
+    assert_eq!(
+        restarted.store.detail(&f.root.path, "data").unwrap()["hot"],
+        false
+    );
+}
