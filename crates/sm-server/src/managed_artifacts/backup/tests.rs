@@ -1202,3 +1202,37 @@ fn failed_seed_confirmation_rolls_back_applied_destination() {
         0
     );
 }
+
+#[test]
+fn adoption_rejects_file_removed_during_preparation() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![
+        f.dir.join("data").display().to_string(),
+        f.dir.join("projects").display().to_string(),
+    ];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::write(f.dir.join("projects/code"), b"code").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.directory("existing-data").unwrap();
+    fs::copy(f.dir.join("data/prices"), source.join("prices")).unwrap();
+    let removed = source.join("prices");
+    outbox::AFTER_READ.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            fs::remove_file(removed).unwrap();
+        }))
+    });
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("adopted file missing or changed"),
+        "{error:#}"
+    );
+    assert!(dest.records().unwrap().is_empty());
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert!(confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .is_none());
+    assert!(source.exists());
+    assert!(!dest.root.join("plain/data").exists());
+}

@@ -199,6 +199,16 @@ pub fn seed(
             ensure!(target.is_dir(), "adoption source is missing");
         }
     }
+    // Preparation omitted these payloads. Verify the complete saved set after
+    // the move, including entries that vanished between directory scans.
+    for (path, record) in &adopted.files {
+        if prepared.manifest.files.get(path) == Some(record)
+            && !prepared.transfer.changed.iter().any(|r| &r.path == path)
+        {
+            super::client::verify(&dest.root.join(path), record)
+                .with_context(|| format!("adopted file missing or changed: {path}"))?;
+        }
+    }
     prepared.transfer.deleted = dest
         .records()?
         .keys()
