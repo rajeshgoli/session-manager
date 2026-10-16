@@ -25,14 +25,14 @@ function fixture(direct = []) {
   }
   const context = vm.createContext({
     URL, WebSocket:Socket, location:{href:'https://sm.example.com/terminal/test',protocol:'https:',hostname:'sm.example.com'},
-    window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},addEventListener(){},removeEventListener(){},
+    window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},WebLinksAddon:{WebLinksAddon:class {}},addEventListener(){},removeEventListener(){},
       innerWidth:1440,matchMedia:()=>({matches:false})},
     getComputedStyle:()=>({fontSize:'15px'}),document:{documentElement:{}},performance:{now:()=>0},
     setInterval:()=>0,clearInterval(){},config:{},stored:(key,fallback)=>fallback,store(){},sectionAgents:()=>[],
     SECTION_LABEL:{},SECTION_TONE:{},youFact:()=>null,jobsFact:()=>null,agentFact:()=>null,markAnswered(){},
     ResizeObserver:class {observe(){} disconnect(){}},
     useRef:()=>({current:null}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
-    useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null,
+    useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
     api:async()=>({ws_url:'/client/terminal',ticket_id:`test-${++minted}`,ticket_secret:'test',server_instance:'inst',direct}),
     fetch:async()=>({ok:true,json:async()=>({instance:'inst'})}),AbortController,
     setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),

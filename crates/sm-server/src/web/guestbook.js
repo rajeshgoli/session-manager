@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, openPanel } from './ui.js';
+import { html, api, usePoll, openPanel, LinkedText, linkifyHtml } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 import { WorkLinks } from './history.js';
 export function GuestbookPage() {
@@ -11,7 +11,7 @@ export function GuestbookPage() {
     ${!data ? html`<p>Loading…</p>` : !data.entries.length ? html`<p class="empty">No guestbook entries.</p>` : null}
     ${(data?.entries || []).map(entry => html`<article class="history-card">
       <div class="history-heading"><button class="text-button" onClick=${() => openPanel(`agent:${entry.session_id}`)}>${entry.session_name}</button><span>${entry.provider}</span><small>${entry.signed_at}</small></div>
-      ${entry.html ? html`<div class="guestbook-markdown" dangerouslySetInnerHTML=${{__html:safeThreadHtml(entry.html)}} />` : html`<p class="guestbook-text">${entry.text}</p>`}<small>${entry.repos.join(' · ')}</small><${WorkLinks} work=${{tickets:entry.claims}} />
+      ${entry.html ? html`<div class="guestbook-markdown" dangerouslySetInnerHTML=${{__html:linkifyHtml(safeThreadHtml(entry.html))}} />` : html`<p class="guestbook-text"><${LinkedText} text=${entry.text} /></p>`}<small>${entry.repos.join(' · ')}</small><${WorkLinks} work=${{tickets:entry.claims}} />
     </article>`)}
     <div class="list-pagination">${before ? html`<button class="btn" onClick=${() => setBefore('')}>Newest</button>` : null}${data?.next_before ? html`<button class="btn" onClick=${() => setBefore(data.next_before)}>Older →</button>` : null}</div>
   </div>`;

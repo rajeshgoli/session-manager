@@ -115,7 +115,10 @@ export function TerminalPage({ id, open }) {
   const [doc, , reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
   const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
-  const Renderer = panels.get('agent');
+  // Details, and whatever it links to (a ticket, PR, doc or job), open beside the terminal.
+  const split = open ? open.indexOf(':') : -1;
+  const Renderer = split > 0 ? panels.get(open.slice(0, split)) : null;
+  const panelId = split > 0 ? open.slice(split + 1) : null;
 
   const toggleSwitcher = () => { store('sm-term-switcher', !switcher); setSwitcher(!switcher); };
   const toggleIdle = () => { store('sm-term-switcher-idle', !idleOpen); setIdleOpen(!idleOpen); };
@@ -124,7 +127,12 @@ export function TerminalPage({ id, open }) {
     if (narrow() && switcher) { store('sm-term-switcher', false); setSwitcher(false); }
     if (next.id !== id) navigate(`/terminal/${encodeURIComponent(next.id)}`);
   };
-  const refocus = () => setTimeout(() => control.current?.focus(), 0);
+  // A click on the bar gives the keyboard back to the terminal, except inside the
+  // Report-a-bug dialog, which renders within the bar and has its own fields.
+  const refocus = (event) => {
+    if (event?.target?.closest?.('.board-start-overlay')) return;
+    setTimeout(() => control.current?.focus(), 0);
+  };
   // A retired agent's terminal has nothing left to show, so move on to the next agent,
   // or to the Agents page when none is left (going back could land on one retired earlier).
   const retired = (done) => {
@@ -337,16 +345,16 @@ export function TerminalPage({ id, open }) {
       <${BugButton} page="Terminal" />
       <button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>
     </div>
-    <div class=${`term-main${switcher ? ' with-switch' : ''}`}>
+    <div class=${`term-main${switcher ? ' with-switch' : ''}${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
       ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
         idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
       <div class="term-body" ref=${host}></div>
+      ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
+        onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
+      ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} controls=${html`<span class="ctl">
+        <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>
     ${connection !== 'Live' ? html`<div class="term-notice" role="status">${error || connection}
       ${connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
-    ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
-      onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
-    ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel"><${Renderer} id=${id} controls=${html`<span class="ctl">
-      <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
   </div>`;
 }
