@@ -248,7 +248,9 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
-        if raw_handoff_record(session).is_some_and(|record| record.state != HandoffPhase::Failed) {
+        if raw_handoff_record(session).is_some_and(|record| {
+            !matches!(record.state, HandoffPhase::Asked | HandoffPhase::Failed)
+        }) {
             return Ok(None);
         }
         let now = now_rfc3339();
@@ -1113,6 +1115,12 @@ mod tests {
         store
             .fail_handoff("pred0001", "worktree unavailable")
             .unwrap();
+        assert!(store
+            .claim_retired_handoff_start("pred0001", &note())
+            .unwrap()
+            .is_some());
+
+        set_record(&store, "pred0001", "asked");
         assert!(store
             .claim_retired_handoff_start("pred0001", &note())
             .unwrap()
