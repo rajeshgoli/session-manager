@@ -1,10 +1,20 @@
-export function artifactSections(rows, epic = '') {
-  const list = rows.filter(a => (!epic || a.epic === epic) && (a.state !== 'deleted' || a.needs_owner));
-  const groups = [['Needs you', a => a.needs_owner], ['Hot', a => !a.needs_owner && a.hot && a.state !== 'frozen'],
-    ['Cold, live', a => !a.needs_owner && !a.hot && a.state !== 'frozen'], ['Frozen', a => !a.needs_owner && a.state === 'frozen']];
-  return groups.map(([title, test]) => ({ title, rows: list.filter(test).sort((a,b) => artifactBytes(b)-artifactBytes(a)) })).filter(g => g.rows.length);
+export const artifactBytes = a => a[a.state === 'frozen' ? 'frozen_bytes' : 'disk_bytes'] ?? null;
+export function storageSize(bytes) {
+  if (bytes == null || !Number.isFinite(bytes)) return 'Not measured';
+  if (bytes === 0) return '0 MB';
+  if (bytes < 1e6) return '<1 MB';
+  const [unit,divisor] = bytes >= 1e12 ? ['TB',1e12] : bytes >= 1e9 ? ['GB',1e9] : ['MB',1e6];
+  const value = bytes / divisor;
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${unit}`;
 }
-export const artifactBytes = a => (a.state === 'frozen' ? a.frozen_bytes : a.disk_bytes) || 0;
+export const diskName = f => f.path.startsWith('/Volumes/') ? f.path.slice(9).split('/')[0] : 'Mac storage';
+export const needsDecision = a => a.needs_you?.reasons?.includes('would_delete') || false;
+export const needsAgentFollowup = a => a.needs_you?.reasons?.some(r => ['operation_failed','consumer_unverifiable','vanished'].includes(r)) || false;
+export const artifactInventory = (rows, query = '') => rows.filter(a => (a.state !== 'deleted' || needsAgentFollowup(a)) && (!query.trim() || [a.name,a.note,a.epic,a.repo].some(s => s?.toLowerCase().includes(query.toLowerCase()))))
+  .sort((a,b) => (artifactBytes(b) ?? -1) - (artifactBytes(a) ?? -1) || a.name.localeCompare(b.name));
+export const largestArtifacts = rows => artifactInventory(rows).filter(a => !needsDecision(a) && !needsAgentFollowup(a) && artifactBytes(a) >= 1e9).slice(0,5);
+export const artifactSummary = a => a.investigating ? 'Agent investigating' : needsAgentFollowup(a) ? (a.state === 'deleted' ? 'Folder missing · agent follow-up needed' : 'Storage issue · agent follow-up needed') : needsDecision(a) ? 'Cleanup proposed · review before deleting' : a.state === 'unrecorded' ? "Needs an agent’s record" : a.state === 'frozen' ? 'Compressed · restored when needed' : a.hot ? 'In recent use' : 'Saved work';
+export const backupSummary = b => !b ? 'Backup status unavailable' : !b.enabled ? 'Backup is off' : b.confirmed_at ? `Backup confirmed ${b.confirmed_at.slice(0,10)}` : 'No confirmed backup yet';
 export const duration = seconds => seconds == null || !Number.isFinite(seconds) ? 'unknown' : seconds < 60 ? `${Math.ceil(seconds)}s` : `${Math.ceil(seconds / 60)} min`;
 export function backupLabel(a) {
   const returning = a.backup_return_seconds == null ? 'return time not measured' : `estimated return ${duration(a.backup_return_seconds)}`;
@@ -12,15 +22,8 @@ export function backupLabel(a) {
   return a.rebuildable ? `not backed up: rebuilds in ${duration(a.rebuild_seconds)}; ${returning}` : 'not backed up (not rebuildable)';
 }
 
-export function backupNights(runs, now = new Date()) {
-  return Array.from({length:7},(_,i)=>{
-    const day = new Date(now); day.setDate(day.getDate() - (6-i));
-    const date = day.toLocaleDateString('en-CA');
-    const run = runs.find(r => new Date(r.started_at).toLocaleDateString('en-CA') === date);
-    return {date, mark:run ? (['acked','succeeded'].includes(run.state) ? '✓' : '✗') : '—'};
-  });
-}
-export function age(iso) {
-  const days = Math.floor((Date.now()-Date.parse(iso))/86400000);
-  return Number.isFinite(days) ? days < 1 ? 'today' : `${days}d ago` : 'age unknown';
+export function artifactReport(a) {
+  const text = a.report?.detail_json;
+  if (!text) return null;
+  try { return JSON.parse(text).note || text; } catch { return text; }
 }

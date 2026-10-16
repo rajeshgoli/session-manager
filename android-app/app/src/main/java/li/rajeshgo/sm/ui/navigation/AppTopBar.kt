@@ -16,6 +16,7 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.AutoStories
 import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
@@ -56,6 +57,7 @@ class AppMenuActions(
     val onOpenSettings: () -> Unit,
     /** The bug button: captures the screen, then opens Report a bug (spec 1859 C1). */
     val onReportBug: () -> Unit = {},
+    val onOpenArtifacts: () -> Unit = {},
 )
 
 /**
@@ -138,6 +140,9 @@ fun AppTopBar(
                         }
                         if (current != Routes.GUESTBOOK) {
                             MenuEntry("Guestbook", Icons.Rounded.AutoStories) { menuExpanded = false; menu.onOpenGuestbook() }
+                        }
+                        if (current != Routes.ARTIFACTS) {
+                            MenuEntry("Artifacts", Icons.Rounded.Storage) { menuExpanded = false; menu.onOpenArtifacts() }
                         }
                         if (current != Routes.ANALYTICS) {
                             MenuEntry("Analytics", Icons.Rounded.Analytics) { menuExpanded = false; menu.onOpenAnalytics() }

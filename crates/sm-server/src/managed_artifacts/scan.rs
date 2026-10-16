@@ -135,20 +135,47 @@ impl ManagedArtifacts {
         tx.commit()?;
         Ok(())
     }
+    /// Measure unknown folders too: an absent record is agent work, not zero bytes.
+    pub fn measure_one(&self, root: &ArtifactRoot, name: &str) -> Result<Value> {
+        validate_name(name)?;
+        let a = self.store.detail(&root.path, name)?;
+        if !matches!(a["state"].as_str(), Some("live" | "unrecorded")) || !a["op"].is_null() {
+            bail!("artifact must be live or unrecorded and not busy to measure");
+        }
+        let path = Path::new(if a["location"] == "cold" {
+            &root.cold_store
+        } else {
+            &root.path
+        })
+        .join(name);
+        // measure() never follows symlinks or crosses filesystem boundaries.
+        let size = measure(&path)?;
+        self.store.open()?.execute("UPDATE artifacts SET disk_bytes=?3,data_bytes=?4,content_stamp=?5,size_measured_at=?6 WHERE root=?1 AND name=?2 AND state IN ('live','unrecorded') AND op IS NULL",params![root.path,name,size.disk_bytes,size.data_bytes,size.stamp(),now()])?;
+        self.store.open()?.execute(
+            "DELETE FROM artifact_meta WHERE key=?1",
+            [format!("size_error:{}:{name}", root.path)],
+        )?;
+        self.store.detail(&root.path, name)
+    }
     pub fn measure_root(&self, root: &ArtifactRoot) -> Result<()> {
         for a in self.store.list(&root.path)? {
-            if a["state"] != "live" {
+            if !matches!(a["state"].as_str(), Some("live" | "unrecorded")) || !a["op"].is_null() {
                 continue;
             }
             let name = a["name"].as_str().unwrap();
-            let path = Path::new(if a["location"] == "cold" {
-                &root.cold_store
-            } else {
-                &root.path
-            })
-            .join(name);
-            let size = measure(&path)?;
-            self.store.open()?.execute("UPDATE artifacts SET disk_bytes=?3,data_bytes=?4,content_stamp=?5,size_measured_at=?6 WHERE root=?1 AND name=?2 AND state='live' AND op IS NULL",params![root.path,name,size.disk_bytes,size.data_bytes,size.stamp(),now()])?;
+            if let Err(error) = self.measure_one(root, name) {
+                // One missing or unreadable folder must not starve the rest.
+                let conn = self.store.open()?;
+                store::set_meta(
+                    &conn,
+                    &format!("size_error:{}:{name}", root.path),
+                    &error.to_string(),
+                )?;
+                eprintln!(
+                    "artifact size unavailable for {}/{name}; continuing management: {error:#}",
+                    root.path
+                );
+            }
         }
         Ok(())
     }

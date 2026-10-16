@@ -6,6 +6,7 @@
             android:name=".debug.AndroidSmokeActivity"
             android:exported="true"
             android:theme="@style/Theme.SessionManager" />
+        <activity android:name=".debug.ArtifactsPreviewActivity" android:exported="true" android:theme="@style/Theme.SessionManager" />
     </application>
 
 </manifest>

@@ -380,6 +380,7 @@ fn mutate(
         .map_err(refusal)?;
     let result = (|| -> anyhow::Result<Value> {
         match action.as_str() {
+            "measure" => svc.measure_one(root, &name),
             "new" | "record" => {
                 let mut flags: RecordFlags = serde_json::from_value(body.clone())?;
                 if flags.ticket.is_none() {

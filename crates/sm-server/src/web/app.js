@@ -286,7 +286,7 @@ function Rail({ page, layout, updateLayout }) {
   const board = useShared('board_badge');
   const counts = badges(queue, inbox, board);
   const artifacts = useShared('artifacts');
-  counts.artifacts = { count: artifacts?.needs_you_count || 0, tone: 'magenta' };
+  counts.artifacts = { count: (artifacts?.artifacts || []).filter(a => a.needs_you?.reasons?.includes('would_delete')).length, tone: 'amber' };
   const folded = layout.rail === 'folded';
   const item = (p) => {
     const badge = counts[p.key];

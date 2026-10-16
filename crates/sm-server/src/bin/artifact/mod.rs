@@ -67,6 +67,10 @@ enum ArtifactCommand {
         name: String,
     },
     Disk,
+    /// Measure a folder without changing its retention policy. Run bulk walks via sm queue.
+    Measure {
+        name: String,
+    },
     Unclaimable {
         name: String,
         #[arg(long)]
@@ -170,6 +174,7 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
             (name, "thaw", json!({}))
         }
         ArtifactCommand::Rebuild { name } => (name, "rebuild", json!({})),
+        ArtifactCommand::Measure { name } => (name, "measure", json!({})),
         ArtifactCommand::Done { name } => (name, "done", json!({})),
         ArtifactCommand::Consumer {
             name,

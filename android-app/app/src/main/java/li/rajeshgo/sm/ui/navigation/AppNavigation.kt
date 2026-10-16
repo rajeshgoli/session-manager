@@ -183,6 +183,7 @@ fun AppNavigation() {
         onOpenHistory = { navController.navigate(Routes.HISTORY) { launchSingleTop = true } },
         onOpenNotes = { navController.navigate(Routes.NOTES) { launchSingleTop = true } },
         onOpenGuestbook = { navController.navigate(Routes.GUESTBOOK) { launchSingleTop = true } },
+        onOpenArtifacts = { navController.navigate(Routes.ARTIFACTS) { launchSingleTop = true } },
         onOpenAnalytics = { navController.navigate(Routes.ANALYTICS) { launchSingleTop = true } },
         onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
         onReportBug = { context.findActivity()?.let(bugViewModel::open) },

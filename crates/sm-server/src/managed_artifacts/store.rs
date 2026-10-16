@@ -117,6 +117,7 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         &format!("investigating:{root}:{}", name.to_ascii_lowercase())
     )?
     .filter(|s| !s.is_empty()));
+    value["size_error"] = json!(meta(conn, &format!("size_error:{root}:{name}"))?);
     value["report"] = query(conn, "SELECT actor,at,detail_json FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE AND kind='report' ORDER BY id DESC LIMIT 1", &[&root,&name])?.pop().unwrap_or(Value::Null);
     Ok(value)
 }
