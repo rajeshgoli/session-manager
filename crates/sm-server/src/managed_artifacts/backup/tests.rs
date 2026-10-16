@@ -1167,6 +1167,83 @@ fn failed_adoption_returns_original_folder_without_registering_records() {
 }
 
 #[test]
+fn adoption_sync_failure_prevents_confirmation_and_preserves_recovery_journal() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.directory("existing-data").unwrap();
+    fs::copy(f.dir.join("data/prices"), source.join("prices")).unwrap();
+
+    seed::FAIL_ADOPTION_SYNC.set(true);
+    let result = seed::seed_inner(&f.manager, "backup-mini", &mut dest, Some(&source));
+    seed::FAIL_ADOPTION_SYNC.set(false);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("directory sync failure"));
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert!(confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .is_none());
+    assert!(dest.records().unwrap().is_empty());
+    assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
+    assert!(!dest.root.join("plain/data").exists());
+    assert!(dest.meta("pending_seed").unwrap().is_some());
+
+    // The guard already returned the folder, but its sync failed too. Recovery
+    // must retry the sync even though no reverse rename remains to perform.
+    seed::FAIL_ADOPTION_SYNC.set(true);
+    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None);
+    seed::FAIL_ADOPTION_SYNC.set(false);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("directory sync failure"));
+    assert!(dest.meta("pending_seed").unwrap().is_some());
+    drop(dest);
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None).unwrap_err();
+    assert!(error.to_string().contains("unknown backup device"));
+    assert!(dest.meta("pending_seed").unwrap().is_none());
+    assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
+}
+
+#[test]
+fn adoption_recovery_keeps_journal_until_reverse_rename_is_synced() {
+    let f = Fixture::new();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let source = dest.root.join("existing-data");
+    let target = dest.directory("plain/data").unwrap();
+    fs::write(target.join("prices"), b"prices").unwrap();
+    dest.set_meta(
+        "pending_seed",
+        &serde_json::json!({
+            "id": "seed-interrupted", "manifest": Manifest::default(),
+            "adoption": [source, target]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    seed::FAIL_ADOPTION_SYNC.set(true);
+    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None);
+    seed::FAIL_ADOPTION_SYNC.set(false);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("directory sync failure"));
+    assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
+    assert!(!target.exists());
+    assert!(dest.meta("pending_seed").unwrap().is_some());
+    drop(dest);
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None).unwrap_err();
+    assert!(error.to_string().contains("unknown backup device"));
+    assert!(dest.meta("pending_seed").unwrap().is_none());
+    assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
+}
+
+#[test]
 fn failed_seed_confirmation_rolls_back_applied_destination() {
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
