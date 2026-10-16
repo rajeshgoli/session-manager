@@ -972,3 +972,44 @@ fn expired_applied_request_rolls_back_before_requesting_another_delta() {
     dest.rollback("expired").unwrap();
     assert_eq!(dest.records().unwrap(), original);
 }
+
+#[test]
+fn seed_refuses_active_pull_before_changing_destination() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"A").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let records = dest.records().unwrap();
+    lifecycle::request(&f.manager, "backup-mini", Some(&first)).unwrap();
+    fs::write(f.dir.join("data/prices"), b"BBBB").unwrap();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("remote backup request is active"));
+    assert_eq!(dest.records().unwrap(), records);
+    assert_eq!(fs::read(dest.root.join("plain/data/prices")).unwrap(), b"A");
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+}
+
+#[test]
+fn failed_seed_application_removes_destination_staging() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"source").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let plain = dest.directory("plain/data").unwrap();
+    fs::write(plain.join("prices"), b"untracked").unwrap();
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, None).is_err());
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
+    assert_eq!(fs::read(plain.join("prices")).unwrap(), b"untracked");
+    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+}

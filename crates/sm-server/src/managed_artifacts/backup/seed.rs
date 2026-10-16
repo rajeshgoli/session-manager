@@ -16,7 +16,10 @@ impl Drop for SeedOutbox {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("could not remove seed outbox {}: {error}", self.0.display());
+                eprintln!(
+                    "could not remove seed temporary directory {}: {error}",
+                    self.0.display()
+                );
             }
         }
     }
@@ -103,6 +106,20 @@ pub fn seed(
         prepared.deferred.is_empty(),
         "seed source changed during preparation; retry"
     );
+    // Hold the source-store write transaction from the active-request check
+    // through confirmation so no pull can start against the previous head.
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM backup_requests WHERE device=?1 AND state IN ('preparing','ready'))",[device],|r|r.get(0))?;
+    ensure!(
+        !active,
+        "remote backup request is active; seed confirmation deferred"
+    );
+    ensure!(
+        confirmed(&tx, device)?.map(|m| m.manifest_id) == previous,
+        "backup head changed during seed preparation; retry"
+    );
+    let _incoming = SeedOutbox(dest.root.join(".incoming").join(&id));
     if let Some(adopt) = adopt {
         let plain: Vec<_> = scopes.iter().filter(|s| s.plain).collect();
         ensure!(
@@ -189,13 +206,6 @@ pub fn seed(
     )?;
     dest.apply(&id, &prepared.transfer, &staging, true, 1.0)?;
     prepared.manifest.base = previous.clone();
-    let mut conn = manager.store.open()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM backup_requests WHERE device=?1 AND state IN ('preparing','ready'))",[device],|r|r.get(0))?;
-    ensure!(
-        !active,
-        "remote backup request is active; seed confirmation deferred"
-    );
     save_manifest(&tx, device, &prepared.manifest)?;
     confirm(&tx, device, &id)?;
     lifecycle::mark_covered(
