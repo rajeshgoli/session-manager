@@ -49,7 +49,7 @@ working JDK through `JAVA_HOME`.
 
 ```
 cd ..
-VERSION_CODE=2 VERSION_NAME=0.1.1 RELEASE_NOTES="Describe what changed and what to try." ./scripts/deploy_android_app.sh
+RELEASE_NOTES="Describe what changed and what to try." ./scripts/deploy_android_app.sh
 ```
 
 By default the deploy script uploads:
@@ -61,7 +61,7 @@ Every deployment requires a short owner-facing release note through `RELEASE_NOT
 or `RELEASE_NOTES_FILE` (at most 1000 characters). State what changed and what to
 try. The update banner and Settings show it before installation.
 
-You can override those with `APP_NAME`, `SERVER_URL`, `VERSION_CODE`, `VERSION_NAME`, or by passing a different APK path as the first argument.
+You can override those with `APP_NAME`, `SERVER_URL`, or by passing a different APK path as the first argument. The script publishes the version code and name read from the APK itself; the server refuses a version code that is not higher than the published one, because Android cannot install a downgrade.
 
 The server stores:
 - `latest.apk` for convenience

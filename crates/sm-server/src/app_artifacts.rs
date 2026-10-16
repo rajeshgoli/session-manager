@@ -113,6 +113,25 @@ pub fn store_artifact(
     })
 }
 
+/// Why a deploy must be refused for its version code, if it must. Once the
+/// published artifact records a version code, every deploy must carry a higher
+/// one: Android refuses a downgrade with only "App not installed", so a lower
+/// code strands every phone on an update it offers but can never install.
+pub fn version_code_refusal(published: Option<i64>, next: Option<i64>) -> Option<String> {
+    let published = published?;
+    match next {
+        Some(next) if next > published => None,
+        Some(next) => Some(format!(
+            "version_code {next} is not higher than the published version_code {published}; \
+             Android cannot install it over the current app. Rebuild with a higher SM_VERSION_CODE."
+        )),
+        None => Some(format!(
+            "version_code is required: the published artifact has version_code {published}, \
+             and a deploy without one cannot be checked for a downgrade."
+        )),
+    }
+}
+
 pub fn read_metadata(root: &Path, app_name: &str) -> Result<AppArtifactMetadata> {
     let path = meta_path(root, app_name);
     let content = fs::read_to_string(&path)
@@ -155,7 +174,7 @@ fn now_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_app_name, valid_artifact_hash};
+    use super::{valid_app_name, valid_artifact_hash, version_code_refusal};
 
     #[test]
     fn app_names_match_python_managed_artifact_contract() {
@@ -178,6 +197,21 @@ mod tests {
         let value = serde_json::to_string(&meta).unwrap();
         let decoded: super::AppArtifactMetadata = serde_json::from_str(&value).unwrap();
         assert_eq!(decoded.release_notes, meta.release_notes);
+    }
+
+    #[test]
+    fn version_code_must_advance_once_recorded() {
+        assert_eq!(version_code_refusal(None, None), None);
+        assert_eq!(version_code_refusal(None, Some(1)), None);
+        assert_eq!(version_code_refusal(Some(1155), Some(1156)), None);
+        let downgrade = version_code_refusal(Some(1155), Some(1)).unwrap();
+        assert!(
+            downgrade.contains("version_code 1 is not higher"),
+            "{downgrade}"
+        );
+        assert!(version_code_refusal(Some(1155), Some(1155)).is_some());
+        let missing = version_code_refusal(Some(1155), None).unwrap();
+        assert!(missing.contains("version_code is required"), "{missing}");
     }
 
     #[test]

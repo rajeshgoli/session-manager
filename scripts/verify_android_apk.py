@@ -46,10 +46,32 @@ def find_apkanalyzer() -> str:
     raise RuntimeError("apkanalyzer is required: set ANDROID_HOME or put it on PATH")
 
 
+def manifest_version(apkanalyzer: str, apk: Path) -> tuple[str, str]:
+    """The APK's own versionCode and versionName, which Android compares on install."""
+    values = []
+    for field in ("version-code", "version-name"):
+        result = subprocess.run([apkanalyzer, "manifest", field, str(apk)],
+                                capture_output=True, text=True, timeout=60)
+        lines = result.stdout.strip().splitlines()
+        if result.returncode or not lines:
+            raise RuntimeError(f"cannot read the APK {field}")
+        values.append(lines[-1].strip())
+    return values[0], values[1]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("apk", type=Path)
+    parser.add_argument("--print-version", action="store_true",
+                        help="print only '<versionCode> <versionName>' from the APK manifest")
     args = parser.parse_args()
+    if args.print_version:
+        try:
+            print(*manifest_version(find_apkanalyzer(), args.apk))
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            print(f"APK verification failed: {error}", file=sys.stderr)
+            return 1
+        return 0
     try:
         result = subprocess.run(
             [find_apkanalyzer(), "dex", "code", "--class", "li.rajeshgo.sm.BuildConfig", str(args.apk)],

@@ -74,7 +74,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::app_artifacts::{
     hashed_path, meta_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
-    APP_ARTIFACT_MAX_SIZE_BYTES,
+    version_code_refusal, APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::btw::{
     codex_btw_event, extract_stock_codex_answer, validate_prompt, BtwRequestRecord, BtwStore,
@@ -3934,6 +3934,15 @@ async fn deploy_app_artifact(
         claim.check_version(version_name.as_deref())?;
     }
     let root = expand_home(&state.config.app_artifacts.root_dir);
+    let published_version_code = read_metadata(&root, &app_name)
+        .ok()
+        .and_then(|metadata| metadata.version_code);
+    if let Some(detail) = version_code_refusal(published_version_code, version_code) {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        });
+    }
     let stored_version_name = version_name.clone().unwrap_or_default();
     let stored = store_artifact(
         &root,
