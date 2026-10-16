@@ -7,7 +7,6 @@ use crate::owner_events::{self as log, EventQuery, OwnerEvent, OwnerEventStore};
 use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
 
 const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const OWNER_ONLY: &str = "autopm events are owner-only";
 
 pub(super) fn store(state: &AppState) -> OwnerEventStore {
     OwnerEventStore::new(expand_home(&state.config.sm_send.db_path))
@@ -225,25 +224,13 @@ fn bad_request(detail: impl Into<String>) -> ApiError {
     }
 }
 
-/// `GET /autopm/events` (A.7). Owner only until the autopm role exists.
+/// `GET /autopm/events` (A.7). Owner or authenticated Auto PM.
 pub(super) async fn list_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EventsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_owner_page_read_allowed(&state, &request)?;
-    // Past the page login, only the owner: loopback without an agent
-    // header, or a request whose identity is the owner's.
-    let local = is_request_local_bypass(&state, &request);
-    if from_agent(request.headers())
-        || (!local
-            && owner_surface(&state, request.headers(), request_peer_addr(&request)).is_none())
-    {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: OWNER_ONLY.into(),
-        });
-    }
+    super::autopm::role::actor(&state, &request)?;
     let limit = query.limit.unwrap_or(log::DEFAULT_LIMIT);
     if !(1..=log::MAX_LIMIT).contains(&limit) {
         return Err(bad_request(format!("limit must be 1-{}", log::MAX_LIMIT)));

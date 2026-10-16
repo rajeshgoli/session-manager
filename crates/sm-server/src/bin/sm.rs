@@ -1338,10 +1338,23 @@ fn run() -> Result<()> {
                 bail!("sm register is self-directed; pass only the role");
             }
             let role = required_positional(args.role, "role")?;
-            let payload = client.post_json(
-                &format!("/sessions/{session_id}/registry"),
-                json!({ "requester_session_id": session_id, "role": role }),
-            )?;
+            let credential = if sm_server::sessions::normalize_role(&role) == "autopm" {
+                Some(current_session_credential(&session_id)?)
+            } else {
+                None
+            };
+            let headers = credential
+                .as_deref()
+                .map(|value| vec![("X-SM-Session-Credential", value)])
+                .unwrap_or_default();
+            let payload = client
+                .request_with_headers(
+                    "POST",
+                    &format!("/sessions/{session_id}/registry"),
+                    Some(json!({ "requester_session_id": session_id, "role": role })),
+                    &headers,
+                )?
+                .into_json()?;
             let role_name = payload["role"].as_str().unwrap_or(&role);
             let target_session = payload["session_id"].as_str().unwrap_or(&session_id);
             println!("Registered: {role_name} -> {target_session}");
@@ -1352,10 +1365,23 @@ fn run() -> Result<()> {
                 bail!("sm unregister is self-directed; pass only the role");
             }
             let role = required_positional(args.role, "role")?;
-            let payload = client.delete_json(
-                &format!("/sessions/{session_id}/registry"),
-                json!({ "requester_session_id": session_id, "role": role }),
-            )?;
+            let credential = if sm_server::sessions::normalize_role(&role) == "autopm" {
+                Some(current_session_credential(&session_id)?)
+            } else {
+                None
+            };
+            let headers = credential
+                .as_deref()
+                .map(|value| vec![("X-SM-Session-Credential", value)])
+                .unwrap_or_default();
+            let payload = client
+                .request_with_headers(
+                    "DELETE",
+                    &format!("/sessions/{session_id}/registry"),
+                    Some(json!({ "requester_session_id": session_id, "role": role })),
+                    &headers,
+                )?
+                .into_json()?;
             let role_name = payload["role"].as_str().unwrap_or(&role);
             println!("Unregistered: {role_name}");
         }
@@ -5358,7 +5384,18 @@ impl ApiClient {
         // Identify the calling agent, so owner-only routes can refuse it
         // (sm#1651, Appendix I.1).
         let session_id = optional_current_session_id();
+        let autopm_credential = if path.starts_with("/autopm/") {
+            session_id
+                .as_deref()
+                .map(current_session_credential)
+                .transpose()?
+        } else {
+            None
+        };
         let mut headers = headers.to_vec();
+        if let Some(credential) = autopm_credential.as_deref() {
+            headers.push(("X-SM-Session-Credential", credential));
+        }
         if let Some(session_id) = session_id.as_deref() {
             headers.push(("X-SM-Session", session_id));
         }

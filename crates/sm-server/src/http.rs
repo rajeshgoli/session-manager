@@ -11984,6 +11984,7 @@ async fn register_agent_role(
         &format!("/sessions/{session_id}/registry"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    autopm::role::registry_guard(&state, &headers, &session_id, &payload.role)?;
     registry_mutation_response(
         &state,
         state
@@ -12006,6 +12007,7 @@ async fn unregister_agent_role(
         &format!("/sessions/{session_id}/registry"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    autopm::role::registry_guard(&state, &headers, &session_id, &payload.role)?;
     registry_mutation_response(
         &state,
         state
