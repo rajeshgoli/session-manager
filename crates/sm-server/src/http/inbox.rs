@@ -22,8 +22,8 @@ use crate::owner_inbox::{
     agent_thread_key, doc_thread_key, OwnerInboxStore, OwnerNote, ThreadMarks,
 };
 use crate::owner_messages::{
-    derive_message_state, render_thread_text, OwnerMessage, OwnerMessageReply, OwnerMessageState,
-    RecordReply, ReplyComment,
+    derive_message_state, render_thread_text, OwnerApp, OwnerMessage, OwnerMessageReply,
+    OwnerMessageState, RecordReply, ReplyComment,
 };
 use crate::owner_push::{format_ts, notification_for, parse_ts, Follow, REASON_JOB_FINISHED};
 use crate::turn_messages::{FinishedRow, ThreadReply};
@@ -986,7 +986,8 @@ pub(super) async fn post_agent_send(
         &format!("{}/send", agent_thread_path(&session_id)),
     )?;
     let payload: SendRequest = docs::parse_json_body(&body)?;
-    send_to_agent(&state, &session_id, payload, None).await
+    let app = super::owner_events::owner_app(&state, &headers, peer_addr).await;
+    send_to_agent(&state, &session_id, payload, None, app).await
 }
 
 async fn send_to_agent(
@@ -994,6 +995,7 @@ async fn send_to_agent(
     session_id: &str,
     payload: SendRequest,
     thread_key: Option<&str>,
+    app: OwnerApp,
 ) -> Result<Json<Value>, ApiError> {
     let submission_id = payload.submission_id.trim().to_owned();
     if !valid_submission_id(&submission_id) {
@@ -1086,7 +1088,7 @@ async fn send_to_agent(
         })
         .or_else(|| selected.last())
         .copied();
-    let delivered_text = render_thread_text(&state.config.owner_name, target, &text, &quotes);
+    let delivered_text = render_thread_text(app, &text, &quotes);
     let response = match target {
         Some(message) => {
             let (reply, inserted) = store.record_reply(&RecordReply {

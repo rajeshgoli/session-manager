@@ -298,7 +298,7 @@
 <tbody>
 <tr><td>An agent sends a blocking question</td><td>Your phone buzzes, as today. The tap opens its agent thread, scrolled to the question. The row sits under <b>Needs you</b> until you reply or clear it, on the phone or at sm.rajeshgo.li.</td></tr>
 <tr><td>You reply, and the agent answers with another <code>sm send rajesh</code></td><td>The answer lands in the same thread under your reply. You see the whole exchange on one page.</td></tr>
-<tr><td>You want to tell a running agent something it has not asked about</td><td>Open its thread from the Inbox, or from the Watch card, and type. It arrives as <code>[Input from: Rajesh via sm app]</code>, the header agents already answer. Today this needs the terminal's "Message agent" box.</td></tr>
+<tr><td>You want to tell a running agent something it has not asked about</td><td>Open its thread from the Inbox, or from the Watch card, and type. It arrives as you typed it, ending with <code>[sent from sm phone app]</code> or <code>[sent from sm web app]</code>. Today this needs the terminal's "Message agent" box.</td></tr>
 <tr><td>An agent publishes a doc without <code>--review</code></td><td>Its doc thread shows under <b>New</b>, like a message without <code>--blocking</code>. Reading it moves it to Earlier. A later revision brings it back to New.</td></tr>
 <tr><td>An agent asks for a review</td><td>Its doc thread moves to <b>Needs you</b> and the phone buzzes, as today. The tap opens the doc page, where you comment and submit to GitHub, or tap <b>No review needed</b>. The review wakes the agent with <code>[sm review]</code>, as today. The agent thread gets a grey line, <i>Asked for review: &lt;title&gt;</i>, linking the doc.</td></tr>
 <tr><td>You review a doc whose author has ended</td><td>As on sm.rajeshgo.li today: the review goes to GitHub, and the doc page offers <b>Assign to a new agent</b>. If the PR already merged, commenting opens a new PR first. The hand-off and the new agent's next revision stay in the same doc thread. Until you review, the request shows under <b>New</b>, not Needs you: nobody is blocked, the same rule a blocking message from an ended agent follows today.</td></tr>
@@ -448,11 +448,12 @@
 <li>Each quote must come from a message of this thread (400); empty quotes are dropped. No text and no quotes: 400.</li>
 </ol>
 <p>The send is recorded as a reply to the newest needs_you message; else the newest quoted message; else the agent's newest message. With no message at all it is a note. One message is queued for the recipient and delivered at once when the runtime is enabled. The text the agent receives:</p>
-<pre><code>[Input from: Rajesh via sm app] Re: "Keep it?" (msg_1a2b3c4d)
-&gt; Nothing reads fills.
+<pre><code>&gt; Nothing reads fills.
 
-The month-end recon does.</code></pre>
-<p>A note has no <code>Re:</code> part: <code>[Input from: Rajesh via sm app]</code>, a newline, the text. Response: the stored reply or note with <code>kind</code> (<code>reply</code> or <code>note</code>), <code>message_id</code> (null for a note), <code>delivered_to_session_id</code> and <code>delivered_to_session_name</code>.</p>
+The month-end recon does.
+
+[sent from sm phone app]</code></pre>
+<p>A note reads the same; the trailer names the app as in 1580 D4. Response: the stored reply or note with <code>kind</code> (<code>reply</code> or <code>note</code>), <code>message_id</code> (null for a note), <code>delivered_to_session_id</code> and <code>delivered_to_session_name</code>.</p>
 
 <h4>B7. Notices, access, token</h4>
 <ul>

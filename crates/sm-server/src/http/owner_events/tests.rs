@@ -42,6 +42,17 @@ fn add_users(config: &mut AppConfig) {
 }
 
 fn fixture() -> Fixture {
+    let (state, db, bearer, guest_bearer) = owner_state();
+    Fixture {
+        app: router(state),
+        store: OwnerEventStore::new(db),
+        bearer,
+        guest_bearer,
+    }
+}
+
+/// The server state behind [`fixture`], its event database and both bearers.
+fn owner_state() -> (AppState, PathBuf, String, String) {
     let mut config = google_auth_config();
     config.cloudflare_access = cloudflare_access_config().cloudflare_access;
     config.paths.state_file = write_session_state("fork1001", "running");
@@ -59,12 +70,7 @@ fn fixture() -> Fixture {
     let (bearer, guest_bearer) = (token("rajeshgoli@gmail.com"), token("guest@example.com"));
     let state = AppState::new(config);
     seed_cloudflare_access_jwks(&state);
-    Fixture {
-        app: router(state),
-        store: OwnerEventStore::new(db),
-        bearer,
-        guest_bearer,
-    }
+    (state, db, bearer, guest_bearer)
 }
 
 fn request(
@@ -488,5 +494,47 @@ async fn events_route_needs_the_owner_without_google_auth() {
         );
         let status = app.clone().oneshot(request).await.unwrap().status();
         assert_eq!(status, expected, "{email}");
+    }
+}
+
+#[tokio::test]
+async fn owner_app_names_the_phone_the_web_app_or_neither() {
+    use crate::owner_messages::OwnerApp;
+    let (state, _, bearer, _) = owner_state();
+    let state = Arc::new(state);
+    let browser =
+        test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+    let phone = test_mobile_access_assertion("pixel-9");
+    let peer: SocketAddr = "203.0.113.9:443".parse().unwrap();
+    for (host, headers, expected) in [
+        (
+            "testserver",
+            vec![("authorization", bearer.as_str())],
+            OwnerApp::Phone,
+        ),
+        (
+            "sm-app.example.com",
+            vec![("cf-access-jwt-assertion", phone.as_str())],
+            OwnerApp::Phone,
+        ),
+        (
+            "sm.example.com",
+            vec![("cf-access-jwt-assertion", browser.as_str())],
+            OwnerApp::Web,
+        ),
+        ("sm.example.com", vec![], OwnerApp::Unknown),
+    ] {
+        let request = request(
+            Method::POST,
+            "/inbox/agent/fork1001/send",
+            host,
+            &headers,
+            "",
+        );
+        assert_eq!(
+            owner_app(&state, request.headers(), peer).await,
+            expected,
+            "{host} {headers:?}"
+        );
     }
 }
