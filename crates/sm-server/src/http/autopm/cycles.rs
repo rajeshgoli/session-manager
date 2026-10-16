@@ -130,7 +130,8 @@ pub(in crate::http) fn deliver(state: &AppState, ticket: i64) -> anyhow::Result<
     if RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
         .message_delivered(&key)?
     {
-        return Ok(true);
+        // A historical stopped seat must not satisfy start() for a new cycle.
+        return Ok(!session.is_stopped());
     }
     if super::super::auto_retire::retired_autopm_needs_successor(state, &session) {
         // The cycle wake below remains durably addressed to the retired
@@ -614,6 +615,38 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn delivered_brief_for_stopped_historical_seat_does_not_satisfy_start() {
+        let state = role_state();
+        prepare(&state, 3001, "pm", "old brief").unwrap();
+        state
+            .session_store
+            .update_owner_settings(&json!({"autopm":{"enabled":true}}), |_| Ok(Ok(())))
+            .unwrap()
+            .unwrap();
+        assert!(deliver(&state, 3001).unwrap());
+        let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+        queue.mark_delivered("autopm-brief-pm").unwrap();
+        let path = &state.config.paths.state_file;
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let pm = raw["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|session| session["id"] == "pm")
+            .unwrap();
+        pm["status"] = json!("stopped");
+        std::fs::write(path, raw.to_string()).unwrap();
+        assert!(!deliver(&state, 3001).unwrap());
+        assert!(state
+            .session_store
+            .get_session("pm")
+            .unwrap()
+            .unwrap()
+            .is_stopped());
     }
 
     #[test]
