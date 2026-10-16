@@ -114,9 +114,9 @@ pub fn repair(conn: &Connection, messages: Option<&Path>) -> Result<()> {
     let Some(config) = config else { return Ok(()) };
     let manager = ManagedArtifacts::new(&serde_json::from_str(&config)?)?;
     attach_store(conn, &manager.store)?;
-    if store::meta(conn, "pressure_history_imported")?.is_none() {
-        conn.execute("INSERT OR IGNORE INTO artifact_completions(job_id,root,state,finished_at,bytes_written) SELECT q.id,j.root,q.state,q.finished_at,MAX(j.bytes_written) FROM main.queue_jobs q JOIN artifact_jobs j ON j.job_id=q.id WHERE q.finished_at IS NOT NULL AND j.bytes_written IS NOT NULL GROUP BY q.id,j.root",[])?;
-        store::set_meta(conn, "pressure_history_imported", &now())?;
+    if store::meta(conn, "pressure_history_imported_v2")?.is_none() {
+        conn.execute("INSERT INTO artifact_completions(job_id,root,state,finished_at,bytes_written,placement) SELECT q.id,j.root,q.state,q.finished_at,MAX(j.bytes_written),CASE WHEN COUNT(DISTINCT a.location)=1 AND MIN(a.state)='live' AND MAX(a.state)='live' AND NOT EXISTS(SELECT 1 FROM artifact_jobs old JOIN artifact_events e ON e.root=old.root AND e.name=old.name WHERE old.job_id=q.id AND e.kind IN ('moved','frozen','thawed','deleted','vanished','created','rebuilt') AND e.at>=q.finished_at) THEN MAX(a.location) END FROM main.queue_jobs q JOIN artifact_jobs j ON j.job_id=q.id JOIN artifacts a ON a.root=j.root AND a.name=j.name WHERE q.finished_at IS NOT NULL AND j.bytes_written IS NOT NULL GROUP BY q.id,j.root ON CONFLICT(job_id) DO UPDATE SET placement=COALESCE(artifact_completions.placement,excluded.placement)",[])?;
+        store::set_meta(conn, "pressure_history_imported_v2", &now())?;
     }
     // Artifact-side-only submission commits must not retain in-use protection
     // forever. Keep the records and failure history, never delete their files.
@@ -716,7 +716,7 @@ pub fn complete(conn: &Connection, id: &str, db: Option<&Path>) -> Result<()> {
         0
     };
     tx.execute("UPDATE artifact_jobs SET state=?2,exit_code=?3,wall_seconds=?4,bytes_written=?5 WHERE job_id=?1",params![id,job["state"].as_str(),job["exit_code"].as_i64(),wall,written])?;
-    tx.execute("INSERT INTO artifact_completions(job_id,root,state,finished_at,bytes_written) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(job_id) DO UPDATE SET state=excluded.state,finished_at=excluded.finished_at,bytes_written=excluded.bytes_written",params![id,p.root.path,job["state"].as_str().unwrap_or("failed"),job["finished_at"].as_str().unwrap_or(&now()),written])?;
+    tx.execute("INSERT INTO artifact_completions(job_id,root,state,finished_at,bytes_written,placement) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(job_id) DO UPDATE SET state=excluded.state,finished_at=excluded.finished_at,bytes_written=excluded.bytes_written,placement=excluded.placement",params![id,p.root.path,job["state"].as_str().unwrap_or("failed"),job["finished_at"].as_str().unwrap_or(&now()),written,reservation.as_ref().and_then(|r|r["placed"].as_str())])?;
     if let Some(r) = &reservation {
         for name in names(r, "inputs_json")?
             .into_iter()

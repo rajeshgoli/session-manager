@@ -464,6 +464,13 @@ impl AppState {
             }
         }
         ma::pressure::periodic(svc)?;
+        ma::pressure::resolve_notices(svc, |prefix| {
+            let inbox = messages::owner_message_store(self);
+            for (suffix, _) in inbox.open_keyed("sm-artifacts", prefix)? {
+                inbox.mark_handled_by_delivery_key(&format!("{prefix}{suffix}"))?;
+            }
+            Ok(())
+        })?;
         ma::pressure::notify(svc, time::OffsetDateTime::now_utc(), |key, body| {
             let inbox = messages::owner_message_store(self);
             let prefix = format!("{}:", key.rsplit_once(':').map(|(p, _)| p).unwrap_or(key));

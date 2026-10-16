@@ -651,3 +651,31 @@ async fn managed_artifacts_system_messages_refuse_replies() {
         .await;
     assert!(body["reply_to_session_id"].is_null());
 }
+
+#[tokio::test]
+async fn managed_artifacts_recovered_pressure_closes_blocking_message() {
+    use sm_server::managed_artifacts::store;
+    use sm_server::owner_messages::{NewOwnerMessage, OwnerMessageStore};
+    let f = Fixture::new();
+    let inbox = OwnerMessageStore::new(f.dir.join("queue.db"));
+    let key = "pressure_pending:123:100";
+    inbox
+        .create_once(
+            NewOwnerMessage {
+                human: f.state.config().owner_name.clone(),
+                sender_session_id: "sm-artifacts".into(),
+                sender_session_name: "sm artifacts".into(),
+                title: "Disk space".into(),
+                body_markdown: "Space needed".into(),
+                blocking: true,
+            },
+            Some(key),
+        )
+        .unwrap();
+    assert!(inbox.is_open_by_delivery_key(key).unwrap());
+    store::set_meta(&f.store().open().unwrap(), "pressure_pending:123", "null").unwrap();
+    f.state.managed_artifacts_pass().unwrap();
+    assert!(!inbox.is_open_by_delivery_key(key).unwrap());
+    f.state.managed_artifacts_pass().unwrap();
+    assert!(!inbox.is_open_by_delivery_key(key).unwrap());
+}

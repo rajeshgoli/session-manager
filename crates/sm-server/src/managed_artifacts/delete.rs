@@ -147,8 +147,7 @@ impl ManagedArtifacts {
         if automatic && self.config.deletion_mode == "report_only" {
             for member in &members {
                 let n = member["name"].as_str().unwrap();
-                let exists:i64=tx.query_row("SELECT COUNT(*) FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE AND kind='would_delete'",params![root.path,n],|r|r.get(0))?;
-                if exists == 0 {
+                if !needs_you::warning_current(&tx, &root.path, n)? {
                     event(
                         &tx,
                         &root.path,

@@ -90,7 +90,7 @@ impl Fixture {
     fn history(&self, name: &str, bytes: u64, days: i64, state: &str) {
         self.conn()
             .execute(
-                "INSERT INTO artifact_completions VALUES(?1,?2,?3,?4,?5)",
+                "INSERT INTO artifact_completions VALUES(?1,?2,?3,?4,?5,'root')",
                 params![
                     name,
                     self.root.path,
@@ -540,4 +540,69 @@ fn waiting_jobs_are_scoped_to_their_filesystem_and_exclude_thaw_holds() {
         )
         .unwrap();
     assert_eq!(waiting(&f.conn(), &f.manager, 2).unwrap(), 0);
+}
+
+#[test]
+fn cold_and_unknown_completion_placement_do_not_inflate_root_target() {
+    let f = Fixture::new();
+    f.disks(100, 100);
+    f.history("root-job", 200, 0, "succeeded");
+    f.history("cold-job", 9000, 0, "succeeded");
+    f.history("unknown-old-job", 9900, 0, "succeeded");
+    f.conn()
+        .execute(
+            "UPDATE artifact_completions SET placement='cold' WHERE job_id='cold-job'",
+            [],
+        )
+        .unwrap();
+    f.conn()
+        .execute(
+            "UPDATE artifact_completions SET placement=NULL WHERE job_id='unknown-old-job'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(enough(&f.conn(), &f.manager, 1, 100).unwrap(), 200);
+    // Cold space targets are driven by the largest thaw, not output history.
+    assert_eq!(enough(&f.conn(), &f.manager, 2, 100).unwrap(), 100);
+}
+
+#[test]
+fn report_only_renews_acknowledged_warning_without_repeating_current_warning() {
+    let f = Fixture::new();
+    f.frozen("a", 100, 300);
+    f.manager.delete_pressure(&f.root, "a").unwrap();
+    for activity in [
+        "owner_opened",
+        "owner_investigate",
+        "owner_keep_live",
+        "marks",
+        "recorded",
+    ] {
+        store::event(&f.conn(), &f.root.path, "a", activity, "owner", json!({})).unwrap();
+        assert_eq!(
+            f.manager.store.detail(&f.root.path, "a").unwrap()["needs_owner"],
+            false,
+            "{activity}"
+        );
+        f.manager.delete_pressure(&f.root, "a").unwrap();
+        assert_eq!(
+            f.manager.store.detail(&f.root.path, "a").unwrap()["needs_owner"],
+            true,
+            "{activity}"
+        );
+        f.manager.delete_pressure(&f.root, "a").unwrap();
+    }
+    let count: i64 = f
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_events WHERE kind='would_delete'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 6);
+    assert_eq!(
+        artifact(&f.conn(), &f.root.path, "a").unwrap()["state"],
+        "frozen"
+    );
 }

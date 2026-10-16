@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS artifact_disk_holds (
  job_id TEXT PRIMARY KEY, root TEXT NOT NULL, role TEXT NOT NULL, label TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS artifact_completions (
  job_id TEXT PRIMARY KEY, root TEXT NOT NULL, state TEXT NOT NULL,
- finished_at TEXT NOT NULL, bytes_written INTEGER NOT NULL);
+ finished_at TEXT NOT NULL, bytes_written INTEGER NOT NULL, placement TEXT);
 CREATE INDEX IF NOT EXISTS artifact_completion_window ON artifact_completions(root,finished_at);
 
 CREATE TABLE IF NOT EXISTS artifact_meta (key TEXT PRIMARY KEY, value TEXT);

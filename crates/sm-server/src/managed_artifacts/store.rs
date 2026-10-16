@@ -18,6 +18,15 @@ impl ArtifactStore {
         conn.busy_timeout(Duration::from_secs(30))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        if !query(&conn, "PRAGMA table_info(artifact_completions)", &[])?
+            .iter()
+            .any(|c| c["name"] == "placement")
+        {
+            conn.execute(
+                "ALTER TABLE artifact_completions ADD COLUMN placement TEXT",
+                [],
+            )?;
+        }
         Ok(conn)
     }
     pub fn list(&self, root: &str) -> Result<Vec<Value>> {

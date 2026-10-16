@@ -19,7 +19,7 @@ pub fn enough(
     let mut result = floor;
     for root in &manager.config.roots {
         if queue::fs_stats(&root.path, manager.config.floor_percent)?.2 == device {
-            let bytes: u64 = conn.query_row("SELECT COALESCE(MAX(bytes_written),0) FROM artifact_completions WHERE root=?1 AND state='succeeded' AND finished_at>=?2",params![root.path,since],|r|r.get(0))?;
+            let bytes: u64 = conn.query_row("SELECT COALESCE(MAX(bytes_written),0) FROM artifact_completions WHERE root=?1 AND placement='root' AND state='succeeded' AND finished_at>=?2",params![root.path,since],|r|r.get(0))?;
             result = result.max(bytes);
         }
         if moves::cold_mounted(root)
@@ -297,3 +297,22 @@ pub fn notify(
 #[cfg(test)]
 #[path = "pressure_tests.rs"]
 mod tests;
+
+/// Resolve already-sent blockers when a later measurement clears pressure.
+/// Repeating this callback is harmless; owner message handling is idempotent.
+pub fn resolve_notices(
+    manager: &ManagedArtifacts,
+    mut resolve: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for row in store::query(
+        &manager.store.open()?,
+        "SELECT key FROM artifact_meta WHERE key LIKE 'pressure_pending:%' AND value='null'",
+        &[],
+    )? {
+        resolve(&format!(
+            "{}:",
+            row["key"].as_str().context("pressure key")?
+        ))?;
+    }
+    Ok(())
+}

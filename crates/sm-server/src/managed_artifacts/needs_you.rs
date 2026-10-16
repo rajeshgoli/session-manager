@@ -43,7 +43,7 @@ pub fn reasons(conn: &Connection, a: &Value) -> Result<Vec<String>> {
         } else {
             score::deletion_eligible(conn, root, &set).is_ok()
         };
-        if eligible && last("would_delete") > acted.max(last("recorded")).max(last("marks")) {
+        if eligible && warning_current(conn, root, name)? {
             reasons.push("would_delete".into());
         }
         if a["project"] == 1 && last("project_added") > acted {
@@ -84,4 +84,9 @@ pub fn item(conn: &Connection, a: &Value) -> Result<Option<Value>> {
     Ok(Some(
         json!({"root":a["root"],"name":a["name"],"reasons":reasons,"buttons":buttons}),
     ))
+}
+
+/// Acknowledging a warning ends that episode, not every future pressure warning.
+pub fn warning_current(conn: &Connection, root: &str, name: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(CASE WHEN kind='would_delete' THEN id END),0)>COALESCE(MAX(CASE WHEN kind IN ('owner_delete','owner_thaw','owner_keep_live','owner_investigate','owner_opened','owner_action','recorded','marks') THEN id END),0) FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE",params![root,name],|r|r.get(0))?)
 }
