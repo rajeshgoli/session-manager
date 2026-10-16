@@ -117,7 +117,8 @@ export function TerminalPage({ id, open }) {
   const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
   const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
   const showKeys = useWidth(touchKeys);
-  const wide = !useWidth(narrow);
+  // Touch screens keep the phone bar and its keys, even a tablet held wide.
+  const wide = !useWidth(narrow) && !showKeys;
   const [doc, , reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
   const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
