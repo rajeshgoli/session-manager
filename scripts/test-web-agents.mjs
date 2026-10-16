@@ -321,16 +321,18 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
       if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
       if (url.pathname === '/watch/state') {
         const only = url.searchParams.get('session');
-        const list = only ? fixture().filter((s) => s.id === only) : fixture();
+        const all = fixture().map((s) => s.id === 'sm-1776' ? { ...s, facts: { ...s.facts, you: { kind: 'prompt', since: NOW, text: 'Allow prompt in its terminal', more: 0, dismissible: false } } } : s);
+        const list = only ? all.filter((s) => s.id === only) : all;
         return route.fulfill({ json: { generated_at: NOW, sessions: list, counts: {} } });
       }
       if (url.pathname.endsWith('/last-turn')) return route.fulfill({ json: { at: NOW, html: '<p>Done; one question left.</p>' } });
-      if (url.pathname === '/inbox/agent/sm-1726-engineer/send' && request.method() === 'POST') {
+      if (url.pathname === '/inbox/thread/ticket%3Arajeshgoli%2Fsession-manager%231726/send' && request.method() === 'POST') {
         sent.push(JSON.parse(request.postData()));
         return route.fulfill({ json: {} });
       }
       if (url.pathname === '/inbox/agent/sm-1726-engineer') {
-        return route.fulfill({ json: { title: 'sm-1726-engineer', status: 'idle', can_send: true, reply_to: { name: 'sm-1726-engineer' }, items: [
+        return route.fulfill({ json: { thread_key: 'ticket:rajeshgoli/session-manager#1726', title: 'sm-1726-engineer', status: 'idle', can_send: true,
+          reply_options: [{ id: 'sm-1726-engineer', name: 'sm-1726-engineer', status: 'live', can_send: true }, { id: 'sm-1726-helper', name: 'sm-1726-helper', status: 'live', can_send: true }], items: [
           { type: 'doc_revision', at: NOW, sender: { name: 'sm-1726-engineer' }, sha: 'abcdef1234', review_state: 'requested',
             html: '<a href="/docs/session-manager/docs/working/1726.html">1726 memo</a>' },
           { html: '<div class="b ask" data-msg="m1"><p data-sm-line="1">Can you run one manual Chrome check?</p></div>' },
@@ -344,15 +346,21 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
     await page.locator('.details-band .thread-items', { hasText: 'Can you run one manual Chrome check?' }).waitFor();
     assert.equal(await page.locator('.details-band .thread-doc-card strong').innerText(), '1726 memo');
     assert.equal(await page.locator('.details-band .msgbox').count(), 0, 'one compose box, the thread\'s');
+    // A ticket's work thread sends through its own route, so the chosen recipient is the one that gets it.
+    await page.getByRole('combobox', { name: 'Reply to' }).selectOption('sm-1726-helper');
     await page.getByRole('textbox', { name: 'Reply' }).fill('Ran it, passes');
     await page.getByRole('button', { name: 'Send' }).click();
     await page.waitForFunction(() => document.querySelector('textarea[aria-label="Reply"]')?.value === '');
     assert.equal(sent[0].body, 'Ran it, passes');
+    assert.equal(sent[0].to, 'sm-1726-helper');
     // Work tab's Last turn Reply comes back to the Inbox tab without leaving the page.
     await page.locator('.details-band .tabs button', { hasText: 'Work' }).click();
     await page.locator('.details-band .last-turn-foot button', { hasText: 'Reply' }).click();
     await page.locator('.details-band .tabs button.on', { hasText: 'Inbox' }).waitFor();
     assert.equal(new URL(page.url()).pathname, '/');
+    // A terminal permission prompt is not an Inbox question: Details opens on Work.
+    await page.goto('http://localhost/?open=agent:sm-1776');
+    await page.locator('.details-band .tabs button.on', { hasText: 'Work' }).waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

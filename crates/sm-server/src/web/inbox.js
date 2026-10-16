@@ -209,7 +209,9 @@ export function Thread({ id, workKey, controls, agent, embedded = false }) {
     if (attempt.current?.signature !== signature) attempt.current = {signature, id: crypto.randomUUID()};
     setBusy(true); setFailure('');
     try {
-      await write(`${endpoint}/send`, {...payload, submission_id: attempt.current.id});
+      // An agent's thread may be a ticket's work thread; only its send honours the chosen recipient.
+      const sendPath = data?.thread_key ? `/inbox/thread/${encodeURIComponent(data.thread_key)}/send` : `${endpoint}/send`;
+      await write(sendPath, {...payload, submission_id: attempt.current.id});
       scrollOnLoad.current = true;
       attempt.current = null; setBody(''); setQuotes([]); reload();
     } catch (e) { setFailure(e.message); }

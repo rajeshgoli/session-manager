@@ -564,7 +564,8 @@ export function AgentPanel({ id, controls }) {
   // An open question opens on the agent's Inbox thread so it can be answered here (sm#2245).
   const [picked, setPicked] = useState(null);
   useEffect(() => setPicked(null), [id]);
-  const tab = picked || (agent?.facts?.you ? 'inbox' : 'work');
+  // A terminal permission prompt is answered in the terminal, so it stays on Work.
+  const tab = picked || (['message', 'doc_review'].includes(agent?.facts?.you?.kind) ? 'inbox' : 'work');
   if (!agent) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
