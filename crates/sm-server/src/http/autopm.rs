@@ -6,6 +6,7 @@
 //! The owner and authenticated live autopm role holder may use the control routes.
 
 use super::*;
+pub(super) mod cycles;
 pub(super) mod role;
 use crate::autopm::budget::{self, ReviewGate, ReviewStep};
 use crate::autopm::experiments::{self, Ctx, Git, Pull};
@@ -630,6 +631,9 @@ fn latest_readout(conn: &rusqlite::Connection) -> rusqlite::Result<Option<Value>
 /// Applies an owner settings change to the auto PM: the kill switch (B.5),
 /// enable (C.4 standing reservations), and skip (C.1).
 pub(super) fn on_settings_change(state: &AppState, before: &Settings, after: &Settings) {
+    if let Err(error) = cycles::settings_changed(state, before, after) {
+        eprintln!("autopm cycle settings failed: {error:#}");
+    }
     state.autopm_switches.set_enabled(after.enabled);
     let store = store(state);
     let now = autopm::now_ms();
@@ -1002,6 +1006,7 @@ pub(super) fn minute(
         );
     }
     run_effects(state, effects);
+    cycles::tick(state, autopm::now_ms())?;
     Ok(())
 }
 

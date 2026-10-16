@@ -333,7 +333,7 @@ fn review_run_tokens_come_from_the_runs_own_output() {
     );
 }
 
-fn role_state() -> AppState {
+pub(super) fn role_state() -> AppState {
     use sha2::{Digest, Sha256};
     let state = state();
     let sessions: Vec<Value> = ["pm", "other", "successor"].into_iter().map(|id| json!({

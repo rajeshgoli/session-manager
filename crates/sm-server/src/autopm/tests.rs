@@ -11,6 +11,7 @@ use serde_json::json;
 use std::sync::Mutex;
 
 mod budget_tests;
+mod cycle_tests;
 mod measure_tests;
 
 const COMMIT: &str = "c0ffee0000000000000000000000000000000000";

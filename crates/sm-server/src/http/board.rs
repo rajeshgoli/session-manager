@@ -438,6 +438,11 @@ fn authorization_current(
     state: &AppState,
     record: &board::auto_start::Record,
 ) -> anyhow::Result<bool> {
+    if super::autopm::cycles::is_cycle(state, &record.repo, record.number)?
+        && !super::autopm::cycles::may_start(state)?
+    {
+        return Ok(false);
+    }
     if new_agent_settings(state)?.auto_start_paused {
         return Ok(false);
     }
@@ -2003,6 +2008,20 @@ pub(super) async fn start(
     } else {
         options
     };
+    let cycle_seat = auto && super::autopm::cycles::is_cycle(&state, &key.0, key.1)?;
+    let brief = match trimmed(&payload.brief) {
+        Some(brief) if reservation.started_early => format!(
+            "{brief}\n\n{}",
+            options["early_start_paragraph"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        Some(brief) => brief,
+        None => options["brief"].as_str().unwrap_or_default().to_owned(),
+    };
+    if cycle_seat {
+        super::autopm::cycles::prepare(&state, key.1, &id, &brief)?;
+    }
     let created = create_session_from_request(
         state.clone(),
         CreateCoreSessionRequest {
@@ -2013,16 +2032,7 @@ pub(super) async fn start(
             // Absent or blank leaves the choice to the provider.
             model: crate::config::trimmed(&payload.model),
             reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
-            initial_message: Some(match trimmed(&payload.brief) {
-                Some(brief) if reservation.started_early => format!(
-                    "{brief}\n\n{}",
-                    options["early_start_paragraph"]
-                        .as_str()
-                        .unwrap_or_default()
-                ),
-                Some(brief) => brief,
-                None => options["brief"].as_str().unwrap_or_default().to_owned(),
-            }),
+            initial_message: if cycle_seat { None } else { Some(brief) },
             parent_session_id: None,
             node: None,
             wait: None,
@@ -2035,6 +2045,9 @@ pub(super) async fn start(
     .await;
     claims::finish_spawn_ticket(&state, &reservation, created.is_ok());
     let session = created?;
+    if cycle_seat {
+        super::autopm::cycles::deliver(&state, key.1)?;
+    }
     if !auto {
         if let Err(error) = board_store(&state).cancel_auto_start(
             &key,
