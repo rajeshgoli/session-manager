@@ -292,3 +292,29 @@ fn rejects_ambiguous_layout_unavailable_mount_and_capacity() {
     assert!(prepare(&f.manager, &scopes, None, "alias").is_err());
     assert!(!f.dir.join("outbox/alias").exists());
 }
+
+#[test]
+fn scope_counts_each_job_once_across_overlapping_output_sets() {
+    let mut f = Fixture::new();
+    for name in ["a", "b", "c"] {
+        f.artifact(name, "live", true, false, 10);
+    }
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("UPDATE artifacts SET set_id='a'", []).unwrap();
+    conn.execute("DELETE FROM artifact_jobs", []).unwrap();
+    for (name, job) in [
+        ("a", "first"),
+        ("b", "first"),
+        ("b", "second"),
+        ("c", "second"),
+    ] {
+        conn.execute("INSERT INTO artifact_jobs(root,name,job_id,state,wall_seconds) VALUES(?1,?2,?3,'succeeded',10)", params![f.manager.config.roots[0].path,name,job]).unwrap();
+    }
+    // Each folder packs to 16 bytes. Rebuilding any member runs both 10s jobs.
+    f.manager.config.backup.backup_rate_default = "1B".into();
+    assert_eq!(collect_scope(&f.manager, "mini").unwrap().len(), 3);
+    // At half the rate the return takes 32s, exceeding the actual 20s rebuild.
+    // Counting shared jobs twice would incorrectly retain all three folders.
+    f.manager.config.backup.backup_rate_default = "0.5B".into();
+    assert!(collect_scope(&f.manager, "mini").unwrap().is_empty());
+}

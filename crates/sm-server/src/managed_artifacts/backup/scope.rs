@@ -111,7 +111,7 @@ fn included(conn: &Connection, a: &serde_json::Value, bytes: u64, rate: f64) -> 
     if a["state"] == "unrecorded" || a["recipe_complete"] != 1 || store::has_gpu(a) {
         return Ok(true);
     }
-    let seconds: f64 = conn.query_row("SELECT COALESCE(SUM(wall_seconds),0) FROM artifact_jobs WHERE root=?1 AND name=?2 AND state='succeeded'", params![a["root"].as_str(),a["name"].as_str()],|r| r.get(0))?;
+    let seconds: f64 = conn.query_row("SELECT COALESCE(SUM(seconds),0) FROM (SELECT j.job_id,MAX(j.wall_seconds) seconds FROM artifact_jobs j JOIN artifacts a ON a.root=j.root AND a.name=j.name WHERE a.root=?1 AND a.set_id=?2 AND j.state='succeeded' GROUP BY j.job_id)", params![a["root"].as_str(),a["set_id"].as_str()],|r| r.get(0))?;
     Ok(seconds > bytes as f64 / rate)
 }
 pub(super) fn validate_scopes(scopes: &[Scope]) -> Result<()> {
