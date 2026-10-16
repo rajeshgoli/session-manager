@@ -8,6 +8,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material3.*
@@ -31,6 +32,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun SettingsScreen(
     onNavigateToWatch: () -> Unit,
+    onOpenAutoPm: () -> Unit = {},
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -154,6 +156,15 @@ fun SettingsScreen(
         }
         if (state.isLoggedIn) Box(Modifier.bringIntoViewRequester(reviews)) {
             SettingsGroup("Reviews") { ReviewsSection() }
+        }
+        if (state.isLoggedIn) SettingsGroup("Auto PM") {
+            Row(Modifier.fillMaxWidth().clickable(onClick = onOpenAutoPm), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Auto PM", style = MaterialTheme.typography.bodyLarge)
+                    Text("On/off, this week's budget, what changed", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                }
+                Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, "Open Auto PM", tint = TextMuted)
+            }
         }
         if (state.isLoggedIn) SettingsGroup("Terminals") {
             TerminalLimitsSection()

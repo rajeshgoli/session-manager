@@ -282,6 +282,7 @@ fun ThreadScreen(
     onDone: () -> Unit,
     onMessage: (String) -> Unit,
 ) {
+    li.rajeshgo.sm.ui.navigation.ScreenName("inbox/thread")
     val viewModel: ThreadViewModel = viewModel(key = "thread:${target.key ?: target.sessionId}")
     LaunchedEffect(target) { viewModel.open(target) }
     LaunchedEffect(target) {

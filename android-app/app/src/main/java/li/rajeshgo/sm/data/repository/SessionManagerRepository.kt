@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
@@ -359,6 +360,26 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).setOwnerSettings(patch) }.mapFailure(::classifyWriteFailure)
     }
 
+    /** The live auto PM switches (spec 2170 B.1), read in the background. */
+    suspend fun fetchSwitches(baseUrl: String, token: String): Map<String, Boolean> = withContext(Dispatchers.IO) {
+        val settings = executeReadRequest(baseUrl, token) { it.getSwitchSettings() }
+        settings["switches"]?.jsonObject.orEmpty().mapValues { (_, on) -> on.jsonPrimitive.booleanOrNull == true }
+    }
+
+    suspend fun fetchAutopm(baseUrl: String, token: String, background: Boolean = false) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getAutopm(if (background) "1" else null) }
+    }
+
+    suspend fun sendAutopmFeedback(baseUrl: String, token: String, experimentId: String, up: Boolean) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).sendAutopmFeedback(li.rajeshgo.sm.data.model.AutopmFeedback(experimentId, if (up) "up" else "down")) }
+            .mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun setAutopmSwitch(baseUrl: String, token: String, key: String, on: Boolean) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setAutopmSwitch(key, li.rajeshgo.sm.data.model.AutopmSwitchWrite(on, "turned back on in Settings")) }
+            .mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchLatestHostRestart(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getLatestHostRestart() }
     }
@@ -581,8 +602,9 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).ackFollow(followId) }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun fetchInbox(baseUrl: String, token: String, filter: String): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
-        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter) } }) { ScreenCache.inbox[filter] = it }
+    /** `background` for the app's own reads (the badge refresher), which are never the owner's (spec 2170 A.5). */
+    suspend fun fetchInbox(baseUrl: String, token: String, filter: String, background: Boolean = false): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
+        ScreenCache.remember({ executeReadRequest(baseUrl, token) { it.getInbox(filter, if (background) "1" else null) } }) { ScreenCache.inbox[filter] = it }
     }
 
     suspend fun fetchBoard(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardResponse = withContext(Dispatchers.IO) {

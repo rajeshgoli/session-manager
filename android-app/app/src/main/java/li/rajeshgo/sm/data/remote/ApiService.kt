@@ -146,6 +146,19 @@ interface ApiService {
     @GET("client/settings")
     suspend fun getOwnerSettings(): kotlinx.serialization.json.JsonObject
 
+    /** The app's own switch re-read (spec 2170 B.1): background, never the owner's action. */
+    @GET("client/settings")
+    suspend fun getSwitchSettings(@Header("x-sm-bg") background: String = "1"): kotlinx.serialization.json.JsonObject
+
+    @GET("client/autopm")
+    suspend fun getAutopm(@Header("x-sm-bg") background: String?): li.rajeshgo.sm.data.model.AutopmView
+
+    @POST("client/autopm/feedback")
+    suspend fun sendAutopmFeedback(@Body feedback: li.rajeshgo.sm.data.model.AutopmFeedback): kotlinx.serialization.json.JsonObject
+
+    @PUT("autopm/switches/{key}")
+    suspend fun setAutopmSwitch(@Path("key") key: String, @Body write: li.rajeshgo.sm.data.model.AutopmSwitchWrite): kotlinx.serialization.json.JsonObject
+
     @retrofit2.http.PUT("client/settings")
     suspend fun setOwnerSettings(@Body patch: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 
@@ -242,7 +255,7 @@ interface ApiService {
 
     /** The owner's Inbox (sm#1647); `filter` is `open`, `docs` or `done`. */
     @GET("inbox?format=json")
-    suspend fun getInbox(@Query("filter") filter: String): li.rajeshgo.sm.data.model.InboxResponse
+    suspend fun getInbox(@Query("filter") filter: String, @Header("x-sm-bg") background: String? = null): li.rajeshgo.sm.data.model.InboxResponse
 
     /** Done on a thread: clears its open ask without messaging the agent. */
     /** One work thread (sm#1835); [key] is its `thread_key`. */
@@ -293,7 +306,8 @@ interface ApiService {
     suspend fun getBoard(): li.rajeshgo.sm.data.model.BoardResponse
 
     @GET("client/board/badge")
-    suspend fun getBoardBadge(): li.rajeshgo.sm.data.model.BoardBadge
+    /** Only the badge refresher reads it: always background (spec 2170 A.5). */
+    suspend fun getBoardBadge(@Header("x-sm-bg") background: String = "1"): li.rajeshgo.sm.data.model.BoardBadge
 
     /** The owner saw the board: clears the Board count on web and phone. */
     @POST("client/board/seen")

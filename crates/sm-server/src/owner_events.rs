@@ -696,6 +696,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("PATCH", "/autopm/experiments/{id}", "autopm.experiment_set", Some("experiment")),
     ("POST", "/autopm/experiments/{id}/live", "autopm.experiment_live", Some("experiment")),
     ("GET", "/autopm/budget", "autopm.budget", None),
+    ("GET", "/client/autopm", "autopm.view", None),
     ("POST", "/client/autopm/feedback", "autopm.feedback", None),
 ];
 

@@ -2372,6 +2372,7 @@ pub fn router(state: AppState) -> Router {
             post(autopm::experiment_live),
         )
         .route("/autopm/budget", get(autopm::get_budget))
+        .route("/client/autopm", get(autopm::client_view))
         .route("/client/autopm/feedback", post(autopm::feedback))
         .fallback(not_found);
     if inbound_email_alias != DEFAULT_EMAIL_WEBHOOK_PATH {

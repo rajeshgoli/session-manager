@@ -5,6 +5,11 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import android.view.KeyEvent
+import android.view.MotionEvent
+import li.rajeshgo.sm.data.remote.ClientNav
+import li.rajeshgo.sm.data.remote.ClientNavState
+import li.rajeshgo.sm.push.FollowPush
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.board.BoardLinkRequests
@@ -26,6 +31,8 @@ class MainActivity : ComponentActivity() {
         EnrollmentLinkRequests.pending = null
         ReaderLinkRequests.pending = null
         BoardLinkRequests.pending = null
+        // The first owner request says how the app opened (spec 2170 A.5); a tap or link below overrides it.
+        if (savedInstanceState == null) ClientNav.arrived("launch")
         takeEnrollmentLink(intent)
         takeReaderLink(intent)
         takeFollowOpen(intent)
@@ -50,6 +57,17 @@ class MainActivity : ComponentActivity() {
         takeFollowOpen(intent)
     }
 
+    /** A tap or key makes the requests that follow the owner's (spec 2170 A.5). */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) ClientNav.acted()
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) ClientNav.acted()
+        return super.dispatchKeyEvent(event)
+    }
+
     private fun enrollmentUrlFromIntent(intent: Intent?): String? {
         val uri = intent?.data ?: return null
         if (uri.scheme != "sm-enroll" || uri.host != "enroll") {
@@ -61,6 +79,7 @@ class MainActivity : ComponentActivity() {
     /** Hands a tapped follow notification to the watch screen, and a board alert to the Board tab, once. */
     private fun takeFollowOpen(intent: Intent?) {
         val open = FollowOpen.fromIntent(intent) ?: return
+        ClientNav.arrived(ClientNavState.pushNav(intent?.getStringExtra(FollowPush.EXTRA_NOTICE_ID)))
         val lane = open.readerPath?.let(::boardLaneFromPath)
         when {
             open.readerPath?.startsWith("/settings") == true ->
@@ -76,11 +95,13 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != Intent.ACTION_VIEW) return
         val url = intent.dataString ?: return
         boardLaneForLink(url, BuildConfig.SM_LINK_HOST)?.let { lane ->
+            ClientNav.arrived("link")
             BoardLinkRequests.pending = lane
             setIntent(Intent(this, MainActivity::class.java))
             return
         }
         val page = readerPageForLink(url, BuildConfig.SM_LINK_HOST) ?: return
+        ClientNav.arrived("link")
         ReaderLinkRequests.pending = page
         setIntent(Intent(this, MainActivity::class.java))
     }
@@ -88,6 +109,7 @@ class MainActivity : ComponentActivity() {
     /** Hands an opened enrollment link to the Settings screen, once. */
     private fun takeEnrollmentLink(intent: Intent?) {
         val url = enrollmentUrlFromIntent(intent) ?: return
+        ClientNav.arrived("link")
         EnrollmentLinkRequests.pending = url
         setIntent(Intent(this, MainActivity::class.java))
     }

@@ -132,14 +132,101 @@ export function trimPageData(data, cap = 300000) {
   return out;
 }
 
+// ---- client headers (spec 2170 A.5) -----------------------------------------
+
+// A request within this long of the owner's last tap, key or page switch is
+// theirs; anything later, or a poll's repeat, is background.
+export const FOREGROUND_MS = 2000;
+const PANEL_SCREENS = { agent: 'session/detail', job: 'queue/job', thread: 'inbox/thread', doc: 'doc' };
+
+/** The `x-sm-screen` name for a page and its open panel: `board`, `session/detail`, `doc`. */
+export function screenFor(page, open, path = '') {
+  const kind = open ? open.split(':', 1)[0] : null;
+  if (kind) return PANEL_SCREENS[kind] || `${page}/${kind}`;
+  if (page === 'settings' && path.endsWith('#auto-pm')) return 'settings/autopm';
+  return page;
+}
+
+/** What a page load is: `link` for a deep path opened fresh, else `launch`. */
+export function loadNav(type, path) {
+  return type === 'navigate' && path !== '/' && path !== '/watch' ? 'link' : 'launch';
+}
+
+export function clientNavState(now = () => Date.now()) {
+  const state = { screen: null, pending: 'launch', last: now(), polling: false };
+  return {
+    state,
+    /** The owner tapped, typed or switched page. */
+    acted() { state.last = now(); },
+    setScreen(screen) { state.screen = screen; },
+    /** Headers for the request starting now; the first owner request after a load carries how it began. */
+    headers() {
+      const out = {};
+      const screen = typeof state.screen === 'function' ? state.screen() : state.screen;
+      if (screen) out['x-sm-screen'] = screen;
+      if (state.polling || now() - state.last > FOREGROUND_MS) {
+        out['x-sm-bg'] = '1';
+        return out;
+      }
+      out['x-sm-nav'] = state.pending || 'nav';
+      state.pending = null;
+      return out;
+    },
+  };
+}
+export const clientNav = clientNavState();
+if (typeof window !== 'undefined') {
+  try {
+    const entry = performance.getEntriesByType('navigation')[0];
+    clientNav.state.pending = loadNav(entry?.type, location.pathname);
+  } catch (e) { /* older browser: a load is a launch */ }
+  const acted = () => clientNav.acted();
+  window.addEventListener('pointerdown', acted, true);
+  window.addEventListener('keydown', acted, true);
+  window.addEventListener('popstate', acted);
+}
+
+// ---- switches (spec 2170 B.1) -----------------------------------------------
+
+// Every response names the switch version; a new one re-reads the switches,
+// and an open tab re-reads them every 30 s anyway.
+export const SWITCH_REFRESH_MS = 30000;
+let switchVersion = null;
+let switchRead = null;
+function noteSwitches(version) {
+  if (!version || version === switchVersion) return;
+  switchVersion = version;
+  readSwitches();
+}
+export function readSwitches() {
+  if (switchRead) return switchRead;
+  const was = clientNav.state.polling;
+  clientNav.state.polling = true;
+  const request = api('/client/settings');
+  clientNav.state.polling = was;
+  switchRead = request
+    .then((settings) => setShared('switches', settings?.switches || {}))
+    .catch(() => {})
+    .finally(() => { switchRead = null; });
+  return switchRead;
+}
+if (typeof document !== 'undefined') {
+  setInterval(() => { if (!document.hidden) readSwitches(); }, SWITCH_REFRESH_MS);
+}
+/** Whether an auto PM switch is on; a missing key is off. */
+export function useSwitch(key) {
+  return useShared('switches')?.[key] === true;
+}
+
 export async function api(path, { method = 'GET', body, headers = {} } = {}) {
-  const options = { method, credentials: 'same-origin', cache: 'no-store', headers: { ...headers } };
+  const options = { method, credentials: 'same-origin', cache: 'no-store', headers: { ...clientNav.headers(), ...headers } };
   if (body !== undefined) {
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
   const response = await fetch(path, options);
   noteBuild(response.headers.get('x-sm-build'));
+  noteSwitches(response.headers.get('x-sm-switches'));
   const text = await response.text();
   let value = null;
   try {
@@ -175,8 +262,10 @@ export const network = {
 /**
  * Call `load` now and every `ms` while the browser tab is visible (D2), and
  * keep the last good value on a failure. Returns `[value, error, reload]`.
+ * `background` marks even the first load as not the owner's (spec 2170 A.5):
+ * the shell's own counters, not a page opening.
  */
-export function usePoll(load, ms, deps = []) {
+export function usePoll(load, ms, deps = [], { background = false } = {}) {
   const [state, setState] = useState({ value: undefined, error: null });
   const saved = useRef(load);
   saved.current = load;
@@ -191,11 +280,17 @@ export function usePoll(load, ms, deps = []) {
       clearTimeout(timer);
       // The first load runs even in a hidden tab; later polls wait for it to show.
       if (document.hidden && !first) return;
+      const wasFirst = first;
       first = false;
       if (!running) {
         running = true;
         try {
-          const value = await saved.current();
+          // A poll's repeats are background; its first load is the page opening.
+          const was = clientNav.state.polling;
+          clientNav.state.polling = background || !wasFirst;
+          const pending = saved.current();
+          clientNav.state.polling = was;
+          const value = await pending;
           if (alive) setState({ value, error: null });
           if (alive) network.report(poll, true);
         } catch (error) {

@@ -1,6 +1,9 @@
 // Same-origin document reader; the document keeps its existing review sheet.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, registerPanel, closePanel, openPanel, bus, typingIn } from './ui.js';
+import { html, registerPanel, closePanel, openPanel, bus, typingIn, clientNav } from './ui.js';
+
+// The ask thread's refresh is the reader's own read, never the owner's (spec 2170 A.5).
+const BACKGROUND = { 'x-sm-bg': '1' };
 
 export function shellName(path = location.pathname) {
   return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/history/tickets': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
@@ -41,13 +44,13 @@ export function Reader({ id, controls, onBack = closePanel }) {
   const refreshAsk = async (docId = doc?.docId) => {
     if (!docId) return;
     try {
-      const response = await fetch(`/docs/${encodeURIComponent(docId)}/ask-target`);
+      const response = await fetch(`/docs/${encodeURIComponent(docId)}/ask-target`, { headers: BACKGROUND });
       if (!response.ok) throw Error(`Ask target: ${response.status}`);
       const info = await response.json();
       setAskTarget(info);
       if (!targetInitialized.current) { setTarget(info.default); targetInitialized.current = true; }
       else setTarget(previous => previous === 'author' && !info.author?.live ? info.default : previous);
-      const thread = await fetch(`/docs/${encodeURIComponent(docId)}/ask-items`);
+      const thread = await fetch(`/docs/${encodeURIComponent(docId)}/ask-items`, { headers: BACKGROUND });
       if (!thread.ok) throw Error(`Ask items: ${thread.status}`);
       const data = await thread.json();
       setItems(data.items || []);
@@ -65,7 +68,7 @@ export function Reader({ id, controls, onBack = closePanel }) {
     setSending(true);
     try {
       const response = await fetch(`/docs/${encodeURIComponent(doc.docId)}/ask`, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-sm-doc-token': doc.token },
+        method: 'POST', headers: { ...clientNav.headers(), 'content-type': 'application/json', 'x-sm-doc-token': doc.token },
         body: JSON.stringify({ text: question, quote: quote || undefined, target }),
       });
       if (!response.ok) throw Error((await response.text()).slice(0, 240));

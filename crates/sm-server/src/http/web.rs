@@ -45,6 +45,7 @@ const ASSETS: &[Asset] = &[
     asset!("analytics.js", JS),
     asset!("queue.css", "text/css; charset=utf-8"),
     asset!("settings.js", JS),
+    asset!("autopm.js", JS),
     asset!("handoff.js", JS),
     asset!("devices.js", JS),
     asset!("worktrees.js", JS),
@@ -261,9 +262,9 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .collect();
         let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
-        // Raw source bytes, excluding vendors. Clickable terminal links (#2177)
-        // bring the app to 354,970 bytes; 352 KiB leaves ~1.5% headroom.
-        const BUDGET: usize = 352 * 1024;
+        // Raw source bytes, excluding vendors. Settings › Auto PM and the client
+        // headers (#2176) bring the app to 368,248 bytes; 364 KiB leaves ~1.2% headroom.
+        const BUDGET: usize = 364 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

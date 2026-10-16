@@ -68,6 +68,7 @@ object Routes {
     const val HISTORY = "history"
     const val NOTES = "notes"
     const val GUESTBOOK = "guestbook"
+    const val AUTOPM = "autopm"
 }
 
 @Composable
@@ -135,6 +136,18 @@ fun AppNavigation() {
             delay(INBOX_BADGE_REFRESH_MS)
         }
     }
+    // Auto PM switches (spec 2170 B.1): re-read when a response names a new version, and every 30 s in front.
+    val switchVersion by li.rajeshgo.sm.data.remote.ClientNav.switchVersion.collectAsState()
+    LaunchedEffect(switchVersion, isLoggedIn) {
+        if (switchVersion != null && isLoggedIn == true) li.rajeshgo.sm.ui.autopm.AutopmSwitches.refresh(context)
+    }
+    LaunchedEffect(resumed, isLoggedIn) {
+        if (!resumed || isLoggedIn != true) return@LaunchedEffect
+        while (isActive) {
+            li.rajeshgo.sm.ui.autopm.AutopmSwitches.refresh(context)
+            delay(li.rajeshgo.sm.ui.autopm.AUTOPM_REFRESH_MS)
+        }
+    }
     val toInbox = { toTab(Routes.INBOX) }
     val toWatch = { toTab(Routes.WATCH) }
     val toBoard = { toTab(Routes.BOARD) }
@@ -144,6 +157,7 @@ fun AppNavigation() {
     val currentRoute = backStackEntry?.destination?.route?.substringBefore('?')
     val section = backStackEntry?.arguments?.getString("section")
     LaunchedEffect(currentRoute, section) {
+        li.rajeshgo.sm.data.remote.ClientNav.setRoute(screenForRoute(currentRoute))
         currentRoute?.let { BugScreen.shown(it + section?.let { s -> "?section=$s" }.orEmpty()) }
     }
     val bugViewModel: BugReportViewModel = viewModel()
@@ -202,7 +216,11 @@ fun AppNavigation() {
                             popUpTo(Routes.SETTINGS) { inclusive = true }
                         }
                     },
+                    onOpenAutoPm = { navController.navigate(Routes.AUTOPM) { launchSingleTop = true } },
                 )
+            }
+            composable(Routes.AUTOPM) {
+                li.rajeshgo.sm.ui.autopm.AutoPmScreen(onBack = { navController.popBackStack() }, onOpenInbox = toInbox)
             }
             composable(Routes.INBOX) {
                 InboxScreen(

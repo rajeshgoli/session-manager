@@ -210,7 +210,7 @@ class InboxBadgeRefresher(application: Application) {
         val serverUrl = settingsRepository.serverUrl.first()
         val token = settingsRepository.accessToken.first()
         if (serverUrl.isBlank() || token.isBlank()) return
-        runCatching { repository.fetchInbox(serverUrl, token, InboxFilter.Open.query) }
+        runCatching { repository.fetchInbox(serverUrl, token, InboxFilter.Open.query, background = true) }
             .onSuccess(InboxBadge::update)
     }
 }
