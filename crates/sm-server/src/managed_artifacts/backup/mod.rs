@@ -1,8 +1,11 @@
 //! Backup foundation. The request coordinator owns scheduling and authentication;
 //! these primitives never contact a remote device or delete source data.
+pub mod client;
 pub mod lifecycle;
 mod outbox;
+pub mod pull;
 mod scope;
+pub mod seed;
 mod store;
 pub use outbox::{prepare, Prepared, TransferManifest};
 pub use scope::{collect_scope, Scope};
