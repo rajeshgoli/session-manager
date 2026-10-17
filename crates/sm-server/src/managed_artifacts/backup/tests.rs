@@ -1550,3 +1550,31 @@ fn invalid_backup_exclude_fails_config_validation() {
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("invalid backup exclude"), "{error}");
 }
+
+#[test]
+fn loose_root_file_is_a_one_file_scope_and_round_trips() {
+    use super::client::Destination;
+    let f = Fixture::new();
+    let root = &f.manager.config.roots[0];
+    fs::write(PathBuf::from(&root.path).join("notes.md"), b"cleanup notes").unwrap();
+    f.manager.store.open().unwrap().execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'notes.md','unrecorded','root','notes.md','scan','owner/repo','now')",params![root.path]).unwrap();
+    let scopes = collect_scope(&f.manager, "mini").unwrap();
+    let notes = scopes.iter().find(|s| s.segment == "notes.md").unwrap();
+    assert_eq!(notes.measure().unwrap().data_bytes, 13);
+    let first = prepare(&f.manager, &scopes, None, "first").unwrap();
+    assert!(first
+        .manifest
+        .files
+        .contains_key("packed/notes.md/notes.md.zst"));
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("first", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("first", &first.transfer, &staging, false, 0.1)
+        .unwrap();
+    dest.restore(&f.dir.join("restored"), None, &[]).unwrap();
+    assert_eq!(
+        fs::read(f.dir.join("restored/notes.md/notes.md")).unwrap(),
+        b"cleanup notes"
+    );
+}
