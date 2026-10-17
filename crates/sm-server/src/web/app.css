@@ -241,6 +241,10 @@ select.inp { padding: 3px 6px; }
 .last-turn code { font-family: var(--mono); font-size: .92em; } .last-turn pre { overflow-x: auto; }
 .you.note { color: var(--ink-2); }
 .note-edit { display: flex; gap: 6px; align-items: center; }
+.inline-edit { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.acts.with-links { align-items: center; }
+.acts.with-links .links { display: contents; }
+.acts.with-links > .anchor:first-of-type { margin-left: auto; }
 .note-edit input { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; color: var(--ink); }
 .last-turn-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
 .plain-btn { border: 0; background: none; padding: 0; color: inherit; cursor: pointer; text-align: left; }

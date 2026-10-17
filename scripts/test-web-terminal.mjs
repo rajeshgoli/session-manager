@@ -79,7 +79,7 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
   if (failDirect) await page.addInitScript(() => { window.failDirect = true; });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  const state = { sessions: fixture(), answered: [], retired: [], tickets: 0 };
+  const state = { sessions: fixture(), answered: [], retired: [], renamed: [], tickets: 0 };
   await page.route('**/*', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -111,6 +111,14 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
       const id = decodeURIComponent(retire[1]);
       state.retired.push({ id, body: request.postDataJSON() });
       state.sessions = state.sessions.filter((s) => s.id !== id);
+      return route.fulfill({ json: {} });
+    }
+    const rename = /^\/sessions\/([^/]+)$/.exec(url.pathname);
+    if (rename && request.method() === 'PATCH') {
+      const id = decodeURIComponent(rename[1]);
+      const name = request.postDataJSON().friendly_name;
+      state.renamed.push({ id, name });
+      state.sessions = state.sessions.map((s) => (s.id === id ? { ...s, name } : s));
       return route.fulfill({ json: {} });
     }
     if (url.pathname === '/watch/state') return route.fulfill({ json: { sessions: state.sessions, counts: {} } });
@@ -345,6 +353,22 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
       } else {
         assert.ok(body.y + body.height <= box.y + 1, `panel sits below the terminal ${JSON.stringify({ body, box })}`);
         assert.ok(body.height < before.height, 'terminal shortens to make room');
+      }
+      // Beside its own terminal (#2270): no Open in Claude, Terminal or Retire, which the bar
+      // carries; the ticket chip shares the row; no Note section until a note is pinned.
+      await panel.locator('.acts .link-chip').waitFor();
+      assert.deepEqual(await panel.locator('.acts button').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label') || x.textContent.trim())),
+        ['#2200 ↗', 'Hand off…', 'More']);
+      assert.equal(await panel.locator('.pbody h3', { hasText: 'Note' }).count(), 0);
+      if (viewport.width > 900) {
+        await panel.getByRole('button', { name: 'More' }).click();
+        await panel.getByRole('button', { name: 'Rename…' }).click();
+        const field = panel.getByRole('textbox', { name: 'Name' });
+        await field.fill('sm-1776-b');
+        await field.press('Enter');
+        await panel.locator('.phd .t', { hasText: 'sm-1776-b' }).waitFor();
+        assert.deepEqual(state.renamed, [{ id: 'sm-1776', name: 'sm-1776-b' }]);
+        assert.equal(await panel.locator('.inline-edit').count(), 0, 'the editor closes after a rename');
       }
       const ticket = panel.getByRole('button', { name: /#2200/ }).first();
       await ticket.waitFor();

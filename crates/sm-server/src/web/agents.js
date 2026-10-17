@@ -267,8 +267,8 @@ function Facts({ agent, now, onAnswered, onRetired, cardSection }) {
       : null}`;
 }
 
-/** Pin a note saying why the agent waits; it replaces "stalled" (sm#1851). */
-function NoteEditor({ agent, onSaved }) {
+/** Pin a note saying why the agent waits; it replaces "stalled" (sm#1851). Opened from ⋯. */
+function NoteEditor({ agent, onSaved, onClose }) {
   const current = agent.facts?.note?.text || '';
   const [text, setText] = useState(current);
   const [busy, setBusy] = useState(false);
@@ -279,20 +279,50 @@ function NoteEditor({ agent, onSaved }) {
       await api(`/sessions/${encodeURIComponent(agent.id)}/note`, { method: 'PUT', body: { text: value } });
       toast(value.trim() ? 'Note pinned' : 'Note removed');
       if (onSaved) onSaved();
+      onClose();
     } catch (error) {
       toast(error.message);
     } finally {
       setBusy(false);
     }
   };
-  return html`<section><h3>Note</h3><div class="note-edit">
-    <input type="text" maxlength="200" placeholder="Why it waits, e.g. Waiting for the midnight window"
+  return html`<div class="note-edit inline-edit">
+    <input type="text" maxlength="200" aria-label="Note" autofocus placeholder="Why it waits, e.g. Waiting for the midnight window"
       value=${text} disabled=${busy} onInput=${(e) => setText(e.target.value)}
-      onKeyDown=${(e) => { if (e.key === 'Enter' && text.trim() !== current) save(text); }} />
+      onKeyDown=${(e) => { if (e.key === 'Escape') onClose(); if (e.key === 'Enter' && text.trim() !== current) save(text); }} />
     <button type="button" class="btn sm" disabled=${busy || !text.trim() || text.trim() === current}
       onClick=${() => save(text)}>Pin</button>
     ${current ? html`<button type="button" class="btn sm" disabled=${busy} onClick=${() => save('')}>Remove</button>` : null}
-  </div></section>`;
+    <button type="button" class="btn sm" disabled=${busy} onClick=${onClose}>Cancel</button>
+  </div>`;
+}
+
+/** Rename through PATCH /sessions/{id}; the server enforces sm's name rules. */
+function RenameEditor({ agent, onSaved, onClose }) {
+  const [text, setText] = useState(agent.name);
+  const [busy, setBusy] = useState(false);
+  const name = text.trim();
+  const save = async () => {
+    if (!name || name === agent.name || busy) return;
+    setBusy(true);
+    try {
+      await api(`/sessions/${encodeURIComponent(agent.id)}`, { method: 'PATCH', body: { friendly_name: name } });
+      toast(`Renamed to ${name}`);
+      onSaved?.();
+      onClose();
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return html`<div class="note-edit inline-edit">
+    <input type="text" maxlength="32" aria-label="Name" autofocus value=${text} disabled=${busy}
+      onInput=${(e) => setText(e.target.value)}
+      onKeyDown=${(e) => { if (e.key === 'Escape') onClose(); if (e.key === 'Enter') save(); }} />
+    <button type="button" class="btn sm" disabled=${busy || !name || name === agent.name} onClick=${save}>Rename</button>
+    <button type="button" class="btn sm" disabled=${busy} onClick=${onClose}>Cancel</button>
+  </div>`;
 }
 
 // ---- page -------------------------------------------------------------------
@@ -558,25 +588,26 @@ function useAgent(id) {
   return { agent, claims: detailClaims(agent?.claims, doc?.retainedClaims), reload, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
 }
 
-export function AgentPanel({ id, controls }) {
+/** `beside` is 'terminal' when the panel sits next to that agent's terminal, whose bar already
+ * carries Open in Claude and Retire (sm#2270). */
+export function AgentPanel({ id, controls, beside }) {
   const { agent, claims, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
   // An open question opens on the agent's Inbox thread so it can be answered here (sm#2245).
   const [picked, setPicked] = useState(null);
-  useEffect(() => setPicked(null), [id]);
+  const [editing, setEditing] = useState(null);
+  useEffect(() => { setPicked(null); setEditing(null); }, [id]);
   // A terminal permission prompt is answered in the terminal, so it stays on Work.
   const tab = picked || (['message', 'doc_review'].includes(agent?.facts?.you?.kind) ? 'inbox' : 'work');
   if (!agent) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
   }
-  const claim = (agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0];
   const since = agent.state === 'stopped' ? agent.last_activity : agent.activity_since || agent.last_activity;
   const parts = [
     providerLabel(agent.provider),
     agent.model,
     agent.reasoning_effort,
-    claim && `${claim.kind === 'pr' ? 'PR ' : ''}#${claim.number}`,
     `${agent.state === 'working' ? 'working' : agent.state} since ${clock(since)}`,
   ].filter(Boolean);
   return html`
@@ -586,11 +617,15 @@ export function AgentPanel({ id, controls }) {
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
-    <${AgentActions} agent=${agent} onRetired=${(done) => { if (done) closePanel(); reload(); }} />
-    <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
-      prs=${claims.filter(item => item.kind === 'pr')}
-      jobs=${agent.jobs || []} thread=${agent.thread}
-      docs=${agent.docs || []} />
+    <${AgentActions} agent=${agent} beside=${beside} onEdit=${setEditing}
+      onRetired=${(done) => { if (done) closePanel(); reload(); }}>
+      <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
+        prs=${claims.filter(item => item.kind === 'pr')}
+        jobs=${agent.jobs || []} thread=${agent.thread}
+        docs=${agent.docs || []} />
+    <//>
+    ${editing === 'rename' ? html`<${RenameEditor} agent=${agent} onSaved=${reload} onClose=${() => setEditing(null)} />` : null}
+    ${editing === 'note' ? html`<${NoteEditor} agent=${agent} onSaved=${reload} onClose=${() => setEditing(null)} />` : null}
     <div class="tabs" role="tablist">
       ${[['work', 'Work'], ['inbox', 'Inbox'], ['activity', 'Activity'], ['summary', 'Summary']].map(
         ([key, label]) => html`<button type="button" role="tab" aria-selected=${tab === key}
@@ -608,18 +643,21 @@ export function AgentPanel({ id, controls }) {
   `;
 }
 
-function AgentActions({ agent, onRetired }) {
+/** Beside the terminal, the row holds only what its bar lacks, and the link chips join it. */
+function AgentActions({ agent, beside, onEdit, onRetired, children }) {
   const [menu, setMenu] = useState(null);
-  const linked = claudeLink(agent);
+  const linked = claudeLink(agent) && beside !== 'terminal';
   const live = agent.state !== 'stopped';
+  const full = live && beside !== 'terminal';
   const close = () => setMenu(null);
-  return html`<div class="acts">
+  const actions = html`<div class=${`acts${beside === 'terminal' ? ' with-links' : ''}`}>
+    ${beside === 'terminal' ? children : null}
     ${linked ? html`<button type="button" class="btn pri" onClick=${() => openInClaude(agent)}>Open in Claude ↗</button>` : null}
-    ${live
+    ${full
       ? html`<button type="button" class=${linked ? 'btn' : 'btn pri'}
           onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨ Terminal</button>`
       : null}
-    ${live ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} />` : null}
+    ${full ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} />` : null}
     ${live
       ? html`<span class="anchor"><button type="button" class="btn" data-pop-anchor
           onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
@@ -627,8 +665,9 @@ function AgentActions({ agent, onRetired }) {
       : null}
     <span class="anchor"><button type="button" class="btn" data-pop-anchor aria-label="More"
       onClick=${() => setMenu(menu === 'more' ? null : 'more')}>⋯</button>
-      ${menu === 'more' ? html`<${MoreMenu} agent=${agent} onClose=${close} />` : null}</span>
+      ${menu === 'more' ? html`<${MoreMenu} agent=${agent} onClose=${close} onEdit=${onEdit} />` : null}</span>
   </div>`;
+  return beside === 'terminal' ? actions : html`${actions}${children}`;
 }
 
 function FollowButton({ id, menu = false, onClose }) {
@@ -653,7 +692,7 @@ function FollowButton({ id, menu = false, onClose }) {
     disabled=${busy || !follows} onClick=${toggle}>${following ? menu ? 'Unfollow' : 'Following' : 'Follow'}</button>`;
 }
 
-function MoreMenu({ agent, onClose }) {
+function MoreMenu({ agent, onClose, onEdit }) {
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
   const copy = async () => {
@@ -690,6 +729,9 @@ function MoreMenu({ agent, onClose }) {
     }); }}>Clone</button>
     <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
+    <button type="button" onClick=${() => { onClose(); onEdit('rename'); }}>Rename…</button>
+    ${agent.state !== 'stopped' ? html`<button type="button" onClick=${() => { onClose(); onEdit('note'); }}>
+      ${agent.facts?.note ? 'Edit note…' : 'Pin a note…'}</button>` : null}
   <//>`;
 }
 
@@ -739,7 +781,6 @@ function WorkTab({ agent, claims, now, onAnswered, onReply }) {
           ${agent.status_at ? html`<div class="sub">${clock(agent.status_at)}</div>` : null}</section>`
       : null}
     <${LastTurn} id=${agent.id} onReply=${onReply} />
-    <${NoteEditor} agent=${agent} onSaved=${onAnswered} />
     <section><h3>Workspace</h3><div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div></section>
   `;
 }
