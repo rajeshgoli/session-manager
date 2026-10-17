@@ -242,6 +242,30 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
   return value;
 }
 
+/**
+ * An owner write that carries the inbox token. The token comes with the page
+ * and lasts 24 hours, so a tab left open longer re-reads it from a fresh
+ * page shell and tries once more (sm#2261).
+ */
+export async function inboxWrite(path, body) {
+  const send = () => api(path, { method: 'POST', headers: config.inbox_token ? { 'X-SM-Doc-Token': config.inbox_token } : {}, body });
+  const used = config.inbox_token;
+  try {
+    return await send();
+  } catch (e) {
+    if (e.status !== 401 && e.status !== 403) throw e;
+    let fresh = null;
+    try {
+      const page = await (await fetch('/', { credentials: 'same-origin', cache: 'no-store' })).text();
+      const shell = new DOMParser().parseFromString(page, 'text/html');
+      fresh = JSON.parse(shell.getElementById('sm-config')?.textContent || '{}').inbox_token;
+    } catch (ignored) { /* keep the original error */ }
+    if (!fresh || fresh === used) throw e;
+    config.inbox_token = fresh;
+    return send();
+  }
+}
+
 // ---- network state and polling ---------------------------------------------
 
 // Polls failing right now; the page is offline while any is.

@@ -58,14 +58,15 @@ function workspaceChoices(settings, watch) {
 const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~' || path.startsWith('~/'));
 
 /**
- * `prefill` may carry provider, model, effort and workspace (Clone).
+ * `prefill` may carry provider, model, effort and workspace (Clone), and a
+ * first message (an artifact investigation brief).
  */
 export function NewAgentPopover({ prefill = {}, onClose }) {
   const [settings, setSettings] = useState(null);
   const local = useLocalModel();
   const [watch, setWatch] = useState(null);
   const [error, setError] = useState(null);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(!!prefill.message);
   const [form, setForm] = useState(null);
   const [models, setModels] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -90,7 +91,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
           workspace,
           otherWorkspace: '',
           name: '',
-          message: '',
+          message: prefill.message || '',
         });
       })
       .catch((e) => alive && setError(e.message));

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age, stored, store } from './ui.js';
+import { html, api, inboxWrite, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age, stored, store } from './ui.js';
 import { Reader, readerPath } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -26,7 +26,7 @@ function useWatchedAgent(id) {
 }
 const factText = facts => !facts ? '' : facts.agent?.state === 'stopped' ? 'Stopped'
   : `${facts.agent?.state === 'working' ? '● Working' : '○ Idle'}${facts.agent?.since ? ` ${age(facts.agent.since)}` : ''}`;
-const write = (path, body) => api(path, { method: 'POST', headers: { 'X-SM-Doc-Token': config.inbox_token }, body });
+const write = inboxWrite;
 const docRevision = item => {
   const link = new DOMParser().parseFromString(item.html, 'text/html').querySelector('a[href]');
   return link ? { path: readerPath(link.getAttribute('href')), title: link.textContent.trim() } : null;

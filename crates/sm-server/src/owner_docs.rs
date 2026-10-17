@@ -1021,6 +1021,12 @@ impl OwnerDocStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let path_of = |doc: &OwnerDoc| (doc.repo.clone(), doc.path.clone());
+        let live_paths: BTreeMap<String, (String, String)> = docs
+            .iter()
+            .filter(|doc| doc.retracted_at.is_none())
+            .map(|doc| (doc.id.clone(), path_of(doc)))
+            .collect();
         let docs: Vec<_> = docs
             .into_iter()
             .filter(|doc| include_retracted || doc.retracted_at.is_none())
@@ -1040,6 +1046,17 @@ impl OwnerDocStore {
                     .entry(publish.doc_id.clone())
                     .or_default()
                     .push(publish);
+            }
+        }
+        // One file can be two docs: its PR copy and the copy published after
+        // merge. The newest publish of the file is the one to read (sm#2261).
+        let mut newest_of_path = BTreeMap::<(String, String), String>::new();
+        for (doc_id, path) in &live_paths {
+            if let Some(latest) = publishes.get(doc_id).and_then(|p| p.last()) {
+                let newest = newest_of_path.entry(path.clone()).or_default();
+                if timestamp_after(&latest.published_at, newest) {
+                    *newest = latest.published_at.clone();
+                }
             }
         }
         let mut views = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1104,8 +1121,17 @@ impl OwnerDocStore {
                     })
                     .unwrap_or_default(),
             };
+            let mut state = derive_owner_doc_state(&inputs);
+            // An unread copy of a file that has a newer copy is not news.
+            if matches!(state, OwnerDocState::New | OwnerDocState::Updated)
+                && newest_of_path
+                    .get(&path_of(&doc))
+                    .is_some_and(|newest| timestamp_after(newest, &latest.published_at))
+            {
+                state = OwnerDocState::Read;
+            }
             summaries.push(OwnerDocSummary {
-                state: derive_owner_doc_state(&inputs),
+                state,
                 latest_commit_sha: latest.commit_sha.clone(),
                 latest_blob_sha: latest.blob_sha.clone(),
                 published_at: latest.published_at.clone(),
@@ -2214,6 +2240,32 @@ mod tests {
         assert_eq!(state(&doc.id), OwnerDocState::Updated);
         store.record_view(&doc.id, &"2".repeat(40)).unwrap();
         assert_eq!(state(&doc.id), OwnerDocState::Read);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_newer_copy_of_the_same_file_retires_the_unread_pr_copy() {
+        let (store, dir) = store();
+        let state = |id: &str| store.summary(id).unwrap().unwrap().state;
+        let pr_copy = store
+            .publish(publish(Some(7), "a", "1"), |_| true)
+            .unwrap()
+            .doc;
+        assert_eq!(state(&pr_copy.id), OwnerDocState::New);
+        // Merged, then published again from main: a second doc, same file.
+        let main_copy = store
+            .publish(publish(None, "b", "2"), |_| true)
+            .unwrap()
+            .doc;
+        assert_ne!(main_copy.id, pr_copy.id);
+        assert_eq!(state(&pr_copy.id), OwnerDocState::Read);
+        assert_eq!(state(&main_copy.id), OwnerDocState::New);
+        // A review request on the older copy still stands.
+        let mut asked = publish(Some(7), "c", "3");
+        asked.review_requested = true;
+        store.publish(asked, |_| true).unwrap();
+        store.publish(publish(None, "d", "4"), |_| true).unwrap();
+        assert_eq!(state(&pr_copy.id), OwnerDocState::ReviewRequested);
         fs::remove_dir_all(dir).unwrap();
     }
 

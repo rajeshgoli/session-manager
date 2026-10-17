@@ -50,3 +50,42 @@ test('artifact fixture renders on desktop and phone with owner confirmation and 
     }
   } finally {await browser.close();}
 });
+
+// The whole app, rail included: the rail must stay put while the page scrolls.
+const appShell = `<!doctype html><html data-theme="dark"><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="/assets/queue.css">
+<script type="importmap">{"imports":{"preact":"/assets/vendor/preact.module.js","preact/hooks":"/assets/vendor/hooks.module.js","htm":"/assets/vendor/htm.module.js"}}</script>
+<script id="sm-config" type="application/json">{"inbox_token":"fixture"}</script>
+<script type="module" src="/assets/app.js"></script></head><body><div id="app"></div></body></html>`;
+
+test('investigate opens the New agent launcher with the brief, and the page scrolls under a fixed rail', async () => {
+  const browser = await chromium.launch({channel:'chrome',headless:true});
+  try {
+    const page = await browser.newPage({viewport:{width:1440,height:420}});
+    const errors=[]; const posts=[];
+    page.on('pageerror', e=>errors.push(e.message));
+    await page.route('**/*',async route => {
+      const req=route.request();const url=new URL(req.url());
+      if(url.pathname.startsWith('/assets/')) return route.fulfill({body:await readFile(new URL(url.pathname.slice(8),assets)),contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript'});
+      if(req.isNavigationRequest()) return route.fulfill({body:appShell,contentType:'text/html'});
+      if(req.method()==='POST') { posts.push(req.postDataJSON()); return route.fulfill({json:{brief:'Investigate managed artifact research-data in /artifacts.',working_dir:'/repo/checkout'}}); }
+      if(url.pathname==='/client/settings') return route.fulfill({json:{new_agent:{provider:'claude',workspaces:['/repo/checkout']}}});
+      return route.fulfill({json:url.pathname==='/artifacts'?fixture:{}});
+    });
+    await page.goto('https://sm.example.com/artifacts');
+    await page.getByRole('heading',{name:'Taking up space'}).waitFor();
+    await page.mouse.move(700,300);
+    await page.mouse.wheel(0,2000);
+    await page.waitForTimeout(200);
+    assert.equal(await page.evaluate(()=>document.scrollingElement.scrollTop),0,'the window must not scroll');
+    assert.ok(await page.evaluate(()=>document.querySelector('.artifacts-scroll').scrollTop>0),'the page scrolls inside its own box');
+    await page.getByRole('button',{name:/Retained market data/}).click();
+    await page.getByRole('button',{name:'Ask an agent to investigate'}).click();
+    const message = page.locator('textarea');
+    await message.waitFor();
+    assert.equal(await message.inputValue(),'Investigate managed artifact research-data in /artifacts.');
+    assert.deepEqual(posts,[{root:'/artifacts',action:'brief'}],'nothing is started until the owner starts it');
+    assert.ok(await page.locator('.rail').isVisible());
+    assert.deepEqual(errors,[]);
+  } finally {await browser.close();}
+});
