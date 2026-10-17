@@ -27,7 +27,16 @@ fun JsonObject.number(key: String): Long = (get(key) as? JsonPrimitive)?.doubleO
 fun JsonObject.rows(key: String): List<JsonObject> = (get(key) as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
 fun artifactSize(a: JsonObject): Long = a.number(if (a.text("state") == "frozen") "frozen_bytes" else "disk_bytes")
 
-data class ArtifactsState(val data: JsonObject? = null, val error: String? = null, val busy: Boolean = false)
+/** An investigation the owner is about to start from the New agent sheet (sm#2266). */
+data class InvestigationStart(val name: String, val workingDir: String, val brief: String)
+
+data class ArtifactsState(
+    val data: JsonObject? = null,
+    val error: String? = null,
+    val busy: Boolean = false,
+    val investigation: InvestigationStart? = null,
+    val createError: String? = null,
+)
 class ArtifactsViewModel(application: Application) : AndroidViewModel(application) {
     private val settings = SettingsRepository(application)
     private val repository = SessionManagerRepository(settings)
@@ -47,6 +56,40 @@ class ArtifactsViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
     fun refresh() { viewModelScope.launch { load() } }
+
+    /** Fetches the brief, then the screen opens the New agent sheet with it. */
+    fun investigate(a: JsonObject) {
+        if (mutable.value.busy) return
+        mutable.value = mutable.value.copy(busy = true, error = null)
+        viewModelScope.launch {
+            try {
+                val brief = repository.artifactBrief(settings.serverUrl.first(), settings.accessToken.first(), a.text("name"), a.text("root")).getOrThrow()
+                mutable.value = mutable.value.copy(investigation = InvestigationStart(a.text("name"), brief.text("working_dir"), brief.text("brief")), createError = null)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                mutable.value = mutable.value.copy(error = e.message)
+            } finally { mutable.value = mutable.value.copy(busy = false) }
+        }
+    }
+
+    fun closeInvestigation() { mutable.value = mutable.value.copy(investigation = null, createError = null) }
+
+    fun createSession(request: li.rajeshgo.sm.data.model.CreateSessionRequest) {
+        if (mutable.value.busy) return
+        mutable.value = mutable.value.copy(busy = true, createError = null)
+        viewModelScope.launch {
+            repository.createSession(settings.serverUrl.first(), settings.accessToken.first(), request)
+                .onSuccess { mutable.value = mutable.value.copy(investigation = null); load() }
+                .onFailure { mutable.value = mutable.value.copy(createError = it.message ?: "Could not create session") }
+            mutable.value = mutable.value.copy(busy = false)
+        }
+    }
+
+    suspend fun sessionAgentTypes(): List<li.rajeshgo.sm.ui.watch.AgentTypeChoice> =
+        li.rajeshgo.sm.ui.watch.agentTypeChoices(repository.fetchOwnerSettings(settings.serverUrl.first(), settings.accessToken.first()))
+
+    suspend fun sessionModels(provider: String, workingDir: String): li.rajeshgo.sm.data.model.SessionModelsResponse =
+        repository.fetchSessionModelCatalog(settings.serverUrl.first(), settings.accessToken.first(), provider, workingDir)
     fun act(a: JsonObject, action: String) {
         if (mutable.value.busy) return
         mutable.value = mutable.value.copy(busy = true, error = null)

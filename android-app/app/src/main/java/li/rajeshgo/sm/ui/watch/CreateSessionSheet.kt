@@ -104,12 +104,14 @@ fun CreateSessionSheet(
     onBugDraftChange: (String) -> Unit = {},
     onClearBugDraft: () -> Unit = {},
     onAgentTypeChange: (String?) -> Unit = {},
+    /** Opens New agent on this folder and first message, such as an artifact investigation brief (sm#2266). */
+    prefill: CreateSessionRequest? = null,
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     // The agent fields open on the bug defaults once they arrive.
-    val sheetKey = ticket?.label ?: bug?.let { "bug:${it.defaults != null}" } ?: source?.id
+    val sheetKey = ticket?.label ?: bug?.let { "bug:${it.defaults != null}" } ?: prefill?.let { "prefill:${it.workingDir}:${it.initialMessage.hashCode()}" } ?: source?.id
     val template = remember(sheetKey) {
-        ticket?.let { CreateSessionRequest(it.provider, it.workingDir, it.model, it.effort) } ?: bug?.defaults ?: sessionTemplate(source)
+        ticket?.let { CreateSessionRequest(it.provider, it.workingDir, it.model, it.effort) } ?: bug?.defaults ?: prefill ?: sessionTemplate(source)
     }
     // Board Start and the bug's agent take the same choices.
     val startLike = ticket != null || bug != null
@@ -150,7 +152,7 @@ fun CreateSessionSheet(
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name.orEmpty()) }
-    var prompt by rememberSaveable(sheetKey) { mutableStateOf(ticket?.brief.orEmpty()) }
+    var prompt by rememberSaveable(sheetKey) { mutableStateOf(ticket?.brief ?: prefill?.initialMessage.orEmpty()) }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()
     var catalog by remember(provider, directory) { mutableStateOf(emptyList<String>()) }

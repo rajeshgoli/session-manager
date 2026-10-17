@@ -749,6 +749,15 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).artifactOwnerAction(name, body); Unit }.mapFailure(::classifyWriteFailure)
     }
 
+    /** The investigation brief and repo folder for [name] (sm#2266); starts nothing. */
+    suspend fun artifactBrief(baseUrl: String, token: String, name: String, root: String): Result<kotlinx.serialization.json.JsonObject> = withContext(Dispatchers.IO) {
+        runCatching {
+            api(baseUrl, token).artifactOwnerAction(name, kotlinx.serialization.json.buildJsonObject {
+                put("root", kotlinx.serialization.json.JsonPrimitive(root)); put("action", kotlinx.serialization.json.JsonPrimitive("brief"))
+            })
+        }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchAgentHistory(baseUrl: String, token: String, query: String?, before: String?): li.rajeshgo.sm.data.model.AgentHistoryResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getAgentHistory(query, before) }
     }
