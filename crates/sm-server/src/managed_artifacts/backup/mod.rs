@@ -8,7 +8,7 @@ mod scope;
 pub mod seed;
 mod store;
 pub use outbox::{prepare, Prepared, TransferManifest};
-pub use scope::{collect_scope, Scope};
+pub use scope::{collect_scope, exclude_set, Exclude, Scope};
 pub use store::{confirm, confirmed, load_manifest, rates, record_rate, save_manifest, Rates};
 
 use anyhow::{ensure, Result};

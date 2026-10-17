@@ -85,10 +85,30 @@ pub(super) fn root_metadata(path: &Path) -> Result<Entry> {
 /// No symlink traversal, no device crossings, and no lossy filename conversion.
 /// Unsupported special files fail closed instead of silently disappearing.
 pub fn inventory(root: &Path) -> Result<Vec<Entry>> {
-    fn walk(root: &Path, dir: &Path, device: u64, entries: &mut Vec<Entry>) -> Result<()> {
+    inventory_excluding(root, |_| false)
+}
+
+/// As [`inventory`], treating an entry whose root-relative path `skip` accepts
+/// as absent; a skipped directory is not descended.
+pub fn inventory_excluding(root: &Path, skip: impl Fn(&str) -> bool) -> Result<Vec<Entry>> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        device: u64,
+        skip: &dyn Fn(&str) -> bool,
+        entries: &mut Vec<Entry>,
+    ) -> Result<()> {
         for item in fs::read_dir(dir)? {
             let path = item?.path();
             if path.file_name().is_some_and(|n| n == ".DS_Store") {
+                continue;
+            }
+            if path
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .is_some_and(skip)
+            {
                 continue;
             }
             let m = fs::symlink_metadata(&path)?;
@@ -132,7 +152,7 @@ pub fn inventory(root: &Path) -> Result<Vec<Entry>> {
                 target,
             });
             if m.is_dir() {
-                walk(root, &path, device, entries)?;
+                walk(root, &path, device, skip, entries)?;
             }
         }
         Ok(())
@@ -140,7 +160,7 @@ pub fn inventory(root: &Path) -> Result<Vec<Entry>> {
     let metadata = fs::symlink_metadata(root)?;
     ensure!(metadata.is_dir(), "archive source must be a real directory");
     let mut entries = Vec::new();
-    walk(root, root, metadata.dev(), &mut entries)?;
+    walk(root, root, metadata.dev(), &skip, &mut entries)?;
     entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
     Ok(entries)
 }
