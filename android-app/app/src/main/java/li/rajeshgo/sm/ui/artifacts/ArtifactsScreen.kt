@@ -35,7 +35,7 @@ fun ArtifactsScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: Artifac
             busy = state.busy,
             error = state.createError,
             onDismiss = viewModel::closeInvestigation,
-            prefill = li.rajeshgo.sm.ui.watch.sessionTemplate(null).copy(workingDir = start.workingDir, initialMessage = start.brief),
+            prefill = start.request,
             onCreate = viewModel::createSession,
         )
     }

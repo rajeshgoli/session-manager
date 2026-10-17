@@ -285,11 +285,23 @@ fn scan_missing_live_record_is_vanished() {
     let f = Fixture::new();
     f.create("123_data");
     f.svc.done(&f.root, "123_data", "maker").unwrap();
+    let conn = f.svc.store.open().unwrap();
+    conn.execute("DELETE FROM artifact_consumers", []).unwrap();
+    conn.execute(
+        "INSERT INTO artifact_consumers(root,name,repo,number,added_by,added_at,last_state) VALUES(?1,'123_data','acme/widgets',123,'maker','2026-10-17T00:00:00Z','OPEN')",
+        [&f.root.path],
+    )
+    .unwrap();
     fs::remove_dir(f.path("123_data")).unwrap();
     f.svc.scan(&f.root).unwrap();
-    let a = f.svc.store.detail(&f.root.path, "123_data").unwrap();
-    assert_eq!(a["delete_reason"], "vanished");
-    assert_eq!(a["needs_owner"], true);
+    let needs = || f.svc.store.detail(&f.root.path, "123_data").unwrap();
+    assert_eq!(needs()["delete_reason"], "vanished");
+    // An open ticket still uses it: someone must look.
+    assert_eq!(needs()["needs_owner"], true);
+    // Every ticket that used it is closed: nobody needs it (sm#2271).
+    conn.execute("UPDATE artifact_consumers SET last_state='CLOSED'", [])
+        .unwrap();
+    assert_eq!(needs()["needs_owner"], false);
 }
 #[test]
 fn initial_grace_is_persisted_once() {

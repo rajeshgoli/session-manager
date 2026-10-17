@@ -62,8 +62,17 @@ pub fn reasons(conn: &Connection, a: &Value) -> Result<Vec<String>> {
             reasons.push("consumer_unverifiable".into());
         }
     }
+    // A folder that vanished matters only while work that uses it is still
+    // open (or cannot be checked); otherwise nobody needs it (sm#2271).
     if a["delete_reason"] == "vanished" && last("vanished").max(last("deleted")) > acted {
-        reasons.push("vanished".into());
+        let needed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_consumers WHERE root=?1 AND name=?2 COLLATE NOCASE AND COALESCE(last_state,'UNKNOWN') NOT IN ('CLOSED','MERGED'))",
+            params![root, name],
+            |r| r.get(0),
+        )?;
+        if needed {
+            reasons.push("vanished".into());
+        }
     }
     Ok(reasons)
 }

@@ -151,7 +151,7 @@ fun CreateSessionSheet(
     val customConfig = !typesLoading && selectedType == null
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
-    var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name.orEmpty()) }
+    var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name ?: prefill?.name.orEmpty()) }
     var prompt by rememberSaveable(sheetKey) { mutableStateOf(ticket?.brief ?: prefill?.initialMessage.orEmpty()) }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()

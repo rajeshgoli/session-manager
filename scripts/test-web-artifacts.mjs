@@ -68,7 +68,7 @@ test('investigate opens the New agent launcher with the brief, and the page scro
       const req=route.request();const url=new URL(req.url());
       if(url.pathname.startsWith('/assets/')) return route.fulfill({body:await readFile(new URL(url.pathname.slice(8),assets)),contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript'});
       if(req.isNavigationRequest()) return route.fulfill({body:appShell,contentType:'text/html'});
-      if(req.method()==='POST') { posts.push(req.postDataJSON()); return route.fulfill({json:{brief:'Investigate managed artifact research-data in /artifacts.',working_dir:'/repo/checkout'}}); }
+      if(req.method()==='POST') { posts.push(req.postDataJSON()); return route.fulfill({json:{brief:'The artifact folder research-data in /artifacts needs a look.',working_dir:'/repo/checkout',name:'artifact-research-data',provider:'codex',model:'gpt-6-luna',effort:'high'}}); }
       if(url.pathname==='/client/settings') return route.fulfill({json:{new_agent:{provider:'claude',workspaces:['/repo/checkout']}}});
       return route.fulfill({json:url.pathname==='/artifacts'?fixture:{}});
     });
@@ -83,7 +83,8 @@ test('investigate opens the New agent launcher with the brief, and the page scro
     await page.getByRole('button',{name:'Ask an agent to investigate'}).click();
     const message = page.locator('textarea');
     await message.waitFor();
-    assert.equal(await message.inputValue(),'Investigate managed artifact research-data in /artifacts.');
+    assert.equal(await message.inputValue(),'The artifact folder research-data in /artifacts needs a look.');
+    assert.equal(await page.getByPlaceholder('sm picks one').inputValue(),'artifact-research-data');
     assert.deepEqual(posts,[{root:'/artifacts',action:'brief'}],'nothing is started until the owner starts it');
     assert.ok(await page.locator('.rail').isVisible());
     assert.deepEqual(errors,[]);
