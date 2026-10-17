@@ -249,6 +249,7 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
  */
 export async function inboxWrite(path, body) {
   const send = () => api(path, { method: 'POST', headers: config.inbox_token ? { 'X-SM-Doc-Token': config.inbox_token } : {}, body });
+  const used = config.inbox_token;
   try {
     return await send();
   } catch (e) {
@@ -259,7 +260,7 @@ export async function inboxWrite(path, body) {
       const shell = new DOMParser().parseFromString(page, 'text/html');
       fresh = JSON.parse(shell.getElementById('sm-config')?.textContent || '{}').inbox_token;
     } catch (ignored) { /* keep the original error */ }
-    if (!fresh || fresh === config.inbox_token) throw e;
+    if (!fresh || fresh === used) throw e;
     config.inbox_token = fresh;
     return send();
   }
