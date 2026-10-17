@@ -835,6 +835,34 @@ async fn queue_submission_survives_a_failed_post_commit_thaw_notice() {
 }
 
 #[tokio::test]
+async fn queue_job_without_artifact_flags_reserves_the_frozen_folder_it_names() {
+    let f = Fixture::new();
+    let conn = f.store().open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'chains','frozen','cold','chains','queue','owner/research',?2)",rusqlite::params![f.root(),sm_server::managed_artifacts::now()]).unwrap();
+    let path = format!("{}/chains/nk5", f.root());
+    let (status,body)=f.request("POST","/queue-jobs",Some("maker"),json!({"type":"background","label":"plain-reader","notify_target":"maker","requester_session_id":"maker","cwd":f.dir,"argv":["/bin/ls",path]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let inputs: String = conn
+        .query_row(
+            "SELECT inputs_json FROM artifact_job_reservations WHERE job_id=?1",
+            [body["id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(inputs, r#"["chains"]"#);
+    let (status,body)=f.request("POST","/queue-jobs",Some("maker"),json!({"type":"background","label":"plain-other","notify_target":"maker","requester_session_id":"maker","cwd":f.dir,"argv":["/usr/bin/true"]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reserved: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_job_reservations WHERE job_id=?1",
+            [body["id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reserved, 0);
+}
+
+#[tokio::test]
 async fn managed_artifacts_needs_you_badge_counts_current_items() {
     let f = Fixture::new();
     for name in ["orphan", "second"] {

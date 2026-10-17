@@ -134,6 +134,52 @@ impl PreparedSubmission {
         })
     }
 
+    /// A job without artifact flags still reserves (and so thaws) the recorded
+    /// folders its argv or script names by path. Returns None when it names no
+    /// recorded folder, so such jobs behave exactly as before.
+    pub fn detect_undeclared(
+        manager: &ManagedArtifacts,
+        request: &CreateQueueJob,
+    ) -> Result<Option<Self>> {
+        if request
+            .script
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_SCRIPT_BYTES)
+        {
+            return Ok(None);
+        }
+        let mut texts = request.argv.clone().unwrap_or_default();
+        texts.extend(request.script.clone());
+        let mut conn = None;
+        for root in &manager.config.roots {
+            let detected = detect_names(root, &texts);
+            if detected.is_empty() {
+                continue;
+            }
+            let conn = match &conn {
+                Some(conn) => conn,
+                None => conn.insert(manager.store.open()?),
+            };
+            let mut recorded = Vec::new();
+            for name in detected {
+                if resolve_input(conn, &root.path, &name)?.is_some() {
+                    recorded.push(name);
+                }
+            }
+            if !recorded.is_empty() {
+                return Ok(Some(Self {
+                    declarations: Declarations::default(),
+                    root: root.clone(),
+                    request: request.clone(),
+                    rebuild: None,
+                    git: GitState::capture(Path::new(&request.cwd)),
+                    detected: recorded,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Call after attaching `artifacts.db` and starting an IMMEDIATE transaction
     /// on the queue connection. The caller inserts the queue row in this same
     /// transaction and rolls it back on ANY error from this method.

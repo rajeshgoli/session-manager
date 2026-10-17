@@ -245,6 +245,52 @@ fn frozen_inputs_request_thaw_and_do_not_start() {
     assert!(!Path::new(&f.root.path).join("out").exists());
 }
 #[test]
+fn job_without_artifact_flags_thaws_the_frozen_folder_its_argv_names() {
+    let f = Fixture::new();
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'chains','frozen','cold','chains','queue','owner/repo',?2)",params![f.root.path,now()]).unwrap();
+    let mut request = f.request();
+    request.argv = Some(vec![
+        "lanes.sh".into(),
+        format!("{}/chains/nk5", f.root.path),
+    ]);
+    let p = PreparedSubmission::detect_undeclared(&f.manager, &request)
+        .unwrap()
+        .expect("recorded folder is detected");
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
+        &f.state(),
+        request.clone(),
+        300,
+        None,
+        Some((&f.manager, &p)),
+    )
+    .unwrap();
+    assert_eq!(
+        admit(&f.conn(), &job.id).unwrap().as_deref(),
+        Some("thawing")
+    );
+    assert!(f.detail("chains")["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "thaw_requested"));
+
+    // Paths under the root that match no record leave the job untouched.
+    request.argv = Some(vec![format!("{}/scratch/out", f.root.path)]);
+    assert!(PreparedSubmission::detect_undeclared(&f.manager, &request)
+        .unwrap()
+        .is_none());
+    request.argv = Some(vec![
+        "sm".into(),
+        "artifact".into(),
+        "thaw".into(),
+        "chains".into(),
+    ]);
+    assert!(PreparedSubmission::detect_undeclared(&f.manager, &request)
+        .unwrap()
+        .is_none());
+}
+#[test]
 fn overrun_message_and_event_are_emitted_once() {
     let f = Fixture::new();
     let mut d = f.declarations("out");

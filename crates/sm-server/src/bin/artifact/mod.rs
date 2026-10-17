@@ -214,7 +214,15 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
     body["root"] = json!(args.root);
     body["repo"] = json!(repo);
     body["name"] = json!(name);
-    let id = current_session_id()?;
+    // Queue jobs start without the agent's environment, so this is where a job
+    // that runs `sm artifact thaw` lands.
+    let id = optional_current_session_id().ok_or_else(|| {
+        anyhow!(
+            "sm artifact {action} needs SESSION_MANAGER_ID, which queue jobs do not have; \
+             to thaw {name} for a queue job, run `sm queue run --input {name} ...` \
+             or name its path in the command, and sm thaws it before the job starts"
+        )
+    })?;
     let path = if create {
         "/artifacts".into()
     } else {

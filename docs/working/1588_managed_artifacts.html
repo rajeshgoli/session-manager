@@ -525,7 +525,7 @@ CREATE TABLE backup_static (path TEXT PRIMARY KEY, content_stamp TEXT, backup_st
 <ul>
 <li><b>Record flags</b>, allowed only with <code>--artifact</code>: <code>--note</code>, <code>--describe</code>, <code>--consumer</code>, <code>--project</code>, <code>--keep-until</code>, <code>--recipe-complete</code>, <code>--ticket</code>, <code>--epic</code>. They apply to every <code>--artifact</code> of the job and are validated at submission by D.2's per-field rules (the set-completeness rule is checked at E.5). Stored as <code>pending_record_json</code>. GPU flags are not accepted: queue jobs run on the Mac.</li>
 </ul>
-<p>A job with none of these behaves exactly as today. <code>--input</code> alone marks inputs in use for the job's life.</p>
+<p>A job with none of these still runs E.2 step 2: when its argv or script names the path of a recorded artifact, that artifact is a detected input (reserved, thawed if frozen, refused if mid-operation); otherwise the job behaves exactly as today. <code>--input</code> alone marks inputs in use for the job's life. <code>sm artifact</code> commands need the agent's session id, which queue jobs do not inherit, so a job thaws its folder through detection or <code>--input</code>, never by running <code>sm artifact thaw</code>.</p>
 <h4>E.2 At submission (<code>create_queue_job</code>, <code>http.rs:8108</code> → <code>create_queue_job_conn</code>, <code>queue.rs:4091</code>)</h4>
 <ol>
 <li>Resolve the root from <code>cwd</code> (D rules).</li>
@@ -636,7 +636,7 @@ Unrecorded folders are frozen on &lt;grace_until local date&gt;.</code></pre>
 <pre><code># &lt;name&gt; is frozen
 Frozen &lt;local date&gt; by sm. &lt;data size&gt; of data in &lt;frozen size&gt; of archives.
 Thaw: sm artifact thaw &lt;name&gt; --wait      (about &lt;ETA&gt;)
-Queue jobs that name this folder thaw it automatically.
+Queue jobs thaw it automatically when they name its path or pass --input &lt;name&gt;.
 Record: sm artifact show &lt;name&gt;</code></pre>
 <p>The swap is: rename the old entry to <code>&lt;root&gt;/.&lt;name&gt;.old</code>, create the placeholder at <code>&lt;root&gt;/.&lt;name&gt;.placeholder</code>, rename it to <code>&lt;root&gt;/&lt;name&gt;</code>, then delete <code>.&lt;name&gt;.old</code>.</p>
 <h4>H.4 Thaw</h4>
