@@ -446,7 +446,7 @@ export function TerminalPage({ id, open }) {
       <div class="term-body" ref=${host}></div>
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
-      ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} controls=${html`<span class="ctl">
+      ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">
         <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>
     ${connection !== 'Live' ? html`<div class="term-notice" role="status">${error || connection}

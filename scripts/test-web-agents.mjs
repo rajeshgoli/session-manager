@@ -192,7 +192,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             await actions.getByRole('button', { name: 'More' }).click();
             const menu = actions.locator('.pop.menu');
             assert.deepEqual(await menu.locator(':scope > button').allInnerTexts(),
-              ['Hand off now', 'Clone', 'Follow', 'Copy attach command']);
+              ['Hand off now', 'Clone', 'Follow', 'Copy attach command', 'Rename…', 'Pin a note…']);
             const menuBox = await menu.boundingBox();
             const bandBox = await page.locator('.details-band').boundingBox();
             assert.ok(menuBox.x >= bandBox.x && menuBox.x + menuBox.width <= bandBox.x + bandBox.width,
