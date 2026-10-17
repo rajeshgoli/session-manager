@@ -39,7 +39,12 @@ test('work threads, reply targets, Archive and the fold at desktop and phone wid
           window.__smDoc = { config:{title:'Fit and finish memo',docId:'memo'}, openReview(){ document.body.append('Review sheet opened'); } };
         </script>` });
         if (request.isNavigationRequest()) return route.fulfill({ body:shell, contentType:'text/html' });
-        if (url.pathname === '/inbox/archive') archived = true;
+        // The page's token has expired: Archive re-reads a fresh one (sm#2261).
+        if (url.pathname === '/') return route.fulfill({ body:shell.replace('"fixture"', '"fresh"'), contentType:'text/html' });
+        if (url.pathname === '/inbox/archive') {
+          if (request.headers()['x-sm-doc-token'] !== 'fresh') return route.fulfill({ status:401, json:{ detail:'Authentication required' } });
+          archived = true;
+        }
         if (url.pathname === '/inbox/unarchive') archived = false;
         if (url.pathname.endsWith('/send')) sends.push(request.postDataJSON());
         let data = {};

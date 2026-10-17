@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { safeThreadHtml, Thread } from './inbox.js';
 import {
-  html, api, usePoll, useNow, config, age, limitText, clock,
+  html, api, inboxWrite, usePoll, useNow, config, age, limitText, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
   openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
@@ -826,11 +826,7 @@ function MessageBox({ agent }) {
     if (!body || busy) return;
     setBusy(true);
     try {
-      await api(`/inbox/agent/${encodeURIComponent(agent.id)}/send`, {
-        method: 'POST',
-        headers: config.inbox_token ? { 'x-sm-doc-token': config.inbox_token } : {},
-        body: { submission_id: submissionId(), body },
-      });
+      await inboxWrite(`/inbox/agent/${encodeURIComponent(agent.id)}/send`, { submission_id: submissionId(), body });
       setText('');
       toast(`Sent to ${agent.name}`);
     } catch (error) {

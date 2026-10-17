@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, config, ConfirmButton, bus, LinkedText, linkifyHtml } from './ui.js';
+import { html, api, usePoll, config, ConfirmButton, bus, newAgent, LinkedText, linkifyHtml } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupLabel } from './artifacts-model.js';
 
@@ -9,7 +9,7 @@ function Row({ row: a, open, select }) {
     <small class=${needsDecision(a) ? 'artifact-warning' : ''}>${artifactSummary(a)}</small>
   </button>`;
 }
-function Detail({ a, data, close, act, busy }) {
+function Detail({ a, data, close, act, investigate, busy }) {
   const dependents = (a.dependents || []).map(d => d.name).join(', ');
   const prompt = `${a.name}: ${size(artifactBytes(a))}${!a.rebuildable ? ' · no complete rebuild recipe recorded' : ''}${dependents ? ` · input of ${dependents}` : ''}.`;
   return html`<section class="artifact-detail" aria-label="Folder details">
@@ -21,7 +21,7 @@ function Detail({ a, data, close, act, busy }) {
     <p class="artifact-muted">${backupLabel(a)}</p>
     ${a.report ? html`<div class="artifact-markdown">${a.report_html ? html`<div dangerouslySetInnerHTML=${{__html:linkifyHtml(safeThreadHtml(a.report_html))}} />` : html`<${LinkedText} text=${artifactReport(a)} />`}</div>` : null}
     ${data.can_act ? html`<fieldset disabled=${busy}><legend>Owner actions</legend>
-      ${!a.investigating ? html`<button class="btn artifact-primary" onClick=${() => act(a,'investigate')}>Ask an agent to investigate</button>` : html`<p>Agent investigating</p>`}
+      ${!a.investigating ? html`<button class="btn artifact-primary" onClick=${() => investigate(a)}>Ask an agent to investigate</button>` : html`<p>Agent investigating</p>`}
       ${a.state === 'frozen' ? html`<${ConfirmButton} label="Restore" confirmLabel="Restore" className="btn sm" prompt=${`Restore ${prompt}`} onConfirm=${() => act(a,'thaw')} />` : null}
       ${['live','frozen'].includes(a.state) ? html`<${ConfirmButton} label=${`Keep ${data.keep_live_days || 30} days`} confirmLabel="Keep available" className="btn sm" prompt=${`Keep available: ${prompt}`} onConfirm=${() => act(a,'keep_live')} />` : null}
       ${a.state !== 'deleted' ? html`<${ConfirmButton} label="Delete folder…" confirmLabel="Delete folder" className="btn sm danger" prompt=${`Delete ${prompt}`} onConfirm=${() => act(a,'delete')} />` : null}
@@ -55,10 +55,20 @@ export function ArtifactsPage() {
     catch (e) { setActionError(e.message); }
     finally { setBusy(false); reload(); bus.emit('artifacts-changed'); }
   };
-  const renderRows = list => list.map(a=>html`<div key=${a.root+a.name}><${Row} row=${a} select=${setSelected} open=${current === a}/>${current === a ? html`<${Detail} a=${a} data=${data} close=${()=>setSelected(null)} act=${act} busy=${busy}/>` : null}</div>`);
+  // The owner starts the investigator from the New agent launcher like any
+  // other agent, so the agent type is the owner's choice (sm#2262).
+  const investigate = async a => {
+    setBusy(true); setActionError(null);
+    try {
+      const { brief, working_dir } = await api(`/artifacts/${encodeURIComponent(a.name)}/owner-action`,{method:'POST',body:{root:a.root,action:'brief'}});
+      newAgent({ workspace: working_dir, message: brief });
+    } catch (e) { setActionError(e.message); }
+    finally { setBusy(false); }
+  };
+  const renderRows = list => list.map(a=>html`<div key=${a.root+a.name}><${Row} row=${a} select=${setSelected} open=${current === a}/>${current === a ? html`<${Detail} a=${a} data=${data} close=${()=>setSelected(null)} act=${act} investigate=${investigate} busy=${busy}/>` : null}</div>`);
   const shown = browse ? filtered.slice(0,limit) : largestArtifacts(rows);
   const currentShown = shown.includes(current) || (!browse && (decisions.slice(0,5).includes(current) || followup.slice(0,5).includes(current)));
-  return html`<main class="artifacts-page">
+  return html`<div class="content artifacts-scroll"><main class="artifacts-page">
     <link rel="stylesheet" href=${`/assets/artifacts.css?v=${config.build_id}`} />
     <header class="artifact-header"><div><h1>${browse ? 'All artifacts' : 'Artifacts'}</h1><p>Storage & saved work</p></div><button class="btn sm" onClick=${browse ? ()=>setBrowse(false) : reload}>${browse ? 'Overview' : 'Refresh'}</button></header>
     ${error || actionError ? html`<p role="alert">${actionError || error.message}<button class="btn sm" onClick=${reload}>Retry</button></p>` : null}
@@ -76,7 +86,7 @@ export function ArtifactsPage() {
       `}
       <section aria-label=${browse ? 'All folders' : 'Largest folders'}>${renderRows(shown)}</section>
       ${!shown.length ? html`<p class="artifact-muted">${browse ? 'No matching folders' : 'No measured folders over 1 GB'}</p>` : null}
-      ${current && !currentShown ? html`<${Detail} a=${current} data=${data} close=${()=>setSelected(null)} act=${act} busy=${busy}/>` : null}
+      ${current && !currentShown ? html`<${Detail} a=${current} data=${data} close=${()=>setSelected(null)} act=${act} investigate=${investigate} busy=${busy}/>` : null}
       ${browse ? filtered.length > limit ? html`<button class="btn sm" onClick=${()=>setLimit(limit+25)}>Show 25 more · ${filtered.length-limit} remaining</button>` : null : html`
         <button class="artifact-browse" onClick=${()=>setBrowse(true)}>Browse all ${inventory.length} folders <span>›</span></button>
         <section class="artifact-background"><h2 class="artifact-heading">Managed in the background</h2>
@@ -88,5 +98,5 @@ export function ArtifactsPage() {
         </section>
       `}
     `}
-  </main>`;
+  </main></div>`;
 }

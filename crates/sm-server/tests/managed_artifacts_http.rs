@@ -321,6 +321,54 @@ async fn managed_artifacts_owner_keep_live_and_delete() {
 }
 
 #[tokio::test]
+async fn managed_artifacts_brief_opens_the_launcher_and_any_agent_may_report() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.request(
+            "POST",
+            "/artifacts",
+            Some("maker"),
+            json!({"name":"sample","note":"inspect this dataset","project":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, brief) = f
+        .request(
+            "POST",
+            "/artifacts/sample/owner-action",
+            Some("owner@example.com"),
+            json!({"action":"brief"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{brief}");
+    assert!(brief["brief"]
+        .as_str()
+        .unwrap()
+        .starts_with("Investigate managed artifact sample in "));
+    assert_eq!(
+        brief["working_dir"],
+        f.state.config().managed_artifacts.roots[0].repo_checkout
+    );
+    // The brief starts nothing: no investigation is recorded.
+    let (_, list) = f
+        .request("GET", "/artifacts", Some("owner@example.com"), json!({}))
+        .await;
+    assert!(list["artifacts"][0]["investigating"].is_null(), "{list}");
+    // With none recorded, the agent the owner started may report.
+    let (status, reported) = f
+        .request(
+            "POST",
+            "/artifacts/sample/report",
+            Some("maker"),
+            json!({"note":"keep it","recommend":"keep"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reported}");
+}
+
+#[tokio::test]
 async fn managed_artifacts_investigate_spawns_once_and_report_finishes() {
     let f = Fixture::new();
     f.register_steward();
