@@ -730,7 +730,7 @@ function MoreMenu({ agent, onClose, onEdit }) {
     <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
     <button type="button" onClick=${() => { onClose(); onEdit('rename'); }}>Rename…</button>
-    ${agent.state !== 'stopped' ? html`<button type="button" onClick=${() => { onClose(); onEdit('note'); }}>
+    ${agent.state !== 'stopped' || agent.facts?.note ? html`<button type="button" onClick=${() => { onClose(); onEdit('note'); }}>
       ${agent.facts?.note ? 'Edit note…' : 'Pin a note…'}</button>` : null}
   <//>`;
 }
