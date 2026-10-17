@@ -1,7 +1,7 @@
 //! Local USB seeding. Confirmation happens only after the destination verifies
 //! and applies the complete scope; a concurrent remote request makes seed fail.
 use super::{client::Destination, lifecycle, *};
-use crate::managed_artifacts::{archive, scan, ManagedArtifacts};
+use crate::managed_artifacts::{archive, ManagedArtifacts};
 use anyhow::{ensure, Context};
 use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
@@ -162,7 +162,10 @@ pub(super) fn seed_inner(
         "seed-{}",
         time::OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
-    let coverage:Vec<_>=scopes.iter().map(|s|Ok(json!({"source":s.source,"prefix":s.prefix(),"stamp":scan::measure(&s.source)?.stamp()}))).collect::<Result<_>>()?;
+    let coverage: Vec<_> = scopes
+        .iter()
+        .map(|s| Ok(json!({"source":s.source,"prefix":s.prefix(),"stamp":s.measure()?.stamp()})))
+        .collect::<Result<_>>()?;
     // Verified adopted files form a local base: preparation includes their
     // records but does not spool or transmit a second copy of their payloads.
     let mut adopted = Manifest::default();
@@ -178,7 +181,7 @@ pub(super) fn seed_inner(
         } else {
             dest.root.join(scope.prefix())
         };
-        for entry in archive::inventory(&source)? {
+        for entry in archive::inventory_excluding(&source, |p| scope.exclude.skips(p))? {
             if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                 continue;
             }
@@ -274,7 +277,7 @@ pub(super) fn seed_inner(
                     "adoption source overlaps managed backup data"
                 );
             }
-            for entry in archive::inventory(&source)? {
+            for entry in archive::inventory_excluding(&source, |p| plain[0].exclude.skips(p))? {
                 if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                     continue;
                 }

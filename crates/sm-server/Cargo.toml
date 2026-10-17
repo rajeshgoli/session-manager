@@ -38,6 +38,7 @@ time = { workspace = true, features = ["formatting", "local-offset", "macros", "
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 ureq = { workspace = true }
 
+globset = "0.4"
 tar = "0.4.45"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 

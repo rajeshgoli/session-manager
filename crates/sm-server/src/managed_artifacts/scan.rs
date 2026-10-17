@@ -14,13 +14,29 @@ impl Size {
     }
 }
 pub fn measure(path: &Path) -> Result<Size> {
+    measure_excluding(path, |_| false)
+}
+
+/// As [`measure`], leaving out every entry whose path relative to `path` `skip`
+/// accepts, together with everything beneath a skipped directory.
+pub fn measure_excluding(path: &Path, skip: impl Fn(&str) -> bool) -> Result<Size> {
     fn walk(
+        root: &Path,
         path: &Path,
         device: u64,
+        skip: &dyn Fn(&str) -> bool,
         seen: &mut HashSet<(u64, u64)>,
         size: &mut Size,
     ) -> Result<()> {
         if path.file_name().is_some_and(|n| n == ".DS_Store") {
+            return Ok(());
+        }
+        if path
+            .strip_prefix(root)
+            .ok()
+            .and_then(Path::to_str)
+            .is_some_and(|relative| !relative.is_empty() && skip(relative))
+        {
             return Ok(());
         }
         let m = fs::symlink_metadata(path)?;
@@ -37,7 +53,7 @@ pub fn measure(path: &Path) -> Result<Size> {
         }
         if m.is_dir() {
             for entry in fs::read_dir(path)? {
-                walk(&entry?.path(), device, seen, size)?;
+                walk(root, &entry?.path(), device, skip, seen, size)?;
             }
         }
         Ok(())
@@ -45,7 +61,9 @@ pub fn measure(path: &Path) -> Result<Size> {
     let mut size = Size::default();
     walk(
         path,
+        path,
         fs::symlink_metadata(path)?.dev(),
+        &skip,
         &mut HashSet::new(),
         &mut size,
     )?;

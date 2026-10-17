@@ -280,7 +280,7 @@ pub fn prepare_request(manager: &ManagedArtifacts, id: &str) -> Result<()> {
         )?;
         let mut coverage = Vec::new();
         for scope in &scopes {
-            coverage.push(json!({"source":scope.source,"prefix":scope.prefix(),"stamp":crate::managed_artifacts::scan::measure(&scope.source)?.stamp()}));
+            coverage.push(json!({"source":scope.source,"prefix":scope.prefix(),"stamp":scope.measure()?.stamp()}));
         }
         let mut progress_at = std::time::Instant::now();
         let prepared =
@@ -485,7 +485,20 @@ pub(super) fn mark_covered(
     for scope in covered {
         let source = PathBuf::from(scope["source"].as_str().context("coverage source")?);
         let stamp = scope["stamp"].as_str().context("coverage stamp")?;
-        if !crate::managed_artifacts::scan::measure(&source).is_ok_and(|size| size.stamp() == stamp)
+        // Re-measure with the exclusions the preparation stamp used.
+        let static_identity = manager
+            .config
+            .backup
+            .static_paths
+            .iter()
+            .map(|p| crate::sessions::expand_home(p))
+            .find(|p| fs::canonicalize(p).is_ok_and(|p| p == source));
+        let exclude = match &static_identity {
+            Some(identity) => super::Exclude::for_static(&manager.config.backup, identity)?,
+            None => super::Exclude::default(),
+        };
+        if !crate::managed_artifacts::scan::measure_excluding(&source, |p| exclude.skips(p))
+            .is_ok_and(|size| size.stamp() == stamp)
         {
             continue;
         }

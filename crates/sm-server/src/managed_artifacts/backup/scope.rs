@@ -1,9 +1,45 @@
-use super::super::{config::ArtifactBackupConfig, scan, score, store, ManagedArtifacts};
+use super::super::{archive, config::ArtifactBackupConfig, scan, score, store, ManagedArtifacts};
 use super::*;
 use crate::sessions::expand_home;
 use anyhow::{ensure, Context};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rusqlite::{params, Connection};
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+
+/// Every configured exclusion, home-expanded. An invalid glob is a config error.
+pub fn exclude_set(config: &ArtifactBackupConfig) -> Result<GlobSet> {
+    let mut set = GlobSetBuilder::new();
+    for pattern in &config.exclude {
+        let expanded = expand_home(pattern);
+        let expanded = expanded.to_str().context("backup exclude is not UTF-8")?;
+        set.add(
+            GlobBuilder::new(expanded)
+                .literal_separator(true)
+                .build()
+                .with_context(|| format!("invalid backup exclude: {pattern}"))?,
+        );
+    }
+    Ok(set.build()?)
+}
+
+/// Exclusions for one static scope, matched at its configured identity path
+/// (`~/data`, not the canonical source a symlink resolves to). A matching file
+/// or directory is absent from the backup, with everything beneath it.
+#[derive(Clone, Debug, Default)]
+pub struct Exclude(Option<(PathBuf, Arc<GlobSet>)>);
+impl Exclude {
+    pub fn for_static(config: &ArtifactBackupConfig, identity: &Path) -> Result<Self> {
+        let set = exclude_set(config)?;
+        Ok(Self(
+            (!set.is_empty()).then(|| (identity.to_path_buf(), Arc::new(set))),
+        ))
+    }
+    pub fn skips(&self, relative: &str) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|(identity, set)| set.is_match(identity.join(relative)))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Scope {
@@ -12,8 +48,15 @@ pub struct Scope {
     pub plain: bool,
     pub holding_days: u64,
     pub estimated_bytes: u64,
+    pub exclude: Exclude,
 }
 impl Scope {
+    pub fn inventory(&self) -> Result<Vec<archive::Entry>> {
+        archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))
+    }
+    pub fn measure(&self) -> Result<scan::Size> {
+        scan::measure_excluding(&self.source, |p| self.exclude.skips(p))
+    }
     pub fn prefix(&self) -> String {
         format!(
             "{}/{}",
@@ -27,6 +70,7 @@ fn scope(
     source: PathBuf,
     identity: &Path,
     estimate: u64,
+    exclude: Exclude,
 ) -> Result<Scope> {
     let segment = identity
         .file_name()
@@ -50,6 +94,7 @@ fn scope(
         plain,
         holding_days,
         estimated_bytes: estimate,
+        exclude,
     })
 }
 
@@ -65,9 +110,17 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
         let source = fs::canonicalize(&identity)
             .with_context(|| format!("backup source unavailable: {}", identity.display()))?;
         ensure!(source.is_dir(), "backup static source must be a directory");
-        let measured = scan::measure(&source)?;
+        let mut static_scope = scope(
+            config,
+            source,
+            &identity,
+            0,
+            Exclude::for_static(config, &identity)?,
+        )?;
+        let measured = static_scope.measure()?;
         conn.execute("INSERT INTO backup_static(path,content_stamp) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET content_stamp=excluded.content_stamp",params![identity.to_string_lossy(),measured.stamp()])?;
-        scopes.push(scope(config, source, &identity, measured.data_bytes)?);
+        static_scope.estimated_bytes = measured.data_bytes;
+        scopes.push(static_scope);
     }
     for root in &manager.config.roots {
         for a in manager.store.list(&root.path)? {
@@ -99,7 +152,7 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
                 (scan::measure(&source)?.data_bytes as f64 / ratio).ceil() as u64
             };
             if included(&conn, &a, bytes, rate)? {
-                scopes.push(scope(config, source, &identity, bytes)?);
+                scopes.push(scope(config, source, &identity, bytes, Exclude::default())?);
             }
         }
     }

@@ -52,6 +52,7 @@ impl Fixture {
                 plain: name == "data",
                 holding_days: if name == "data" { 30 } else { 60 },
                 estimated_bytes: 100,
+                exclude: Exclude::default(),
             })
             .collect()
     }
@@ -1488,4 +1489,64 @@ fn uncommitted_seed_is_rolled_back_on_remote_recovery() {
         Some("confirmed")
     );
     assert!(dest.meta("pending_seed").unwrap().is_none());
+}
+
+#[test]
+fn excluded_static_trees_are_absent_unstamped_and_later_deleted() {
+    let mut f = Fixture::new();
+    let projects = f.dir.join("projects");
+    let p = projects.display().to_string();
+    for dir in ["app/src", "app/target/debug", "comfyui/models"] {
+        fs::create_dir_all(projects.join(dir)).unwrap();
+    }
+    fs::write(projects.join("app/src/main.rs"), b"fn main() {}").unwrap();
+    fs::write(projects.join("app/targets.txt"), b"not a build folder").unwrap();
+    fs::write(projects.join("app/target/debug/bin"), b"built").unwrap();
+    fs::write(projects.join("comfyui/models/weights"), b"downloadable").unwrap();
+    f.manager.config.backup.static_paths = vec![p.clone()];
+    f.manager.config.backup.exclude = vec![format!("{p}/comfyui"), format!("{p}/**/target")];
+    let scopes = collect_scope(&f.manager, "mini").unwrap();
+    let first = prepare(&f.manager, &scopes, None, "one").unwrap();
+    assert_eq!(
+        first.manifest.files.keys().collect::<Vec<_>>(),
+        [
+            "packed/projects/app/src/main.rs.zst",
+            "packed/projects/app/targets.txt.zst"
+        ]
+    );
+    // Build churn under an excluded tree leaves the coverage stamp unchanged.
+    let stamp = scopes[0].measure().unwrap().stamp();
+    fs::write(projects.join("app/target/debug/bin"), b"rebuilt and longer").unwrap();
+    assert_eq!(scopes[0].measure().unwrap().stamp(), stamp);
+    // Excluding a file that is already backed up reports it deleted.
+    f.manager
+        .config
+        .backup
+        .exclude
+        .push(format!("{p}/app/targets.txt"));
+    let scopes = collect_scope(&f.manager, "mini").unwrap();
+    let second = prepare(&f.manager, &scopes, Some(&first.manifest), "two").unwrap();
+    assert_eq!(
+        second.transfer.deleted,
+        ["packed/projects/app/targets.txt.zst"]
+    );
+    assert!(second.transfer.changed.is_empty());
+}
+
+#[test]
+fn invalid_backup_exclude_fails_config_validation() {
+    let mut config = ManagedArtifactsConfig::default();
+    assert!(exclude_set(&config.backup)
+        .unwrap()
+        .is_match(crate::sessions::expand_home(
+            "~/projects/fractal-algo-rust/target"
+        )));
+    assert!(!exclude_set(&config.backup)
+        .unwrap()
+        .is_match(crate::sessions::expand_home("~/projects/app/targets.txt")));
+    config.enabled = true;
+    config.validate().unwrap();
+    config.backup.exclude = vec!["~/projects/[unclosed".into()];
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("invalid backup exclude"), "{error}");
 }

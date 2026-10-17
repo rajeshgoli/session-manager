@@ -118,6 +118,7 @@ impl ManagedArtifactsConfig {
         {
             bail!("invalid managed_artifacts limits");
         }
+        super::backup::exclude_set(&self.backup)?;
         if self.backup.enabled {
             super::backup::parse_rate(&self.backup.backup_rate_default)?;
             if self.backup.outbox_part_bytes == 0
@@ -215,6 +216,9 @@ impl ManagedArtifactsConfig {
 pub struct ArtifactBackupConfig {
     pub enabled: bool,
     pub static_paths: Vec<String>,
+    /// Globs over static-path files and directories, written from the static
+    /// path (`~/projects/**/target`); a match is absent from the backup.
+    pub exclude: Vec<String>,
     pub puller_devices: Vec<String>,
     pub outbox: String,
     pub outbox_part_bytes: u64,
@@ -230,6 +234,21 @@ impl Default for ArtifactBackupConfig {
         Self {
             enabled: false,
             static_paths: vec!["~/data".into(), "~/projects".into(), "~/.config".into()],
+            // Downloadable models and rebuildable build output.
+            exclude: [
+                "~/projects/comfyui",
+                "~/projects/**/target",
+                "~/projects/**/.build",
+                "~/projects/**/node_modules",
+                "~/projects/**/.venv",
+                "~/projects/**/venv",
+                "~/projects/**/__pycache__",
+                "~/projects/**/.ruff_cache",
+                "~/projects/**/dist",
+                "~/projects/**/android/app/build",
+            ]
+            .map(String::from)
+            .into(),
             puller_devices: vec!["backup-mini".into()],
             outbox: "/Volumes/ColdSSD/.backup-outbox".into(),
             outbox_part_bytes: 4_294_967_296,

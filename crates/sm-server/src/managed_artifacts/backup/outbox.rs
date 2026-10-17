@@ -1,4 +1,4 @@
-use super::super::{archive, moves, ManagedArtifacts};
+use super::super::{moves, ManagedArtifacts};
 use super::*;
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
@@ -250,7 +250,7 @@ pub(super) fn prepare_with_progress(
         manifest
             .holding_days
             .insert(prefix.clone(), scope.holding_days);
-        for entry in archive::inventory(&scope.source)? {
+        for entry in scope.inventory()? {
             if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                 continue;
             }
@@ -371,7 +371,7 @@ pub(super) fn pending_input(scopes: &[Scope], base: Option<&Manifest>) -> Result
     let mut input = 0u64;
     let mut estimate = 0u64;
     for scope in scopes {
-        let entries = archive::inventory(&scope.source)?;
+        let entries = scope.inventory()?;
         let mut total = 0u64;
         let mut changed = 0u64;
         for entry in entries {
