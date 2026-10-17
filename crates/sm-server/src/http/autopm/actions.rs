@@ -495,8 +495,9 @@ impl ask::Effects for Runtime<'_> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("proposal has no target repo"))?;
         let body = format!(
-            "Auto PM proposal from session-manager experiment {}. For Rajesh to schedule.\n\n{}",
+            "Auto PM proposal from session-manager experiment {}. For {} to schedule.\n\n{}",
             x.id,
+            self.0.config.owner_name,
             x.proposal_md.as_deref().unwrap_or_default()
         );
         let n = file(

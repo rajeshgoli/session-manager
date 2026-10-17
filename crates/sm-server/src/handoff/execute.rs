@@ -291,6 +291,16 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     ("owner_notices", "session_id", "history"),
     (
+        "autopm_cycle_seats",
+        "session_id",
+        "the original cycle seat and its once-keyed brief; queued messages follow handoff",
+    ),
+    (
+        "investigation_worktrees",
+        "session_id",
+        "history of who created the worktree; cleanup checks live sessions using its path",
+    ),
+    (
         "auto_starts",
         "session_id",
         "history of the agent started for the ticket",

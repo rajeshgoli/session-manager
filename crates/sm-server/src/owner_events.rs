@@ -442,6 +442,18 @@ pub struct ResolvedAction {
 /// router registers; path parameters fill the target id. A route missing here records its template.
 #[rustfmt::skip]
 pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
+    ("GET", "/backup/status", "backup.summary", None),
+    ("POST", "/backup/requests", "backup.request", None),
+    ("GET", "/backup/requests/{id}", "backup.status", Some("backup_request")),
+    ("GET", "/backup/requests/{id}/parts/{n}", "backup.part", Some("backup_request")),
+    ("POST", "/backup/requests/{id}/ack", "backup.ack", Some("backup_request")),
+    ("POST", "/backup/probe", "backup.probe", None),
+    ("POST", "/backup/renew", "backup.renew", None),
+    ("POST", "/backup/allow-deletes", "backup.allow_deletes", None),
+    ("POST", "/artifacts/{name}/owner-action", "artifact.owner_action", Some("artifact")),
+    ("POST", "/autopm/ask", "autopm.ask", None),
+    ("POST", "/autopm/issues", "autopm.issue_create", None),
+    ("PUT", "/autopm/auto-start", "autopm.auto_start", None),
     ("GET", "/health", "server.health", None),
     ("GET", "/health/detailed", "server.health_detailed", None),
     ("GET", "/auth/session", "auth.session", None),
