@@ -103,3 +103,4 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
   (`owner_web_guard`, and add it to `OWNER_WEB_READS` or `owner_web_writes` in `http.rs` tests).
   Session-auth-only routes pass on localhost and on scratch servers, then return 401 on the
   public host (#1858). Check a new web screen on `sm.rajeshgo.li` after deploy.
+- Never search the home directory recursively (`find ~`, `rg ~`, `du ~`). Every agent runs inside the tmux server sm-server started, so macOS charges the walk into `~/Library` to sm-server and pops "sm-server would like to access data from other apps" on Rajesh's screen (sm#2267). Search the specific directory you need.

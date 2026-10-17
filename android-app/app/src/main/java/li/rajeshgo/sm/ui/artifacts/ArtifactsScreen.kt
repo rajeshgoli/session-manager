@@ -24,12 +24,26 @@ import li.rajeshgo.sm.ui.watch.MarkdownText
 @Composable
 fun ArtifactsScreen(onBack: () -> Unit, menu: AppMenuActions, viewModel: ArtifactsViewModel, onNavigate: (String) -> Unit) {
     val state by viewModel.state.collectAsState()
-    ArtifactsContent(state, onBack, menu, viewModel::refresh, viewModel::act, onNavigate)
+    ArtifactsContent(state, onBack, menu, viewModel::refresh, viewModel::act, onNavigate, viewModel::investigate)
+    // Investigating starts an agent like any other: the New agent sheet, on the brief (sm#2266).
+    state.investigation?.let { start ->
+        li.rajeshgo.sm.ui.watch.CreateSessionSheet(
+            source = null,
+            sessions = emptyList(),
+            loadModels = viewModel::sessionModels,
+            loadAgentTypes = viewModel::sessionAgentTypes,
+            busy = state.busy,
+            error = state.createError,
+            onDismiss = viewModel::closeInvestigation,
+            prefill = li.rajeshgo.sm.ui.watch.sessionTemplate(null).copy(workingDir = start.workingDir, initialMessage = start.brief),
+            onCreate = viewModel::createSession,
+        )
+    }
 }
 
 @Composable
 internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: AppMenuActions,
-    refresh: () -> Unit, act: (JsonObject, String) -> Unit, onNavigate: (String) -> Unit) {
+    refresh: () -> Unit, act: (JsonObject, String) -> Unit, onNavigate: (String) -> Unit, investigate: (JsonObject) -> Unit = {}) {
     val data = state.data
     val rows = data?.rows("artifacts").orEmpty()
     val inventory = artifactInventory(rows)
@@ -112,7 +126,7 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
     selected?.let { previous ->
         val a = rows.firstOrNull { it.text("root") == previous.text("root") && it.text("name") == previous.text("name") } ?: previous
         ArtifactSheet(a, data?.flag("can_act") == true, state.busy, data?.number("keep_live_days") ?: 30,
-            onClose = { selected = null }, onAction = { action -> confirmation = a to action })
+            onClose = { selected = null }, onAction = { action -> if (action == "investigate") { selected = null; investigate(a) } else confirmation = a to action })
     }
     confirmation?.let { (a, action) ->
         AlertDialog(onDismissRequest = { confirmation = null }, title = { Text("${actionLabel(action)}?") },
@@ -120,7 +134,6 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
                 when (action) {
                     "delete" -> "Deletes this saved work. " + (if (!a.flag("rebuildable")) "No complete rebuild recipe is recorded. " else "A rebuild recipe is recorded. ") +
                         a.rows("dependents").joinToString(prefix = if (a.rows("dependents").isEmpty()) "" else "Used by: ") { it.text("name") }
-                    "investigate" -> "An agent will check files, git history and dependencies, then record a recommendation. It will not delete the folder."
                     "keep_live" -> "Keeps this work available for ${data?.number("keep_live_days")} days."
                     else -> "Restores the compressed folder so it can be used again."
                 }) },

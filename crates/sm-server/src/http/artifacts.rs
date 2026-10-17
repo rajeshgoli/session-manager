@@ -288,7 +288,8 @@ async fn investigation_brief(
         let detail = svc.store.detail(&root.path, &name).map_err(refusal)?;
         Ok(Json(json!({
             "brief": brief_for(&name, &root.path, &detail),
-            "working_dir": root.repo_checkout,
+            // Every launcher takes an absolute folder; config may say `~/…`.
+            "working_dir": expand_home(&root.repo_checkout),
         }))
         .into_response())
     })
