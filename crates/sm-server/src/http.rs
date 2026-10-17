@@ -8477,6 +8477,16 @@ async fn create_queue_job(
                 detail: e.to_string(),
             })?,
         )
+    } else if let Some(manager) = state.managed_artifacts.as_ref() {
+        // A job without artifact flags still thaws the frozen folders it names.
+        // A broken artifact store must not refuse jobs that never declared any.
+        crate::managed_artifacts::submission::PreparedSubmission::detect_undeclared(
+            manager, &request,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("artifact input detection skipped: {error:#}");
+            None
+        })
     } else {
         None
     };

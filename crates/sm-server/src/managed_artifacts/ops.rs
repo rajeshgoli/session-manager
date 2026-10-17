@@ -447,7 +447,7 @@ fn swap(op: &Operation, m: &Member, target: Option<&Path>) -> Result<()> {
             archive::Manifest::read(&Path::new(&op.root.cold_store).join(".frozen").join(&m.name))?;
         // Rewrite even after an interrupted write; publication never exposes a
         // partial FROZEN.md. The temporary directory belongs to this journal.
-        fs::write(placeholder.join("FROZEN.md"), format!("# {} is frozen\nFrozen {} by sm. {} bytes of data in {} bytes of archives.\nThaw: sm artifact thaw {} --wait (about {:.0} seconds)\nQueue jobs that name this folder thaw it automatically.\nRecord: sm artifact show {}\n",m.name,manifest.frozen_at,manifest.data_bytes,manifest.parts.iter().map(|p|p.output_bytes).sum::<u64>(),m.name,manifest.data_bytes as f64 / (100_000_000_000.0 / 60.0),m.name))?;
+        fs::write(placeholder.join("FROZEN.md"), format!("# {} is frozen\nFrozen {} by sm. {} bytes of data in {} bytes of archives.\nThaw: sm artifact thaw {} --wait (about {:.0} seconds)\nQueue jobs thaw it automatically when they name its path or pass --input {}.\nRecord: sm artifact show {}\n",m.name,manifest.frozen_at,manifest.data_bytes,manifest.parts.iter().map(|p|p.output_bytes).sum::<u64>(),m.name,manifest.data_bytes as f64 / (100_000_000_000.0 / 60.0),m.name,m.name))?;
         File::open(placeholder.join("FROZEN.md"))?.sync_all()?;
         sync_dir(&placeholder)?;
     }
