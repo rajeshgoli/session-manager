@@ -8490,17 +8490,30 @@ async fn create_queue_job(
     } else {
         None
     };
-    let job = RetainedQueueStore::create_queue_job_with_artifacts(
-        &queue_state_dir,
-        request,
-        max_wait_seconds,
-        payload.stop_grace_seconds,
-        prepared
-            .as_ref()
-            .zip(state.managed_artifacts.as_ref())
-            .map(|(p, m)| (m, p)),
-    )
-    .map_err(|error| {
+    // Creation may wait out SQLite contention for seconds; keep it off the
+    // async workers.
+    let caller = crate::local_identity::current();
+    let create_state = Arc::clone(&state);
+    let create_dir = queue_state_dir.clone();
+    let stop_grace_seconds = payload.stop_grace_seconds;
+    let (created, prepared) = tokio::task::spawn_blocking(move || {
+        let created = crate::local_identity::sync_scope(caller, || {
+            RetainedQueueStore::create_queue_job_with_artifacts(
+                &create_dir,
+                request,
+                max_wait_seconds,
+                stop_grace_seconds,
+                prepared
+                    .as_ref()
+                    .zip(create_state.managed_artifacts.as_ref())
+                    .map(|(p, m)| (m, p)),
+            )
+        });
+        (created, prepared)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(anyhow::anyhow!("queue submit task failed: {error}")))?;
+    let job = created.map_err(|error| {
         if prepared.is_some()
             && error.downcast_ref::<rusqlite::Error>().is_none()
             && error.downcast_ref::<std::io::Error>().is_none()

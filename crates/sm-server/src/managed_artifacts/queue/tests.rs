@@ -291,6 +291,55 @@ fn job_without_artifact_flags_thaws_the_frozen_folder_its_argv_names() {
         .is_none());
 }
 #[test]
+fn submission_waits_out_an_artifacts_writer_longer_than_busy_timeout() {
+    // sm#2259: a plain job naming a recorded folder failed with "database is
+    // locked" whenever another artifacts writer held or committed meanwhile.
+    let f = Fixture::new();
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'chains','live','root','chains','queue','owner/repo',?2)",params![f.root.path,now()]).unwrap();
+    let mut request = f.request();
+    request.argv = Some(vec![format!("{}/chains/nk5", f.root.path)]);
+    let p = PreparedSubmission::detect_undeclared(&f.manager, &request)
+        .unwrap()
+        .expect("recorded folder is detected");
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let store = f.manager.store.clone();
+    let root = f.root.path.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = store.open().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.execute(
+            "UPDATE artifacts SET last_used_at=?2 WHERE root=?1 AND name='chains'",
+            params![root, now()],
+        )
+        .unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    wait_locked.recv().unwrap();
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
+        &f.state(),
+        request,
+        300,
+        None,
+        Some((&f.manager, &p)),
+    )
+    .unwrap();
+    writer.join().unwrap();
+    assert_eq!(job.state, "pending");
+    let reserved: i64 = f
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_job_reservations WHERE job_id=?1",
+            [&job.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reserved, 1);
+}
+
+#[test]
 fn overrun_message_and_event_are_emitted_once() {
     let f = Fixture::new();
     let mut d = f.declarations("out");

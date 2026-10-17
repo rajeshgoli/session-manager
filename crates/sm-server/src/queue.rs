@@ -25,7 +25,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{
     params,
     types::{Value as SqlValue, ValueRef},
-    Connection, OpenFlags, OptionalExtension,
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior,
 };
 use serde::Serialize;
 use serde_json::{Number as JsonNumber, Value as JsonValue};
@@ -1584,27 +1584,9 @@ impl RetainedQueueStore {
         std::fs::create_dir_all(state_dir)?;
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
         init_queue_jobs_schema(&conn)?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| {
-            let mut request = request;
-            request.notify_session_id.clear();
-            let job = create_queue_job_conn(&conn, state_dir, request, 0, None)?;
-            conn.execute(
-                "UPDATE queue_jobs SET owner=?2 WHERE id=?1",
-                params![job.id, owner],
-            )?;
-            Ok(job)
-        })();
-        match result {
-            Ok(job) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(job)
-            }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        let mut request = request;
+        request.notify_session_id.clear();
+        create_queue_job_conn_with_artifacts(&conn, state_dir, request, 0, None, None, Some(owner))
     }
 
     pub fn owned_queue_job(state_dir: &Path, owner: &str) -> Result<Option<QueueJobRecord>> {
@@ -1705,6 +1687,7 @@ impl RetainedQueueStore {
             max_wait_seconds,
             stop_grace_seconds,
             artifacts,
+            None,
         )
     }
 
@@ -4147,22 +4130,43 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn create_queue_job_conn(
-    conn: &Connection,
-    state_dir: &Path,
-    request: CreateQueueJob,
-    max_wait_seconds: i64,
-    stop_grace_seconds: Option<i64>,
-) -> Result<QueueJobRecord> {
-    create_queue_job_conn_with_artifacts(
-        conn,
-        state_dir,
-        request,
-        max_wait_seconds,
-        stop_grace_seconds,
-        None,
-    )
+/// How long a submission keeps retrying SQLite contention before failing.
+const QUEUE_SUBMIT_BUSY_DEADLINE: StdDuration = StdDuration::from_secs(30);
+
+fn sqlite_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
 }
+
+/// Reruns `attempt`, which must roll back on failure, while it fails on
+/// SQLite contention and `deadline` has not passed.
+fn retry_on_sqlite_busy<T>(
+    deadline: StdDuration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let mut delay = StdDuration::from_millis(50);
+    loop {
+        match attempt() {
+            Err(error) if sqlite_busy(&error) && started.elapsed() + delay < deadline => {
+                thread::sleep(delay);
+                delay = (delay * 2).min(StdDuration::from_secs(1));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// `owner` tags an application-owned job (`create_owned_queue_job`) in the
+/// same transaction as its row.
 fn create_queue_job_conn_with_artifacts(
     conn: &Connection,
     state_dir: &Path,
@@ -4173,15 +4177,11 @@ fn create_queue_job_conn_with_artifacts(
         &crate::managed_artifacts::ManagedArtifacts,
         &crate::managed_artifacts::submission::PreparedSubmission,
     )>,
+    owner: Option<&str>,
 ) -> Result<QueueJobRecord> {
     if let Some((manager, _)) = artifacts {
         crate::managed_artifacts::submission::attach_store(conn, &manager.store)?;
-        conn.execute("INSERT INTO queue_artifact_context(id,config_json) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json",[serde_json::to_string(&manager.config)?])?;
     }
-    let transaction = artifacts
-        .map(|_| conn.unchecked_transaction())
-        .transpose()?;
-    let conn: &Connection = transaction.as_deref().unwrap_or(conn);
     let id = generate_queue_job_id();
     let local_binding = local_wall::prepare(state_dir, &id, &mut request)?;
     let local_binding_json = local_binding
@@ -4233,8 +4233,12 @@ fn create_queue_job_conn_with_artifacts(
         .map(serde_json::to_string)
         .transpose()?;
     let env_json = serde_json::to_string(&request.env)?;
-    conn.execute(
-        r#"
+    let insert = |tx: &rusqlite::Transaction<'_>| -> Result<QueueJobRecord> {
+        if let Some((manager, _)) = artifacts {
+            tx.execute("INSERT INTO queue_artifact_context(id,config_json) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json",[serde_json::to_string(&manager.config)?])?;
+        }
+        tx.execute(
+            r#"
         INSERT INTO queue_jobs
             (id, type, label, requester_session_id, notify_session_id, cwd,
              argv_json, script_path, env_json, timeout_seconds, max_wait_seconds, cpu_percent,
@@ -4248,44 +4252,52 @@ fn create_queue_job_conn_with_artifacts(
              NULL, ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?17, ?18,
              NULL, NULL, NULL, ?19, ?20, ?21, ?22)
         "#,
-        params![
-            id,
-            request.job_type,
-            request.label,
-            request.requester_session_id,
-            request.notify_session_id,
-            request.cwd,
-            argv_json,
-            script_path,
-            env_json,
-            request.timeout_seconds,
-            max_wait_seconds,
-            request.cpu_percent,
-            request.gpu_percent,
-            request.memory_bytes,
-            queued_at,
-            log_path.display().to_string(),
-            exit_code_path.display().to_string(),
-            wrapper_path.display().to_string(),
-            request.rank_tickets.as_deref().map(rank_tickets_json),
-            local_agent_id,
-            local_binding_json,
-            stop_grace_seconds,
-        ],
-    )?;
-    if let Some((manager, prepared)) = artifacts {
-        crate::managed_artifacts::queue::save(
-            transaction.as_ref().expect("artifact transaction"),
-            manager,
-            prepared,
-            &id,
+            params![
+                id,
+                request.job_type,
+                request.label,
+                request.requester_session_id,
+                request.notify_session_id,
+                request.cwd,
+                argv_json,
+                script_path,
+                env_json,
+                request.timeout_seconds,
+                max_wait_seconds,
+                request.cpu_percent,
+                request.gpu_percent,
+                request.memory_bytes,
+                queued_at,
+                log_path.display().to_string(),
+                exit_code_path.display().to_string(),
+                wrapper_path.display().to_string(),
+                request.rank_tickets.as_deref().map(rank_tickets_json),
+                local_agent_id,
+                local_binding_json,
+                stop_grace_seconds,
+            ],
         )?;
-    }
-    let result = get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")?;
-    if let Some(transaction) = transaction {
-        transaction.commit()?;
-    }
-    Ok(result)
+        if let Some(owner) = owner {
+            tx.execute(
+                "UPDATE queue_jobs SET owner=?2 WHERE id=?1",
+                params![id, owner],
+            )?;
+        }
+        if let Some((manager, prepared)) = artifacts {
+            crate::managed_artifacts::queue::save(tx, manager, prepared, &id)?;
+        }
+        get_queue_job_conn(tx, &id)?.context("created queue job was not persisted")
+    };
+    // IMMEDIATE takes the queue and attached artifacts write locks up front,
+    // honouring busy_timeout. A deferred transaction upgrading from a read
+    // fails at once with "database is locked" when any other artifacts
+    // writer committed in between (sm#2259).
+    retry_on_sqlite_busy(QUEUE_SUBMIT_BUSY_DEADLINE, || {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let job = insert(&tx)?;
+        tx.commit()?;
+        Ok(job)
+    })
 }
 
 fn write_queue_job_wrapper(
