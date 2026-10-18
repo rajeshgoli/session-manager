@@ -87,6 +87,19 @@ pub fn detail(conn: &Connection, root: &str, name: &str) -> Result<Value> {
         ("events","SELECT * FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE ORDER BY id DESC LIMIT 50"),
     ] {value[key]=json!(query(conn,sql,&[&root,&name])?);}
     value["operation"] = query(conn, "SELECT id,kind,phase,created_at,finished_at,error FROM artifact_operations WHERE root=?1 AND set_id=?2 ORDER BY id DESC LIMIT 1", &[&root, &value["set_id"].as_str().unwrap_or(name)])?.pop().unwrap_or(Value::Null);
+    // Operations run one at a time across every root, oldest first.
+    if let Some(id) = value["operation"]["id"].as_i64().filter(|_| {
+        !matches!(
+            value["operation"]["phase"].as_str(),
+            Some("done" | "failed")
+        )
+    }) {
+        value["operation"]["ahead"] = json!(query(
+            conn,
+            "SELECT id,kind,phase,json_extract(members_json,'$[0].name') AS name FROM artifact_operations WHERE phase NOT IN ('done','failed') AND id<?1 ORDER BY id",
+            &[&id]
+        )?);
+    }
     value["thaw_eta_seconds"] =
         json!(value["data_bytes"].as_u64().unwrap_or(0) as f64 / thaw_rate(conn, root)?);
     let jobs = value["jobs"].as_array().unwrap();

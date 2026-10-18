@@ -248,12 +248,41 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+    if matches!(action, "freeze" | "thaw") && !wait_for_thaw {
+        eprintln!("{}", operation_summary(&name, action, &v["operation"]));
+    }
     if create {
         println!("{}/{}", json_string(&v, "root"), json_string(&v, "name"));
     } else {
         println!("{}", serde_json::to_string_pretty(&v)?);
     }
     Ok(())
+}
+/// A freeze or thaw returns before any byte moves, so say where it waits.
+fn operation_summary(name: &str, action: &str, op: &Value) -> String {
+    let ahead = op["ahead"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let queue = match ahead.first() {
+        None if op["error"].is_string() => op["error"].as_str().unwrap_or_default().to_string(),
+        None => match op["phase"].as_str() {
+            Some("queued") | None => "it starts next".to_string(),
+            Some(phase) => format!("it is {phase}"),
+        },
+        Some(first) => format!(
+            "{} operation{} ahead; {} {} is {}",
+            ahead.len(),
+            if ahead.len() == 1 { "" } else { "s" },
+            first["kind"].as_str().unwrap_or("?"),
+            first["name"].as_str().unwrap_or("?"),
+            first["phase"].as_str().unwrap_or("?"),
+        ),
+    };
+    format!(
+        "{action} of {name} queued as artifact operation {} ({queue}). State changes when it finishes; follow with `sm artifact show {name}`.",
+        op["id"]
+    )
 }
 fn encode(s: &str) -> String {
     s.bytes()

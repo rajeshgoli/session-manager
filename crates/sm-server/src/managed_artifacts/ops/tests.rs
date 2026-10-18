@@ -114,6 +114,32 @@ fn managed_artifacts_keep_live_thaws_and_protects_for_configured_days() {
 }
 
 #[test]
+fn managed_artifacts_queued_freeze_records_request_and_names_the_operation_ahead() {
+    let f = Fixture::new();
+    f.create("first");
+    f.create("second");
+    let first = request(&f.manager, &f.root, "first", "freezing", "maker").unwrap();
+    assert!(first["operation"]["ahead"].as_array().unwrap().is_empty());
+    let second = request(&f.manager, &f.root, "second", "freezing", "maker").unwrap();
+    assert_eq!(second["state"], "live");
+    assert_eq!(second["op"], "freezing");
+    let ahead = second["operation"]["ahead"].as_array().unwrap();
+    assert_eq!(ahead.len(), 1);
+    assert_eq!(ahead[0]["name"], "first");
+    assert_eq!(ahead[0]["phase"], "queued");
+    let requested = &second["events"][0];
+    assert_eq!(requested["kind"], "op_requested");
+    assert_eq!(requested["actor"], "maker");
+    let detail: Value = serde_json::from_str(requested["detail_json"].as_str().unwrap()).unwrap();
+    assert_eq!(detail["operation"], "freezing");
+    assert_eq!(detail["operation_id"], second["operation"]["id"]);
+    resume(&f.manager).unwrap();
+    let done = f.detail("second");
+    assert_eq!(done["state"], "frozen");
+    assert!(done["operation"].get("ahead").is_none());
+}
+
+#[test]
 fn managed_artifacts_ops_freeze_thaw_round_trip_and_placeholder() {
     let f = Fixture::new();
     f.create("sample");

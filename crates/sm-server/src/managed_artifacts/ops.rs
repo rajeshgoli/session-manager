@@ -252,6 +252,19 @@ pub fn request(
         saved.push(m);
     }
     tx.execute("INSERT INTO artifact_operations(root,set_id,kind,phase,members_json,actor,created_at) VALUES(?1,?2,?3,'queued',?4,?5,?6)", params![root.path,set,kind,serde_json::to_string(&saved)?,actor,now()])?;
+    // A queued operation can wait hours behind another set's copy; the event
+    // is the requester's evidence that the request landed.
+    let id = tx.last_insert_rowid();
+    for m in &saved {
+        event(
+            &tx,
+            &root.path,
+            &m.name,
+            "op_requested",
+            actor,
+            json!({"operation_id":id,"operation":kind}),
+        )?;
+    }
     let result = store::detail(&tx, &root.path, name)?;
     tx.commit()?;
     Ok(result)
