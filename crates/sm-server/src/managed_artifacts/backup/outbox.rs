@@ -288,6 +288,11 @@ pub(super) fn prepare_with_progress(
         Some(staging) => {
             if !resumed {
                 fs::create_dir(staging)?;
+                // Resuming needs the staging folder itself to survive a crash.
+                let incoming = staging.parent().context("staging has no parent")?;
+                for dir in [Some(incoming), incoming.parent()].into_iter().flatten() {
+                    File::open(dir)?.sync_all()?;
+                }
             }
             for stale in [".payload", "manifest.json"] {
                 match fs::remove_file(staging.join(stale)) {
