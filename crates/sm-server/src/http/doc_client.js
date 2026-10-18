@@ -110,6 +110,9 @@
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
     '.item{border:1px solid #e5e7eb;border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:4px}',
     '.err{color:#b91c1c}.ok{color:#15803d}h3{margin:0;font-weight:600;font-size:15px}',
+    '.tag{font-size:12px;font-weight:600;color:#9a6700;background:#fff8c5;border-radius:10px;padding:1px 8px;align-self:flex-start}.tag.r{color:#0550ae;background:#ddf4ff}',
+    '.b{white-space:pre-wrap;word-break:break-word}.item a{color:#1d4ed8}',
+    '.md strong,.md b,.md th{font-weight:600}.md em{font-style:italic}.md{word-break:break-word}.md p,.md ul,.md ol{margin:6px 0}.md ul,.md ol{padding-left:20px}.md table{border-collapse:collapse;display:block;overflow-x:auto}.md th,.md td{border:1px solid #e5e7eb;padding:3px 6px}',
     'label{display:flex;gap:6px;align-items:center}',
     // Touch: 16px text (no zoom on focus) and finger-sized controls.
     '.touch .sheet,.touch .sheet *{font-size:16px}',
@@ -343,6 +346,11 @@
       } }));
       lines.push(parts);
     });
+    var changed = MSG ? [] : S.changedThreads;
+    if (changed.length && store(repliesSeenKey()) !== '1') {
+      lines.push([el('span', { text: 'The agent replied to ' + changed.length + ' comment' + (changed.length === 1 ? '' : 's') + ' on passages it has since changed.' }),
+        el('button', { class: 'lk', text: 'Read', onclick: showChangedThreads })]);
+    }
     lines.forEach(function (parts) { var row = el('div', {}, parts); row.style.cssText = 'display:flex;gap:6px 12px;flex-wrap:wrap;width:100%'; banner.appendChild(row); });
     banner.hidden = !lines.length;
     layout();
@@ -385,7 +393,10 @@
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
     'button{cursor:pointer;border:1px solid #d0d7de;border-radius:6px;padding:' + (coarse ? '9px 16px' : '5px 12px') + ';background:#f6f8fa;color:#1f2328}',
     'button.p{background:#1f883d;border-color:#1f883d;color:#fff}button.d{color:#cf222e}button:disabled{opacity:.5}',
-    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}'
+    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}',
+    '.tag.r{color:#0550ae;background:#ddf4ff}.card.r{border-left-color:#8250df}a{color:#0969da}',
+    '.md strong,.md b,.md th{font-weight:600}.md em{font-style:italic}.md{word-break:break-word}.md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}.md p,.md ul,.md ol{margin:6px 0}.md ul,.md ol{padding-left:20px}',
+    '.md table{border-collapse:collapse;display:block;overflow-x:auto}.md th,.md td{border:1px solid #d0d7de;padding:3px 6px;font-size:13px}.md code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#f6f8fa;padding:0 3px;border-radius:4px}'
   ].join('\n');
   function blocksFor(line) { return document.querySelectorAll('[data-sm-line="' + line + '"]'); }
   function blockForDraft(d) {
@@ -463,6 +474,72 @@
         ]));
       });
     });
+  }
+
+  // ---- agent replies to the last review (sm#2305) -----------------------
+  // A reply sits open under the passage it answers while that passage is
+  // still in the doc word for word: the agent answered in words, not in the
+  // doc. Replies on passages that changed are counted in the banner instead.
+  S.threads = [];
+  S.changedThreads = [];
+  S.threadsReview = null;
+  function repliesSeenKey() {
+    // Every reply's id, so a later reply brings the banner back.
+    var ids = [];
+    S.changedThreads.forEach(function (t) { t.replies.forEach(function (r) { ids.push((r.url || '').replace(/^.*\D/, '')); }); });
+    return 'sm-doc-replies-seen:' + CONFIG.docId + ':' + sha7(S.threadsReview && S.threadsReview.commit_sha) + ':' + ids.join(',');
+  }
+  // The innermost block holding the whole quote; a quote spanning blocks
+  // falls back to the block where its start is.
+  function blockForQuote(quote) {
+    var blocks = document.querySelectorAll(BLOCK);
+    var i;
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(quote) >= 0) return blocks[i];
+    var probe = quote.slice(0, 40);
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
+    return null;
+  }
+  function threadParts(t) {
+    var parts = [el('span', { class: 'tag', text: 'You commented' }), el('div', { class: 'b', text: t.comment })];
+    t.replies.forEach(function (r) {
+      // `html` is the server's sanitized Markdown rendering of the reply.
+      var body = el('div', { class: 'md' });
+      if (r.html) body.innerHTML = r.html; else body.textContent = r.body;
+      parts.push(el('span', { class: 'tag r', text: 'Agent replied' }), body);
+    });
+    var last = t.replies[t.replies.length - 1];
+    parts.push(el('div', { class: 'row' }, [el('a', { href: (last && last.url) || t.url, target: '_blank', rel: 'noopener', text: 'Open on GitHub' })]));
+    return parts;
+  }
+  function renderThreads() {
+    removeBubbles('thread');
+    var text = collapse(document.body ? document.body.textContent : '');
+    S.changedThreads = S.threads.filter(function (t) {
+      var quote = collapse(t.quote);
+      var block = quote && text.indexOf(quote) >= 0 ? blockForQuote(quote) : null;
+      if (block) bubble(block, 'thread').root.appendChild(el('div', { class: 'card r' }, threadParts(t)));
+      return !block;
+    });
+    renderBanner();
+  }
+  function showChangedThreads() {
+    clear(sheet);
+    sheet.appendChild(el('h3', { text: 'Replies on passages since changed' }));
+    S.changedThreads.forEach(function (t) {
+      sheet.appendChild(el('div', { class: 'item' }, [t.quote ? el('div', { class: 'q', text: t.quote }) : null].concat(threadParts(t))));
+    });
+    sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+    sheet.hidden = false;
+    store(repliesSeenKey(), '1');
+    renderBanner();
+  }
+  function loadThreads() {
+    if (MSG) return;
+    api('GET', '/review-replies').then(function (res) {
+      S.threads = (res && res.threads) || [];
+      S.threadsReview = (res && res.review) || null;
+      renderThreads();
+    }).catch(function () { /* offline or GitHub down: show none */ });
   }
 
   // ---- selecting what to comment on -------------------------------------
@@ -851,6 +928,7 @@
   renderBanner();
   markers();
   pollHead();
+  loadThreads();
   setInterval(pollHead, 60000);
   document.addEventListener('visibilitychange', pollHead);
 })
