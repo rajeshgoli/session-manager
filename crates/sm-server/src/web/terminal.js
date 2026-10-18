@@ -5,6 +5,7 @@ import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, S
 import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
+import { isLight, terminalTheme } from './terminal-theme.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -171,7 +172,7 @@ export function TerminalPage({ id, open }) {
   useEffect(() => {
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
-      scrollback: 10000, theme: { background: '#0E0F14', foreground: '#D7DAE3' },
+      scrollback: 10000, theme: terminalTheme(isLight()),
       // OSC 8 links, without xterm's confirm dialog.
       linkHandler: { activate: openLink, allowNonHttpProtocols: false },
     });
@@ -179,6 +180,12 @@ export function TerminalPage({ id, open }) {
     terminal.loadAddon(fit);
     terminal.loadAddon(new window.WebLinksAddon.WebLinksAddon(openLink));
     terminal.open(host.current);
+    // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).
+    const scheme = matchMedia('(prefers-color-scheme: dark)');
+    const retheme = () => { terminal.options.theme = terminalTheme(isLight()); };
+    scheme.addEventListener('change', retheme);
+    const themeWatch = new MutationObserver(retheme);
+    themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     let socket = null, stopped = false, live = false, timer = null, handshakeTimer = null, retries = 0;
     let pinger = null, pingId = 0, samples = [];
     // Background probes for the direct path while on the relay; a switch that fails stops them for this page.
@@ -382,7 +389,7 @@ export function TerminalPage({ id, open }) {
     fitNow();
     connect();
     return () => {
-      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); data.dispose(); terminal.dispose();
+      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
   }, [id, attempt]);
