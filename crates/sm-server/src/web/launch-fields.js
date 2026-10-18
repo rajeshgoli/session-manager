@@ -4,7 +4,7 @@ export function claudeDefaults(settings) {
   const defaults = settings?.new_agent?.claude || {};
   return { provider: 'claude', model: defaults.model || null, reasoning_effort: defaults.effort || null };
 }
-export const exactConfig = value => `${value.provider === 'claude' ? 'Claude' : 'Codex'} · ${value.model || 'provider default'} · ${value.reasoning_effort || value.effort || 'default effort'}`;
+export const exactConfig = value => `${value.provider === 'claude' ? 'Claude' : value.provider === 'opencode' ? 'Local' : 'Codex'} · ${value.model || 'provider default'} · ${value.reasoning_effort || value.effort || 'default effort'}`;
 /** The agent types configured in Settings › New agents. */
 export const agentTypes = settings => settings?.new_agent?.agent_types || [];
 export const typeConfig = type => ({ provider: type.provider, model: type.model, reasoning_effort: type.effort });
@@ -19,12 +19,14 @@ export function matchType(types, choice) {
  * Every configured agent type as a one-click button (sm#1981), plus Other,
  * which hands the choice to the provider, model and effort fields.
  * `value` is the chosen type's name, OTHER_TYPE, or null; onPick gets the type, or null for Other.
+ * `extra` is one more card before Other, { key, title, detail, disabled, onPick }: the local model (sm#2307).
  */
-export function TypePicker({ settings, value = null, onPick, other = true }) {
-  const button = (key, title, detail, pick) => html`<button type="button" key=${key} class=${`preset ${value === key ? 'on' : ''}`}
-    aria-pressed=${value === key} onClick=${pick}><b>${title}</b><span>${detail}</span></button>`;
+export function TypePicker({ settings, value = null, onPick, other = true, extra = null }) {
+  const button = (key, title, detail, pick, disabled = false) => html`<button type="button" key=${key} class=${`preset ${value === key ? 'on' : ''}`}
+    aria-pressed=${value === key} disabled=${disabled} onClick=${pick}><b>${title}</b><span>${detail}</span></button>`;
   return html`<div class="launch-presets" role="group" aria-label="Agent type">
     ${agentTypes(settings).map(t => button(t.name, t.name, exactConfig(typeConfig(t)), () => onPick(t)))}
+    ${extra ? button(extra.key, extra.title, extra.detail, extra.onPick, extra.disabled) : null}
     ${other ? button(OTHER_TYPE, 'Other', 'Choose provider, model and effort', () => onPick(null)) : null}
   </div>`;
 }

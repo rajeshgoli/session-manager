@@ -101,16 +101,26 @@ for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied
       });
       await page.goto('https://start.test/');
       await page.getByRole('radio', { name: 'Claude', exact: true }).waitFor();
-      const local = page.getByRole('button', { name: 'Local (loaded-model)', exact: true });
-      if (state === 'absent') { assert.equal(await local.count(), 0); return; }
+      // The local model is a preset card beside the agent types, and Local a provider under Other (sm#2307).
+      const local = page.locator('.launch-presets .preset', { hasText: 'local/loaded-model' });
+      const localRadio = page.getByRole('radio', { name: 'Local', exact: true });
+      if (state === 'absent') { assert.equal(await local.count(), 0); assert.equal(await localRadio.count(), 0); return; }
       await local.waitFor();
-      if (state === 'unloaded') await page.getByText('Not loaded: Start loads it first, which takes a few minutes', { exact: true }).waitFor();
+      if (state === 'unloaded') await page.getByText('Local · not loaded; Start loads it (minutes)', { exact: true }).waitFor();
       if (state === 'occupied') {
         assert.equal(await local.isDisabled(), true);
         await page.getByText('no local seat free (1/1 used by worker)', { exact: true }).waitFor();
         return;
       }
-      await local.click();
+      if (state === 'free') {
+        await localRadio.click();
+        const model = page.getByRole('combobox', { name: 'Model', exact: true });
+        assert.deepEqual(await model.locator('option').allTextContents(), ['loaded-model']);
+      } else {
+        await local.click();
+        assert.equal(await local.getAttribute('aria-pressed'), 'true');
+        assert.equal(await localRadio.count(), 0);
+      }
       assert.equal(await page.getByRole('radiogroup', { name: 'Effort', exact: true }).count(), 0);
       await page.getByRole('button', { name: 'Start', exact: true }).click();
       await page.waitForFunction(() => window.closedPopover);
