@@ -462,7 +462,17 @@ pub(super) fn prepare_with_progress(
                     super::client::verify(&spool, &record)?;
                     let spooled = fs::metadata(&spool)?;
                     let parent = placed.parent().context("staged path has no parent")?;
+                    // Each folder created here is synced into its own parent.
+                    let created: Vec<_> = parent
+                        .ancestors()
+                        .take_while(|dir| !dir.exists())
+                        .map(Path::to_path_buf)
+                        .collect();
                     fs::create_dir_all(parent)?;
+                    for dir in &created {
+                        File::open(dir.parent().context("staged folder has no parent")?)?
+                            .sync_all()?;
+                    }
                     // The placed file is durable before its line is, and the
                     // line names the copy's own mtime, so an index line never
                     // vouches for an older copy of the path.
