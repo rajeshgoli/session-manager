@@ -79,6 +79,15 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
+/// The one seed staging directory a failed seed left, if any.
+fn seed_staging(dest: &super::client::Destination) -> Option<PathBuf> {
+    let mut staging: Vec<_> = fs::read_dir(dest.root.join(".incoming"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(staging.len() <= 1, "{staging:?}");
+    staging.pop()
+}
 
 #[test]
 fn rate_defaults_medians_windows_and_device_isolation() {
@@ -805,6 +814,7 @@ fn seed_adopts_plain_copy_confirms_full_scope_and_next_request_is_empty() {
         "backup-mini",
         &mut dest,
         Some(&f.dir.join("remote/existing-data")),
+        false,
     )
     .unwrap();
     assert!(!f.dir.join("remote/existing-data").exists());
@@ -858,7 +868,8 @@ fn seed_rejects_mismatched_adoption_without_moving_original() {
         &f.manager,
         "backup-mini",
         &mut dest,
-        Some(&f.dir.join("existing-data"))
+        Some(&f.dir.join("existing-data")),
+        false
     )
     .is_err());
     assert_eq!(
@@ -883,7 +894,7 @@ fn seed_rejects_managed_adoption_and_cleans_outbox() {
     fs::write(f.dir.join("data/prices"), b"prices").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
     let source = dest.directory("packed/existing").unwrap();
-    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).is_err());
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source), false).is_err());
     assert!(source.exists());
     assert_eq!(
         fs::read_dir(f.dir.join("outbox"))
@@ -899,9 +910,9 @@ fn reseed_removes_files_absent_from_full_source() {
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"prices").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     fs::remove_file(f.dir.join("data/prices")).unwrap();
-    super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     assert!(dest.records().unwrap().is_empty());
     assert!(!dest.root.join("plain/data/prices").exists());
 }
@@ -993,11 +1004,11 @@ fn seed_refuses_active_pull_before_changing_destination() {
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"A").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     let records = dest.records().unwrap();
     lifecycle::request(&f.manager, "backup-mini", Some(&first)).unwrap();
     fs::write(f.dir.join("data/prices"), b"BBBB").unwrap();
-    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap_err();
     assert!(error
         .to_string()
         .contains("remote backup request is active"));
@@ -1013,17 +1024,18 @@ fn seed_refuses_active_pull_before_changing_destination() {
 }
 
 #[test]
-fn failed_seed_application_removes_destination_staging() {
+fn failed_seed_application_keeps_destination_staging() {
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"source").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
     let plain = dest.directory("plain/data").unwrap();
     fs::write(plain.join("prices"), b"untracked").unwrap();
-    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, None).is_err());
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).is_err());
+    let staging = seed_staging(&dest).unwrap();
     assert_eq!(
-        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
-        0
+        fs::read(staging.join("plain/data/prices")).unwrap(),
+        b"source"
     );
     assert_eq!(fs::read(plain.join("prices")).unwrap(), b"untracked");
     assert!(!f.dir.join("outbox").exists());
@@ -1035,12 +1047,12 @@ fn failed_seed_rolls_back_files_already_replaced() {
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"original").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     let original = dest.records().unwrap();
     fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
     fs::write(f.dir.join("data/zzz"), b"source").unwrap();
     fs::write(dest.root.join("plain/data/zzz"), b"untracked").unwrap();
-    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap_err();
     assert!(error
         .to_string()
         .contains("untracked destination file differs"));
@@ -1064,10 +1076,13 @@ fn failed_seed_rolls_back_files_already_replaced() {
             .manifest_id,
         first
     );
+    // The replacement apply had already moved into place is staged again.
+    let staging = seed_staging(&dest).unwrap();
     assert_eq!(
-        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
-        0
+        fs::read(staging.join("plain/data/prices")).unwrap(),
+        b"replacement"
     );
+    assert_eq!(fs::read(staging.join("plain/data/zzz")).unwrap(), b"source");
 }
 
 #[test]
@@ -1163,14 +1178,16 @@ fn failed_adoption_returns_original_folder_without_registering_records() {
     fs::copy(f.dir.join("data/prices"), source.join("prices")).unwrap();
     let packed = dest.directory("packed/projects").unwrap();
     fs::write(packed.join("code.zst"), b"untracked").unwrap();
-    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).is_err());
+    assert!(super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source), false).is_err());
     assert!(dest.records().unwrap().is_empty());
     assert!(dest.state().unwrap().confirmed.is_none());
     assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
     assert!(!dest.root.join("plain/data").exists());
-    assert_eq!(
-        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
-        0
+    let staging = seed_staging(&dest).unwrap();
+    assert!(staging.join("packed/projects/code.zst").is_file());
+    assert!(
+        !staging.join("plain").exists(),
+        "adopted files are never staged"
     );
 }
 
@@ -1202,7 +1219,7 @@ fn adoption_sync_failure_prevents_confirmation_and_preserves_recovery_journal() 
     // The guard already returned the folder, but its sync failed too. Recovery
     // must retry the sync even though no reverse rename remains to perform.
     seed::FAIL_ADOPTION_SYNC.set(true);
-    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None);
+    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None, false);
     seed::FAIL_ADOPTION_SYNC.set(false);
     assert!(result
         .unwrap_err()
@@ -1211,7 +1228,7 @@ fn adoption_sync_failure_prevents_confirmation_and_preserves_recovery_journal() 
     assert!(dest.meta("pending_seed").unwrap().is_some());
     drop(dest);
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None).unwrap_err();
+    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None, false).unwrap_err();
     assert!(error.to_string().contains("unknown backup device"));
     assert!(dest.meta("pending_seed").unwrap().is_none());
     assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
@@ -1234,7 +1251,7 @@ fn adoption_recovery_keeps_journal_until_reverse_rename_is_synced() {
     )
     .unwrap();
     seed::FAIL_ADOPTION_SYNC.set(true);
-    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None);
+    let result = seed::seed(&f.manager, "unknown-device", &mut dest, None, false);
     seed::FAIL_ADOPTION_SYNC.set(false);
     assert!(result
         .unwrap_err()
@@ -1245,7 +1262,7 @@ fn adoption_recovery_keeps_journal_until_reverse_rename_is_synced() {
     assert!(dest.meta("pending_seed").unwrap().is_some());
     drop(dest);
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None).unwrap_err();
+    let error = seed::seed(&f.manager, "unknown-device", &mut dest, None, false).unwrap_err();
     assert!(error.to_string().contains("unknown backup device"));
     assert!(dest.meta("pending_seed").unwrap().is_none());
     assert_eq!(fs::read(source.join("prices")).unwrap(), b"prices");
@@ -1257,11 +1274,11 @@ fn failed_seed_confirmation_rolls_back_applied_destination() {
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
     fs::write(f.dir.join("data/prices"), b"original").unwrap();
     let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
-    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let first = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     let original = dest.records().unwrap();
     f.manager.store.open().unwrap().execute_batch("CREATE TRIGGER fail_seed_confirmation BEFORE INSERT ON backup_requests BEGIN SELECT RAISE(ABORT, 'injected confirmation failure'); END;").unwrap();
     fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
-    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap_err();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap_err();
     assert!(
         error.to_string().contains("injected confirmation failure"),
         "{error:#}"
@@ -1282,9 +1299,10 @@ fn failed_seed_confirmation_rolls_back_applied_destination() {
             .manifest_id,
         first
     );
+    let staging = seed_staging(&dest).unwrap();
     assert_eq!(
-        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
-        0
+        fs::read(staging.join("plain/data/prices")).unwrap(),
+        b"replacement"
     );
 }
 
@@ -1306,7 +1324,8 @@ fn adoption_rejects_file_removed_during_preparation() {
             fs::remove_file(removed).unwrap();
         }))
     });
-    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source)).unwrap_err();
+    let error =
+        super::seed::seed(&f.manager, "backup-mini", &mut dest, Some(&source), false).unwrap_err();
     assert!(
         error
             .to_string()
@@ -1623,7 +1642,7 @@ fn seed_leaves_files_changed_while_packing_for_the_first_request() {
         }))
     });
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
-    seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
         .unwrap()
         .unwrap();
@@ -2036,7 +2055,7 @@ fn disk_reports_are_stored_rendered_and_a_failing_drive_alerts_weekly() {
 }
 
 #[test]
-fn seed_stages_on_destination_refuses_past_floor_and_clears_stale_staging() {
+fn seed_stages_on_destination_refuses_past_floor_and_resumes_staging() {
     use super::{client::Destination, seed};
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
@@ -2044,18 +2063,18 @@ fn seed_stages_on_destination_refuses_past_floor_and_clears_stale_staging() {
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
     fs::create_dir_all(dest.root.join(".incoming/seed-stale/plain")).unwrap();
     outbox::DIRECT_FLOOR.set(Some(u128::MAX / 2));
-    let error = seed::seed(&f.manager, "backup-mini", &mut dest, None)
+    let error = seed::seed(&f.manager, "backup-mini", &mut dest, None, false)
         .unwrap_err()
         .to_string();
     outbox::DIRECT_FLOOR.set(None);
     assert!(error.contains("would cross its floor"), "{error}");
-    assert_eq!(
-        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
-        0
-    );
+    // The earlier staging is resumed under the new seed's id, never deleted.
+    let staging = seed_staging(&dest).unwrap();
+    assert_ne!(staging.file_name().unwrap(), "seed-stale");
+    assert!(staging.join(outbox::INDEX).is_file());
     assert!(dest.state().unwrap().confirmed.is_none());
     // No outbox is created on the cold store for a seed.
-    seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
     assert!(!f.dir.join("outbox").exists());
     assert_eq!(
         fs::read(dest.root.join("plain/data/prices")).unwrap(),
@@ -2065,4 +2084,142 @@ fn seed_stages_on_destination_refuses_past_floor_and_clears_stale_staging() {
         fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
         0
     );
+}
+
+fn two_scope_seed_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![
+        f.dir.join("data").display().to_string(),
+        f.dir.join("projects").display().to_string(),
+    ];
+    for (path, body) in [
+        ("data/a", "alpha"),
+        ("data/b", "bravo"),
+        ("data/c", "charlie"),
+        ("projects/x", "x-ray"),
+        ("projects/y", "yankee"),
+    ] {
+        fs::write(f.dir.join(path), body).unwrap();
+    }
+    f
+}
+/// Run a seed, returning its result and every source file it read.
+fn seed_reading(
+    f: &Fixture,
+    dest: &mut super::client::Destination,
+    fresh: bool,
+) -> (Result<String>, Vec<PathBuf>) {
+    outbox::READS.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    let result = super::seed::seed(&f.manager, "backup-mini", dest, None, fresh);
+    (
+        result,
+        outbox::READS.with(|r| r.borrow_mut().take().unwrap()),
+    )
+}
+
+#[test]
+fn stopped_seed_keeps_staging_and_next_seed_reuses_it() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(2));
+    let (result, first_reads) = seed_reading(&f, &mut dest, false);
+    outbox::FAIL_AFTER_PLACED.set(None);
+    assert!(result.unwrap_err().to_string().contains("injected stop"));
+    assert_eq!(first_reads.len(), 2);
+    let staging = seed_staging(&dest).unwrap();
+    assert_eq!(outbox::staged_index(&staging).unwrap().len(), 2);
+    assert!(dest.state().unwrap().confirmed.is_none());
+
+    let (result, second_reads) = seed_reading(&f, &mut dest, false);
+    let id = result.unwrap();
+    assert!(
+        second_reads.iter().all(|p| !first_reads.contains(p)),
+        "reused files were read again: {second_reads:?}"
+    );
+    assert_eq!(second_reads.len(), 3);
+    // The confirmed manifest is the one an uninterrupted preparation gives.
+    let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .unwrap();
+    assert_eq!(confirmed.manifest_id, id);
+    assert_eq!(
+        confirmed.files,
+        f.prepare("uninterrupted", None).manifest.files
+    );
+    for record in confirmed.files.values() {
+        super::client::verify(&dest.root.join(&record.path), record).unwrap();
+    }
+    assert_eq!(dest.records().unwrap(), confirmed.files);
+    assert!(seed_staging(&dest).is_none());
+}
+
+#[test]
+fn resumed_seed_restages_changed_sources_and_drops_removed_ones() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(5));
+    assert!(seed_reading(&f, &mut dest, false).0.is_err());
+    outbox::FAIL_AFTER_PLACED.set(None);
+    fs::write(f.dir.join("data/b"), b"bravo, changed").unwrap();
+    fs::remove_file(f.dir.join("data/c")).unwrap();
+    // Fail after apply, so the swept and returned staging can be inspected.
+    let conn = f.manager.store.open().unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_seed_confirmation BEFORE INSERT ON backup_requests BEGIN SELECT RAISE(ABORT, 'injected confirmation failure'); END;").unwrap();
+    let (result, reads) = seed_reading(&f, &mut dest, false);
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("injected confirmation failure"));
+    assert_eq!(reads, [f.dir.join("data/b")]);
+    let staging = seed_staging(&dest).unwrap();
+    assert_eq!(
+        fs::read(staging.join("plain/data/b")).unwrap(),
+        b"bravo, changed"
+    );
+    assert!(staging.join("plain/data/a").is_file());
+    assert!(!staging.join("plain/data/c").exists(), "orphan left staged");
+    assert!(dest.records().unwrap().is_empty());
+    assert!(!dest.root.join("plain/data/a").exists());
+
+    conn.execute_batch("DROP TRIGGER fail_seed_confirmation")
+        .unwrap();
+    let (result, reads) = seed_reading(&f, &mut dest, false);
+    result.unwrap();
+    assert!(reads.is_empty(), "{reads:?}");
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/b")).unwrap(),
+        b"bravo, changed"
+    );
+    assert!(!dest.root.join("plain/data/c").exists());
+    assert!(!dest.records().unwrap().contains_key("plain/data/c"));
+    assert_eq!(dest.records().unwrap().len(), 4);
+}
+
+#[test]
+fn fresh_seed_discards_earlier_staging() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(3));
+    assert!(seed_reading(&f, &mut dest, false).0.is_err());
+    outbox::FAIL_AFTER_PLACED.set(None);
+    let (result, reads) = seed_reading(&f, &mut dest, true);
+    result.unwrap();
+    assert_eq!(reads.len(), 5);
+    assert!(seed_staging(&dest).is_none());
+}
+
+#[test]
+fn torn_index_line_is_cut_and_its_file_restaged() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(2));
+    assert!(seed_reading(&f, &mut dest, false).0.is_err());
+    outbox::FAIL_AFTER_PLACED.set(None);
+    let index = seed_staging(&dest).unwrap().join(outbox::INDEX);
+    let body = fs::read(&index).unwrap();
+    // A crash mid-append leaves the second line without its newline.
+    fs::write(&index, &body[..body.len() - 10]).unwrap();
+    let (result, reads) = seed_reading(&f, &mut dest, false);
+    result.unwrap();
+    assert_eq!(reads.len(), 4);
 }

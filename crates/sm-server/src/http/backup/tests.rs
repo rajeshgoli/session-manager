@@ -664,7 +664,7 @@ async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
         fs::write(dir.join("data/deleted"), b"delete me").unwrap();
         fs::write(dir.join("projects/code"), b"code").unwrap();
         let mut dest = Destination::open(&dir.join("remote")).unwrap();
-        let seeded = seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+        let seeded = seed::seed(&manager, "backup-mini", &mut dest, None, false).unwrap();
         fs::write(dir.join("data/prices"), b"replacement").unwrap();
         fs::remove_file(dir.join("data/deleted")).unwrap();
         fs::write(dir.join("projects/code"), b"new code").unwrap();
@@ -822,7 +822,7 @@ async fn pretend_mini_updates_its_own_sm_then_pulls_and_reports_on_the_backup_ca
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(dir.join("data/prices"), b"original").unwrap();
         let mut dest = Destination::open(&dir.join("remote")).unwrap();
-        seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+        seed::seed(&manager, "backup-mini", &mut dest, None, false).unwrap();
         let mut mini = Mini {
             remote: HttpRemote {
                 agent,
@@ -998,7 +998,7 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
     moves::TEST_MOUNTED.set(true);
     fs::write(f.dir.join("data/prices"), b"original").unwrap();
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
-    let mut confirmed = seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+    let mut confirmed = seed::seed(&manager, "backup-mini", &mut dest, None, false).unwrap();
     publish_cli(&f.dir, "sm 0.2.0 (abcdef012345)", b"0123456789", false);
     let app = router(f.state.clone());
     let mut id = String::new();

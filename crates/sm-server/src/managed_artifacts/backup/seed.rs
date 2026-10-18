@@ -1,29 +1,16 @@
 //! Local USB seeding. Confirmation happens only after the destination verifies
 //! and applies the complete scope; a concurrent remote request makes seed fail.
+//! Staged files survive a failed or stopped seed, and the next seed resumes
+//! them; only a confirmed seed, or `--fresh`, removes seed staging (#2301).
 use super::{client::Destination, lifecycle, *};
 use crate::managed_artifacts::{archive, ManagedArtifacts};
 use anyhow::{ensure, Context};
 use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
 use std::{
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
-// Seeds have no durable request until confirmation, so lifecycle expiry cannot
-// reclaim an outbox left behind by an earlier validation/application error.
-struct SeedOutbox(PathBuf);
-impl Drop for SeedOutbox {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "could not remove seed temporary directory {}: {error}",
-                    self.0.display()
-                );
-            }
-        }
-    }
-}
 struct AdoptionMove(Option<(PathBuf, PathBuf)>);
 impl Drop for AdoptionMove {
     fn drop(&mut self) {
@@ -89,15 +76,16 @@ fn resolve(dest: &mut Destination, journal: &Journal, committed: bool) -> Result
         }
         tx.commit()?;
         dest.confirm(&journal.id)?;
+        let incoming = dest.root.join(".incoming").join(&journal.id);
+        if incoming.exists() {
+            fs::remove_dir_all(incoming)?;
+        }
     } else {
+        dest.return_seed_staging(&journal.id, &journal.manifest.files)?;
         dest.rollback(&journal.id)?;
         if let Some((source, target)) = &journal.adoption {
             restore_adoption(source, target)?;
         }
-    }
-    let incoming = dest.root.join(".incoming").join(&journal.id);
-    if incoming.exists() {
-        fs::remove_dir_all(incoming)?;
     }
     dest.conn
         .execute("DELETE FROM metadata WHERE key='pending_seed'", [])?;
@@ -127,20 +115,49 @@ fn recover_local(manager: &ManagedArtifacts, device: &str, dest: &mut Destinatio
     }
     Ok(())
 }
+/// Seed staging directories under `.incoming`, oldest first.
+fn seed_staging(dest: &Destination) -> Result<Vec<PathBuf>> {
+    let mut staging = Vec::new();
+    for entry in fs::read_dir(dest.directory(".incoming")?)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("seed-") && entry.file_type()?.is_dir() {
+            let stamp = name["seed-".len()..].parse::<i128>().unwrap_or(0);
+            staging.push((stamp, entry.path()));
+        }
+    }
+    staging.sort();
+    Ok(staging.into_iter().map(|(_, path)| path).collect())
+}
+/// Move the newest seed staging to this seed's id, so preparation resumes it.
+fn resume_staging(dest: &Destination, staging: &Path) -> Result<()> {
+    let Some(previous) = seed_staging(dest)?.pop() else {
+        return Ok(());
+    };
+    let index = super::outbox::staged_index(&previous)?;
+    let bytes: u64 = index.values().map(|s| s.record.size).sum();
+    println!(
+        "Resuming an earlier seed: {} files ({:.1} GB) already staged; unchanged ones are reused. Pass --fresh to discard them.",
+        index.len(),
+        bytes as f64 / 1e9
+    );
+    fs::rename(&previous, staging)?;
+    File::open(staging.parent().context("staging has no parent")?)?.sync_all()?;
+    Ok(())
+}
 pub fn seed(
     manager: &ManagedArtifacts,
     device: &str,
     dest: &mut Destination,
     adopt: Option<&Path>,
+    fresh: bool,
 ) -> Result<String> {
     recover_local(manager, device, dest)?;
-    // With any pending seed resolved, remaining seed staging is from a seed that
-    // crashed before it wrote its journal.
-    let incoming = dest.directory(".incoming")?;
-    for entry in fs::read_dir(&incoming)? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("seed-") {
-            fs::remove_dir_all(entry.path())?;
+    // With any pending seed resolved, its staged files are back in staging.
+    if fresh {
+        for staging in seed_staging(dest)? {
+            fs::remove_dir_all(&staging)?;
+            println!("Discarded seed staging {}", staging.display());
         }
     }
     let result = seed_inner(manager, device, dest, adopt);
@@ -231,9 +248,16 @@ pub(super) fn seed_inner(
     // Files are staged straight onto the destination: no transit parts on the
     // cold store, and only the destination needs room for the compressed scope.
     let staging = dest.directory(".incoming")?.join(&id);
+    resume_staging(dest, &staging)?;
     let mut prepared =
         super::outbox::prepare_direct(manager, &scopes, adopt.map(|_| &adopted), &id, &staging)?;
-    let _outbox = SeedOutbox(prepared.directory.clone());
+    if prepared.reused.0 > 0 {
+        println!(
+            "Reused {} staged files ({:.1} GB) from the earlier seed.",
+            prepared.reused.0,
+            prepared.reused.1 as f64 / 1e9
+        );
+    }
     // Files that changed or vanished while being read are left out of the
     // confirmed manifest, so the first remote request ships them as changed.
     coverage.retain(|scope| {
@@ -257,7 +281,6 @@ pub(super) fn seed_inner(
         confirmed(&tx, device)?.map(|m| m.manifest_id) == previous,
         "backup head changed during seed preparation; retry"
     );
-    let _incoming = SeedOutbox(dest.root.join(".incoming").join(&id));
     let mut journal = Journal {
         id: id.clone(),
         manifest: prepared.manifest.clone(),
@@ -351,6 +374,8 @@ pub(super) fn seed_inner(
         .collect();
     prepared.transfer.base = previous.clone();
     if let Err(error) = dest.apply_seed(&id, &prepared.transfer, &staging) {
+        dest.return_seed_staging(&id, &prepared.manifest.files)
+            .context("return staged files after failed seed application")?;
         dest.rollback(&id)
             .context("restore destination after failed seed application")?;
         return Err(error);
@@ -389,6 +414,8 @@ pub(super) fn seed_inner(
     })();
     if let Err(error) = confirmation {
         if !source_committed {
+            dest.return_seed_staging(&id, &prepared.manifest.files)
+                .context("return staged files after failed seed confirmation")?;
             dest.rollback(&id)
                 .context("restore destination after failed seed confirmation")?;
         }

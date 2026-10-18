@@ -308,8 +308,8 @@ impl Destination {
     }
     /// A seed's apply moves staged files into place instead of copying them, so
     /// it needs room for one copy of the scope, not two. Staging was verified as
-    /// each file was placed, and a failed seed rolls back and starts over, so the
-    /// staged payloads need not survive for a repeat.
+    /// each file was placed; a failed seed calls `return_seed_staging` before
+    /// rolling back, so a later seed reuses every staged file.
     pub fn apply_seed(
         &mut self,
         id: &str,
@@ -506,6 +506,43 @@ impl Destination {
         }
         if let Some(parent) = current.parent() {
             File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+    /// Move each file a seed's apply placed back to its staging path, so the
+    /// rollback that follows restores the previous files without discarding the
+    /// staged copies (#2301). Only regular files of `records` that this run
+    /// journaled count: adopted and deleted paths are never staged copies.
+    pub fn return_seed_staging(
+        &self,
+        id: &str,
+        records: &BTreeMap<String, FileRecord>,
+    ) -> Result<()> {
+        safe_relative(id)?;
+        ensure!(!id.contains('/'), "invalid backup request id");
+        let Some(run) = self.meta(&format!("holding:{id}"))? else {
+            return Ok(());
+        };
+        let paths = self
+            .conn
+            .prepare("SELECT path FROM history WHERE run=?1")?
+            .query_map([&run], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let staging = self.directory(&format!(".incoming/{id}"))?;
+        for path in paths {
+            if records.get(&path).is_none_or(|r| r.target.is_some()) {
+                continue;
+            }
+            // Apply removes a staged file only by moving it into place.
+            let current = safe_path(&self.root, &path, false)?;
+            let staged = safe_path(&staging, &path, true)?;
+            if staged.exists() || !fs::symlink_metadata(&current).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            fs::rename(&current, &staged)?;
+            for parent in [current.parent(), staged.parent()].into_iter().flatten() {
+                File::open(parent)?.sync_all()?;
+            }
         }
         Ok(())
     }
