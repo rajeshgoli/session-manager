@@ -1,7 +1,7 @@
 // The New agent popover (spec 1710 D6.5, sm#1981): pick a configured agent
 // type and press Start, or Other for provider, model and effort; "Change"
 // opens the workspace, name and first message in the same panel.
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, openPanel, toast } from './ui.js';
 import { TypePicker, OTHER_TYPE, agentTypes, matchType } from './launch-fields.js';
 
@@ -13,8 +13,13 @@ export function useLocalModel() {
   const [local, setLocal] = useState(null);
   useEffect(() => {
     let alive = true;
-    const refresh = () => api('/client/session-models?provider=opencode')
-      .then(value => { if (alive) setLocal(value); })
+    // The loaded model comes from session-models; the last model sm knew, loaded
+    // or not, from /client/model, so an unloaded model can still be picked (sm#2297).
+    const refresh = () => Promise.all([
+      api('/client/session-models?provider=opencode'),
+      api('/client/model').then(value => value?.model || null).catch(() => null),
+    ])
+      .then(([value, record]) => { if (alive) setLocal({ ...value, record }); })
       .catch(() => { if (alive) setLocal(null); });
     refresh();
     const timer = setInterval(refresh, 5000);
@@ -22,11 +27,35 @@ export function useLocalModel() {
   }, []);
   return local;
 }
-export const localBlocked = (local, provider) => provider === 'opencode' && (!local?.models?.length || local.available === false);
+/** False once the dialog closes, so a model load that finishes later starts nothing. */
+export function useOpen() {
+  const open = useRef(true);
+  useEffect(() => () => { open.current = false; }, []);
+  return open;
+}
+/** The known local model needs loading before an agent can start on it. */
+const needsLoad = local => !local?.models?.length && !!local?.record && !['loading', 'ready', 'draining'].includes(local.record.state);
+export const localBlocked = (local, provider) => provider === 'opencode'
+  && (local?.models?.length ? local.available === false : !needsLoad(local));
+/** Loads the known local model if none is loaded; returns the model to start on. */
+export async function ensureLocalLoaded(local) {
+  if (local?.models?.length) return local.models[0];
+  const { key, seats, context, identifier } = local.record;
+  await api('/client/model/load', { method: 'POST', body: { key, seats, context } });
+  return identifier;
+}
 export function LocalChoice({ local, provider, onPick }) {
-  return local?.models?.length ? html`<div class="line"><button type="button" class=${`btn ${provider === 'opencode' ? 'pri' : ''}`}
-    disabled=${local.available === false} onClick=${() => onPick(local.models[0])}>${`Local (${local.models[0]})`}</button>
-    ${local.reason ? html`<span class="sub">${local.reason}</span>` : null}</div>` : null;
+  const loaded = local?.models?.[0];
+  const name = loaded || local?.record?.identifier;
+  if (!name) return null;
+  const state = local.record?.state;
+  const note = loaded ? local.reason
+    : state === 'loading' ? 'Model loading…'
+    : state === 'draining' ? 'Model unloading…'
+    : 'Not loaded: Start loads it first, which takes a few minutes';
+  return html`<div class="line"><button type="button" class=${`btn ${provider === 'opencode' ? 'pri' : ''}`}
+    disabled=${localBlocked(local, 'opencode')} onClick=${() => onPick(name)}>${`Local (${name})`}</button>
+    ${note ? html`<span class="sub">${note}</span>` : null}</div>`;
 }
 const PROVIDERS = [{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }];
 const OTHER = '__other__';
@@ -64,6 +93,7 @@ const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~'
 export function NewAgentPopover({ prefill = {}, onClose }) {
   const [settings, setSettings] = useState(null);
   const local = useLocalModel();
+  const open = useOpen();
   const [watch, setWatch] = useState(null);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(!!prefill.message);
@@ -128,6 +158,16 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     setError(null);
     const body = { provider: form.provider, working_dir: folder };
     if (form.model) body.model = form.model;
+    if (form.provider === 'opencode') {
+      try {
+        body.model = await ensureLocalLoaded(local);
+        if (!open.current) return;
+      } catch (e) {
+        setError(`Local model did not load: ${e.message}`);
+        setBusy(false);
+        return;
+      }
+    }
     if (form.effort) body.reasoning_effort = form.effort;
     if (form.name.trim()) body.name = form.name.trim();
     if (form.message.trim()) body.initial_message = form.message.trim();
@@ -206,7 +246,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
       ${error ? html`<p class="err">${error}</p>` : null}
       <div class="row">
         <button type="button" class="btn" onClick=${onClose}>Cancel</button>
-        <button type="button" class="btn pri" disabled=${busy || localBlocked(local, form.provider)} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button>
+        <button type="button" class="btn pri" disabled=${busy || localBlocked(local, form.provider)} onClick=${start}>${busy ? (form.provider === 'opencode' && !local?.models?.length ? 'Loading model…' : 'Starting…') : 'Start'}</button>
       </div>`;
   }
   return html`<${Popover} onClose=${onClose} align="right">
