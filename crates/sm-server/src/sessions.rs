@@ -8190,7 +8190,7 @@ impl SessionStore {
         };
         if let Some(queue) = &self.queue_store {
             let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf());
-            snapshot.handoff_ticket_overrides = claims.handoff_ticket_overrides_by_session()?;
+            snapshot.handoff_inherited = claims.handoff_inherited_by_session()?;
         }
         Ok(snapshot)
     }
@@ -15589,7 +15589,7 @@ struct StateSnapshot {
     #[serde(default)]
     handoff_defaults: Option<Value>,
     #[serde(skip)]
-    handoff_ticket_overrides: BTreeMap<String, crate::handoff::policy::HandoffOverride>,
+    handoff_inherited: BTreeMap<String, crate::handoff::policy::Inherited>,
     #[serde(default)]
     maintainer_session_id: Option<String>,
     #[serde(default)]
@@ -15626,7 +15626,7 @@ impl TryFrom<RawStateSnapshot> for StateSnapshot {
         }
         Ok(Self {
             sessions,
-            handoff_ticket_overrides: BTreeMap::new(),
+            handoff_inherited: BTreeMap::new(),
             maintainer_session_id: raw.maintainer_session_id,
             handoff_defaults: raw.handoff_defaults,
             agent_registrations: raw.agent_registrations,
@@ -15674,7 +15674,7 @@ impl StateSnapshot {
                 session,
                 &defaults,
                 &session_refs,
-                self.handoff_ticket_overrides.get(&session.id),
+                self.handoff_inherited.get(&session.id),
             ));
         }
 
@@ -23401,7 +23401,7 @@ sleep 30
     fn snapshot_projects_aliases_and_pending_adoption_proposals() {
         let snapshot = StateSnapshot {
             handoff_defaults: None,
-            handoff_ticket_overrides: BTreeMap::new(),
+            handoff_inherited: BTreeMap::new(),
             sessions: vec![
                 SessionRecord {
                     id: "em123456".to_owned(),
@@ -23466,7 +23466,7 @@ sleep 30
     fn snapshot_prunes_stopped_aliases_even_when_restorable() {
         let snapshot = StateSnapshot {
             handoff_defaults: None,
-            handoff_ticket_overrides: BTreeMap::new(),
+            handoff_inherited: BTreeMap::new(),
             sessions: vec![
                 SessionRecord {
                     id: "dead001".to_owned(),

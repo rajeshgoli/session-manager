@@ -308,7 +308,6 @@ impl HandoffDefaults {
 pub struct HandoffOverride {
     pub enabled: Option<bool>,
     pub threshold_percent: Option<f64>,
-    /// Per-agent only: a ticket override never sets these (sm#2283).
     pub ask_on_codex_review: Option<bool>,
     pub ask_on_doc_review: Option<bool>,
     pub set_at: Option<String>,
@@ -488,44 +487,56 @@ pub fn effective_policy(
     override_: Option<&HandoffOverride>,
     has_gauge: bool,
 ) -> EffectivePolicy {
-    effective_policy_with_ticket(defaults, provider, override_, None, has_gauge)
+    effective_policy_inherited(defaults, provider, override_, None, has_gauge)
 }
 
-pub fn effective_policy_with_ticket(
+/// What an agent inherits below its own override: its first ticket's, then that ticket's lane's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Inherited {
+    pub ticket: Option<HandoffOverride>,
+    pub lane: Option<HandoffOverride>,
+}
+
+/// Each field resolves on its own: agent, ticket, lane, then the Settings default (sm#2293).
+pub fn effective_policy_inherited(
     defaults: &HandoffDefaults,
     provider: &str,
     override_: Option<&HandoffOverride>,
-    ticket: Option<&HandoffOverride>,
+    inherited: Option<&Inherited>,
     has_gauge: bool,
 ) -> EffectivePolicy {
+    let ticket = inherited.and_then(|value| value.ticket.as_ref());
+    let lane = inherited.and_then(|value| value.lane.as_ref());
+    let levels = [override_, ticket, lane];
+    let pick = |field: fn(&HandoffOverride) -> Option<bool>| {
+        levels.iter().flatten().find_map(|value| field(value))
+    };
     let thresholds = defaults.thresholds(provider);
-    let enabled = override_
-        .and_then(|value| value.enabled)
-        .or_else(|| ticket.and_then(|value| value.enabled))
-        .unwrap_or_else(|| defaults.provider_enabled(provider));
-    let threshold_percent = override_
-        .and_then(|value| value.threshold_percent)
-        .or_else(|| ticket.and_then(|value| value.threshold_percent))
+    let enabled =
+        pick(|value| value.enabled).unwrap_or_else(|| defaults.provider_enabled(provider));
+    let threshold_percent = levels
+        .iter()
+        .flatten()
+        .find_map(|value| value.threshold_percent)
         .unwrap_or(thresholds.threshold_percent);
-    let reminder_percent = thresholds.reminder_percent;
     let source = if override_.is_some_and(HandoffOverride::is_active) {
         "override"
     } else if ticket.is_some_and(HandoffOverride::is_active) {
         "ticket"
+    } else if lane.is_some_and(HandoffOverride::is_active) {
+        "lane"
     } else {
         "default"
     };
     EffectivePolicy {
         enabled,
         threshold_percent,
-        reminder_percent,
+        reminder_percent: thresholds.reminder_percent,
         source,
         has_gauge,
-        ask_on_codex_review: override_
-            .and_then(|value| value.ask_on_codex_review)
+        ask_on_codex_review: pick(|value| value.ask_on_codex_review)
             .unwrap_or(defaults.ask_on_codex_review),
-        ask_on_doc_review: override_
-            .and_then(|value| value.ask_on_doc_review)
+        ask_on_doc_review: pick(|value| value.ask_on_doc_review)
             .unwrap_or(defaults.ask_on_doc_review),
     }
 }
@@ -1013,22 +1024,49 @@ mod tests {
     #[test]
     fn ticket_fields_fill_only_unset_agent_fields() {
         let defaults = HandoffDefaults::default();
-        let ticket = over(Some(true), Some(30.0));
+        let ticket = Inherited {
+            ticket: Some(over(Some(true), Some(30.0))),
+            lane: None,
+        };
         let agent = over(None, Some(45.0));
-        let policy = effective_policy_with_ticket(
-            &defaults,
-            "codex-fork",
-            Some(&agent),
-            Some(&ticket),
-            true,
-        );
+        let policy =
+            effective_policy_inherited(&defaults, "codex-fork", Some(&agent), Some(&ticket), true);
         assert!(policy.enabled);
         assert_eq!(policy.threshold_percent, 45.0);
         assert_eq!(policy.source, "override");
         let inherited =
-            effective_policy_with_ticket(&defaults, "codex-fork", None, Some(&ticket), true);
+            effective_policy_inherited(&defaults, "codex-fork", None, Some(&ticket), true);
         assert_eq!(inherited.threshold_percent, 30.0);
         assert_eq!(inherited.source, "ticket");
+    }
+
+    #[test]
+    fn lane_fields_fill_what_agent_and_ticket_leave_unset() {
+        // Lane: on at 50%, no Codex-review ask. Ticket: 40%. Agent: nothing.
+        let defaults = HandoffDefaults::default();
+        let lane = HandoffOverride {
+            enabled: Some(true),
+            threshold_percent: Some(50.0),
+            ask_on_codex_review: Some(false),
+            ..HandoffOverride::default()
+        };
+        let both = Inherited {
+            ticket: Some(over(None, Some(40.0))),
+            lane: Some(lane.clone()),
+        };
+        let policy = effective_policy_inherited(&defaults, "claude", None, Some(&both), true);
+        assert!(policy.enabled);
+        assert_eq!(policy.threshold_percent, 40.0);
+        assert!(!policy.ask_on_codex_review);
+        assert_eq!(policy.ask_on_doc_review, defaults.ask_on_doc_review);
+        assert_eq!(policy.source, "ticket");
+        let lane_only = Inherited {
+            ticket: None,
+            lane: Some(lane),
+        };
+        let policy = effective_policy_inherited(&defaults, "claude", None, Some(&lane_only), true);
+        assert_eq!(policy.threshold_percent, 50.0);
+        assert_eq!(policy.source, "lane");
     }
 
     #[test]

@@ -19,11 +19,11 @@ export function tokensOf(percent, window) {
   return Number.isFinite(value) && window ? `${tokens(window * value / 100)} of ${tokens(window)} tokens` : '';
 }
 
-const ticketPath = ({ repo, number }) => `/handoff-policy/ticket/${repo.split('/').map(encodeURIComponent).join('/')}/${number}`;
-const SOURCE = { override: 'Set for this agent', ticket: 'From its ticket', default: 'Using the default' };
+const scopedPath = (kind, { repo, number }) => `/handoff-policy/${kind}/${repo.split('/').map(encodeURIComponent).join('/')}/${number}`;
+const SOURCE = { override: 'Set for this agent', ticket: 'From its ticket', lane: 'From its lane', default: 'Using the default' };
 
 const PRESETS = [35, 50, 65];
-// Per-agent overrides of Settings › Context handoff › When a review is requested.
+// Overrides of Settings › Context handoff › When a review is requested.
 const REVIEW_ASKS = [
   ['ask_on_codex_review', 'Hand off before a Codex review'],
   ['ask_on_doc_review', 'Hand off before your doc review'],
@@ -31,10 +31,11 @@ const REVIEW_ASKS = [
 
 /**
  * `agent`: `{id, provider, state}` or null. `ticket`: `{repo: "owner/name",
- * number}` or null; without it the agent's ticket claim is used. `scope`
- * picks the first view: `agent` or `ticket`.
+ * number}` or null; without it the agent's ticket claim is used. `lane`:
+ * `{repo, number}` of a lane's goal, which alone sets the scope (sm#2293).
+ * `scope` picks the first view: `agent` or `ticket`.
  */
-export function HandoffPopover({ agent: given, ticket, scope: initialScope, align, onClose, showAskNow = true }) {
+export function HandoffPopover({ agent: given, ticket, lane, scope: initialScope, align, onClose, showAskNow = true }) {
   // A Board holder carries only its id and name; its provider and model,
   // which set the window, come from `/watch/state`.
   const [watched, setWatched] = useState(null);
@@ -49,14 +50,18 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
   const claim = (agent?.claims || []).find(item => item.kind === 'ticket');
   const held = ticket || (claim && { repo: claim.repo, number: claim.number });
   const forTicket = held && held.repo?.includes('/') ? held : null;
-  const [scope, setScope] = useState(initialScope === 'ticket' && forTicket || !agent ? 'ticket' : 'agent');
+  const [scope, setScope] = useState(lane ? 'lane' : initialScope === 'ticket' && forTicket || !agent ? 'ticket' : 'agent');
   const [defaults, setDefaults] = useState(null);
   const [policy, setPolicy] = useState(null);
   // null: nothing typed. '' is a cleared field, kept so a new number can be typed in (sm#2283).
   const [draft, setDraft] = useState(null);
   const [note, setNote] = useState('Loading…');
   const [asking, setAsking] = useState(false);
-  const path = scope === 'ticket' ? forTicket && ticketPath(forTicket) : `/sessions/${encodeURIComponent(agent.id)}/handoff-policy`;
+  const path = scope === 'lane' ? scopedPath('lane', lane)
+    : scope === 'ticket' ? forTicket && scopedPath('ticket', forTicket) : `/sessions/${encodeURIComponent(agent.id)}/handoff-policy`;
+  // A ticket or lane stores only what it sets; null fields fall through to the defaults.
+  const stored = scope !== 'agent';
+  const setHere = value => ['enabled', 'threshold_percent', ...REVIEW_ASKS.map(([key]) => key)].some(key => value[key] !== null && value[key] !== undefined);
   const provider = ['codex-fork', 'opencode'].includes(agent?.provider) ? agent.provider : 'claude';
   const base = defaults?.provider_thresholds?.[provider]?.threshold_percent;
   // The agent's own window: Claude's is 1M for a `[1m]` model, else 200k.
@@ -65,9 +70,11 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
   // A ticket override leaves unset fields to each agent's provider default.
   const enabled = policy ? policy.enabled ?? (agent ? !!defaults?.providers?.[provider] : false) : false;
   const threshold = policy?.threshold_percent ?? (agent ? base : null);
-  const describe = value => scope === 'ticket'
-    ? value.enabled !== null || value.threshold_percent !== null ? `Set for ticket #${forTicket.number}`
-      : agent ? 'Using the default' : 'Not set: the agent that takes this ticket uses its provider’s default'
+  const describe = value => scope === 'lane'
+    ? setHere(value) ? `Set for this lane; a ticket or agent setting wins` : 'Not set: its agents use their ticket’s setting or the default'
+    : scope === 'ticket'
+    ? setHere(value) ? `Set for ticket #${forTicket.number}`
+      : agent ? 'Using the default' : 'Not set: the agent that takes this ticket uses its lane’s setting or the default'
     : value.has_gauge === false ? 'This agent has no context gauge, so it cannot hand off automatically.'
     : SOURCE[value.source] || '';
   useEffect(() => { api('/handoff-defaults').then(setDefaults).catch(() => {}); }, []);
@@ -112,8 +119,11 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
           ${PRESETS.map(percent => html`<button type="button" class=${`btn sm${threshold === percent && draft === null ? ' on' : ''}`}
             onClick=${() => write({ threshold_percent: percent })}>${percent}%</button>`)}
           <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>
-        ${scope === 'agent' && agent ? REVIEW_ASKS.map(([key, label]) => html`<label class="check"><${Toggle} label=${label}
-            checked=${!!policy[key]} onChange=${value => write({ [key]: value })} /> ${label}</label>`) : null}`
+        ${REVIEW_ASKS.map(([key, label]) => {
+          const value = policy[key] ?? (stored ? defaults?.[key] : null);
+          return html`<label class="check"><${Toggle} label=${label} checked=${!!value} onChange=${next => write({ [key]: next })} />
+            ${label}${stored && policy[key] == null ? html` <span class="sub">(default)</span>` : null}</label>`;
+        })}`
       : null}
     <span class="sub" role="status">${note}</span>
     ${live && showAskNow ? html`<hr class="pop-rule" />

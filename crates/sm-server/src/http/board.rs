@@ -613,6 +613,13 @@ pub(super) fn board_payload(
 fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()> {
     let db = expand_home(&state.config.sm_send.db_path);
     let policies = crate::review::policy::list(&db)?;
+    // Each lane's handoff override (sm#2293), keyed by its goal ticket.
+    let lane_handoffs = crate::work_claims::WorkClaimStore::new(db.clone())
+        .handoff_overrides()?
+        .into_iter()
+        .filter(|(scope, ..)| *scope == crate::work_claims::HandoffScope::Lane)
+        .map(|(_, repo, number, value)| ((repo, number), value.to_json()))
+        .collect::<BTreeMap<_, _>>();
     let mut by_key = BTreeMap::new();
     for policy in policies {
         by_key.insert(
@@ -651,7 +658,7 @@ fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()
             .unwrap_or(Value::Null);
     };
     for lane in payload["lanes"].as_array_mut().into_iter().flatten() {
-        let repo = lane["goal"]["repo"].as_str().unwrap_or("");
+        let repo = lane["goal"]["repo"].as_str().unwrap_or("").to_owned();
         let number = lane["goal"]["number"].as_i64().unwrap_or(0);
         lane["review_policy"] = by_key
             .get(&("lane".into(), repo.to_owned(), number))
@@ -659,6 +666,10 @@ fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()
                 json!({"reviewer":p["reviewer"],"fallback":p["fallback"],
                 "set_by_name":p["set_by_name"],"set_at":p["set_at"]})
             })
+            .unwrap_or(Value::Null);
+        lane["handoff"] = lane_handoffs
+            .get(&(repo.to_owned(), number))
+            .cloned()
             .unwrap_or(Value::Null);
         for ticket in lane["tickets"].as_array_mut().into_iter().flatten() {
             decorate_ticket(ticket);

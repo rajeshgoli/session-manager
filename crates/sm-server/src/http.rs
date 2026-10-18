@@ -2344,6 +2344,10 @@ pub fn router(state: AppState) -> Router {
             get(handoff::get_ticket_handoff_policy).put(handoff::put_ticket_handoff_policy),
         )
         .route(
+            "/handoff-policy/lane/{owner}/{repo}/{number}",
+            get(handoff::get_lane_handoff_policy).put(handoff::put_lane_handoff_policy),
+        )
+        .route(
             "/sessions/{session_id}/maintainer",
             put(set_maintainer).delete(clear_maintainer),
         )
@@ -25761,6 +25765,36 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["enabled"], true);
+
+        // A lane's override, keyed by its goal (sm#2293), carries the review switches.
+        let lane_uri = "/handoff-policy/lane/acme/widgets/1700";
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(
+                        lane_uri,
+                        json!({"threshold_percent": 50, "ask_on_codex_review": false}),
+                        false,
+                    ),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["threshold_percent"], 50);
+        assert_eq!(body["ask_on_codex_review"], false);
+        assert_eq!(body["enabled"], Value::Null);
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(Method::GET, lane_uri, Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["threshold_percent"], 50);
 
         // Remote owner (the app): passes.
         let (status, body) = response_json(
