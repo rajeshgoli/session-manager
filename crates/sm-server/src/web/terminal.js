@@ -5,7 +5,7 @@ import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, S
 import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
-import { contrastFloor, isLight, terminalTheme } from './terminal-theme.js';
+import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -172,7 +172,7 @@ export function TerminalPage({ id, open }) {
   useEffect(() => {
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
-      scrollback: 10000, theme: terminalTheme(isLight()), minimumContrastRatio: contrastFloor(isLight()),
+      lineHeight: 1.12, scrollback: 10000, minimumContrastRatio: CONTRAST_FLOOR,
       // OSC 8 links, without xterm's confirm dialog.
       linkHandler: { activate: openLink, allowNonHttpProtocols: false },
     });
@@ -183,12 +183,16 @@ export function TerminalPage({ id, open }) {
     // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).
     const scheme = matchMedia('(prefers-color-scheme: dark)');
     const retheme = () => {
-      const light = isLight();
-      terminal.options.theme = terminalTheme(light);
-      terminal.options.minimumContrastRatio = contrastFloor(light);
+      const theme = terminalTheme(isLight(), stored(THEME_KEY));
+      terminal.options.theme = theme;
+      host.current.style.background = theme.background;
     };
+    retheme();
     scheme.addEventListener('change', retheme);
     const themeWatch = new MutationObserver(retheme);
+    // Settings › Appearance in another tab; the same tab's Settings is a different page.
+    const storageWatch = (event) => { if (event.key === THEME_KEY) retheme(); };
+    window.addEventListener('storage', storageWatch);
     themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     let socket = null, stopped = false, live = false, timer = null, handshakeTimer = null, retries = 0;
     let pinger = null, pingId = 0, samples = [];
@@ -393,7 +397,7 @@ export function TerminalPage({ id, open }) {
     fitNow();
     connect();
     return () => {
-      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); data.dispose(); terminal.dispose();
+      stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
   }, [id, attempt]);

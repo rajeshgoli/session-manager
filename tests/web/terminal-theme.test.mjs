@@ -1,8 +1,8 @@
 // Run: node --test tests/web/terminal-theme.test.mjs
-// #2304: the web terminal follows Settings › Appearance; light mirrors the 256-colour palette.
+// #2304: terminal themes with light and dark variants, chosen by Settings › Appearance.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { DARK, contrastFloor, isLight, lightTheme, mirror, paletteRgb, terminalTheme } from '../../crates/sm-server/src/web/terminal-theme.js';
+import { CONTRAST_FLOOR, DEFAULT_THEME, THEMES, isLight, paletteRgb, recolour, terminalTheme } from '../../crates/sm-server/src/web/terminal-theme.js';
 
 const doc = (theme) => ({ documentElement: { dataset: theme ? { theme } : {} } });
 const media = (dark) => () => ({ matches: dark });
@@ -13,18 +13,26 @@ const luma = (hex) => {
 };
 const contrast = (a, b) => { const [x, y] = [luma(a), luma(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
 
-test('theme choice follows the setting, and the OS on System', () => {
+test('appearance follows the setting, and the OS on System', () => {
   assert.equal(isLight(doc('light'), media(true)), true);
   assert.equal(isLight(doc('dark'), media(false)), false);
   assert.equal(isLight(doc('system'), media(false)), true);
   assert.equal(isLight(doc('system'), media(true)), false);
   assert.equal(isLight(doc(), media(false)), true);
-  assert.equal(terminalTheme(false), DARK);
-  assert.equal(terminalTheme(true).background, '#FCFCFA');
-  // Default text on ANSI black (SGR 40) shares its colour in light, so light needs a contrast floor.
-  assert.equal(terminalTheme(true).black, terminalTheme(true).foreground);
-  assert.ok(contrastFloor(true) >= 4.5);
-  assert.equal(contrastFloor(false), 1);
+});
+
+test('every theme has readable light and dark variants; unknown names fall back to sm', () => {
+  for (const name of Object.keys(THEMES)) {
+    const light = terminalTheme(true, name), dark = terminalTheme(false, name);
+    assert.ok(luma(light.background) > luma(light.foreground), name);
+    assert.ok(luma(dark.background) < luma(dark.foreground), name);
+    assert.ok(contrast(light.background, light.foreground) > 4.5, name);
+    assert.ok(contrast(dark.background, dark.foreground) > 4.5, name);
+    assert.equal(light.extendedAnsi.length, 240);
+  }
+  assert.equal(terminalTheme(true, 'nope'), terminalTheme(true, DEFAULT_THEME));
+  assert.equal(terminalTheme(false), terminalTheme(false, 'sm'));
+  assert.ok(CONTRAST_FLOOR >= 4.5);
 });
 
 test('palette indexes match xterm', () => {
@@ -35,17 +43,19 @@ test('palette indexes match xterm', () => {
   assert.deepEqual(paletteRgb(255), [238, 238, 238]);
 });
 
-test('light palette covers 16-255 and keeps Claude\'s colours readable', () => {
-  const light = lightTheme();
-  assert.equal(light.extendedAnsi.length, 240);
-  const at = (i) => light.extendedAnsi[i - 16];
-  // White emphasis text and grey dim text on the light background.
-  assert.ok(contrast(at(231), light.background) > 12);
-  assert.ok(contrast(at(246), light.background) > 4);
-  // Text on the prompt box (grey 237) stays readable; the box itself is pale.
-  assert.ok(luma(at(237)) > 0.5);
-  assert.ok(contrast(light.foreground, at(237)) > 7);
-  // Hue survives: a red stays red.
-  const red = mirror([255, 0, 0]);
-  assert.ok(parseInt(red.slice(1, 3), 16) > parseInt(red.slice(3, 5), 16) * 2);
+test('recolouring keeps lightness, so Claude\'s light and dark palettes both read right', () => {
+  for (const light of [true, false]) {
+    const v = terminalTheme(light, 'sm');
+    const at = (i) => v.extendedAnsi[i - 16];
+    // Black and white land on the theme's dark and light ends.
+    assert.equal(at(16), light ? v.foreground : v.background);
+    assert.equal(at(231), light ? v.background : v.foreground);
+    // Claude's light palette (fg 16 on box 255) in light, its dark one (231 on 237) in dark.
+    if (light) assert.ok(contrast(at(16), at(255)) > 10);
+    else assert.ok(contrast(at(231), at(237)) > 5);
+  }
+  // A hue takes the theme's accent: Claude's green 114 becomes a green.
+  const green = recolour(paletteRgb(114), THEMES.solarized.dark);
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(green.slice(i, i + 2), 16));
+  assert.ok(g > r && g > b, green);
 });

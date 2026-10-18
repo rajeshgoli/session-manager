@@ -5,6 +5,7 @@ import { TITLES_KEY } from './agents.js';
 import { tokens, tokensOf } from './handoff.js';
 import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
 import { DevicesList } from './devices.js';
+import { THEMES, THEME_KEY, DEFAULT_THEME, isLight, terminalTheme } from './terminal-theme.js';
 import { LeftoverWorktrees } from './worktrees.js';
 import { AutoPmSettings } from './autopm.js';
 
@@ -148,6 +149,26 @@ export function SettingsPage() {
   </div>`;
 }
 
+/** Settings › Appearance › Terminal: one card per theme, drawn in the page's light or dark. */
+function TerminalThemes({ value, onChange, light }) {
+  return html`<div class="settings-field"><span>Terminal</span>
+    <div class="term-themes" role="radiogroup" aria-label="Terminal theme">
+      ${Object.entries(THEMES).map(([name, theme]) => {
+        const v = terminalTheme(light, name);
+        return html`<button type="button" role="radio" aria-checked=${name === value} class=${`term-theme${name === value ? ' on' : ''}`}
+          onClick=${() => onChange(name)} key=${name}>
+          <span class="term-theme-sample" style=${{ background: v.background, color: v.foreground }}>
+            <span><b style=${{ color: v.green }}>❯</b> sm status</span>
+            <span style=${{ color: v.extendedAnsi[246 - 16] }}>Working · 3m</span>
+            <span class="term-theme-dots">${['red', 'yellow', 'green', 'cyan', 'blue', 'magenta'].map(c =>
+              html`<i style=${{ background: v[c] }}></i>`)}</span>
+          </span>
+          <span class="term-theme-name">${theme.label}</span></button>`;
+      })}
+    </div>
+    <p class="sub">Each theme has a light and a dark version; the Theme setting above picks which.</p></div>`;
+}
+
 function Appearance() {
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('sm-theme') || 'system'; } catch { return 'system'; } });
   const [textSize, setTextSize] = useState(() => {
@@ -155,6 +176,8 @@ function Appearance() {
     catch { return 15; }
   });
   const [titles, setTitles] = useState(() => stored(TITLES_KEY, true) !== false);
+  const [termTheme, setTermTheme] = useState(() => (THEMES[stored(THEME_KEY)] ? stored(THEME_KEY) : DEFAULT_THEME));
+  const chooseTerm = value => { setTermTheme(value); store(THEME_KEY, value); setStatus('Saved'); };
   const [status, setStatus] = useState('');
   const chooseTitles = value => { setTitles(value); store(TITLES_KEY, value); setStatus('Saved'); };
   const choose = value => { setTheme(value); document.documentElement.dataset.theme = value;
@@ -163,6 +186,7 @@ function Appearance() {
     try { localStorage.setItem('sm-text-size', String(size)); setStatus('Saved'); } catch { setStatus('Applied until reload; browser storage is unavailable.'); } };
   return html`<h2>Appearance</h2><${Seg} label="Theme" value=${theme} onChange=${choose}
     options=${['system', 'light', 'dark'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))} />
+    <${TerminalThemes} value=${termTheme} onChange=${chooseTerm} light=${isLight()} />
     <div class="text-size-setting"><label for="sm-text-size">Text size</label>
       <input id="sm-text-size" type="range" min="13" max="19" step="1" value=${textSize}
         onInput=${event => chooseSize(Number(event.target.value))} />

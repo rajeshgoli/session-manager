@@ -471,3 +471,29 @@ test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse 
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('terminal theme: picked in Settings, light or dark from Appearance, switching live (#2304)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/settings#appearance`);
+    const pick = page.getByRole('radio', { name: /Solarized/ });
+    await pick.click();
+    assert.equal(await pick.getAttribute('aria-checked'), 'true');
+    assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-theme')), '"solarized"');
+    if (SHOTS) await page.locator('.term-themes').screenshot({ path: `${SHOTS}/settings-terminal-themes.png` });
+
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.locator('.term-body .xterm').waitFor();
+    const background = () => page.evaluate(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor);
+    assert.equal(await background(), 'rgb(253, 246, 227)', 'Solarized light on a light page');
+    // System follows the OS while the page is open.
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor === 'rgb(0, 43, 54)');
+    // An explicit Theme wins over the OS.
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor === 'rgb(253, 246, 227)');
+    if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-solarized-light.png` });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
