@@ -1,5 +1,6 @@
 //! Backup foundation. The request coordinator owns scheduling and authentication;
 //! these primitives never contact a remote device or delete source data.
+pub mod cli_build;
 pub mod client;
 pub mod lifecycle;
 mod outbox;

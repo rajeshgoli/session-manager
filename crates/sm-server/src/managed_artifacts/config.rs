@@ -224,8 +224,39 @@ pub struct ArtifactBackupConfig {
     pub plain_paths: Vec<String>,
     pub holding_days: std::collections::BTreeMap<String, u64>,
     pub backup_rate_default: String,
-    /// Where `scripts/restart-rust-server.sh` publishes the mini's `sm` (#2264).
+    /// Where sm builds and publishes the mini's `sm` (#2264).
     pub cli_dir: String,
+    pub cli_build: CliBuildConfig,
+}
+/// Building the mini's `sm` when it asks for one (#2264).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CliBuildConfig {
+    /// Git repository to build from; empty means the checkout holding the
+    /// running sm-server (the deployed checkout), which has its commit.
+    pub source: String,
+    /// `PATH` for the build: cargo, rustup, git, and the Xcode tools. launchd
+    /// gives sm-server a minimal one.
+    pub path: String,
+    /// Repository a failed build's ticket is filed in.
+    pub ticket_repo: String,
+    /// Goal ticket in `ticket_repo` the failure ticket goes under; none files
+    /// it unplaced.
+    pub ticket_goal: Option<i64>,
+    /// A failed build of the same commit is retried after this many hours.
+    pub retry_hours: u64,
+}
+impl Default for CliBuildConfig {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            path: "~/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                .into(),
+            ticket_repo: "rajeshgoli/session-manager".into(),
+            ticket_goal: None,
+            retry_hours: 12,
+        }
+    }
 }
 impl Default for ArtifactBackupConfig {
     fn default() -> Self {
@@ -246,6 +277,7 @@ impl Default for ArtifactBackupConfig {
             ]),
             backup_rate_default: "18.75MB".into(),
             cli_dir: "~/.local/share/claude-sessions/backup-cli".into(),
+            cli_build: CliBuildConfig::default(),
         }
     }
 }

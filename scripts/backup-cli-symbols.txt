@@ -1,7 +1,7 @@
 # Symbols the backup mini's sm (x86_64-apple-darwin) imports, each checked
 # against the macOS SDK headers' availability annotations as present on macOS
-# 10.13 or earlier (#2264). scripts/build-backup-cli.sh fails a deploy when the
-# build imports a symbol not listed here. Format: <symbol> <library>, sorted.
+# 10.13 or earlier (#2264). scripts/build-backup-cli.sh refuses a build that
+# imports a symbol not listed here. Format: <symbol> <library>, sorted.
 # Newest at review: fclonefileat, getentropy, clock_gettime (10.12);
 # removexattr (10.4); CCRandomGenerateBytes (10.10). The binary links no symbol
 # from CoreFoundation, Security or ServiceManagement.

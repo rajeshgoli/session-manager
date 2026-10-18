@@ -1070,3 +1070,115 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
     moves::TEST_MOUNTED.set(false);
     drop(dest);
 }
+
+/// Records issues sm files; GitHub is otherwise unreachable.
+#[derive(Default)]
+struct Tickets {
+    created: std::sync::Mutex<Vec<(String, String, String)>>,
+    resolves: std::sync::atomic::AtomicUsize,
+}
+impl crate::board::sync::BoardSource for Tickets {
+    fn issues_page(
+        &self,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<crate::board::sync::IssuesPage, String> {
+        Err("offline".into())
+    }
+    fn connection_page(
+        &self,
+        _: &str,
+        _: i64,
+        _: crate::board::sync::IssueConnection,
+        _: &str,
+    ) -> Result<(Vec<crate::board::sync::RefNode>, Option<String>), String> {
+        Err("offline".into())
+    }
+    fn items(
+        &self,
+        _: &str,
+        _: &[i64],
+    ) -> Result<std::collections::BTreeMap<i64, Option<crate::board::sync::RefNode>>, String> {
+        Err("offline".into())
+    }
+    fn resolve(
+        &self,
+        _: &[crate::board::model::Key],
+    ) -> Result<Vec<Option<crate::board::sync::ResolvedIssue>>, String> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
+        Err("offline".into())
+    }
+    fn write_link(
+        &self,
+        _: &crate::board::sync::LinkMutation,
+    ) -> Result<(), crate::board::sync::WriteError> {
+        Err(crate::board::sync::WriteError::Transport("offline".into()))
+    }
+    fn create_issue(&self, repo: &str, title: &str, body: &str) -> Result<(i64, String), String> {
+        let mut created = self.created.lock().unwrap();
+        created.push((repo.into(), title.into(), body.into()));
+        let n = 9000 + created.len() as i64;
+        Ok((n, format!("https://github.com/{repo}/issues/{n}")))
+    }
+}
+
+#[test]
+fn a_failed_mini_build_files_one_ticket_under_the_configured_goal() {
+    use crate::managed_artifacts::backup::cli_build;
+    let mut f = Fixture::new();
+    f.state.config.managed_artifacts.backup.cli_build.source = f.dir.display().to_string();
+    f.state
+        .config
+        .managed_artifacts
+        .backup
+        .cli_build
+        .ticket_goal = Some(2300);
+    let tickets = Arc::new(Tickets::default());
+    let state = f.state.clone().with_board_source(tickets.clone());
+    let manager = ManagedArtifacts::new(&state.config.managed_artifacts).unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    // The mini asks: one build is queued, and asking again queues no other.
+    request_cli_build(&state, commit).unwrap();
+    request_cli_build(&state, commit).unwrap();
+    let queue = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let job = crate::queue::RetainedQueueStore::owned_queue_job(&queue, &cli_build::owner(commit))
+        .unwrap()
+        .unwrap();
+    file_cli_build_failure(&state, &manager, commit).unwrap();
+    assert!(
+        tickets.created.lock().unwrap().is_empty(),
+        "nothing failed yet"
+    );
+    fs::write(
+        job.log_path.as_ref().unwrap(),
+        "error[E0425]: cannot find value\n",
+    )
+    .unwrap();
+    crate::queue::open_queue_jobs_connection(&queue.join("queue_runner.db"))
+        .unwrap()
+        .execute(
+            "UPDATE queue_jobs SET state='failed', finished_at=?2 WHERE id=?1",
+            rusqlite::params![
+                job.id,
+                OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        file_cli_build_failure(&state, &manager, commit).unwrap();
+    }
+    let created = tickets.created.lock().unwrap().clone();
+    assert_eq!(created.len(), 1, "one ticket per failed commit");
+    let (repo, title, body) = &created[0];
+    assert_eq!(repo, "rajeshgoli/session-manager");
+    assert_eq!(
+        title,
+        "Auto-filed: backup mini sm build failed at 0123456789ab"
+    );
+    assert!(body.contains(commit) && body.contains("error[E0425]") && body.contains(&job.id));
+    assert!(body.contains("keeps its current"));
+    // Placing it under the goal went to GitHub (offline here, so only logged).
+    assert!(tickets.resolves.load(Ordering::SeqCst) > 0);
+}

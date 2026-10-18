@@ -331,14 +331,96 @@ fn published_cli(state: &AppState) -> Result<(bk::update::CliInfo, PathBuf), Api
     })?;
     Ok((info, dir.join(bk::update::CLI_FILE)))
 }
-/// `{version, sha256, bytes}` of the `sm` the mini should run (#2264).
+/// `{version, sha256, bytes}` of the `sm` the mini should run (#2264). Asking
+/// also starts a build of this server's commit when that is not what is
+/// published; the mini picks it up on a later night.
 pub(super) async fn cli(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
     device(&request)?;
     service(&state)?;
-    tokio::task::spawn_blocking(move || Ok(Json(published_cli(&state)?.0).into_response())).await?
+    tokio::task::spawn_blocking(move || {
+        if let Some(commit) = bk::cli_build::server_commit() {
+            if let Err(error) = request_cli_build(&state, commit) {
+                eprintln!("backup mini sm build was not queued: {error:#}");
+            }
+        }
+        Ok(Json(published_cli(&state)?.0).into_response())
+    })
+    .await?
+}
+fn request_cli_build(state: &AppState, commit: &str) -> anyhow::Result<()> {
+    let backup = &state.config.managed_artifacts.backup;
+    bk::cli_build::request(
+        &bk::cli_build::Build {
+            dir: &expand_home(&backup.cli_dir),
+            config: &backup.cli_build,
+            queue_dir: &expand_home(&state.config.queue_runner_state_dir().to_string_lossy()),
+            executable: &std::env::current_exe()?,
+            commit,
+            version: bk::update::CLI_VERSION,
+        },
+        OffsetDateTime::now_utc(),
+    )?;
+    Ok(())
+}
+/// One ticket per commit whose build failed. The mini keeps its current sm.
+fn file_cli_build_failure(
+    state: &AppState,
+    manager: &ManagedArtifacts,
+    commit: &str,
+) -> anyhow::Result<()> {
+    let queue_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let Some(failure) = bk::cli_build::failure(&queue_dir, commit)? else {
+        return Ok(());
+    };
+    let conn = manager.store.open()?;
+    let key = format!("backup_cli_ticket:{commit}");
+    if crate::managed_artifacts::store::meta(&conn, &key)?.is_some() {
+        return Ok(());
+    }
+    let config = &state.config.managed_artifacts.backup.cli_build;
+    let mut tail = failure.log_tail.replace("~~~", "~ ~ ~");
+    if tail.len() > 20_000 {
+        let mut start = tail.len() - 20_000;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = tail[start..].to_owned();
+    }
+    let title = format!(
+        "Auto-filed: backup mini sm build failed at {}",
+        &commit[..12]
+    );
+    let body = format!(
+        "sm-server at commit `{commit}` could not build the `sm` that the remote backup Mac mini \
+         runs (x86_64, macOS 10.13; #2264). Nothing changed on the mini: it keeps its current \
+         `sm`. sm builds again when the mini next asks after {} hours, and on the first request \
+         after any deploy of another commit.\n\n\
+         To reproduce, from a checkout of `{commit}`: \
+         `SM_BUILD_SHA={commit} scripts/build-backup-cli.sh stage --target-dir target \
+         --expect-version '{}' --dir \"$(mktemp -d)\"`.\n\n\
+         Queue job `{}` ended `{}`. End of its log:\n\n~~~\n{tail}\n~~~\n",
+        config.retry_hours,
+        bk::update::CLI_VERSION,
+        failure.job_id,
+        failure.state,
+    );
+    let (number, url) = state
+        .board_source
+        .create_issue(&config.ticket_repo, &title, &body)
+        .map_err(|error| anyhow::anyhow!("file the backup mini build ticket: {error}"))?;
+    crate::managed_artifacts::store::set_meta(&conn, &key, &url)?;
+    if let Some(goal) = config.ticket_goal {
+        let repo = crate::work_claims::canonical_repo(&config.ticket_repo);
+        if let Err(error) =
+            board::place_under(state, (repo.clone(), number), (repo, goal), "sm backup")
+        {
+            eprintln!("backup mini build ticket {url} was not placed under #{goal}: {error:#}");
+        }
+    }
+    Ok(())
 }
 pub(super) async fn cli_binary(
     State(state): State<Arc<AppState>>,
@@ -477,6 +559,11 @@ impl AppState {
             &std::env::current_exe()?,
         )?;
         life::missed_alerts(manager, OffsetDateTime::now_utc().unix_timestamp())?;
+        if let Some(commit) = bk::cli_build::server_commit() {
+            if let Err(error) = file_cli_build_failure(self, manager, commit) {
+                eprintln!("backup mini build failure was not filed: {error:#}");
+            }
+        }
         deliver_alerts(self, manager)
     }
 }

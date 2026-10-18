@@ -415,10 +415,6 @@ SM_STAGING="$SM_BINARY.staging.$$"
 # The `sm` CLI from the same build, copied out before the source check so a later
 # build in the target dir cannot change what gets installed.
 SM_CLI_STAGING=""
-# The backup mini's Intel `sm`, from the same build (#2264). sm-server reads it
-# from managed_artifacts.backup.cli_dir, whose default this matches.
-SM_BACKUP_CLI_DIR="${SM_BACKUP_CLI_DIR:-$HOME/.local/share/claude-sessions/backup-cli}"
-BACKUP_CLI_STAGED=0
 RENDERED_PLIST=""
 # A fixed path, not one under $TMPDIR: agent sandboxes give sessions their own
 # TMPDIR, and two restarts that compute different lock paths exclude nothing.
@@ -429,8 +425,6 @@ cleanup() {
   local rc=$?
   rm -f "$SM_STAGING"
   [[ -n "$SM_CLI_STAGING" ]] && rm -f "$SM_CLI_STAGING"
-  [[ "$BACKUP_CLI_STAGED" -eq 1 ]] \
-    && rm -f "$SM_BACKUP_CLI_DIR/sm-x86_64-apple-darwin.staging" "$SM_BACKUP_CLI_DIR/sm-x86_64-apple-darwin.json.staging"
   [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST" "$RENDERED_PLIST.diff"
   [[ "$LOCK_OWNED" -eq 1 ]] && rm -rf "$SM_LOCK"
   return $rc
@@ -999,8 +993,7 @@ else
   # From REPO_ROOT: cargo reads .cargo/config.toml from the cwd, which
   # --manifest-path does not redirect. SM_BUILD_SHA names the commit in the
   # server facts of bug reports filed from the app.
-  build_sha="$(git_repo rev-parse HEAD 2>/dev/null || true)"
-  (cd "$REPO_ROOT" && SM_BUILD_SHA="$build_sha" cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR") \
+  (cd "$REPO_ROOT" && SM_BUILD_SHA="$(git_repo rev-parse HEAD 2>/dev/null || true)" cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR") \
     || fail "build failed - the running service was not touched"
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"
@@ -1012,15 +1005,6 @@ else
     mkdir -p "$(dirname "$SM_BINARY")" 2>/dev/null || true
     cp -p "$SM_TARGET_DIR/release/sm" "$SM_CLI_STAGING" || SM_CLI_STAGING=""
   fi
-
-  step "Building the backup mini's sm (x86_64, macOS 10.13)"
-  # The remote backup disk's Mac mini updates itself from this on its nightly
-  # pull, so it must come from the same commit as the server. Staged now, beside
-  # its final path, and published only once the new server is healthy.
-  BACKUP_CLI_STAGED=1
-  (cd "$REPO_ROOT" && SM_BUILD_SHA="$build_sha" "$REPO_ROOT/scripts/build-backup-cli.sh" stage \
-      --target-dir "$SM_TARGET_DIR" --native "$SM_TARGET_DIR/release/sm" --dir "$SM_BACKUP_CLI_DIR") \
-    || fail "the backup mini's sm did not build or verify (see above) - the running service was not touched"
 fi
 
 step "Staging and signing"
@@ -1224,16 +1208,6 @@ elif SM_CLI_BINARY="$SM_CLI_BINARY" "$REPO_ROOT/scripts/install-sm-cli.sh" --sou
 else
   echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2
   echo "         Re-run scripts/install-sm-cli.sh once the build is fixed." >&2
-fi
-
-step "Publishing the backup mini's sm"
-if [[ "$BACKUP_CLI_STAGED" -ne 1 ]]; then
-  echo "skipped (--skip-build/--adopt): the published backup mini sm is whatever was there before"
-elif "$REPO_ROOT/scripts/build-backup-cli.sh" publish --dir "$SM_BACKUP_CLI_DIR"; then
-  BACKUP_CLI_STAGED=0
-else
-  echo "WARNING: the backup mini's sm was not published; $SM_LABEL itself is healthy." >&2
-  echo "         The mini keeps its current sm until the next deploy." >&2
 fi
 
 step "Done"

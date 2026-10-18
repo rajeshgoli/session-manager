@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Builds the `sm` the backup mini runs (#2264): an Intel Mac mini that may be on
-# macOS 10.13. scripts/restart-rust-server.sh runs `stage` with the native build
-# and `publish` once the new server is healthy; sm serves the published pair at
+# macOS 10.13. sm-server runs this from a checkout of its own commit when the
+# mini asks for its sm and the published one is another commit
+# (managed_artifacts/backup/cli_build.rs); it serves the published pair at
 # GET /backup/cli and /backup/cli/binary, and the mini updates itself from it.
 #
-#   build-backup-cli.sh stage --target-dir DIR --native SM --dir CLI_DIR
-#       Build, verify, and write CLI_DIR/sm-x86_64-apple-darwin{,.json}.staging.
+#   build-backup-cli.sh stage --target-dir DIR --expect-version V --dir CLI_DIR
+#       Build, verify that `sm --version` prints V, and write
+#       CLI_DIR/sm-x86_64-apple-darwin{,.json}.staging.
 #   build-backup-cli.sh publish --dir CLI_DIR
 #       Rename both staged files into place, binary first.
 #
 # Run from the repository root (cargo reads .cargo/config.toml from the cwd).
-# SM_BUILD_SHA must match the native build's, so both print the same --version.
+# SM_BUILD_SHA names the commit; it is what puts the commit into --version.
 set -euo pipefail
 
 TRIPLE=x86_64-apple-darwin
@@ -22,11 +24,11 @@ fail() { echo "ERROR: $1" >&2; exit 1; }
 
 mode="${1:-}"
 [[ $# -gt 0 ]] && shift
-target_dir="" native="" dir=""
+target_dir="" expected="" dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target-dir) target_dir="$2"; shift 2 ;;
-    --native) native="$2"; shift 2 ;;
+    --expect-version) expected="$2"; shift 2 ;;
     --dir) dir="$2"; shift 2 ;;
     *) fail "unknown argument: $1" ;;
   esac
@@ -45,7 +47,7 @@ if [[ "$mode" == publish ]]; then
   exit 0
 fi
 [[ "$mode" == stage ]] || fail "usage: build-backup-cli.sh stage|publish ..."
-[[ -n "$target_dir" && -n "$native" ]] || fail "stage needs --target-dir and --native"
+[[ -n "$target_dir" && -n "$expected" ]] || fail "stage needs --target-dir and --expect-version"
 
 rustup target list --installed 2>/dev/null | grep -qx "$TRIPLE" \
   || fail "the $TRIPLE Rust target is not installed; run: rustup target add $TRIPLE"
@@ -83,12 +85,11 @@ $new
        build; remove the dependency that introduced it."
 fi
 
-native_version="$("$native" --version)"
 arch -x86_64 /usr/bin/true 2>/dev/null \
   || fail "Rosetta is needed to check the $TRIPLE build's version; run: softwareupdate --install-rosetta"
 intel_version="$(arch -x86_64 "$binary" --version)"
-[[ "$intel_version" == "$native_version" ]] \
-  || fail "the $TRIPLE build reports '$intel_version' but the native build reports '$native_version'"
+[[ "$intel_version" == "$expected" ]] \
+  || fail "the $TRIPLE build reports '$intel_version'; sm-server expects '$expected'"
 [[ "$intel_version" =~ ^sm\ [^\"\\]+\ \([0-9a-f]{12}\)$ ]] \
   || fail "sm --version must name the commit; got '$intel_version'"
 
