@@ -7,7 +7,90 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
+    time::{Duration, Instant},
 };
+
+/// `fsync(2)` on a path. Rust's `sync_all`/`sync_data` are `F_FULLFSYNC` on
+/// macOS, a full drive-cache flush that costs about 45 ms on a USB hard disk;
+/// batches pair plain `fsync`s with one [`full_fsync`] (#2317).
+pub(super) fn fsync_path(path: &Path) -> Result<()> {
+    let file = File::open(path)?;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+/// Flush the drive's cache as well, once per batch.
+pub(super) fn full_fsync(file: &File) -> Result<()> {
+    file.sync_all()?;
+    Ok(())
+}
+/// Durability barrier for many files: start writing everything, then wait for
+/// each path, then flush the drive's cache once through `anchor`.
+pub(super) fn barrier<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+    anchor: &File,
+) -> Result<()> {
+    unsafe { libc::sync() };
+    for path in paths {
+        fsync_path(path)?;
+    }
+    full_fsync(anchor)
+}
+
+/// Direct-mode staging made durable in batches: files are placed without
+/// waiting for the disk, and their index lines are appended only after one
+/// barrier covers the whole batch, so a line never vouches for a copy a crash
+/// could lose.
+#[derive(Default)]
+struct Batch {
+    paths: std::collections::BTreeSet<PathBuf>,
+    files: usize,
+    bytes: u64,
+    lines: Vec<u8>,
+    started: Option<Instant>,
+}
+impl Batch {
+    fn add(
+        &mut self,
+        placed: PathBuf,
+        dirs: impl IntoIterator<Item = PathBuf>,
+        bytes: u64,
+        line: &[u8],
+    ) {
+        self.started.get_or_insert_with(Instant::now);
+        self.paths.insert(placed);
+        self.paths.extend(dirs);
+        self.files += 1;
+        self.bytes += bytes;
+        self.lines.extend_from_slice(line);
+    }
+    fn due(&self) -> bool {
+        #[cfg(test)]
+        if let Some(files) = BATCH_FILES.get() {
+            return self.files >= files;
+        }
+        self.files >= 512
+            || self.bytes >= 4 << 30
+            || self
+                .started
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+    }
+    fn flush(&mut self, index: &mut File) -> Result<()> {
+        if self.files == 0 {
+            return Ok(());
+        }
+        unsafe { libc::sync() };
+        for path in &self.paths {
+            fsync_path(path)?;
+        }
+        index.write_all(&self.lines)?;
+        full_fsync(index)?;
+        *self = Self::default();
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransferManifest {
@@ -164,6 +247,7 @@ fn stage(
     spool: &Path,
     packed: bool,
     before: &fs::Metadata,
+    durable: bool,
 ) -> Result<Option<String>> {
     let mut input = match OpenOptions::new()
         .read(true)
@@ -209,11 +293,16 @@ fn stage(
         // Standard zstd output either way; workers only shorten large files.
         encoder.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
         copy(&mut encoder)?;
-        encoder.finish()?.sync_all()?;
+        let file = encoder.finish()?;
+        if durable {
+            file.sync_all()?;
+        }
     } else {
         let mut file = file;
         copy(&mut file)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
     }
     #[cfg(test)]
     AFTER_READ.with(|hook| {
@@ -235,6 +324,10 @@ type ReadHook = Box<dyn FnOnce(&Path)>;
 thread_local! { pub(super) static DIRECT_FLOOR: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 thread_local! { pub(super) static READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { pub(super) static CRASH_AFTER_PLACED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+thread_local! { pub(super) static BATCH_FILES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_AFTER_PLACED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
@@ -323,6 +416,9 @@ pub(super) fn prepare_with_progress(
         None => None,
     };
     let mut reused = (0u64, 0u64);
+    let mut batch = Batch::default();
+    // `<dest>/.incoming/<id>`: an interrupted apply leaves staged copies here.
+    let destination = direct.and_then(Path::parent).and_then(Path::parent);
     #[cfg(test)]
     let mut placed_count = 0usize;
     let direct_floor = match direct {
@@ -418,9 +514,18 @@ pub(super) fn prepare_with_progress(
                     && s.record.mode == record.mode
                     && s.record.target.is_none()
                     && record.target.is_none()
-                    && fs::symlink_metadata(directory.join(&path)).is_ok_and(|m| {
-                        m.is_file() && m.len() == s.staged_bytes && mtime(&m) == s.staged_mtime_ns
-                    })
+                    // In staging, or already moved to its destination path by
+                    // an interrupted apply (a rename keeps size and mtime).
+                    && [Some(directory.join(&path)), destination.map(|d| d.join(&path))]
+                        .into_iter()
+                        .flatten()
+                        .any(|copy| {
+                            fs::symlink_metadata(copy).is_ok_and(|m| {
+                                m.is_file()
+                                    && m.len() == s.staged_bytes
+                                    && mtime(&m) == s.staged_mtime_ns
+                            })
+                        })
             }) {
                 reused = (reused.0 + 1, reused.1 + record.size);
                 manifest.files.insert(path, staged.record.clone());
@@ -448,7 +553,7 @@ pub(super) fn prepare_with_progress(
                         "backup destination would cross its floor"
                     );
                 }
-                record.sha256 = stage(&source, &spool, !scope.plain, &metadata)?;
+                record.sha256 = stage(&source, &spool, !scope.plain, &metadata, direct.is_none())?;
                 record.sha256.is_some()
             };
             if !stable {
@@ -463,36 +568,46 @@ pub(super) fn prepare_with_progress(
                     let spooled = fs::metadata(&spool)?;
                     let parent = placed.parent().context("staged path has no parent")?;
                     // Each folder created here is synced into its own parent.
+                    // Each folder created here must reach its own parent.
                     let created: Vec<_> = parent
                         .ancestors()
                         .take_while(|dir| !dir.exists())
+                        .filter_map(Path::parent)
                         .map(Path::to_path_buf)
                         .collect();
                     fs::create_dir_all(parent)?;
-                    for dir in &created {
-                        File::open(dir.parent().context("staged folder has no parent")?)?
-                            .sync_all()?;
-                    }
-                    // The placed file is durable before its line is, and the
-                    // line names the copy's own mtime, so an index line never
-                    // vouches for an older copy of the path.
+                    // The batch makes the placed file durable before its line,
+                    // and the line names the copy's own mtime, so an index line
+                    // never vouches for an older copy of the path.
                     fs::rename(&spool, &placed)?;
-                    File::open(parent)?.sync_all()?;
-                    File::open(&directory)?.sync_all()?;
                     let mut line = serde_json::to_vec(&Staged {
                         record: record.clone(),
                         staged_bytes: spooled.len(),
                         staged_mtime_ns: mtime(&spooled),
                     })?;
                     line.push(b'\n');
-                    let index_file = index_file.as_mut().context("seed index not open")?;
-                    index_file.write_all(&line)?;
-                    index_file.sync_data()?;
+                    batch.add(
+                        placed.clone(),
+                        created
+                            .into_iter()
+                            .chain([parent.to_path_buf(), directory.clone()]),
+                        spooled.len(),
+                        &line,
+                    );
+                    if batch.due() {
+                        batch.flush(index_file.as_mut().context("seed index not open")?)?;
+                    }
                     #[cfg(test)]
                     {
                         placed_count += 1;
+                        // A stop after N durable files, or a crash that loses
+                        // the batch not yet flushed.
                         if FAIL_AFTER_PLACED.get() == Some(placed_count) {
+                            batch.flush(index_file.as_mut().context("seed index not open")?)?;
                             anyhow::bail!("injected stop after {placed_count} staged files");
+                        }
+                        if CRASH_AFTER_PLACED.get() == Some(placed_count) {
+                            anyhow::bail!("injected crash after {placed_count} staged files");
                         }
                     }
                 } else if record.target.is_none() {
@@ -518,6 +633,9 @@ pub(super) fn prepare_with_progress(
     }
     if let Some(writer) = writer {
         parts.push(writer.finish()?);
+    }
+    if let Some(index_file) = index_file.as_mut() {
+        batch.flush(index_file)?;
     }
     if resumed {
         let keep = changed

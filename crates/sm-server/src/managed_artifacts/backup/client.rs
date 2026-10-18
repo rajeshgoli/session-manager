@@ -336,6 +336,39 @@ impl Destination {
         if let Some(applied) = self.applied(id)? {
             return Ok(applied);
         }
+        if !consume {
+            return self.apply_journaled(id, manifest, staging, allow_deletes, max_fraction, None);
+        }
+        // A seed's journal is one transaction and its renames meet one durability
+        // barrier, instead of a commit and folder syncs per file (#2317). The
+        // journal commits on failure too, so the seed's recovery sees what moved.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut touched = BTreeSet::new();
+        let result = self.apply_journaled(
+            id,
+            manifest,
+            staging,
+            allow_deletes,
+            max_fraction,
+            Some(&mut touched),
+        );
+        let durable = File::open(&self.root)
+            .map_err(anyhow::Error::from)
+            .and_then(|root| super::outbox::barrier(&touched, &root));
+        self.conn.execute_batch("COMMIT")?;
+        durable?;
+        result
+    }
+    fn apply_journaled(
+        &mut self,
+        id: &str,
+        manifest: &TransferManifest,
+        staging: &Path,
+        allow_deletes: bool,
+        max_fraction: f64,
+        mut touched: Option<&mut BTreeSet<PathBuf>>,
+    ) -> Result<Applied> {
+        let consume = touched.is_some();
         ensure!(manifest.manifest_id == id, "manifest request mismatch");
         ensure!(
             max_fraction.is_finite() && (0.0..=1.0).contains(&max_fraction),
@@ -401,7 +434,7 @@ impl Destination {
                 Some(record),
                 staging,
                 manifest,
-                consume,
+                touched.as_deref_mut(),
             )?;
         }
         for path in deletes.difference(&held) {
@@ -412,7 +445,7 @@ impl Destination {
                 None,
                 staging,
                 manifest,
-                consume,
+                touched.as_deref_mut(),
             )?;
         }
         let result = Applied {
@@ -420,7 +453,8 @@ impl Destination {
             held_deletions: held.len() as u64,
             files: self.records()?.len() as u64,
         };
-        let tx = self.conn.transaction()?;
+        // A savepoint nests inside a seed's transaction and is a transaction otherwise.
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM pending_deletes", [])?;
         for path in held {
             tx.execute("INSERT INTO pending_deletes(path) VALUES(?1)", [path])?;
@@ -442,8 +476,9 @@ impl Destination {
         new: Option<&FileRecord>,
         staging: &Path,
         manifest: &TransferManifest,
-        consume: bool,
+        mut touched: Option<&mut BTreeSet<PathBuf>>,
     ) -> Result<()> {
+        let consume = touched.is_some();
         let current = safe_path(&self.root, path, true)?;
         let key = format!("holding:{id}");
         let run = if let Some(run) = self.meta(&key)? {
@@ -502,7 +537,16 @@ impl Destination {
             fs::remove_file(&current)?;
         }
         for parent in [current.parent(), holding.parent()].into_iter().flatten() {
-            File::open(parent)?.sync_all()?;
+            match touched.as_deref_mut() {
+                // Folders safe_path created must reach their own parents too.
+                Some(touched) => touched.extend(
+                    parent
+                        .ancestors()
+                        .take_while(|dir| dir.starts_with(&self.root))
+                        .map(Path::to_path_buf),
+                ),
+                None => File::open(parent)?.sync_all()?,
+            }
         }
         if let Some(record) = new {
             self.conn.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body",params![path,serde_json::to_string(record)?])?;
@@ -510,7 +554,7 @@ impl Destination {
             self.conn
                 .execute("DELETE FROM files WHERE path=?1", [path])?;
         }
-        if let Some(parent) = current.parent() {
+        if let Some(parent) = current.parent().filter(|_| !consume) {
             File::open(parent)?.sync_all()?;
         }
         Ok(())
