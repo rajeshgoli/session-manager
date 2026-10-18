@@ -2262,3 +2262,60 @@ fn staged_copy_other_than_the_indexed_one_is_restaged() {
     assert_eq!(reads, [f.dir.join("data/a")]);
     assert_eq!(fs::read(dest.root.join("plain/data/a")).unwrap(), b"alpha");
 }
+
+#[test]
+fn crashed_seed_reuses_flushed_batches_and_restages_the_rest() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::BATCH_FILES.set(Some(2));
+    outbox::CRASH_AFTER_PLACED.set(Some(3));
+    let (result, first_reads) = seed_reading(&f, &mut dest, false);
+    outbox::CRASH_AFTER_PLACED.set(None);
+    outbox::BATCH_FILES.set(None);
+    assert!(result.unwrap_err().to_string().contains("injected crash"));
+    assert_eq!(first_reads.len(), 3);
+    let staging = seed_staging(&dest).unwrap();
+    // Only the flushed batch is vouched for; the third file's line never landed.
+    assert_eq!(outbox::staged_index(&staging).unwrap().len(), 2);
+    let (result, second_reads) = seed_reading(&f, &mut dest, false);
+    result.unwrap();
+    assert!(second_reads.iter().all(|p| !first_reads[..2].contains(p)));
+    assert_eq!(second_reads.len(), 3);
+    let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        confirmed.files,
+        f.prepare("uninterrupted", None).manifest.files
+    );
+    assert_eq!(dest.records().unwrap(), confirmed.files);
+}
+
+#[test]
+fn files_an_interrupted_apply_moved_are_reused_in_place() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(5));
+    let (result, _) = seed_reading(&f, &mut dest, false);
+    outbox::FAIL_AFTER_PLACED.set(None);
+    assert!(result.is_err());
+    // As if apply had moved two staged files into place and then crashed.
+    let staging = seed_staging(&dest).unwrap();
+    let index = outbox::staged_index(&staging).unwrap();
+    let moved: Vec<_> = index.keys().take(2).cloned().collect();
+    for path in &moved {
+        let target = dest.root.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::rename(staging.join(path), &target).unwrap();
+    }
+    let (result, reads) = seed_reading(&f, &mut dest, false);
+    result.unwrap();
+    assert!(reads.is_empty(), "moved files were restaged: {reads:?}");
+    let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .unwrap();
+    for record in confirmed.files.values() {
+        super::client::verify(&dest.root.join(&record.path), record).unwrap();
+    }
+    assert_eq!(dest.records().unwrap(), confirmed.files);
+}
