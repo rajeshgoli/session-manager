@@ -657,22 +657,20 @@ pub(super) fn card(conn: &Connection, device: &str, at: i64) -> Result<Value> {
                     .is_some_and(|t| date(t).is_ok_and(|d| d == night))
             })
             .collect();
+        // Only finished nights: tonight before its run, or a run under way,
+        // has nothing to report yet.
         let (ok, error) = if runs.iter().any(|r| r["state"] == "acked") {
-            (json!(true), Value::Null)
+            (true, Value::Null)
         } else if runs
             .iter()
             .any(|r| matches!(r["state"].as_str(), Some("preparing" | "ready")))
+            || (runs.is_empty() && night == today)
         {
-            (Value::Null, json!("in progress"))
+            continue;
         } else if let Some(r) = runs.first() {
-            (
-                json!(false),
-                json!(r["error"].as_str().unwrap_or("not applied")),
-            )
-        } else if night == today {
-            (Value::Null, json!("not yet"))
+            (false, json!(r["error"].as_str().unwrap_or("not applied")))
         } else {
-            (json!(false), json!("no request"))
+            (false, json!("no request"))
         };
         nights.push(json!({"date":night.to_string(),"ok":ok,"error":error}));
     }
@@ -715,7 +713,19 @@ pub(super) fn card(conn: &Connection, device: &str, at: i64) -> Result<Value> {
     if disk.is_object() {
         disk["pruned_on"] = pruned_on;
     }
-    Ok(json!({"nights":nights,"last_night":last_night,"weekly_check":weekly_check,"disk":disk}))
+    // Which speeds are measured rather than the configured default.
+    let mut measured = serde_json::Map::new();
+    for kind in ["fetch", "apply", "probe"] {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM backup_rate_samples WHERE device=?1 AND kind=?2 AND (kind='probe' OR bytes>1000000000)",
+            params![device, kind],
+            |r| r.get(0),
+        )?;
+        measured.insert(kind.into(), json!(count > 0));
+    }
+    Ok(
+        json!({"nights":nights,"last_night":last_night,"weekly_check":weekly_check,"disk":disk,"measured":measured}),
+    )
 }
 
 pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
