@@ -36,6 +36,7 @@ impl Fixture {
             config.managed_artifacts.backup.static_paths.clone();
         config.managed_artifacts.backup.puller_devices =
             vec!["backup-mini".into(), "other-mini".into()];
+        config.managed_artifacts.backup.cli_dir = dir.join("cli").display().to_string();
         let state = AppState::new(config);
         super::super::tests::seed_cloudflare_access_jwks(&state);
         Self { dir, state }
@@ -401,28 +402,18 @@ async fn ready_parts_use_persisted_outbox_after_configuration_change() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
+/// A mutual-TLS listener in front of the router, standing in for the Access edge,
+/// and an agent holding the pretend mini's device certificate.
+struct Tls {
+    base: String,
+    agent: ureq::Agent,
+    handle: axum_server::Handle<SocketAddr>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+fn serve_tls(f: &Fixture) -> Tls {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    use crate::{
-        device_identity::{openssl, Identity},
-        managed_artifacts::backup::{
-            client::Destination,
-            pull::{self, HttpRemote, Remote},
-            seed, Part,
-        },
-    };
+    use crate::device_identity::{openssl, Identity};
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-    let mut f = Fixture::new();
-    fs::create_dir(f.dir.join("projects")).unwrap();
-    f.state
-        .config
-        .managed_artifacts
-        .backup
-        .static_paths
-        .push(f.dir.join("projects").display().to_string());
-    f.state.managed_artifacts =
-        Some(ManagedArtifacts::new(&f.state.config.managed_artifacts).unwrap());
     let ca_key = f.dir.join("ca.key");
     let ca_path = f.dir.join("ca.pem");
     let ca = openssl(
@@ -544,99 +535,128 @@ async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
     .handle(handle.clone())
     .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     let server = tokio::spawn(server);
+    let certs = |pem: &[u8]| {
+        ureq::tls::parse_pem(pem)
+            .filter_map(|item| match item.unwrap() {
+                ureq::tls::PemItem::Certificate(c) => Some(c),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let trusted = ureq::tls::RootCerts::new_with_certs(&certs(ca.as_bytes()));
+    let client = ureq::tls::ClientCert::new_with_certs(
+        &certs(
+            fs::read(identity_dir.join("certificate.pem"))
+                .unwrap()
+                .as_slice(),
+        ),
+        ureq::tls::PrivateKey::from_pem(&fs::read(identity_dir.join("private-key.pem")).unwrap())
+            .unwrap(),
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(trusted.clone())
+                .client_cert(Some(client))
+                .build(),
+        )
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let base = format!("https://127.0.0.1:{}", address.port());
+    let no_identity: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(ureq::tls::TlsConfig::builder().root_certs(trusted).build())
+        .build()
+        .into();
+    assert!(no_identity
+        .get(format!("{base}/backup/status"))
+        .call()
+        .is_err());
+    Tls {
+        base,
+        agent,
+        handle,
+        server,
+    }
+}
+use crate::managed_artifacts::backup::{
+    pull::{HttpRemote, Remote},
+    Part,
+};
+struct Mini {
+    remote: HttpRemote,
+    manager: ManagedArtifacts,
+    interrupt: bool,
+    lose_ack: bool,
+    offsets: Vec<u64>,
+}
+impl Remote for Mini {
+    fn json(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> anyhow::Result<(u16, Value)> {
+        let response = self.remote.json(method, path, body)?;
+        if method == "POST" && path == "/backup/requests" && response.0 == 202 {
+            let id = response.1["id"].as_str().unwrap();
+            life::prepare_request(&self.manager, id)?;
+            return self
+                .remote
+                .json("GET", &format!("/backup/requests/{id}"), None);
+        }
+        if path.ends_with("/ack") && self.lose_ack {
+            self.lose_ack = false;
+            anyhow::bail!("injected lost ack response");
+        }
+        Ok(response)
+    }
+    fn download(
+        &mut self,
+        id: &str,
+        part: &Part,
+        offset: u64,
+        output: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        self.offsets.push(offset);
+        if self.interrupt {
+            self.interrupt = false;
+            let mut bytes = Vec::new();
+            self.remote.download(id, part, offset, &mut bytes)?;
+            output.write_all(&bytes[..7])?;
+            anyhow::bail!("injected interrupted local write");
+        }
+        self.remote.download(id, part, offset, output)
+    }
+    fn probe(&mut self) -> anyhow::Result<Value> {
+        self.remote.probe()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
+    use crate::managed_artifacts::backup::{client::Destination, pull, seed};
+    let mut f = Fixture::new();
+    fs::create_dir(f.dir.join("projects")).unwrap();
+    f.state
+        .config
+        .managed_artifacts
+        .backup
+        .static_paths
+        .push(f.dir.join("projects").display().to_string());
+    f.state.managed_artifacts =
+        Some(ManagedArtifacts::new(&f.state.config.managed_artifacts).unwrap());
+    let Tls {
+        base,
+        agent,
+        handle,
+        server,
+    } = serve_tls(&f);
     let dir = f.dir.clone();
     let manager = f.state.managed_artifacts.as_ref().unwrap().clone();
     tokio::task::spawn_blocking(move || {
         moves::TEST_MOUNTED.set(true);
-        let certs = |pem: &[u8]| {
-            ureq::tls::parse_pem(pem)
-                .filter_map(|item| match item.unwrap() {
-                    ureq::tls::PemItem::Certificate(c) => Some(c),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        let trusted = ureq::tls::RootCerts::new_with_certs(&certs(ca.as_bytes()));
-        let client = ureq::tls::ClientCert::new_with_certs(
-            &certs(
-                fs::read(identity_dir.join("certificate.pem"))
-                    .unwrap()
-                    .as_slice(),
-            ),
-            ureq::tls::PrivateKey::from_pem(
-                &fs::read(identity_dir.join("private-key.pem")).unwrap(),
-            )
-            .unwrap(),
-        );
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .root_certs(trusted.clone())
-                    .client_cert(Some(client))
-                    .build(),
-            )
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build()
-            .into();
-        let base = format!("https://127.0.0.1:{}", address.port());
-        let no_identity: ureq::Agent = ureq::Agent::config_builder()
-            .tls_config(ureq::tls::TlsConfig::builder().root_certs(trusted).build())
-            .build()
-            .into();
-        assert!(no_identity
-            .get(format!("{base}/backup/status"))
-            .call()
-            .is_err());
-        struct Mini {
-            remote: HttpRemote,
-            manager: ManagedArtifacts,
-            interrupt: bool,
-            lose_ack: bool,
-            offsets: Vec<u64>,
-        }
-        impl Remote for Mini {
-            fn json(
-                &mut self,
-                method: &str,
-                path: &str,
-                body: Option<Value>,
-            ) -> anyhow::Result<(u16, Value)> {
-                let response = self.remote.json(method, path, body)?;
-                if method == "POST" && path == "/backup/requests" && response.0 == 202 {
-                    let id = response.1["id"].as_str().unwrap();
-                    life::prepare_request(&self.manager, id)?;
-                    return self
-                        .remote
-                        .json("GET", &format!("/backup/requests/{id}"), None);
-                }
-                if path.ends_with("/ack") && self.lose_ack {
-                    self.lose_ack = false;
-                    anyhow::bail!("injected lost ack response");
-                }
-                Ok(response)
-            }
-            fn download(
-                &mut self,
-                id: &str,
-                part: &Part,
-                offset: u64,
-                output: &mut dyn std::io::Write,
-            ) -> anyhow::Result<()> {
-                self.offsets.push(offset);
-                if self.interrupt {
-                    self.interrupt = false;
-                    let mut bytes = Vec::new();
-                    self.remote.download(id, part, offset, &mut bytes)?;
-                    output.write_all(&bytes[..7])?;
-                    anyhow::bail!("injected interrupted local write");
-                }
-                self.remote.download(id, part, offset, output)
-            }
-            fn probe(&mut self) -> anyhow::Result<Value> {
-                self.remote.probe()
-            }
-        }
         fs::write(dir.join("data/prices"), b"original").unwrap();
         fs::write(dir.join("data/deleted"), b"delete me").unwrap();
         fs::write(dir.join("projects/code"), b"code").unwrap();
@@ -680,4 +700,373 @@ async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
     .unwrap();
     handle.shutdown();
     server.await.unwrap().unwrap();
+}
+
+/// Publishes `bytes` as the mini's sm the way the deploy does, or a description
+/// whose hash does not match when `corrupt`.
+fn publish_cli(root: &std::path::Path, version: &str, bytes: &[u8], corrupt: bool) {
+    use sha2::Digest;
+    let dir = root.join("cli");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(bk::update::CLI_FILE), bytes).unwrap();
+    let mut sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    if corrupt {
+        sha256 = "0".repeat(64);
+    }
+    fs::write(
+        dir.join(bk::update::CLI_JSON),
+        json!({"version": version, "sha256": sha256, "bytes": bytes.len()}).to_string(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn published_sm_is_served_only_to_puller_devices_with_ranges() {
+    let f = Fixture::new();
+    let app = router(f.state.clone());
+    let get =
+        |path: &str, name: Option<&str>| f.req("GET", path, name, "sm-app.example.com", json!({}));
+    let response = app
+        .clone()
+        .oneshot(get("/backup/cli", Some("backup-mini")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    publish_cli(&f.dir, "sm 0.2.0 (new)", b"0123456789", false);
+    for (name, host, status) in [
+        (None, "sm-app.example.com", StatusCode::FORBIDDEN),
+        (Some("phone"), "sm-app.example.com", StatusCode::FORBIDDEN),
+        (Some("backup-mini"), "localhost", StatusCode::FORBIDDEN),
+        (Some("backup-mini"), "sm-app.example.com", StatusCode::OK),
+    ] {
+        for path in ["/backup/cli", "/backup/cli/binary"] {
+            let response = app
+                .clone()
+                .oneshot(f.req("GET", path, name, host, json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path} {name:?} {host}");
+        }
+    }
+    let response = app
+        .clone()
+        .oneshot(get("/backup/cli", Some("backup-mini")))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let info: bk::update::CliInfo = serde_json::from_slice(&body).unwrap();
+    assert_eq!((info.version.as_str(), info.bytes), ("sm 0.2.0 (new)", 10));
+    let mut req = get("/backup/cli/binary", Some("backup-mini"));
+    req.headers_mut()
+        .insert("range", "bytes=4-".parse().unwrap());
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-range"], "bytes 4-9/10");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"456789");
+    // A binary that does not match its description is being replaced.
+    fs::write(f.dir.join("cli").join(bk::update::CLI_FILE), b"short").unwrap();
+    let response = app
+        .oneshot(get("/backup/cli/binary", Some("backup-mini")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pretend_mini_updates_its_own_sm_then_pulls_and_reports_on_the_backup_card() {
+    use crate::managed_artifacts::backup::{
+        client::Destination,
+        pull, seed,
+        update::{self, CliSource, Gate, Outcome, UpdateReport},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new();
+    f.state.managed_artifacts =
+        Some(ManagedArtifacts::new(&f.state.config.managed_artifacts).unwrap());
+    let Tls {
+        base,
+        agent,
+        handle,
+        server,
+    } = serve_tls(&f);
+    let dir = f.dir.clone();
+    let manager = f.state.managed_artifacts.as_ref().unwrap().clone();
+    let old = b"#!/bin/sh\necho 'sm 0.1.0 (old)'\n".to_vec();
+    let new =
+        b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'sm 0.2.0 (new)'; fi\nexit 0\n".to_vec();
+    tokio::task::spawn_blocking(move || {
+        moves::TEST_MOUNTED.set(true);
+        let binary = dir.join("bin/sm");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, &old).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("data/prices"), b"original").unwrap();
+        let mut dest = Destination::open(&dir.join("remote")).unwrap();
+        seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+        let mut mini = Mini {
+            remote: HttpRemote {
+                agent,
+                base: base.clone(),
+            },
+            manager: manager.clone(),
+            interrupt: false,
+            lose_ack: false,
+            offsets: Vec::new(),
+        };
+        let gate = Gate {
+            api_url: base,
+            identity: dir.join("identity"),
+            timeout: std::time::Duration::from_secs(30),
+        };
+        let night = |mini: &mut Mini, dest: &mut Destination, own: &str| {
+            let outcome = update::update(&binary, own, dest, &mut mini.remote, &gate).unwrap();
+            // After an install the new binary runs the pull (exec with --no-update).
+            (outcome, pull::pull(dest, mini).unwrap())
+        };
+
+        // Nothing published: the pull runs and reports no update.
+        let (outcome, ack) = night(&mut mini, &mut dest, "sm 0.1.0 (old)");
+        assert_eq!(outcome, Outcome::Unchanged);
+        assert!(ack.applied && ack.update.is_none());
+
+        publish_cli(&dir, "sm 0.2.0 (new)", &new, true);
+        fs::write(dir.join("data/prices"), b"night two").unwrap();
+        let (outcome, ack) = night(&mut mini, &mut dest, "sm 0.1.0 (old)");
+        let Outcome::Failed(failed) = outcome else {
+            panic!("corrupt sm installed")
+        };
+        assert!(failed.error.as_deref().unwrap().contains("SHA-256"));
+        assert!(ack.applied);
+        assert_eq!(ack.update, Some(failed.clone()));
+        assert_eq!(fs::read(&binary).unwrap(), old);
+        let card = life::owner_summary(&manager).unwrap();
+        assert_eq!(card["update"]["ok"], false);
+        assert_eq!(card["update"]["to"], "sm 0.2.0 (new)");
+
+        publish_cli(&dir, "sm 0.2.0 (new)", &new, false);
+        let info = mini.remote.cli().unwrap().unwrap();
+        let mut tail = Vec::new();
+        mini.remote.cli_download(&info, 9, &mut tail).unwrap();
+        assert_eq!(tail, new[9..]);
+        fs::write(dir.join("data/prices"), b"night three").unwrap();
+        let (outcome, ack) = night(&mut mini, &mut dest, "sm 0.1.0 (old)");
+        let ok = UpdateReport {
+            from: "sm 0.1.0 (old)".into(),
+            to: "sm 0.2.0 (new)".into(),
+            ok: true,
+            error: None,
+        };
+        assert_eq!(outcome, Outcome::Installed(ok.clone()));
+        assert!(ack.applied);
+        assert_eq!(ack.update, Some(ok));
+        assert_eq!(fs::read(&binary).unwrap(), new);
+        assert_eq!(fs::read(update::sibling(&binary, ".prev")).unwrap(), old);
+        assert_eq!(
+            fs::read(dest.root.join("plain/data/prices")).unwrap(),
+            b"night three"
+        );
+        let card = life::owner_summary(&manager).unwrap();
+        assert_eq!(card["update"]["ok"], true);
+        assert!(card["update"]["at"].is_string());
+        let runs: Vec<Option<String>> = manager
+            .store
+            .open()
+            .unwrap()
+            .prepare("SELECT update_json FROM backup_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!(runs[0].is_none() && runs[1].is_some() && runs[2].is_some());
+
+        // The next night the new binary is current: no update, nothing reported.
+        let (outcome, ack) = night(&mut mini, &mut dest, "sm 0.2.0 (new)");
+        assert_eq!(outcome, Outcome::Unchanged);
+        assert!(ack.update.is_none());
+        moves::TEST_MOUNTED.set(false);
+    })
+    .await
+    .unwrap();
+    handle.shutdown();
+    server.await.unwrap().unwrap();
+}
+
+/// Asserts `actual` still carries every field the fixture shows, with a type an
+/// older client can parse. `null` accepts anything (an `Option` field); a `"*"`
+/// key stands for a map whose keys vary; arrays compare their first element.
+fn assert_shape(expected: &Value, actual: &Value, at: &str) {
+    match expected {
+        Value::Null => {}
+        Value::Bool(_) => assert!(
+            actual.is_boolean(),
+            "{at}: expected a boolean, got {actual}"
+        ),
+        Value::String(_) => assert!(actual.is_string(), "{at}: expected a string, got {actual}"),
+        Value::Number(n) if n.is_u64() => {
+            assert!(
+                actual.is_u64(),
+                "{at}: expected an unsigned integer, got {actual}"
+            )
+        }
+        Value::Number(_) => assert!(actual.is_number(), "{at}: expected a number, got {actual}"),
+        Value::Array(items) => {
+            let actual = actual
+                .as_array()
+                .unwrap_or_else(|| panic!("{at}: expected an array"));
+            if let Some(first) = items.first() {
+                let item = actual
+                    .first()
+                    .unwrap_or_else(|| panic!("{at}: expected items"));
+                assert_shape(first, item, &format!("{at}[0]"));
+            }
+        }
+        Value::Object(fields) => {
+            let actual = actual
+                .as_object()
+                .unwrap_or_else(|| panic!("{at}: expected an object, got {actual}"));
+            for (key, value) in fields {
+                if key == "*" {
+                    for (k, v) in actual {
+                        assert_shape(value, v, &format!("{at}.{k}"));
+                    }
+                } else {
+                    let field = actual
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{at}: field {key} is missing"));
+                    assert_shape(value, field, &format!("{at}.{key}"));
+                }
+            }
+        }
+    }
+}
+
+/// Section 5 of #2264: every sm that can be on the mini must keep working against
+/// this server. The fixtures are what the client sent and parsed when they were
+/// checked in; never edit one to make this test pass. A new client behaviour gets
+/// a new fixture.
+#[tokio::test]
+async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
+    use crate::managed_artifacts::backup::{
+        client::Destination, lifecycle::RequestStatus, seed, update::CliInfo,
+    };
+    let fixture = |name: &str| -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/backup_client")
+            .join(name);
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
+    };
+    let mut f = Fixture::new();
+    f.state.managed_artifacts =
+        Some(ManagedArtifacts::new(&f.state.config.managed_artifacts).unwrap());
+    let manager = f.state.managed_artifacts.clone().unwrap();
+    moves::TEST_MOUNTED.set(true);
+    fs::write(f.dir.join("data/prices"), b"original").unwrap();
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let mut confirmed = seed::seed(&manager, "backup-mini", &mut dest, None).unwrap();
+    publish_cli(&f.dir, "sm 0.2.0 (abcdef012345)", b"0123456789", false);
+    let app = router(f.state.clone());
+    let mut id = String::new();
+    let mut part_bytes = 0u64;
+    let replay = |name: &str, id: &str, part_bytes: u64, confirmed: &str| {
+        let exchange = fixture(name);
+        let path = exchange["path"].as_str().unwrap().replace("{id}", id);
+        let mut body = exchange.get("request").cloned().unwrap_or(json!({}));
+        if body["have"] == "$CONFIRMED" {
+            body["have"] = json!(confirmed);
+        }
+        let mut req = f.req(
+            exchange["method"].as_str().unwrap(),
+            &path,
+            Some("backup-mini"),
+            "sm-app.example.com",
+            body,
+        );
+        if let Some(bytes) = exchange["request_zero_bytes"].as_u64() {
+            let chunks = stream::iter(
+                (0..bytes / (1 << 20))
+                    .map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 1 << 20]))),
+            );
+            *req.body_mut() = Body::from_stream(chunks);
+        }
+        if let Some(headers) = exchange["request_headers"].as_object() {
+            for (k, v) in headers {
+                req.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.as_str().unwrap().parse().unwrap(),
+                );
+            }
+        }
+        let app = app.clone();
+        let name = name.to_owned();
+        let size = part_bytes.to_string();
+        let last = part_bytes.saturating_sub(1).to_string();
+        async move {
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status().as_u16() as u64,
+                exchange["status"].as_u64().unwrap(),
+                "{name}"
+            );
+            if let Some(headers) = exchange["response_headers"].as_object() {
+                for (k, v) in headers {
+                    let want = v
+                        .as_str()
+                        .unwrap()
+                        .replace("{size}", &size)
+                        .replace("{last}", &last);
+                    assert_eq!(response.headers()[k.as_str()], want.as_str(), "{name} {k}");
+                }
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let actual: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            if let Some(expected) = exchange.get("response") {
+                assert_shape(expected, &actual, &name);
+            }
+            actual
+        }
+    };
+    replay("01_status.json", &id, 0, &confirmed).await;
+    let cli = replay("02_cli.json", &id, 0, &confirmed).await;
+    serde_json::from_value::<CliInfo>(cli).unwrap();
+    replay("03_cli_binary_resume.json", &id, 0, &confirmed).await;
+    replay("04_request_mismatch.json", &id, 0, &confirmed).await;
+    for (ack, content) in [
+        ("08_ack_applied.json", "changed once"),
+        ("10_ack_with_check_and_update.json", "changed twice"),
+    ] {
+        fs::write(f.dir.join("data/prices"), content).unwrap();
+        let created = replay("05_request_create.json", &id, 0, &confirmed).await;
+        id = serde_json::from_value::<RequestStatus>(created).unwrap().id;
+        life::prepare_request(&manager, &id).unwrap();
+        let ready = replay("06_request_ready.json", &id, 0, &confirmed).await;
+        let ready: RequestStatus = serde_json::from_value(ready).unwrap();
+        part_bytes = ready.parts[0].bytes;
+        replay("07_part_resume.json", &id, part_bytes, &confirmed).await;
+        replay(ack, &id, part_bytes, &confirmed).await;
+        let acked = replay("09_request_acked.json", &id, part_bytes, &confirmed).await;
+        serde_json::from_value::<RequestStatus>(acked).unwrap();
+        confirmed = id.clone();
+    }
+    replay("11_probe.json", &id, part_bytes, &confirmed).await;
+    replay("12_renew_parsed.json", &id, part_bytes, &confirmed).await;
+    // Every fixture file is replayed above.
+    let count = fs::read_dir(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/backup_client"),
+    )
+    .unwrap()
+    .count();
+    assert_eq!(count, 12);
+    let card = life::owner_summary(&manager).unwrap();
+    assert_eq!(card["update"]["to"], "sm 0.2.0 (abcdef012345)");
+    moves::TEST_MOUNTED.set(false);
+    drop(dest);
 }

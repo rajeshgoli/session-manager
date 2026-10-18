@@ -49,6 +49,14 @@ fun backupSummary(backup: JsonObject?): String = when {
     else -> "No confirmed backup yet"
 }
 
+/** The remote disk's latest self-update of its sm (#2264), or null. */
+fun backupUpdate(backup: JsonObject?): String? {
+    val update = backup?.get("update") as? JsonObject ?: return null
+    val on = update.text("at").take(10).let { if (it.isEmpty()) "" else " on $it" }
+    return if (update.flag("ok")) "Remote disk: updated to ${update.text("to")}$on"
+    else "Remote disk: update to ${update.text("to")} failed$on: ${update.text("error").ifEmpty { "unknown error" }}"
+}
+
 fun artifactReport(a: JsonObject): String? = (a["report"] as? JsonObject)?.text("detail_json")?.let { text ->
     runCatching { Json.parseToJsonElement(text).jsonObject.text("note").ifBlank { text } }.getOrDefault(text)
 }

@@ -47,4 +47,13 @@ class ArtifactsModelsTest {
         assertTrue(largestArtifacts(items).isEmpty())
         assertEquals(1,artifactInventory(items,"vanished").size)
     }
+    @Test fun backupCardReportsTheRemoteDisksSelfUpdate() {
+        fun backup(update: String) = Json.parseToJsonElement("""{"enabled":true,"update":$update}""").jsonObject
+        assertNull(backupUpdate(Json.parseToJsonElement("""{"enabled":true}""").jsonObject))
+        assertNull(backupUpdate(backup("null")))
+        assertEquals("Remote disk: updated to sm 0.2.0 (abc) on 2026-10-18",
+            backupUpdate(backup("""{"to":"sm 0.2.0 (abc)","ok":true,"at":"2026-10-18T09:31:00Z"}""")))
+        assertEquals("Remote disk: update to sm 0.2.0 (abc) failed on 2026-10-18: downloaded sm failed SHA-256 check",
+            backupUpdate(backup("""{"to":"sm 0.2.0 (abc)","ok":false,"error":"downloaded sm failed SHA-256 check","at":"2026-10-18T09:31:00Z"}""")))
+    }
 }

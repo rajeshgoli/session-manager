@@ -1,0 +1,7 @@
+{
+  "client": "sm backup pull, update step 1: parsed as CliInfo; 404 means nothing published",
+  "method": "GET",
+  "path": "/backup/cli",
+  "status": 200,
+  "response": {"version": "sm 0.2.0 (abcdef012345)", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "bytes": 10}
+}

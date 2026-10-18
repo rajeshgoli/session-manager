@@ -4,7 +4,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const assets = new URL('../crates/sm-server/src/web/', import.meta.url);
 const fixture = {
-  can_act:true, keep_live_days:30, needs_you_count:1, mode:'report_only', epics:[], recent:[], backup:{runs:[]},
+  can_act:true, keep_live_days:30, needs_you_count:1, mode:'report_only', epics:[], recent:[], backup:{enabled:true,runs:[],update:{from:'sm 0.1.0 (aaaaaaaaaaaa)',to:'sm 0.2.0 (bbbbbbbbbbbb)',ok:false,error:'downloaded sm failed SHA-256 check',at:'2026-10-18T09:31:00Z'}},
   filesystems:[{path:'/artifacts',bytes:1e12,free:4e11,floor:5e10,enough:2e11,outstanding:1e10,mounted:true}],
   artifacts:[{name:'research-data',root:'/artifacts',state:'live',location:'root',note:'Retained market data',description_html:'<h3>Retention</h3><p><strong>Keep</strong> <a href="https://example.com/source">source</a> and https://example.com/report.</p><table><thead><tr><th>File</th><th>Use</th></tr></thead><tbody><tr><td>data</td><td>training</td></tr></tbody></table>',report:{detail_json:'{"note":"Retain data"}'},report_html:'<ul><li>Retain <code>data</code></li></ul>',disk_bytes:1e10,hot:true,needs_owner:true,needs_you:{reasons:['unrecorded']},consumers:[],jobs:[],events:[],rebuildable:false,backup_due:true,created_at:'2026-10-15',dependents:[{name:'simulation'}]},
     {name:'frozen-data',root:'/artifacts',state:'frozen',location:'cold',note:'Completed research',disk_bytes:1e10,frozen_bytes:1e9,hot:false,consumers:[],jobs:[],events:[],backup_due:true}]
@@ -36,6 +36,7 @@ test('artifact fixture renders on desktop and phone with owner confirmation and 
       assert.equal(await page.getByRole('table').count(),1);
       assert.equal(await page.locator('.artifact-markdown code').textContent(),'data');
       assert.equal(await page.getByText('Needs you',{exact:false}).count(),0);
+      assert.ok(await page.getByText('Remote disk: update to sm 0.2.0 (bbbbbbbbbbbb) failed on 2026-10-18: downloaded sm failed SHA-256 check',{exact:true}).isVisible());
       assert.ok(await page.getByRole('button',{name:'Keep 30 days',exact:true}).isVisible());
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
       await page.getByRole('button',{name:'Delete folder…',exact:true}).click();

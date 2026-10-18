@@ -25,6 +25,10 @@ pub struct Ack {
     pub held_deletions: u64,
     pub check: Option<Check>,
     pub error: Option<String>,
+    /// The mini's self-update tonight, if it tried one (#2264). Optional: older
+    /// clients never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<super::update::UpdateReport>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestStatus {
@@ -339,6 +343,14 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
         ack.fetched_bytes <= i64::MAX as u64 && ack.held_deletions <= i64::MAX as u64,
         "invalid backup count"
     );
+    if let Some(update) = &ack.update {
+        ensure!(
+            update.from.len() <= 200
+                && update.to.len() <= 200
+                && update.error.as_ref().is_none_or(|e| e.len() <= 4000),
+            "invalid backup update report"
+        );
+    }
     if ack.applied && ack.fetched_bytes > 0 {
         ensure!(
             ack.fetch_seconds > 0.0 && ack.apply_seconds > 0.0,
@@ -387,7 +399,8 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
             ack.error
         ],
     )?;
-    tx.execute("INSERT INTO backup_runs(queue_job_id,started_at,finished_at,state,include_count,include_bytes) VALUES(?1,?2,?3,?4,?5,?6)",params![r["queue_job_id"].as_str(),time::OffsetDateTime::from_unix_timestamp(r["created_at"].as_i64().context("request creation time")?)?.format(&time::format_description::well_known::Rfc3339)?,now(),if ack.applied {"acked"}else{"failed"},load_manifest(&tx,device,id)?.files.len() as i64,ack.fetched_bytes])?;
+    let update = ack.update.as_ref().map(serde_json::to_string).transpose()?;
+    tx.execute("INSERT INTO backup_runs(queue_job_id,started_at,finished_at,state,include_count,include_bytes,update_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![r["queue_job_id"].as_str(),time::OffsetDateTime::from_unix_timestamp(r["created_at"].as_i64().context("request creation time")?)?.format(&time::format_description::well_known::Rfc3339)?,now(),if ack.applied {"acked"}else{"failed"},load_manifest(&tx,device,id)?.files.len() as i64,ack.fetched_bytes,update])?;
     if ack.check.as_ref().is_some_and(|c| !c.ok) {
         alert(
             &tx,
@@ -554,7 +567,20 @@ pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
     .transpose()?
     .map(|at| at.format(&time::format_description::well_known::Rfc3339))
     .transpose()?;
+    // The latest self-update the mini reported, success or failure (#2264).
+    let update = artifact_store::query(
+        &conn,
+        "SELECT finished_at,update_json FROM backup_runs WHERE update_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        &[],
+    )?
+    .pop()
+    .map(|r| -> Result<Value> {
+        let mut update: Value = serde_json::from_str(r["update_json"].as_str().unwrap_or("{}"))?;
+        update["at"] = r["finished_at"].clone();
+        Ok(update)
+    })
+    .transpose()?;
     Ok(
-        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"]}),
+        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"update":update,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"]}),
     )
 }

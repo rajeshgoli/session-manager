@@ -7,6 +7,7 @@ pub mod pull;
 mod scope;
 pub mod seed;
 mod store;
+pub mod update;
 pub use outbox::{prepare, Prepared, TransferManifest};
 pub use scope::{collect_scope, Scope};
 pub use store::{confirm, confirmed, load_manifest, rates, record_rate, save_manifest, Rates};

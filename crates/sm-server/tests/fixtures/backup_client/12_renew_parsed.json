@@ -1,0 +1,7 @@
+{
+  "client": "sm backup pull near certificate expiry: the server must still parse this body. A success needs the Cloudflare Access sync, so the replay sees the refusal for an unenrolled key; the client reads certificate_chain_pem from a success",
+  "method": "POST",
+  "path": "/backup/renew",
+  "request": {"csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nMA==\n-----END CERTIFICATE REQUEST-----\n", "certificate_pem": "-----BEGIN CERTIFICATE-----\nMA==\n-----END CERTIFICATE-----\n"},
+  "status": 409
+}

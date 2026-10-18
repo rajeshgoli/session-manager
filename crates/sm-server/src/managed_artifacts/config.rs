@@ -224,6 +224,8 @@ pub struct ArtifactBackupConfig {
     pub plain_paths: Vec<String>,
     pub holding_days: std::collections::BTreeMap<String, u64>,
     pub backup_rate_default: String,
+    /// Where `scripts/restart-rust-server.sh` publishes the mini's `sm` (#2264).
+    pub cli_dir: String,
 }
 impl Default for ArtifactBackupConfig {
     fn default() -> Self {
@@ -243,6 +245,7 @@ impl Default for ArtifactBackupConfig {
                 ("~/.config".into(), 300),
             ]),
             backup_rate_default: "18.75MB".into(),
+            cli_dir: "~/.local/share/claude-sessions/backup-cli".into(),
         }
     }
 }

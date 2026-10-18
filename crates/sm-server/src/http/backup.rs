@@ -271,7 +271,16 @@ pub(super) async fn part(
         Ok((file, part.bytes))
     })
     .await??;
-    let (start, length, partial) = byte_range(range.as_deref(), bytes)?;
+    ranged(file, bytes, range.as_deref(), "application/zstd").await
+}
+/// Streams `file` (of `bytes` bytes), honouring a single `Range` header.
+async fn ranged(
+    file: fs::File,
+    bytes: u64,
+    range: Option<&str>,
+    content_type: &'static str,
+) -> Result<Response, ApiError> {
+    let (start, length, partial) = byte_range(range, bytes)?;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = tokio::fs::File::from_std(file);
     file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -301,7 +310,7 @@ pub(super) async fn part(
         })
         .header("accept-ranges", "bytes")
         .header("content-length", length)
-        .header(CONTENT_TYPE, "application/zstd");
+        .header(CONTENT_TYPE, content_type);
     if partial {
         response = response.header(
             "content-range",
@@ -311,6 +320,48 @@ pub(super) async fn part(
     response
         .body(body)
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))
+}
+fn published_cli(state: &AppState) -> Result<(bk::update::CliInfo, PathBuf), ApiError> {
+    let dir = expand_home(&state.config.managed_artifacts.backup.cli_dir);
+    let info = bk::update::published(&dir)?.ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "no sm is published for the backup mini",
+        )
+    })?;
+    Ok((info, dir.join(bk::update::CLI_FILE)))
+}
+/// `{version, sha256, bytes}` of the `sm` the mini should run (#2264).
+pub(super) async fn cli(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    device(&request)?;
+    service(&state)?;
+    tokio::task::spawn_blocking(move || Ok(Json(published_cli(&state)?.0).into_response())).await?
+}
+pub(super) async fn cli_binary(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    device(&request)?;
+    service(&state)?;
+    let range = header_text(request.headers(), "range");
+    let (file, bytes) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let (info, path) = published_cli(&state)?;
+        let file = fs::File::open(path)?;
+        // The deploy renames the binary, then its description; between the two a
+        // reader could pair them wrongly. The mini's SHA-256 check is the backstop.
+        if file.metadata()?.len() != info.bytes {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the published sm is being replaced; retry",
+            ));
+        }
+        Ok((file, info.bytes))
+    })
+    .await??;
+    ranged(file, bytes, range.as_deref(), "application/octet-stream").await
 }
 pub(super) async fn probe(
     State(state): State<Arc<AppState>>,

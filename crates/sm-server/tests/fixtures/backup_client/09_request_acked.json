@@ -1,0 +1,19 @@
+{
+  "client": "sm backup pull after a lost ack response: state acked completes locally",
+  "method": "GET",
+  "path": "/backup/requests/{id}",
+  "status": 200,
+  "response": {
+    "id": "backup-00000000000000000000000000000000",
+    "state": "acked",
+    "retry_after_seconds": null,
+    "estimate_bytes": 8,
+    "manifest_id": "backup-00000000000000000000000000000000",
+    "parts": [],
+    "manifest": null,
+    "deletions": [],
+    "allow_deletes": false,
+    "max_delete_fraction": 0.1,
+    "error": null
+  }
+}

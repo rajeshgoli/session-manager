@@ -1,7 +1,7 @@
 import { useState } from 'preact/hooks';
 import { html, api, usePoll, config, ConfirmButton, bus, newAgent, LinkedText, linkifyHtml } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
-import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupLabel } from './artifacts-model.js';
+import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupUpdate, backupLabel } from './artifacts-model.js';
 
 function Row({ row: a, open, select }) {
   return html`<button class="artifact-row" onClick=${() => select(a)} aria-expanded=${open}>
@@ -81,6 +81,7 @@ export function ArtifactsPage() {
             ${f.free < f.floor ? html`<small class="artifact-warning">Space is running low</small>` : null}` : null}
         </div>`)}</section>
         <p class=${data.backup?.enabled ? 'artifact-muted' : 'artifact-warning'}>${backupSummary(data.backup)}</p>
+        ${backupUpdate(data.backup) ? html`<p class=${data.backup.update.ok ? 'artifact-muted' : 'artifact-warning'}>${backupUpdate(data.backup)}</p>` : null}
         ${decisions.length ? html`<section><h2 class="artifact-heading">Cleanup to review</h2>${renderRows(decisions.slice(0,5))}${decisions.length > 5 ? html`<button class="btn sm" onClick=${()=>setBrowse(true)}>Browse all ${decisions.length} proposals</button>` : null}</section>` : null}
         <h2 class="artifact-heading">Taking up space</h2><p class="artifact-muted">Largest folders over 1 GB</p>
       `}

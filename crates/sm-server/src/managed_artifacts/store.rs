@@ -27,6 +27,12 @@ impl ArtifactStore {
                 [],
             )?;
         }
+        if !query(&conn, "PRAGMA table_info(backup_runs)", &[])?
+            .iter()
+            .any(|c| c["name"] == "update_json")
+        {
+            conn.execute("ALTER TABLE backup_runs ADD COLUMN update_json TEXT", [])?;
+        }
         Ok(conn)
     }
     pub fn list(&self, root: &str) -> Result<Vec<Value>> {

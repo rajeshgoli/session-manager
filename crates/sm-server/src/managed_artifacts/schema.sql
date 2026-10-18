@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS artifact_events (id INTEGER PRIMARY KEY AUTOINCREMENT
   actor TEXT, detail_json TEXT);
 CREATE TABLE IF NOT EXISTS backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, queue_job_id TEXT,
   started_at TEXT, finished_at TEXT, state TEXT, include_count INTEGER, include_bytes INTEGER,
-  log_path TEXT);
+  log_path TEXT,
+  update_json TEXT);              -- the mini's self-update report from the ack (#2264)
 CREATE TABLE IF NOT EXISTS backup_static (path TEXT PRIMARY KEY, content_stamp TEXT, backup_stamp TEXT, backed_up_at TEXT);
 
 CREATE TABLE IF NOT EXISTS artifact_disk_holds (

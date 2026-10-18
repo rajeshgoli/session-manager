@@ -1,0 +1,8 @@
+{
+  "client": "sm backup pull before #2264: an ack without update; only the 2xx status is read",
+  "method": "POST",
+  "path": "/backup/requests/{id}/ack",
+  "request": {"applied": true, "fetched_bytes": 120, "fetch_seconds": 0.5, "apply_seconds": 0.25, "held_deletions": 0, "check": null, "error": null},
+  "status": 200,
+  "response": {"ok": true}
+}

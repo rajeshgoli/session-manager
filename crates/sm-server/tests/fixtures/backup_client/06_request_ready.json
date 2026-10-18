@@ -1,0 +1,25 @@
+{
+  "client": "sm backup pull: parsed as RequestStatus, then parts and manifest drive the download and apply",
+  "method": "GET",
+  "path": "/backup/requests/{id}",
+  "status": 200,
+  "response": {
+    "id": "backup-00000000000000000000000000000000",
+    "state": "ready",
+    "retry_after_seconds": null,
+    "estimate_bytes": 8,
+    "manifest_id": "backup-00000000000000000000000000000000",
+    "parts": [{"n": 0, "file": "part-0000.tar.zst", "bytes": 120, "sha256": "00"}],
+    "manifest": {
+      "manifest_id": "backup-00000000000000000000000000000000",
+      "base": "backup-11111111111111111111111111111111",
+      "changed": [{"path": "plain/data/prices", "size": 8, "mtime_ns": 1760000000000000000, "mode": 33188, "sha256": "00", "target": null}],
+      "deleted": [],
+      "holding_days": {"*": 30}
+    },
+    "deletions": [],
+    "allow_deletes": false,
+    "max_delete_fraction": 0.1,
+    "error": null
+  }
+}

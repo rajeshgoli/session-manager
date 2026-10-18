@@ -449,6 +449,8 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/backup/requests/{id}/ack", "backup.ack", Some("backup_request")),
     ("POST", "/backup/probe", "backup.probe", None),
     ("POST", "/backup/renew", "backup.renew", None),
+    ("GET", "/backup/cli", "backup.cli", None),
+    ("GET", "/backup/cli/binary", "backup.cli_binary", None),
     ("POST", "/backup/allow-deletes", "backup.allow_deletes", None),
     ("POST", "/artifacts/{name}/owner-action", "artifact.owner_action", Some("artifact")),
     ("POST", "/autopm/ask", "autopm.ask", None),

@@ -74,6 +74,11 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
                     val backup = data["backup"] as? JsonObject
                     Text(backupSummary(backup), color = if (backup?.flag("enabled") == true) TextSecondary else Amber,
                         style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 2.dp, top = 8.dp))
+                    backupUpdate(backup)?.let { line ->
+                        val ok = (backup?.get("update") as? JsonObject)?.flag("ok") == true
+                        Text(line, color = if (ok) TextSecondary else Amber,
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 2.dp, top = 4.dp))
+                    }
                 }
                 if (decisions.isNotEmpty()) {
                     item { SectionHeader("CLEANUP TO REVIEW") }
