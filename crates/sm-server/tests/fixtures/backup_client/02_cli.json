@@ -1,7 +1,12 @@
 {
-  "client": "sm backup pull, update step 1: parsed as CliInfo; 404 means nothing published",
+  "client": "sm backup pull, once tonight's backup is ready: parsed as CliInfo; building=true means wait for the server's build",
   "method": "GET",
   "path": "/backup/cli",
   "status": 200,
-  "response": {"version": "sm 0.2.0 (abcdef012345)", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "bytes": 10}
+  "response": {
+    "version": "sm 0.2.0 (abcdef012345)",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "bytes": 10,
+    "building": false
+  }
 }

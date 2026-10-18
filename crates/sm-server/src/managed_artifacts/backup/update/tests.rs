@@ -31,6 +31,8 @@ impl Mini {
             api_url: "https://sm-app.example.com".into(),
             identity: self.dir.join("identity"),
             timeout: Duration::from_secs(10),
+            build_wait: Duration::from_secs(5),
+            poll: Duration::from_millis(10),
         }
     }
     fn update(&self, source: &mut Source) -> Outcome {
@@ -79,6 +81,9 @@ struct Source {
     bytes: Vec<u8>,
     interrupt: bool,
     offsets: Vec<u64>,
+    /// Answers "building" this many more times before publishing.
+    building: usize,
+    asked: usize,
 }
 impl Source {
     fn new(version: &str, bytes: Vec<u8>) -> Self {
@@ -91,12 +96,25 @@ impl Source {
             bytes,
             interrupt: false,
             offsets: vec![],
+            building: 0,
+            asked: 0,
         }
     }
 }
 impl CliSource for Source {
-    fn cli(&mut self) -> Result<Option<CliInfo>> {
-        Ok(self.info.clone())
+    fn cli(&mut self) -> Result<Advert> {
+        self.asked += 1;
+        if self.building > 0 {
+            self.building -= 1;
+            return Ok(Advert {
+                published: None,
+                building: true,
+            });
+        }
+        Ok(Advert {
+            published: self.info.clone(),
+            building: false,
+        })
     }
     fn cli_download(&mut self, _: &CliInfo, offset: u64, output: &mut dyn Write) -> Result<()> {
         self.offsets.push(offset);
@@ -286,4 +304,27 @@ fn published_reads_the_installed_description() {
         })
     );
     assert!(CLI_VERSION.starts_with("sm ") && CLI_VERSION.ends_with(')'));
+}
+
+#[test]
+fn waits_for_a_build_the_server_has_under_way_but_not_past_the_limit() {
+    let b = Mini::new();
+    let args = b.dir.join("args");
+    let mut source = Source::new("sm 0.2.0 (new)", candidate("sm 0.2.0 (new)", 0, &args));
+    source.building = 3;
+    assert!(matches!(b.update(&mut source), Outcome::Installed(_)));
+    assert_eq!(source.asked, 4);
+
+    let b = Mini::new();
+    let mut source = Source::new("sm 0.2.0 (new)", candidate("sm 0.2.0 (new)", 0, &args));
+    source.building = usize::MAX;
+    let gate = Gate {
+        build_wait: Duration::from_millis(100),
+        ..b.gate()
+    };
+    let started = Instant::now();
+    let outcome = update(&b.binary, "sm 0.1.0 (old)", &b.dest, &mut source, &gate).unwrap();
+    assert_eq!(outcome, Outcome::Unchanged);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    b.assert_old_runs();
 }
