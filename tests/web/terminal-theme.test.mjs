@@ -2,7 +2,7 @@
 // #2304: the web terminal follows Settings › Appearance; light mirrors the 256-colour palette.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { DARK, isLight, lightTheme, mirror, paletteRgb, terminalTheme } from '../../crates/sm-server/src/web/terminal-theme.js';
+import { DARK, contrastFloor, isLight, lightTheme, mirror, paletteRgb, terminalTheme } from '../../crates/sm-server/src/web/terminal-theme.js';
 
 const doc = (theme) => ({ documentElement: { dataset: theme ? { theme } : {} } });
 const media = (dark) => () => ({ matches: dark });
@@ -21,6 +21,10 @@ test('theme choice follows the setting, and the OS on System', () => {
   assert.equal(isLight(doc(), media(false)), true);
   assert.equal(terminalTheme(false), DARK);
   assert.equal(terminalTheme(true).background, '#FCFCFA');
+  // Default text on ANSI black (SGR 40) shares its colour in light, so light needs a contrast floor.
+  assert.equal(terminalTheme(true).black, terminalTheme(true).foreground);
+  assert.ok(contrastFloor(true) >= 4.5);
+  assert.equal(contrastFloor(false), 1);
 });
 
 test('palette indexes match xterm', () => {

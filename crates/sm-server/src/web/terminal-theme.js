@@ -74,3 +74,7 @@ export function isLight(doc = document, media = window.matchMedia) {
 }
 
 export const terminalTheme = (light) => (light ? lightTheme() : DARK);
+
+/** Light keeps ANSI black dark for text, so text on a black background (SGR 40) would vanish;
+ *  xterm then lifts any pair below this contrast. Dark keeps the colours exactly as drawn. */
+export const contrastFloor = (light) => (light ? 4.5 : 1);

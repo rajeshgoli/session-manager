@@ -5,7 +5,7 @@ import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, S
 import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
-import { isLight, terminalTheme } from './terminal-theme.js';
+import { contrastFloor, isLight, terminalTheme } from './terminal-theme.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -172,7 +172,7 @@ export function TerminalPage({ id, open }) {
   useEffect(() => {
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
-      scrollback: 10000, theme: terminalTheme(isLight()),
+      scrollback: 10000, theme: terminalTheme(isLight()), minimumContrastRatio: contrastFloor(isLight()),
       // OSC 8 links, without xterm's confirm dialog.
       linkHandler: { activate: openLink, allowNonHttpProtocols: false },
     });
@@ -182,7 +182,11 @@ export function TerminalPage({ id, open }) {
     terminal.open(host.current);
     // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).
     const scheme = matchMedia('(prefers-color-scheme: dark)');
-    const retheme = () => { terminal.options.theme = terminalTheme(isLight()); };
+    const retheme = () => {
+      const light = isLight();
+      terminal.options.theme = terminalTheme(light);
+      terminal.options.minimumContrastRatio = contrastFloor(light);
+    };
     scheme.addEventListener('change', retheme);
     const themeWatch = new MutationObserver(retheme);
     themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
