@@ -76,6 +76,7 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       const turn = agent.locator('.history-turn');
       assert.equal(await turn.locator('strong').textContent(), 'Memo 1768 is merged');
       assert.ok(await turn.evaluate(el => el.scrollHeight > el.clientHeight), 'a long turn starts clamped');
+      assert.ok(await turn.evaluate(el => el.classList.contains('clipped')), 'a clamped turn fades out');
       await agent.getByRole('button', {name:'Show more'}).click();
       assert.ok(await turn.evaluate(el => el.scrollHeight <= el.clientHeight + 1), 'Show more reveals the whole turn');
       assert.ok(await turn.getByText('Final line.').isVisible());

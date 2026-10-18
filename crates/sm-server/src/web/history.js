@@ -24,11 +24,17 @@ function LastTurn({ html: turnHtml }) {
   const [clipped, setClipped] = useState(false);
   useLayoutEffect(() => {
     const el = body.current;
-    if (el && !open) setClipped(el.scrollHeight > el.clientHeight + 1);
+    if (!el || open) return;
+    const measure = () => setClipped(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    // Images loading and width changes (rotation, resize) move the overflow.
+    const observer = new ResizeObserver(measure);
+    for (const node of [el, ...el.children]) observer.observe(node);
+    return () => observer.disconnect();
   }, [turnHtml, open]);
   return html`<div class="history-last-turn-block">
     <div class="lbl">Last turn</div>
-    <div ref=${body} class=${`md history-turn${open ? ' open' : ''}`} dangerouslySetInnerHTML=${{ __html: linkifyHtml(safeThreadHtml(turnHtml)) }} />
+    <div ref=${body} class=${`md history-turn${open ? ' open' : clipped ? ' clipped' : ''}`} dangerouslySetInnerHTML=${{ __html: linkifyHtml(safeThreadHtml(turnHtml)) }} />
     ${clipped || open ? html`<button class="text-button history-more" onClick=${() => setOpen(!open)}>${open ? 'Show less' : 'Show more'}</button>` : null}
   </div>`;
 }
