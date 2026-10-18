@@ -1581,3 +1581,54 @@ fn loose_root_file_is_a_one_file_scope_and_round_trips() {
     fs::write(f.dir.join("projects").join(FILE_ENTRY), b"x").unwrap();
     assert!(prepare(&f.manager, &f.scopes(), None, "second").is_err());
 }
+
+#[test]
+fn file_removed_after_inventory_waits_a_night_then_is_deleted() {
+    let f = Fixture::new();
+    fs::write(f.dir.join("projects/a"), b"a").unwrap();
+    fs::write(f.dir.join("projects/b"), b"b").unwrap();
+    let first = f.prepare("first", None);
+    fs::write(f.dir.join("projects/a"), b"a, edited").unwrap();
+    let b = f.dir.join("projects/b");
+    outbox::AFTER_READ
+        .with(|hook| *hook.borrow_mut() = Some(Box::new(move |_| fs::remove_file(&b).unwrap())));
+    let second = f.prepare("second", Some(&first.manifest));
+    assert_eq!(second.deferred, vec!["packed/projects/b.zst"]);
+    assert_eq!(
+        second.manifest.files.get("packed/projects/b.zst"),
+        first.manifest.files.get("packed/projects/b.zst")
+    );
+    assert!(second.transfer.deleted.is_empty());
+    let third = f.prepare("third", Some(&second.manifest));
+    assert_eq!(third.transfer.deleted, vec!["packed/projects/b.zst"]);
+}
+
+#[test]
+fn seed_leaves_files_changed_while_packing_for_the_first_request() {
+    use super::{client::Destination, seed};
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    fs::write(f.dir.join("data/stable"), b"stable").unwrap();
+    outbox::AFTER_READ.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|p| {
+            fs::write(p, b"written during the seed").unwrap()
+        }))
+    });
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    let confirmed = confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+        .unwrap()
+        .unwrap();
+    assert!(!confirmed.files.contains_key("plain/data/prices"));
+    assert!(confirmed.files.contains_key("plain/data/stable"));
+    let next = f.prepare("next", Some(&confirmed));
+    assert_eq!(
+        next.transfer
+            .changed
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>(),
+        ["plain/data/prices"]
+    );
+}

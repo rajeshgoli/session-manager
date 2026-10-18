@@ -162,7 +162,7 @@ pub(super) fn seed_inner(
         "seed-{}",
         time::OffsetDateTime::now_utc().unix_timestamp_nanos()
     );
-    let coverage: Vec<_> = scopes
+    let mut coverage: Vec<_> = scopes
         .iter()
         .map(|s| Ok(json!({"source":s.source,"prefix":s.prefix(),"stamp":s.measure()?.stamp()})))
         .collect::<Result<_>>()?;
@@ -221,10 +221,16 @@ pub(super) fn seed_inner(
     }
     let mut prepared = prepare(manager, &scopes, adopt.map(|_| &adopted), &id)?;
     let _outbox = SeedOutbox(prepared.directory.clone());
-    ensure!(
-        prepared.deferred.is_empty(),
-        "seed source changed during preparation; retry"
-    );
+    // Files that changed or vanished while being read are left out of the
+    // confirmed manifest, so the first remote request ships them as changed.
+    coverage.retain(|scope| {
+        !prepared.deferred.iter().any(|path| {
+            path.starts_with(&format!(
+                "{}/",
+                scope["prefix"].as_str().unwrap_or_default()
+            ))
+        })
+    });
     // Hold the source-store write transaction from the active-request check
     // through confirmation so no pull can start against the previous head.
     let mut conn = manager.store.open()?;

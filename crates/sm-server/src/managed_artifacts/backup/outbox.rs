@@ -115,10 +115,16 @@ fn stage(
     packed: bool,
     before: &fs::Metadata,
 ) -> Result<Option<String>> {
-    let mut input = OpenOptions::new()
+    let mut input = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(source)?;
+        .open(source)
+    {
+        Ok(input) => input,
+        // Removed after its metadata was read: treated as changed.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     if !same(before, &input.metadata()?) {
         return Ok(None);
     }
@@ -270,12 +276,26 @@ pub(super) fn prepare_with_progress(
                 !manifest.files.contains_key(&path),
                 "backup layout collision: {path}"
             );
-            let metadata = fs::symlink_metadata(&source)?;
-            ensure!(
-                metadata.is_file() == (entry.kind == "file")
-                    && metadata.file_type().is_symlink() == (entry.kind == "symlink"),
-                "source kind changed during backup"
-            );
+            let metadata = match fs::symlink_metadata(&source) {
+                Ok(m)
+                    if m.is_file() == (entry.kind == "file")
+                        && m.file_type().is_symlink() == (entry.kind == "symlink") =>
+                {
+                    Some(m)
+                }
+                Ok(_) => None,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            // Removed or replaced since the inventory: like a change, it waits for
+            // the next preparation, which sees its new state.
+            let Some(metadata) = metadata else {
+                if let Some(old) = base.and_then(|m| m.files.get(&path)) {
+                    manifest.files.insert(path.clone(), old.clone());
+                }
+                deferred.push(path);
+                continue;
+            };
             let mut record = FileRecord {
                 path: path.clone(),
                 size: entry.size,
@@ -296,7 +316,11 @@ pub(super) fn prepare_with_progress(
             }
             let spool = directory.join(".payload");
             let stable = if record.target.is_some() {
-                fs::read_link(&source)?.to_str() == record.target.as_deref()
+                fs::read_link(&source)
+                    .ok()
+                    .as_deref()
+                    .and_then(Path::to_str)
+                    == record.target.as_deref()
                     && mtime(&metadata) == record.mtime_ns
             } else if metadata.len() != entry.size || mtime(&metadata) != record.mtime_ns {
                 false
