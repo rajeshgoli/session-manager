@@ -607,7 +607,7 @@ export function AgentPanel({ id, controls, beside }) {
   return html`
     <div class="phd">
       <${Ring} percent=${agent.context_percent} suffix="%" />
-      <span class="t" title=${`${agent.name} · ${homeRelative(agent.working_dir || agent.repo)}`}>${agent.name}</span>
+      <span class="t" title=${agent.name}>${agent.name}</span>
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
@@ -739,6 +739,7 @@ function AgentStatus({ agent, claims, now, onAnswered }) {
     ${reviews.map((review) => html`<div><span class="ball amber">${reviewWaitText(agent.waiting_on_review, review, now)}</span>
       <span class="sub">PR #${review.pr_number} · requested ${age(review.since, now)} ago</span></div>`)}
     ${agent.status_text ? html`<div class="quote">${agent.status_text}${agent.status_at ? html` <span class="sub">· ${clock(agent.status_at)}</span>` : null}</div>` : null}
+    <div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div>
   </div>`;
 }
 
