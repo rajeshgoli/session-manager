@@ -2223,3 +2223,21 @@ fn torn_index_line_is_cut_and_its_file_restaged() {
     result.unwrap();
     assert_eq!(reads.len(), 4);
 }
+
+#[test]
+fn staged_copy_other_than_the_indexed_one_is_restaged() {
+    let f = two_scope_seed_fixture();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    outbox::FAIL_AFTER_PLACED.set(Some(5));
+    assert!(seed_reading(&f, &mut dest, false).0.is_err());
+    outbox::FAIL_AFTER_PLACED.set(None);
+    // An older same-size copy where the indexed one should be, as a lost
+    // rename after a power cut would leave it.
+    let staged = seed_staging(&dest).unwrap().join("plain/data/a");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::write(&staged, b"stale").unwrap();
+    let (result, reads) = seed_reading(&f, &mut dest, false);
+    result.unwrap();
+    assert_eq!(reads, [f.dir.join("data/a")]);
+    assert_eq!(fs::read(dest.root.join("plain/data/a")).unwrap(), b"alpha");
+}

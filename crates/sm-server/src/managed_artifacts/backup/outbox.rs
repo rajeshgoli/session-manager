@@ -35,6 +35,9 @@ pub(super) struct Staged {
     pub record: FileRecord,
     /// Size of the staged copy, which for packed scopes is compressed.
     pub staged_bytes: u64,
+    /// The staged copy's own mtime. Renames keep it and every new copy gets a
+    /// new one, so a line matches only the copy it was written for.
+    pub staged_mtime_ns: i128,
 }
 /// Staged files by path, the last line for a path winning. A line torn by a
 /// crash is cut off so the next append starts on a line of its own.
@@ -410,8 +413,9 @@ pub(super) fn prepare_with_progress(
                     && s.record.mode == record.mode
                     && s.record.target.is_none()
                     && record.target.is_none()
-                    && fs::symlink_metadata(directory.join(&path))
-                        .is_ok_and(|m| m.is_file() && m.len() == s.staged_bytes)
+                    && fs::symlink_metadata(directory.join(&path)).is_ok_and(|m| {
+                        m.is_file() && m.len() == s.staged_bytes && mtime(&m) == s.staged_mtime_ns
+                    })
             }) {
                 reused = (reused.0 + 1, reused.1 + record.size);
                 manifest.files.insert(path, staged.record.clone());
@@ -451,22 +455,24 @@ pub(super) fn prepare_with_progress(
                 if record.target.is_none() && direct.is_some() {
                     let placed = directory.join(&record.path);
                     super::client::verify(&spool, &record)?;
-                    // Drop any older copy before indexing the new one, so no
-                    // index line ever describes bytes other than its file's.
-                    match fs::remove_file(&placed) {
-                        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                        _ => {}
-                    }
+                    let spooled = fs::metadata(&spool)?;
+                    let parent = placed.parent().context("staged path has no parent")?;
+                    fs::create_dir_all(parent)?;
+                    // The placed file is durable before its line is, and the
+                    // line names the copy's own mtime, so an index line never
+                    // vouches for an older copy of the path.
+                    fs::rename(&spool, &placed)?;
+                    File::open(parent)?.sync_all()?;
+                    File::open(&directory)?.sync_all()?;
                     let mut line = serde_json::to_vec(&Staged {
                         record: record.clone(),
-                        staged_bytes: fs::metadata(&spool)?.len(),
+                        staged_bytes: spooled.len(),
+                        staged_mtime_ns: mtime(&spooled),
                     })?;
                     line.push(b'\n');
                     let index_file = index_file.as_mut().context("seed index not open")?;
                     index_file.write_all(&line)?;
                     index_file.sync_data()?;
-                    fs::create_dir_all(placed.parent().context("staged path has no parent")?)?;
-                    fs::rename(&spool, &placed)?;
                     #[cfg(test)]
                     {
                         placed_count += 1;
