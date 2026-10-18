@@ -134,10 +134,16 @@ impl Destination {
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(".sm-backup.lock"))?;
         // The lock's descriptor lives with Destination, including all retries.
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "backup destination is already in use"
-        );
+        // A process forked elsewhere in this process inherits the descriptor until it
+        // execs, so a just-dropped lock can stay held briefly; wait out that window (#2289).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "backup destination is already in use"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let db = safe_path(&root, "state.db", false)?;
         let conn = Connection::open(db)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
