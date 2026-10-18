@@ -377,10 +377,40 @@ fn file_cli_build_failure(
     };
     let conn = manager.store.open()?;
     let key = format!("backup_cli_ticket:{commit}");
-    if crate::managed_artifacts::store::meta(&conn, &key)?.is_some() {
+    let config = &state.config.managed_artifacts.backup.cli_build;
+    let url = match crate::managed_artifacts::store::meta(&conn, &key)? {
+        Some(url) => url,
+        None => {
+            let url = file_cli_build_ticket(state, config, commit, &failure)?;
+            crate::managed_artifacts::store::set_meta(&conn, &key, &url)?;
+            url
+        }
+    };
+    // Placement is tracked apart from filing, so a failed placement is retried
+    // on the next pass without filing a second ticket.
+    let Some(goal) = config.ticket_goal else {
+        return Ok(());
+    };
+    let placed = format!("backup_cli_ticket_placed:{commit}");
+    if crate::managed_artifacts::store::meta(&conn, &placed)?.is_some() {
         return Ok(());
     }
-    let config = &state.config.managed_artifacts.backup.cli_build;
+    let number: i64 = url
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .context("backup mini build ticket URL has no number")?;
+    let repo = crate::work_claims::canonical_repo(&config.ticket_repo);
+    board::place_under(state, (repo.clone(), number), (repo, goal), "sm backup")
+        .with_context(|| format!("place {url} under #{goal}"))?;
+    crate::managed_artifacts::store::set_meta(&conn, &placed, "1")
+}
+fn file_cli_build_ticket(
+    state: &AppState,
+    config: &crate::managed_artifacts::config::CliBuildConfig,
+    commit: &str,
+    failure: &bk::cli_build::Failure,
+) -> anyhow::Result<String> {
     let mut tail = failure.log_tail.replace("~~~", "~ ~ ~");
     if tail.len() > 20_000 {
         let mut start = tail.len() - 20_000;
@@ -407,20 +437,11 @@ fn file_cli_build_failure(
         failure.job_id,
         failure.state,
     );
-    let (number, url) = state
+    let (_, url) = state
         .board_source
         .create_issue(&config.ticket_repo, &title, &body)
         .map_err(|error| anyhow::anyhow!("file the backup mini build ticket: {error}"))?;
-    crate::managed_artifacts::store::set_meta(&conn, &key, &url)?;
-    if let Some(goal) = config.ticket_goal {
-        let repo = crate::work_claims::canonical_repo(&config.ticket_repo);
-        if let Err(error) =
-            board::place_under(state, (repo.clone(), number), (repo, goal), "sm backup")
-        {
-            eprintln!("backup mini build ticket {url} was not placed under #{goal}: {error:#}");
-        }
-    }
-    Ok(())
+    Ok(url)
 }
 pub(super) async fn cli_binary(
     State(state): State<Arc<AppState>>,
@@ -561,7 +582,7 @@ impl AppState {
         life::missed_alerts(manager, OffsetDateTime::now_utc().unix_timestamp())?;
         if let Some(commit) = bk::cli_build::server_commit() {
             if let Err(error) = file_cli_build_failure(self, manager, commit) {
-                eprintln!("backup mini build failure was not filed: {error:#}");
+                eprintln!("backup mini build ticket: {error:#}");
             }
         }
         deliver_alerts(self, manager)

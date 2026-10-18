@@ -179,6 +179,12 @@ pub fn run_worker(commit: &str, dir: &Path, source: &str, version: &str) -> Resu
     let build = dir.join("build");
     let src = build.join("src");
     fs::create_dir_all(&build)?;
+    // One build at a time: two would share the clone, target and staging names.
+    let lock = fs::File::create(build.join(".lock"))?;
+    // SAFETY: flock on a descriptor this function owns until it returns.
+    if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("lock the backup mini build folder");
+    }
     if !src.join(".git").exists() {
         if src.exists() {
             fs::remove_dir_all(&src)?;

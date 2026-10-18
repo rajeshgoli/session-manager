@@ -1166,8 +1166,11 @@ fn a_failed_mini_build_files_one_ticket_under_the_configured_goal() {
             ],
         )
         .unwrap();
+    // GitHub is offline for the placement, so each pass fails to place it.
+    let mut placements = Vec::new();
     for _ in 0..3 {
-        file_cli_build_failure(&state, &manager, commit).unwrap();
+        assert!(file_cli_build_failure(&state, &manager, commit).is_err());
+        placements.push(tickets.resolves.load(Ordering::SeqCst));
     }
     let created = tickets.created.lock().unwrap().clone();
     assert_eq!(created.len(), 1, "one ticket per failed commit");
@@ -1179,6 +1182,6 @@ fn a_failed_mini_build_files_one_ticket_under_the_configured_goal() {
     );
     assert!(body.contains(commit) && body.contains("error[E0425]") && body.contains(&job.id));
     assert!(body.contains("keeps its current"));
-    // Placing it under the goal went to GitHub (offline here, so only logged).
-    assert!(tickets.resolves.load(Ordering::SeqCst) > 0);
+    // A failed placement is retried on every pass, without a second ticket.
+    assert!(placements[0] > 0 && placements[0] < placements[1] && placements[1] < placements[2]);
 }
