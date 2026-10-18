@@ -484,12 +484,19 @@
   S.changedThreads = [];
   S.threadsReview = null;
   function repliesSeenKey() {
-    return 'sm-doc-replies-seen:' + CONFIG.docId + ':' + sha7(S.threadsReview && S.threadsReview.commit_sha) + ':' + S.changedThreads.length;
+    // Every reply's id, so a later reply brings the banner back.
+    var ids = [];
+    S.changedThreads.forEach(function (t) { t.replies.forEach(function (r) { ids.push((r.url || '').replace(/^.*\D/, '')); }); });
+    return 'sm-doc-replies-seen:' + CONFIG.docId + ':' + sha7(S.threadsReview && S.threadsReview.commit_sha) + ':' + ids.join(',');
   }
+  // The innermost block holding the whole quote; a quote spanning blocks
+  // falls back to the block where its start is.
   function blockForQuote(quote) {
-    var probe = collapse(quote).slice(0, 40);
     var blocks = document.querySelectorAll(BLOCK);
-    for (var i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
+    var i;
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(quote) >= 0) return blocks[i];
+    var probe = quote.slice(0, 40);
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
     return null;
   }
   function threadParts(t) {
