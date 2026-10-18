@@ -60,8 +60,8 @@ export function ArtifactsPage() {
   const investigate = async a => {
     setBusy(true); setActionError(null);
     try {
-      const { brief, working_dir } = await api(`/artifacts/${encodeURIComponent(a.name)}/owner-action`,{method:'POST',body:{root:a.root,action:'brief'}});
-      newAgent({ workspace: working_dir, message: brief });
+      const b = await api(`/artifacts/${encodeURIComponent(a.name)}/owner-action`,{method:'POST',body:{root:a.root,action:'brief'}});
+      newAgent({ workspace: b.working_dir, message: b.brief, name: b.name, provider: b.provider, model: b.model, effort: b.effort });
     } catch (e) { setActionError(e.message); }
     finally { setBusy(false); }
   };

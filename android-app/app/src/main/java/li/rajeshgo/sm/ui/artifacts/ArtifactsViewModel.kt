@@ -28,7 +28,7 @@ fun JsonObject.rows(key: String): List<JsonObject> = (get(key) as? JsonArray)?.m
 fun artifactSize(a: JsonObject): Long = a.number(if (a.text("state") == "frozen") "frozen_bytes" else "disk_bytes")
 
 /** An investigation the owner is about to start from the New agent sheet (sm#2266). */
-data class InvestigationStart(val name: String, val workingDir: String, val brief: String)
+data class InvestigationStart(val request: li.rajeshgo.sm.data.model.CreateSessionRequest)
 
 data class ArtifactsState(
     val data: JsonObject? = null,
@@ -64,7 +64,14 @@ class ArtifactsViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             try {
                 val brief = repository.artifactBrief(settings.serverUrl.first(), settings.accessToken.first(), a.text("name"), a.text("root")).getOrThrow()
-                mutable.value = mutable.value.copy(investigation = InvestigationStart(a.text("name"), brief.text("working_dir"), brief.text("brief")), createError = null)
+                mutable.value = mutable.value.copy(investigation = InvestigationStart(li.rajeshgo.sm.data.model.CreateSessionRequest(
+                    provider = brief.text("provider").ifBlank { "claude" },
+                    workingDir = brief.text("working_dir"),
+                    model = brief.text("model").ifBlank { null },
+                    reasoningEffort = brief.text("effort").ifBlank { null },
+                    name = brief.text("name").ifBlank { null },
+                    initialMessage = brief.text("brief"),
+                )), createError = null)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 mutable.value = mutable.value.copy(error = e.message)

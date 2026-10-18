@@ -346,7 +346,12 @@ async fn managed_artifacts_brief_opens_the_launcher_and_any_agent_may_report() {
     assert!(brief["brief"]
         .as_str()
         .unwrap()
-        .starts_with("Investigate managed artifact sample in "));
+        .starts_with("The artifact folder sample in "));
+    assert!(!brief["brief"].as_str().unwrap().contains("Tier"));
+    assert_eq!(brief["name"], "artifact-sample");
+    assert_eq!(brief["provider"], "codex");
+    assert_eq!(brief["model"], "gpt-6-luna");
+    assert_eq!(brief["effort"], "high");
     assert_eq!(
         brief["working_dir"],
         f.state.config().managed_artifacts.roots[0].repo_checkout

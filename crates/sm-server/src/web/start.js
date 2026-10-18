@@ -59,7 +59,7 @@ const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~'
 
 /**
  * `prefill` may carry provider, model, effort and workspace (Clone), and a
- * first message (an artifact investigation brief).
+ * name and first message (an artifact investigation).
  */
 export function NewAgentPopover({ prefill = {}, onClose }) {
   const [settings, setSettings] = useState(null);
@@ -90,7 +90,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
           effort: prefill.provider ? prefill.effort || null : defaults.effort || null,
           workspace,
           otherWorkspace: '',
-          name: '',
+          name: prefill.name || '',
           message: prefill.message || '',
         });
       })
