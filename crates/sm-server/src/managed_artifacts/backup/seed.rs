@@ -350,7 +350,7 @@ pub(super) fn seed_inner(
         .cloned()
         .collect();
     prepared.transfer.base = previous.clone();
-    if let Err(error) = dest.apply(&id, &prepared.transfer, &staging, true, 1.0) {
+    if let Err(error) = dest.apply_seed(&id, &prepared.transfer, &staging) {
         dest.rollback(&id)
             .context("restore destination after failed seed application")?;
         return Err(error);
