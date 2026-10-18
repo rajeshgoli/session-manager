@@ -44,20 +44,31 @@ export async function ensureLocalLoaded(local) {
   await api('/client/model/load', { method: 'POST', body: { key, seats, context } });
   return identifier;
 }
-export function LocalChoice({ local, provider, onPick }) {
-  const loaded = local?.models?.[0];
-  const name = loaded || local?.record?.identifier;
+/** The local model sm can start on, loaded or not, else null. */
+export const localModelName = local => local?.models?.[0] || local?.record?.identifier || null;
+export const LOCAL_TYPE = '__local__';
+/** The local model as a preset card, local/<model> (sm#2307); null when sm knows no local model. */
+export function localPreset(local, onPick) {
+  const name = localModelName(local);
   if (!name) return null;
   const state = local.record?.state;
-  const note = loaded ? local.reason
-    : state === 'loading' ? 'Model loading…'
-    : state === 'draining' ? 'Model unloading…'
-    : 'Not loaded: Start loads it first, which takes a few minutes';
-  return html`<div class="line"><button type="button" class=${`btn ${provider === 'opencode' ? 'pri' : ''}`}
-    disabled=${localBlocked(local, 'opencode')} onClick=${() => onPick(name)}>${`Local (${name})`}</button>
-    ${note ? html`<span class="sub">${note}</span>` : null}</div>`;
+  const detail = local.models?.length ? local.reason || 'Local · loaded'
+    : state === 'loading' ? 'Local · loading…'
+    : state === 'draining' ? 'Local · unloading…'
+    : 'Local · not loaded; Start loads it (minutes)';
+  return { key: LOCAL_TYPE, title: `local/${name}`, detail, disabled: localBlocked(local, 'opencode'), onPick: () => onPick(name) };
+}
+/** Under Local, Model offers only the local model; local agents take no effort. */
+export function LocalModelField({ local, value, onChange }) {
+  const name = localModelName(local);
+  const names = [...new Set([value, name].filter(Boolean))];
+  return html`<div class="fld"><span class="l">Model</span>
+    <select class="inp" aria-label="Model" value=${value || name || ''} onChange=${e => onChange(e.target.value)}>
+      ${names.map(n => html`<option value=${n}>${n}</option>`)}</select></div>`;
 }
 const PROVIDERS = [{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }];
+/** Claude, Codex, and Local while sm knows a local model. */
+export const providerOptions = local => (localModelName(local) ? [...PROVIDERS, { value: 'opencode', label: 'Local' }] : PROVIDERS);
 const OTHER = '__other__';
 const MORE = '__more__';
 const TOP_WORKSPACES = ['fractal-algo-rust', 'session-manager', 'codex-fork', 'deskbar', 'finviz', 'backup-manager'];
@@ -143,6 +154,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
 
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
   const switchProvider = (provider) => {
+    if (provider === 'opencode') { setOther(true); set({ provider, model: localModelName(local), effort: null }); return; }
     const defaults = settings.new_agent[defaultsKey(provider)] || {};
     set({ provider, model: defaults.model || null, effort: defaults.effort || null });
   };
@@ -193,28 +205,28 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     if (!allFolders && form.workspace !== OTHER && form.workspace && !visibleChoices.includes(form.workspace)) {
       visibleChoices.splice(9, 1, form.workspace);
     }
-    const summary = [form.model || providerDefaultModel(form.provider), form.effort || 'default effort', homeRelative(folder) || 'no workspace'];
+    const summary = [form.model || providerDefaultModel(form.provider), ...(form.provider === 'opencode' ? [] : [form.effort || 'default effort']), homeRelative(folder) || 'no workspace'];
     const modelOptions = models.includes(form.model) || !form.model ? models : [form.model, ...models];
     const matched = matchType(agentTypes(settings), { ...form, reasoning_effort: form.effort });
-    const chosen = other || !matched ? OTHER_TYPE : matched;
+    const chosen = other ? OTHER_TYPE : form.provider === 'opencode' ? LOCAL_TYPE : matched || OTHER_TYPE;
     const pick = (type) => {
       setOther(!type);
       if (type) set({ provider: type.provider, model: type.model, effort: type.effort });
     };
     content = html`
-      <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
-      <${LocalChoice} local=${local} provider=${form.provider} onPick=${model => { setOther(true); set({ provider: 'opencode', model, effort: null }); }} />
+      <${TypePicker} settings=${settings} value=${chosen} onPick=${pick}
+        extra=${localPreset(local, model => { setOther(false); set({ provider: 'opencode', model, effort: null }); })} />
       ${chosen === OTHER_TYPE
         ? html`
-          <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${PROVIDERS} />
-          ${form.provider !== 'opencode' ? html`<div class="fld"><span class="l">Model</span>
+          <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${providerOptions(local)} />
+          ${form.provider === 'opencode' ? html`<${LocalModelField} local=${local} value=${form.model} onChange=${model => set({ model })} />` : html`<div class="fld"><span class="l">Model</span>
             <select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
               <option value="">Provider default</option>
               ${modelOptions.map((model) => html`<option value=${model}>${model}</option>`)}
             </select></div>
           <div class="fld"><span class="l">Effort</span>
             <${Seg} label="Effort" value=${form.effort || ''} onChange=${(value) => set({ effort: value || null })}
-              options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>` : null}`
+              options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>`}`
         : null}
       ${expanded
         ? html`

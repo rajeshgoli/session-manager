@@ -781,7 +781,8 @@ button.sw-sec { cursor: pointer; }
 .board-presetbar { padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--panel); }
 .launch-presets { display:flex;gap:8px;flex-wrap:wrap; }
 .preset { background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:8px 12px;color:var(--ink);text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:3px; }
-.preset:hover { border-color:var(--accent); }
+.preset:hover:not(:disabled) { border-color:var(--accent); }
+.preset:disabled { opacity:.55;cursor:not-allowed; }
 .preset.on { border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent); }
 .preset span { color:var(--ink-2);font-size:.8rem;overflow-wrap:anywhere; }
 .board-ticket { grid-template-columns:minmax(0,2.5fr) minmax(0,1fr) minmax(0,1.35fr) minmax(0,1.25fr);gap:16px;padding:16px;align-items:start; }

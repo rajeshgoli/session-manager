@@ -1,7 +1,7 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
-import { EFFORTS, useLocalModel, useOpen, LocalChoice, localBlocked, ensureLocalLoaded } from './start.js';
+import { EFFORTS, useLocalModel, useOpen, localBlocked, ensureLocalLoaded, localPreset, localModelName, providerOptions, LocalModelField, LOCAL_TYPE } from './start.js';
 import { TypePicker, OTHER_TYPE, agentTypes, typeConfig, matchType } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
@@ -288,7 +288,7 @@ function BugText({ value, disabled, onInput }) {
 export function AgentFields({ form, set, settings, models, efforts = EFFORTS, reviewer = true, named = null, extra = null, onType = null, local = null }) {
   const matched = matchType(agentTypes(settings), form);
   const [other, setOther] = useState(!matched);
-  const chosen = other || !matched ? CUSTOM : matched;
+  const chosen = other ? CUSTOM : form.provider === 'opencode' ? LOCAL_TYPE : matched || CUSTOM;
   const pick = (type) => {
     setOther(!type);
     if (!type) return;
@@ -296,18 +296,17 @@ export function AgentFields({ form, set, settings, models, efforts = EFFORTS, re
     if (onType) onType(type);
   };
   return html`
-    <${TypePicker} settings=${settings} value=${chosen} onPick=${pick} />
-    <${LocalChoice} local=${local} provider=${form.provider} onPick=${model => { setOther(true); set({ provider: 'opencode', model, reasoning_effort: null }); }} />
+    <${TypePicker} settings=${settings} value=${chosen} onPick=${pick}
+      extra=${localPreset(local, model => { setOther(false); set({ provider: 'opencode', model, reasoning_effort: null }); })} />
     ${chosen === CUSTOM ? html`
-      <${Seg} label="Provider" value=${form.provider}
-        options=${[{ value: 'claude', label: 'Claude' }, { value: 'codex-fork', label: 'Codex' }]}
-        onChange=${(provider) => set(providerDefaults(settings, provider))} />
-      ${form.provider !== 'opencode' ? html`<label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
+      <${Seg} label="Provider" value=${form.provider} options=${providerOptions(local)}
+        onChange=${(provider) => { setOther(true); set(provider === 'opencode' ? { provider, model: localModelName(local), reasoning_effort: null } : providerDefaults(settings, provider)); }} />
+      ${form.provider === 'opencode' ? html`<${LocalModelField} local=${local} value=${form.model} onChange=${model => set({ model })} />` : html`<label class="fld"><span class="l">Model</span><select class="inp" value=${form.model || ''} onChange=${(e) => set({ model: e.target.value || null })}>
         <option value="">Provider default</option>${models.map((model) => html`<option value=${model}>${model}</option>`)}</select></label>
       <div class="fld"><span class="l">Effort</span><${Seg} label="Effort" value=${form.reasoning_effort || ''}
         options=${[{ value: '', label: 'default' }, ...(efforts[form.provider] || []).map((e) => ({ value: e, label: e }))]}
-        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>` : null}` : null}
-    <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.reasoning_effort || 'default effort'} · ${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span></div>
+        onChange=${(value) => set({ reasoning_effort: value || null })} /></div>`}` : null}
+    <div class="line"><span>${form.model || (form.provider === 'claude' ? 'Claude Code default model' : 'Codex default model')} · ${form.provider === 'opencode' ? '' : `${form.reasoning_effort || 'default effort'} · `}${form.working_dir ? homeRelative(form.working_dir) : 'no checkout'}</span></div>
     ${named}
     ${extra}
     ${reviewer ? html`<${ReviewerRow} form=${form} set=${set} />` : null}`;
