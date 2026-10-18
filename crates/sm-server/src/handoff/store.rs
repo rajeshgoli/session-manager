@@ -173,6 +173,11 @@ impl SessionStore {
         if update.ask_now {
             return Ok(Err("ask_now is available only for an agent".to_owned()));
         }
+        if update.sets_review_asks() {
+            return Ok(Err(
+                "review handoff switches are set per agent, not per ticket".to_owned(),
+            ));
+        }
         let Some(claims) = self.ticket_claim_store() else {
             return Ok(Err("ticket claims are unavailable".to_owned()));
         };
@@ -403,8 +408,8 @@ impl SessionStore {
             return Ok(None);
         };
         let switch = match ask {
-            ReviewAsk::Codex { .. } => context.defaults.ask_on_codex_review,
-            ReviewAsk::Doc { .. } => context.defaults.ask_on_doc_review,
+            ReviewAsk::Codex { .. } => context.policy.ask_on_codex_review,
+            ReviewAsk::Doc { .. } => context.policy.ask_on_doc_review,
         };
         if context.stopped || !context.policy.enabled || !switch || context.record.is_some() {
             return Ok(None);
@@ -1086,6 +1091,39 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_overrides_the_review_switches_both_ways() {
+        // Global on, this agent off: no ask; another agent still asked.
+        let store = store("reviewoverride");
+        store
+            .update_handoff_defaults(&json!({"threshold_percent": 90}))
+            .unwrap()
+            .unwrap();
+        sample(&store, "agent001", 30.0);
+        update(&store, "agent001", json!({"ask_on_codex_review": false}));
+        let codex = ReviewAsk::Codex { pr_number: 7 };
+        assert_eq!(store.review_handoff_ask("agent001", codex).unwrap(), None);
+        let view = store.handoff_policy_view("agent001").unwrap().unwrap();
+        assert_eq!(view["ask_on_codex_review"], false);
+        assert_eq!(view["ask_on_doc_review"], true);
+        assert_eq!(view["source"], "override");
+        // Global off, this agent on: asked.
+        store
+            .update_handoff_defaults(&json!({"ask_on_codex_review": false}))
+            .unwrap()
+            .unwrap();
+        update(&store, "agent001", json!({"ask_on_codex_review": true}));
+        assert!(store
+            .review_handoff_ask("agent001", codex)
+            .unwrap()
+            .is_some());
+        // Use default clears the switch with the rest of the override.
+        update(&store, "agent001", json!({"use_default": true}));
+        let view = store.handoff_policy_view("agent001").unwrap().unwrap();
+        assert_eq!(view["ask_on_codex_review"], false);
+        assert_eq!(view["source"], "default");
+    }
+
+    #[test]
     fn codex_app_has_no_gauge_so_the_floor_is_ignored() {
         let store = store("codexapp");
         let codex = ReviewAsk::Codex { pr_number: 1660 };
@@ -1295,7 +1333,8 @@ mod tests {
             json!({
                 "enabled": true, "threshold_percent": 35, "source": "default",
                 "has_gauge": true, "display": "hands off at 35%", "state": null,
-                "successor": null, "predecessor": null
+                "successor": null, "predecessor": null,
+                "ask_on_codex_review": true, "ask_on_doc_review": true
             })
         );
     }

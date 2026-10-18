@@ -22,6 +22,13 @@ export function tokensOf(percent, window) {
 const ticketPath = ({ repo, number }) => `/handoff-policy/ticket/${repo.split('/').map(encodeURIComponent).join('/')}/${number}`;
 const SOURCE = { override: 'Set for this agent', ticket: 'From its ticket', default: 'Using the default' };
 
+const PRESETS = [35, 50, 65];
+// Per-agent overrides of Settings › Context handoff › When a review is requested.
+const REVIEW_ASKS = [
+  ['ask_on_codex_review', 'Hand off before a Codex review'],
+  ['ask_on_doc_review', 'Hand off before your doc review'],
+];
+
 /**
  * `agent`: `{id, provider, state}` or null. `ticket`: `{repo: "owner/name",
  * number}` or null; without it the agent's ticket claim is used. `scope`
@@ -45,7 +52,8 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
   const [scope, setScope] = useState(initialScope === 'ticket' && forTicket || !agent ? 'ticket' : 'agent');
   const [defaults, setDefaults] = useState(null);
   const [policy, setPolicy] = useState(null);
-  const [draft, setDraft] = useState('');
+  // null: nothing typed. '' is a cleared field, kept so a new number can be typed in (sm#2283).
+  const [draft, setDraft] = useState(null);
   const [note, setNote] = useState('Loading…');
   const [asking, setAsking] = useState(false);
   const path = scope === 'ticket' ? forTicket && ticketPath(forTicket) : `/sessions/${encodeURIComponent(agent.id)}/handoff-policy`;
@@ -67,7 +75,7 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
     if (!path) return;
     let live = true;
     setPolicy(null); setNote('Loading…');
-    api(path).then(value => { if (live) { setPolicy(value); setDraft(''); setNote(describe(value)); } })
+    api(path).then(value => { if (live) { setPolicy(value); setDraft(null); setNote(describe(value)); } })
       .catch(error => live && setNote(error.message));
     return () => { live = false; };
   }, [path]);
@@ -75,19 +83,20 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
     setNote('Saving…');
     try {
       const value = await api(body.ask_now ? `/sessions/${encodeURIComponent(agent.id)}/handoff-policy` : path, { method: 'PUT', body });
-      if (!body.ask_now) { setPolicy(value); setDraft(''); }
+      if (!body.ask_now) { setPolicy(value); setDraft(null); }
       setNote(body.ask_now ? 'Asked the agent to hand off' : `Saved · ${describe(value)}`);
     } catch (error) {
       setNote(error.message);
     }
   };
   const commit = () => {
-    if (draft === '') return;
+    if (draft === null) return;
+    if (draft === '') { setDraft(null); return; }
     const number = Number(draft);
     if (!Number.isInteger(number) || number < 1 || number > 100) setNote('Enter a whole number from 1 to 100');
     else write({ threshold_percent: number });
   };
-  const shown = draft !== '' ? draft : threshold ?? '';
+  const shown = draft ?? threshold ?? '';
   const live = agent && agent.state !== 'stopped';
   return html`<${Popover} onClose=${onClose} align=${align} className="handoff-pop">
     <h2>Automatic handoff</h2>
@@ -100,7 +109,11 @@ export function HandoffPopover({ agent: given, ticket, scope: initialScope, alig
             value=${shown} onInput=${event => setDraft(event.target.value)} onChange=${commit} />
             <span>%${tokensOf(shown, window) ? html` · <b>${tokensOf(shown, window)}</b>` : null}</span></span></div>
         <div class="row" style="justify-content:flex-start">
-          <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>`
+          ${PRESETS.map(percent => html`<button type="button" class=${`btn sm${threshold === percent && draft === null ? ' on' : ''}`}
+            onClick=${() => write({ threshold_percent: percent })}>${percent}%</button>`)}
+          <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>
+        ${scope === 'agent' && agent ? REVIEW_ASKS.map(([key, label]) => html`<label class="check"><${Toggle} label=${label}
+            checked=${!!policy[key]} onChange=${value => write({ [key]: value })} /> ${label}</label>`) : null}`
       : null}
     <span class="sub" role="status">${note}</span>
     ${live && showAskNow ? html`<hr class="pop-rule" />

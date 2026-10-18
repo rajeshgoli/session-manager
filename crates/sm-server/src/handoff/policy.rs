@@ -308,6 +308,9 @@ impl HandoffDefaults {
 pub struct HandoffOverride {
     pub enabled: Option<bool>,
     pub threshold_percent: Option<f64>,
+    /// Per-agent only: a ticket override never sets these (sm#2283).
+    pub ask_on_codex_review: Option<bool>,
+    pub ask_on_doc_review: Option<bool>,
     pub set_at: Option<String>,
 }
 
@@ -320,6 +323,8 @@ impl HandoffOverride {
                 .get("threshold_percent")
                 .and_then(Value::as_f64)
                 .filter(|value| valid_percent(*value, false)),
+            ask_on_codex_review: stored.get("ask_on_codex_review").and_then(Value::as_bool),
+            ask_on_doc_review: stored.get("ask_on_doc_review").and_then(Value::as_bool),
             set_at: stored
                 .get("set_at")
                 .and_then(Value::as_str)
@@ -328,13 +333,18 @@ impl HandoffOverride {
     }
 
     pub fn is_active(&self) -> bool {
-        self.enabled.is_some() || self.threshold_percent.is_some()
+        self.enabled.is_some()
+            || self.threshold_percent.is_some()
+            || self.ask_on_codex_review.is_some()
+            || self.ask_on_doc_review.is_some()
     }
 
     pub fn to_json(&self) -> Value {
         json!({
             "enabled": self.enabled,
             "threshold_percent": self.threshold_percent.map(percent_json),
+            "ask_on_codex_review": self.ask_on_codex_review,
+            "ask_on_doc_review": self.ask_on_doc_review,
             "set_at": self.set_at,
         })
     }
@@ -353,6 +363,8 @@ pub enum FieldChange<T> {
 pub struct PolicyUpdate {
     pub enabled: FieldChange<bool>,
     pub threshold_percent: FieldChange<f64>,
+    pub ask_on_codex_review: FieldChange<bool>,
+    pub ask_on_doc_review: FieldChange<bool>,
     pub use_default: bool,
     pub ask_now: bool,
 }
@@ -365,6 +377,8 @@ impl PolicyUpdate {
         let mut update = Self {
             enabled: FieldChange::Unchanged,
             threshold_percent: FieldChange::Unchanged,
+            ask_on_codex_review: FieldChange::Unchanged,
+            ask_on_doc_review: FieldChange::Unchanged,
             use_default: false,
             ask_now: false,
         };
@@ -384,24 +398,43 @@ impl PolicyUpdate {
                         FieldChange::Set(percent_field(key, value, false)?)
                     };
                 }
+                "ask_on_codex_review" | "ask_on_doc_review" => {
+                    let change = if value.is_null() {
+                        FieldChange::Inherit
+                    } else {
+                        FieldChange::Set(bool_field(key, value)?)
+                    };
+                    if key == "ask_on_codex_review" {
+                        update.ask_on_codex_review = change;
+                    } else {
+                        update.ask_on_doc_review = change;
+                    }
+                }
                 "use_default" => update.use_default = bool_field(key, value)?,
                 "ask_now" => update.ask_now = bool_field(key, value)?,
                 other => return Err(format!("unknown field {other}")),
             }
         }
-        if update.use_default
-            && (update.enabled != FieldChange::Unchanged
-                || update.threshold_percent != FieldChange::Unchanged)
-        {
-            return Err("use_default cannot be combined with enabled or threshold_percent".into());
+        if update.use_default && update.sets_fields() {
+            return Err("use_default cannot be combined with other policy fields".into());
         }
         Ok(update)
     }
 
-    pub fn changes_override(&self) -> bool {
-        self.use_default
-            || self.enabled != FieldChange::Unchanged
+    fn sets_fields(&self) -> bool {
+        self.enabled != FieldChange::Unchanged
             || self.threshold_percent != FieldChange::Unchanged
+            || self.sets_review_asks()
+    }
+
+    /// Whether the update touches the per-agent review switches, which a ticket cannot hold.
+    pub fn sets_review_asks(&self) -> bool {
+        self.ask_on_codex_review != FieldChange::Unchanged
+            || self.ask_on_doc_review != FieldChange::Unchanged
+    }
+
+    pub fn changes_override(&self) -> bool {
+        self.use_default || self.sets_fields()
     }
 
     /// The override after this update. `None` means no override is stored.
@@ -420,6 +453,16 @@ impl PolicyUpdate {
             FieldChange::Inherit => next.threshold_percent = None,
             FieldChange::Set(value) => next.threshold_percent = Some(value),
         }
+        for (change, field) in [
+            (self.ask_on_codex_review, &mut next.ask_on_codex_review),
+            (self.ask_on_doc_review, &mut next.ask_on_doc_review),
+        ] {
+            match change {
+                FieldChange::Unchanged => {}
+                FieldChange::Inherit => *field = None,
+                FieldChange::Set(value) => *field = Some(value),
+            }
+        }
         next.set_at = Some(now.to_owned());
         next.is_active().then_some(next)
     }
@@ -434,6 +477,9 @@ pub struct EffectivePolicy {
     pub reminder_percent: f64,
     pub source: &'static str,
     pub has_gauge: bool,
+    /// Whether a Codex review request or the owner's doc review asks for a handoff first.
+    pub ask_on_codex_review: bool,
+    pub ask_on_doc_review: bool,
 }
 
 pub fn effective_policy(
@@ -475,6 +521,12 @@ pub fn effective_policy_with_ticket(
         reminder_percent,
         source,
         has_gauge,
+        ask_on_codex_review: override_
+            .and_then(|value| value.ask_on_codex_review)
+            .unwrap_or(defaults.ask_on_codex_review),
+        ask_on_doc_review: override_
+            .and_then(|value| value.ask_on_doc_review)
+            .unwrap_or(defaults.ask_on_doc_review),
     }
 }
 
@@ -749,6 +801,8 @@ pub fn view_json(
         "threshold_percent": percent_json(policy.threshold_percent),
         "source": policy.source,
         "has_gauge": policy.has_gauge,
+        "ask_on_codex_review": policy.ask_on_codex_review,
+        "ask_on_doc_review": policy.ask_on_doc_review,
         "display": display(policy, record, successor),
         "state": record.map(|record| record.state.as_str()),
         "successor": successor,
@@ -807,7 +861,7 @@ mod tests {
         HandoffOverride {
             enabled,
             threshold_percent: threshold,
-            set_at: None,
+            ..HandoffOverride::default()
         }
     }
 
