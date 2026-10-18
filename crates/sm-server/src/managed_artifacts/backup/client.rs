@@ -304,6 +304,29 @@ impl Destination {
         allow_deletes: bool,
         max_fraction: f64,
     ) -> Result<Applied> {
+        self.apply_with(id, manifest, staging, allow_deletes, max_fraction, false)
+    }
+    /// A seed's apply moves staged files into place instead of copying them, so
+    /// it needs room for one copy of the scope, not two. Staging was verified as
+    /// each file was placed, and a failed seed rolls back and starts over, so the
+    /// staged payloads need not survive for a repeat.
+    pub fn apply_seed(
+        &mut self,
+        id: &str,
+        manifest: &TransferManifest,
+        staging: &Path,
+    ) -> Result<Applied> {
+        self.apply_with(id, manifest, staging, true, 1.0, true)
+    }
+    fn apply_with(
+        &mut self,
+        id: &str,
+        manifest: &TransferManifest,
+        staging: &Path,
+        allow_deletes: bool,
+        max_fraction: f64,
+        consume: bool,
+    ) -> Result<Applied> {
         if let Some(applied) = self.applied(id)? {
             return Ok(applied);
         }
@@ -359,7 +382,7 @@ impl Destination {
             .cloned()
             .collect();
         // Validate all replacement payloads before any history or current files change.
-        for record in &manifest.changed {
+        for record in manifest.changed.iter().filter(|_| !consume) {
             if record.target.is_none() {
                 verify(&safe_path(staging, &record.path, false)?, record)?;
             }
@@ -372,10 +395,19 @@ impl Destination {
                 Some(record),
                 staging,
                 manifest,
+                consume,
             )?;
         }
         for path in deletes.difference(&held) {
-            self.replace(id, path, records.get(path), None, staging, manifest)?;
+            self.replace(
+                id,
+                path,
+                records.get(path),
+                None,
+                staging,
+                manifest,
+                consume,
+            )?;
         }
         let result = Applied {
             request: id.into(),
@@ -394,6 +426,8 @@ impl Destination {
         tx.commit()?;
         Ok(result)
     }
+    // One journaled change: its inputs are the change itself plus how to publish it.
+    #[allow(clippy::too_many_arguments)]
     fn replace(
         &self,
         id: &str,
@@ -402,6 +436,7 @@ impl Destination {
         new: Option<&FileRecord>,
         staging: &Path,
         manifest: &TransferManifest,
+        consume: bool,
     ) -> Result<()> {
         let current = safe_path(&self.root, path, true)?;
         let key = format!("holding:{id}");
@@ -448,7 +483,9 @@ impl Destination {
         }
         if let Some(record) = new.filter(|r| r.target.is_none()) {
             let source = safe_path(staging, path, false)?;
-            if !current.exists() || verify(&current, record).is_err() {
+            if consume && !current.exists() {
+                fs::rename(source, &current)?;
+            } else if !current.exists() || verify(&current, record).is_err() {
                 // Copy preserves staging for a repeat after interrupted apply.
                 let temp = safe_path(&self.root, &format!(".incoming/{id}/publish/{path}"), true)?;
                 fs::copy(source, &temp)?;

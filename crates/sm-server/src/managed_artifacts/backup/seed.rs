@@ -134,6 +134,15 @@ pub fn seed(
     adopt: Option<&Path>,
 ) -> Result<String> {
     recover_local(manager, device, dest)?;
+    // With any pending seed resolved, remaining seed staging is from a seed that
+    // crashed before it wrote its journal.
+    let incoming = dest.directory(".incoming")?;
+    for entry in fs::read_dir(&incoming)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("seed-") {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
     let result = seed_inner(manager, device, dest, adopt);
     if result.is_err() {
         recover_local(manager, device, dest)?;
@@ -219,7 +228,11 @@ pub(super) fn seed_inner(
             adopted.files.insert(path, record);
         }
     }
-    let mut prepared = prepare(manager, &scopes, adopt.map(|_| &adopted), &id)?;
+    // Files are staged straight onto the destination: no transit parts on the
+    // cold store, and only the destination needs room for the compressed scope.
+    let staging = dest.directory(".incoming")?.join(&id);
+    let mut prepared =
+        super::outbox::prepare_direct(manager, &scopes, adopt.map(|_| &adopted), &id, &staging)?;
     let _outbox = SeedOutbox(prepared.directory.clone());
     // Files that changed or vanished while being read are left out of the
     // confirmed manifest, so the first remote request ships them as changed.
@@ -337,13 +350,7 @@ pub(super) fn seed_inner(
         .cloned()
         .collect();
     prepared.transfer.base = previous.clone();
-    let staging = dest.unpack(
-        &id,
-        &prepared.transfer,
-        &prepared.parts,
-        &prepared.directory,
-    )?;
-    if let Err(error) = dest.apply(&id, &prepared.transfer, &staging, true, 1.0) {
+    if let Err(error) = dest.apply_seed(&id, &prepared.transfer, &staging) {
         dest.rollback(&id)
             .context("restore destination after failed seed application")?;
         return Err(error);
