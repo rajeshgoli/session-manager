@@ -1661,7 +1661,7 @@ async fn task_complete_puts_the_summary_written_after_it_in_finished() {
 }
 
 #[tokio::test]
-async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
+async fn history_rows_carry_the_last_turn_cut_to_300_characters_and_whole_as_html() {
     let f = fixture();
     let store = sm_server::turn_messages::TurnMessageStore::new(f.dir.join("message_queue.db"));
     store
@@ -1680,6 +1680,8 @@ async fn history_rows_carry_the_last_turn_cut_to_300_characters() {
     let text = child["last_turn"]["text"].as_str().unwrap();
     assert_eq!(text.chars().count(), 301);
     assert!(text.ends_with('…'));
+    let html = child["last_turn"]["html"].as_str().unwrap();
+    assert!(html.contains(&"x".repeat(400)), "{html}");
     let orphan = agents.iter().find(|a| a["id"] == "orphan01").unwrap();
     assert!(orphan["last_turn"].is_null());
 }

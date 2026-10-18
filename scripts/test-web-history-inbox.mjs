@@ -33,7 +33,8 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
           data = {rows:[{repo:'owner/repo',number:1,title:'Fixture ticket',state:'open'}], next_before:'older-cursor',
             agents:[{id:'abc12345',name:'sm-1768',provider:'claude',state:'retired',ended_at:new Date(Date.now()-240000).toISOString(),
               working_dir:'/Users/fixture/projects/session-manager',restorable:false,unrestorable_reason:'Runs on node mini',
-              last_turn:{at:'2026-09-30T12:00:00Z',text:'Memo 1768 is merged and published at https://sm.example.com/docs/memo.'},
+              last_turn:{at:'2026-09-30T12:00:00Z',text:'Memo 1768 is merged…',
+                html:`<p><strong>Memo 1768 is merged</strong> and published at https://sm.example.com/docs/memo.</p>${'<p>More detail.</p>'.repeat(12)}<p>Final line.</p>`},
               work:{tickets:[{repo:'owner/repo',number:1768,title:'Memo',state:'closed'}],prs:[],docs:[]}}]};
         } else if (url.pathname === '/watch/state') {
           data = {sessions:retired ? [] : [{id:'fixture',name:'fixture-agent',provider:'claude',state:'idle',claims:[{kind:'ticket',repo:'owner/repo',number:1782}],jobs:[],
@@ -71,8 +72,17 @@ test('History links and Inbox scrolling at desktop and mobile sizes', async () =
       await agent.waitFor();
       assert.equal(new URL(requests.at(-1)).pathname, '/history/agents');
       assert.match(await agent.textContent(), /sm-1768.*CLAUDE.*#1768.*retired 4m ago.*session-manager/s);
-      assert.match(await agent.locator('.history-last-turn').textContent(), /Last turn: “Memo 1768 is merged/);
-      const turnLink = agent.locator('.history-last-turn a');
+      // The whole last turn renders as markdown, clamped until Show more (sm#2292).
+      const turn = agent.locator('.history-turn');
+      assert.equal(await turn.locator('strong').textContent(), 'Memo 1768 is merged');
+      assert.ok(await turn.evaluate(el => el.scrollHeight > el.clientHeight), 'a long turn starts clamped');
+      assert.ok(await turn.evaluate(el => el.classList.contains('clipped')), 'a clamped turn fades out');
+      await agent.getByRole('button', {name:'Show more'}).click();
+      assert.ok(await turn.evaluate(el => el.scrollHeight <= el.clientHeight + 1), 'Show more reveals the whole turn');
+      assert.ok(await turn.getByText('Final line.').isVisible());
+      await agent.getByRole('button', {name:'Show less'}).click();
+      await agent.getByRole('button', {name:'Show more'}).waitFor();
+      const turnLink = turn.locator('a');
       assert.equal(await turnLink.getAttribute('href'), 'https://sm.example.com/docs/memo', 'a URL in the last turn is a link, without the full stop');
       assert.equal(await turnLink.getAttribute('target'), '_blank');
       const restore = agent.getByRole('button', {name:'Restore'});

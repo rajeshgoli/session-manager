@@ -679,6 +679,14 @@ button.sw-sec { cursor: pointer; }
 .history-agent .history-name:hover { color:var(--accent); }
 .history-restore { margin-left:auto; }
 .history-last-turn { margin:0; color:var(--ink-2); display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2; overflow:hidden; }
+.history-last-turn-block .lbl { color:var(--ink-2); font-size:.9rem; }
+.history-turn { max-height:7.5em; overflow:hidden; overflow-wrap:anywhere; }
+.history-turn.clipped { -webkit-mask-image:linear-gradient(#000 70%, transparent); mask-image:linear-gradient(#000 70%, transparent); }
+.history-turn.open { max-height:none; }
+.history-turn > :first-child { margin-top:0; }
+.history-turn > :last-child { margin-bottom:0; }
+.history-turn pre,.history-turn table { display:block; max-width:100%; overflow:auto; }
+.history-more { color:var(--accent); font-size:.9rem; padding:0; }
 .history-meta { margin:6px 0; }
 .history-card > .links { margin-top:2px; }
 .thread-links { padding:7px 12px; border-bottom:1px solid var(--line); }

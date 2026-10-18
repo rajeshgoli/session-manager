@@ -51,12 +51,21 @@ struct AgentRow {
     ended_at: String,
     /// Its last `sm status` text.
     last_status: Option<String>,
-    /// What it wrote at the end of its latest turn, cut to 300 characters.
-    last_turn: Option<TurnMessage>,
+    /// What it wrote at the end of its latest turn.
+    last_turn: Option<LastTurn>,
     restorable: bool,
     /// Why this server cannot restore it; null when `restorable`.
     unrestorable_reason: Option<String>,
     work: AgentWork,
+}
+
+/// The latest turn: `text` cut to 300 characters for the Android row,
+/// `html` the whole turn rendered from markdown and sanitized (sm#2292).
+#[derive(Debug, Serialize)]
+struct LastTurn {
+    at: String,
+    text: String,
+    html: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,7 +154,8 @@ fn row(
 ) -> AgentRow {
     let reason = unrestorable_reason(&record);
     AgentRow {
-        last_turn: turns.remove(&record.id).map(|turn| TurnMessage {
+        last_turn: turns.remove(&record.id).map(|turn| LastTurn {
+            html: crate::owner_doc_render::render_markdown_sanitized(&turn.text),
             text: match turn.text.char_indices().nth(LAST_TURN_CHARS) {
                 Some((cut, _)) => format!("{}…", &turn.text[..cut]),
                 None => turn.text,
