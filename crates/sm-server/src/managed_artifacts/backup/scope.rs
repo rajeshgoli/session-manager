@@ -185,7 +185,14 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
                 let ratio = if source.is_file() {
                     1.0
                 } else {
-                    score::ratio(manager, root, &a)?
+                    // The ratio only sizes the estimate; an artifact written
+                    // during sampling falls back to its last ratio.
+                    score::ratio(manager, root, &a).unwrap_or_else(|_| {
+                        a["ratio_estimate"]
+                            .as_f64()
+                            .filter(|r| r.is_finite() && *r > 0.0)
+                            .unwrap_or(1.0)
+                    })
                 };
                 (scan::measure(&source)?.data_bytes as f64 / ratio).ceil() as u64
             };
