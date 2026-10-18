@@ -545,6 +545,26 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
             }
         }
     }
+    // Agent replies to owner reviews (sm#2305). Reviews posted before the
+    // column existed start closed, so the first pass forwards no old replies.
+    if !conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('owner_doc_reviews') WHERE name = 'replies_closed_at'",
+        )?
+        .exists([])?
+    {
+        conn.execute_batch(
+            "ALTER TABLE owner_doc_reviews ADD COLUMN replies_closed_at TEXT;
+             UPDATE owner_doc_reviews SET replies_closed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS owner_doc_review_replies (
+             comment_id INTEGER PRIMARY KEY,
+             review_id TEXT NOT NULL,
+             forwarded_at TEXT NOT NULL
+         );",
+    )?;
     Ok(())
 }
 
@@ -1606,6 +1626,79 @@ impl OwnerDocStore {
         tx.commit()?;
         Ok((review, changed))
     }
+
+    /// Posted reviews still watched for agent replies (sm#2305): posted at
+    /// or after `since`, with a GitHub review id, and not yet closed.
+    pub fn reviews_watching_replies(&self, since: &str) -> Result<Vec<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
+             WHERE status = 'posted' AND github_review_id IS NOT NULL
+               AND posted_at IS NOT NULL AND replies_closed_at IS NULL
+             ORDER BY posted_at, rowid"
+        ))?;
+        let rows = statement
+            .query_map([], review_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|review| {
+                review
+                    .posted_at
+                    .as_deref()
+                    .is_some_and(|posted| !timestamp_after(since, posted))
+            })
+            .collect())
+    }
+
+    /// Whether a revision other than the reviewed one was published after
+    /// the review posted: the agent answered in the doc.
+    pub fn revision_after_review(&self, review: &OwnerDocReview) -> Result<bool> {
+        let posted_at = review.posted_at.as_deref().unwrap_or(&review.submitted_at);
+        Ok(self.publishes(&review.doc_id)?.iter().any(|publish| {
+            publish.blob_sha != review.blob_sha && timestamp_after(&publish.published_at, posted_at)
+        }))
+    }
+
+    /// Stops watching a review for replies.
+    pub fn close_reply_watch(&self, submission_id: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE owner_doc_reviews SET replies_closed_at = ?2
+             WHERE id = ?1 AND replies_closed_at IS NULL",
+            params![submission_id, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// GitHub comment ids of replies already forwarded to the owner.
+    pub fn forwarded_reply_ids(&self, submission_id: &str) -> Result<BTreeSet<i64>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeSet::new());
+        };
+        let mut statement =
+            conn.prepare("SELECT comment_id FROM owner_doc_review_replies WHERE review_id = ?1")?;
+        let ids = statement
+            .query_map(params![submission_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<BTreeSet<i64>>>()?;
+        Ok(ids)
+    }
+
+    pub fn record_forwarded_replies(&self, submission_id: &str, comment_ids: &[i64]) -> Result<()> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction()?;
+        let now = now_rfc3339();
+        for id in comment_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO owner_doc_review_replies (comment_id, review_id, forwarded_at)
+                 VALUES (?1, ?2, ?3)",
+                params![id, submission_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 const REVIEW_COLUMNS: &str = "id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, \
@@ -2644,5 +2737,82 @@ mod tests {
         );
         assert_eq!(default_doc_title("docs/m.md", b"#hashtag\n"), "m.md");
         assert_eq!(default_doc_title("a/b/log.txt", b"x"), "log.txt");
+    }
+
+    #[test]
+    fn reply_watch_lasts_until_a_new_revision_and_skips_older_reviews() {
+        let (store, dir) = store();
+        let doc = store
+            .publish(publish(Some(7), "a", "1"), |_| true)
+            .unwrap()
+            .doc;
+        let post = |id: &str, posted_at: &str| {
+            store
+                .begin_review(
+                    id,
+                    &doc.id,
+                    &"a".repeat(40),
+                    &"1".repeat(40),
+                    OwnerDocVerdict::Comment,
+                    None,
+                )
+                .unwrap();
+            store
+                .finish_review(
+                    id,
+                    &PostedOwnerDocReview {
+                        github_review_id: Some(99),
+                        github_review_url: "https://github.com/acme/widgets/pull/7".into(),
+                        posted_at: Some(posted_at.into()),
+                        line_comment_count: 1,
+                        file_comment_count: 0,
+                        draft_ids: Vec::new(),
+                        wake: Some(("agent001".into(), "[sm review] ...".into())),
+                    },
+                )
+                .unwrap();
+        };
+        // A review from before the column existed starts closed.
+        post("sub-old00001", "2026-10-01T00:00:00Z");
+        let conn = Connection::open(dir.join("message_queue.db")).unwrap();
+        conn.execute_batch(
+            "UPDATE owner_doc_reviews SET replies_closed_at = NULL;
+             ALTER TABLE owner_doc_reviews DROP COLUMN replies_closed_at;",
+        )
+        .unwrap();
+        store.ensure_schema().unwrap();
+        assert!(store
+            .reviews_watching_replies("2026-01-01T00:00:00Z")
+            .unwrap()
+            .is_empty());
+
+        post("sub-new00001", "2026-10-18T17:26:54Z");
+        let watched = store
+            .reviews_watching_replies("2026-10-11T17:00:00Z")
+            .unwrap();
+        assert_eq!(watched.len(), 1);
+        assert!(store
+            .reviews_watching_replies("2026-10-18T17:26:55.5Z")
+            .unwrap()
+            .is_empty());
+        let review = &watched[0];
+        // Republishing the reviewed bytes is not a new revision.
+        store.publish(publish(Some(7), "c", "1"), |_| true).unwrap();
+        assert!(!store.revision_after_review(review).unwrap());
+        store.publish(publish(Some(7), "d", "2"), |_| true).unwrap();
+        assert!(store.revision_after_review(review).unwrap());
+
+        assert!(store.forwarded_reply_ids(&review.id).unwrap().is_empty());
+        store.record_forwarded_replies(&review.id, &[5, 6]).unwrap();
+        store.record_forwarded_replies(&review.id, &[6]).unwrap();
+        assert_eq!(
+            store.forwarded_reply_ids(&review.id).unwrap(),
+            BTreeSet::from([5, 6])
+        );
+        store.close_reply_watch(&review.id).unwrap();
+        assert!(store
+            .reviews_watching_replies("2026-01-01T00:00:00Z")
+            .unwrap()
+            .is_empty());
     }
 }

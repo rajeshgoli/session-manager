@@ -27,7 +27,7 @@ fn seconds_since(at: Option<&str>) -> Option<i64> {
 }
 
 /// The reviewer session, following a context handoff to its successor.
-fn live_session(state: &AppState, id: &str) -> Result<Option<SessionRecord>> {
+pub(in crate::http) fn live_session(state: &AppState, id: &str) -> Result<Option<SessionRecord>> {
     let Some(session) = state.session_store.get_session(id)? else {
         return Ok(None);
     };
@@ -42,7 +42,7 @@ fn live_session(state: &AppState, id: &str) -> Result<Option<SessionRecord>> {
     Ok((!session.is_stopped() && !session.is_retired()).then_some(session))
 }
 
-fn is_idle(state: &AppState, session: &SessionRecord) -> bool {
+pub(in crate::http) fn is_idle(state: &AppState, session: &SessionRecord) -> bool {
     let response =
         serde_json::to_value(session_response_with_live_activity(state, session.clone()))
             .unwrap_or_default();

@@ -12,10 +12,12 @@ use axum::http::HeaderValue;
 
 mod reopen;
 mod review;
+mod review_replies;
 pub(super) use review::recover_owner_doc_reviews;
 pub(super) use review::review_wake_recipient;
 #[cfg(test)]
 pub(super) use review::review_wake_target;
+pub(super) use review_replies::forward_review_replies;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocFetchError {
@@ -135,6 +137,28 @@ pub trait OwnerDocSource: Send + Sync {
     ) -> Result<Vec<DocReviewOnGitHub>, String> {
         Err("this doc source cannot read reviews".to_owned())
     }
+
+    /// Replies posted since `since` under the comments of review
+    /// `review_id` (sm#2305), oldest first.
+    fn review_replies(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _review_id: i64,
+        _since: &str,
+    ) -> Result<Vec<DocReviewReply>, String> {
+        Err("this doc source cannot read review replies".to_owned())
+    }
+}
+
+/// A reply in the thread of one of the owner's review comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocReviewReply {
+    pub id: i64,
+    /// The owner's comment the reply answers.
+    pub parent_body: String,
+    pub body: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +573,55 @@ impl OwnerDocSource for GhCliDocSource {
             })
             .collect())
     }
+
+    fn review_replies(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        review_id: i64,
+        since: &str,
+    ) -> Result<Vec<DocReviewReply>, String> {
+        let parents = gh_api_json(
+            repo,
+            &format!("pulls/{pr_number}/reviews/{review_id}/comments?per_page=100"),
+            true,
+        )?;
+        let comments = gh_api_json(
+            repo,
+            &format!("pulls/{pr_number}/comments?since={since}&per_page=100"),
+            true,
+        )?;
+        Ok(review_replies_from(&parents, &comments))
+    }
+}
+
+/// Comments in `comments` that answer one of `parents`, oldest first. Agents
+/// post as the owner's GitHub account, so the thread, not the author, says
+/// a comment is a reply to the owner's review.
+pub(super) fn review_replies_from(parents: &Value, comments: &Value) -> Vec<DocReviewReply> {
+    let text = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
+    let parents: BTreeMap<i64, String> = parents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|parent| Some((parent["id"].as_i64()?, text(parent, "body"))))
+        .collect();
+    let mut replies: Vec<DocReviewReply> = comments
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|comment| {
+            let parent_body = parents.get(&comment["in_reply_to_id"].as_i64()?)?;
+            Some(DocReviewReply {
+                id: comment["id"].as_i64()?,
+                parent_body: parent_body.clone(),
+                body: text(comment, "body"),
+                url: text(comment, "html_url"),
+            })
+        })
+        .collect();
+    replies.sort_by_key(|reply| reply.id);
+    replies
 }
 
 pub(super) fn owner_doc_store(state: &AppState) -> OwnerDocStore {
