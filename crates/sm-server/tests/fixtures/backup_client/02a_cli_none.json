@@ -1,0 +1,9 @@
+{
+  "client": "sm backup pull: 404 means nothing is published; building=true means wait for the server's build",
+  "method": "GET",
+  "path": "/backup/cli",
+  "status": 404,
+  "response": {
+    "building": false
+  }
+}

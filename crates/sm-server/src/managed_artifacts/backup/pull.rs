@@ -87,11 +87,16 @@ pub fn pull(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ack> {
         time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     pull_with_check(dest, remote, local.weekday() == time::Weekday::Sunday)
 }
-pub(super) fn pull_with_check(
-    dest: &mut Destination,
-    remote: &mut impl Remote,
-    sunday: bool,
-) -> Result<Ack> {
+/// Where tonight's request stands once the server has finished preparing it.
+pub enum Ready {
+    /// The server already confirmed it (a lost ack response); completed locally.
+    Acked(Ack),
+    Ready(RequestStatus),
+}
+/// Requests tonight's backup, or resumes the pending request, and waits until
+/// the server has prepared it. The request stays pending in the destination, so
+/// a later `pull` (also in a newly installed sm) resumes the same request.
+pub fn wait_ready(dest: &mut Destination, remote: &mut impl Remote) -> Result<Ready> {
     super::seed::recover_remote(dest, remote)?;
     let deadline = Instant::now() + Duration::from_secs(3 * 3600);
     let pending = dest.meta("pending_request")?.filter(|s| !s.is_empty());
@@ -108,7 +113,7 @@ pub(super) fn pull_with_check(
                     )?,
             )?;
             complete_local(dest, &id)?;
-            return Ok(ack);
+            return Ok(Ready::Acked(ack));
         }
         if matches!(status.state.as_str(), "failed" | "expired") {
             dest.rollback(&id)?;
@@ -140,6 +145,17 @@ pub(super) fn pull_with_check(
         status.state,
         status.error.as_deref().unwrap_or("unknown error")
     );
+    Ok(Ready::Ready(status))
+}
+pub(super) fn pull_with_check(
+    dest: &mut Destination,
+    remote: &mut impl Remote,
+    sunday: bool,
+) -> Result<Ack> {
+    let status = match wait_ready(dest, remote)? {
+        Ready::Acked(ack) => return Ok(ack),
+        Ready::Ready(status) => status,
+    };
     let id = &status.id;
     if let Some(body) = dest.meta("pending_ack")?.filter(|s| !s.is_empty()) {
         let ack: Ack = serde_json::from_str(&body)?;
@@ -393,22 +409,29 @@ impl Remote for HttpRemote {
     }
 }
 impl super::update::CliSource for HttpRemote {
-    fn cli(&mut self) -> Result<Option<super::update::CliInfo>> {
-        // Read the status before the body: a server without this route answers
-        // 404 with no JSON, and that means "nothing to update to".
+    fn cli(&mut self) -> Result<super::update::Advert> {
         let mut response = self.agent.get(format!("{}/backup/cli", self.base)).call()?;
         let code = response.status().as_u16();
-        if code == 404 {
-            return Ok(None);
-        }
         let text = response.body_mut().read_to_string()?;
+        // A server without this route answers 404 with no JSON: nothing published.
+        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let building = body["building"].as_bool().unwrap_or(false);
+        if code == 404 {
+            return Ok(super::update::Advert {
+                published: None,
+                building,
+            });
+        }
         ensure!(
             (200..300).contains(&code),
             "backup server returned {code} for the published sm: {text}"
         );
-        Ok(Some(
-            serde_json::from_str(&text).context("published sm description is malformed")?,
-        ))
+        Ok(super::update::Advert {
+            published: Some(
+                serde_json::from_value(body).context("published sm description is malformed")?,
+            ),
+            building,
+        })
     }
     fn cli_download(
         &mut self,

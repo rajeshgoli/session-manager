@@ -590,6 +590,8 @@ struct Mini {
     interrupt: bool,
     lose_ack: bool,
     offsets: Vec<u64>,
+    /// Backup requests created, to check one per night.
+    requests: usize,
 }
 impl Remote for Mini {
     fn json(
@@ -600,6 +602,7 @@ impl Remote for Mini {
     ) -> anyhow::Result<(u16, Value)> {
         let response = self.remote.json(method, path, body)?;
         if method == "POST" && path == "/backup/requests" && response.0 == 202 {
+            self.requests += 1;
             let id = response.1["id"].as_str().unwrap();
             life::prepare_request(&self.manager, id)?;
             return self
@@ -672,6 +675,7 @@ async fn pretend_mini_mutual_tls_seed_resume_ack_and_restore() {
             interrupt: true,
             lose_ack: true,
             offsets: Vec::new(),
+            requests: 0,
         };
         assert!(pull::pull(&mut dest, &mut mini).is_err());
         assert!(pull::pull(&mut dest, &mut mini).is_err());
@@ -732,6 +736,13 @@ async fn published_sm_is_served_only_to_puller_devices_with_ranges() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"building": false})
+    );
     publish_cli(&f.dir, "sm 0.2.0 (new)", b"0123456789", false);
     for (name, host, status) in [
         (None, "sm-app.example.com", StatusCode::FORBIDDEN),
@@ -758,6 +769,10 @@ async fn published_sm_is_served_only_to_puller_devices_with_ranges() {
         .unwrap();
     let info: bk::update::CliInfo = serde_json::from_slice(&body).unwrap();
     assert_eq!((info.version.as_str(), info.bytes), ("sm 0.2.0 (new)", 10));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["building"],
+        false
+    );
     let mut req = get("/backup/cli/binary", Some("backup-mini"));
     req.headers_mut()
         .insert("range", "bytes=4-".parse().unwrap());
@@ -817,16 +832,28 @@ async fn pretend_mini_updates_its_own_sm_then_pulls_and_reports_on_the_backup_ca
             interrupt: false,
             lose_ack: false,
             offsets: Vec::new(),
+            requests: 0,
         };
         let gate = Gate {
             api_url: base,
             identity: dir.join("identity"),
             timeout: std::time::Duration::from_secs(30),
+            build_wait: std::time::Duration::from_secs(5),
+            poll: std::time::Duration::from_millis(50),
         };
         let night = |mini: &mut Mini, dest: &mut Destination, own: &str| {
+            let before = mini.requests;
+            // As sm backup pull does: wait for tonight's backup, update, download.
+            assert!(matches!(
+                pull::wait_ready(dest, mini).unwrap(),
+                pull::Ready::Ready(_)
+            ));
             let outcome = update::update(&binary, own, dest, &mut mini.remote, &gate).unwrap();
-            // After an install the new binary runs the pull (exec with --no-update).
-            (outcome, pull::pull(dest, mini).unwrap())
+            // After an install the new binary (exec with --no-update) resumes the
+            // same request: one backup request per night.
+            let ack = pull::pull(dest, mini).unwrap();
+            assert_eq!(mini.requests, before + 1);
+            (outcome, ack)
         };
 
         // Nothing published: the pull runs and reports no update.
@@ -849,7 +876,9 @@ async fn pretend_mini_updates_its_own_sm_then_pulls_and_reports_on_the_backup_ca
         assert_eq!(card["update"]["to"], "sm 0.2.0 (new)");
 
         publish_cli(&dir, "sm 0.2.0 (new)", &new, false);
-        let info = mini.remote.cli().unwrap().unwrap();
+        let advert = mini.remote.cli().unwrap();
+        assert!(!advert.building);
+        let info = advert.published.unwrap();
         let mut tail = Vec::new();
         mini.remote.cli_download(&info, 9, &mut tail).unwrap();
         assert_eq!(tail, new[9..]);
@@ -1035,6 +1064,9 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
         }
     };
     replay("01_status.json", &id, 0, &confirmed).await;
+    fs::rename(f.dir.join("cli"), f.dir.join("cli-hidden")).unwrap();
+    replay("02a_cli_none.json", &id, 0, &confirmed).await;
+    fs::rename(f.dir.join("cli-hidden"), f.dir.join("cli")).unwrap();
     let cli = replay("02_cli.json", &id, 0, &confirmed).await;
     serde_json::from_value::<CliInfo>(cli).unwrap();
     replay("03_cli_binary_resume.json", &id, 0, &confirmed).await;
@@ -1064,7 +1096,7 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
     )
     .unwrap()
     .count();
-    assert_eq!(count, 12);
+    assert_eq!(count, 13);
     let card = life::owner_summary(&manager).unwrap();
     assert_eq!(card["update"]["to"], "sm 0.2.0 (abcdef012345)");
     moves::TEST_MOUNTED.set(false);

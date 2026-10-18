@@ -53,9 +53,16 @@ pub fn published(dir: &Path) -> Result<Option<CliInfo>> {
     }
 }
 
+/// What `GET /backup/cli` says: the published sm (none on 404), and whether a
+/// build of the server's commit is under way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Advert {
+    pub published: Option<CliInfo>,
+    pub building: bool,
+}
 pub trait CliSource {
-    /// `GET /backup/cli`; `None` on 404.
-    fn cli(&mut self) -> Result<Option<CliInfo>>;
+    /// `GET /backup/cli`.
+    fn cli(&mut self) -> Result<Advert>;
     /// `GET /backup/cli/binary`, appending exactly the bytes after `offset`.
     fn cli_download(&mut self, info: &CliInfo, offset: u64, output: &mut dyn Write) -> Result<()>;
 }
@@ -65,6 +72,9 @@ pub struct Gate {
     pub api_url: String,
     pub identity: PathBuf,
     pub timeout: Duration,
+    /// How long to wait for a build the server has under way, polling every `poll`.
+    pub build_wait: Duration,
+    pub poll: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,9 +99,10 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Steps 1-5 of the update. `binary` is the running binary's canonical path and
-/// `own` its version. Records the report for tonight's ack; never fails the pull
-/// except when the advertisement cannot be read at all (an `Err`).
+/// Steps 1-5 of the update, run once tonight's backup is ready. `binary` is the
+/// running binary's canonical path and `own` its version. Records the report for
+/// tonight's ack; never fails the pull except when the advertisement cannot be
+/// read at all (an `Err`).
 pub fn update(
     binary: &Path,
     own: &str,
@@ -99,7 +110,14 @@ pub fn update(
     source: &mut impl CliSource,
     gate: &Gate,
 ) -> Result<Outcome> {
-    let Some(info) = source.cli()? else {
+    // The server builds while it prepares the backup; usually it is done first.
+    let deadline = Instant::now() + gate.build_wait;
+    let mut advert = source.cli()?;
+    while advert.building && Instant::now() + gate.poll <= deadline {
+        std::thread::sleep(gate.poll);
+        advert = source.cli()?;
+    }
+    let Some(info) = advert.published else {
         return Ok(Outcome::Unchanged);
     };
     let mut state = dest.state()?;

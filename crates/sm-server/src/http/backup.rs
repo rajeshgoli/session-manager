@@ -168,6 +168,8 @@ pub(super) async fn request(
                 Ok((StatusCode::CONFLICT, Json(json!({"expected":expected}))).into_response())
             }
             life::RequestResult::Open(status) => {
+                // Build the mini's sm while the backup is prepared (#2264).
+                start_cli_build(&state);
                 life::schedule(
                     &manager,
                     &expand_home(&state.config.queue_runner_state_dir().to_string_lossy()),
@@ -331,9 +333,9 @@ fn published_cli(state: &AppState) -> Result<(bk::update::CliInfo, PathBuf), Api
     })?;
     Ok((info, dir.join(bk::update::CLI_FILE)))
 }
-/// `{version, sha256, bytes}` of the `sm` the mini should run (#2264). Asking
-/// also starts a build of this server's commit when that is not what is
-/// published; the mini picks it up on a later night.
+/// `{version, sha256, bytes, building}` of the `sm` the mini should run (#2264),
+/// or 404 `{building}` when none is published. `building` is true while a build
+/// of this server's commit is queued or running.
 pub(super) async fn cli(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -341,14 +343,31 @@ pub(super) async fn cli(
     device(&request)?;
     service(&state)?;
     tokio::task::spawn_blocking(move || {
-        if let Some(commit) = bk::cli_build::server_commit() {
-            if let Err(error) = request_cli_build(&state, commit) {
-                eprintln!("backup mini sm build was not queued: {error:#}");
+        let building = start_cli_build(&state);
+        let published =
+            bk::update::published(&expand_home(&state.config.managed_artifacts.backup.cli_dir))?;
+        Ok(match published {
+            Some(info) => {
+                let mut body = serde_json::to_value(info).map_err(anyhow::Error::from)?;
+                body["building"] = json!(building);
+                Json(body).into_response()
             }
-        }
-        Ok(Json(published_cli(&state)?.0).into_response())
+            None => (StatusCode::NOT_FOUND, Json(json!({"building": building}))).into_response(),
+        })
     })
     .await?
+}
+/// Queues a build of this server's commit when it is not what is published.
+/// Whether one is under way; never fails the backup request that asked.
+fn start_cli_build(state: &AppState) -> bool {
+    let Some(commit) = bk::cli_build::server_commit() else {
+        return false;
+    };
+    if let Err(error) = request_cli_build(state, commit) {
+        eprintln!("backup mini sm build was not queued: {error:#}");
+    }
+    let queue = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    bk::cli_build::building(&queue, commit).unwrap_or(false)
 }
 fn request_cli_build(state: &AppState, commit: &str) -> anyhow::Result<()> {
     let backup = &state.config.managed_artifacts.backup;

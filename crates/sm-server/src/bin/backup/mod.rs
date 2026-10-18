@@ -60,27 +60,35 @@ enum BackupCommand {
         device: Option<String>,
     },
 }
-/// Updates this binary when the server advertises another sm, then execs the new
-/// one with `--no-update` so it runs tonight's pull. Returns when the current
-/// binary should run the pull itself.
-fn self_update(dest: &Path, url: &str, identity: &Path, remote: &mut HttpRemote) -> Result<()> {
+/// Run once tonight's backup is ready: updates this binary when the server
+/// advertises another sm, then execs the new one with `--no-update` so it
+/// downloads tonight's backup (resuming the same request). Returns the
+/// destination when the current binary should download it itself.
+fn self_update(
+    destination: Destination,
+    dest: &Path,
+    url: &str,
+    identity: &Path,
+    remote: &mut HttpRemote,
+) -> Result<Destination> {
     use std::os::unix::process::CommandExt;
-    let destination = Destination::open(dest)?;
     let binary = fs::canonicalize(std::env::current_exe()?)?;
     let gate = update::Gate {
         api_url: url.into(),
         identity: identity.into(),
         timeout: std::time::Duration::from_secs(60),
+        build_wait: std::time::Duration::from_secs(30 * 60),
+        poll: std::time::Duration::from_secs(30),
     };
     match update::update(&binary, CLI_VERSION, &destination, remote, &gate) {
-        Ok(Outcome::Unchanged) => Ok(()),
+        Ok(Outcome::Unchanged) => Ok(destination),
         Ok(Outcome::Failed(report)) => {
             eprintln!(
                 "Update to {} failed: {}. Tonight's pull runs on {CLI_VERSION}.",
                 report.to,
                 report.error.as_deref().unwrap_or("unknown error")
             );
-            Ok(())
+            Ok(destination)
         }
         Ok(Outcome::Installed(mut report)) => {
             // The destination lock is released here and by exec (close-on-exec).
@@ -94,12 +102,13 @@ fn self_update(dest: &Path, url: &str, identity: &Path, remote: &mut HttpRemote)
             report.error = Some(format!(
                 "installed, but starting it failed: {error}; tonight's pull ran on {CLI_VERSION}"
             ));
-            Destination::open(dest)?
-                .set_meta(update::PENDING_UPDATE, &serde_json::to_string(&report)?)
+            let destination = Destination::open(dest)?;
+            destination.set_meta(update::PENDING_UPDATE, &serde_json::to_string(&report)?)?;
+            Ok(destination)
         }
         Err(error) => {
             eprintln!("Could not check for a newer sm: {error:#}");
-            Ok(())
+            Ok(destination)
         }
     }
 }
@@ -176,9 +185,6 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
             let identity = expanded(&identity);
             let device = sm_server::device_identity::Identity::load(&identity)?;
             let mut remote = HttpRemote::new(&url, &identity)?;
-            if !check && !no_update {
-                self_update(&expanded(&dest), &url, &identity, &mut remote)?;
-            }
             if device.renewal_due()? {
                 let (status, body) = remote.json(
                     "POST",
@@ -226,7 +232,29 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
                 );
                 println!("Speed probe: {}", remote.probe()?);
             } else {
-                let ack = pull::pull(&mut destination, &mut remote)?;
+                // The server builds the mini's sm while it prepares the backup;
+                // update once the backup is ready, then download it.
+                let acked = if no_update {
+                    None
+                } else {
+                    match pull::wait_ready(&mut destination, &mut remote)? {
+                        pull::Ready::Acked(ack) => Some(ack),
+                        pull::Ready::Ready(_) => {
+                            destination = self_update(
+                                destination,
+                                &expanded(&dest),
+                                &url,
+                                &identity,
+                                &mut remote,
+                            )?;
+                            None
+                        }
+                    }
+                };
+                let ack = match acked {
+                    Some(ack) => ack,
+                    None => pull::pull(&mut destination, &mut remote)?,
+                };
                 println!(
                     "Backup confirmed; fetched {} bytes; held {} deletions.",
                     ack.fetched_bytes, ack.held_deletions

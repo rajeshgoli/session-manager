@@ -1,9 +1,11 @@
-//! Builds the mini's `sm` when it asks for one (#2264). Deploys do not build it:
-//! when the mini calls `GET /backup/cli` and the published build is not this
-//! server's commit, sm queues a background job that checks the commit out into
-//! its own clone and runs that commit's `scripts/build-backup-cli.sh`. The mini
-//! keeps its current `sm` that night and picks up the build on the next. A failed
-//! build changes nothing on the mini; sm files one ticket for the commit.
+//! Builds the mini's `sm` when it asks for a backup (#2264). Deploys do not build
+//! it: when the mini posts tonight's backup request (or calls `GET /backup/cli`)
+//! and the published build is not this server's commit, sm queues a background
+//! job that checks the commit out into its own clone and runs that commit's
+//! `scripts/build-backup-cli.sh`, while the backup is being prepared. The mini
+//! asks for its `sm` once the backup is ready, waits for a build still under way,
+//! and installs it before downloading. A failed build changes nothing on the
+//! mini; sm files one ticket for the commit.
 use super::{update, *};
 use crate::{
     managed_artifacts::config::CliBuildConfig,
@@ -125,6 +127,14 @@ fn checkout_of(executable: &Path) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Whether a build of `commit` is queued or running.
+pub fn building(queue_dir: &Path, commit: &str) -> Result<bool> {
+    Ok(
+        RetainedQueueStore::owned_queue_job(queue_dir, &owner(commit))?
+            .is_some_and(|job| !is_terminal_queue_state(&job.state)),
+    )
 }
 
 /// A finished, failed build of `commit`, with the end of its log.
