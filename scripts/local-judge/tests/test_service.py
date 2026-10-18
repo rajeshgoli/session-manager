@@ -65,6 +65,7 @@ class Model(BaseHTTPRequestHandler):
                   'probably okay' if action == 'curl invalid' else
                   'ALLOWING: okay' if action == 'curl prefix' else
                   'explanation\nALLOW: okay' if action == 'curl preamble' else
+                  'DENY: ' + 'word ' * 30 if action == 'curl verbose' else
                   self.server.answers.get(action, 'deny').upper() + ': recorded proof ruling')
         events = [{'delta': {'type': 'text_delta', 'text': answer}}, {'type': 'message_stop'}]
         payload = ''.join('data: ' + json.dumps(ev) + '\n\n' for ev in events).encode()
@@ -192,7 +193,7 @@ class JudgeTests(unittest.TestCase):
                     expected = case['decision']
                 self.assertEqual(self.ruling(case['tool'], tin), expected)
                 counts[case['kind']] = counts.get(case['kind'], 0) + 1
-        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [35, 18, 5])
+        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [36, 20, 5])
         if not os.environ.get('SM_JUDGE_TEST_MODEL_URL'):
             self.assertGreater(len(self.model.requests), 40)
             request = self.model.requests[0]
@@ -398,6 +399,11 @@ class JudgeTests(unittest.TestCase):
         self.model.expected_key = self.auth_token
         self.start()
         self.assertEqual(self.ruling(tin={'command': 'curl valid'}), 'allow')
+        # An over-budget reason keeps its ruling instead of reading as an outage.
+        result = self.decide(tin={'command': 'curl verbose'})
+        self.assertEqual(result['permissionDecision'], 'deny')
+        self.assertNotIn('judge unavailable', result['permissionDecisionReason'])
+        self.assertEqual(self.logs()[-1]['reason'], ' '.join(['word'] * 20))
         self.assertEqual(self.model.api_keys[-1], self.auth_token)
 
     def test_safe_names_do_not_hide_executable_identity(self):
@@ -538,6 +544,11 @@ class JudgeTests(unittest.TestCase):
             self.assertLess(time.monotonic() - start, 0.75)
             self.assertIn('judge_error', self.logs()[-1])
         self.assertEqual(self.ruling(tin={'command': 'curl valid'}), 'allow')
+        # An over-budget reason keeps its ruling instead of reading as an outage.
+        result = self.decide(tin={'command': 'curl verbose'})
+        self.assertEqual(result['permissionDecision'], 'deny')
+        self.assertNotIn('judge unavailable', result['permissionDecisionReason'])
+        self.assertEqual(self.logs()[-1]['reason'], ' '.join(['word'] * 20))
         self.assertEqual(self.ruling(tin={'command': 'curl chunked'}), 'allow')
         start = time.monotonic()
         self.assertEqual(self.ruling(tin={'command': 'curl held'}), 'allow')
