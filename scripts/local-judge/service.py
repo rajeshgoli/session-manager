@@ -381,6 +381,16 @@ def judge_message(tool, tin, agent):
 VERDICT = re.compile(r"^(ALLOW|DENY): ([^\r\n]+)$")
 
 
+def verdict(line):
+    """(decision, reason) for a well-formed answer line, else None. A reason
+    over the 20-word budget is trimmed: the decision word is the ruling, and
+    discarding it would show the agent a false "judge unavailable"."""
+    match = VERDICT.fullmatch(line.strip())
+    if not match:
+        return None
+    return match.group(1).lower(), " ".join(match.group(2).split()[:20])
+
+
 def ask_judge_stream(tool, tin, agent):
     """(decision, reason, raw) or raises on timeout / unparseable reply."""
     with open(ARGS.policy) as f:
@@ -426,19 +436,18 @@ def ask_judge_stream(tool, tin, agent):
                         raise ValueError("judge reply too large")
                     # The answer line can finish before MTPLX closes the stream.
                     if "\n" in text:
-                        match = VERDICT.fullmatch(text.split("\n", 1)[0].strip())
-                        if match and len(match.group(2).split()) < 20:
-                            return match.group(1).lower(), match.group(2).strip(), text
-                        raise ValueError("unparseable judge reply")
+                        ruling = verdict(text.split("\n", 1)[0])
+                        if ruling:
+                            return (*ruling, text)
+                        raise ValueError(f"unparseable judge reply: {text[:200]!r}")
                 if ev.get("type") == "message_stop":
-                    match = VERDICT.fullmatch(text.strip())
-                    if match and len(match.group(2).split()) < 20:
-                        return match.group(1).lower(), match.group(2).strip(), text
-                    raise ValueError("unparseable judge reply")
-        for ln in text.split("\n")[:1]:
-            m = VERDICT.match(ln.strip())
-            if m and len(m.group(2).split()) < 20:
-                return m.group(1).lower(), m.group(2).strip(), text
+                    ruling = verdict(text)
+                    if ruling:
+                        return (*ruling, text)
+                    raise ValueError(f"unparseable judge reply: {text[:200]!r}")
+        ruling = verdict(text.split("\n", 1)[0])
+        if ruling:
+            return (*ruling, text)
         if time.monotonic() >= deadline:
             raise TimeoutError("judge did not answer in time")
         raise ValueError(f"unparseable judge reply: {text[:200]!r}")
