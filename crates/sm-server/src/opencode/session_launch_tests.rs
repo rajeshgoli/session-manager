@@ -874,10 +874,7 @@ fn opencode_brief_carries_the_local_agent_addendum() {
     f.create("local1", Some("brief")).unwrap();
     let brief = f.launches()[0].initial_message.clone().unwrap();
     assert!(brief.starts_with("brief\n\nYour tier is Local."), "{brief}");
-    assert!(
-        brief.contains("sm doc publish <path> --pr <number> --review"),
-        "{brief}"
-    );
+    assert!(brief.contains("only your registered branch"), "{brief}");
 }
 
 #[test]
