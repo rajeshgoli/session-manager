@@ -3,6 +3,7 @@
 //! durable loading/ready/draining/yielded states exposed by this module.
 use crate::{
     config::AppConfig,
+    queue::ModelReloadBlock,
     sessions::{expand_home, SessionStore},
 };
 use anyhow::{bail, Context, Result};
@@ -1130,7 +1131,7 @@ impl ModelHost {
         Ok(self.record()?.is_none_or(|m| m.state != "ready"))
     }
     /// The hold is deliberately monotonic and starts afresh after an sm restart.
-    fn reload_pass(&self, available: Option<i64>, perf_blocked: bool) -> Result<()> {
+    fn reload_pass(&self, available: Option<i64>, block: ModelReloadBlock) -> Result<()> {
         let _lock = self
             .operation
             .lock()
@@ -1143,7 +1144,7 @@ impl ModelHost {
         }
         let eligible = model.state == "yielded"
             && model.desired
-            && !perf_blocked
+            && block != ModelReloadBlock::PerfJob
             && available
                 .is_some_and(|a| a >= model.reservation_bytes.saturating_add(self.yield_line()));
         let mut since = self
@@ -1155,7 +1156,11 @@ impl ModelHost {
             return Ok(());
         }
         let started = *since.get_or_insert_with(Instant::now);
-        if started.elapsed() < Duration::from_secs(self.config.reload_hold) {
+        // A cooldown defers the load without restarting the free-memory hold;
+        // restarting it let every finished tests job starve a parked agent.
+        if started.elapsed() < Duration::from_secs(self.config.reload_hold)
+            || block == ModelReloadBlock::Cooldown
+        {
             return Ok(());
         }
         *since = None;
@@ -1172,7 +1177,7 @@ pub fn retry_reload(state_dir: &Path) -> Result<()> {
     if host.yield_worker.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let blocked = crate::queue::model_reload_blocked(state_dir, host.queue_policy)?;
+    let blocked = crate::queue::model_reload_block(state_dir, host.queue_policy)?;
     host.reload_pass(
         crate::queue::host_memory_capacity().map(|(_, a)| a),
         blocked,
@@ -1183,10 +1188,11 @@ impl ModelHost {
     pub fn queue_card(&self) -> Result<Value> {
         self.card_snapshot(
             crate::queue::host_memory_capacity().map(|(_, a)| a),
-            crate::queue::model_reload_blocked(&self.queue_dir, self.queue_policy)?,
+            crate::queue::model_reload_block(&self.queue_dir, self.queue_policy)?,
         )
     }
-    fn card_snapshot(&self, available: Option<i64>, perf_blocked: bool) -> Result<Value> {
+    fn card_snapshot(&self, available: Option<i64>, block: ModelReloadBlock) -> Result<Value> {
+        let perf_blocked = block != ModelReloadBlock::None;
         let model = self.record()?;
         let agents = self.local_sessions()?;
         let seats = model.as_ref().map_or(0, |m| m.seats);
@@ -1222,7 +1228,11 @@ impl ModelHost {
             format!(
             "Reload needs {} GB free for {}s continuously and no perf run or cooldown; held {}s{}",
             gb(required.unwrap_or(0)), self.config.reload_hold, held,
-            if perf_blocked { "; waiting for perf run or cooldown" } else { "" })
+            match block {
+                ModelReloadBlock::PerfJob => "; waiting for the perf run",
+                ModelReloadBlock::Cooldown => "; load waits for the queue cooldown",
+                ModelReloadBlock::None => "",
+            })
         });
         Ok(serde_json::json!({"state":state,"model_text":model_text,
             "seats_used":agents.len(),"seats_total":seats,"agents":names,

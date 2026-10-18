@@ -14464,17 +14464,39 @@ mod review_queue_tests {
     }
 }
 
-pub(crate) fn model_reload_blocked(
+/// What keeps a yielded local model from reloading on the queue's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelReloadBlock {
+    None,
+    /// A perf job is running or waiting to run: it owns the machine, so the
+    /// reload hold restarts and a waiting job is not delayed by a model load.
+    PerfJob,
+    /// A perf or tests job finished moments ago. The load waits for the
+    /// cooldown to end, but the free-memory hold keeps running.
+    Cooldown,
+}
+
+pub(crate) fn model_reload_block(
     state_dir: &Path,
     captured: QueueAdmissionPolicy,
-) -> Result<bool> {
+) -> Result<ModelReloadBlock> {
     let path = state_dir.join("queue_runner.db");
     if !path.exists() {
-        return Ok(false);
+        return Ok(ModelReloadBlock::None);
     }
     let conn = open_queue_jobs_connection(&path)?;
     init_queue_jobs_schema(&conn)?;
     let jobs = list_queue_job_runtime_records_conn(&conn)?;
-    Ok(running_queue_job_count(&jobs, Some("perf")) > 0
-        || perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)))
+    let perf_waiting = jobs
+        .iter()
+        .any(|job| job.job_type == "perf" && job.state == "pending");
+    Ok(
+        if running_queue_job_count(&jobs, Some("perf")) > 0 || perf_waiting {
+            ModelReloadBlock::PerfJob
+        } else if perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)) {
+            ModelReloadBlock::Cooldown
+        } else {
+            ModelReloadBlock::None
+        },
+    )
 }
