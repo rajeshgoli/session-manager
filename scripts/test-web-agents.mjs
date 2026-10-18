@@ -416,3 +416,63 @@ test('Hand off…: a cleared field takes a typed percent; presets; per-agent rev
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Settings › Context handoff (#2294): defaults grid, review switches, Set differently with Reset', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const width of [1440, 390]) {
+      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      const errors = [];
+      page.on('pageerror', (error) => errors.push(error.message));
+      const puts = [];
+      let items = [
+        { kind: 'lane', repo: 'rajeshgoli/fractal-algo-rust', number: 2130, title: 'Iteration 11', override: { enabled: true, threshold_percent: 50, ask_on_codex_review: false, ask_on_doc_review: null } },
+        { kind: 'ticket', repo: 'rajeshgoli/session-manager', number: 2264, title: 'Backup mini', override: { enabled: false, threshold_percent: null, ask_on_codex_review: null, ask_on_doc_review: null } },
+        { kind: 'agent', id: 'sm-1776', name: 'sm-1776', override: { enabled: null, threshold_percent: 65, ask_on_codex_review: null, ask_on_doc_review: null } },
+      ];
+      const defaults = { providers: { claude: true, 'codex-fork': false, opencode: false }, window_tokens: { claude: 1000000 },
+        provider_thresholds: { claude: { threshold_percent: 35, reminder_percent: 45, review_floor_percent: 20 } },
+        ask_on_codex_review: true, ask_on_doc_review: true };
+      await page.route('http://localhost/**', async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        if (url.pathname.startsWith('/assets/')) {
+          const file = url.pathname.slice('/assets/'.length);
+          return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
+        }
+        if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+        if (request.method() === 'PUT') {
+          puts.push([url.pathname, request.postDataJSON()]);
+          if (request.postDataJSON().use_default) items = items.filter((item) => !url.pathname.includes(String(item.number || item.id)));
+          return route.fulfill({ json: url.pathname === '/handoff-defaults' ? defaults : {} });
+        }
+        if (url.pathname === '/handoff-defaults') return route.fulfill({ json: defaults });
+        if (url.pathname === '/handoff-overrides') return route.fulfill({ json: { items } });
+        if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions: [], counts: {} } });
+        return route.fulfill({ json: {} });
+      });
+      await page.goto('http://localhost/settings#context-handoff');
+      const field = page.getByRole('spinbutton', { name: 'Hand off at' });
+      await field.waitFor();
+      assert.equal(await field.inputValue(), '35');
+      assert.equal(await page.locator('.hd-row:not(.hd-head)').count(), 3, 'one row per provider');
+      assert.deepEqual(await page.locator('.hd-overrides .hd-what').allInnerTexts(),
+        ['on · at 50% · no handoff before Codex review', 'off', 'at 65%']);
+      const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+      assert.ok(pageWidth <= width, `no horizontal scroll at ${width} px (got ${pageWidth})`);
+      if (SHOTS) await page.screenshot({ path: `${SHOTS}/settings-handoff-${width}.png`, fullPage: true });
+      if (width === 1440) {
+        await field.fill('');
+        await field.pressSequentially('50');
+        await field.press('Enter');
+        for (let i = 0; i < 100 && !puts.length; i += 1) await page.waitForTimeout(50);
+        assert.deepEqual(puts[0], ['/handoff-defaults', { provider_thresholds: { claude: { threshold_percent: 50 } } }]);
+        await page.locator('.hd-overrides li', { hasText: 'Ticket #2264' }).getByRole('button', { name: 'Reset' }).click();
+        await page.locator('.hd-overrides li', { hasText: 'Ticket #2264' }).waitFor({ state: 'detached' });
+        assert.deepEqual(puts.at(-1), ['/handoff-policy/ticket/rajeshgoli/session-manager/2264', { use_default: true }]);
+      }
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+});

@@ -230,6 +230,52 @@ impl SessionStore {
         Ok(Ok(self.scoped_handoff_policy_view(scope, repo, number)?))
     }
 
+    /// Everything set differently from the defaults (`GET /handoff-overrides`, sm#2294):
+    /// lanes, tickets, then live agents, each with its stored fields.
+    pub fn handoff_overrides_list(&self) -> Result<Value> {
+        let mut items = Vec::new();
+        if let Some(claims) = self.ticket_claim_store() {
+            for stored in claims.handoff_overrides()? {
+                items.push(json!({
+                    "kind": match stored.scope {
+                        HandoffScope::Lane => "lane",
+                        HandoffScope::Ticket => "ticket",
+                    },
+                    "repo": stored.repo,
+                    "number": stored.number,
+                    "title": stored.title,
+                    "override": stored.value.to_json(),
+                }));
+            }
+        }
+        let state = self.load_raw_json_value()?;
+        for session in state
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+        {
+            if raw_session_is_stopped(session) {
+                continue;
+            }
+            let Some(value) = HandoffOverride::from_stored(session.get(policy::OVERRIDE_KEY))
+                .filter(HandoffOverride::is_active)
+            else {
+                continue;
+            };
+            let id = json_text(session.get("id")).unwrap_or_default();
+            let name = json_text(session.get("friendly_name"))
+                .or_else(|| json_text(session.get("name")))
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| id.clone());
+            items.push(
+                json!({"kind": "agent", "id": id, "name": name, "override": value.to_json()}),
+            );
+        }
+        Ok(json!({ "items": items }))
+    }
+
     /// The overrides a session inherits: its first ticket's and that ticket's lane's.
     fn inherited_handoff_for_session(&self, session_id: &str) -> Option<Inherited> {
         let claims = self.ticket_claim_store()?;
@@ -989,6 +1035,30 @@ mod tests {
         sample(&store, "agent001", 30.0);
         let codex = ReviewAsk::Codex { pr_number: 7 };
         assert_eq!(store.review_handoff_ask("agent001", codex).unwrap(), None);
+        // Settings lists all three levels; an agent with no override is left out.
+        update(&store, "agent001", json!({"threshold_percent": 60}));
+        let list = store.handoff_overrides_list().unwrap();
+        let rows = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["kind"].as_str().unwrap(),
+                    item["number"].as_i64(),
+                    item["id"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ("lane", Some(1700), None),
+                ("ticket", Some(1782), None),
+                ("agent", None, Some("agent001")),
+            ]
+        );
+        assert_eq!(list["items"][2]["override"]["threshold_percent"], 60);
     }
 
     #[test]

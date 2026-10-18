@@ -1,6 +1,6 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg, Toggle, age, stored, store } from './ui.js';
+import { html, api, config, Seg, Toggle, age, stored, store, toast } from './ui.js';
 import { TITLES_KEY } from './agents.js';
 import { tokens, tokensOf } from './handoff.js';
 import { ReviewerEditor, PolicyPopover, reviewerText, fallbackText, setByText } from './reviews.js';
@@ -328,39 +328,101 @@ const HANDOFF_PROVIDERS = [
   ['claude', 'Claude agents', () => 'Off. Claude agents keep working until their context fills.'],
   ['codex-fork', 'Codex agents', window => `Off. Codex compacts its own context near the end of its ${window ? `${tokens(window)} ` : ''}window.`],
 ];
+// The defaults grid (sm#2294): one row per provider, these columns, each defined under the grid.
 const THRESHOLDS = [
-  ['threshold_percent', 'Hand off at', '0.01', ''],
-  ['reminder_percent', 'Remind at', '0.01', ''],
-  ['review_floor_percent', 'Review floor', '0', ' (below this, a review request does not ask for a handoff)'],
+  ['threshold_percent', 'Hand off at', 0.01, 'sm asks the agent to hand off once its context reaches this level.'],
+  ['reminder_percent', 'Remind at', 0.01, 'If it has not handed off by here, sm reminds it once.'],
+  ['review_floor_percent', 'Review floor', 0, 'Below this, a review request does not ask for a handoff.'],
+];
+const REVIEW_SWITCHES = [
+  ['ask_on_codex_review', 'Before a Codex review of a PR', 'When an agent requests a Codex review, ask it to hand off first, so its successor reads the review.'],
+  ['ask_on_doc_review', 'Before your review of a doc', 'When an agent asks you to review a doc, ask it to hand off first; your review wakes its successor.'],
 ];
 
-function Threshold({ label, initial, min, window, note, save }) {
-  const [draft, setDraft] = useState(initial);
-  return html`<${Field} label=${`${label} (%)`} type="number" min=${min} max="100" step="any" initial=${initial}
-    onDraft=${setDraft} hint=${`${tokensOf(draft, window) ? `· ${tokensOf(draft, window)}` : ''}${note}`}
-    save=${value => { if (!value.trim() || !Number.isFinite(Number(value))) throw new Error('Enter a percentage.'); return save(Number(value)); }} />`;
+/** A percent that saves on Enter or blur; an emptied field reverts to the saved value. */
+function PercentCell({ label, initial, min, window, save, list }) {
+  const [draft, setDraft] = useState(null);
+  const [error, setError] = useState('');
+  const shown = draft ?? initial ?? '';
+  const commit = async () => {
+    if (draft === null) return;
+    if (draft === '' || Number(draft) === Number(initial)) { setDraft(null); return; }
+    const value = Number(draft);
+    if (!Number.isFinite(value) || value < min || value > 100) { setError(`${min}–100`); return; }
+    try { await save(value); setDraft(null); setError(''); } catch (e) { setError(e.message); }
+  };
+  return html`<span class="hd-cell"><span class="hd-label">${label}</span>
+    <span><input class="inp num" type="number" min=${String(min)} max="100" step="any" aria-label=${label} list=${list}
+      value=${shown} onInput=${e => { setDraft(e.target.value); setError(''); }} onChange=${commit}
+      onKeyDown=${e => { if (e.key === 'Escape') setDraft(null); }} />%</span>
+    <span class=${error ? 'err' : 'sub'}>${error || tokensOf(shown, window)}</span></span>`;
+}
+
+/** What a stored override changes, in words: "off · at 50% · no handoff before Codex review". */
+export function overrideText(value) {
+  const parts = [];
+  if (value.enabled === false) parts.push('off');
+  if (value.enabled === true) parts.push('on');
+  if (value.threshold_percent != null) parts.push(`at ${value.threshold_percent}%`);
+  for (const [key, what] of [['ask_on_codex_review', 'Codex review'], ['ask_on_doc_review', 'doc review']]) {
+    if (value[key] === false) parts.push(`no handoff before ${what}`);
+    if (value[key] === true) parts.push(`hands off before ${what}`);
+  }
+  return parts.join(' · ');
+}
+
+const overridePath = item => item.kind === 'agent' ? `/sessions/${encodeURIComponent(item.id)}/handoff-policy`
+  : `/handoff-policy/${item.kind}/${item.repo.split('/').map(encodeURIComponent).join('/')}/${item.number}`;
+
+function SetDifferently({ write }) {
+  const [state, reload] = useResource('/handoff-overrides');
+  const [busy, setBusy] = useState(null);
+  const reset = async item => {
+    setBusy(overridePath(item));
+    try { await write(overridePath(item), { use_default: true }); reload(); } catch (e) { toast(e.message); } finally { setBusy(null); }
+  };
+  const name = item => item.kind === 'agent' ? item.name
+    : `${item.kind === 'lane' ? 'Lane' : 'Ticket'} #${item.number}${item.title ? ` · ${item.title}` : ''}`;
+  return html`<h3>Set differently</h3>
+    <p class="sub">Lanes, tickets and agents that do not use these defaults. An agent takes its own setting first, then its ticket's, then its lane's, then the defaults; each field separately.</p>
+    <${Resource} state=${state} retry=${reload}>${data => data.items.length ? html`<ul class="hd-overrides">${data.items.map(item => html`<li key=${overridePath(item)}>
+        <span class=${`hd-kind ${item.kind}`}>${item.kind}</span>
+        <span class="hd-name">${name(item)}<span class="sub">${item.kind === 'agent' ? '' : ` ${item.repo}`}</span></span>
+        <span class="hd-what">${overrideText(item.override)}</span>
+        <button class="btn sm" disabled=${busy === overridePath(item)} onClick=${() => reset(item)}>Reset</button></li>`)}</ul>`
+      : html`<p class="sub">Nothing: every agent uses the defaults.</p>`}</${Resource}>`;
 }
 
 function Handoff({ write }) {
   const [state, reload, setData] = useResource('/handoff-defaults');
   const save = body => write('/handoff-defaults', body).then(data => { setData(data); return data; });
-  return html`<h2>Context handoff</h2><p class="sub">Let a fresh agent take over when context fills up. Shared with the phone.</p>
+  // A switch has no field to show an error in, so a failed save says so in a toast.
+  const flip = body => save(body).catch(error => toast(`Not saved: ${error.message}`));
+  return html`<h2>Context handoff</h2><p class="sub">A fresh agent takes over when context fills up. Shared with the phone.</p>
     <${Resource} state=${state} retry=${reload}>${data => html`
-      ${HANDOFF_PROVIDERS.map(([provider, name, off]) => {
-        const on = !!data.providers[provider];
-        const thresholds = data.provider_thresholds?.[provider] || {};
-        return html`<section class="handoff-provider" key=${provider}><h3>${name}</h3>
-          <${Field} label="Hand off automatically" type="checkbox" initial=${on} save=${value => save({ providers: { [provider]: value } })} />
-          ${on ? THRESHOLDS.map(([key, label, min, note]) => html`<${Threshold} key=${key} label=${label} min=${min} note=${note}
-              initial=${String(thresholds[key] ?? '')} window=${data.window_tokens?.[provider]}
-              save=${value => save({ provider_thresholds: { [provider]: { [key]: value } } })} />`)
-            : html`<p class="sub">${off(data.window_tokens?.[provider])}</p>`}
-        </section>`;
-      })}
-      ${HANDOFF_PROVIDERS.some(([provider]) => data.providers[provider]) ? html`<h3>When a review is requested</h3>
-        ${[['ask_on_codex_review', 'Codex review of a PR: ask the agent to hand off first'], ['ask_on_doc_review', 'Your review of a doc: ask the agent to hand off first']].map(([key, label]) => html`<${Field}
-          label=${label} type="checkbox" initial=${data[key]} save=${value => save({ [key]: value })} />`)}` : null}
-      <p class="sub">To try handoff on one agent or one ticket, leave these off and use Hand off… in that agent's details or in a ticket's ⋯ on the Board. The agents that take over inherit the setting.</p>
+      <datalist id="hd-presets"><option value="35" /><option value="50" /><option value="65" /></datalist>
+      <div class="hd-grid" role="table" aria-label="Handoff defaults by provider">
+        <div class="hd-row hd-head" role="row"><span></span><span>Automatic</span>${THRESHOLDS.map(([, label]) => html`<span>${label}</span>`)}</div>
+        ${HANDOFF_PROVIDERS.map(([provider, name, off]) => {
+          const on = !!data.providers[provider];
+          const thresholds = data.provider_thresholds?.[provider] || {};
+          const window = data.window_tokens?.[provider];
+          return html`<div class=${`hd-row${on ? '' : ' off'}`} role="row" key=${provider}>
+            <span class="hd-provider">${name}${on ? null : html`<span class="sub">${off(window)}</span>`}</span>
+            <span class="hd-cell"><span class="hd-label">Automatic</span><${Toggle} label=${`${name}: hand off automatically`} checked=${on}
+              onChange=${value => flip({ providers: { [provider]: value } })} /></span>
+            ${on ? THRESHOLDS.map(([key, label, min]) => html`<${PercentCell} key=${key} label=${label} min=${min} window=${window}
+                list=${key === 'threshold_percent' ? 'hd-presets' : null} initial=${thresholds[key]}
+                save=${value => save({ provider_thresholds: { [provider]: { [key]: value } } })} />`)
+              : null}
+          </div>`;
+        })}
+      </div>
+      <dl class="hd-terms">${THRESHOLDS.map(([, label, , text]) => html`<dt>${label}</dt><dd>${text}</dd>`)}</dl>
+      <h3>When a review is requested</h3>
+      ${REVIEW_SWITCHES.map(([key, label, text]) => html`<label class="check hd-switch"><${Toggle} label=${label} checked=${!!data[key]}
+          onChange=${value => flip({ [key]: value })} /><span>${label}<span class="sub">${text}</span></span></label>`)}
+      <${SetDifferently} write=${write} />
     `}</${Resource}>`;
 }
 

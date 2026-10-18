@@ -176,6 +176,14 @@ fn prefixed(alias: &str) -> String {
         .join(", ")
 }
 
+pub struct StoredHandoffOverride {
+    pub scope: HandoffScope,
+    pub repo: String,
+    pub number: i64,
+    pub title: Option<String>,
+    pub value: crate::handoff::policy::HandoffOverride,
+}
+
 /// Where a handoff override lives: a ticket, or a lane by its goal ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandoffScope {
@@ -780,34 +788,29 @@ impl WorkClaimStore {
         .map_err(Into::into)
     }
 
-    /// Every stored ticket and lane override, for the Settings list.
-    pub fn handoff_overrides(
-        &self,
-    ) -> Result<
-        Vec<(
-            HandoffScope,
-            String,
-            i64,
-            crate::handoff::policy::HandoffOverride,
-        )>,
-    > {
+    /// Every stored ticket and lane override with the item's title when the Board knows it.
+    pub fn handoff_overrides(&self) -> Result<Vec<StoredHandoffOverride>> {
         let Some(conn) = self.open_read()? else {
             return Ok(Vec::new());
         };
         let mut all = Vec::new();
         for scope in [HandoffScope::Lane, HandoffScope::Ticket] {
             let mut statement = conn.prepare(&format!(
-                "SELECT repo, number, {HANDOFF_OVERRIDE_COLUMNS} FROM {} ORDER BY repo, number",
+                "SELECT o.repo, o.number, i.title, {} FROM {} AS o
+                    LEFT JOIN board_items AS i ON i.repo = o.repo AND i.number = o.number
+                    ORDER BY o.repo, o.number",
+                prefixed("o"),
                 scope.table()
             ))?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((
+                    Ok(StoredHandoffOverride {
                         scope,
-                        row.get(0)?,
-                        row.get(1)?,
-                        handoff_override_row(row, 2)?,
-                    ))
+                        repo: row.get(0)?,
+                        number: row.get(1)?,
+                        title: row.get(2)?,
+                        value: handoff_override_row(row, 3)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             all.extend(rows);
