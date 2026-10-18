@@ -869,6 +869,15 @@ fn opencode_reader_observation_survives_launch_acknowledgement() {
 }
 
 #[test]
+fn opencode_brief_carries_the_local_agent_addendum() {
+    let f = Fixture::new();
+    f.create("local1", Some("brief")).unwrap();
+    let brief = f.launches()[0].initial_message.clone().unwrap();
+    assert!(brief.starts_with("brief\n\nYour tier is Local."), "{brief}");
+    assert!(brief.contains("only your registered branch"), "{brief}");
+}
+
+#[test]
 fn opencode_terminal_fence_prevents_initial_brief_submission() {
     let f = Fixture::new();
     let store = f.store.clone();

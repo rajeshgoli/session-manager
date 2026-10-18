@@ -99,7 +99,7 @@ impl Readers {
                         break;
                     }
                     if let Err(error) = &result {
-                        eprintln!("opencode reader {worker_id}: {error:#}");
+                        eprintln!("{} opencode reader {worker_id}: {error:#}", now_rfc3339());
                     }
                     let wait = if result.is_ok() {
                         delay = 1;
@@ -394,11 +394,13 @@ fn resync(
     let conversation = session
         .provider_resume_id
         .context("opencode conversation missing")?;
-    let mut activity = current_activity(client, &conversation)?;
+    let mut activity = current_activity(client, &conversation).context("status before history")?;
     let mut snapshot = None;
     for _ in 0..3 {
-        let messages = client.conversation_messages(&conversation)?;
-        let after = current_activity(client, &conversation)?;
+        let messages = client
+            .conversation_messages(&conversation)
+            .context("history")?;
+        let after = current_activity(client, &conversation).context("status after history")?;
         if activity == after {
             snapshot = Some(messages);
             break;
@@ -446,7 +448,10 @@ fn read_connection(
     if !continue_reading(state, id)? {
         return Ok(());
     }
-    state.session_store.reconcile_opencode_runtime(id)?;
+    state
+        .session_store
+        .reconcile_opencode_runtime(id)
+        .context("runtime reconcile")?;
     if !continue_reading(state, id)? {
         return Ok(());
     }
@@ -457,7 +462,7 @@ fn read_connection(
         .get_session(id)?
         .context("opencode session disappeared")?;
     let (client, config) = client_and_config(state, &session)?;
-    let mut stream = client.event_stream()?;
+    let mut stream = client.event_stream().context("event stream connect")?;
     if let Some(worker) = readers
         .workers
         .lock()
@@ -470,12 +475,14 @@ fn read_connection(
     // covered by this stream even while the creator commits acknowledgement.
     state
         .session_store
-        .recover_opencode_launch_for_session(id)?;
+        .recover_opencode_launch_for_session(id)
+        .context("launch recovery")?;
     let connected = Instant::now();
     let mut conversation = resync(state, handle, id, &client, &config)?;
     state
         .session_store
-        .drain_opencode_outbox(id, &TmuxRuntime::from_app_config(&state.config))?;
+        .drain_opencode_outbox(id, &TmuxRuntime::from_app_config(&state.config))
+        .context("outbox delivery")?;
     readers.update(&state.session_store, id)?;
     loop {
         let event = match read_event(&mut stream) {
