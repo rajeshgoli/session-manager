@@ -638,15 +638,19 @@ fn reload_hold_resets_on_pressure_or_perf_and_resumes_without_duplicate_prompt()
     ready(&host);
     let store = local_session(&host, "running");
     host.unload(true, Some("host memory pressure")).unwrap();
-    host.reload_pass(Some(275 * GB), false).unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
     assert!(host.reload_since.lock().unwrap().is_some());
-    host.reload_pass(Some(1), false).unwrap();
+    host.reload_pass(Some(1), ModelReloadBlock::None).unwrap();
     assert!(host.reload_since.lock().unwrap().is_none());
-    host.reload_pass(Some(275 * GB), false).unwrap();
-    host.reload_pass(Some(275 * GB), true).unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::PerfRunning)
+        .unwrap();
     assert!(host.reload_since.lock().unwrap().is_none());
     *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(601));
-    host.reload_pass(Some(275 * GB), false).unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
     assert_eq!(host.record().unwrap().unwrap().state, "ready");
     assert_eq!(server.started.load(Ordering::SeqCst), 1);
     assert!(store
@@ -664,18 +668,50 @@ fn reload_hold_resets_on_pressure_or_perf_and_resumes_without_duplicate_prompt()
     let mut raw: Value = serde_json::from_slice(&fs::read(&host.state_file).unwrap()).unwrap();
     raw["sessions"][0]["status"] = serde_json::json!("idle");
     fs::write(&host.state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
-    host.reload_pass(Some(275 * GB), false).unwrap();
-    host.reload_pass(Some(275 * GB), false).unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
     let messages = queue.pending_messages_for_target("local-seat", 10).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text, "[sm] The local model was unloaded while you were working (host memory pressure). Continue where you left off.");
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn reload_cooldown_defers_the_load_without_restarting_the_hold() {
+    let (mut host, server, root) = fixture();
+    host.config.reload_hold = 600;
+    ready(&host);
+    let _store = local_session(&host, "running");
+    host.unload(true, Some("host memory pressure")).unwrap();
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
+    *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(601));
+    // A finished tests job's cooldown: the hold survives, the load waits.
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::Cooldown)
+        .unwrap();
+    assert!(host.reload_since.lock().unwrap().is_some());
+    assert_eq!(host.record().unwrap().unwrap().state, "yielded");
+    let card = host
+        .card_snapshot(Some(275 * GB), ModelReloadBlock::Cooldown)
+        .unwrap();
+    assert!(
+        card["reload_text"].as_str().unwrap().contains("held 60"),
+        "{card}"
+    );
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
+    assert_eq!(host.record().unwrap().unwrap().state, "ready");
+    assert_eq!(server.started.load(Ordering::SeqCst), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
 fn queue_card_reports_free_full_draining_and_yielded_reload_hold() {
     let (host, _, root) = fixture();
     ready(&host);
-    let card = host.card_snapshot(Some(70 * GB), false).unwrap();
+    let card = host
+        .card_snapshot(Some(70 * GB), ModelReloadBlock::None)
+        .unwrap();
     assert_eq!(card["model_text"], "loaded (qwen3.8-flash-next)");
     assert_eq!(card["seats_text"], "0 of 1");
     assert!(card["memory_text"]
@@ -684,18 +720,22 @@ fn queue_card_reports_free_full_draining_and_yielded_reload_hold() {
         .starts_with("70.0 GB free, yields below "));
     local_session(&host, "idle");
     assert_eq!(
-        host.card_snapshot(Some(70 * GB), false).unwrap()["seats_text"],
+        host.card_snapshot(Some(70 * GB), ModelReloadBlock::None)
+            .unwrap()["seats_text"],
         "1 of 1: sm-local-seat"
     );
     let mut model = host.record().unwrap().unwrap();
     host.transition(&mut model, "draining").unwrap();
     assert_eq!(
-        host.card_snapshot(Some(70 * GB), false).unwrap()["model_text"],
+        host.card_snapshot(Some(70 * GB), ModelReloadBlock::None)
+            .unwrap()["model_text"],
         "draining"
     );
     host.unload(true, Some("perf run")).unwrap();
     *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
-    let card = host.card_snapshot(Some(275 * GB), false).unwrap();
+    let card = host
+        .card_snapshot(Some(275 * GB), ModelReloadBlock::None)
+        .unwrap();
     assert_eq!(card["model_text"], "yielded to perf run");
     assert!(card["reload_held_seconds"].as_u64().unwrap() >= 30);
     assert!(card["reload_text"].as_str().unwrap().contains("held 30s"));
@@ -738,7 +778,9 @@ fn automatic_reload_retries_transient_failures_after_confirmed_cleanup_and_new_h
         server.fail_ready.store(!fail_start, Ordering::SeqCst);
         server.fail_stop.store(fail_stop, Ordering::SeqCst);
         host.set_reload_hold_for_test(601);
-        assert!(host.reload_pass(Some(275 * GB), false).is_err());
+        assert!(host
+            .reload_pass(Some(275 * GB), ModelReloadBlock::None)
+            .is_err());
         let failed = host.record().unwrap().unwrap();
         assert!(failed.desired);
         assert_eq!(failed.state, if fail_stop { "draining" } else { "yielded" });
@@ -758,14 +800,16 @@ fn automatic_reload_retries_transient_failures_after_confirmed_cleanup_and_new_h
         server.fail_ready.store(false, Ordering::SeqCst);
         server.fail_stop.store(false, Ordering::SeqCst);
         let attempts = server.started.load(Ordering::SeqCst);
-        host.reload_pass(Some(275 * GB), false).unwrap();
+        host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+            .unwrap();
         assert_eq!(
             server.started.load(Ordering::SeqCst),
             attempts,
             "retry must earn a fresh hold"
         );
         host.set_reload_hold_for_test(601);
-        host.reload_pass(Some(275 * GB), false).unwrap();
+        host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
+            .unwrap();
         assert_eq!(host.record().unwrap().unwrap().state, "ready");
         assert_eq!(server.started.load(Ordering::SeqCst), attempts + 1);
         assert!(host
