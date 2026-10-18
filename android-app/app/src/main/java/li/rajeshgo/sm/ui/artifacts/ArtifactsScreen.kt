@@ -84,7 +84,7 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
                 }
             } else {
                 item { StoragePanel(data.rows("filesystems")) }
-                item { BackupPanel(data["backup"] as? JsonObject) }
+                item { BackupAlert(data["backup"] as? JsonObject) }
                 if (decisions.isNotEmpty()) {
                     item { SectionHeader("CLEANUP TO REVIEW") }
                     items(decisions.take(5), key = { "review:" + it.text("root") + it.text("name") }) { a -> ArtifactRow(a) { selected = a } }
@@ -111,6 +111,7 @@ internal fun ArtifactsContent(state: ArtifactsState, onBack: () -> Unit, menu: A
                         if (compressed.isNotEmpty()) Text("${compressed.size} compressed folders · ${storageSize(compressed.sumOf(::artifactSize))}", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                         if (missing > 0) Text("$missing folders need an agent's record. This is bookkeeping, not a decision for you.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                         if (unmeasured > 0) Text("$unmeasured folder sizes unavailable. The list above is incomplete until measured.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                        BackupPanel(data["backup"] as? JsonObject)
                         Text("Keep work you still need. Agents check its history and dependencies before proposing cleanup.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -163,32 +164,40 @@ private fun StoragePanel(disks: List<JsonObject>) {
     }
 }
 
+/** Beside storage, one line only when backup needs the owner (#2291). */
+@Composable
+private fun BackupAlert(backup: JsonObject?) {
+    val line = if (backup?.flag("enabled") != true) backupSummary(backup) else backupCard(backup)?.attention
+    line?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 2.dp, top = 8.dp)) }
+}
+
 @Composable
 private fun BackupPanel(backup: JsonObject?) {
-    val card = backupCard(backup)
-    if (card == null) {
-        Text(backupSummary(backup), color = Amber, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 2.dp, top = 8.dp))
+    val card = backupCard(backup) ?: return
+    val small = MaterialTheme.typography.bodySmall
+    if (card.empty) {
+        Text("No confirmed backup yet.", color = TextSecondary, style = small)
+        backupUpdate(backup)?.let { Text(it, color = TextSecondary, style = small) }
         return
     }
     var night by remember { mutableStateOf<BackupNight?>(null) }
-    val small = MaterialTheme.typography.bodySmall
-    Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(top = 10.dp)) {
+    Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("Backup", style = MaterialTheme.typography.titleSmall)
                 Text(backupSummary(backup), color = TextMuted, style = small)
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (card.nights.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 card.nights.forEach { n ->
                     Box(Modifier.size(30.dp).background(PanelMuted, RoundedCornerShape(8.dp)).clickable { night = if (night == n) null else n },
                         contentAlignment = Alignment.Center) {
-                        Text(n.mark, color = when (n.ok) { true -> Emerald; false -> Amber; null -> TextMuted })
+                        Text(n.mark, color = if (n.ok) Emerald else Amber)
                     }
                 }
             }
-            night?.let { Text(it.detail, color = if (it.ok == false) Amber else TextSecondary, style = small) }
-            Text(card.lastNight, color = TextSecondary, style = small)
-            Text(card.check, color = if (card.checkOk) TextSecondary else Amber, style = small)
+            night?.let { Text(it.detail, color = if (!it.ok) Amber else TextSecondary, style = small) }
+            card.lastNight?.let { Text(it, color = TextSecondary, style = small) }
+            card.check?.let { Text(it, color = if (card.checkOk) TextSecondary else Amber, style = small) }
             card.disk?.let { d ->
                 Text(d.line, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 LinearProgressIndicator(progress = { if (d.total > 0) (d.used.toFloat() / d.total).coerceIn(0f, 1f) else 0f },
@@ -197,8 +206,8 @@ private fun BackupPanel(backup: JsonObject?) {
                 d.pruned?.let { Text(it, color = TextSecondary, style = small) }
                 Text("Drive health: ${d.health}", color = if (d.failing) Amber else TextSecondary, style = small,
                     fontWeight = if (d.failing) FontWeight.Bold else FontWeight.Normal)
-            } ?: Text("Remote disk: not reported yet", color = TextMuted, style = small)
-            Text("${card.rates} · in force ${card.inForce}", color = TextMuted, style = small)
+            }
+            card.rates?.let { Text(it, color = TextMuted, style = small) }
             backupUpdate(backup)?.let { line ->
                 val ok = (backup?.get("update") as? JsonObject)?.flag("ok") == true
                 Text(line, color = if (ok) TextSecondary else Amber, style = small)

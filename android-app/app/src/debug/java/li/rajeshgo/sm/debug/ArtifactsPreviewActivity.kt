@@ -35,7 +35,7 @@ class ArtifactsPreviewActivity : ComponentActivity() {
           "card":{"nights":[{"date":"2026-10-11","ok":true},{"date":"2026-10-12","ok":true},{"date":"2026-10-13","ok":false,"error":"backup disk full: needs 5000000000 bytes"},
             {"date":"2026-10-14","ok":true},{"date":"2026-10-15","ok":true},{"date":"2026-10-16","ok":true},{"date":"2026-10-17","ok":true}],
             "last_night":{"bytes":2400000000,"seconds":1260,"confirmed_at":"2026-10-17T09:35:00Z"},
-            "weekly_check":{"date":"2026-10-12","ok":true,"files_checked":1204,"bad":0},
+            "weekly_check":{"date":"2026-10-12","ok":true,"files_checked":1204,"bad":0},"measured":{"fetch":true,"apply":true,"probe":true},
             "disk":{"total_bytes":4000000000000,"free_bytes":1100000000000,"holding_bytes":310000000000,"holding_oldest":"2026-08-19","health":"failing","pruned_on":"2026-10-13"}}}""").jsonObject
         val base = if (intent.getBooleanExtra("backup", false)) kotlinx.serialization.json.JsonObject(fixture + ("backup" to backup)) else fixture
         val displayed = if (showMarkdown) {

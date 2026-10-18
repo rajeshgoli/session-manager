@@ -37,27 +37,39 @@ test('failed operations and vanished folders remain agent follow-up, not owner d
   assert.equal(artifactInventory(rows,'issue-2').length,1);
 });
 
-test('the Backup card shows nights, the remote disk and its health, and copes with an older mini', () => {
+test('the Backup card shows only what it has to report, and raises one line when backup needs the owner', () => {
   assert.equal(backupCard({enabled:false}), null);
   const base = {enabled:true, fetch_rate:18.75e6, apply_rate:100e6, probe_rate:25e6, effective_rate:18.75e6};
-  const old = backupCard({...base, card:{nights:[{date:'2026-10-16',ok:false,error:'backup disk full: needs 5 bytes'},{date:'2026-10-17',ok:true,error:null}],
-    last_night:{bytes:2e9,seconds:300,confirmed_at:'2026-10-17T09:35:00Z'}, weekly_check:{date:'2026-10-12',ok:true,files_checked:120,bad:0}, disk:null}});
+  // Before the first confirmed backup: nothing but one line, and no default speeds.
+  const fresh = backupCard({...base, card:{nights:[], last_night:null, weekly_check:null, disk:null, measured:{fetch:false,apply:false,probe:false}}});
+  assert.ok(fresh.empty);
+  assert.equal(fresh.rates, null);
+  assert.equal(fresh.attention, null);
+  // An older server's unfinished night (ok null) is never shown as a dot.
+  assert.deepEqual(backupCard({...base, card:{nights:[{date:'2026-10-17',ok:null,error:'not yet'}]}}).nights, []);
+  const old = backupCard({...base, card:{nights:[{date:'2026-10-16',ok:true},{date:'2026-10-17',ok:false,error:'backup disk full: needs 5 bytes'}],
+    last_night:{bytes:2e9,seconds:300,confirmed_at:'2026-10-16T09:35:00Z'}, weekly_check:{date:'2026-10-12',ok:true,files_checked:120,bad:0}, disk:null,
+    measured:{fetch:true,apply:false,probe:true}}});
   assert.equal(old.disk, null);
-  assert.deepEqual(old.nights.map(n => n.mark), ['✗','✓']);
-  assert.equal(old.nights[0].detail, '2026-10-16: backup disk full: needs 5 bytes');
+  assert.ok(!old.empty);
+  assert.deepEqual(old.nights.map(n => n.mark), ['✓','✗']);
+  assert.equal(old.attention, "Last night's backup failed: backup disk full: needs 5 bytes");
   assert.match(old.lastNight, /^Last backup: 2\.0 GB in 5 min, confirmed /);
   assert.equal(old.check, 'Weekly check 2026-10-12: 120 files, all ok');
-  assert.equal(old.rates, 'Download 150 Mbit/s · Disk 800 Mbit/s · Restore 200 Mbit/s');
-  assert.equal(old.inForce, '150 Mbit/s');
+  assert.equal(old.rates, 'Download 150 Mbit/s · Restore 200 Mbit/s · in force 150 Mbit/s');
   const disk = {total_bytes:4e12, free_bytes:1e12, holding_bytes:3e10, holding_oldest:'2026-09-17', health:'failing', pruned:null, pruned_on:'2026-10-01'};
-  const card = backupCard({...base, card:{nights:[], last_night:null, weekly_check:{date:'2026-10-12',ok:false,files_checked:120,bad:2}, disk}});
+  const card = backupCard({...base, card:{nights:[{date:'2026-10-17',ok:true}], last_night:null, weekly_check:{date:'2026-10-12',ok:false,files_checked:120,bad:2}, disk}});
+  assert.equal(card.attention, 'Backup drive is failing. Replace it, then reseed with sm backup seed.');
   assert.equal(card.disk.line, '3.0 TB used · 1.0 TB free of 4.0 TB');
   assert.equal(card.disk.holding, 'Holding 30 GB · oldest 2026-09-17');
   assert.equal(card.disk.pruned, 'Holding shortened for space on 2026-10-01');
   assert.equal(card.disk.health, 'Failing');
-  assert.ok(card.disk.failing);
   assert.equal(card.check, 'Weekly check 2026-10-12: 120 files, 2 bad');
-  assert.equal(card.lastNight, 'No confirmed backup yet');
-  assert.equal(backupCard({...base, card:{disk:{...disk, health:'not_reported', pruned_on:null}}}).disk.health, 'Not reported');
-  assert.equal(backupCard({...base, card:{disk:{...disk, health:'not_reported', pruned_on:null}}}).disk.pruned, null);
+  assert.equal(card.lastNight, null);
+  assert.equal(backupCard({...base, card:{nights:[{date:'2026-10-17',ok:true}], weekly_check:{date:'2026-10-12',ok:false,files_checked:120,bad:2}, disk:{...disk, health:'verified'}}}).attention,
+    'Backup check found 2 damaged files on the remote disk');
+  const healthy = backupCard({...base, card:{nights:[{date:'2026-10-17',ok:true}], disk:{...disk, health:'not_reported', pruned_on:null}}});
+  assert.equal(healthy.attention, null);
+  assert.equal(healthy.disk.health, 'Not reported');
+  assert.equal(healthy.disk.pruned, null);
 });

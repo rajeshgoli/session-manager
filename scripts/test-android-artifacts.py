@@ -24,7 +24,14 @@ try:
     content=(out/'android-ui.xml').read_text()
     assert ('Retention' in content if os.environ.get('MARKDOWN')=='1' else 'TAKING UP SPACE' in content and '1.7 TB of 4.0 TB used' in content), content[:2000]
     if os.environ.get('BACKUP')=='1':
-        assert 'Drive health: Failing' in content and '2.9 TB used' in content and 'Holding shortened for space on 2026-10-13' in content, content[:2000]
+        # Beside storage only the one line that needs the owner; the card is further down.
+        assert 'Backup drive is failing' in content and 'Drive health' not in content, content[:2000]
+        for _ in range(3): run('shell','input','swipe','540','1800','540','500','300'); time.sleep(1)
+        with open(out/'android-artifacts-backup.png','wb') as f: run('exec-out','screencap','-p',stdout=f)
+        run('shell','uiautomator','dump','/sdcard/2224-ui.xml')
+        run('pull','/sdcard/2224-ui.xml',str(out/'android-ui-backup.xml'))
+        card=(out/'android-ui-backup.xml').read_text()
+        assert 'Drive health: Failing' in card and '2.9 TB used' in card and 'Holding shortened for space on 2026-10-13' in card, card[:2000]
     assert 'Needs you' not in content
     print('Native overview rendered: rounded storage, largest folders, no Needs you badge')
 finally:

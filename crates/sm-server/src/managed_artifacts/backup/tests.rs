@@ -1895,15 +1895,27 @@ fn disk_reports_are_stored_rendered_and_a_failing_drive_alerts_weekly() {
         have = Some(req.id.clone());
         req.id
     };
+    // Tonight's run under way has nothing to report: no night is shown.
+    fs::write(f.dir.join("data/prices"), "v0").unwrap();
+    assert!(matches!(
+        l::request(&f.manager, "mini", None).unwrap(),
+        RequestResult::Open(_)
+    ));
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let card = l::card(&conn, "mini", now).unwrap();
+    assert_eq!(card["nights"], serde_json::json!([]));
+    assert_eq!(card["measured"]["fetch"], false);
     // An older mini sends no disk report: the card says not reported, no floor.
     let first = night("v1", None);
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let card = l::card(&conn, "mini", now).unwrap();
     assert!(card["disk"].is_null());
     assert_eq!(
         card["nights"].as_array().unwrap().last().unwrap()["ok"],
         true
     );
+    assert_eq!(card["nights"].as_array().unwrap().len(), 1);
+    // A 6-byte transfer measures no speed: the defaults stay unshown.
+    assert_eq!(card["measured"]["fetch"], false);
     assert_eq!(card["last_night"]["bytes"], 6);
     assert_eq!(card["weekly_check"]["files_checked"], 3);
     assert_eq!(card["weekly_check"]["bad"], 0);

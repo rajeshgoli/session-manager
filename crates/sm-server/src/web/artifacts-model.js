@@ -23,17 +23,28 @@ const HEALTH = {verified:'Verified', failing:'Failing', not_reported:'Not report
 export const backupRate = bps => bps == null || !Number.isFinite(bps) ? 'unknown' : `${Math.round(bps * 8 / 1e6)} Mbit/s`;
 const when = at => new Date(at).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'});
 // The Backup card (#2276), from the remote disk's acknowledgements; null when backup is off.
+// Each line appears only when it has something real to report (#2291).
 export function backupCard(b) {
   if (!b?.enabled) return null;
   const c = b.card || {};
   const d = c.disk;
   const last = c.last_night;
   const check = c.weekly_check;
+  const measured = c.measured || {};
+  const nights = (c.nights || []).filter(n => n.ok === true || n.ok === false).map(n => ({date: n.date, ok: n.ok, mark: n.ok ? '✓' : '✗',
+    detail: n.ok ? `${n.date}: confirmed` : `${n.date}: ${n.error || 'not confirmed'}`}));
+  const latest = nights.at(-1);
+  const rates = [['Download', measured.fetch, b.fetch_rate], ['Disk', measured.apply, b.apply_rate], ['Restore', measured.probe, b.probe_rate]]
+    .filter(([, on]) => on).map(([name, , r]) => `${name} ${backupRate(r)}`);
   return {
-    nights: (c.nights || []).map(n => ({date: n.date, ok: n.ok, mark: n.ok === true ? '✓' : n.ok === false ? '✗' : '·',
-      detail: n.ok === true ? `${n.date}: confirmed` : `${n.date}: ${n.error || 'not confirmed'}`})),
-    lastNight: last ? `Last backup: ${storageSize(last.bytes)} in ${duration(last.seconds)}, confirmed ${when(last.confirmed_at)}` : 'No confirmed backup yet',
-    check: check ? `Weekly check ${check.date}: ${check.files_checked} files, ${check.ok ? 'all ok' : `${check.bad} bad`}` : 'Weekly check: not run yet',
+    empty: !nights.length && !last && !check && !d,
+    // One line at the top of the page, only when backup needs the owner.
+    attention: d?.health === 'failing' ? 'Backup drive is failing. Replace it, then reseed with sm backup seed.'
+      : check?.ok === false ? `Backup check found ${check.bad} damaged files on the remote disk`
+      : latest?.ok === false ? `Last night's backup failed: ${latest.detail.slice(latest.date.length + 2)}` : null,
+    nights,
+    lastNight: last ? `Last backup: ${storageSize(last.bytes)} in ${duration(last.seconds)}, confirmed ${when(last.confirmed_at)}` : null,
+    check: check ? `Weekly check ${check.date}: ${check.files_checked} files, ${check.ok ? 'all ok' : `${check.bad} bad`}` : null,
     checkOk: !check || check.ok !== false,
     disk: d ? {
       used: Math.max(0, d.total_bytes - d.free_bytes), total: d.total_bytes,
@@ -42,8 +53,7 @@ export function backupCard(b) {
       pruned: d.pruned_on ? `Holding shortened for space on ${d.pruned_on}` : null,
       health: HEALTH[d.health] || 'Not reported', failing: d.health === 'failing',
     } : null,
-    rates: [['Download', b.fetch_rate], ['Disk', b.apply_rate], ['Restore', b.probe_rate]].map(([name, r]) => `${name} ${backupRate(r)}`).join(' · '),
-    inForce: backupRate(b.effective_rate),
+    rates: rates.length ? `${rates.join(' · ')} · in force ${backupRate(b.effective_rate)}` : null,
   };
 }
 export const duration = seconds => seconds == null || !Number.isFinite(seconds) ? 'unknown' : seconds < 60 ? `${Math.ceil(seconds)}s` : `${Math.ceil(seconds / 60)} min`;

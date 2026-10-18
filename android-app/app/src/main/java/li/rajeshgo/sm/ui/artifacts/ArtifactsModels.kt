@@ -60,10 +60,10 @@ fun backupUpdate(backup: JsonObject?): String? {
     else "Remote disk: update to ${update.text("to")} failed$on: ${update.text("error").ifEmpty { "unknown error" }}"
 }
 
-data class BackupNight(val date: String, val ok: Boolean?, val mark: String, val detail: String)
+data class BackupNight(val date: String, val ok: Boolean, val mark: String, val detail: String)
 data class BackupDisk(val used: Long, val total: Long, val line: String, val holding: String, val pruned: String?, val health: String, val failing: Boolean)
-data class BackupCard(val nights: List<BackupNight>, val lastNight: String, val check: String, val checkOk: Boolean,
-    val disk: BackupDisk?, val rates: String, val inForce: String)
+data class BackupCard(val empty: Boolean, val attention: String?, val nights: List<BackupNight>, val lastNight: String?, val check: String?,
+    val checkOk: Boolean, val disk: BackupDisk?, val rates: String?)
 
 private fun JsonObject.decimal(key: String): Double? = (get(key) as? JsonPrimitive)?.doubleOrNull
 private fun JsonObject.child(key: String): JsonObject? = get(key) as? JsonObject
@@ -73,18 +73,19 @@ private fun localTime(at: String): String = runCatching {
     DateTimeFormatter.ofPattern("MMM d, h:mm a", Locale.US).format(Instant.parse(at).atZone(ZoneId.systemDefault()))
 }.getOrDefault(at)
 
-/** The Backup card (#2276), from the remote disk's acknowledgements; null when backup is off. */
+/** The Backup card (#2276), from the remote disk's acknowledgements; null when backup is off.
+ *  Each line appears only when it has something real to report (#2291). */
 fun backupCard(backup: JsonObject?): BackupCard? {
     if (backup == null || !backup.flag("enabled")) return null
     val card = backup.child("card")
-    val nights = card?.rows("nights").orEmpty().map { n ->
-        val ok = (n["ok"] as? JsonPrimitive)?.booleanOrNull
+    val nights = card?.rows("nights").orEmpty().mapNotNull { n ->
+        val ok = (n["ok"] as? JsonPrimitive)?.booleanOrNull ?: return@mapNotNull null
         val date = n.text("date")
-        BackupNight(date, ok, when (ok) { true -> "✓"; false -> "✗"; null -> "·" },
-            if (ok == true) "$date: confirmed" else "$date: ${n.text("error").ifEmpty { "not confirmed" }}")
+        BackupNight(date, ok, if (ok) "✓" else "✗", if (ok) "$date: confirmed" else "$date: ${n.text("error").ifEmpty { "not confirmed" }}")
     }
     val last = card?.child("last_night")
     val check = card?.child("weekly_check")
+    val measured = card?.child("measured")
     val disk = card?.child("disk")?.let { d ->
         val total = d.number("total_bytes")
         val free = d.number("free_bytes")
@@ -95,17 +96,23 @@ fun backupCard(backup: JsonObject?): BackupCard? {
             when (d.text("health")) { "verified" -> "Verified"; "failing" -> "Failing"; else -> "Not reported" },
             d.text("health") == "failing")
     }
+    val latest = nights.lastOrNull()
+    val rates = listOf(Triple("Download", "fetch", "fetch_rate"), Triple("Disk", "apply", "apply_rate"), Triple("Restore", "probe", "probe_rate"))
+        .filter { measured?.flag(it.second) == true }.map { (name, _, key) -> "$name ${backupRate(backup.decimal(key))}" }
     return BackupCard(
+        empty = nights.isEmpty() && last == null && check == null && disk == null,
+        attention = when {
+            disk?.failing == true -> "Backup drive is failing. Replace it, then reseed with sm backup seed."
+            check != null && !check.flag("ok") -> "Backup check found ${check.number("bad")} damaged files on the remote disk"
+            latest?.ok == false -> "Last night's backup failed: ${latest.detail.removePrefix("${latest.date}: ")}"
+            else -> null
+        },
         nights = nights,
-        lastNight = last?.let { "Last backup: ${storageSize(it.number("bytes"))} in ${backupDuration(it.number("seconds"))}, confirmed ${localTime(it.text("confirmed_at"))}" }
-            ?: "No confirmed backup yet",
-        check = check?.let { "Weekly check ${it.text("date")}: ${it.number("files_checked")} files, " + if (it.flag("ok")) "all ok" else "${it.number("bad")} bad" }
-            ?: "Weekly check: not run yet",
+        lastNight = last?.let { "Last backup: ${storageSize(it.number("bytes"))} in ${backupDuration(it.number("seconds"))}, confirmed ${localTime(it.text("confirmed_at"))}" },
+        check = check?.let { "Weekly check ${it.text("date")}: ${it.number("files_checked")} files, " + if (it.flag("ok")) "all ok" else "${it.number("bad")} bad" },
         checkOk = check == null || check.flag("ok"),
         disk = disk,
-        rates = listOf("Download" to "fetch_rate", "Disk" to "apply_rate", "Restore" to "probe_rate")
-            .joinToString(" · ") { (name, key) -> "$name ${backupRate(backup.decimal(key))}" },
-        inForce = backupRate(backup.decimal("effective_rate")),
+        rates = if (rates.isEmpty()) null else rates.joinToString(" · ") + " · in force ${backupRate(backup.decimal("effective_rate"))}",
     )
 }
 

@@ -35,20 +35,21 @@ function Detail({ a, data, close, act, investigate, busy }) {
 function BackupCard({ backup }) {
   const [night,setNight] = useState(null);
   const card = backupCard(backup);
-  if (!card) return html`<p class="artifact-warning">${backupSummary(backup)}</p>`;
+  if (!card) return null;
   const update = backupUpdate(backup);
+  if (card.empty) return html`<p>No confirmed backup yet.</p>${update ? html`<p class=${backup.update.ok ? '' : 'artifact-warning'}>${update}</p>` : null}`;
   return html`<section class="artifact-backup" aria-label="Backup">
     <div class="artifact-disk-label"><h2>Backup</h2><span>${backupSummary(backup)}</span></div>
-    <div class="artifact-nights" aria-label="Last 7 nights">${card.nights.map(n=>html`<button class=${n.ok === false ? 'bad' : n.ok ? 'ok' : ''} title=${n.detail} aria-label=${n.detail} onClick=${()=>setNight(night === n ? null : n)}>${n.mark}</button>`)}</div>
-    ${night ? html`<small class=${night.ok === false ? 'artifact-warning' : 'artifact-muted'}>${night.detail}</small>` : null}
-    <p class="artifact-muted">${card.lastNight}</p>
-    <p class=${card.checkOk ? 'artifact-muted' : 'artifact-warning'}>${card.check}</p>
+    ${card.nights.length ? html`<div class="artifact-nights" aria-label="Recent nights">${card.nights.map(n=>html`<button class=${n.ok ? 'ok' : 'bad'} title=${n.detail} aria-label=${n.detail} onClick=${()=>setNight(night === n ? null : n)}>${n.mark}</button>`)}</div>` : null}
+    ${night ? html`<small class=${night.ok ? 'artifact-muted' : 'artifact-warning'}>${night.detail}</small>` : null}
+    ${card.lastNight ? html`<p class="artifact-muted">${card.lastNight}</p>` : null}
+    ${card.check ? html`<p class=${card.checkOk ? 'artifact-muted' : 'artifact-warning'}>${card.check}</p>` : null}
     ${card.disk ? html`<strong>${card.disk.line}</strong>
       <meter aria-label="Remote disk used space" min="0" max=${card.disk.total} value=${card.disk.used}/>
       <p class="artifact-muted">${card.disk.holding}</p>
       ${card.disk.pruned ? html`<p class="artifact-muted">${card.disk.pruned}</p>` : null}
-      <p class=${card.disk.failing ? 'artifact-warning' : 'artifact-muted'}>Drive health: ${card.disk.failing ? html`<b>${card.disk.health}</b>` : card.disk.health}</p>` : html`<p class="artifact-muted">Remote disk: not reported yet</p>`}
-    <p class="artifact-muted">${card.rates} · in force ${card.inForce}</p>
+      <p class=${card.disk.failing ? 'artifact-warning' : 'artifact-muted'}>Drive health: ${card.disk.failing ? html`<b>${card.disk.health}</b>` : card.disk.health}</p>` : null}
+    ${card.rates ? html`<p class="artifact-muted">${card.rates}</p>` : null}
     ${update ? html`<p class=${backup.update.ok ? 'artifact-muted' : 'artifact-warning'}>${update}</p>` : null}
   </section>`;
 }
@@ -100,7 +101,7 @@ export function ArtifactsPage() {
             <meter aria-label=${`${diskName(f)} used space`} min="0" max=${f.bytes} value=${f.bytes-f.free} class=${f.free < f.floor ? 'artifact-low-space' : ''}/>
             ${f.free < f.floor ? html`<small class="artifact-warning">Space is running low</small>` : null}` : null}
         </div>`)}</section>
-        <${BackupCard} backup=${data.backup} />
+        ${!data.backup?.enabled ? html`<p class="artifact-warning">${backupSummary(data.backup)}</p>` : backupCard(data.backup)?.attention ? html`<p class="artifact-warning">${backupCard(data.backup).attention}</p>` : null}
         ${decisions.length ? html`<section><h2 class="artifact-heading">Cleanup to review</h2>${renderRows(decisions.slice(0,5))}${decisions.length > 5 ? html`<button class="btn sm" onClick=${()=>setBrowse(true)}>Browse all ${decisions.length} proposals</button>` : null}</section>` : null}
         <h2 class="artifact-heading">Taking up space</h2><p class="artifact-muted">Largest folders over 1 GB</p>
       `}
@@ -114,6 +115,7 @@ export function ArtifactsPage() {
           ${frozen.length ? html`<p>${frozen.length} compressed folders · ${size(frozen.reduce((n,a)=>n+(artifactBytes(a)||0),0))}</p>` : null}
           ${unrecorded ? html`<p>${unrecorded} folders need an agent’s record. This is bookkeeping, not a decision for you.</p>` : null}
           ${unmeasured ? html`<p>${unmeasured} folder sizes unavailable. The list above is incomplete until measured.</p>` : null}
+          <${BackupCard} backup=${data.backup} />
           <p>Keep work you still need. Agents check its history and dependencies before proposing cleanup.</p>
         </section>
       `}
