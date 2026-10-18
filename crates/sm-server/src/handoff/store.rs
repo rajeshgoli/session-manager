@@ -154,22 +154,30 @@ impl SessionStore {
             .map(|queue| crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf()))
     }
 
-    /// A ticket's or lane's stored override; unset fields are null.
+    /// A ticket's or lane's stored override; unset fields are null. A ticket's view
+    /// also carries its lane's override under `lane`, which fills its unset fields.
     pub fn scoped_handoff_policy_view(
         &self,
         scope: HandoffScope,
         repo: &str,
         number: i64,
     ) -> Result<Value> {
-        let override_ = self
-            .ticket_claim_store()
-            .map(|store| store.handoff_override(scope, repo, number))
-            .transpose()?
-            .flatten();
-        Ok(override_.map_or_else(
-            || HandoffOverride::default().to_json(),
-            |value| value.to_json(),
-        ))
+        let Some(claims) = self.ticket_claim_store() else {
+            return Ok(HandoffOverride::default().to_json());
+        };
+        let mut view = claims
+            .handoff_override(scope, repo, number)?
+            .unwrap_or_default()
+            .to_json();
+        if scope == HandoffScope::Ticket {
+            view["lane"] = match claims.lane_goal_for_ticket(repo, number)? {
+                Some((goal_repo, goal)) => claims
+                    .handoff_override(HandoffScope::Lane, &goal_repo, goal)?
+                    .map_or(Value::Null, |value| value.to_json()),
+                None => Value::Null,
+            };
+        }
+        Ok(view)
     }
 
     pub fn update_scoped_handoff_policy(
@@ -219,10 +227,7 @@ impl SessionStore {
             self.recheck_handoff_policy(&mut state, id, enabled, runtime.as_ref())?;
         }
         self.write_raw_json_value(&state)?;
-        Ok(Ok(next.map_or_else(
-            || HandoffOverride::default().to_json(),
-            |value| value.to_json(),
-        )))
+        Ok(Ok(self.scoped_handoff_policy_view(scope, repo, number)?))
     }
 
     /// The overrides a session inherits: its first ticket's and that ticket's lane's.
@@ -971,6 +976,11 @@ mod tests {
             1782,
             json!({"threshold_percent": 40, "ask_on_doc_review": false}),
         );
+        let ticket = store
+            .scoped_handoff_policy_view(HandoffScope::Ticket, "acme/widgets", 1782)
+            .unwrap();
+        assert_eq!(ticket["threshold_percent"], 40);
+        assert_eq!(ticket["lane"]["threshold_percent"], 50);
         let inside = store.handoff_policy_view("agent001").unwrap().unwrap();
         assert_eq!(inside["source"], "ticket");
         assert_eq!(inside["threshold_percent"], 40);

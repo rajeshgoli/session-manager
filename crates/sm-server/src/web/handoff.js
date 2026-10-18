@@ -68,8 +68,10 @@ export function HandoffPopover({ agent: given, ticket, lane, scope: initialScope
   // An unheld ticket has no provider yet: show only what the ticket sets.
   const window = !agent ? null : provider === 'claude' && agent.model ? (agent.model.endsWith('[1m]') ? 1e6 : 2e5) : defaults?.window_tokens?.[provider];
   // A ticket override leaves unset fields to each agent's provider default.
-  const enabled = policy ? policy.enabled ?? (agent ? !!defaults?.providers?.[provider] : false) : false;
-  const threshold = policy?.threshold_percent ?? (agent ? base : null);
+  // A ticket's unset fields come from its lane's, which the ticket view carries (sm#2293).
+  const lane_ = scope === 'ticket' ? policy?.lane : null;
+  const enabled = policy ? policy.enabled ?? lane_?.enabled ?? (agent ? !!defaults?.providers?.[provider] : false) : false;
+  const threshold = policy?.threshold_percent ?? lane_?.threshold_percent ?? (agent ? base : null);
   const describe = value => scope === 'lane'
     ? setHere(value) ? `Set for this lane; a ticket or agent setting wins` : 'Not set: its agents use their ticket’s setting or the default'
     : scope === 'ticket'
@@ -120,9 +122,10 @@ export function HandoffPopover({ agent: given, ticket, lane, scope: initialScope
             onClick=${() => write({ threshold_percent: percent })}>${percent}%</button>`)}
           <button type="button" class="btn sm" onClick=${() => write({ use_default: true })}>Use default</button></div>
         ${REVIEW_ASKS.map(([key, label]) => {
-          const value = policy[key] ?? (stored ? defaults?.[key] : null);
+          const value = policy[key] ?? lane_?.[key] ?? (stored ? defaults?.[key] : null);
+          const from = !stored || policy[key] != null ? '' : lane_?.[key] != null ? '(from its lane)' : '(default)';
           return html`<label class="check"><${Toggle} label=${label} checked=${!!value} onChange=${next => write({ [key]: next })} />
-            ${label}${stored && policy[key] == null ? html` <span class="sub">(default)</span>` : null}</label>`;
+            ${label}${from ? html` <span class="sub">${from}</span>` : null}</label>`;
         })}`
       : null}
     <span class="sub" role="status">${note}</span>
