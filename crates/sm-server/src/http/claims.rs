@@ -655,6 +655,9 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     }
     super::merge_holds::sync(state)?;
     super::docs::end_closed_pr_review_requests(state)?;
+    if let Err(error) = super::docs::forward_review_replies(state) {
+        eprintln!("doc review replies pass failed: {error:#}");
+    }
     let now = time::OffsetDateTime::now_utc();
     let mut notified = store.run_check_a(&answered, &sessions, now)?;
     for session_id in store.sessions_due_check_b()? {
