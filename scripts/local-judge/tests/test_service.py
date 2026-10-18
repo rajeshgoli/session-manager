@@ -193,7 +193,7 @@ class JudgeTests(unittest.TestCase):
                     expected = case['decision']
                 self.assertEqual(self.ruling(case['tool'], tin), expected)
                 counts[case['kind']] = counts.get(case['kind'], 0) + 1
-        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [35, 21, 5])
+        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [37, 21, 5])
         if not os.environ.get('SM_JUDGE_TEST_MODEL_URL'):
             self.assertGreater(len(self.model.requests), 40)
             request = self.model.requests[0]
