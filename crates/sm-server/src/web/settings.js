@@ -150,7 +150,16 @@ export function SettingsPage() {
 }
 
 /** Settings › Appearance › Terminal: one card per theme, drawn in the page's light or dark. */
-function TerminalThemes({ value, onChange, light }) {
+function TerminalThemes({ value, onChange }) {
+  // Redraw when the OS switches appearance while Theme is System.
+  const [, setScheme] = useState(0);
+  useEffect(() => {
+    const scheme = matchMedia('(prefers-color-scheme: dark)');
+    const redraw = () => setScheme(n => n + 1);
+    scheme.addEventListener('change', redraw);
+    return () => scheme.removeEventListener('change', redraw);
+  }, []);
+  const light = isLight();
   return html`<div class="settings-field"><span>Terminal</span>
     <div class="term-themes" role="radiogroup" aria-label="Terminal theme">
       ${Object.entries(THEMES).map(([name, theme]) => {
@@ -186,7 +195,7 @@ function Appearance() {
     try { localStorage.setItem('sm-text-size', String(size)); setStatus('Saved'); } catch { setStatus('Applied until reload; browser storage is unavailable.'); } };
   return html`<h2>Appearance</h2><${Seg} label="Theme" value=${theme} onChange=${choose}
     options=${['system', 'light', 'dark'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))} />
-    <${TerminalThemes} value=${termTheme} onChange=${chooseTerm} light=${isLight()} />
+    <${TerminalThemes} value=${termTheme} onChange=${chooseTerm} />
     <div class="text-size-setting"><label for="sm-text-size">Text size</label>
       <input id="sm-text-size" type="range" min="13" max="19" step="1" value=${textSize}
         onInput=${event => chooseSize(Number(event.target.value))} />

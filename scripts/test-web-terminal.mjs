@@ -482,6 +482,12 @@ test('terminal theme: picked in Settings, light or dark from Appearance, switchi
     assert.equal(await pick.getAttribute('aria-checked'), 'true');
     assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-theme')), '"solarized"');
     if (SHOTS) await page.locator('.term-themes').screenshot({ path: `${SHOTS}/settings-terminal-themes.png` });
+    // The cards redraw when the OS turns dark under Theme: System.
+    const card = () => page.evaluate(() => getComputedStyle(document.querySelector('.term-theme.on .term-theme-sample')).backgroundColor);
+    assert.equal(await card(), 'rgb(253, 246, 227)');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-theme.on .term-theme-sample')).backgroundColor === 'rgb(0, 43, 54)');
+    await page.emulateMedia({ colorScheme: 'light' });
 
     await page.goto(`${ORIGIN}/terminal/iter8-run`);
     await page.locator('.term-body .xterm').waitFor();
