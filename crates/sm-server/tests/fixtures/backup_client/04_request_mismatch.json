@@ -1,0 +1,8 @@
+{
+  "client": "sm backup pull: 409 reads expected",
+  "method": "POST",
+  "path": "/backup/requests",
+  "request": {"have": "backup-not-the-confirmed-manifest"},
+  "status": 409,
+  "response": {"expected": null}
+}

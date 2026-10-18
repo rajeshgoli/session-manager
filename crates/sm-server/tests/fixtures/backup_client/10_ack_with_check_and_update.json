@@ -1,0 +1,13 @@
+{
+  "client": "sm backup pull on a Sunday after a failed self-update",
+  "method": "POST",
+  "path": "/backup/requests/{id}/ack",
+  "request": {
+    "applied": true, "fetched_bytes": 120, "fetch_seconds": 0.5, "apply_seconds": 0.25, "held_deletions": 0,
+    "check": {"ok": true, "files_checked": 1, "bad": []},
+    "error": null,
+    "update": {"from": "sm 0.1.0 (000000000000)", "to": "sm 0.2.0 (abcdef012345)", "ok": false, "error": "downloaded sm failed SHA-256 check"}
+  },
+  "status": 200,
+  "response": {"ok": true}
+}

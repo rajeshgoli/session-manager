@@ -2053,6 +2053,8 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/probe", post(backup::probe))
         .route("/backup/renew", post(backup::renew))
         .route("/backup/status", get(backup::summary))
+        .route("/backup/cli", get(backup::cli))
+        .route("/backup/cli/binary", get(backup::cli_binary))
         .route("/backup/allow-deletes", post(backup::allow_deletes))
         .route("/artifacts", get(artifacts::list).post(artifacts::create))
         .route("/artifacts/{name}", get(artifacts::show))

@@ -1,0 +1,8 @@
+{
+  "client": "sm backup pull: a resumed part download needs 206 and this Content-Range",
+  "method": "GET",
+  "path": "/backup/requests/{id}/parts/0",
+  "request_headers": {"range": "bytes=1-"},
+  "status": 206,
+  "response_headers": {"content-range": "bytes 1-{last}/{size}"}
+}

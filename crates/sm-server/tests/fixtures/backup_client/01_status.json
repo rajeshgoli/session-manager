@@ -1,0 +1,7 @@
+{
+  "client": "sm backup self-test and sm backup pull --check: only the 2xx status is read",
+  "method": "GET",
+  "path": "/backup/status",
+  "status": 200,
+  "response": {"device": "backup-mini", "confirmed": null, "rates": {}}
+}

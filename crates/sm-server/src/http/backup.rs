@@ -271,7 +271,16 @@ pub(super) async fn part(
         Ok((file, part.bytes))
     })
     .await??;
-    let (start, length, partial) = byte_range(range.as_deref(), bytes)?;
+    ranged(file, bytes, range.as_deref(), "application/zstd").await
+}
+/// Streams `file` (of `bytes` bytes), honouring a single `Range` header.
+async fn ranged(
+    file: fs::File,
+    bytes: u64,
+    range: Option<&str>,
+    content_type: &'static str,
+) -> Result<Response, ApiError> {
+    let (start, length, partial) = byte_range(range, bytes)?;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = tokio::fs::File::from_std(file);
     file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -301,7 +310,7 @@ pub(super) async fn part(
         })
         .header("accept-ranges", "bytes")
         .header("content-length", length)
-        .header(CONTENT_TYPE, "application/zstd");
+        .header(CONTENT_TYPE, content_type);
     if partial {
         response = response.header(
             "content-range",
@@ -311,6 +320,151 @@ pub(super) async fn part(
     response
         .body(body)
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))
+}
+fn published_cli(state: &AppState) -> Result<(bk::update::CliInfo, PathBuf), ApiError> {
+    let dir = expand_home(&state.config.managed_artifacts.backup.cli_dir);
+    let info = bk::update::published(&dir)?.ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "no sm is published for the backup mini",
+        )
+    })?;
+    Ok((info, dir.join(bk::update::CLI_FILE)))
+}
+/// `{version, sha256, bytes}` of the `sm` the mini should run (#2264). Asking
+/// also starts a build of this server's commit when that is not what is
+/// published; the mini picks it up on a later night.
+pub(super) async fn cli(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    device(&request)?;
+    service(&state)?;
+    tokio::task::spawn_blocking(move || {
+        if let Some(commit) = bk::cli_build::server_commit() {
+            if let Err(error) = request_cli_build(&state, commit) {
+                eprintln!("backup mini sm build was not queued: {error:#}");
+            }
+        }
+        Ok(Json(published_cli(&state)?.0).into_response())
+    })
+    .await?
+}
+fn request_cli_build(state: &AppState, commit: &str) -> anyhow::Result<()> {
+    let backup = &state.config.managed_artifacts.backup;
+    bk::cli_build::request(
+        &bk::cli_build::Build {
+            dir: &expand_home(&backup.cli_dir),
+            config: &backup.cli_build,
+            queue_dir: &expand_home(&state.config.queue_runner_state_dir().to_string_lossy()),
+            executable: &std::env::current_exe()?,
+            commit,
+            version: bk::update::CLI_VERSION,
+        },
+        OffsetDateTime::now_utc(),
+    )?;
+    Ok(())
+}
+/// One ticket per commit whose build failed. The mini keeps its current sm.
+fn file_cli_build_failure(
+    state: &AppState,
+    manager: &ManagedArtifacts,
+    commit: &str,
+) -> anyhow::Result<()> {
+    let queue_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let Some(failure) = bk::cli_build::failure(&queue_dir, commit)? else {
+        return Ok(());
+    };
+    let conn = manager.store.open()?;
+    let key = format!("backup_cli_ticket:{commit}");
+    let config = &state.config.managed_artifacts.backup.cli_build;
+    let url = match crate::managed_artifacts::store::meta(&conn, &key)? {
+        Some(url) => url,
+        None => {
+            let url = file_cli_build_ticket(state, config, commit, &failure)?;
+            crate::managed_artifacts::store::set_meta(&conn, &key, &url)?;
+            url
+        }
+    };
+    // Placement is tracked apart from filing, so a failed placement is retried
+    // on the next pass without filing a second ticket.
+    let Some(goal) = config.ticket_goal else {
+        return Ok(());
+    };
+    let placed = format!("backup_cli_ticket_placed:{commit}");
+    if crate::managed_artifacts::store::meta(&conn, &placed)?.is_some() {
+        return Ok(());
+    }
+    let number: i64 = url
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .context("backup mini build ticket URL has no number")?;
+    let repo = crate::work_claims::canonical_repo(&config.ticket_repo);
+    board::place_under(state, (repo.clone(), number), (repo, goal), "sm backup")
+        .with_context(|| format!("place {url} under #{goal}"))?;
+    crate::managed_artifacts::store::set_meta(&conn, &placed, "1")
+}
+fn file_cli_build_ticket(
+    state: &AppState,
+    config: &crate::managed_artifacts::config::CliBuildConfig,
+    commit: &str,
+    failure: &bk::cli_build::Failure,
+) -> anyhow::Result<String> {
+    let mut tail = failure.log_tail.replace("~~~", "~ ~ ~");
+    if tail.len() > 20_000 {
+        let mut start = tail.len() - 20_000;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = tail[start..].to_owned();
+    }
+    let title = format!(
+        "Auto-filed: backup mini sm build failed at {}",
+        &commit[..12]
+    );
+    let body = format!(
+        "sm-server at commit `{commit}` could not build the `sm` that the remote backup Mac mini \
+         runs (x86_64, macOS 10.13; #2264). Nothing changed on the mini: it keeps its current \
+         `sm`. sm builds again when the mini next asks after {} hours, and on the first request \
+         after any deploy of another commit.\n\n\
+         To reproduce, from a checkout of `{commit}`: \
+         `SM_BUILD_SHA={commit} scripts/build-backup-cli.sh stage --target-dir target \
+         --expect-version '{}' --dir \"$(mktemp -d)\"`.\n\n\
+         Queue job `{}` ended `{}`. End of its log:\n\n~~~\n{tail}\n~~~\n",
+        config.retry_hours,
+        bk::update::CLI_VERSION,
+        failure.job_id,
+        failure.state,
+    );
+    let (_, url) = state
+        .board_source
+        .create_issue(&config.ticket_repo, &title, &body)
+        .map_err(|error| anyhow::anyhow!("file the backup mini build ticket: {error}"))?;
+    Ok(url)
+}
+pub(super) async fn cli_binary(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    device(&request)?;
+    service(&state)?;
+    let range = header_text(request.headers(), "range");
+    let (file, bytes) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let (info, path) = published_cli(&state)?;
+        let file = fs::File::open(path)?;
+        // The deploy renames the binary, then its description; between the two a
+        // reader could pair them wrongly. The mini's SHA-256 check is the backstop.
+        if file.metadata()?.len() != info.bytes {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the published sm is being replaced; retry",
+            ));
+        }
+        Ok((file, info.bytes))
+    })
+    .await??;
+    ranged(file, bytes, range.as_deref(), "application/octet-stream").await
 }
 pub(super) async fn probe(
     State(state): State<Arc<AppState>>,
@@ -426,6 +580,11 @@ impl AppState {
             &std::env::current_exe()?,
         )?;
         life::missed_alerts(manager, OffsetDateTime::now_utc().unix_timestamp())?;
+        if let Some(commit) = bk::cli_build::server_commit() {
+            if let Err(error) = file_cli_build_failure(self, manager, commit) {
+                eprintln!("backup mini build ticket: {error:#}");
+            }
+        }
         deliver_alerts(self, manager)
     }
 }

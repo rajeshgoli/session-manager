@@ -34,7 +34,11 @@ mod queue_artifacts;
 mod watch;
 
 #[derive(Parser)]
-#[command(name = "sm", version, about = "Session Manager Rust CLI")]
+#[command(
+    name = "sm",
+    version = env!("SM_CLI_VERSION"),
+    about = "Session Manager Rust CLI"
+)]
 struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     api_url: Option<String>,

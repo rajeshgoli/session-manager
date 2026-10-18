@@ -15,6 +15,10 @@ export const artifactInventory = (rows, query = '') => rows.filter(a => (a.state
 export const largestArtifacts = rows => artifactInventory(rows).filter(a => !needsDecision(a) && !needsAgentFollowup(a) && artifactBytes(a) >= 1e9).slice(0,5);
 export const artifactSummary = a => a.investigating ? 'Agent investigating' : needsAgentFollowup(a) ? (a.state === 'deleted' ? 'Folder missing · agent follow-up needed' : 'Storage issue · agent follow-up needed') : needsDecision(a) ? 'Cleanup proposed · review before deleting' : a.state === 'unrecorded' ? "Needs an agent’s record" : a.state === 'frozen' ? 'Compressed · restored when needed' : a.hot ? 'In recent use' : 'Saved work';
 export const backupSummary = b => !b ? 'Backup status unavailable' : !b.enabled ? 'Backup is off' : b.confirmed_at ? `Backup confirmed ${b.confirmed_at.slice(0,10)}` : 'No confirmed backup yet';
+// The remote disk's latest self-update of its sm (#2264), or null.
+export const backupUpdate = b => !b?.update ? null : b.update.ok
+  ? `Remote disk: updated to ${b.update.to}${b.update.at ? ` on ${b.update.at.slice(0,10)}` : ''}`
+  : `Remote disk: update to ${b.update.to} failed${b.update.at ? ` on ${b.update.at.slice(0,10)}` : ''}: ${b.update.error || 'unknown error'}`;
 export const duration = seconds => seconds == null || !Number.isFinite(seconds) ? 'unknown' : seconds < 60 ? `${Math.ceil(seconds)}s` : `${Math.ceil(seconds / 60)} min`;
 export function backupLabel(a) {
   const returning = a.backup_return_seconds == null ? 'return time not measured' : `estimated return ${duration(a.backup_return_seconds)}`;

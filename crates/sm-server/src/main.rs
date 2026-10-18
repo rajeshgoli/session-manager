@@ -78,6 +78,15 @@ struct Args {
     backup_prepare: Option<String>,
     #[arg(long, requires = "backup_prepare", hide = true)]
     backup_db: Option<PathBuf>,
+    /// Internal worker building the backup mini's sm for this commit (#2264).
+    #[arg(long, requires_all = ["backup_cli_dir", "backup_cli_source", "backup_cli_version"], hide = true)]
+    backup_cli_build: Option<String>,
+    #[arg(long, requires = "backup_cli_build", hide = true)]
+    backup_cli_dir: Option<PathBuf>,
+    #[arg(long, requires = "backup_cli_build", hide = true)]
+    backup_cli_source: Option<String>,
+    #[arg(long, requires = "backup_cli_build", hide = true)]
+    backup_cli_version: Option<String>,
     /// Wait for the serving slot to pass its listeners before startup writes.
     #[arg(long)]
     take_over: bool,
@@ -93,6 +102,14 @@ async fn main() -> Result<()> {
         return sm_server::managed_artifacts::backup::lifecycle::run_worker(
             args.backup_db.unwrap(),
             &id,
+        );
+    }
+    if let Some(commit) = args.backup_cli_build {
+        return sm_server::managed_artifacts::backup::cli_build::run_worker(
+            &commit,
+            &args.backup_cli_dir.unwrap(),
+            &args.backup_cli_source.unwrap(),
+            &args.backup_cli_version.unwrap(),
         );
     }
     if let Some(path) = args.local_wall_owner {

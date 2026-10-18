@@ -360,6 +360,7 @@ fn request_lifecycle_is_device_scoped_and_reuses_open_requests() {
         held_deletions: 0,
         check: None,
         error: None,
+        update: None,
     };
     l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
     let conn = f.manager.store.open().unwrap();
@@ -466,6 +467,7 @@ fn expired_request_retries_delta_and_alerts_recover_after_confirmation() {
             bad: vec!["plain/data/prices".into()],
         }),
         error: None,
+        update: None,
     };
     // The fixture's configured device is backup-mini; recovery is per device.
     crate::managed_artifacts::store::set_meta(&conn, "backup_missed:mini", "1").unwrap();

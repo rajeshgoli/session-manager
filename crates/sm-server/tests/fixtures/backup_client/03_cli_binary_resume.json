@@ -1,0 +1,8 @@
+{
+  "client": "sm backup pull, update step 2: a resumed download needs 206 and this Content-Range",
+  "method": "GET",
+  "path": "/backup/cli/binary",
+  "request_headers": {"range": "bytes=4-"},
+  "status": 206,
+  "response_headers": {"content-range": "bytes 4-9/10"}
+}

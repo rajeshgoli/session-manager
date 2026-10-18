@@ -1023,6 +1023,41 @@ pub(super) async fn post_link(
     Ok(Json(body))
 }
 
+/// Puts an issue sm itself filed under `goal`, as `sm board under` does.
+pub(super) fn place_under(
+    state: &AppState,
+    ticket: Key,
+    goal: Key,
+    actor_name: &str,
+) -> anyhow::Result<()> {
+    let request = LinkRequest {
+        ticket,
+        target: goal,
+        kind: EdgeKind::SubIssue,
+        remove: false,
+        actor: "sm:owner".to_owned(),
+        actor_name: actor_name.to_owned(),
+    };
+    {
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let store = board_store(state);
+        board::write_link(
+            &store,
+            state.board_source.as_ref(),
+            &request,
+            time::OffsetDateTime::now_utc(),
+        )?
+        .map_err(|refusal| anyhow::anyhow!("{}", refusal.detail()))?;
+        let recomputed = store.recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+        send_alerts(state, &recomputed);
+    }
+    request_pass(state);
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct PostLaneRequest {
     repo: String,

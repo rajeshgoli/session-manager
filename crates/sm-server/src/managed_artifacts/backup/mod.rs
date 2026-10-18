@@ -1,5 +1,6 @@
 //! Backup foundation. The request coordinator owns scheduling and authentication;
 //! these primitives never contact a remote device or delete source data.
+pub mod cli_build;
 pub mod client;
 pub mod lifecycle;
 mod outbox;
@@ -7,6 +8,7 @@ pub mod pull;
 mod scope;
 pub mod seed;
 mod store;
+pub mod update;
 pub use outbox::{prepare, Prepared, TransferManifest};
 pub use scope::{collect_scope, exclude_set, Exclude, Scope};
 pub use store::{confirm, confirmed, load_manifest, rates, record_rate, save_manifest, Rates};

@@ -32,6 +32,13 @@ fn successful((status, body): (u16, Value)) -> Result<Value> {
     );
     Ok(body)
 }
+fn clear_update(dest: &Destination) -> Result<()> {
+    dest.conn.execute(
+        "DELETE FROM metadata WHERE key=?1",
+        [super::update::PENDING_UPDATE],
+    )?;
+    Ok(())
+}
 fn clear_pending(dest: &Destination) -> Result<()> {
     dest.conn.execute(
         "DELETE FROM metadata WHERE key IN ('pending_request', 'pending_ack')",
@@ -49,6 +56,7 @@ fn finish(dest: &mut Destination, remote: &mut impl Remote, id: &str, ack: &Ack)
         dest.rollback(id)?;
         cleanup_staging(dest, id)?;
         clear_pending(dest)?;
+        clear_update(dest)?;
         bail!("backup integrity check failed; repair the reported files or reseed the destination");
     }
     complete_local(dest, id)
@@ -59,6 +67,7 @@ fn complete_local(dest: &Destination, id: &str) -> Result<()> {
     dest.confirm(id)?;
     cleanup_staging(dest, id)?;
     clear_pending(dest)?;
+    clear_update(dest)?;
     dest.expire_history(time::OffsetDateTime::now_utc().unix_timestamp())
 }
 fn cleanup_staging(dest: &Destination, id: &str) -> Result<()> {
@@ -222,6 +231,10 @@ pub(super) fn pull_with_check(
         held_deletions: applied.held_deletions,
         check,
         error: (!healthy).then(|| "destination integrity check failed".into()),
+        update: dest
+            .meta(super::update::PENDING_UPDATE)?
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?,
     };
     // Persist the exact ack before sending it: a lost response can be retried
     // without changing timings, rechecking different files, or moving history.
@@ -377,5 +390,59 @@ impl Remote for HttpRemote {
         Ok(serde_json::from_str(
             &response.body_mut().read_to_string()?,
         )?)
+    }
+}
+impl super::update::CliSource for HttpRemote {
+    fn cli(&mut self) -> Result<Option<super::update::CliInfo>> {
+        // Read the status before the body: a server without this route answers
+        // 404 with no JSON, and that means "nothing to update to".
+        let mut response = self.agent.get(format!("{}/backup/cli", self.base)).call()?;
+        let code = response.status().as_u16();
+        if code == 404 {
+            return Ok(None);
+        }
+        let text = response.body_mut().read_to_string()?;
+        ensure!(
+            (200..300).contains(&code),
+            "backup server returned {code} for the published sm: {text}"
+        );
+        Ok(Some(
+            serde_json::from_str(&text).context("published sm description is malformed")?,
+        ))
+    }
+    fn cli_download(
+        &mut self,
+        info: &super::update::CliInfo,
+        offset: u64,
+        output: &mut dyn Write,
+    ) -> Result<()> {
+        let mut request = self.agent.get(format!("{}/backup/cli/binary", self.base));
+        if offset > 0 {
+            request = request.header("Range", format!("bytes={offset}-"));
+        }
+        let mut response = request.call()?;
+        ensure!(
+            response.status().as_u16() == if offset == 0 { 200 } else { 206 },
+            "backup server refused the sm download: {}",
+            response.status()
+        );
+        if offset > 0 {
+            ensure!(
+                response
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    == Some(format!("bytes {offset}-{}/{}", info.bytes - 1, info.bytes).as_str()),
+                "sm download range response mismatch"
+            );
+        }
+        let remaining = info
+            .bytes
+            .checked_sub(offset)
+            .context("invalid resume offset")?;
+        let mut reader = response.body_mut().as_reader();
+        let copied = io::copy(&mut reader.by_ref().take(remaining), output)?;
+        ensure!(copied == remaining, "sm download interrupted");
+        Ok(())
     }
 }

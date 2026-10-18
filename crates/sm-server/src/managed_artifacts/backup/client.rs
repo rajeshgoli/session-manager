@@ -21,6 +21,10 @@ pub struct Destination {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     pub confirmed: Option<String>,
+    /// Versions of `sm` that `sm backup pull --rollback` backed out; not reinstalled
+    /// until the server advertises another version (#2264).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_versions: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Applied {
@@ -165,6 +169,11 @@ impl Destination {
         }
     }
     pub fn confirm(&self, id: &str) -> Result<()> {
+        let mut state = self.state()?;
+        state.confirmed = Some(id.into());
+        self.write_state(&state)
+    }
+    pub fn write_state(&self, state: &State) -> Result<()> {
         let path = safe_path(&self.root, "state.json.tmp", false)?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -173,12 +182,7 @@ impl Destination {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
-        serde_json::to_writer(
-            &mut file,
-            &State {
-                confirmed: Some(id.into()),
-            },
-        )?;
+        serde_json::to_writer(&mut file, state)?;
         file.sync_all()?;
         fs::rename(path, safe_path(&self.root, "state.json", false)?)?;
         File::open(&self.root)?.sync_all()?;
