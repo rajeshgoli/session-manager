@@ -1038,7 +1038,7 @@ fn opencode_launch_record(
         credential_rotation_id: None,
         restore_authorized: operation == "restore",
         opencode_restore_terminal_metadata: None,
-        initial_message: request.initial_message.clone(),
+        initial_message: request.initial_message.as_deref().map(with_local_addendum),
         model: record.model.clone(),
         reasoning_effort: None,
         spawn_launch_intent_id: request
@@ -1056,4 +1056,16 @@ fn opencode_launch_record(
         updated_at: now,
         failure_reason: None,
     }
+}
+
+/// Standing instructions every local agent needs: the judge's rules for
+/// publishing, messaging and reading denials. Appended to the task brief.
+const LOCAL_AGENT_ADDENDUM: &str = include_str!("../../../../docs/product/local_agent_addendum.md");
+
+fn with_local_addendum(brief: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        brief.trim_end(),
+        LOCAL_AGENT_ADDENDUM.trim_end()
+    )
 }

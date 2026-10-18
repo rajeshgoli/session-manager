@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shlex
+import subprocess
 import shutil
 import hashlib
 import fcntl
@@ -48,6 +49,7 @@ ACTIVE = 0
 DRAIN = threading.Condition(LOCK)
 STOP_EVENT = threading.Event()
 
+UNCLEAR = "the judge gave no clear ruling on this exact command; this is not an outage"
 DENY_TAIL = ("Denied ({id}). Do not retry this in another form. If the work needs it, tell your parent "
              "with sm send, then continue with what you can do, or stop.")
 
@@ -322,6 +324,111 @@ def current_branch(agent):
     return None
 
 
+# Workflow commands the policy always permits. The local model misreads some of
+# them (a branch named local-main read as main; a doc's text read as commands),
+# so a command made only of these segments is decided here, not by the model.
+UNSAFE_FOR_RULES = {"credential", "obfuscation", "dynamic shell expansion", "shell wildcard"}
+SM_READS = {("status",), ("me",), ("what",), ("children",), ("--help",), ("queue", "list"),
+            ("doc", "cat"), ("doc", "list"), ("doc", "show")}
+
+
+def push_has_configured_destination(agent):
+    """remote.origin.push can map `git push origin <b>` onto another branch."""
+    try:
+        out = subprocess.run(["git", "-C", agent["checkout"], "config", "--get-all", "remote.origin.push"],
+                             capture_output=True, timeout=5)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+    return out.returncode != 1
+
+
+def workflow_segment(words, cwd, agent):
+    """Reason when one simple command is a permitted workflow command, else None."""
+    branch = agent["branch"]
+    checkout = os.path.realpath(agent["checkout"])
+    if words[:2] == ["git", "push"]:
+        args = [w for w in words[2:] if w not in ("-u", "--set-upstream")]
+        if os.path.realpath(cwd) != checkout or len(args) != 2 or args[0] != "origin":
+            return None
+        if current_branch(agent) != branch or branch in ("main", "master"):
+            return None
+        if args[1] in (f"{branch}:{branch}", f"HEAD:{branch}"):
+            return "push of the registered branch to origin"
+        if args[1] in (branch, "HEAD") and not push_has_configured_destination(agent):
+            return "push of the registered branch to origin"
+        return None
+    if words[:3] == ["sm", "doc", "publish"]:
+        paths, rest = [], words[3:]
+        while rest:
+            word = rest.pop(0)
+            if word in ("--review", "--no-pr"):
+                continue
+            if word == "--pr" and rest and rest[0].isdigit():
+                rest.pop(0)
+                continue
+            if word in ("--title", "--note") and rest:
+                rest.pop(0)
+                continue
+            if word.startswith("-"):
+                return None
+            paths.append(word)
+        if len(paths) != 1:
+            return None
+        path = os.path.realpath(os.path.join(cwd, paths[0]))
+        if not (path.startswith(checkout + os.sep) and os.path.isfile(path)):
+            return None
+        return "sm doc publish of a file in the checkout"
+    if words[0] == "sm" and any(tuple(words[1:1 + len(k)]) == k for k in SM_READS):
+        if "--out" in words:
+            return None
+        return f"sm {words[1]} is a permitted sm command"
+    return None
+
+
+def workflow_rule(cmd, cwd, agent, hits):
+    """Allow reason when every segment is a permitted workflow command, an
+    in-checkout `cd`, or a head/tail of its output; otherwise None."""
+    if UNSAFE_FOR_RULES & set(hits) or "\n" in cmd or "\r" in cmd:
+        return None
+    cmd = re.sub(r"(?<=\s)2>&1(?=\s|$)", "", cmd)
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments, current, op = [], [], None
+    for token in tokens + [";"]:
+        if token in ("&&", "|", ";"):
+            if not current:
+                return None
+            segments.append((op, current))
+            current, op = [], token
+        elif set(token) & set(";&|()<>"):
+            return None
+        else:
+            current.append(token)
+    reasons = []
+    for op, words in segments:
+        if words[0] in ("tail", "head"):
+            if op != "|" or not all(re.fullmatch(r"-n|-?[0-9]+|-n[0-9]+", w) for w in words[1:]):
+                return None
+            continue
+        if op == "|":
+            return None
+        if words[0] == "cd":
+            target = os.path.realpath(os.path.join(cwd, os.path.expanduser(words[1]))) if len(words) == 2 else ""
+            if not target or not inside(target, agent) or not os.path.isdir(target):
+                return None
+            cwd = target
+            continue
+        reason = workflow_segment(words, cwd, agent)
+        if reason is None:
+            return None
+        reasons.append(reason)
+    return "; ".join(reasons) if reasons else None
+
+
 def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
@@ -357,6 +464,9 @@ def rule_stage(tool, tin, cwd, agent):
                 return "deny", "checkout HEAD does not name the registered branch"
         if not hits:
             return "allow", "no egress word in the command"
+        reason = workflow_rule(cmd, cwd or agent["checkout"], agent, egress_hits(cmd, agent))
+        if reason:
+            return "allow", reason
         return "judge", "egress words: " + ", ".join(hits)
     return "judge", f"tool {tool} has no rule"
 
@@ -378,7 +488,9 @@ def judge_message(tool, tin, agent):
             "Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.")
 
 
-VERDICT = re.compile(r"^(ALLOW|DENY): ([^\r\n]+)$")
+# `ALLOW: reason`, also bare or markdown-wrapped (`**DENY** - reason`). A word
+# that merely starts with the verdict (`ALLOWING`) is not one.
+VERDICT = re.compile(r"^[*_`#> ]*(ALLOW|DENY)\b[*_`]*\s*(?:[:\-\u2013\u2014.]\s*)?([^\r\n]*)$")
 
 
 def verdict(line):
@@ -388,7 +500,9 @@ def verdict(line):
     match = VERDICT.fullmatch(line.strip())
     if not match:
         return None
-    return match.group(1).lower(), " ".join(match.group(2).split()[:20])
+    reason = " ".join(match.group(2).strip("*_` ").split()[:20])
+    decision = match.group(1).lower()
+    return decision, reason or {"allow": "allowed", "deny": "denied"}[decision] + " by the judge"
 
 
 def ask_judge_stream(tool, tin, agent):
@@ -570,7 +684,10 @@ def decide(hook, agent_id, token):
                         rec["judge_raw"] = raw[:500]
                     except Exception as e:  # timeout, connection, parse: all deny
                         rec["judge_error"] = f"{type(e).__name__}: {e}"[:300]
-                        decision, reason = "deny", "judge unavailable; retry this command in a minute"
+                        # The model answers deterministically: an unreadable answer
+                        # is not an outage, and retrying would repeat it.
+                        decision, reason = "deny", (UNCLEAR if "unparseable" in str(e)
+                                                    else "judge unavailable; retry this command in a minute")
     rec.update(stage=stage, decision=decision, reason=reason, ms=round((time.time() - t0) * 1000))
     if decision == "deny":
         rec["denial_id"] = new_denial_id()

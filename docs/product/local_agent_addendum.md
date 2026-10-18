@@ -11,5 +11,12 @@ and run `sm request-review` for that pull request. Address correctness findings
 before declaring the work complete. The local judge checks every tool call;
 if it denies an action, read the reason and do not disguise the same action.
 
+Push only your registered branch, to `origin`. To give the owner a document,
+commit it, push, open a pull request with `gh pr create`, then run
+`sm doc publish <path> --pr <number> --review`. Write every `sm send` message
+inline or in a heredoc; the judge denies a message body read from a file.
+"Judge unavailable" means the judge could not be reached: retry once a minute
+later. "No clear ruling" is not an outage; report the command to your parent.
+
 If you cannot continue, report the specific blocker to your parent with
 `sm send`, including what you finished and what remains, then stop and wait.

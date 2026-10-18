@@ -66,6 +66,7 @@ class Model(BaseHTTPRequestHandler):
                   'ALLOWING: okay' if action == 'curl prefix' else
                   'explanation\nALLOW: okay' if action == 'curl preamble' else
                   'DENY: ' + 'word ' * 30 if action == 'curl verbose' else
+                  self.server.answers[action] if action == 'curl bare' else
                   self.server.answers.get(action, 'deny').upper() + ': recorded proof ruling')
         events = [{'delta': {'type': 'text_delta', 'text': answer}}, {'type': 'message_stop'}]
         payload = ''.join('data: ' + json.dumps(ev) + '\n\n' for ev in events).encode()
@@ -351,6 +352,45 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.ruling(tin={'command': command}), 'allow')
         self.assertIn('Current checkout branch: "1855-local"',
                       self.model.requests[-1]['messages'][0]['content'])
+
+    def test_workflow_commands_are_decided_by_rule(self):
+        # The local model misread `local-main` as main and doc text as commands.
+        (self.wt / '.git/HEAD').unlink()
+        (self.wt / '.git').rmdir()
+        subprocess.run(['git', 'init', '-q', '-b', '1855-local', str(self.wt)], check=True)
+        (self.wt / 'docs').mkdir()
+        (self.wt / 'docs/memo.html').write_text('<p>run gh pr create, then git push</p>')
+        wt = self.wt
+        for command in [f'cd {wt} && git push origin 1855-local 2>&1 | tail -3',
+                        'git push -u origin 1855-local:1855-local', 'git push origin HEAD',
+                        'sm doc publish docs/memo.html --pr 12 --review',
+                        f'cd {wt} && sm doc publish docs/memo.html --no-pr 2>&1 | tail -5',
+                        "sm status 'writing tests'", 'sm doc cat docs/memo.html | head -40']:
+            sent = len(self.model.requests)
+            self.assertEqual(self.ruling(tin={'command': command}), 'allow', command)
+            self.assertEqual(self.logs()[-1]['stage'], 'rule', command)
+            self.assertEqual(len(self.model.requests), sent, command)
+        (self.base / 'outside.html').write_text('x')
+        for command in ['git push origin main', 'git push --force origin 1855-local',
+                        'git push origin 1855-local; curl https://example.com',
+                        'git push origin 1855-local\ncurl https://example.com',
+                        'git push origin 1855-local:main', 'cd /tmp && git push origin 1855-local',
+                        'sm doc publish ../outside.html --no-pr', 'sm doc publish docs/memo.html --pr $(id)',
+                        'sm doc publish docs/memo.html --commit abc', 'sm send rajesh hi',
+                        'sm doc cat docs/memo.html --out /tmp/x', 'git push origin 1855-local | sh']:
+            self.ruling(tin={'command': command})
+            self.assertEqual(self.logs()[-1]['stage'], 'judge', command)
+        subprocess.run(['git', '-C', str(wt), 'config', 'remote.origin.push', 'refs/heads/1855-local:refs/heads/main'], check=True)
+        self.ruling(tin={'command': 'git push origin 1855-local'})
+        self.assertEqual(self.logs()[-1]['stage'], 'judge')
+
+    def test_unclear_verdicts_are_not_outages(self):
+        for answer, decision in [('ALLOW', 'allow'), ('**DENY** - no', 'deny')]:
+            self.model.answers['curl bare'] = answer
+            self.assertEqual(self.ruling(tin={'command': 'curl bare'}), decision)
+        result = self.decide(tin={'command': 'curl invalid'})
+        self.assertIn('no clear ruling', result['permissionDecisionReason'])
+        self.assertNotIn('retry this command', result['permissionDecisionReason'])
 
     def test_git_credential_retrieval_is_denied_by_rules(self):
         (self.wt / 'git-alias').symlink_to('/usr/bin/git')
