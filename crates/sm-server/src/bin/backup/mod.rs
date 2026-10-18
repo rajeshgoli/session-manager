@@ -44,6 +44,9 @@ enum BackupCommand {
         dest: PathBuf,
         #[arg(long)]
         adopt_plain: Option<PathBuf>,
+        /// Discard files an earlier, unfinished seed staged instead of reusing them.
+        #[arg(long)]
+        fresh: bool,
         #[arg(long, default_value = "~/.config/session-manager/config.yaml")]
         config: PathBuf,
     },
@@ -143,13 +146,14 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
             device,
             dest,
             adopt_plain,
+            fresh,
             config,
         } => {
             let config = AppConfig::load_from_path(expanded(&config))?;
             let manager = ManagedArtifacts::new(&config.managed_artifacts)?;
             let mut destination = Destination::open(&expanded(&dest))?;
             let adopt = adopt_plain.as_ref().map(|p| expanded(p));
-            let id = seed::seed(&manager, &device, &mut destination, adopt.as_deref())?;
+            let id = seed::seed(&manager, &device, &mut destination, adopt.as_deref(), fresh)?;
             println!("Seed verified and confirmed: {id}");
         }
         BackupCommand::SelfTest { identity } => {

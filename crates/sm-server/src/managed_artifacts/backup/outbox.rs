@@ -24,6 +24,56 @@ pub struct Prepared {
     pub parts: Vec<Part>,
     pub deferred: Vec<String>,
     pub directory: PathBuf,
+    /// Files, and their source bytes, an earlier seed had already staged.
+    pub reused: (u64, u64),
+}
+/// Seed staging index: one line per placed file, appended and synced as it is
+/// placed, so a later seed can reuse what an interrupted one staged (#2301).
+pub(super) const INDEX: &str = "index.jsonl";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Staged {
+    pub record: FileRecord,
+    /// Size of the staged copy, which for packed scopes is compressed.
+    pub staged_bytes: u64,
+    /// The staged copy's own mtime. Renames keep it and every new copy gets a
+    /// new one, so a line matches only the copy it was written for.
+    pub staged_mtime_ns: i128,
+}
+/// Staged files by path, the last line for a path winning. A line torn by a
+/// crash is cut off so the next append starts on a line of its own.
+pub(super) fn staged_index(staging: &Path) -> Result<BTreeMap<String, Staged>> {
+    let path = staging.join(INDEX);
+    let body = match fs::read(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let whole = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    if whole < body.len() {
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(whole as u64)?;
+        file.sync_all()?;
+    }
+    Ok(body[..whole]
+        .split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Staged>(line).ok())
+        .map(|staged| (staged.record.path.clone(), staged))
+        .collect())
+}
+/// Delete staged files no record kept, then the directories that leaves empty.
+fn sweep(dir: &Path, keep: &std::collections::BTreeSet<PathBuf>, top: bool) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.is_dir() {
+            sweep(&path, keep, false)?;
+        } else if !(keep.contains(&path) || top && path.file_name() == Some(INDEX.as_ref())) {
+            fs::remove_file(&path)?;
+        }
+    }
+    if !top && fs::read_dir(dir)?.next().is_none() {
+        fs::remove_dir(dir)?;
+    }
+    Ok(())
 }
 struct Staging(PathBuf, bool);
 impl Drop for Staging {
@@ -128,6 +178,12 @@ fn stage(
     if !same(before, &input.metadata()?) {
         return Ok(None);
     }
+    #[cfg(test)]
+    READS.with(|reads| {
+        if let Some(reads) = reads.borrow_mut().as_mut() {
+            reads.push(source.to_path_buf());
+        }
+    });
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -178,6 +234,10 @@ type ReadHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! { pub(super) static DIRECT_FLOOR: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
+thread_local! { pub(super) static READS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_AFTER_PLACED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
 thread_local! { pub(super) static AFTER_READ: std::cell::RefCell<Option<ReadHook>> = const { std::cell::RefCell::new(None) }; }
 
 /// Create one immutable outbox. Caller persists the candidate manifest and only
@@ -194,7 +254,9 @@ pub fn prepare(
 /// Seeding: place each staged file at `<staging>/<record path>`, the layout
 /// `Destination::unpack` produces, instead of packing transit parts. Free space
 /// on the staging disk is checked per file against a 5% floor, since the raw
-/// scope can far exceed the compressed result.
+/// scope can far exceed the compressed result. Existing staging is resumed: a
+/// file whose source still matches its index line is reused unread, and staged
+/// files no source still needs are deleted. Staging is never removed here.
 pub(super) fn prepare_direct(
     manager: &ManagedArtifacts,
     scopes: &[Scope],
@@ -221,16 +283,48 @@ pub(super) fn prepare_with_progress(
         config.outbox_part_bytes > 0,
         "backup part limit must be positive"
     );
+    let resumed = direct.is_some_and(Path::exists);
     let directory = match direct {
         Some(staging) => {
-            fs::create_dir(staging)?;
+            if !resumed {
+                fs::create_dir(staging)?;
+                // Resuming needs the staging folder itself to survive a crash.
+                let incoming = staging.parent().context("staging has no parent")?;
+                for dir in [Some(incoming), incoming.parent()].into_iter().flatten() {
+                    File::open(dir)?.sync_all()?;
+                }
+            }
+            for stale in [".payload", "manifest.json"] {
+                match fs::remove_file(staging.join(stale)) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+            }
             staging.to_path_buf()
         }
         None => outbox_directory(manager, scopes, base, id)?,
     };
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let mut guard = Staging(directory.clone(), false);
+    let mut guard = Staging(directory.clone(), direct.is_some());
+    let index = if resumed {
+        staged_index(&directory)?
+    } else {
+        BTreeMap::new()
+    };
+    let mut index_file = match direct {
+        Some(_) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(directory.join(INDEX))?,
+        ),
+        None => None,
+    };
+    let mut reused = (0u64, 0u64);
+    #[cfg(test)]
+    let mut placed_count = 0usize;
     let direct_floor = match direct {
         Some(_) => {
             let disk = nix::sys::statvfs::statvfs(&directory)?;
@@ -317,6 +411,23 @@ pub(super) fn prepare_with_progress(
                 manifest.files.insert(path, old.clone());
                 continue;
             }
+            // The rule above, against the staging index of an interrupted seed.
+            if let Some(staged) = index.get(&path).filter(|s| {
+                s.record.size == record.size
+                    && s.record.mtime_ns == record.mtime_ns
+                    && s.record.mode == record.mode
+                    && s.record.target.is_none()
+                    && record.target.is_none()
+                    && fs::symlink_metadata(directory.join(&path)).is_ok_and(|m| {
+                        m.is_file() && m.len() == s.staged_bytes && mtime(&m) == s.staged_mtime_ns
+                    })
+            }) {
+                reused = (reused.0 + 1, reused.1 + record.size);
+                manifest.files.insert(path, staged.record.clone());
+                changed.push(staged.record.clone());
+                progress(entry.size)?;
+                continue;
+            }
             let spool = directory.join(".payload");
             let stable = if record.target.is_some() {
                 fs::read_link(&source)
@@ -348,9 +459,42 @@ pub(super) fn prepare_with_progress(
             } else {
                 if record.target.is_none() && direct.is_some() {
                     let placed = directory.join(&record.path);
-                    fs::create_dir_all(placed.parent().context("staged path has no parent")?)?;
+                    super::client::verify(&spool, &record)?;
+                    let spooled = fs::metadata(&spool)?;
+                    let parent = placed.parent().context("staged path has no parent")?;
+                    // Each folder created here is synced into its own parent.
+                    let created: Vec<_> = parent
+                        .ancestors()
+                        .take_while(|dir| !dir.exists())
+                        .map(Path::to_path_buf)
+                        .collect();
+                    fs::create_dir_all(parent)?;
+                    for dir in &created {
+                        File::open(dir.parent().context("staged folder has no parent")?)?
+                            .sync_all()?;
+                    }
+                    // The placed file is durable before its line is, and the
+                    // line names the copy's own mtime, so an index line never
+                    // vouches for an older copy of the path.
                     fs::rename(&spool, &placed)?;
-                    super::client::verify(&placed, &record)?;
+                    File::open(parent)?.sync_all()?;
+                    File::open(&directory)?.sync_all()?;
+                    let mut line = serde_json::to_vec(&Staged {
+                        record: record.clone(),
+                        staged_bytes: spooled.len(),
+                        staged_mtime_ns: mtime(&spooled),
+                    })?;
+                    line.push(b'\n');
+                    let index_file = index_file.as_mut().context("seed index not open")?;
+                    index_file.write_all(&line)?;
+                    index_file.sync_data()?;
+                    #[cfg(test)]
+                    {
+                        placed_count += 1;
+                        if FAIL_AFTER_PLACED.get() == Some(placed_count) {
+                            anyhow::bail!("injected stop after {placed_count} staged files");
+                        }
+                    }
                 } else if record.target.is_none() {
                     if writer.as_ref().is_some_and(|w| {
                         w.input_bytes.saturating_add(record.size) > config.outbox_part_bytes
@@ -374,6 +518,14 @@ pub(super) fn prepare_with_progress(
     }
     if let Some(writer) = writer {
         parts.push(writer.finish()?);
+    }
+    if resumed {
+        let keep = changed
+            .iter()
+            .filter(|r| r.target.is_none())
+            .map(|r| directory.join(&r.path))
+            .collect();
+        sweep(&directory, &keep, true)?;
     }
     let deleted = base
         .into_iter()
@@ -403,6 +555,7 @@ pub(super) fn prepare_with_progress(
         parts,
         deferred,
         directory,
+        reused,
     })
 }
 
