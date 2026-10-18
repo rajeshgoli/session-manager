@@ -631,6 +631,27 @@ fn client_round_trip_history_deletion_guard_and_lost_ack_replay() {
 }
 
 #[test]
+fn destination_open_waits_out_a_briefly_held_lock() {
+    use super::client::Destination;
+    use std::os::unix::io::AsRawFd;
+    let f = Fixture::new();
+    let root = f.dir.join("remote");
+    drop(Destination::open(&root).unwrap());
+    // A forked child that has not yet exec'd holds the lock on its own descriptor.
+    let held = fs::File::open(root.join(".sm-backup.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(held);
+    });
+    Destination::open(&root).unwrap();
+    release.join().unwrap();
+}
+
+#[test]
 fn client_detects_corruption_and_refuses_untracked_file_loss_and_symlink_escape() {
     use super::client::Destination;
     let f = Fixture::new();
