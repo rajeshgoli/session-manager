@@ -150,6 +150,8 @@ fn stage(
     };
     if packed {
         let mut encoder = zstd::stream::write::Encoder::new(file, 9)?;
+        // Standard zstd output either way; workers only shorten large files.
+        encoder.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
         copy(&mut encoder)?;
         encoder.finish()?.sync_all()?;
     } else {
@@ -174,6 +176,8 @@ fn stage(
 #[cfg(test)]
 type ReadHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
+thread_local! { pub(super) static DIRECT_FLOOR: std::cell::Cell<Option<u128>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
 thread_local! { pub(super) static AFTER_READ: std::cell::RefCell<Option<ReadHook>> = const { std::cell::RefCell::new(None) }; }
 
 /// Create one immutable outbox. Caller persists the candidate manifest and only
@@ -184,7 +188,21 @@ pub fn prepare(
     base: Option<&Manifest>,
     id: &str,
 ) -> Result<Prepared> {
-    prepare_with_progress(manager, scopes, base, id, |_| Ok(()))
+    prepare_with_progress(manager, scopes, base, id, None, |_| Ok(()))
+}
+
+/// Seeding: place each staged file at `<staging>/<record path>`, the layout
+/// `Destination::unpack` produces, instead of packing transit parts. Free space
+/// on the staging disk is checked per file against a 5% floor, since the raw
+/// scope can far exceed the compressed result.
+pub(super) fn prepare_direct(
+    manager: &ManagedArtifacts,
+    scopes: &[Scope],
+    base: Option<&Manifest>,
+    id: &str,
+    staging: &Path,
+) -> Result<Prepared> {
+    prepare_with_progress(manager, scopes, base, id, Some(staging), |_| Ok(()))
 }
 
 pub(super) fn prepare_with_progress(
@@ -192,6 +210,7 @@ pub(super) fn prepare_with_progress(
     scopes: &[Scope],
     base: Option<&Manifest>,
     id: &str,
+    direct: Option<&Path>,
     mut progress: impl FnMut(u64) -> Result<()>,
 ) -> Result<Prepared> {
     safe_relative(id)?;
@@ -202,42 +221,26 @@ pub(super) fn prepare_with_progress(
         config.outbox_part_bytes > 0,
         "backup part limit must be positive"
     );
-    let outbox = crate::sessions::expand_home(&config.outbox);
-    let parent = outbox.parent().context("outbox has no parent")?;
-    let parent_meta = fs::metadata(parent).context("backup cold store unavailable")?;
-    ensure!(
-        manager.config.roots.iter().any(|r| moves::cold_mounted(r)
-            && fs::metadata(&r.cold_store).is_ok_and(|m| m.dev() == parent_meta.dev())),
-        "outbox is not on a mounted cold store"
-    );
-    let (_, estimate) = pending_input(scopes, base)?;
-    let estimate = u128::from(estimate);
-    let disk = nix::sys::statvfs::statvfs(parent)?;
-    let free = u128::from(disk.blocks_available()) * u128::from(disk.fragment_size());
-    let floor = u128::from(disk.blocks())
-        * u128::from(disk.fragment_size())
-        * u128::from(manager.config.floor_percent)
-        / 100;
-    ensure!(
-        free >= estimate + floor,
-        "backup outbox would cross cold-store floor"
-    );
-    match fs::create_dir(&outbox) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let m = fs::symlink_metadata(&outbox)?;
-            ensure!(
-                m.is_dir() && m.dev() == parent_meta.dev(),
-                "unsafe backup outbox directory"
-            );
+    let directory = match direct {
+        Some(staging) => {
+            fs::create_dir(staging)?;
+            staging.to_path_buf()
         }
-        Err(e) => return Err(e.into()),
-    }
-    let directory = outbox.join(id);
-    fs::create_dir(&directory)?;
+        None => outbox_directory(manager, scopes, base, id)?,
+    };
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let mut guard = Staging(directory.clone(), false);
+    let direct_floor = match direct {
+        Some(_) => {
+            let disk = nix::sys::statvfs::statvfs(&directory)?;
+            let floor = u128::from(disk.blocks()) * u128::from(disk.fragment_size()) * 5 / 100;
+            #[cfg(test)]
+            let floor = DIRECT_FLOOR.get().unwrap_or(floor);
+            Some(floor)
+        }
+        None => None,
+    };
     let mut manifest = Manifest {
         manifest_id: id.into(),
         base: base.map(|m| m.manifest_id.clone()),
@@ -325,6 +328,15 @@ pub(super) fn prepare_with_progress(
             } else if metadata.len() != entry.size || mtime(&metadata) != record.mtime_ns {
                 false
             } else {
+                if let Some(floor) = direct_floor {
+                    let disk = nix::sys::statvfs::statvfs(&directory)?;
+                    let free =
+                        u128::from(disk.blocks_available()) * u128::from(disk.fragment_size());
+                    ensure!(
+                        free >= u128::from(entry.size) + floor,
+                        "backup destination would cross its floor"
+                    );
+                }
                 record.sha256 = stage(&source, &spool, !scope.plain, &metadata)?;
                 record.sha256.is_some()
             };
@@ -334,7 +346,12 @@ pub(super) fn prepare_with_progress(
                 }
                 deferred.push(path);
             } else {
-                if record.target.is_none() {
+                if record.target.is_none() && direct.is_some() {
+                    let placed = directory.join(&record.path);
+                    fs::create_dir_all(placed.parent().context("staged path has no parent")?)?;
+                    fs::rename(&spool, &placed)?;
+                    super::client::verify(&placed, &record)?;
+                } else if record.target.is_none() {
                     if writer.as_ref().is_some_and(|w| {
                         w.input_bytes.saturating_add(record.size) > config.outbox_part_bytes
                             && w.input_bytes > 0
@@ -387,6 +404,50 @@ pub(super) fn prepare_with_progress(
         deferred,
         directory,
     })
+}
+
+/// The cold-store outbox for one request, after its location and capacity checks.
+fn outbox_directory(
+    manager: &ManagedArtifacts,
+    scopes: &[Scope],
+    base: Option<&Manifest>,
+    id: &str,
+) -> Result<PathBuf> {
+    let config = &manager.config.backup;
+    let outbox = crate::sessions::expand_home(&config.outbox);
+    let parent = outbox.parent().context("outbox has no parent")?;
+    let parent_meta = fs::metadata(parent).context("backup cold store unavailable")?;
+    ensure!(
+        manager.config.roots.iter().any(|r| moves::cold_mounted(r)
+            && fs::metadata(&r.cold_store).is_ok_and(|m| m.dev() == parent_meta.dev())),
+        "outbox is not on a mounted cold store"
+    );
+    let (_, estimate) = pending_input(scopes, base)?;
+    let estimate = u128::from(estimate);
+    let disk = nix::sys::statvfs::statvfs(parent)?;
+    let free = u128::from(disk.blocks_available()) * u128::from(disk.fragment_size());
+    let floor = u128::from(disk.blocks())
+        * u128::from(disk.fragment_size())
+        * u128::from(manager.config.floor_percent)
+        / 100;
+    ensure!(
+        free >= estimate + floor,
+        "backup outbox would cross cold-store floor"
+    );
+    match fs::create_dir(&outbox) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let m = fs::symlink_metadata(&outbox)?;
+            ensure!(
+                m.is_dir() && m.dev() == parent_meta.dev(),
+                "unsafe backup outbox directory"
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let directory = outbox.join(id);
+    fs::create_dir(&directory)?;
+    Ok(directory)
 }
 
 /// Count only changed regular files; full-scope estimates must not reserve a

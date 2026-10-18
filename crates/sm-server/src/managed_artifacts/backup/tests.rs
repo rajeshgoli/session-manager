@@ -1007,7 +1007,9 @@ fn seed_refuses_active_pull_before_changing_destination() {
         dest.state().unwrap().confirmed.as_deref(),
         Some(first.as_str())
     );
-    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+    // A seed stages on the destination and leaves nothing in the outbox.
+    let outbox = f.dir.join("outbox");
+    assert!(!outbox.exists() || fs::read_dir(outbox).unwrap().count() == 0);
 }
 
 #[test]
@@ -1024,7 +1026,7 @@ fn failed_seed_application_removes_destination_staging() {
         0
     );
     assert_eq!(fs::read(plain.join("prices")).unwrap(), b"untracked");
-    assert_eq!(fs::read_dir(f.dir.join("outbox")).unwrap().count(), 0);
+    assert!(!f.dir.join("outbox").exists());
 }
 
 #[test]
@@ -2019,4 +2021,36 @@ fn disk_reports_are_stored_rendered_and_a_failing_drive_alerts_weekly() {
     };
     let error = l::acknowledge(&f.manager, "mini", &req.id, &bad).unwrap_err();
     assert_eq!(error.to_string(), "invalid backup disk report");
+}
+
+#[test]
+fn seed_stages_on_destination_refuses_past_floor_and_clears_stale_staging() {
+    use super::{client::Destination, seed};
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    fs::create_dir_all(dest.root.join(".incoming/seed-stale/plain")).unwrap();
+    outbox::DIRECT_FLOOR.set(Some(u128::MAX / 2));
+    let error = seed::seed(&f.manager, "backup-mini", &mut dest, None)
+        .unwrap_err()
+        .to_string();
+    outbox::DIRECT_FLOOR.set(None);
+    assert!(error.contains("would cross its floor"), "{error}");
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
+    assert!(dest.state().unwrap().confirmed.is_none());
+    // No outbox is created on the cold store for a seed.
+    seed::seed(&f.manager, "backup-mini", &mut dest, None).unwrap();
+    assert!(!f.dir.join("outbox").exists());
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"prices"
+    );
+    assert_eq!(
+        fs::read_dir(dest.root.join(".incoming")).unwrap().count(),
+        0
+    );
 }

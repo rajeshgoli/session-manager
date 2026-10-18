@@ -192,7 +192,7 @@ pub fn status(manager: &ManagedArtifacts, device: &str, id: &str) -> Result<Requ
 /// The device's latest disk report, from its acknowledgements (#2276).
 fn latest_disk(conn: &Connection, device: &str) -> Result<Option<(i64, super::disk::Disk)>> {
     let mut stmt = conn.prepare(
-        "SELECT acked_at,ack_json FROM backup_requests WHERE device=?1 AND ack_json IS NOT NULL ORDER BY acked_at DESC,created_at DESC",
+        "SELECT acked_at,ack_json FROM backup_requests WHERE device=?1 AND ack_json IS NOT NULL ORDER BY acked_at DESC,created_at DESC,rowid DESC",
     )?;
     let mut rows = stmt.query([device])?;
     while let Some(r) = rows.next()? {
@@ -324,8 +324,13 @@ pub fn prepare_request(manager: &ManagedArtifacts, id: &str) -> Result<()> {
             coverage.push(json!({"source":scope.source,"prefix":scope.prefix(),"stamp":scope.measure()?.stamp()}));
         }
         let mut progress_at = std::time::Instant::now();
-        let prepared =
-            super::outbox::prepare_with_progress(manager, &scopes, base.as_ref(), id, |bytes| {
+        let prepared = super::outbox::prepare_with_progress(
+            manager,
+            &scopes,
+            base.as_ref(),
+            id,
+            None,
+            |bytes| {
                 remaining = remaining.saturating_sub(bytes);
                 if remaining == 0 || progress_at.elapsed().as_secs() >= 1 {
                     conn.execute(
@@ -335,7 +340,8 @@ pub fn prepare_request(manager: &ManagedArtifacts, id: &str) -> Result<()> {
                     progress_at = std::time::Instant::now();
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         coverage.retain(|scope| {
             !prepared
                 .deferred
