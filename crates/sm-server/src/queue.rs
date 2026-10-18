@@ -14468,8 +14468,9 @@ mod review_queue_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelReloadBlock {
     None,
-    /// A perf job is running: it owns the machine, so the reload hold restarts.
-    PerfRunning,
+    /// A perf job is running or waiting to run: it owns the machine, so the
+    /// reload hold restarts and a waiting job is not delayed by a model load.
+    PerfJob,
     /// A perf or tests job finished moments ago. The load waits for the
     /// cooldown to end, but the free-memory hold keeps running.
     Cooldown,
@@ -14486,11 +14487,16 @@ pub(crate) fn model_reload_block(
     let conn = open_queue_jobs_connection(&path)?;
     init_queue_jobs_schema(&conn)?;
     let jobs = list_queue_job_runtime_records_conn(&conn)?;
-    Ok(if running_queue_job_count(&jobs, Some("perf")) > 0 {
-        ModelReloadBlock::PerfRunning
-    } else if perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)) {
-        ModelReloadBlock::Cooldown
-    } else {
-        ModelReloadBlock::None
-    })
+    let perf_waiting = jobs
+        .iter()
+        .any(|job| job.job_type == "perf" && job.state == "pending");
+    Ok(
+        if running_queue_job_count(&jobs, Some("perf")) > 0 || perf_waiting {
+            ModelReloadBlock::PerfJob
+        } else if perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)) {
+            ModelReloadBlock::Cooldown
+        } else {
+            ModelReloadBlock::None
+        },
+    )
 }

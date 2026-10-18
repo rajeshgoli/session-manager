@@ -645,7 +645,7 @@ fn reload_hold_resets_on_pressure_or_perf_and_resumes_without_duplicate_prompt()
     assert!(host.reload_since.lock().unwrap().is_none());
     host.reload_pass(Some(275 * GB), ModelReloadBlock::None)
         .unwrap();
-    host.reload_pass(Some(275 * GB), ModelReloadBlock::PerfRunning)
+    host.reload_pass(Some(275 * GB), ModelReloadBlock::PerfJob)
         .unwrap();
     assert!(host.reload_since.lock().unwrap().is_none());
     *host.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(601));

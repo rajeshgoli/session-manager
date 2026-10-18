@@ -1144,7 +1144,7 @@ impl ModelHost {
         }
         let eligible = model.state == "yielded"
             && model.desired
-            && block != ModelReloadBlock::PerfRunning
+            && block != ModelReloadBlock::PerfJob
             && available
                 .is_some_and(|a| a >= model.reservation_bytes.saturating_add(self.yield_line()));
         let mut since = self
@@ -1229,7 +1229,7 @@ impl ModelHost {
             "Reload needs {} GB free for {}s continuously and no perf run or cooldown; held {}s{}",
             gb(required.unwrap_or(0)), self.config.reload_hold, held,
             match block {
-                ModelReloadBlock::PerfRunning => "; waiting for the perf run",
+                ModelReloadBlock::PerfJob => "; waiting for the perf run",
                 ModelReloadBlock::Cooldown => "; load waits for the queue cooldown",
                 ModelReloadBlock::None => "",
             })
