@@ -45,7 +45,7 @@ test('the Backup card shows nights, the remote disk and its health, and copes wi
   assert.equal(old.disk, null);
   assert.deepEqual(old.nights.map(n => n.mark), ['✗','✓']);
   assert.equal(old.nights[0].detail, '2026-10-16: backup disk full: needs 5 bytes');
-  assert.match(old.lastNight, /^Last night: 2\.0 GB in 5 min, confirmed /);
+  assert.match(old.lastNight, /^Last backup: 2\.0 GB in 5 min, confirmed /);
   assert.equal(old.check, 'Weekly check 2026-10-12: 120 files, all ok');
   assert.equal(old.rates, 'Download 150 Mbit/s · Disk 800 Mbit/s · Restore 200 Mbit/s');
   assert.equal(old.inForce, '150 Mbit/s');
@@ -57,7 +57,7 @@ test('the Backup card shows nights, the remote disk and its health, and copes wi
   assert.equal(card.disk.health, 'Failing');
   assert.ok(card.disk.failing);
   assert.equal(card.check, 'Weekly check 2026-10-12: 120 files, 2 bad');
-  assert.equal(card.lastNight, 'No confirmed night yet');
+  assert.equal(card.lastNight, 'No confirmed backup yet');
   assert.equal(backupCard({...base, card:{disk:{...disk, health:'not_reported', pruned_on:null}}}).disk.health, 'Not reported');
   assert.equal(backupCard({...base, card:{disk:{...disk, health:'not_reported', pruned_on:null}}}).disk.pruned, null);
 });

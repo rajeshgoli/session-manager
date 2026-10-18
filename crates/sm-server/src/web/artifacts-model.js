@@ -32,7 +32,7 @@ export function backupCard(b) {
   return {
     nights: (c.nights || []).map(n => ({date: n.date, ok: n.ok, mark: n.ok === true ? '✓' : n.ok === false ? '✗' : '·',
       detail: n.ok === true ? `${n.date}: confirmed` : `${n.date}: ${n.error || 'not confirmed'}`})),
-    lastNight: last ? `Last night: ${storageSize(last.bytes)} in ${duration(last.seconds)}, confirmed ${when(last.confirmed_at)}` : 'No confirmed night yet',
+    lastNight: last ? `Last backup: ${storageSize(last.bytes)} in ${duration(last.seconds)}, confirmed ${when(last.confirmed_at)}` : 'No confirmed backup yet',
     check: check ? `Weekly check ${check.date}: ${check.files_checked} files, ${check.ok ? 'all ok' : `${check.bad} bad`}` : 'Weekly check: not run yet',
     checkOk: !check || check.ok !== false,
     disk: d ? {

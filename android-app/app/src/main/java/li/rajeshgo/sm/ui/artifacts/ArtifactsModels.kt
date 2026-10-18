@@ -97,8 +97,8 @@ fun backupCard(backup: JsonObject?): BackupCard? {
     }
     return BackupCard(
         nights = nights,
-        lastNight = last?.let { "Last night: ${storageSize(it.number("bytes"))} in ${backupDuration(it.number("seconds"))}, confirmed ${localTime(it.text("confirmed_at"))}" }
-            ?: "No confirmed night yet",
+        lastNight = last?.let { "Last backup: ${storageSize(it.number("bytes"))} in ${backupDuration(it.number("seconds"))}, confirmed ${localTime(it.text("confirmed_at"))}" }
+            ?: "No confirmed backup yet",
         check = check?.let { "Weekly check ${it.text("date")}: ${it.number("files_checked")} files, " + if (it.flag("ok")) "all ok" else "${it.number("bad")} bad" }
             ?: "Weekly check: not run yet",
         checkOk = check == null || check.flag("ok"),
