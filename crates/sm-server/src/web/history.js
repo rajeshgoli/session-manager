@@ -1,5 +1,5 @@
-import { useState } from 'preact/hooks';
-import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, LinkedText, providerLabel, age, basename } from './ui.js';
+import { useState, useRef, useLayoutEffect } from 'preact/hooks';
+import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, LinkedText, linkifyHtml, providerLabel, age, basename } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 
 export function WorkLinks({ work = {} }) {
@@ -17,6 +17,21 @@ export function HistoryPage({ path }) {
     <${HistoryList} key=${agents} agents=${agents} />
   </div>`;
 }
+// The whole last turn as markdown, clamped to a few lines until Show more (sm#2292).
+function LastTurn({ html: turnHtml }) {
+  const body = useRef(null);
+  const [open, setOpen] = useState(false);
+  const [clipped, setClipped] = useState(false);
+  useLayoutEffect(() => {
+    const el = body.current;
+    if (el && !open) setClipped(el.scrollHeight > el.clientHeight + 1);
+  }, [turnHtml, open]);
+  return html`<div class="history-last-turn-block">
+    <div class="lbl">Last turn</div>
+    <div ref=${body} class=${`md history-turn${open ? ' open' : ''}`} dangerouslySetInnerHTML=${{ __html: linkifyHtml(safeThreadHtml(turnHtml)) }} />
+    ${clipped || open ? html`<button class="text-button history-more" onClick=${() => setOpen(!open)}>${open ? 'Show less' : 'Show more'}</button>` : null}
+  </div>`;
+}
 function AgentRow({ row, busy, restore }) {
   const work = row.work || {};
   const [ticket, ...tickets] = work.tickets || [];
@@ -30,7 +45,8 @@ function AgentRow({ row, busy, restore }) {
       <button class="btn pri sm history-restore" disabled=${!row.restorable || !!busy} title=${row.unrestorable_reason || 'Restore agent'}
         onClick=${() => restore(row)}>${busy === row.id ? 'Restoring…' : 'Restore'}</button>
     </div>
-    ${row.last_turn?.text ? html`<p class="history-last-turn">Last turn: “<${LinkedText} text=${row.last_turn.text} />”</p>`
+    ${row.last_turn?.html ? html`<${LastTurn} html=${row.last_turn.html} />`
+      : row.last_turn?.text ? html`<p class="history-last-turn">Last turn: “<${LinkedText} text=${row.last_turn.text} />”</p>`
       : row.last_status ? html`<p class="history-last-turn">Last words: “<${LinkedText} text=${row.last_status} />”</p>` : null}
     <${Links} ticket=${ticket} tickets=${tickets} prs=${work.prs || []} docs=${work.docs || []} />
   </article>`;
