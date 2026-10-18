@@ -286,7 +286,7 @@ function NoteEditor({ agent, onSaved, onClose }) {
       setBusy(false);
     }
   };
-  return html`<div class="note-edit inline-edit">
+  return html`<div class="note-edit">
     <input type="text" maxlength="200" aria-label="Note" autofocus placeholder="Why it waits, e.g. Waiting for the midnight window"
       value=${text} disabled=${busy} onInput=${(e) => setText(e.target.value)}
       onKeyDown=${(e) => { if (e.key === 'Escape') onClose(); if (e.key === 'Enter' && text.trim() !== current) save(text); }} />
@@ -316,7 +316,7 @@ function RenameEditor({ agent, onSaved, onClose }) {
       setBusy(false);
     }
   };
-  return html`<div class="note-edit inline-edit">
+  return html`<div class="note-edit">
     <input type="text" maxlength="32" aria-label="Name" autofocus value=${text} disabled=${busy}
       onInput=${(e) => setText(e.target.value)}
       onKeyDown=${(e) => { if (e.key === 'Escape') onClose(); if (e.key === 'Enter') save(); }} />
@@ -588,15 +588,14 @@ function useAgent(id) {
   return { agent, claims: detailClaims(agent?.claims, doc?.retainedClaims), reload, loading: !doc && !error, error: doc && !agent ? new Error('This agent is not known to sm.') : error };
 }
 
-/** `beside` is 'terminal' when the panel sits next to that agent's terminal, whose bar already
- * carries Open in Claude and Retire (sm#2270). */
+/** `beside` is 'terminal' when the panel sits next to that agent's terminal, whose bar carries
+ * every action, so the panel is details only (sm#2270, sm#2277). */
 export function AgentPanel({ id, controls, beside }) {
   const { agent, claims, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
   // An open question opens on the agent's Inbox thread so it can be answered here (sm#2245).
   const [picked, setPicked] = useState(null);
-  const [editing, setEditing] = useState(null);
-  useEffect(() => { setPicked(null); setEditing(null); }, [id]);
+  useEffect(() => setPicked(null), [id]);
   // A terminal permission prompt is answered in the terminal, so it stays on Work.
   const tab = picked || (['message', 'doc_review'].includes(agent?.facts?.you?.kind) ? 'inbox' : 'work');
   if (!agent) {
@@ -617,17 +616,14 @@ export function AgentPanel({ id, controls, beside }) {
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
-    <${AgentActions} agent=${agent} beside=${beside} onEdit=${setEditing}
-      onRetired=${(done) => { if (done) closePanel(); reload(); }}>
-      <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
-        prs=${claims.filter(item => item.kind === 'pr')}
-        jobs=${agent.jobs || []} thread=${agent.thread}
-        docs=${agent.docs || []} />
-    <//>
-    ${editing === 'rename' ? html`<${RenameEditor} agent=${agent} onSaved=${reload} onClose=${() => setEditing(null)} />` : null}
-    ${editing === 'note' ? html`<${NoteEditor} agent=${agent} onSaved=${reload} onClose=${() => setEditing(null)} />` : null}
+    ${beside === 'terminal' ? null : html`<${AgentActions} agent=${agent} onSaved=${reload}
+      onRetired=${(done) => { if (done) closePanel(); reload(); }} />`}
+    <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
+      prs=${claims.filter(item => item.kind === 'pr')}
+      jobs=${agent.jobs || []} thread=${agent.thread}
+      docs=${agent.docs || []} />
     <div class="tabs" role="tablist">
-      ${[['work', 'Work'], ['inbox', 'Inbox'], ['activity', 'Activity'], ['summary', 'Summary']].map(
+      ${[['work', 'Work'], ['inbox', 'Inbox']].map(
         ([key, label]) => html`<button type="button" role="tab" aria-selected=${tab === key}
           class=${tab === key ? 'on' : ''} onClick=${() => setPicked(key)}>${label}</button>`,
       )}
@@ -636,38 +632,42 @@ export function AgentPanel({ id, controls, beside }) {
       empty=${html`<div class="pbody"><p class="muted">No messages yet.</p></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />` : html`<div class="pbody">
       ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload}
         onReply=${() => setPicked('inbox')} />` : null}
-      ${tab === 'activity' ? html`<${ActivityTab} id=${agent.id} />` : null}
-      ${tab === 'summary' ? html`<${SummaryTab} agent=${agent} />` : null}
     </div>`}
     ${agent.state !== 'stopped' && tab !== 'inbox' ? html`<${MessageBox} agent=${agent} />` : null}
   `;
 }
 
-/** Beside the terminal, the row holds only what its bar lacks, and the link chips join it. */
-function AgentActions({ agent, beside, onEdit, onRetired, children }) {
-  const [menu, setMenu] = useState(null);
-  const linked = claudeLink(agent) && beside !== 'terminal';
+function AgentActions({ agent, onSaved, onRetired }) {
+  const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
-  const full = live && beside !== 'terminal';
-  const close = () => setMenu(null);
-  const actions = html`<div class=${`acts${beside === 'terminal' ? ' with-links' : ''}`}>
-    ${beside === 'terminal' ? children : null}
+  return html`<div class="acts">
     ${linked ? html`<button type="button" class="btn pri" onClick=${() => openInClaude(agent)}>Open in Claude ↗</button>` : null}
-    ${full
+    ${live
       ? html`<button type="button" class=${linked ? 'btn' : 'btn pri'}
           onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨ Terminal</button>`
       : null}
-    ${full ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} />` : null}
-    ${live
-      ? html`<span class="anchor"><button type="button" class="btn" data-pop-anchor
-          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
-          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} onClose=${close} showAskNow=${false} />` : null}</span>`
-      : null}
-    <span class="anchor"><button type="button" class="btn" data-pop-anchor aria-label="More"
-      onClick=${() => setMenu(menu === 'more' ? null : 'more')}>⋯</button>
-      ${menu === 'more' ? html`<${MoreMenu} agent=${agent} onClose=${close} onEdit=${onEdit} />` : null}</span>
+    ${live ? html`<${RetireButton} agent=${agent} onRetired=${onRetired} />` : null}
+    <${AgentMenus} agent=${agent} onSaved=${onSaved} />
   </div>`;
-  return beside === 'terminal' ? actions : html`${actions}${children}`;
+}
+
+/** Hand off… and ⋯, in the Details panel and in the terminal bar. `compact` folds Hand off…
+ * into ⋯ for the phone's bar; `small` sizes the buttons for a bar. */
+export function AgentMenus({ agent, onSaved, compact = false, small = false, align }) {
+  const [menu, setMenu] = useState(null);
+  const live = agent.state !== 'stopped';
+  const close = () => setMenu(null);
+  const btn = small ? 'btn sm' : 'btn';
+  return html`${live && !compact
+      ? html`<span class="anchor"><button type="button" class=${btn} data-pop-anchor
+          onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
+          ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} align=${align} onClose=${close} showAskNow=${false} />` : null}</span>`
+      : null}
+    <span class="anchor"><button type="button" class=${btn} data-pop-anchor aria-label="More"
+      onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
+      ${menu === 'more' ? html`<${MoreMenu} agent=${agent} align=${align} onClose=${close} onSaved=${onSaved}
+        onHandoff=${live && compact ? () => setMenu('handoff') : null} />` : null}
+      ${menu === 'handoff' && compact ? html`<${HandoffPopover} agent=${agent} align=${align} onClose=${close} showAskNow=${false} />` : null}</span>`;
 }
 
 function FollowButton({ id, menu = false, onClose }) {
@@ -692,8 +692,9 @@ function FollowButton({ id, menu = false, onClose }) {
     disabled=${busy || !follows} onClick=${toggle}>${following ? menu ? 'Unfollow' : 'Following' : 'Follow'}</button>`;
 }
 
-function MoreMenu({ agent, onClose, onEdit }) {
+function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
   const [asking, setAsking] = useState(false);
+  const [editing, setEditing] = useState(null);
   const [busy, setBusy] = useState(false);
   const copy = async () => {
     try {
@@ -716,7 +717,12 @@ function MoreMenu({ agent, onClose, onEdit }) {
       setBusy(false);
     }
   };
-  return html`<${Popover} onClose=${onClose} className="menu">
+  if (editing) {
+    const Editor = editing === 'rename' ? RenameEditor : NoteEditor;
+    return html`<${Popover} onClose=${onClose} align=${align}><${Editor} agent=${agent} onSaved=${onSaved} onClose=${onClose} /><//>`;
+  }
+  return html`<${Popover} onClose=${onClose} align=${align} className="menu">
+    ${onHandoff ? html`<button type="button" onClick=${onHandoff}>Hand off…</button>` : null}
     ${agent.state !== 'stopped'
       ? asking
         ? html`<div class="confirm" style="padding:6px 10px">Ask ${agent.name} to hand off now?
@@ -729,8 +735,8 @@ function MoreMenu({ agent, onClose, onEdit }) {
     }); }}>Clone</button>
     <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
-    <button type="button" onClick=${() => { onClose(); onEdit('rename'); }}>Rename…</button>
-    ${agent.state !== 'stopped' || agent.facts?.note ? html`<button type="button" onClick=${() => { onClose(); onEdit('note'); }}>
+    <button type="button" onClick=${() => setEditing('rename')}>Rename…</button>
+    ${agent.state !== 'stopped' || agent.facts?.note ? html`<button type="button" onClick=${() => setEditing('note')}>
       ${agent.facts?.note ? 'Edit note…' : 'Pin a note…'}</button>` : null}
   <//>`;
 }
@@ -795,67 +801,6 @@ function LastTurn({ id, onReply }) {
     <div class="quote last-turn md" dangerouslySetInnerHTML=${{ __html: safeThreadHtml(turn.html || '') }} />
     <div class="last-turn-foot"><span class="sub">${clock(turn.at)}</span>
       <button type="button" class="btn sm" onClick=${reply}>Reply</button></div></section>`;
-}
-
-function ActivityTab({ id }) {
-  const [value, error] = usePoll(() => api(`/sessions/${encodeURIComponent(id)}/tool-calls?limit=10`), 10000, [id]);
-  if (!value) return html`<p class="muted">${error ? error.message : 'Loading…'}</p>`;
-  const calls = value.tool_calls || [];
-  if (!calls.length) return html`<p class="muted">No tool calls recorded.</p>`;
-  return html`<ul>${calls.map((call) => html`<li class="tool">
-    <span class="when">${clock(call.timestamp)}</span><span class="mono">${call.tool_name}</span></li>`)}</ul>`;
-}
-
-const WHAT_DONE = ['completed', 'failed', 'timed_out'];
-
-/** The phone's Summarize progress: POST /sessions/{id}/what in poll mode. */
-function SummaryTab({ agent }) {
-  const [request, setRequest] = useState(null);
-  const [error, setError] = useState(null);
-  useEffect(() => {
-    if (!request || WHAT_DONE.includes(request.status)) return undefined;
-    const timer = setTimeout(async () => {
-      try {
-        setRequest(await api(`/btw-requests/${encodeURIComponent(request.request_id)}`));
-        setError(null);
-      } catch (e) {
-        // Keep polling: a copy of the request re-arms this effect.
-        setError(e.message);
-        setRequest((current) => ({ ...current }));
-      }
-    }, 2000);
-    return () => clearTimeout(timer);
-  }, [request]);
-  const start = async () => {
-    setError(null);
-    try {
-      setRequest(await api(`/sessions/${encodeURIComponent(agent.id)}/what`, { method: 'POST', body: { delivery_mode: 'poll' } }));
-    } catch (e) {
-      const active = e.status === 409 && /request (\S+)$/.exec(e.message);
-      if (active) {
-        try {
-          setRequest(await api(`/btw-requests/${encodeURIComponent(active[1])}`));
-          return;
-        } catch (inner) {
-          setError(inner.message);
-          return;
-        }
-      }
-      setError(e.message);
-    }
-  };
-  const pending = request && !WHAT_DONE.includes(request.status);
-  return html`
-    <div class="row" style="display:flex;gap:8px;align-items:center">
-      <button type="button" class="btn" disabled=${pending || agent.state === 'stopped'} onClick=${start}>
-        ${request ? 'Summarize again' : 'Summarize progress'}</button>
-      ${pending ? html`<span class="sub">Asking ${agent.name}…</span>` : null}
-    </div>
-    ${error ? html`<p class="err">${error}</p>` : null}
-    ${request && request.status === 'completed' ? html`<div class="summary">${request.result}</div>` : null}
-    ${request && ['failed', 'timed_out'].includes(request.status)
-      ? html`<p class="err">${request.error || 'The summary did not finish.'}</p>` : null}
-  `;
 }
 
 /** An owner message, as a reply sent from the phone (POST /inbox/agent/{id}/send). */

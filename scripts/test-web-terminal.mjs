@@ -154,7 +154,7 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
             // The desktop bar (#2242): who and how full on the left, actions on the right, Retire last;
             // no Back button and no "Live" while live.
             assert.deepEqual(await page.locator('.term-bar button').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label') || x.textContent.trim())),
-              ['Notes ⌘J', 'Details', 'Open in Claude', 'Redraw', 'Report a bug', 'Retire']);
+              ['Notes ⌘J', 'Details', 'Hand off…', 'More', 'Open in Claude', 'Redraw', 'Report a bug', 'Retire']);
             assert.equal(await page.locator('.term-bar .term-connection').count(), 0);
             assert.equal(await page.locator('.term-who .t').innerText(), 'iter8-run');
           }
@@ -354,22 +354,24 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
         assert.ok(body.y + body.height <= box.y + 1, `panel sits below the terminal ${JSON.stringify({ body, box })}`);
         assert.ok(body.height < before.height, 'terminal shortens to make room');
       }
-      // Beside its own terminal (#2270): no Open in Claude, Terminal or Retire, which the bar
-      // carries; the ticket chip shares the row; no Note section until a note is pinned.
-      await panel.locator('.acts .link-chip').waitFor();
-      assert.deepEqual(await panel.locator('.acts button').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label') || x.textContent.trim())),
-        ['#2200 ↗', 'Hand off…', 'More']);
+      // Beside its own terminal (#2277): details only. Every action is in the bar, so the panel
+      // has no action row; its tabs are Work and Inbox; no Note section until a note is pinned.
+      await panel.locator('.links .link-chip').waitFor();
+      assert.equal(await panel.locator('.acts').count(), 0);
+      assert.deepEqual(await panel.getByRole('tab').allInnerTexts(), ['Work', 'Inbox']);
       assert.equal(await panel.locator('.pbody h3', { hasText: 'Note' }).count(), 0);
-      if (viewport.width > 900) {
-        await panel.getByRole('button', { name: 'More' }).click();
-        await panel.getByRole('button', { name: 'Rename…' }).click();
-        const field = panel.getByRole('textbox', { name: 'Name' });
-        await field.fill('sm-1776-b');
-        await field.press('Enter');
-        await panel.locator('.phd .t', { hasText: 'sm-1776-b' }).waitFor();
-        assert.deepEqual(state.renamed, [{ id: 'sm-1776', name: 'sm-1776-b' }]);
-        assert.equal(await panel.locator('.inline-edit').count(), 0, 'the editor closes after a rename');
-      }
+      // Rename from the bar's ⋯; on a phone, Hand off… folds into ⋯.
+      const bar = page.locator('.term-bar');
+      await bar.getByRole('button', { name: 'More' }).click();
+      const menu = bar.locator('.pop.menu');
+      assert.equal(await menu.getByRole('button', { name: 'Hand off…' }).count(), viewport.width > 900 ? 0 : 1);
+      await menu.getByRole('button', { name: 'Rename…' }).click();
+      const field = bar.getByRole('textbox', { name: 'Name' });
+      await field.fill(viewport.width > 900 ? 'sm-1776-b' : 'sm-1776-c');
+      await field.press('Enter');
+      await panel.locator('.phd .t', { hasText: viewport.width > 900 ? 'sm-1776-b' : 'sm-1776-c' }).waitFor();
+      assert.equal(state.renamed.at(-1).id, 'sm-1776');
+      assert.equal(await bar.locator('.pop').count(), 0, 'the editor closes after a rename');
       const ticket = panel.getByRole('button', { name: /#2200/ }).first();
       await ticket.waitFor();
       await ticket.click();

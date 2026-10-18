@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4): switcher, phone keys, route and round-trip time.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store, toast } from './ui.js';
-import { RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
+import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
@@ -137,7 +137,7 @@ export function TerminalPage({ id, open }) {
   // A click on the bar gives the keyboard back to the terminal, except inside the
   // Report-a-bug dialog, which renders within the bar and has its own fields.
   const refocus = (event) => {
-    if (event?.target?.closest?.('.board-start-overlay')) return;
+    if (event?.target?.closest?.('.board-start-overlay, .pop')) return;
     setTimeout(() => control.current?.focus(), 0);
   };
   // A retired agent's terminal has nothing left to show, so move on to the next agent,
@@ -391,6 +391,8 @@ export function TerminalPage({ id, open }) {
   const live = connection === 'Live';
   const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
   const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
+  // Hand off… and ⋯ live here, not in the Details panel beside this terminal (#2277).
+  const menus = (compact) => agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
   // Desktop (#2242): who and how full on the left; connection words only when not live,
   // with the route in the dot's tooltip; actions on the right, Retire last.
@@ -403,7 +405,7 @@ export function TerminalPage({ id, open }) {
       </span>
       ${live ? null : html`<span class="term-connection" role="status">${connection}</span>`}
       <span class="sp"></span>
-      ${notes}${details}
+      ${notes}${details}${menus(false)}
       <span class="term-icons">
         ${linked ? html`<button type="button" class="icon-btn" title="Open in Claude" aria-label="Open in Claude"
           onClick=${() => openInClaude(agent)}><${Icon} name="external" /></button>` : null}
@@ -430,6 +432,7 @@ export function TerminalPage({ id, open }) {
       <span class="sp"></span>
       ${linked ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
       ${retire}
+      ${menus(true)}
       <${BugButton} page="Terminal" />
       <button type="button" class="btn sm" disabled=${!live} title="Repaint the agent's screen"
         onClick=${() => control.current?.redraw()}>Redraw</button>

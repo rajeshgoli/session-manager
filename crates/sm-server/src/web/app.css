@@ -241,10 +241,6 @@ select.inp { padding: 3px 6px; }
 .last-turn code { font-family: var(--mono); font-size: .92em; } .last-turn pre { overflow-x: auto; }
 .you.note { color: var(--ink-2); }
 .note-edit { display: flex; gap: 6px; align-items: center; }
-.inline-edit { padding: 8px 12px; border-bottom: 1px solid var(--line); }
-.acts.with-links { align-items: center; }
-.acts.with-links .links { display: contents; }
-.acts.with-links > .anchor:first-of-type { margin-left: auto; }
 .note-edit input { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; color: var(--ink); }
 .last-turn-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
 .plain-btn { border: 0; background: none; padding: 0; color: inherit; cursor: pointer; text-align: left; }
@@ -343,6 +339,8 @@ button.sw-sec { cursor: pointer; }
 .term-connection { white-space: nowrap; font-size: .9rem; }
 .term-bar .retire-confirm { position: fixed; top: 44px; right: 12px; z-index: 32; white-space: normal; overflow-wrap: anywhere; }
 .term-bar .retire-confirm .btn { flex: none; }
+/* The phone bar scrolls sideways, which would clip a popover anchored inside it. */
+.term-bar .pop { position: fixed; top: 44px !important; right: 12px !important; left: auto !important; }
 .term-notice { position: absolute; bottom: 16px; left: 12px; right: 12px; padding: 10px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
 .term-page .term-panel, .term-page .term-panel:has(.doc-reader.ask-open) { position: relative; inset: auto; z-index: auto; width: auto; min-height: 0; overflow: hidden; color: var(--ink); }
 @media (max-width: 900px) {
