@@ -664,7 +664,7 @@ export function AgentMenus({ agent, onSaved, compact = false, small = false, ali
           ${menu === 'handoff' ? html`<${HandoffPopover} agent=${agent} align=${align} onClose=${close} showAskNow=${false} />` : null}</span>`
       : null}
     <span class="anchor"><button type="button" class=${btn} data-pop-anchor aria-label="More"
-      onClick=${() => setMenu(menu ? null : 'more')}>⋯</button>
+      onClick=${() => setMenu(menu === 'more' || (compact && menu) ? null : 'more')}>⋯</button>
       ${menu === 'more' ? html`<${MoreMenu} agent=${agent} align=${align} onClose=${close} onSaved=${onSaved}
         onHandoff=${live && compact ? () => setMenu('handoff') : null} />` : null}
       ${menu === 'handoff' && compact ? html`<${HandoffPopover} agent=${agent} align=${align} onClose=${close} showAskNow=${false} />` : null}</span>`;
@@ -719,7 +719,8 @@ function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
   };
   if (editing) {
     const Editor = editing === 'rename' ? RenameEditor : NoteEditor;
-    return html`<${Popover} onClose=${onClose} align=${align}><${Editor} agent=${agent} onSaved=${onSaved} onClose=${onClose} /><//>`;
+    // A fresh Popover, so it re-fits the viewport for the wider editor.
+    return html`<${Popover} key=${editing} onClose=${onClose} align=${align}><${Editor} agent=${agent} onSaved=${onSaved} onClose=${onClose} /><//>`;
   }
   return html`<${Popover} onClose=${onClose} align=${align} className="menu">
     ${onHandoff ? html`<button type="button" onClick=${onHandoff}>Hand off…</button>` : null}
