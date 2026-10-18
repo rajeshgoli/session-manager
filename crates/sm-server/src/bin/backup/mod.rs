@@ -3,6 +3,7 @@ use anyhow::ensure;
 use sm_server::managed_artifacts::{
     backup::{
         client::Destination,
+        disk,
         pull::{self, HttpRemote, Remote},
         seed,
         update::{self, Outcome, CLI_VERSION},
@@ -216,7 +217,6 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
                     &fs::read(identity.join("identity.json"))
                         .context("device identity metadata missing; enroll with --headless")?,
                 )?;
-                let disk = nix::sys::statvfs::statvfs(&destination.root)?;
                 println!("Device certificate accepted by {url}");
                 println!(
                     "Certificate expiry: {}",
@@ -226,9 +226,18 @@ pub(super) fn run(args: BackupArgs, api_url: Option<String>) -> Result<()> {
                     "Last confirmed manifest: {}",
                     destination.state()?.confirmed.as_deref().unwrap_or("none")
                 );
+                let disk = destination.disk_report(None, disk::health(&destination.root))?;
+                println!("Destination total bytes: {}", disk.total_bytes);
+                println!("Destination free bytes: {}", disk.free_bytes);
                 println!(
-                    "Destination free bytes: {}",
-                    u64::from(disk.blocks_available()) * disk.fragment_size()
+                    "Holding: {} bytes, oldest {}",
+                    disk.holding_bytes,
+                    disk.holding_oldest.as_deref().unwrap_or("none")
+                );
+                println!("Drive health (SMART): {}", disk.health);
+                println!(
+                    "Space floor: {} bytes",
+                    destination.space_floor(disk.total_bytes)?
                 );
                 println!("Speed probe: {}", remote.probe()?);
             } else {

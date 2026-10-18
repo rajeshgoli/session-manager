@@ -56,4 +56,28 @@ class ArtifactsModelsTest {
         assertEquals("Remote disk: update to sm 0.2.0 (abc) failed on 2026-10-18: downloaded sm failed SHA-256 check",
             backupUpdate(backup("""{"to":"sm 0.2.0 (abc)","ok":false,"error":"downloaded sm failed SHA-256 check","at":"2026-10-18T09:31:00Z"}""")))
     }
+
+    @Test fun backupCardShowsNightsDiskAndHealthAndCopesWithAnOlderMini() {
+        fun card(json: String) = backupCard(Json.parseToJsonElement(json).jsonObject)
+        assertNull(card("""{"enabled":false}"""))
+        val rates = """"fetch_rate":18750000.0,"apply_rate":100000000.0,"probe_rate":25000000.0,"effective_rate":18750000.0"""
+        val old = card("""{"enabled":true,$rates,"card":{"nights":[{"date":"2026-10-16","ok":false,"error":"backup disk full: needs 5 bytes"},{"date":"2026-10-17","ok":true}],
+            "last_night":{"bytes":2000000000,"seconds":300,"confirmed_at":"2026-10-17T09:35:00Z"},"weekly_check":{"date":"2026-10-12","ok":true,"files_checked":120,"bad":0},"disk":null}}""")!!
+        assertNull(old.disk)
+        assertEquals(listOf("✗", "✓"), old.nights.map { it.mark })
+        assertEquals("2026-10-16: backup disk full: needs 5 bytes", old.nights[0].detail)
+        assertTrue(old.lastNight.startsWith("Last night: 2.0 GB in 5 min, confirmed "))
+        assertEquals("Weekly check 2026-10-12: 120 files, all ok", old.check)
+        assertEquals("Download 150 Mbit/s · Disk 800 Mbit/s · Restore 200 Mbit/s", old.rates)
+        val failing = card("""{"enabled":true,$rates,"card":{"nights":[],"weekly_check":{"date":"2026-10-12","ok":false,"files_checked":120,"bad":2},
+            "disk":{"total_bytes":4000000000000,"free_bytes":1000000000000,"holding_bytes":30000000000,"holding_oldest":"2026-09-17","health":"failing","pruned_on":"2026-10-01"}}}""")!!
+        val disk = failing.disk!!
+        assertEquals("3.0 TB used · 1.0 TB free of 4.0 TB", disk.line)
+        assertEquals("Holding 30 GB · oldest 2026-09-17", disk.holding)
+        assertEquals("Holding shortened for space on 2026-10-01", disk.pruned)
+        assertEquals("Failing", disk.health)
+        assertTrue(disk.failing)
+        assertEquals("Weekly check 2026-10-12: 120 files, 2 bad", failing.check)
+        assertEquals("No confirmed night yet", failing.lastNight)
+    }
 }

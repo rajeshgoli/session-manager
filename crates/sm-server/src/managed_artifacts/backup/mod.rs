@@ -2,6 +2,7 @@
 //! these primitives never contact a remote device or delete source data.
 pub mod cli_build;
 pub mod client;
+pub mod disk;
 pub mod lifecycle;
 mod outbox;
 pub mod pull;

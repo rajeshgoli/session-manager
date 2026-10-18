@@ -29,6 +29,10 @@ pub struct Ack {
     /// clients never send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<super::update::UpdateReport>,
+    /// The remote disk's size, holding and drive health (#2276). Optional:
+    /// older clients never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<super::disk::Disk>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestStatus {
@@ -43,6 +47,11 @@ pub struct RequestStatus {
     pub allow_deletes: bool,
     pub max_delete_fraction: f64,
     pub error: Option<String>,
+    /// Free space the remote disk keeps by deleting old holding folders
+    /// (#2276). Absent until the disk has reported its size, and from older
+    /// servers.
+    #[serde(default)]
+    pub space_floor_bytes: Option<u64>,
 }
 #[derive(Debug)]
 pub enum RequestResult {
@@ -110,6 +119,7 @@ fn status_row(r: &Value) -> Result<RequestStatus> {
         allow_deletes: r["allow_deletes"] == 1,
         max_delete_fraction: r["max_delete_fraction"].as_f64().unwrap_or(0.1),
         error: r["error"].as_str().map(str::to_owned),
+        space_floor_bytes: None,
     })
 }
 fn packing_rate(conn: &Connection) -> Result<f64> {
@@ -140,7 +150,9 @@ pub fn request(
     )?
     .pop()
     {
-        return Ok(RequestResult::Open(Box::new(status_row(&r)?)));
+        let mut status = status_row(&r)?;
+        status.space_floor_bytes = space_floor(&tx, manager, device)?;
+        return Ok(RequestResult::Open(Box::new(status)));
     }
     let head = confirmed(&tx, device)?.map(|m| m.manifest_id);
     if have != head.as_deref() {
@@ -150,7 +162,8 @@ pub fn request(
     let config = serde_json::to_string(&manager.config)?;
     let outbox = crate::sessions::expand_home(&manager.config.backup.outbox).join(&id);
     tx.execute("INSERT INTO backup_requests(id,device,state,base,created_at,config_json,outbox,packing_rate,max_delete_fraction) VALUES(?1,?2,'preparing',?3,?4,?5,?6,?7,?8)",params![id,device,have,epoch(),config,outbox.to_string_lossy(),packing_rate(&tx)?,manager.config.backup.max_delete_fraction])?;
-    let result = status_row(&row(&tx, device, &id)?)?;
+    let mut result = status_row(&row(&tx, device, &id)?)?;
+    result.space_floor_bytes = space_floor(&tx, manager, device)?;
     tx.commit()?;
     Ok(RequestResult::Open(Box::new(result)))
 }
@@ -171,9 +184,33 @@ pub fn status(manager: &ManagedArtifacts, device: &str, id: &str) -> Result<Requ
             artifact_store::set_meta(&tx, &key, "0")?;
         }
     }
-    let result = status_row(&row(&tx, device, id)?)?;
+    let mut result = status_row(&row(&tx, device, id)?)?;
+    result.space_floor_bytes = space_floor(&tx, manager, device)?;
     tx.commit()?;
     Ok(result)
+}
+/// The device's latest disk report, from its acknowledgements (#2276).
+fn latest_disk(conn: &Connection, device: &str) -> Result<Option<(i64, super::disk::Disk)>> {
+    let mut stmt = conn.prepare(
+        "SELECT acked_at,ack_json FROM backup_requests WHERE device=?1 AND ack_json IS NOT NULL ORDER BY acked_at DESC,created_at DESC",
+    )?;
+    let mut rows = stmt.query([device])?;
+    while let Some(r) = rows.next()? {
+        let ack: Value = serde_json::from_str(&r.get::<_, String>(1)?)?;
+        if let Some(disk) = ack.get("disk").filter(|d| !d.is_null()) {
+            return Ok(Some((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                serde_json::from_value(disk.clone())?,
+            )));
+        }
+    }
+    Ok(None)
+}
+/// `max(space_floor_percent × total, 50 GB)` once the disk has reported its size.
+fn space_floor(conn: &Connection, manager: &ManagedArtifacts, device: &str) -> Result<Option<u64>> {
+    Ok(latest_disk(conn, device)?.map(|(_, disk)| {
+        super::disk::floor_bytes(manager.config.backup.space_floor_percent, disk.total_bytes)
+    }))
 }
 pub fn allow_deletes(manager: &ManagedArtifacts, device: &str) -> Result<()> {
     artifact_store::set_meta(
@@ -351,6 +388,15 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
             "invalid backup update report"
         );
     }
+    if let Some(disk) = &ack.disk {
+        ensure!(
+            super::disk::HEALTH.contains(&disk.health.as_str())
+                && disk.holding_oldest.as_ref().is_none_or(|d| d.len() <= 10)
+                && disk.free_bytes <= disk.total_bytes
+                && disk.total_bytes <= i64::MAX as u64,
+            "invalid backup disk report"
+        );
+    }
     if ack.applied && ack.fetched_bytes > 0 {
         ensure!(
             ack.fetch_seconds > 0.0 && ack.apply_seconds > 0.0,
@@ -417,6 +463,9 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
         let total = load_manifest(&tx, device, id)?.files.len() as u64 + ack.held_deletions;
         alert(&tx,&format!("backup-held:{id}"),"Backup deletions need confirmation",&format!("The remote disk held back {} deletions ({:.1}% of its files). If you meant this, run `sm backup allow-deletes`.",ack.held_deletions,100.0*ack.held_deletions as f64/total.max(1) as f64),true)?;
     }
+    if let Some(disk) = &ack.disk {
+        drive_health_alert(&tx, device, &disk.health, epoch())?;
+    }
     if ack.applied {
         let key = format!("backup_missed:{device}");
         if artifact_store::meta(&tx, &key)?.as_deref() == Some("1") {
@@ -454,6 +503,32 @@ fn alert(conn: &Connection, key: &str, title: &str, body: &str, blocking: bool) 
         "INSERT OR IGNORE INTO backup_alerts(key,title,body,blocking) VALUES(?1,?2,?3,?4)",
         params![key, title, body, blocking],
     )?;
+    Ok(())
+}
+/// One blocking message when the drive first reports failing, then one every
+/// seven days while it stays failing (#2276). Any other report clears it.
+pub(super) fn drive_health_alert(
+    conn: &Connection,
+    device: &str,
+    health: &str,
+    at: i64,
+) -> Result<()> {
+    let key = format!("backup_drive_failing:{device}");
+    if health != "failing" {
+        return artifact_store::set_meta(conn, &key, "");
+    }
+    let last = artifact_store::meta(conn, &key)?.and_then(|s| s.parse::<i64>().ok());
+    if last.is_none_or(|last| at.saturating_sub(last) >= 7 * 86400) {
+        alert(
+            conn,
+            // The previous message's time keeps a reminder's key distinct.
+            &format!("backup-failing:{device}:{at}:{}", last.unwrap_or(0)),
+            "Backup drive is failing",
+            "The backup drive reports it is failing (SMART). Replace it, then reseed with `sm backup seed`.",
+            true,
+        )?;
+        artifact_store::set_meta(conn, &key, &at.to_string())?;
+    }
     Ok(())
 }
 pub fn missed_alerts(manager: &ManagedArtifacts, at: i64) -> Result<()> {
@@ -537,12 +612,112 @@ pub(super) fn mark_covered(
     Ok(())
 }
 
+fn rfc3339(at: i64) -> Result<String> {
+    Ok(time::OffsetDateTime::from_unix_timestamp(at)?
+        .format(&time::format_description::well_known::Rfc3339)?)
+}
+/// The Backup card (#2276): the last seven nights, last night's transfer, the
+/// weekly check, and the remote disk, from the device's acknowledgements.
+pub(super) fn card(conn: &Connection, device: &str, at: i64) -> Result<Value> {
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let date = |t: i64| -> Result<time::Date> {
+        Ok(time::OffsetDateTime::from_unix_timestamp(t)?
+            .to_offset(offset)
+            .date())
+    };
+    let requests = artifact_store::query(
+        conn,
+        "SELECT state,created_at,acked_at,ack_json,error FROM backup_requests WHERE device=?1 ORDER BY created_at DESC,id DESC LIMIT 400",
+        &[&device],
+    )?;
+    // Nights before backup began are not misses.
+    let began = artifact_store::meta(conn, &format!("backup_enabled:{device}"))?
+        .and_then(|s| s.parse::<i64>().ok())
+        .into_iter()
+        .chain(requests.last().and_then(|r| r["created_at"].as_i64()))
+        .min();
+    let today = date(at)?;
+    let mut nights = Vec::new();
+    for back in (0..7).rev() {
+        let night = today - time::Duration::days(back);
+        if began.is_none_or(|b| date(b).is_ok_and(|b| b > night)) {
+            continue;
+        }
+        let runs: Vec<&Value> = requests
+            .iter()
+            .filter(|r| {
+                r["created_at"]
+                    .as_i64()
+                    .is_some_and(|t| date(t).is_ok_and(|d| d == night))
+            })
+            .collect();
+        let (ok, error) = if runs.iter().any(|r| r["state"] == "acked") {
+            (json!(true), Value::Null)
+        } else if runs
+            .iter()
+            .any(|r| matches!(r["state"].as_str(), Some("preparing" | "ready")))
+        {
+            (Value::Null, json!("in progress"))
+        } else if let Some(r) = runs.first() {
+            (
+                json!(false),
+                json!(r["error"].as_str().unwrap_or("not applied")),
+            )
+        } else if night == today {
+            (Value::Null, json!("not yet"))
+        } else {
+            (json!(false), json!("no request"))
+        };
+        nights.push(json!({"date":night.to_string(),"ok":ok,"error":error}));
+    }
+    let mut last_night = Value::Null;
+    let mut weekly_check = Value::Null;
+    let mut disk = Value::Null;
+    let mut pruned_on = Value::Null;
+    for r in &requests {
+        let Some(acked_at) = r["acked_at"].as_i64() else {
+            continue;
+        };
+        let ack: Value = serde_json::from_str(r["ack_json"].as_str().unwrap_or("{}"))?;
+        if last_night.is_null() && r["state"] == "acked" {
+            last_night = json!({
+                "bytes": ack["fetched_bytes"],
+                "seconds": acked_at.saturating_sub(r["created_at"].as_i64().unwrap_or(acked_at)),
+                "confirmed_at": rfc3339(acked_at)?,
+            });
+        }
+        if weekly_check.is_null() && ack["check"].is_object() {
+            let check = &ack["check"];
+            weekly_check = json!({
+                "date": date(acked_at)?.to_string(),
+                "ok": check["ok"],
+                "files_checked": check["files_checked"],
+                "bad": check["bad"].as_array().map_or(0, Vec::len),
+            });
+        }
+        if disk.is_null() && ack["disk"].is_object() {
+            disk = ack["disk"].clone();
+            disk["reported_at"] = json!(rfc3339(acked_at)?);
+        }
+        if pruned_on.is_null()
+            && at.saturating_sub(acked_at) <= 30 * 86400
+            && ack["disk"]["pruned"].is_object()
+        {
+            pruned_on = json!(date(acked_at)?.to_string());
+        }
+    }
+    if disk.is_object() {
+        disk["pruned_on"] = pruned_on;
+    }
+    Ok(json!({"nights":nights,"last_night":last_night,"weekly_check":weekly_check,"disk":disk}))
+}
+
 pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
     let conn = manager.store.open()?;
     let mut devices = Vec::new();
     for device in &manager.config.backup.puller_devices {
         let runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests WHERE device=?1 ORDER BY created_at DESC,id DESC LIMIT 7",&[device])?;
-        devices.push(json!({"device":device,"confirmed":confirmed(&conn,device)?.map(|m|m.manifest_id),"runs":runs,"rates":rates(&conn,device,parse_rate(&manager.config.backup.backup_rate_default)?)?}));
+        devices.push(json!({"device":device,"confirmed":confirmed(&conn,device)?.map(|m|m.manifest_id),"runs":runs,"rates":rates(&conn,device,parse_rate(&manager.config.backup.backup_rate_default)?)?,"card":card(&conn,device,epoch())?}));
     }
     let mut runs=artifact_store::query(&conn,"SELECT id,state,created_at,ready_at,acked_at,estimate_bytes,ack_json,error FROM backup_requests ORDER BY created_at DESC,id DESC LIMIT 7",&[])?;
     for run in &mut runs {
@@ -569,6 +744,10 @@ pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
         .first()
         .map(|d| d["rates"].clone())
         .unwrap_or(Value::Null);
+    let card = devices
+        .first()
+        .map(|d| d["card"].clone())
+        .unwrap_or(Value::Null);
     let confirmed_at = artifact_store::query(
         &conn,
         "SELECT acked_at FROM backup_requests WHERE state='acked' ORDER BY acked_at DESC LIMIT 1",
@@ -594,6 +773,6 @@ pub fn owner_summary(manager: &ManagedArtifacts) -> Result<Value> {
     })
     .transpose()?;
     Ok(
-        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"update":update,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"]}),
+        json!({"enabled":manager.config.backup.enabled,"devices":devices,"runs":runs,"confirmed_at":confirmed_at,"update":update,"rate_default":manager.config.backup.backup_rate_default,"scope_roots":manager.config.backup.static_paths,"fetch_rate":rates["fetch"],"apply_rate":rates["apply"],"probe_rate":rates["probe"],"effective_rate":rates["effective"],"card":card}),
     )
 }

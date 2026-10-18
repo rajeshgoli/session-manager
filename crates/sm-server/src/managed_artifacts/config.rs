@@ -128,6 +128,7 @@ impl ManagedArtifactsConfig {
                 || self.backup.alert_after_missed_nights > 3650
                 || !self.backup.max_delete_fraction.is_finite()
                 || !(0.0..=1.0).contains(&self.backup.max_delete_fraction)
+                || !(0.0..=100.0).contains(&self.backup.space_floor_percent)
                 || self.backup.puller_devices.is_empty()
                 || self.roots.is_empty()
             {
@@ -228,6 +229,9 @@ pub struct ArtifactBackupConfig {
     pub plain_paths: Vec<String>,
     pub holding_days: std::collections::BTreeMap<String, u64>,
     pub backup_rate_default: String,
+    /// The remote disk keeps this percentage of itself free (at least 50 GB)
+    /// by deleting its oldest holding folders (#2276).
+    pub space_floor_percent: f64,
     /// Where sm builds and publishes the mini's `sm` (#2264).
     pub cli_dir: String,
     pub cli_build: CliBuildConfig,
@@ -295,6 +299,7 @@ impl Default for ArtifactBackupConfig {
                 ("~/.config".into(), 300),
             ]),
             backup_rate_default: "18.75MB".into(),
+            space_floor_percent: 10.0,
             cli_dir: "~/.local/share/claude-sessions/backup-cli".into(),
             cli_build: CliBuildConfig::default(),
         }
