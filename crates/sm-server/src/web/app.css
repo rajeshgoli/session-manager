@@ -310,7 +310,17 @@ div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
 .term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "side term"; }
 /* Details and Notes sit beside the terminal, which refits to the space left. */
 .term-main.with-panel { grid-template-columns: auto minmax(0, 1fr) min(28rem, 40vw); grid-template-areas: "side term panel"; }
-.term-body { grid-area: term; min-height: 0; min-width: 0; overflow: hidden; padding: 4px; }
+.term-body { grid-area: term; min-height: 0; min-width: 0; overflow: hidden; }
+.term-body .xterm { height: 100%; padding: 10px 14px; }
+/* xterm.css paints its scroll area black; the theme colour on .term-body shows instead. */
+.term-body .xterm .xterm-viewport { background-color: transparent !important; }
+.term-themes { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.term-theme { display: flex; flex-direction: column; gap: 6px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); cursor: pointer; text-align: left; }
+.term-theme.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.term-theme-sample { display: flex; flex-direction: column; gap: 2px; width: 9.5rem; padding: 8px 10px; border-radius: 7px; font: .8rem/1.35 var(--mono); }
+.term-theme-dots { display: flex; gap: 4px; margin-top: 4px; }
+.term-theme-dots i { width: 10px; height: 10px; border-radius: 50%; }
+.term-theme-name { padding: 0 6px 2px; font-size: .9rem; }
 .term-page .term-main > .term-panel { grid-area: panel; }
 /* The agent list ends in an edge bar that folds it; folded, only the bar stays (#2242). */
 .term-side { grid-area: side; display: flex; min-height: 0; }
