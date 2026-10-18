@@ -1,7 +1,7 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
-import { EFFORTS, useLocalModel, LocalChoice, localBlocked } from './start.js';
+import { EFFORTS, useLocalModel, LocalChoice, localBlocked, ensureLocalLoaded } from './start.js';
 import { TypePicker, OTHER_TYPE, agentTypes, typeConfig, matchType } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
 
@@ -188,6 +188,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
     if (busy) return;
     setBusy(true); setError(null);
     try {
+      if (method === 'POST' && body.provider === 'opencode') body.model = await ensureLocalLoaded(local);
       const result = await api(path, { method, body });
       onClose(); onStarted(); done(result);
     } catch (e) { setError(e.message); }
@@ -201,7 +202,9 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
     if (busy) return;
     setBusy(true); setError(null);
     try {
-      const result = await api('/client/bug-reports', { method: 'POST', body: bugBody(bug, report, form) });
+      const body = bugBody(bug, report, form);
+      if (body.start?.provider === 'opencode') body.start.model = await ensureLocalLoaded(local);
+      const result = await api('/client/bug-reports', { method: 'POST', body });
       if (result.start_error) { setFiled(result); setError(result.start_error); return; }
       onClose();
       toast(filedText(result), result.started ? () => openPanel(`agent:${result.started.session_id}`) : () => window.open(result.issue.url, '_blank', 'noopener'));
@@ -258,7 +261,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}
     <div class="row"><button class="btn" disabled=${busy} onClick=${onClose}>${startable && !later ? 'Cancel' : 'Close'}</button>
       ${auto ? html`<button class="btn" disabled=${busy} onClick=${() => run('DELETE', autoStartPath(ticket), undefined, () => toast('Cancelled'))}>Cancel auto-start</button>` : null}
-      ${startable ? html`<button class="btn pri" disabled=${!form || busy || localBlocked(local, form?.provider)} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
+      ${startable ? html`<button class="btn pri" disabled=${!form || busy || localBlocked(local, form?.provider) || (later && form?.provider === 'opencode' && !local?.models?.length)} onClick=${start}>${busy ? 'Starting…' : later ? 'Start when ready' : blocked ? 'Start anyway' : 'Start'}</button>` : null}</div>
   <//>`;
 }
 

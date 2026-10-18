@@ -75,7 +75,7 @@ for (const width of [390, 1440]) test(`New agent offers project folders and subm
   } finally { await browser.close(); }
 });
 
-for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied', 'free']) {
+for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied', 'free', 'unloaded']) {
   test(`Local ${surface} choice: ${state}`, async () => {
     const browser = await chromium.launch({ channel: 'chrome', headless: true });
     try {
@@ -91,8 +91,10 @@ for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied
         if (url.pathname === '/watch/state') return json({ sessions: [] });
         if (url.pathname === '/client/board/start-options') return json({ provider: 'claude', model: null, working_dir: '/tmp/repo', name: 'fix', brief: 'Fix it' });
         if (url.pathname === '/client/session-models') return json(url.searchParams.get('provider') === 'opencode'
-          ? { models: state === 'absent' ? [] : ['loaded-model'], available: state === 'free', reason: state === 'occupied' ? 'no local seat free (1/1 used by worker)' : undefined }
+          ? { models: ['absent', 'unloaded'].includes(state) ? [] : ['loaded-model'], available: state === 'free', reason: state === 'occupied' ? 'no local seat free (1/1 used by worker)' : undefined }
           : { models: [] });
+        if (url.pathname === '/client/model' && state === 'unloaded') return json({ model: { key: 'org/loaded-model', identifier: 'loaded-model', seats: 1, context: 200000, state: 'unloaded' } });
+        if (url.pathname === '/client/model/load') { posted.push(route.request().postDataJSON()); return json({}); }
         if (['/client/sessions', '/client/board/start'].includes(url.pathname)) { posted.push(route.request().postDataJSON()); return json({ id: 'new', session_id: 'new', name: 'local' }); }
         if (url.pathname.startsWith('/assets/')) return route.fulfill({ contentType: url.pathname.endsWith('.css') ? 'text/css' : 'text/javascript', body: await readFile(new URL(url.pathname.slice(8), assets), 'utf8') });
         return route.abort();
@@ -102,6 +104,7 @@ for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied
       const local = page.getByRole('button', { name: 'Local (loaded-model)', exact: true });
       if (state === 'absent') { assert.equal(await local.count(), 0); return; }
       await local.waitFor();
+      if (state === 'unloaded') await page.getByText('Not loaded: Start loads it first, which takes a few minutes', { exact: true }).waitFor();
       if (state === 'occupied') {
         assert.equal(await local.isDisabled(), true);
         await page.getByText('no local seat free (1/1 used by worker)', { exact: true }).waitFor();
@@ -111,6 +114,7 @@ for (const surface of ['new', 'board']) for (const state of ['absent', 'occupied
       assert.equal(await page.getByRole('radiogroup', { name: 'Effort', exact: true }).count(), 0);
       await page.getByRole('button', { name: 'Start', exact: true }).click();
       await page.waitForFunction(() => window.closedPopover);
+      if (state === 'unloaded') assert.deepEqual(posted.shift(), { key: 'org/loaded-model', seats: 1, context: 200000 });
       assert.equal(posted.length, 1);
       assert.equal(posted[0].provider, 'opencode');
       assert.equal(posted[0].model, 'loaded-model');
