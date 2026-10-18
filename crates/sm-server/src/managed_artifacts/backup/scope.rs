@@ -51,8 +51,38 @@ pub struct Scope {
     pub exclude: Exclude,
 }
 impl Scope {
+    /// A loose file at an artifact root's top level is a one-file scope whose
+    /// only entry is [`FILE_ENTRY`], keeping the remote layout of
+    /// `packed/<segment>/<path>`.
     pub fn inventory(&self) -> Result<Vec<archive::Entry>> {
-        archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))
+        let m = fs::symlink_metadata(&self.source)?;
+        if m.is_file() {
+            use std::os::unix::fs::MetadataExt;
+            return Ok(vec![archive::Entry {
+                path: FILE_ENTRY.into(),
+                kind: "file".into(),
+                size: m.len(),
+                mtime: m.mtime(),
+                mtime_nsec: m.mtime_nsec(),
+                mode: m.mode() & 0o7777,
+                target: None,
+            }]);
+        }
+        let entries = archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))?;
+        ensure!(
+            !entries.iter().any(|e| e.path == FILE_ENTRY),
+            "backup source has a top-level {FILE_ENTRY}, which is reserved: {}",
+            self.source.display()
+        );
+        Ok(entries)
+    }
+    /// The local file behind an inventory entry.
+    pub fn path_of(&self, relative: &str) -> PathBuf {
+        if self.source.is_file() {
+            self.source.clone()
+        } else {
+            self.source.join(relative)
+        }
     }
     pub fn measure(&self) -> Result<scan::Size> {
         scan::measure_excluding(&self.source, |p| self.exclude.skips(p))
@@ -144,11 +174,19 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
             };
             let source = fs::canonicalize(source)
                 .with_context(|| format!("backup artifact unavailable: {name}"))?;
-            ensure!(source.is_dir(), "backup artifact must be a directory");
+            ensure!(
+                source.is_dir() || source.is_file(),
+                "backup artifact must be a directory or file"
+            );
             let bytes = if a["state"] == "frozen" {
                 scan::measure(&source)?.data_bytes
             } else {
-                let ratio = score::ratio(manager, root, &a)?;
+                // A loose file is unrecorded, so always in scope; its estimate stays raw.
+                let ratio = if source.is_file() {
+                    1.0
+                } else {
+                    score::ratio(manager, root, &a)?
+                };
                 (scan::measure(&source)?.data_bytes as f64 / ratio).ceil() as u64
             };
             if included(&conn, &a, bytes, rate)? {
@@ -177,7 +215,7 @@ pub(super) fn validate_scopes(scopes: &[Scope]) -> Result<()> {
             scope.segment
         );
         ensure!(
-            scope.source.is_absolute() && scope.source.is_dir(),
+            scope.source.is_absolute() && (scope.source.is_dir() || scope.source.is_file()),
             "backup source unavailable"
         );
     }

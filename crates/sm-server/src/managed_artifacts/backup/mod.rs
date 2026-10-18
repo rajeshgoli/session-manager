@@ -44,6 +44,11 @@ pub struct Part {
     pub sha256: String,
 }
 
+/// The inner name of a one-file scope: a loose file `<name>` at an artifact
+/// root is stored as `packed/<name>/.sm-file.zst` and restored as `<name>`.
+/// No scope may have a top-level entry of this name.
+pub const FILE_ENTRY: &str = ".sm-file";
+
 pub fn safe_relative(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()

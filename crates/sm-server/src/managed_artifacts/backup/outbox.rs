@@ -254,7 +254,7 @@ pub(super) fn prepare_with_progress(
             if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                 continue;
             }
-            let source = scope.source.join(&entry.path);
+            let source = scope.path_of(&entry.path);
             let path = format!(
                 "{prefix}/{}{}",
                 entry.path,

@@ -637,6 +637,11 @@ impl Destination {
             } else {
                 relative
             };
+            // A one-file scope restores as the file itself.
+            let relative = relative
+                .strip_suffix(&format!("/{FILE_ENTRY}"))
+                .filter(|scope| !scope.contains('/'))
+                .unwrap_or(relative);
             if !paths.is_empty()
                 && !paths
                     .iter()
