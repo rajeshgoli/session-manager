@@ -265,6 +265,7 @@ fn operation_summary(name: &str, action: &str, op: &Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or_default();
     let queue = match ahead.first() {
+        None if op["error"].is_string() => op["error"].as_str().unwrap_or_default().to_string(),
         None => match op["phase"].as_str() {
             Some("queued") | None => "it starts next".to_string(),
             Some(phase) => format!("it is {phase}"),
