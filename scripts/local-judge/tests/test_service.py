@@ -377,7 +377,8 @@ class JudgeTests(unittest.TestCase):
                         'git push origin 1855-local:main', 'cd /tmp && git push origin 1855-local',
                         'sm doc publish ../outside.html --no-pr', 'sm doc publish docs/memo.html --pr $(id)',
                         'sm doc publish docs/memo.html --commit abc', 'sm send rajesh hi',
-                        'sm doc cat docs/memo.html --out /tmp/x', 'git push origin 1855-local | sh']:
+                        'sm doc cat docs/memo.html --out /tmp/x', 'sm doc cat docs/memo.html --out=/tmp/x',
+                        'git push origin 1855-local | sh']:
             self.ruling(tin={'command': command})
             self.assertEqual(self.logs()[-1]['stage'], 'judge', command)
         subprocess.run(['git', '-C', str(wt), 'config', 'remote.origin.push', 'refs/heads/1855-local:refs/heads/main'], check=True)
@@ -385,7 +386,9 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(self.logs()[-1]['stage'], 'judge')
 
     def test_unclear_verdicts_are_not_outages(self):
-        for answer, decision in [('ALLOW', 'allow'), ('**DENY** - no', 'deny')]:
+        for answer, decision in [('ALLOW', 'allow'), ('**DENY** - no', 'deny'),
+                                 ('ALLOW or DENY: insufficient context', 'deny'),
+                                 ('ALLOW only if X; otherwise DENY', 'deny')]:
             self.model.answers['curl bare'] = answer
             self.assertEqual(self.ruling(tin={'command': 'curl bare'}), decision)
         result = self.decide(tin={'command': 'curl invalid'})

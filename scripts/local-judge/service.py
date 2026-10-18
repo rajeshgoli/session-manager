@@ -379,7 +379,7 @@ def workflow_segment(words, cwd, agent):
             return None
         return "sm doc publish of a file in the checkout"
     if words[0] == "sm" and any(tuple(words[1:1 + len(k)]) == k for k in SM_READS):
-        if "--out" in words:
+        if any(w == "--out" or w.startswith("--out=") for w in words):
             return None
         return f"sm {words[1]} is a permitted sm command"
     return None
@@ -490,7 +490,7 @@ def judge_message(tool, tin, agent):
 
 # `ALLOW: reason`, also bare or markdown-wrapped (`**DENY** - reason`). A word
 # that merely starts with the verdict (`ALLOWING`) is not one.
-VERDICT = re.compile(r"^[*_`#> ]*(ALLOW|DENY)\b[*_`]*\s*(?:[:\-\u2013\u2014.]\s*)?([^\r\n]*)$")
+VERDICT = re.compile(r"^[*_`#> ]*(ALLOW|DENY)[*_`]*(?:\s*|\s*[:\-\u2013\u2014]\s*([^\r\n]*))$")
 
 
 def verdict(line):
@@ -500,7 +500,7 @@ def verdict(line):
     match = VERDICT.fullmatch(line.strip())
     if not match:
         return None
-    reason = " ".join(match.group(2).strip("*_` ").split()[:20])
+    reason = " ".join((match.group(2) or "").strip("*_` ").split()[:20])
     decision = match.group(1).lower()
     return decision, reason or {"allow": "allowed", "deny": "denied"}[decision] + " by the judge"
 
