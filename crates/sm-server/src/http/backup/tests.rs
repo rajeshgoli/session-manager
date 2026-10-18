@@ -1074,6 +1074,7 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
     for (ack, content) in [
         ("08_ack_applied.json", "changed once"),
         ("10_ack_with_check_and_update.json", "changed twice"),
+        ("13_ack_with_disk.json", "changed three times"),
     ] {
         fs::write(f.dir.join("data/prices"), content).unwrap();
         let created = replay("05_request_create.json", &id, 0, &confirmed).await;
@@ -1096,9 +1097,15 @@ async fn backup_routes_stay_compatible_with_checked_in_client_fixtures() {
     )
     .unwrap()
     .count();
-    assert_eq!(count, 13);
+    assert_eq!(count, 14);
     let card = life::owner_summary(&manager).unwrap();
     assert_eq!(card["update"]["to"], "sm 0.2.0 (abcdef012345)");
+    assert_eq!(card["card"]["disk"]["holding_oldest"], "2026-09-17");
+    // Once the disk has reported its size, requests carry the floor.
+    fs::write(f.dir.join("data/prices"), "changed four times").unwrap();
+    let created = replay("05_request_create.json", &id, 0, &confirmed).await;
+    let ready = serde_json::from_value::<RequestStatus>(created).unwrap();
+    assert_eq!(ready.space_floor_bytes, Some(400_000_000_000));
     moves::TEST_MOUNTED.set(false);
     drop(dest);
 }

@@ -1,6 +1,7 @@
 //! Resumable pull orchestration, separate from HTTP for failure-injection tests.
 use super::{
     client::Destination,
+    disk,
     lifecycle::{Ack, RequestStatus},
     *,
 };
@@ -57,7 +58,13 @@ fn finish(dest: &mut Destination, remote: &mut impl Remote, id: &str, ack: &Ack)
         cleanup_staging(dest, id)?;
         clear_pending(dest)?;
         clear_update(dest)?;
-        bail!("backup integrity check failed; repair the reported files or reseed the destination");
+        if ack.check.as_ref().is_some_and(|check| !check.ok) {
+            bail!("backup integrity check failed; repair the reported files or reseed the destination");
+        }
+        bail!(
+            "{}",
+            ack.error.as_deref().unwrap_or("backup was not applied")
+        );
     }
     complete_local(dest, id)
 }
@@ -176,7 +183,26 @@ pub(super) fn pull_with_check(
     );
     safe_relative(id)?;
     ensure!(!id.contains('/'), "invalid backup request id");
+    if let Some(floor) = status.space_floor_bytes {
+        dest.set_meta(disk::FLOOR_KEY, &floor.to_string())?;
+    }
+    let floor = dest.space_floor(disk::space(&dest.root)?.0)?;
+    let free = |root: &Path| Ok(disk::space(root)?.1);
+    let mut pruned = disk::Pruned::default();
     let download = dest.directory(&format!(".downloads/{id}"))?;
+    // Room for the parts still to fetch and their unpacked copy, taken as the
+    // parts' size until they can be read.
+    let total: u64 = status.parts.iter().map(|p| p.bytes).sum();
+    let mut have = 0u64;
+    for part in &status.parts {
+        safe_relative(&part.file)?;
+        ensure!(!part.file.contains('/'), "invalid backup part filename");
+        have += fs::metadata(download.join(&part.file)).map_or(0, |m| m.len().min(part.bytes));
+    }
+    let short = dest.prune_holding(total - have + total, floor, Some(id), free, &mut pruned)?;
+    if short > 0 {
+        return disk_full(dest, remote, id, 0, 0.0, short, pruned);
+    }
     let mut fetch_seconds = 0.0;
     let mut fetched = 0u64;
     for part in &status.parts {
@@ -215,6 +241,17 @@ pub(super) fn pull_with_check(
     let fetch_seconds = fetch_seconds.max(0.001);
     let apply = Instant::now();
     let staging = dest.unpack(id, manifest, &status.parts, &download)?;
+    // Applying copies the unpacked files into place: room for that once more.
+    let short = dest.prune_holding(
+        disk::tree_bytes(&staging)?,
+        floor,
+        Some(id),
+        free,
+        &mut pruned,
+    )?;
+    if short > 0 {
+        return disk_full(dest, remote, id, fetched, fetch_seconds, short, pruned);
+    }
     let applied = dest.apply(
         id,
         manifest,
@@ -223,6 +260,7 @@ pub(super) fn pull_with_check(
         status.max_delete_fraction,
     )?;
     let apply_seconds = apply.elapsed().as_secs_f64().max(0.001);
+    dest.prune_holding(0, floor, Some(id), free, &mut pruned)?;
     let local =
         time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     let week = local.date().to_string();
@@ -251,6 +289,7 @@ pub(super) fn pull_with_check(
             .meta(super::update::PENDING_UPDATE)?
             .map(|body| serde_json::from_str(&body))
             .transpose()?,
+        disk: Some(dest.disk_report(Some(pruned), disk::health(&dest.root))?),
     };
     // Persist the exact ack before sending it: a lost response can be retried
     // without changing timings, rechecking different files, or moving history.
@@ -258,6 +297,35 @@ pub(super) fn pull_with_check(
     if healthy && ack.check.is_some() {
         dest.set_meta("checked_sunday", &week)?;
     }
+    finish(dest, remote, id, &ack)?;
+    Ok(ack)
+}
+/// Deleting every holding folder still leaves too little room: acknowledge
+/// without applying. Tonight's outbox is discarded, and missed nights alert.
+fn disk_full(
+    dest: &mut Destination,
+    remote: &mut impl Remote,
+    id: &str,
+    fetched_bytes: u64,
+    fetch_seconds: f64,
+    short: u64,
+    pruned: disk::Pruned,
+) -> Result<Ack> {
+    let ack = Ack {
+        applied: false,
+        fetched_bytes,
+        fetch_seconds,
+        apply_seconds: 0.0,
+        held_deletions: 0,
+        check: None,
+        error: Some(format!("backup disk full: needs {short} bytes")),
+        update: dest
+            .meta(super::update::PENDING_UPDATE)?
+            .map(|body| serde_json::from_str(&body))
+            .transpose()?,
+        disk: Some(dest.disk_report(Some(pruned), disk::health(&dest.root))?),
+    };
+    dest.set_meta("pending_ack", &serde_json::to_string(&ack)?)?;
     finish(dest, remote, id, &ack)?;
     Ok(ack)
 }

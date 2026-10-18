@@ -20,6 +20,7 @@
     "deletions": [],
     "allow_deletes": false,
     "max_delete_fraction": 0.1,
-    "error": null
+    "error": null,
+    "space_floor_bytes": null
   }
 }

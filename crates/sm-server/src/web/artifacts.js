@@ -1,7 +1,7 @@
 import { useState } from 'preact/hooks';
 import { html, api, usePoll, config, ConfirmButton, bus, newAgent, LinkedText, linkifyHtml } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
-import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupUpdate, backupLabel } from './artifacts-model.js';
+import { artifactReport, artifactBytes, storageSize as size, diskName, needsDecision, needsAgentFollowup, artifactInventory, largestArtifacts, artifactSummary, backupSummary, backupUpdate, backupLabel, backupCard } from './artifacts-model.js';
 
 function Row({ row: a, open, select }) {
   return html`<button class="artifact-row" onClick=${() => select(a)} aria-expanded=${open}>
@@ -30,6 +30,26 @@ function Detail({ a, data, close, act, investigate, busy }) {
       <h3>Recipe</h3><pre>${JSON.stringify(a.jobs || [],null,2)}</pre><h3>Recent events</h3>
       <ul>${(a.events || []).slice(0,10).map(e=>html`<li>${e.at} · ${e.kind} · ${e.detail_json}</li>`)}</ul>
     </details>
+  </section>`;
+}
+function BackupCard({ backup }) {
+  const [night,setNight] = useState(null);
+  const card = backupCard(backup);
+  if (!card) return html`<p class="artifact-warning">${backupSummary(backup)}</p>`;
+  const update = backupUpdate(backup);
+  return html`<section class="artifact-backup" aria-label="Backup">
+    <div class="artifact-disk-label"><h2>Backup</h2><span>${backupSummary(backup)}</span></div>
+    <div class="artifact-nights" aria-label="Last 7 nights">${card.nights.map(n=>html`<button class=${n.ok === false ? 'bad' : n.ok ? 'ok' : ''} title=${n.detail} aria-label=${n.detail} onClick=${()=>setNight(night === n ? null : n)}>${n.mark}</button>`)}</div>
+    ${night ? html`<small class=${night.ok === false ? 'artifact-warning' : 'artifact-muted'}>${night.detail}</small>` : null}
+    <p class="artifact-muted">${card.lastNight}</p>
+    <p class=${card.checkOk ? 'artifact-muted' : 'artifact-warning'}>${card.check}</p>
+    ${card.disk ? html`<strong>${card.disk.line}</strong>
+      <meter aria-label="Remote disk used space" min="0" max=${card.disk.total} value=${card.disk.used}/>
+      <p class="artifact-muted">${card.disk.holding}</p>
+      ${card.disk.pruned ? html`<p class="artifact-muted">${card.disk.pruned}</p>` : null}
+      <p class=${card.disk.failing ? 'artifact-warning' : 'artifact-muted'}>Drive health: ${card.disk.failing ? html`<b>${card.disk.health}</b>` : card.disk.health}</p>` : html`<p class="artifact-muted">Remote disk: not reported yet</p>`}
+    <p class="artifact-muted">${card.rates} · in force ${card.inForce}</p>
+    ${update ? html`<p class=${backup.update.ok ? 'artifact-muted' : 'artifact-warning'}>${update}</p>` : null}
   </section>`;
 }
 export function ArtifactsPage() {
@@ -80,8 +100,7 @@ export function ArtifactsPage() {
             <meter aria-label=${`${diskName(f)} used space`} min="0" max=${f.bytes} value=${f.bytes-f.free} class=${f.free < f.floor ? 'artifact-low-space' : ''}/>
             ${f.free < f.floor ? html`<small class="artifact-warning">Space is running low</small>` : null}` : null}
         </div>`)}</section>
-        <p class=${data.backup?.enabled ? 'artifact-muted' : 'artifact-warning'}>${backupSummary(data.backup)}</p>
-        ${backupUpdate(data.backup) ? html`<p class=${data.backup.update.ok ? 'artifact-muted' : 'artifact-warning'}>${backupUpdate(data.backup)}</p>` : null}
+        <${BackupCard} backup=${data.backup} />
         ${decisions.length ? html`<section><h2 class="artifact-heading">Cleanup to review</h2>${renderRows(decisions.slice(0,5))}${decisions.length > 5 ? html`<button class="btn sm" onClick=${()=>setBrowse(true)}>Browse all ${decisions.length} proposals</button>` : null}</section>` : null}
         <h2 class="artifact-heading">Taking up space</h2><p class="artifact-muted">Largest folders over 1 GB</p>
       `}

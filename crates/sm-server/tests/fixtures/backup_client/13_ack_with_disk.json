@@ -1,0 +1,13 @@
+{
+  "client": "sm backup pull from a mini that reports its disk (#2276); older minis omit disk",
+  "method": "POST",
+  "path": "/backup/requests/{id}/ack",
+  "request": {
+    "applied": true, "fetched_bytes": 120, "fetch_seconds": 0.5, "apply_seconds": 0.25, "held_deletions": 0,
+    "check": null,
+    "error": null,
+    "disk": {"total_bytes": 4000000000000, "free_bytes": 1000000000000, "holding_bytes": 30000000000, "holding_oldest": "2026-09-17", "health": "not_reported", "pruned": {"folders": 2, "bytes": 5000000000}}
+  },
+  "status": 200,
+  "response": {"ok": true}
+}

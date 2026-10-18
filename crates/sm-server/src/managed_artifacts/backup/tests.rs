@@ -361,6 +361,7 @@ fn request_lifecycle_is_device_scoped_and_reuses_open_requests() {
         check: None,
         error: None,
         update: None,
+        disk: None,
     };
     l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
     let conn = f.manager.store.open().unwrap();
@@ -468,6 +469,7 @@ fn expired_request_retries_delta_and_alerts_recover_after_confirmation() {
         }),
         error: None,
         update: None,
+        disk: None,
     };
     // The fixture's configured device is backup-mini; recovery is per device.
     crate::managed_artifacts::store::set_meta(&conn, "backup_missed:mini", "1").unwrap();
@@ -744,6 +746,7 @@ fn client_resumes_interrupted_download_and_recovers_a_lost_ack_response() {
             allow_deletes: false,
             max_delete_fraction: 0.1,
             error: None,
+            space_floor_bytes: Some(0),
         },
         bytes,
         interrupt: true,
@@ -1633,4 +1636,387 @@ fn seed_leaves_files_changed_while_packing_for_the_first_request() {
             .collect::<Vec<_>>(),
         ["plain/data/prices"]
     );
+}
+
+#[test]
+fn diskutil_smart_status_maps_to_health() {
+    use super::disk::parse_smart;
+    let info = |status: &str| {
+        format!("   Device Node:              /dev/disk4s1\n   SMART Status:             {status}\n   Volume Free Space:        1.2 TB\n")
+    };
+    assert_eq!(parse_smart(&info("Verified")), "verified");
+    assert_eq!(parse_smart(&info("Failing")), "failing");
+    assert_eq!(parse_smart(&info("Not Supported")), "not_reported");
+    assert_eq!(
+        parse_smart("   Device Node:              /dev/disk4s1\n"),
+        "not_reported"
+    );
+    assert_eq!(parse_smart(""), "not_reported");
+}
+
+/// A remote disk with three dated holding folders of 100 bytes each, and one
+/// current file applied through the ordinary path.
+fn holding_fixture(f: &Fixture) -> super::client::Destination {
+    use super::client::Destination;
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let first = f.prepare("first", None);
+    let dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("first", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    let mut dest = dest;
+    dest.apply("first", &first.transfer, &staging, false, 0.1)
+        .unwrap();
+    dest.confirm("first").unwrap();
+    // The apply's own (empty) holding folder is not part of this fixture.
+    fs::remove_dir_all(dest.root.join(".holding")).unwrap();
+    dest.conn.execute("DELETE FROM history", []).unwrap();
+    for (n, run) in ["2026-01-03-c", "2026-01-01-a", "2026-01-02-b"]
+        .iter()
+        .enumerate()
+    {
+        let dir = dest.root.join(".holding").join(run).join("plain/data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("prices"), vec![b'x'; 100]).unwrap();
+        dest.conn
+            .execute(
+                "INSERT INTO history(run,path,held_at,days,body) VALUES(?1,'plain/data/prices',?2,30,NULL)",
+                params![run, 1000 + n as i64],
+            )
+            .unwrap();
+    }
+    dest
+}
+/// A 1000-byte disk whose only other contents are its holding folders.
+fn simulated_free(root: &std::path::Path) -> anyhow::Result<u64> {
+    let mut used = 0;
+    for run in ["2026-01-01-a", "2026-01-02-b", "2026-01-03-c"] {
+        if root.join(".holding").join(run).exists() {
+            used += 100;
+        }
+    }
+    Ok(1000 - used)
+}
+
+#[test]
+fn pruning_deletes_oldest_holding_first_and_never_current_files() {
+    use super::disk::Pruned;
+    let f = Fixture::new();
+    let dest = holding_fixture(&f);
+    let report = dest.disk_report(None, "not_reported").unwrap();
+    assert_eq!(report.holding_bytes, 300);
+    assert_eq!(report.holding_oldest.as_deref(), Some("2026-01-01"));
+    assert_eq!(report.pruned, None);
+    // Free 700 against a floor of 750: one folder, the oldest, goes.
+    let mut pruned = Pruned::default();
+    let short = dest
+        .prune_holding(0, 750, None, simulated_free, &mut pruned)
+        .unwrap();
+    assert_eq!(short, 0);
+    assert_eq!(
+        pruned,
+        Pruned {
+            folders: 1,
+            bytes: 100
+        }
+    );
+    assert!(!dest.root.join(".holding/2026-01-01-a").exists());
+    assert!(dest.root.join(".holding/2026-01-02-b").exists());
+    assert!(dest.root.join(".holding/2026-01-03-c").exists());
+    let runs: Vec<String> = dest
+        .conn
+        .prepare("SELECT run FROM history ORDER BY run")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(runs, ["2026-01-02-b", "2026-01-03-c"]);
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"prices"
+    );
+    let report = dest.disk_report(Some(pruned.clone()), "verified").unwrap();
+    assert_eq!(report.holding_oldest.as_deref(), Some("2026-01-02"));
+    assert_eq!(
+        report.pruned,
+        Some(Pruned {
+            folders: 1,
+            bytes: 100
+        })
+    );
+    // Tonight's folder (c) is kept even when that leaves too little room;
+    // the shortfall is what remains.
+    let mut pruned = Pruned::default();
+    let short = dest
+        .prune_holding(500, 750, Some("c"), simulated_free, &mut pruned)
+        .unwrap();
+    assert_eq!(pruned.folders, 1);
+    assert!(dest.root.join(".holding/2026-01-03-c").exists());
+    assert_eq!(short, 500 + 750 - 900);
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/prices")).unwrap(),
+        b"prices"
+    );
+    assert!(dest.root.join("state.db").exists() && dest.root.join("state.json").exists());
+}
+
+#[test]
+fn an_impossible_apply_acknowledges_disk_full_without_applying() {
+    use super::{
+        client::Destination,
+        lifecycle::RequestStatus,
+        pull::{self, Remote},
+    };
+    struct Fake {
+        status: RequestStatus,
+        acks: Vec<serde_json::Value>,
+        downloads: usize,
+    }
+    impl Remote for Fake {
+        fn json(
+            &mut self,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+        ) -> Result<(u16, serde_json::Value)> {
+            if method == "POST" && path.ends_with("/ack") {
+                self.acks.push(body.unwrap());
+                return Ok((200, serde_json::json!({"ok":true})));
+            }
+            Ok((200, serde_json::to_value(&self.status)?))
+        }
+        fn download(
+            &mut self,
+            _: &str,
+            _: &Part,
+            _: u64,
+            _: &mut dyn std::io::Write,
+        ) -> Result<()> {
+            self.downloads += 1;
+            anyhow::bail!("no download expected")
+        }
+        fn probe(&mut self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let f = Fixture::new();
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let first = f.prepare("first", None);
+    let mut fake = Fake {
+        status: RequestStatus {
+            id: "first".into(),
+            state: "ready".into(),
+            retry_after_seconds: None,
+            estimate_bytes: 6,
+            manifest_id: Some("first".into()),
+            parts: first.parts,
+            manifest: Some(first.transfer),
+            deletions: vec![],
+            allow_deletes: false,
+            max_delete_fraction: 0.1,
+            error: None,
+            // More than any disk holds.
+            space_floor_bytes: Some(u64::MAX / 2),
+        },
+        acks: vec![],
+        downloads: 0,
+    };
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let error = pull::pull(&mut dest, &mut fake).unwrap_err();
+    assert!(
+        error.to_string().starts_with("backup disk full: needs "),
+        "{error}"
+    );
+    assert_eq!(fake.downloads, 0);
+    assert_eq!(fake.acks.len(), 1);
+    let ack = &fake.acks[0];
+    assert_eq!(ack["applied"], false);
+    assert!(ack["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("backup disk full: needs "));
+    assert!(ack["disk"]["total_bytes"].as_u64().unwrap() > 0);
+    assert!(super::disk::HEALTH.contains(&ack["disk"]["health"].as_str().unwrap()));
+    // Nothing applied, nothing pending: the next night asks afresh.
+    assert!(dest.records().unwrap().is_empty());
+    assert!(dest.state().unwrap().confirmed.is_none());
+    assert!(dest.meta("pending_request").unwrap().is_none());
+    assert_eq!(
+        dest.meta("space_floor_bytes").unwrap().as_deref(),
+        Some((u64::MAX / 2).to_string().as_str())
+    );
+}
+
+#[test]
+fn disk_reports_are_stored_rendered_and_a_failing_drive_alerts_weekly() {
+    use super::{
+        disk::{Disk, Pruned},
+        lifecycle::{self as l, RequestResult},
+    };
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    let conn = f.manager.store.open().unwrap();
+    let failing_alerts = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM backup_alerts WHERE key LIKE 'backup-failing:mini:%' AND blocking=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mut have: Option<String> = None;
+    let mut night = |content: &str, disk: Option<Disk>| -> String {
+        fs::write(f.dir.join("data/prices"), content).unwrap();
+        let RequestResult::Open(req) = l::request(&f.manager, "mini", have.as_deref()).unwrap()
+        else {
+            panic!()
+        };
+        l::prepare_request(&f.manager, &req.id).unwrap();
+        let ack = l::Ack {
+            applied: true,
+            fetched_bytes: 6,
+            fetch_seconds: 1.0,
+            apply_seconds: 1.0,
+            held_deletions: 0,
+            check: Some(l::Check {
+                ok: true,
+                files_checked: 3,
+                bad: vec![],
+            }),
+            error: None,
+            update: None,
+            disk,
+        };
+        l::acknowledge(&f.manager, "mini", &req.id, &ack).unwrap();
+        have = Some(req.id.clone());
+        req.id
+    };
+    // An older mini sends no disk report: the card says not reported, no floor.
+    let first = night("v1", None);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let card = l::card(&conn, "mini", now).unwrap();
+    assert!(card["disk"].is_null());
+    assert_eq!(
+        card["nights"].as_array().unwrap().last().unwrap()["ok"],
+        true
+    );
+    assert_eq!(card["last_night"]["bytes"], 6);
+    assert_eq!(card["weekly_check"]["files_checked"], 3);
+    assert_eq!(card["weekly_check"]["bad"], 0);
+    assert_eq!(
+        l::status(&f.manager, "mini", &first)
+            .unwrap()
+            .space_floor_bytes,
+        None
+    );
+    // A new mini reports its disk and tonight's pruning; the drive is failing.
+    let disk = Disk {
+        total_bytes: 4_000_000_000_000,
+        free_bytes: 1_000_000_000_000,
+        holding_bytes: 30_000_000_000,
+        holding_oldest: Some("2026-09-17".into()),
+        health: "failing".into(),
+        pruned: Some(Pruned {
+            folders: 2,
+            bytes: 5_000_000_000,
+        }),
+    };
+    let second = night("v2", Some(disk.clone()));
+    let card = l::card(&conn, "mini", now).unwrap();
+    assert_eq!(card["disk"]["total_bytes"], 4_000_000_000_000u64);
+    assert_eq!(card["disk"]["health"], "failing");
+    assert_eq!(card["disk"]["holding_oldest"], "2026-09-17");
+    assert!(card["disk"]["pruned_on"].is_string());
+    // 10% of 4 TB is above the 50 GB minimum.
+    assert_eq!(
+        l::status(&f.manager, "mini", &second)
+            .unwrap()
+            .space_floor_bytes,
+        Some(400_000_000_000)
+    );
+    assert_eq!(failing_alerts(), 1);
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM backup_alerts WHERE key LIKE 'backup-failing:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(body, "The backup drive reports it is failing (SMART). Replace it, then reseed with `sm backup seed`.");
+    // Still failing the next night: no second message within seven days.
+    night(
+        "v3",
+        Some(Disk {
+            pruned: None,
+            ..disk.clone()
+        }),
+    );
+    assert_eq!(failing_alerts(), 1);
+    // Seven days after the first message, a reminder.
+    let stamp: i64 = crate::managed_artifacts::store::meta(&conn, "backup_drive_failing:mini")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    crate::managed_artifacts::store::set_meta(
+        &conn,
+        "backup_drive_failing:mini",
+        &(stamp - 7 * 86400).to_string(),
+    )
+    .unwrap();
+    night(
+        "v4",
+        Some(Disk {
+            pruned: None,
+            ..disk.clone()
+        }),
+    );
+    assert_eq!(failing_alerts(), 2);
+    // A small disk gets the 50 GB minimum; a healthy report clears the state.
+    let last = night(
+        "v5",
+        Some(Disk {
+            total_bytes: 100_000_000_000,
+            free_bytes: 0,
+            health: "verified".into(),
+            pruned: None,
+            ..disk.clone()
+        }),
+    );
+    assert_eq!(
+        l::status(&f.manager, "mini", &last)
+            .unwrap()
+            .space_floor_bytes,
+        Some(50_000_000_000)
+    );
+    assert_eq!(
+        crate::managed_artifacts::store::meta(&conn, "backup_drive_failing:mini")
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+    // An invalid health is refused.
+    fs::write(f.dir.join("data/prices"), "v6").unwrap();
+    let RequestResult::Open(req) = l::request(&f.manager, "mini", Some(&last)).unwrap() else {
+        panic!()
+    };
+    l::prepare_request(&f.manager, &req.id).unwrap();
+    let bad = l::Ack {
+        applied: true,
+        fetched_bytes: 6,
+        fetch_seconds: 1.0,
+        apply_seconds: 1.0,
+        held_deletions: 0,
+        check: None,
+        error: None,
+        update: None,
+        disk: Some(Disk {
+            health: "melting".into(),
+            ..disk
+        }),
+    };
+    let error = l::acknowledge(&f.manager, "mini", &req.id, &bad).unwrap_err();
+    assert_eq!(error.to_string(), "invalid backup disk report");
 }

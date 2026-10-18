@@ -19,6 +19,33 @@ export const backupSummary = b => !b ? 'Backup status unavailable' : !b.enabled 
 export const backupUpdate = b => !b?.update ? null : b.update.ok
   ? `Remote disk: updated to ${b.update.to}${b.update.at ? ` on ${b.update.at.slice(0,10)}` : ''}`
   : `Remote disk: update to ${b.update.to} failed${b.update.at ? ` on ${b.update.at.slice(0,10)}` : ''}: ${b.update.error || 'unknown error'}`;
+const HEALTH = {verified:'Verified', failing:'Failing', not_reported:'Not reported'};
+export const backupRate = bps => bps == null || !Number.isFinite(bps) ? 'unknown' : `${Math.round(bps * 8 / 1e6)} Mbit/s`;
+const when = at => new Date(at).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'});
+// The Backup card (#2276), from the remote disk's acknowledgements; null when backup is off.
+export function backupCard(b) {
+  if (!b?.enabled) return null;
+  const c = b.card || {};
+  const d = c.disk;
+  const last = c.last_night;
+  const check = c.weekly_check;
+  return {
+    nights: (c.nights || []).map(n => ({date: n.date, ok: n.ok, mark: n.ok === true ? '✓' : n.ok === false ? '✗' : '·',
+      detail: n.ok === true ? `${n.date}: confirmed` : `${n.date}: ${n.error || 'not confirmed'}`})),
+    lastNight: last ? `Last backup: ${storageSize(last.bytes)} in ${duration(last.seconds)}, confirmed ${when(last.confirmed_at)}` : 'No confirmed backup yet',
+    check: check ? `Weekly check ${check.date}: ${check.files_checked} files, ${check.ok ? 'all ok' : `${check.bad} bad`}` : 'Weekly check: not run yet',
+    checkOk: !check || check.ok !== false,
+    disk: d ? {
+      used: Math.max(0, d.total_bytes - d.free_bytes), total: d.total_bytes,
+      line: `${storageSize(Math.max(0, d.total_bytes - d.free_bytes))} used · ${storageSize(d.free_bytes)} free of ${storageSize(d.total_bytes)}`,
+      holding: `Holding ${storageSize(d.holding_bytes)}${d.holding_oldest ? ` · oldest ${d.holding_oldest}` : ''}`,
+      pruned: d.pruned_on ? `Holding shortened for space on ${d.pruned_on}` : null,
+      health: HEALTH[d.health] || 'Not reported', failing: d.health === 'failing',
+    } : null,
+    rates: [['Download', b.fetch_rate], ['Disk', b.apply_rate], ['Restore', b.probe_rate]].map(([name, r]) => `${name} ${backupRate(r)}`).join(' · '),
+    inForce: backupRate(b.effective_rate),
+  };
+}
 export const duration = seconds => seconds == null || !Number.isFinite(seconds) ? 'unknown' : seconds < 60 ? `${Math.ceil(seconds)}s` : `${Math.ceil(seconds / 60)} min`;
 export function backupLabel(a) {
   const returning = a.backup_return_seconds == null ? 'return time not measured' : `estimated return ${duration(a.backup_return_seconds)}`;
