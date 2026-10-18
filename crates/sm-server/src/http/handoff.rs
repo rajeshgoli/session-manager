@@ -97,6 +97,16 @@ pub(super) async fn get_handoff_defaults(
     Ok(Json(state.session_store.handoff_defaults()?.to_json()))
 }
 
+/// Lanes, tickets and live agents whose handoff differs from the defaults (sm#2294).
+pub(super) async fn get_handoff_overrides(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    ensure_owner(&state, &headers, peer_addr, "/handoff-overrides", None)?;
+    Ok(Json(state.session_store.handoff_overrides_list()?))
+}
+
 pub(super) async fn put_handoff_defaults(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,

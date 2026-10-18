@@ -2343,6 +2343,7 @@ pub fn router(state: AppState) -> Router {
             "/handoff-policy/ticket/{owner}/{repo}/{number}",
             get(handoff::get_ticket_handoff_policy).put(handoff::put_ticket_handoff_policy),
         )
+        .route("/handoff-overrides", get(handoff::get_handoff_overrides))
         .route(
             "/handoff-policy/lane/{owner}/{repo}/{number}",
             get(handoff::get_lane_handoff_policy).put(handoff::put_lane_handoff_policy),

@@ -697,8 +697,34 @@ button.sw-sec { cursor: pointer; }
 .handoff-pop .handoff-at b { color:var(--ink); }
 .handoff-pop .handoff-at input { width:5rem; }
 .pop-rule { border:0; border-top:1px solid var(--line); margin:2px 0; width:100%; }
-.handoff-provider { border-top:1px solid var(--line); padding-top:4px; margin-bottom:8px; }
-.handoff-provider h3 { margin-top:12px !important; }
+.hd-grid { display:flex; flex-direction:column; border-top:1px solid var(--line); margin-top:8px; }
+.hd-row { display:grid; grid-template-columns:minmax(8rem,1.4fr) 5.5rem repeat(3, minmax(6.5rem,1fr)); gap:10px; align-items:start; padding:8px 0; border-bottom:1px solid var(--line); }
+.hd-head { font-size:.8rem; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-3); padding:6px 0; }
+.hd-provider { display:flex; flex-direction:column; gap:2px; font-weight:600; }
+.hd-provider .sub { font-weight:400; }
+.hd-row.off .hd-provider { grid-column:1 / 2; }
+.hd-cell { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.hd-cell .inp.num { width:5.5rem; margin-right:3px; }
+.hd-label { display:none; }
+.hd-terms { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; margin:10px 0 4px; font-size:.9rem; }
+.hd-terms dt { font-weight:600; }
+.hd-terms dd { margin:0; color:var(--ink-2); }
+.hd-switch { display:flex; gap:10px; align-items:flex-start; margin:6px 0; }
+.hd-switch > span { display:flex; flex-direction:column; gap:2px; }
+.hd-overrides { list-style:none; padding:0; margin:6px 0; display:flex; flex-direction:column; }
+.hd-overrides li { display:grid; grid-template-columns:4.5rem minmax(0,1fr) minmax(0,1.2fr) auto; gap:10px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+.hd-kind { font-size:.75rem; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-3); }
+.hd-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.hd-what { color:var(--ink-2); font-size:.9rem; }
+@media (max-width: 640px) {
+  .hd-head { display:none; }
+  .hd-row { grid-template-columns:1fr 1fr; }
+  .hd-provider { grid-column:1 / -1; }
+  .hd-label { display:block; font-size:.8rem; color:var(--ink-3); }
+  .hd-overrides li { grid-template-columns:minmax(0,1fr) auto; }
+  .hd-kind { grid-column:1 / -1; }
+  .hd-what { grid-column:1 / 2; }
+}
 .about-title { display:flex; gap:10px; align-items:baseline; }
 .about-mark { color:var(--accent); font:700 1.4rem var(--mono); }
 .about-rows { display:flex; flex-direction:column; border:1px solid var(--line); border-radius:8px; background:var(--panel); }

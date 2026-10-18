@@ -617,8 +617,8 @@ fn add_review_fields(state: &AppState, payload: &mut Value) -> anyhow::Result<()
     let lane_handoffs = crate::work_claims::WorkClaimStore::new(db.clone())
         .handoff_overrides()?
         .into_iter()
-        .filter(|(scope, ..)| *scope == crate::work_claims::HandoffScope::Lane)
-        .map(|(_, repo, number, value)| ((repo, number), value.to_json()))
+        .filter(|stored| stored.scope == crate::work_claims::HandoffScope::Lane)
+        .map(|stored| ((stored.repo, stored.number), stored.value.to_json()))
         .collect::<BTreeMap<_, _>>();
     let mut by_key = BTreeMap::new();
     for policy in policies {
