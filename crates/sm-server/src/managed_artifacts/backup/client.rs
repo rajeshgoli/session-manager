@@ -106,6 +106,14 @@ pub(super) fn verify(path: &Path, record: &FileRecord) -> Result<()> {
     );
     Ok(())
 }
+/// One journaled change to the destination, between its journal and record.
+struct Change<'a> {
+    path: &'a str,
+    old: Option<&'a FileRecord>,
+    new: Option<&'a FileRecord>,
+    current: PathBuf,
+    holding: PathBuf,
+}
 impl Destination {
     pub fn open_existing(path: &Path) -> Result<Self> {
         ensure!(
@@ -336,28 +344,7 @@ impl Destination {
         if let Some(applied) = self.applied(id)? {
             return Ok(applied);
         }
-        if !consume {
-            return self.apply_journaled(id, manifest, staging, allow_deletes, max_fraction, None);
-        }
-        // A seed's journal is one transaction and its renames meet one durability
-        // barrier, instead of a commit and folder syncs per file (#2317). The
-        // journal commits on failure too, so the seed's recovery sees what moved.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let mut touched = BTreeSet::new();
-        let result = self.apply_journaled(
-            id,
-            manifest,
-            staging,
-            allow_deletes,
-            max_fraction,
-            Some(&mut touched),
-        );
-        let durable = File::open(&self.root)
-            .map_err(anyhow::Error::from)
-            .and_then(|root| super::outbox::barrier(&touched, &root));
-        self.conn.execute_batch("COMMIT")?;
-        durable?;
-        result
+        self.apply_journaled(id, manifest, staging, allow_deletes, max_fraction, consume)
     }
     fn apply_journaled(
         &mut self,
@@ -366,9 +353,8 @@ impl Destination {
         staging: &Path,
         allow_deletes: bool,
         max_fraction: f64,
-        mut touched: Option<&mut BTreeSet<PathBuf>>,
+        consume: bool,
     ) -> Result<Applied> {
-        let consume = touched.is_some();
         ensure!(manifest.manifest_id == id, "manifest request mismatch");
         ensure!(
             max_fraction.is_finite() && (0.0..=1.0).contains(&max_fraction),
@@ -426,27 +412,41 @@ impl Destination {
                 verify(&safe_path(staging, &record.path, false)?, record)?;
             }
         }
-        for record in &manifest.changed {
-            self.replace(
-                id,
-                &record.path,
-                records.get(&record.path),
-                Some(record),
-                staging,
-                manifest,
-                touched.as_deref_mut(),
-            )?;
-        }
-        for path in deletes.difference(&held) {
-            self.replace(
-                id,
-                path,
-                records.get(path),
-                None,
-                staging,
-                manifest,
-                touched.as_deref_mut(),
-            )?;
+        let work: Vec<(&str, Option<&FileRecord>)> = manifest
+            .changed
+            .iter()
+            .map(|r| (r.path.as_str(), Some(r)))
+            .chain(deletes.difference(&held).map(|p| (p.as_str(), None)))
+            .collect();
+        if consume {
+            // A seed journals, publishes and records 512 changes at a time:
+            // the chunk's journal commits before any of its renames, and one
+            // barrier makes the renames durable before the chunk is recorded,
+            // instead of commits and folder syncs per file (#2317).
+            for chunk in work.chunks(512) {
+                let changes = self.in_transaction(|d| {
+                    chunk
+                        .iter()
+                        .filter_map(|(path, new)| {
+                            d.journal(id, path, records.get(*path), *new, manifest)
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                let mut touched = BTreeSet::new();
+                for change in &changes {
+                    self.publish(id, change, staging, Some(&mut touched))?;
+                }
+                super::outbox::barrier(&touched, &File::open(&self.root)?)?;
+                self.in_transaction(|d| changes.iter().try_for_each(|c| d.record(c, true)))?;
+            }
+        } else {
+            for (path, new) in work {
+                if let Some(change) = self.journal(id, path, records.get(path), new, manifest)? {
+                    self.publish(id, &change, staging, None)?;
+                    self.record(&change, false)?;
+                }
+            }
         }
         let result = Applied {
             request: id.into(),
@@ -466,19 +466,23 @@ impl Destination {
         tx.commit()?;
         Ok(result)
     }
-    // One journaled change: its inputs are the change itself plus how to publish it.
-    #[allow(clippy::too_many_arguments)]
-    fn replace(
+    /// Run `f` in one SQLite transaction that commits even when `f` fails, so a
+    /// partly written journal survives for recovery, as per-statement commits did.
+    fn in_transaction<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = f(self);
+        self.conn.execute_batch("COMMIT")?;
+        result
+    }
+    /// Journal one change before its renames: `None` when nothing changes.
+    fn journal<'a>(
         &self,
         id: &str,
-        path: &str,
-        old: Option<&FileRecord>,
-        new: Option<&FileRecord>,
-        staging: &Path,
+        path: &'a str,
+        old: Option<&'a FileRecord>,
+        new: Option<&'a FileRecord>,
         manifest: &TransferManifest,
-        mut touched: Option<&mut BTreeSet<PathBuf>>,
-    ) -> Result<()> {
-        let consume = touched.is_some();
+    ) -> Result<Option<Change<'a>>> {
         let current = safe_path(&self.root, path, true)?;
         let key = format!("holding:{id}");
         let run = if let Some(run) = self.meta(&key)? {
@@ -497,9 +501,8 @@ impl Destination {
                 "untracked destination file differs: {path}"
             );
         }
-        let same = old == new;
-        if same {
-            return Ok(());
+        if old == new {
+            return Ok(None);
         }
         let days = manifest
             .holding_days
@@ -516,45 +519,81 @@ impl Destination {
                 old.map(serde_json::to_string).transpose()?
             ],
         )?;
+        Ok(Some(Change {
+            path,
+            old,
+            new,
+            current,
+            holding,
+        }))
+    }
+    /// The journaled change's renames. A seed (`touched`) moves staged files and
+    /// collects folders for its chunk's barrier; otherwise each folder is synced.
+    fn publish(
+        &self,
+        id: &str,
+        change: &Change,
+        staging: &Path,
+        touched: Option<&mut BTreeSet<PathBuf>>,
+    ) -> Result<()> {
+        let Change {
+            path,
+            old,
+            new,
+            current,
+            holding,
+        } = change;
+        let consume = touched.is_some();
         // A deterministic holding path makes the filesystem half of the journal
         // repeatable when a process dies between rename and SQLite commit.
         if old.is_some_and(|r| r.target.is_none()) && !holding.exists() {
             ensure!(current.is_file(), "previous backup file missing: {path}");
-            fs::rename(&current, &holding)?;
+            fs::rename(current, holding)?;
         }
         if let Some(record) = new.filter(|r| r.target.is_none()) {
             let source = safe_path(staging, path, false)?;
             if consume && !current.exists() {
-                fs::rename(source, &current)?;
-            } else if !current.exists() || verify(&current, record).is_err() {
+                fs::rename(source, current)?;
+            } else if !current.exists() || verify(current, record).is_err() {
                 // Copy preserves staging for a repeat after interrupted apply.
                 let temp = safe_path(&self.root, &format!(".incoming/{id}/publish/{path}"), true)?;
                 fs::copy(source, &temp)?;
                 File::open(&temp)?.sync_all()?;
-                fs::rename(temp, &current)?;
+                fs::rename(temp, current)?;
             }
         } else if current.exists() {
-            fs::remove_file(&current)?;
+            fs::remove_file(current)?;
         }
-        for parent in [current.parent(), holding.parent()].into_iter().flatten() {
-            match touched.as_deref_mut() {
-                // Folders safe_path created must reach their own parents too.
-                Some(touched) => touched.extend(
-                    parent
-                        .ancestors()
-                        .take_while(|dir| dir.starts_with(&self.root))
-                        .map(Path::to_path_buf),
-                ),
-                None => File::open(parent)?.sync_all()?,
+        let parents = [current.parent(), holding.parent()].into_iter().flatten();
+        match touched {
+            // Folders safe_path created must reach their own parents too.
+            Some(touched) => {
+                for parent in parents {
+                    touched.extend(
+                        parent
+                            .ancestors()
+                            .take_while(|dir| dir.starts_with(&self.root))
+                            .map(Path::to_path_buf),
+                    );
+                }
+            }
+            None => {
+                for parent in parents {
+                    File::open(parent)?.sync_all()?;
+                }
             }
         }
-        if let Some(record) = new {
-            self.conn.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body",params![path,serde_json::to_string(record)?])?;
+        Ok(())
+    }
+    /// Record a published change in the destination's file list.
+    fn record(&self, change: &Change, batched: bool) -> Result<()> {
+        if let Some(record) = change.new {
+            self.conn.execute("INSERT INTO files(path,body) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET body=excluded.body",params![change.path,serde_json::to_string(record)?])?;
         } else {
             self.conn
-                .execute("DELETE FROM files WHERE path=?1", [path])?;
+                .execute("DELETE FROM files WHERE path=?1", [change.path])?;
         }
-        if let Some(parent) = current.parent().filter(|_| !consume) {
+        if let Some(parent) = change.current.parent().filter(|_| !batched) {
             File::open(parent)?.sync_all()?;
         }
         Ok(())
