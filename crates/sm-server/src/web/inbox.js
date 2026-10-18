@@ -266,7 +266,7 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
         <button class="btn pri" onClick=${() => openPanel(`doc:${newest.doc.path}`)}>Read latest</button>
         ${reviewOpen ? html`<button class="btn" onClick=${() => openPanel(`doc:${newest.doc.path}#sm-review`)}>Review</button>` : null}</div>` : null}
     ${error ? html`<p role="alert">${error.message}</p>` : null}
-    <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => {
+    <div class="thread-items" ref=${items} onClick=${quote}>${(data?.items || []).map((item,i) => {
       if (item.type === 'doc_revision') {
         const doc = docRevision(item);
         return html`<div key=${i} class="thread-doc-card">

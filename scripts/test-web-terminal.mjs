@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdir } from 'node:fs/promises';
+const SHOTS = process.env.SHOTS_DIR;
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const assets = new URL('../crates/sm-server/src/web/', import.meta.url);
 const ORIGIN = 'https://sm.example.com';
@@ -136,7 +137,7 @@ const routeTimed = (page) => page.waitForFunction(() => /ms$/.test(document.quer
 
 test('switcher, keys and route at desktop and phone sizes', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
-  const shots = process.env.SHOTS_DIR;
+  const shots = SHOTS;
   if (shots) await mkdir(shots, { recursive: true });
   try {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
@@ -355,10 +356,10 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
         assert.ok(body.height < before.height, 'terminal shortens to make room');
       }
       // Beside its own terminal (#2277): details only. Every action is in the bar, so the panel
-      // has no action row; its tabs are Work and Inbox; no Note section until a note is pinned.
-      await panel.locator('.links .link-chip').waitFor();
+      // has no action row; one view, no tabs (#2280); no Note section until a note is pinned.
+      await panel.locator('.agent-status .agent-ticket').waitFor();
       assert.equal(await panel.locator('.acts').count(), 0);
-      assert.deepEqual(await panel.getByRole('tab').allInnerTexts(), ['Work', 'Inbox']);
+      assert.equal(await panel.locator('.tabs').count(), 0);
       assert.equal(await panel.locator('.pbody h3', { hasText: 'Note' }).count(), 0);
       // Rename from the bar's ⋯; on a phone, Hand off… folds into ⋯.
       const bar = page.locator('.term-bar');
@@ -372,6 +373,7 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
       await panel.locator('.phd .t', { hasText: viewport.width > 900 ? 'sm-1776-b' : 'sm-1776-c' }).waitFor();
       assert.equal(state.renamed.at(-1).id, 'sm-1776');
       assert.equal(await bar.locator('.pop').count(), 0, 'the editor closes after a rename');
+      if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-details-${viewport.width}.png` });
       const ticket = panel.getByRole('button', { name: /#2200/ }).first();
       await ticket.waitFor();
       await ticket.click();
