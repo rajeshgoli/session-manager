@@ -1,7 +1,7 @@
 // The New agent popover (spec 1710 D6.5, sm#1981): pick a configured agent
 // type and press Start, or Other for provider, model and effort; "Change"
 // opens the workspace, name and first message in the same panel.
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, openPanel, toast } from './ui.js';
 import { TypePicker, OTHER_TYPE, agentTypes, matchType } from './launch-fields.js';
 
@@ -26,6 +26,12 @@ export function useLocalModel() {
     return () => { alive = false; clearInterval(timer); };
   }, []);
   return local;
+}
+/** False once the dialog closes, so a model load that finishes later starts nothing. */
+export function useOpen() {
+  const open = useRef(true);
+  useEffect(() => () => { open.current = false; }, []);
+  return open;
 }
 /** The known local model needs loading before an agent can start on it. */
 const needsLoad = local => !local?.models?.length && !!local?.record && !['loading', 'ready', 'draining'].includes(local.record.state);
@@ -87,6 +93,7 @@ const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~'
 export function NewAgentPopover({ prefill = {}, onClose }) {
   const [settings, setSettings] = useState(null);
   const local = useLocalModel();
+  const open = useOpen();
   const [watch, setWatch] = useState(null);
   const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(!!prefill.message);
@@ -154,6 +161,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     if (form.provider === 'opencode') {
       try {
         body.model = await ensureLocalLoaded(local);
+        if (!open.current) return;
       } catch (e) {
         setError(`Local model did not load: ${e.message}`);
         setBusy(false);
