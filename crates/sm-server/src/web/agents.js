@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { safeThreadHtml, Thread } from './inbox.js';
 import {
-  html, api, inboxWrite, usePoll, useNow, config, age, limitText, clock,
+  html, api, inboxWrite, usePoll, useNow, config, age, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
   openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
@@ -593,11 +593,6 @@ function useAgent(id) {
 export function AgentPanel({ id, controls, beside }) {
   const { agent, claims, reload, loading, error } = useAgent(id);
   const now = useNow(15000);
-  // An open question opens on the agent's Inbox thread so it can be answered here (sm#2245).
-  const [picked, setPicked] = useState(null);
-  useEffect(() => setPicked(null), [id]);
-  // A terminal permission prompt is answered in the terminal, so it stays on Work.
-  const tab = picked || (['message', 'doc_review'].includes(agent?.facts?.you?.kind) ? 'inbox' : 'work');
   if (!agent) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
@@ -612,28 +607,17 @@ export function AgentPanel({ id, controls, beside }) {
   return html`
     <div class="phd">
       <${Ring} percent=${agent.context_percent} suffix="%" />
-      <span class="t" title=${agent.name}>${agent.name}</span>
+      <span class="t" title=${`${agent.name} · ${homeRelative(agent.working_dir || agent.repo)}`}>${agent.name}</span>
       ${controls}
       <span class="s">${parts.join(' · ')}</span>
     </div>
     ${beside === 'terminal' ? null : html`<${AgentActions} agent=${agent} onSaved=${reload}
       onRetired=${(done) => { if (done) closePanel(); reload(); }} />`}
-    <${Links} tickets=${claims.filter(item => item.kind === 'ticket')}
-      prs=${claims.filter(item => item.kind === 'pr')}
-      jobs=${agent.jobs || []} thread=${agent.thread}
-      docs=${agent.docs || []} />
-    <div class="tabs" role="tablist">
-      ${[['work', 'Work'], ['inbox', 'Inbox']].map(
-        ([key, label]) => html`<button type="button" role="tab" aria-selected=${tab === key}
-          class=${tab === key ? 'on' : ''} onClick=${() => setPicked(key)}>${label}</button>`,
-      )}
-    </div>
-    ${tab === 'inbox' ? html`<${Thread} key=${agent.id} id=${agent.id} embedded
-      empty=${html`<div class="pbody"><p class="muted">No messages yet.</p></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />` : html`<div class="pbody">
-      ${tab === 'work' ? html`<${WorkTab} agent=${agent} claims=${claims} now=${now} onAnswered=${reload}
-        onReply=${() => setPicked('inbox')} />` : null}
-    </div>`}
-    ${agent.state !== 'stopped' && tab !== 'inbox' ? html`<${MessageBox} agent=${agent} />` : null}
+    <${Links} prs=${claims.filter(item => item.kind === 'pr')}
+      jobs=${agent.jobs || []} docs=${agent.docs || []} />
+    <${AgentStatus} agent=${agent} claims=${claims} now=${now} onAnswered=${reload} />
+    <${Thread} key=${agent.id} id=${agent.id} embedded
+      empty=${html`<div class="pbody"><${LastTurn} id=${agent.id} /></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />
   `;
 }
 
@@ -742,66 +726,29 @@ function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
   <//>`;
 }
 
-const DOC_LINK = (doc) => doc.reader_path || doc.browser_url || doc.url;
-
-function WorkTab({ agent, claims, now, onAnswered, onReply }) {
-  const jobs = (agent.jobs || []).filter((job) => ['running', 'pending'].includes(job.state));
+/** Above the conversation (sm#2280): where the agent stands. The link chips carry PRs, jobs and
+ * docs; the thread below carries its turns and your messages. */
+function AgentStatus({ agent, claims, now, onAnswered }) {
   const reviews = (agent.waiting_on || []).filter((w) => w.kind === 'review');
-  const docs = agent.docs || [];
-  const ticketClaims = claims.filter((claim) => claim.kind !== 'pr');
-  const prClaims = claims.filter((claim) => claim.kind === 'pr');
-  const itemButton = (kind, id, href, children) => html`<button type="button" class="plain-btn"
-    onClick=${() => openItem(kind, id, href)}>${children}</button>`;
-  return html`
+  const tickets = claims.filter((claim) => claim.kind === 'ticket');
+  return html`<div class="pbody agent-status">
     <div class="acard-facts"><${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} /></div>
-    ${ticketClaims.length
-      ? html`<section><h3>Ticket</h3><ul>${ticketClaims.map((claim) => html`<li>
-          ${itemButton('ticket', `${claim.repo}#${claim.number}`, claim.url,
-            html`<span class="tk">#${claim.number}</span> ${claim.title || claim.repo}`)}
-          ${claim.state ? html` <span class="sub">${claim.state}</span>` : null}
-          ${claim.ended_at ? html` <span class="sub">· claim ended</span>` : null}</li>`)}</ul></section>`
-      : null}
-    ${prClaims.length
-      ? html`<section><h3>Pull requests</h3><ul>${prClaims.map((claim) => html`<li>
-          <a href=${claim.url} target="_blank" rel="noopener"><span class="tk">PR #${claim.number}</span> ${claim.title || ''}</a>
-          ${claim.state ? html` <span class="sub">${claim.state}</span>` : null}
-          ${claim.ended_at ? html` <span class="sub">· claim ended</span>` : null}</li>`)}</ul></section>`
-      : null}
-    ${reviews.length
-      ? html`<section><h3>Reviews</h3><ul>${reviews.map((review) => html`<li>
-          <span class="ball amber">${reviewWaitText(agent.waiting_on_review, review, now)}</span> <span class="sub">PR #${review.pr_number} · requested ${age(review.since, now)} ago</span></li>`)}</ul></section>`
-      : null}
-    ${docs.length
-      ? html`<section><h3>Docs</h3><ul>${docs.slice(0, 6).map((doc) => html`<li>
-          ${itemButton('doc', doc.reader_path || doc.id, DOC_LINK(doc), doc.title || doc.name || doc.id)}
-          ${doc.state ? html` <span class="sub">${String(doc.state).replace(/_/g, ' ')}</span>` : null}</li>`)}</ul></section>`
-      : null}
-    ${jobs.length
-      ? html`<section><h3>Queue jobs</h3><ul>${jobs.map((job) => html`<li>
-          ${itemButton('job', job.id, null, html`<span class=${`ball ${job.state === 'running' ? 'green' : 'amber'}`}>${job.label}</span>`)}
-          <span class="sub"> ${job.state === 'running'
-            ? `running ${age(job.started_at, now)}${job.timeout_seconds ? ` of ${limitText(job.timeout_seconds)}` : ''}`
-            : `waiting ${age(job.queued_at, now)}`}</span></li>`)}</ul></section>`
-      : null}
-    ${agent.status_text
-      ? html`<section><h3>Last words</h3><div class="quote">${agent.status_text}</div>
-          ${agent.status_at ? html`<div class="sub">${clock(agent.status_at)}</div>` : null}</section>`
-      : null}
-    <${LastTurn} id=${agent.id} onReply=${onReply} />
-    <section><h3>Workspace</h3><div class="sub mono">${homeRelative(agent.working_dir || agent.repo)}</div></section>
-  `;
+    ${tickets.map((claim) => html`<button type="button" class="plain-btn agent-ticket"
+      onClick=${() => openItem('ticket', `${claim.repo}#${claim.number}`, claim.url)}>
+      <span class="tk">#${claim.number}</span> ${claim.title || claim.repo}${claim.state ? html` <span class="sub">· ${claim.state}</span>` : null}${claim.ended_at ? html` <span class="sub">· claim ended</span>` : null}</button>`)}
+    ${reviews.map((review) => html`<div><span class="ball amber">${reviewWaitText(agent.waiting_on_review, review, now)}</span>
+      <span class="sub">PR #${review.pr_number} · requested ${age(review.since, now)} ago</span></div>`)}
+    ${agent.status_text ? html`<div class="quote">${agent.status_text}${agent.status_at ? html` <span class="sub">· ${clock(agent.status_at)}</span>` : null}</div>` : null}
+  </div>`;
 }
 
 // What the agent wrote at the end of its latest turn; none yet is a 404.
-function LastTurn({ id, onReply }) {
+function LastTurn({ id }) {
   const [turn] = usePoll(() => api(`/sessions/${encodeURIComponent(id)}/last-turn`).catch(() => null), 30000, [id]);
   if (!turn) return null;
-  // Reply continues in the agent's Inbox thread, shown in this panel's Inbox tab.
-  const reply = onReply || (() => { navigate('/inbox'); openPanel(`thread:${id}`); });
   return html`<section><h3>Last turn</h3>
     <div class="quote last-turn md" dangerouslySetInnerHTML=${{ __html: safeThreadHtml(turn.html || '') }} />
-    <div class="last-turn-foot"><span class="sub">${clock(turn.at)}</span>
-      <button type="button" class="btn sm" onClick=${reply}>Reply</button></div></section>`;
+    <div class="last-turn-foot"><span class="sub">${clock(turn.at)}</span></div></section>`;
 }
 
 /** An owner message, as a reply sent from the phone (POST /inbox/agent/{id}/send). */

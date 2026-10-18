@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdir } from 'node:fs/promises';
+const SHOTS = process.env.SHOTS_DIR;
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const assets = new URL('../crates/sm-server/src/web/', import.meta.url);
 const shell = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -68,7 +69,7 @@ function fixture() {
 
 test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone sizes', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
-  const shots = process.env.SHOTS_DIR;
+  const shots = SHOTS;
   if (shots) await mkdir(shots, { recursive: true });
   try {
     for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
@@ -304,7 +305,7 @@ test('long agent name keeps the Agents confirmation and Cancel in a phone viewpo
   } finally { await browser.close(); }
 });
 
-test('agent details answer a question in place: Inbox tab shows messages and docs, Reply stays here', async () => {
+test('agent details are one view (#2280): status, then the thread with its docs, one compose box', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
@@ -341,9 +342,10 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
       }
       return route.fulfill({ json: {} });
     });
-    // An agent with an open question opens on its Inbox thread.
+    // No tabs: the status block sits above the thread, and the question shows in the thread.
     await page.goto('http://localhost/?open=agent:sm-1726-engineer');
-    await page.locator('.details-band .tabs button.on', { hasText: 'Inbox' }).waitFor();
+    await page.locator('.details-band .agent-status').waitFor();
+    assert.equal(await page.locator('.details-band .tabs').count(), 0);
     await page.locator('.details-band .thread-items', { hasText: 'Can you run one manual Chrome check?' }).waitFor();
     assert.equal(await page.locator('.details-band .thread-doc-card strong').innerText(), '1726 memo');
     assert.equal(await page.locator('.details-band .msgbox').count(), 0, 'one compose box, the thread\'s');
@@ -354,17 +356,10 @@ test('agent details answer a question in place: Inbox tab shows messages and doc
     await page.waitForFunction(() => document.querySelector('textarea[aria-label="Reply"]')?.value === '');
     assert.equal(sent[0].body, 'Ran it, passes');
     assert.equal(sent[0].to, 'sm-1726-helper');
-    // Work tab's Last turn Reply comes back to the Inbox tab without leaving the page.
-    await page.locator('.details-band .tabs button', { hasText: 'Work' }).click();
-    await page.locator('.details-band .last-turn-foot button', { hasText: 'Reply' }).click();
-    await page.locator('.details-band .tabs button.on', { hasText: 'Inbox' }).waitFor();
-    assert.equal(new URL(page.url()).pathname, '/');
-    // A terminal permission prompt is not an Inbox question: Details opens on Work.
+    if (SHOTS) await page.screenshot({ path: `${SHOTS}/agent-details-one-view.png`, fullPage: true });
+    // An agent with no thread yet shows its last turn and the plain message box.
     await page.goto('http://localhost/?open=agent:sm-1776');
-    await page.locator('.details-band .tabs button.on', { hasText: 'Work' }).waitFor();
-    // An agent with no thread yet keeps the plain message box on its Inbox tab.
-    await page.locator('.details-band .tabs button', { hasText: 'Inbox' }).click();
-    await page.locator('.details-band', { hasText: 'No messages yet.' }).waitFor();
+    await page.locator('.details-band .last-turn', { hasText: 'Done; one question left.' }).waitFor();
     assert.equal(await page.locator('.details-band .msgbox').count(), 1);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
