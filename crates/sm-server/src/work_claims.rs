@@ -656,6 +656,7 @@ impl WorkClaimStore {
                 enabled: row.get::<_, Option<bool>>(0)?,
                 threshold_percent: row.get(1)?,
                 set_at: row.get(2)?,
+                ..Default::default()
             }),
         ).optional().map_err(Into::into)
     }
@@ -721,6 +722,7 @@ impl WorkClaimStore {
                         enabled: row.get(1)?,
                         threshold_percent: row.get(2)?,
                         set_at: row.get(3)?,
+                        ..Default::default()
                     },
                 ))
             })?

@@ -364,3 +364,55 @@ test('agent details are one view (#2280): status, then the thread with its docs,
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
+
+test('Hand off…: a cleared field takes a typed percent; presets; per-agent review switches (#2283)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const errors = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    const puts = [];
+    let policy = { enabled: true, threshold_percent: 35, source: 'default', has_gauge: true, ask_on_codex_review: true, ask_on_doc_review: true };
+    await page.route('http://localhost/**', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.pathname.startsWith('/assets/')) {
+        const file = url.pathname.slice('/assets/'.length);
+        return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
+      }
+      if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions: fixture(), counts: {} } });
+      if (url.pathname === '/sessions/sm-1776/handoff-policy') {
+        if (request.method() === 'PUT') {
+          const body = request.postDataJSON();
+          puts.push(body);
+          policy = { ...policy, ...body, source: 'override' };
+        }
+        return route.fulfill({ json: policy });
+      }
+      if (url.pathname === '/inbox/agent/sm-1776') return route.fulfill({ status: 404, json: { detail: 'Thread not found' } });
+      return route.fulfill({ json: {} });
+    });
+    await page.goto('http://localhost/?open=agent:sm-1776');
+    await page.locator('.details-band .acts').getByRole('button', { name: 'Hand off…' }).click();
+    const pop = page.locator('.handoff-pop');
+    const field = pop.getByRole('spinbutton', { name: 'Hand off at, percent of context' });
+    await field.waitFor();
+    assert.equal(await field.inputValue(), '35');
+    // Clearing keeps the field empty, so typing 50 means 50, not 350.
+    await field.fill('');
+    assert.equal(await field.inputValue(), '');
+    await field.pressSequentially('50');
+    await field.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.handoff-pop [role="status"]')?.textContent.startsWith('Saved'));
+    assert.deepEqual(puts.at(-1), { threshold_percent: 50 });
+    await pop.getByRole('button', { name: '65%' }).click();
+    await page.waitForFunction(() => document.querySelector('.handoff-pop input[type="number"]')?.value === '65');
+    assert.deepEqual(puts.at(-1), { threshold_percent: 65 });
+    await pop.getByRole('switch', { name: 'Hand off before a Codex review' }).click();
+    for (let i = 0; i < 100 && puts.length < 3; i += 1) await page.waitForTimeout(50);
+    assert.deepEqual(puts.at(-1), { ask_on_codex_review: false });
+    await pop.getByRole('switch', { name: 'Hand off before a Codex review', checked: false }).waitFor();
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
