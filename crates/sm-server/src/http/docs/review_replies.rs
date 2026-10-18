@@ -115,6 +115,97 @@ fn forward_one(
     }
 }
 
+/// `GET /docs/{id}/review-replies`: the owner's latest posted review of the
+/// doc, as the threads that have replies. The reader shows each under the
+/// passage it quotes, open when that passage is unchanged (sm#2305).
+pub(super) async fn reader_threads_response(
+    state: &Arc<AppState>,
+    doc: OwnerDoc,
+) -> Result<Response, ApiError> {
+    let cached = state
+        .owner_doc_replies_cache
+        .lock()
+        .unwrap()
+        .get(&doc.id)
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+        .map(|(_, value)| value.clone());
+    if let Some(value) = cached {
+        return Ok(Json(value).into_response());
+    }
+    let task_state = state.clone();
+    let doc_id = doc.id.clone();
+    let value = tokio::task::spawn_blocking(move || reader_threads(&task_state, &doc))
+        .await
+        .map_err(|error| anyhow::anyhow!("review replies task failed: {error}"))?
+        .unwrap_or_else(|error| {
+            eprintln!("review replies for doc {doc_id} failed: {error:#}");
+            json!({ "threads": [] })
+        });
+    state
+        .owner_doc_replies_cache
+        .lock()
+        .unwrap()
+        .insert(doc_id, (std::time::Instant::now(), value.clone()));
+    Ok(Json(value).into_response())
+}
+
+fn reader_threads(state: &AppState, doc: &OwnerDoc) -> anyhow::Result<Value> {
+    let store = owner_doc_store(state);
+    let Some(review) = store
+        .reviews(&doc.id)?
+        .into_iter()
+        .rfind(|review| review.status == "posted" && review.github_review_id.is_some())
+    else {
+        return Ok(json!({ "threads": [] }));
+    };
+    let (Some(pr), Some(github_review_id)) = (store.review_pr(&review)?, review.github_review_id)
+    else {
+        return Ok(json!({ "threads": [] }));
+    };
+    let since = review.posted_at.as_deref().unwrap_or(&review.submitted_at);
+    let replies = state
+        .owner_doc_source
+        .review_replies(&doc.repo, pr, github_review_id, since)
+        .map_err(anyhow::Error::msg)?;
+    Ok(json!({
+        "review": { "commit_sha": review.commit_sha, "url": review.github_review_url },
+        "threads": reader_threads_from(&replies),
+    }))
+}
+
+/// Replies grouped under the comment they answer, in comment order.
+pub(super) fn reader_threads_from(replies: &[DocReviewReply]) -> Vec<Value> {
+    let mut threads: BTreeMap<i64, Value> = BTreeMap::new();
+    for reply in replies {
+        threads.entry(reply.parent_id).or_insert_with(|| {
+            json!({
+                "quote": quoted_selection(&reply.parent_body),
+                "comment": owner_comment(&reply.parent_body),
+                "url": reply.parent_url,
+                "replies": [],
+            })
+        })["replies"]
+            .as_array_mut()
+            .expect("replies is an array")
+            .push(json!({
+                "body": reply.body.trim(),
+                // Agents write Markdown; rendered as the Inbox renders it.
+                "html": crate::owner_doc_render::render_markdown_sanitized(reply.body.trim()),
+                "url": reply.url,
+            }));
+    }
+    threads.into_values().collect()
+}
+
+/// The selection `comment_body` quoted ahead of the owner's words.
+fn quoted_selection(body: &str) -> String {
+    body.lines()
+        .take_while(|line| line.starts_with('>'))
+        .map(|line| line.trim_start_matches('>').trim_start())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) fn replies_message(
     sender: &str,
     doc: &OwnerDoc,
@@ -167,7 +258,7 @@ mod tests {
     #[test]
     fn only_replies_in_the_owner_review_threads_are_kept() {
         let parents = json!([
-            {"id": 10, "body": "> the quote\n\nwhy rate 0.1?"},
+            {"id": 10, "body": "> the quote\n\nwhy rate 0.1?", "html_url": "u10a"},
             {"id": 11, "body": "> other\n\nand this"}
         ]);
         let comments = json!([
@@ -183,6 +274,17 @@ mod tests {
         );
         assert_eq!(replies[0].parent_body, "> the quote\n\nwhy rate 0.1?");
         assert_eq!(replies[0].url, "u30");
+        assert_eq!(replies[0].parent_url, "u10a");
+
+        let threads = reader_threads_from(&replies);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0]["quote"], "the quote");
+        assert_eq!(threads[0]["comment"], "why rate 0.1?");
+        assert_eq!(threads[0]["url"], "u10a");
+        assert_eq!(threads[0]["replies"][0]["body"], "Rate 1 lags.");
+        assert_eq!(threads[0]["replies"][0]["html"], "<p>Rate 1 lags.</p>\n");
+        assert_eq!(threads[1]["replies"][0]["url"], "u31");
+        assert_eq!(quoted_selection("> a\n> b\n\nc"), "a\nb");
     }
 
     #[test]
@@ -202,6 +304,8 @@ mod tests {
         };
         let replies = [DocReviewReply {
             id: 30,
+            parent_id: 10,
+            parent_url: "u10".into(),
             parent_body: "> small cost, big gain\n> second line\n\nIs this right?".into(),
             body: "  You're right, I overstated it.  ".into(),
             url: "https://github.com/acme/widgets/pull/2201#discussion_r30".into(),

@@ -393,7 +393,8 @@ mod web;
 mod worktrees;
 pub use auto_retire::sweep_auto_retire;
 pub use docs::{
-    DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
+    DocFetchError, DocPullRequest, DocReviewOnGitHub, DocReviewReply, OwnerDocSource,
+    SubmittedDocReview,
 };
 
 pub trait GitHubReviewPoster: Send + Sync {
@@ -690,6 +691,8 @@ pub struct AppState {
     owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
     /// Serializes owner doc review submits and their reconciliation.
     owner_doc_reopen_cache: Arc<Mutex<BTreeMap<String, (std::time::Instant, Value)>>>,
+    /// `GET /docs/{id}/review-replies`, briefly, so reloads skip GitHub.
+    owner_doc_replies_cache: Arc<Mutex<BTreeMap<String, (std::time::Instant, Value)>>>,
     /// Analytics payloads per parameter set, cached for 60s.
     analytics_cache: Arc<Mutex<analytics::AnalyticsCache>>,
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
@@ -916,6 +919,7 @@ impl AppState {
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_reopen_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            owner_doc_replies_cache: Arc::new(Mutex::new(BTreeMap::new())),
             analytics_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             owner_message_lock: Arc::new(AsyncMutex::new(())),

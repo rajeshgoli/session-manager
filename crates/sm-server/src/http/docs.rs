@@ -156,7 +156,9 @@ pub trait OwnerDocSource: Send + Sync {
 pub struct DocReviewReply {
     pub id: i64,
     /// The owner's comment the reply answers.
+    pub parent_id: i64,
     pub parent_body: String,
+    pub parent_url: String,
     pub body: String,
     pub url: String,
 }
@@ -600,21 +602,29 @@ impl OwnerDocSource for GhCliDocSource {
 /// a comment is a reply to the owner's review.
 pub(super) fn review_replies_from(parents: &Value, comments: &Value) -> Vec<DocReviewReply> {
     let text = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
-    let parents: BTreeMap<i64, String> = parents
+    let parents: BTreeMap<i64, (String, String)> = parents
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|parent| Some((parent["id"].as_i64()?, text(parent, "body"))))
+        .filter_map(|parent| {
+            Some((
+                parent["id"].as_i64()?,
+                (text(parent, "body"), text(parent, "html_url")),
+            ))
+        })
         .collect();
     let mut replies: Vec<DocReviewReply> = comments
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|comment| {
-            let parent_body = parents.get(&comment["in_reply_to_id"].as_i64()?)?;
+            let parent_id = comment["in_reply_to_id"].as_i64()?;
+            let (parent_body, parent_url) = parents.get(&parent_id)?;
             Some(DocReviewReply {
                 id: comment["id"].as_i64()?,
+                parent_id,
                 parent_body: parent_body.clone(),
+                parent_url: parent_url.clone(),
                 body: text(comment, "body"),
                 url: text(comment, "html_url"),
             })
@@ -1817,7 +1827,12 @@ pub(super) async fn get_owner_doc_subpath(
         return super::ask::items(state, first, request).await;
     }
     // The JSON endpoints also take the page's doc token; pages never do.
-    if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts", "reopen-target"])? {
+    if let Some(doc) = id_subroute(
+        &state,
+        &first,
+        &rest,
+        &["head", "drafts", "reopen-target", "review-replies"],
+    )? {
         if !doc_token_presented(&state, request.headers(), &doc.id) {
             ensure_owner_page_read_allowed(&state, &request)?;
         }
@@ -1849,6 +1864,8 @@ pub(super) async fn get_owner_doc_subpath(
             Ok(Json(value).into_response())
         } else if rest == "head" {
             doc_head_response(&state, &doc, query.sha.as_deref()).await
+        } else if rest == "review-replies" {
+            review_replies::reader_threads_response(&state, doc).await
         } else {
             Ok(Json(json!({ "drafts": owner_doc_store(&state).drafts(&doc.id)? })).into_response())
         };
