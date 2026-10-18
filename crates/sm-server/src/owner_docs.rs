@@ -555,7 +555,8 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
     {
         conn.execute_batch(
             "ALTER TABLE owner_doc_reviews ADD COLUMN replies_closed_at TEXT;
-             UPDATE owner_doc_reviews SET replies_closed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');",
+             UPDATE owner_doc_reviews SET replies_closed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE status = 'posted';",
         )?;
     }
     conn.execute_batch(
@@ -1660,6 +1661,30 @@ impl OwnerDocStore {
         Ok(self.publishes(&review.doc_id)?.iter().any(|publish| {
             publish.blob_sha != review.blob_sha && timestamp_after(&publish.published_at, posted_at)
         }))
+    }
+
+    /// The PR the review was posted on: its submit target, else the PR of
+    /// the latest publish at or before it posted.
+    pub fn review_pr(&self, review: &OwnerDocReview) -> Result<Option<i64>> {
+        if let Some(conn) = self.open_read()? {
+            let target: Option<i64> = conn
+                .query_row(
+                    "SELECT target_pr FROM owner_doc_reviews WHERE id = ?1",
+                    params![review.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if target.is_some() {
+                return Ok(target);
+            }
+        }
+        let posted_at = review.posted_at.as_deref().unwrap_or(&review.submitted_at);
+        Ok(self
+            .publishes(&review.doc_id)?
+            .into_iter()
+            .rfind(|publish| !timestamp_after(&publish.published_at, posted_at))
+            .and_then(|publish| publish.pr_number))
     }
 
     /// Stops watching a review for replies.
@@ -2773,29 +2798,31 @@ mod tests {
                 .unwrap();
         };
         // A review from before the column existed starts closed.
-        post("sub-old00001", "2026-10-01T00:00:00Z");
+        post("sub-old00001", "2025-12-01T00:00:00Z");
         let conn = Connection::open(dir.join("message_queue.db")).unwrap();
         conn.execute_batch(
             "UPDATE owner_doc_reviews SET replies_closed_at = NULL;
+             UPDATE owner_doc_publishes SET published_at = '2026-01-01T00:00:00Z';
              ALTER TABLE owner_doc_reviews DROP COLUMN replies_closed_at;",
         )
         .unwrap();
         store.ensure_schema().unwrap();
         assert!(store
-            .reviews_watching_replies("2026-01-01T00:00:00Z")
+            .reviews_watching_replies("2025-01-01T00:00:00Z")
             .unwrap()
             .is_empty());
 
-        post("sub-new00001", "2026-10-18T17:26:54Z");
+        post("sub-new00001", "2026-01-02T00:00:00Z");
         let watched = store
-            .reviews_watching_replies("2026-10-11T17:00:00Z")
+            .reviews_watching_replies("2025-12-26T00:00:00Z")
             .unwrap();
         assert_eq!(watched.len(), 1);
         assert!(store
-            .reviews_watching_replies("2026-10-18T17:26:55.5Z")
+            .reviews_watching_replies("2026-01-02T00:00:00.5Z")
             .unwrap()
             .is_empty());
         let review = &watched[0];
+        assert_eq!(store.review_pr(review).unwrap(), Some(7));
         // Republishing the reviewed bytes is not a new revision.
         store.publish(publish(Some(7), "c", "1"), |_| true).unwrap();
         assert!(!store.revision_after_review(review).unwrap());

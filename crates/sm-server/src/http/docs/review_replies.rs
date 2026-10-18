@@ -43,10 +43,12 @@ fn forward_one(
     ) else {
         return Ok(());
     };
-    let Some(pr) = doc.pr_number else {
+    // The PR the review was posted on; a doc moved to a new PR since has
+    // left this review behind.
+    let Some(pr) = store.review_pr(review)? else {
         return store.close_reply_watch(&review.id);
     };
-    if store.revision_after_review(review)? {
+    if doc.pr_number != Some(pr) || store.revision_after_review(review)? {
         return store.close_reply_watch(&review.id);
     }
     let Some(session_id) = review.delivered_to_session_id.as_deref() else {
@@ -102,10 +104,15 @@ fn forward_one(
             },
             Some(&key),
         )?;
-    if let crate::owner_messages::CreateOwnerMessage::Created(message) = result {
-        super::super::follows::notice_new_message(state, &message);
+    match result {
+        crate::owner_messages::CreateOwnerMessage::Created(message) => {
+            super::super::follows::notice_new_message(state, &message);
+            store.record_forwarded_replies(&review.id, &ids)
+        }
+        // The agent's unread backlog is full: the replies stay pending and a
+        // later pass sends them once the owner has read some.
+        crate::owner_messages::CreateOwnerMessage::UnreadCapReached => Ok(()),
     }
-    store.record_forwarded_replies(&review.id, &ids)
 }
 
 pub(super) fn replies_message(
