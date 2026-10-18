@@ -396,6 +396,8 @@ function SetDifferently({ write }) {
 function Handoff({ write }) {
   const [state, reload, setData] = useResource('/handoff-defaults');
   const save = body => write('/handoff-defaults', body).then(data => { setData(data); return data; });
+  // A switch has no field to show an error in, so a failed save says so in a toast.
+  const flip = body => save(body).catch(error => toast(`Not saved: ${error.message}`));
   return html`<h2>Context handoff</h2><p class="sub">A fresh agent takes over when context fills up. Shared with the phone.</p>
     <${Resource} state=${state} retry=${reload}>${data => html`
       <datalist id="hd-presets"><option value="35" /><option value="50" /><option value="65" /></datalist>
@@ -408,7 +410,7 @@ function Handoff({ write }) {
           return html`<div class=${`hd-row${on ? '' : ' off'}`} role="row" key=${provider}>
             <span class="hd-provider">${name}${on ? null : html`<span class="sub">${off(window)}</span>`}</span>
             <span class="hd-cell"><span class="hd-label">Automatic</span><${Toggle} label=${`${name}: hand off automatically`} checked=${on}
-              onChange=${value => save({ providers: { [provider]: value } })} /></span>
+              onChange=${value => flip({ providers: { [provider]: value } })} /></span>
             ${on ? THRESHOLDS.map(([key, label, min]) => html`<${PercentCell} key=${key} label=${label} min=${min} window=${window}
                 list=${key === 'threshold_percent' ? 'hd-presets' : null} initial=${thresholds[key]}
                 save=${value => save({ provider_thresholds: { [provider]: { [key]: value } } })} />`)
@@ -419,7 +421,7 @@ function Handoff({ write }) {
       <dl class="hd-terms">${THRESHOLDS.map(([, label, , text]) => html`<dt>${label}</dt><dd>${text}</dd>`)}</dl>
       <h3>When a review is requested</h3>
       ${REVIEW_SWITCHES.map(([key, label, text]) => html`<label class="check hd-switch"><${Toggle} label=${label} checked=${!!data[key]}
-          onChange=${value => save({ [key]: value })} /><span>${label}<span class="sub">${text}</span></span></label>`)}
+          onChange=${value => flip({ [key]: value })} /><span>${label}<span class="sub">${text}</span></span></label>`)}
       <${SetDifferently} write=${write} />
     `}</${Resource}>`;
 }
