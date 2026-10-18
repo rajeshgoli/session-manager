@@ -181,6 +181,7 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
   const [lining, setLining] = useState(false);
   const [defaults, setDefaults] = useState(false);
   const [laneMenu, setLaneMenu] = useState(false);
+  const [handoff, setHandoff] = useState(false);
   const policy = lane.review_policy;
   const groups = groupTickets(lane.tickets || []);
   const counts = lane.counts;
@@ -202,6 +203,9 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
         Reviews: <b>${policy ? reviewerText(policy.reviewer) : 'default'}</b> ▾</button>
         ${reviews ? html`<${PolicyPopover} scope="lane" repo=${lane.goal.repo} number=${lane.goal.number} title=${`Reviews for lane ${lane.rank} · ${lane.goal.title}`}
           policy=${policy} align="right" onClose=${() => setReviews(false)} onSaved=${boardChanged} />` : null}</span>
+      <span class="anchor"><button class="review-pill" data-pop-anchor title=${lane.handoff ? 'Set for this lane; a ticket or agent setting wins' : 'This lane uses the handoff default'}
+        onClick=${() => setHandoff(!handoff)}>Handoff: <b>${laneHandoffText(lane.handoff)}</b> ▾</button>
+        ${handoff ? html`<${HandoffPopover} lane=${lane.goal} align="right" onClose=${() => { setHandoff(false); boardChanged(); }} />` : null}</span>
       <div class="lane-actions">${lane.goal.state === 'close_ready' ? html`<button class="btn sm pri" disabled=${busy} onClick=${() => onClose(lane.goal)}>Close</button>` : null}
         <span class="anchor"><button class="btn sm" data-pop-anchor onClick=${()=>setLaneMenu(!laneMenu)}>Lane actions ⋯</button>
         ${laneMenu?html`<${Popover} onClose=${()=>setLaneMenu(false)} align="right" className="menu">
@@ -227,6 +231,15 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
       <${Fold} tickets=${groups.done.filter(t=>!hasOperations(t))} label="Done" open=${showDone} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>
   </section>`;
 }
+/** The lane's Handoff pill: what the lane sets, or "default" (sm#2293). */
+export function laneHandoffText(value) {
+  if (!value) return 'default';
+  if (value.enabled === false) return 'off';
+  if (value.threshold_percent != null) return `${value.threshold_percent}%`;
+  if (value.enabled === true) return 'on';
+  return 'custom';
+}
+
 function AddLane({ repos, mutate, busy, onClose }) {
   const [repo, setRepo] = useState((repos[0] || {}).repo || '');
   const [number, setNumber] = useState('');

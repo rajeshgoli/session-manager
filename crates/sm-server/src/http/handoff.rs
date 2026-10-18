@@ -9,6 +9,7 @@ use crate::handoff::policy::PolicyUpdate;
 use crate::sessions::{
     HandoffAcceptOutcome, HandoffPolicyOutcome, HandoffWork, ReviewAsk, SuccessorPlan,
 };
+use crate::work_claims::HandoffScope;
 
 /// Header the `sm` client sends from inside a managed session.
 pub(super) const SESSION_HEADER: &str = "x-sm-session";
@@ -165,42 +166,86 @@ pub(super) async fn put_handoff_policy(
 }
 
 pub(super) async fn get_ticket_handoff_policy(
+    state: State<Arc<AppState>>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    path: Path<(String, String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    get_scoped_handoff_policy(HandoffScope::Ticket, state, peer, headers, path)
+}
+
+pub(super) async fn put_ticket_handoff_policy(
+    state: State<Arc<AppState>>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    path: Path<(String, String, i64)>,
+    body: Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    put_scoped_handoff_policy(HandoffScope::Ticket, state, peer, headers, path, body)
+}
+
+/// A lane's override, keyed by its goal ticket (sm#2293).
+pub(super) async fn get_lane_handoff_policy(
+    state: State<Arc<AppState>>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    path: Path<(String, String, i64)>,
+) -> Result<Json<Value>, ApiError> {
+    get_scoped_handoff_policy(HandoffScope::Lane, state, peer, headers, path)
+}
+
+pub(super) async fn put_lane_handoff_policy(
+    state: State<Arc<AppState>>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    path: Path<(String, String, i64)>,
+    body: Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    put_scoped_handoff_policy(HandoffScope::Lane, state, peer, headers, path, body)
+}
+
+fn scope_route(scope: HandoffScope) -> &'static str {
+    match scope {
+        HandoffScope::Ticket => "/handoff-policy/ticket",
+        HandoffScope::Lane => "/handoff-policy/lane",
+    }
+}
+
+fn get_scoped_handoff_policy(
+    scope: HandoffScope,
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((owner, repo, number)): Path<(String, String, i64)>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_owner(&state, &headers, peer_addr, "/handoff-policy/ticket", None)?;
+    ensure_owner(&state, &headers, peer_addr, scope_route(scope), None)?;
     if number <= 0 || owner.is_empty() || repo.is_empty() {
         return Err(status(StatusCode::BAD_REQUEST, "invalid ticket"));
     }
-    Ok(Json(state.session_store.ticket_handoff_policy_view(
+    Ok(Json(state.session_store.scoped_handoff_policy_view(
+        scope,
         &format!("{owner}/{repo}"),
         number,
     )?))
 }
 
-pub(super) async fn put_ticket_handoff_policy(
+fn put_scoped_handoff_policy(
+    scope: HandoffScope,
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_owner(
-        &state,
-        &headers,
-        peer_addr,
-        "/handoff-policy/ticket",
-        Some(&body),
-    )?;
+    ensure_owner(&state, &headers, peer_addr, scope_route(scope), Some(&body))?;
     ensure_core_writes_enabled(&state)?;
     if number <= 0 || owner.is_empty() || repo.is_empty() {
         return Err(status(StatusCode::BAD_REQUEST, "invalid ticket"));
     }
     let update =
         PolicyUpdate::parse(&body).map_err(|detail| status(StatusCode::BAD_REQUEST, detail))?;
-    match state.session_store.update_ticket_handoff_policy(
+    match state.session_store.update_scoped_handoff_policy(
+        scope,
         &format!("{owner}/{repo}"),
         number,
         &update,

@@ -685,6 +685,8 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("PUT", "/handoff-defaults", "handoff.defaults_set", Some("setting")),
     ("GET", "/handoff-policy/ticket/{owner}/{repo}/{number}", "handoff.ticket_policy", Some("ticket")),
     ("PUT", "/handoff-policy/ticket/{owner}/{repo}/{number}", "handoff.ticket_policy_set", Some("ticket")),
+    ("GET", "/handoff-policy/lane/{owner}/{repo}/{number}", "handoff.lane_policy", Some("lane")),
+    ("PUT", "/handoff-policy/lane/{owner}/{repo}/{number}", "handoff.lane_policy_set", Some("lane")),
     ("PUT", "/sessions/{session_id}/maintainer", "session.maintainer", Some("session")),
     ("DELETE", "/sessions/{session_id}/maintainer", "session.maintainer_clear", Some("session")),
     ("POST", "/sessions/{session_id}/registry", "session.register", Some("session")),
@@ -730,7 +732,8 @@ pub fn resolve(method: &str, route: &str, params: &[String]) -> ResolvedAction {
     let mut action = (*action).to_owned();
     let target_id = match route {
         "/client/github/{owner}/{repo}/{number}"
-        | "/handoff-policy/ticket/{owner}/{repo}/{number}" => {
+        | "/handoff-policy/ticket/{owner}/{repo}/{number}"
+        | "/handoff-policy/lane/{owner}/{repo}/{number}" => {
             (params.len() == 3).then(|| format!("{}/{}#{}", params[0], params[1], params[2]))
         }
         "/t/{repo}/{number}" => (params.len() == 2).then(|| format!("{}#{}", params[0], params[1])),

@@ -4,10 +4,12 @@
 
 use super::*;
 use crate::handoff::policy::{
-    self, ask_text, claims_text, effective_policy_with_ticket, reminder_text, AskReason,
+    self, ask_text, claims_text, effective_policy_inherited, reminder_text, AskReason,
     EffectivePolicy, HandoffDefaults, HandoffOverride, HandoffPhase, HandoffRecord, HandoffTrigger,
-    PolicyUpdate, SessionRef,
+    Inherited, PolicyUpdate, SessionRef,
 };
+
+use crate::work_claims::HandoffScope;
 
 /// What `PUT /sessions/{id}/handoff-policy` did.
 #[derive(Debug)]
@@ -43,17 +45,17 @@ struct RawHandoffContext {
 fn raw_handoff_context(
     state: &Value,
     session_id: &str,
-    ticket: Option<&HandoffOverride>,
+    inherited: Option<&Inherited>,
 ) -> Option<RawHandoffContext> {
     let session = raw_session_object(state, session_id)?;
     let defaults = HandoffDefaults::from_stored(state.get(policy::DEFAULTS_KEY));
     let provider = raw_session_provider(session);
     let override_ = HandoffOverride::from_stored(session.get(policy::OVERRIDE_KEY));
-    let policy = effective_policy_with_ticket(
+    let policy = effective_policy_inherited(
         &defaults,
         &provider,
         override_.as_ref(),
-        ticket,
+        inherited,
         provider_has_measured_context_gauge(&provider),
     );
     Some(RawHandoffContext {
@@ -107,15 +109,15 @@ pub(super) fn handoff_view_for_record(
     session: &SessionRecord,
     defaults: &HandoffDefaults,
     session_refs: &BTreeMap<String, SessionRef>,
-    ticket: Option<&HandoffOverride>,
+    inherited: Option<&Inherited>,
 ) -> Value {
     let provider = non_empty_or(session.provider.clone(), "claude");
     let override_ = HandoffOverride::from_stored(session.handoff_policy_override.as_ref());
-    let policy = effective_policy_with_ticket(
+    let policy = effective_policy_inherited(
         defaults,
         &provider,
         override_.as_ref(),
-        ticket,
+        inherited,
         provider_has_measured_context_gauge(&provider),
     );
     let record = session
@@ -152,20 +154,35 @@ impl SessionStore {
             .map(|queue| crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf()))
     }
 
-    pub fn ticket_handoff_policy_view(&self, repo: &str, number: i64) -> Result<Value> {
-        let override_ = self
-            .ticket_claim_store()
-            .map(|store| store.handoff_ticket_override(repo, number))
-            .transpose()?
-            .flatten();
-        Ok(override_.map_or_else(
-            || HandoffOverride::default().to_json(),
-            |value| value.to_json(),
-        ))
+    /// A ticket's or lane's stored override; unset fields are null. A ticket's view
+    /// also carries its lane's override under `lane`, which fills its unset fields.
+    pub fn scoped_handoff_policy_view(
+        &self,
+        scope: HandoffScope,
+        repo: &str,
+        number: i64,
+    ) -> Result<Value> {
+        let Some(claims) = self.ticket_claim_store() else {
+            return Ok(HandoffOverride::default().to_json());
+        };
+        let mut view = claims
+            .handoff_override(scope, repo, number)?
+            .unwrap_or_default()
+            .to_json();
+        if scope == HandoffScope::Ticket {
+            view["lane"] = match claims.lane_goal_for_ticket(repo, number)? {
+                Some((goal_repo, goal)) => claims
+                    .handoff_override(HandoffScope::Lane, &goal_repo, goal)?
+                    .map_or(Value::Null, |value| value.to_json()),
+                None => Value::Null,
+            };
+        }
+        Ok(view)
     }
 
-    pub fn update_ticket_handoff_policy(
+    pub fn update_scoped_handoff_policy(
         &self,
+        scope: HandoffScope,
         repo: &str,
         number: i64,
         update: &PolicyUpdate,
@@ -173,55 +190,67 @@ impl SessionStore {
         if update.ask_now {
             return Ok(Err("ask_now is available only for an agent".to_owned()));
         }
-        if update.sets_review_asks() {
-            return Ok(Err(
-                "review handoff switches are set per agent, not per ticket".to_owned(),
-            ));
-        }
         let Some(claims) = self.ticket_claim_store() else {
             return Ok(Err("ticket claims are unavailable".to_owned()));
         };
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let current = claims.handoff_ticket_override(repo, number)?;
+        let current = claims.handoff_override(scope, repo, number)?;
         let next = update.apply(current.as_ref(), &now_rfc3339());
-        let holders = claims
-            .claims_for_item(repo, number)?
-            .into_iter()
-            .filter(|claim| {
-                claim.kind == "ticket" && claim.ended_at.is_none() && claim.reserved_at.is_none()
-            })
-            .map(|claim| claim.session_id)
-            .collect::<Vec<_>>();
+        // A ticket reaches its holders; a lane can reach any session, so recheck them all.
+        let holders = match scope {
+            HandoffScope::Ticket => claims
+                .claims_for_item(repo, number)?
+                .into_iter()
+                .filter(|claim| {
+                    claim.kind == "ticket"
+                        && claim.ended_at.is_none()
+                        && claim.reserved_at.is_none()
+                })
+                .map(|claim| claim.session_id)
+                .collect::<Vec<_>>(),
+            HandoffScope::Lane => ensure_sessions_array_mut(&mut state)?
+                .iter()
+                .filter_map(|session| json_text(session.get("id")))
+                .collect(),
+        };
         let was_enabled = holders
             .iter()
             .map(|id| {
-                raw_handoff_context(
-                    &state,
-                    id,
-                    self.ticket_handoff_override_for_session(id).as_ref(),
-                )
-                .is_some_and(|context| context.policy.enabled)
+                raw_handoff_context(&state, id, self.inherited_handoff_for_session(id).as_ref())
+                    .is_some_and(|context| context.policy.enabled)
             })
             .collect::<Vec<_>>();
-        claims.set_handoff_ticket_override(repo, number, next.as_ref())?;
+        claims.set_handoff_override(scope, repo, number, next.as_ref())?;
         let runtime = self.delivery_runtime.clone();
         for (id, enabled) in holders.iter().zip(was_enabled) {
             self.recheck_handoff_policy(&mut state, id, enabled, runtime.as_ref())?;
         }
         self.write_raw_json_value(&state)?;
-        Ok(Ok(next.map_or_else(
-            || HandoffOverride::default().to_json(),
-            |value| value.to_json(),
-        )))
+        Ok(Ok(self.scoped_handoff_policy_view(scope, repo, number)?))
     }
 
-    fn ticket_handoff_override_for_session(&self, session_id: &str) -> Option<HandoffOverride> {
-        let queue = self.queue_store.as_ref()?;
-        let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf());
+    /// The overrides a session inherits: its first ticket's and that ticket's lane's.
+    fn inherited_handoff_for_session(&self, session_id: &str) -> Option<Inherited> {
+        let claims = self.ticket_claim_store()?;
         let (repo, number) = claims.first_ticket_for_session(session_id).ok()??;
-        claims.handoff_ticket_override(&repo, number).ok().flatten()
+        let ticket = claims
+            .handoff_override(HandoffScope::Ticket, &repo, number)
+            .ok()
+            .flatten();
+        let lane = claims
+            .lane_goal_for_ticket(&repo, number)
+            .ok()
+            .flatten()
+            .and_then(|(goal_repo, goal)| {
+                claims
+                    .handoff_override(HandoffScope::Lane, &goal_repo, goal)
+                    .ok()
+                    .flatten()
+            });
+        (ticket.is_some() || lane.is_some()).then_some(Inherited { ticket, lane })
     }
+
     /// The default policy, starting values filled in (`GET /handoff-defaults`).
     pub fn handoff_defaults(&self) -> Result<HandoffDefaults> {
         let state = self.load_raw_json_value()?;
@@ -272,12 +301,8 @@ impl SessionStore {
         let was_enabled = session_ids
             .iter()
             .map(|id| {
-                raw_handoff_context(
-                    &state,
-                    id,
-                    self.ticket_handoff_override_for_session(id).as_ref(),
-                )
-                .is_some_and(|context| context.policy.enabled)
+                raw_handoff_context(&state, id, self.inherited_handoff_for_session(id).as_ref())
+                    .is_some_and(|context| context.policy.enabled)
             })
             .collect::<Vec<_>>();
         state
@@ -312,8 +337,7 @@ impl SessionStore {
             let Some(context) = raw_handoff_context(
                 &state,
                 session_id,
-                self.ticket_handoff_override_for_session(session_id)
-                    .as_ref(),
+                self.inherited_handoff_for_session(session_id).as_ref(),
             ) else {
                 return Ok(HandoffPolicyOutcome::NotFound);
             };
@@ -402,8 +426,7 @@ impl SessionStore {
         let Some(context) = raw_handoff_context(
             &state,
             session_id,
-            self.ticket_handoff_override_for_session(session_id)
-                .as_ref(),
+            self.inherited_handoff_for_session(session_id).as_ref(),
         ) else {
             return Ok(None);
         };
@@ -466,8 +489,7 @@ impl SessionStore {
         let Some(context) = raw_handoff_context(
             state,
             session_id,
-            self.ticket_handoff_override_for_session(session_id)
-                .as_ref(),
+            self.inherited_handoff_for_session(session_id).as_ref(),
         ) else {
             return Ok(false);
         };
@@ -550,8 +572,7 @@ impl SessionStore {
         let Some(context) = raw_handoff_context(
             state,
             session_id,
-            self.ticket_handoff_override_for_session(session_id)
-                .as_ref(),
+            self.inherited_handoff_for_session(session_id).as_ref(),
         ) else {
             return Ok(false);
         };
@@ -878,7 +899,8 @@ mod tests {
         sample(&store, "agent001", 25.0);
         sample(&store, "fork0001", 25.0);
         store
-            .update_ticket_handoff_policy(
+            .update_scoped_handoff_policy(
+                HandoffScope::Ticket,
                 "acme/widgets",
                 1782,
                 &PolicyUpdate::parse(&json!({"enabled": true, "threshold_percent": 30})).unwrap(),
@@ -903,10 +925,70 @@ mod tests {
         assert_eq!(agent["enabled"], true);
         assert_eq!(
             store
-                .ticket_handoff_policy_view("acme/widgets", 1782)
+                .scoped_handoff_policy_view(HandoffScope::Ticket, "acme/widgets", 1782)
                 .unwrap()["threshold_percent"],
             30
         );
+    }
+
+    #[test]
+    fn lane_override_reaches_its_tickets_holders_below_the_ticket() {
+        // #1782 sits in lane acme/widgets#1700; #1783 sits in no lane.
+        let store = store("lane-policy");
+        ticket_claim(&store, "agent001", 1782);
+        ticket_claim(&store, "fork0001", 1783);
+        let db_path = store.queue_store.as_ref().unwrap().db_path().to_path_buf();
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO board_lanes (id, goal_repo, goal_number, rank, added_at, added_by, added_by_name)
+                    VALUES (1, 'acme/widgets', 1700, 1, '2026-09-29T00:00:00Z', 'owner', 'Rajesh');
+                INSERT INTO board_members (lane_id, repo, number, joined_at)
+                    VALUES (1, 'acme/widgets', 1782, '2026-09-29T00:00:00Z');",
+            )
+            .unwrap();
+        let set = |scope, number, body: Value| {
+            store
+                .update_scoped_handoff_policy(
+                    scope,
+                    "acme/widgets",
+                    number,
+                    &PolicyUpdate::parse(&body).unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let saved = set(
+            HandoffScope::Lane,
+            1700,
+            json!({"enabled": true, "threshold_percent": 50, "ask_on_codex_review": false}),
+        );
+        assert_eq!(saved["ask_on_codex_review"], false);
+        let inside = store.handoff_policy_view("agent001").unwrap().unwrap();
+        assert_eq!(inside["source"], "lane");
+        assert_eq!(inside["threshold_percent"], 50);
+        assert_eq!(inside["ask_on_codex_review"], false);
+        let outside = store.handoff_policy_view("fork0001").unwrap().unwrap();
+        assert_eq!(outside["source"], "default");
+        // The ticket's own setting wins field by field; the lane fills the rest.
+        set(
+            HandoffScope::Ticket,
+            1782,
+            json!({"threshold_percent": 40, "ask_on_doc_review": false}),
+        );
+        let ticket = store
+            .scoped_handoff_policy_view(HandoffScope::Ticket, "acme/widgets", 1782)
+            .unwrap();
+        assert_eq!(ticket["threshold_percent"], 40);
+        assert_eq!(ticket["lane"]["threshold_percent"], 50);
+        let inside = store.handoff_policy_view("agent001").unwrap().unwrap();
+        assert_eq!(inside["source"], "ticket");
+        assert_eq!(inside["threshold_percent"], 40);
+        assert_eq!(inside["ask_on_codex_review"], false);
+        assert_eq!(inside["ask_on_doc_review"], false);
+        sample(&store, "agent001", 30.0);
+        let codex = ReviewAsk::Codex { pr_number: 7 };
+        assert_eq!(store.review_handoff_ask("agent001", codex).unwrap(), None);
     }
 
     #[test]

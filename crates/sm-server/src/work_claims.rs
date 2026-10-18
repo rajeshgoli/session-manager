@@ -90,6 +90,17 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (repo, number)
         );
+        -- A lane's handoff override, keyed by its goal ticket (sm#2293).
+        CREATE TABLE IF NOT EXISTS handoff_lane_overrides (
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            enabled INTEGER,
+            threshold_percent REAL,
+            ask_on_codex_review INTEGER,
+            ask_on_doc_review INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo, number)
+        );
         CREATE TABLE IF NOT EXISTS investigation_worktrees (
             path TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -142,7 +153,60 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    let ticket_columns = conn
+        .prepare("PRAGMA table_info(handoff_ticket_overrides)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for column in ["ask_on_codex_review", "ask_on_doc_review"] {
+        if !ticket_columns.iter().any(|name| name == column) {
+            conn.execute(
+                &format!("ALTER TABLE handoff_ticket_overrides ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
+    }
     Ok(())
+}
+
+fn prefixed(alias: &str) -> String {
+    HANDOFF_OVERRIDE_COLUMNS
+        .split(", ")
+        .map(|column| format!("{alias}.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Where a handoff override lives: a ticket, or a lane by its goal ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffScope {
+    Ticket,
+    Lane,
+}
+
+impl HandoffScope {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Ticket => "handoff_ticket_overrides",
+            Self::Lane => "handoff_lane_overrides",
+        }
+    }
+}
+
+const HANDOFF_OVERRIDE_COLUMNS: &str =
+    "enabled, threshold_percent, ask_on_codex_review, ask_on_doc_review, updated_at";
+
+/// Reads [`HANDOFF_OVERRIDE_COLUMNS`] starting at column `at`.
+fn handoff_override_row(
+    row: &rusqlite::Row<'_>,
+    at: usize,
+) -> rusqlite::Result<crate::handoff::policy::HandoffOverride> {
+    Ok(crate::handoff::policy::HandoffOverride {
+        enabled: row.get(at)?,
+        threshold_percent: row.get(at + 1)?,
+        ask_on_codex_review: row.get(at + 2)?,
+        ask_on_doc_review: row.get(at + 3)?,
+        set_at: row.get(at + 4)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -641,8 +705,9 @@ pub struct WorkClaimStore {
 }
 
 impl WorkClaimStore {
-    pub fn handoff_ticket_override(
+    pub fn handoff_override(
         &self,
+        scope: HandoffScope,
         repo: &str,
         number: i64,
     ) -> Result<Option<crate::handoff::policy::HandoffOverride>> {
@@ -650,37 +715,104 @@ impl WorkClaimStore {
             return Ok(None);
         };
         conn.query_row(
-            "SELECT enabled, threshold_percent, updated_at FROM handoff_ticket_overrides WHERE repo = ?1 AND number = ?2",
+            &format!(
+                "SELECT {HANDOFF_OVERRIDE_COLUMNS} FROM {} WHERE repo = ?1 AND number = ?2",
+                scope.table()
+            ),
             params![repo, number],
-            |row| Ok(crate::handoff::policy::HandoffOverride {
-                enabled: row.get::<_, Option<bool>>(0)?,
-                threshold_percent: row.get(1)?,
-                set_at: row.get(2)?,
-                ..Default::default()
-            }),
-        ).optional().map_err(Into::into)
+            |row| handoff_override_row(row, 0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
-    pub fn set_handoff_ticket_override(
+    pub fn set_handoff_override(
         &self,
+        scope: HandoffScope,
         repo: &str,
         number: i64,
         value: Option<&crate::handoff::policy::HandoffOverride>,
     ) -> Result<()> {
         let conn = self.open_write()?;
+        let table = scope.table();
         if let Some(value) = value {
-            conn.execute("INSERT INTO handoff_ticket_overrides (repo, number, enabled, threshold_percent, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(repo, number) DO UPDATE SET enabled = excluded.enabled,
-                threshold_percent = excluded.threshold_percent, updated_at = excluded.updated_at",
-                params![repo, number, value.enabled, value.threshold_percent, value.set_at])?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (repo, number, {HANDOFF_OVERRIDE_COLUMNS})
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(repo, number) DO UPDATE SET enabled = excluded.enabled,
+                    threshold_percent = excluded.threshold_percent,
+                    ask_on_codex_review = excluded.ask_on_codex_review,
+                    ask_on_doc_review = excluded.ask_on_doc_review,
+                    updated_at = excluded.updated_at"
+                ),
+                params![
+                    repo,
+                    number,
+                    value.enabled,
+                    value.threshold_percent,
+                    value.ask_on_codex_review,
+                    value.ask_on_doc_review,
+                    value.set_at
+                ],
+            )?;
         } else {
             conn.execute(
-                "DELETE FROM handoff_ticket_overrides WHERE repo = ?1 AND number = ?2",
+                &format!("DELETE FROM {table} WHERE repo = ?1 AND number = ?2"),
                 params![repo, number],
             )?;
         }
         Ok(())
+    }
+
+    /// The goal of the first open lane (by rank) that holds this ticket.
+    pub fn lane_goal_for_ticket(&self, repo: &str, number: i64) -> Result<Option<(String, i64)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT l.goal_repo, l.goal_number FROM board_members m JOIN board_lanes l ON l.id = m.lane_id
+                WHERE m.repo = ?1 AND m.number = ?2 AND l.ended_at IS NULL ORDER BY l.rank LIMIT 1",
+            params![repo, number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Every stored ticket and lane override, for the Settings list.
+    pub fn handoff_overrides(
+        &self,
+    ) -> Result<
+        Vec<(
+            HandoffScope,
+            String,
+            i64,
+            crate::handoff::policy::HandoffOverride,
+        )>,
+    > {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut all = Vec::new();
+        for scope in [HandoffScope::Lane, HandoffScope::Ticket] {
+            let mut statement = conn.prepare(&format!(
+                "SELECT repo, number, {HANDOFF_OVERRIDE_COLUMNS} FROM {} ORDER BY repo, number",
+                scope.table()
+            ))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        scope,
+                        row.get(0)?,
+                        row.get(1)?,
+                        handoff_override_row(row, 2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            all.extend(rows);
+        }
+        Ok(all)
     }
 
     pub fn first_ticket_for_session(&self, session_id: &str) -> Result<Option<(String, i64)>> {
@@ -697,38 +829,56 @@ impl WorkClaimStore {
         .map_err(Into::into)
     }
 
-    pub fn handoff_ticket_overrides_by_session(
+    /// Each session's inherited overrides: its first ticket's and that ticket's lane's.
+    pub fn handoff_inherited_by_session(
         &self,
-    ) -> Result<BTreeMap<String, crate::handoff::policy::HandoffOverride>> {
+    ) -> Result<BTreeMap<String, crate::handoff::policy::Inherited>> {
         let Some(conn) = self.open_read()? else {
             return Ok(BTreeMap::new());
         };
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "WITH ranked AS (
                 SELECT session_id, repo, number,
                     ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY claimed_at, id) AS rank
                 FROM work_claims WHERE kind = 'ticket' AND ended_at IS NULL AND reserved_at IS NULL
+            ),
+            first AS (
+                SELECT session_id, repo, number, (
+                    SELECT l.goal_repo || char(31) || l.goal_number FROM board_members m
+                    JOIN board_lanes l ON l.id = m.lane_id
+                    WHERE m.repo = ranked.repo AND m.number = ranked.number AND l.ended_at IS NULL
+                    ORDER BY l.rank LIMIT 1
+                ) AS lane_key
+                FROM ranked WHERE rank = 1
             )
-            SELECT ranked.session_id, overrides.enabled, overrides.threshold_percent, overrides.updated_at
-            FROM ranked JOIN handoff_ticket_overrides AS overrides
-                ON overrides.repo = ranked.repo AND overrides.number = ranked.number
-            WHERE ranked.rank = 1",
-        )?;
-        let overrides = statement
+            SELECT first.session_id,
+                t.repo, {ticket}, l.repo, {lane}
+            FROM first
+            LEFT JOIN handoff_ticket_overrides AS t
+                ON t.repo = first.repo AND t.number = first.number
+            LEFT JOIN handoff_lane_overrides AS l
+                ON l.repo || char(31) || l.number = first.lane_key
+            WHERE t.repo IS NOT NULL OR l.repo IS NOT NULL",
+            ticket = prefixed("t"),
+            lane = prefixed("l"),
+        ))?;
+        let rows = statement
             .query_map([], |row| {
+                let ticket = row
+                    .get::<_, Option<String>>(1)?
+                    .map(|_| handoff_override_row(row, 2))
+                    .transpose()?;
+                let lane = row
+                    .get::<_, Option<String>>(7)?
+                    .map(|_| handoff_override_row(row, 8))
+                    .transpose()?;
                 Ok((
                     row.get(0)?,
-                    crate::handoff::policy::HandoffOverride {
-                        enabled: row.get(1)?,
-                        threshold_percent: row.get(2)?,
-                        set_at: row.get(3)?,
-                        ..Default::default()
-                    },
+                    crate::handoff::policy::Inherited { ticket, lane },
                 ))
             })?
-            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
-            .map_err(Into::into);
-        overrides
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(rows)
     }
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
