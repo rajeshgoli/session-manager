@@ -52,14 +52,14 @@ pub struct Scope {
 }
 impl Scope {
     /// A loose file at an artifact root's top level is a one-file scope whose
-    /// only entry is named after itself (`packed/<name>/<name>.zst`), keeping
-    /// the remote layout of `packed/<segment>/<path>`.
+    /// only entry is [`FILE_ENTRY`], keeping the remote layout of
+    /// `packed/<segment>/<path>`.
     pub fn inventory(&self) -> Result<Vec<archive::Entry>> {
         let m = fs::symlink_metadata(&self.source)?;
         if m.is_file() {
             use std::os::unix::fs::MetadataExt;
             return Ok(vec![archive::Entry {
-                path: self.segment.clone(),
+                path: FILE_ENTRY.into(),
                 kind: "file".into(),
                 size: m.len(),
                 mtime: m.mtime(),
@@ -68,7 +68,13 @@ impl Scope {
                 target: None,
             }]);
         }
-        archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))
+        let entries = archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))?;
+        ensure!(
+            !entries.iter().any(|e| e.path == FILE_ENTRY),
+            "backup source has a top-level {FILE_ENTRY}, which is reserved: {}",
+            self.source.display()
+        );
+        Ok(entries)
     }
     /// The local file behind an inventory entry.
     pub fn path_of(&self, relative: &str) -> PathBuf {

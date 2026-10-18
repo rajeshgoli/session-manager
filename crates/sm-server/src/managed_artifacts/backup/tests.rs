@@ -1565,7 +1565,7 @@ fn loose_root_file_is_a_one_file_scope_and_round_trips() {
     assert!(first
         .manifest
         .files
-        .contains_key("packed/notes.md/notes.md.zst"));
+        .contains_key("packed/notes.md/.sm-file.zst"));
     let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
     let staging = dest
         .unpack("first", &first.transfer, &first.parts, &first.directory)
@@ -1574,7 +1574,10 @@ fn loose_root_file_is_a_one_file_scope_and_round_trips() {
         .unwrap();
     dest.restore(&f.dir.join("restored"), None, &[]).unwrap();
     assert_eq!(
-        fs::read(f.dir.join("restored/notes.md/notes.md")).unwrap(),
+        fs::read(f.dir.join("restored/notes.md")).unwrap(),
         b"cleanup notes"
     );
+    // A folder may not use the reserved inner name.
+    fs::write(f.dir.join("projects").join(FILE_ENTRY), b"x").unwrap();
+    assert!(prepare(&f.manager, &f.scopes(), None, "second").is_err());
 }
