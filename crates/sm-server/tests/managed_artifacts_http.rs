@@ -1252,3 +1252,25 @@ async fn investigation_git_child_holds_recovery_lock_after_parent_drops_it() {
     child.wait().await.unwrap();
     assert!(investigations::try_lock(&manager).unwrap().is_some());
 }
+#[tokio::test]
+async fn server_starts_while_another_process_holds_the_artifact_writer() {
+    use sm_server::managed_artifacts::store;
+    let f = Fixture::new();
+    let key = format!("investigating:{}:sample", f.root());
+    store::set_meta(&f.store().open().unwrap(), &key, "ended").unwrap();
+    let mut config = f.state.config().clone();
+    config.managed_artifacts.cold_after_days += 1;
+    let writer = f.store().open().unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let state = AppState::try_new(config.clone()).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    writer.execute_batch("ROLLBACK").unwrap();
+    state.managed_artifacts_pass().unwrap();
+    let conn = f.store().open().unwrap();
+    assert_eq!(store::meta(&conn, &key).unwrap(), None);
+    assert_eq!(
+        store::meta(&conn, &format!("cold_days:{}", f.root())).unwrap(),
+        Some(config.managed_artifacts.cold_after_days.to_string())
+    );
+}

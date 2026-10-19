@@ -161,6 +161,8 @@ const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
 const CODEX_REVIEW_REQUEST_TTL_SECONDS: i64 = 60 * 60;
 const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
+/// How long server startup waits for another artifacts.db writer (sm#2391).
+const STARTUP_ARTIFACT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 // After Codex reports "Something went wrong" on a picked-up review, wait this
 // long (or the request's retry interval, if shorter) before re-posting, and
 // give up once this many `@codex review` comments have been posted.
@@ -900,12 +902,27 @@ impl AppState {
             .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
         let managed_artifacts = if config.managed_artifacts.enabled {
             let manager =
-                crate::managed_artifacts::ManagedArtifacts::new(&config.managed_artifacts)?;
-            crate::managed_artifacts::investigations::recover(
-                &manager,
-                &crate::work_claims::WorkClaimStore::new(expand_home(&config.sm_send.db_path)),
-                &session_store,
-            )?;
+                crate::managed_artifacts::ManagedArtifacts::configured(&config.managed_artifacts)?;
+            // Another process, such as a backup seed, can hold the artifacts.db
+            // writer for hours. Waiting it out would miss the 30 s in which a
+            // replacement slot must report serving, and failing here leaves no
+            // slot serving (sm#2391). The background artifacts pass repeats both
+            // steps until the store is writable.
+            let startup = manager.with_busy_timeout(STARTUP_ARTIFACT_BUSY_TIMEOUT);
+            let started = startup.sync_settings().and_then(|()| {
+                crate::managed_artifacts::investigations::recover(
+                    &startup,
+                    &crate::work_claims::WorkClaimStore::new(expand_home(&config.sm_send.db_path)),
+                    &session_store,
+                )
+            });
+            match started {
+                Ok(()) => {}
+                Err(error) if crate::managed_artifacts::store::is_busy(&error) => eprintln!(
+                    "managed artifacts startup recovery deferred to the background pass: {error:#}"
+                ),
+                Err(error) => return Err(error),
+            }
             for root in &manager.config.roots {
                 crate::managed_artifacts::queue::install_operations(
                     &root.path,

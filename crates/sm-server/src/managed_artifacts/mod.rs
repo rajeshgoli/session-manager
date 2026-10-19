@@ -129,14 +129,30 @@ pub struct ManagedArtifacts {
 }
 impl ManagedArtifacts {
     pub fn new(config: &ManagedArtifactsConfig) -> Result<Self> {
-        let manager = Self {
+        let manager = Self::configured(config)?;
+        manager.sync_settings()?;
+        Ok(manager)
+    }
+    /// The manager for `config`, without opening its database.
+    pub fn configured(config: &ManagedArtifactsConfig) -> Result<Self> {
+        Ok(Self {
             config: config.resolved()?,
             store: ArtifactStore::new(crate::sessions::expand_home(&config.db_path)),
-        };
-        let mut conn = manager.store.open()?;
-        let cold_days = manager.config.cold_after_days.to_string();
+        })
+    }
+    /// The same manager, whose connections give up on a held writer after `timeout`.
+    pub fn with_busy_timeout(&self, timeout: std::time::Duration) -> Self {
+        Self {
+            config: self.config.clone(),
+            store: self.store.clone().with_busy_timeout(timeout),
+        }
+    }
+    /// Records the configured cold threshold where database readers find it.
+    pub fn sync_settings(&self) -> Result<()> {
+        let mut conn = self.store.open()?;
+        let cold_days = self.config.cold_after_days.to_string();
         let mut current = true;
-        for root in &manager.config.roots {
+        for root in &self.config.roots {
             current &= store::meta(&conn, &format!("cold_days:{}", root.path))?.as_deref()
                 == Some(cold_days.as_str());
         }
@@ -144,12 +160,12 @@ impl ManagedArtifacts {
         // stall every caller that only constructs a manager (sm#2378).
         if !current {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for root in &manager.config.roots {
+            for root in &self.config.roots {
                 store::set_meta(&tx, &format!("cold_days:{}", root.path), &cold_days)?;
             }
             tx.commit()?;
         }
-        Ok(manager)
+        Ok(())
     }
     pub fn create(
         &self,

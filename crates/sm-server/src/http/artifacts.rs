@@ -703,6 +703,7 @@ impl AppState {
         let Some(svc) = &self.managed_artifacts else {
             return Ok(());
         };
+        svc.sync_settings()?;
         ma::investigations::recover(svc, &claims::work_claim_store(self), &self.session_store)?;
         ma::ops::kick(svc.clone());
         ma::rebuild::kick(svc.clone());
