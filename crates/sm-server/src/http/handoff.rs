@@ -391,13 +391,18 @@ pub(super) async fn get_handoff_draft(
         .as_ref()
         .is_some_and(|h| h["state"] == "failed" && h["note"]["kind"] == "stored")
     {
-        let sha = state
-            .session_store
-            .handoff_draft_record(&id)?
-            .map(|(_, sha)| sha);
-        return Ok(Json(
-            json!({"path":expand_home(&session.working_dir).join(".sm/handoff.md"),"sha256":sha,"resubmit":true}),
-        ));
+        let record = state.session_store.handoff_draft_record(&id)?;
+        let path = record.as_ref().map_or_else(
+            || {
+                expand_home(&session.working_dir)
+                    .join(".sm/handoff.md")
+                    .display()
+                    .to_string()
+            },
+            |(path, _)| path.clone(),
+        );
+        let sha = record.map(|(_, sha)| sha);
+        return Ok(Json(json!({"path":path,"sha256":sha,"resubmit":true})));
     }
     Ok(Json(state.session_store.handoff_draft(&id)?))
 }
