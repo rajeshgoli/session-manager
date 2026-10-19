@@ -52,6 +52,7 @@ async fn browser_terminal_requires_owner_login_and_same_origin_for_mint_and_upgr
     let outsider =
         test_browser_access_assertion("sm-browser-aud", "outsider@example.com", 4_102_444_800);
     for (method, path) in [
+        (Method::POST, "/client/sessions/fork1001/terminal-images"),
         (
             Method::POST,
             "/client/sessions/fork1001/browser-attach-ticket",
@@ -80,6 +81,32 @@ async fn browser_terminal_requires_owner_login_and_same_origin_for_mint_and_upgr
                 "{path}: {}",
                 response.status()
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn browser_terminal_image_upload_stores_bytes_and_rejects_invalid_requests() {
+    let state = browser_terminal_state();
+    let owner = test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+    let image = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZuoAAAAASUVORK5CYII=").unwrap();
+    for (id, mime, data, expected) in [
+        ("missing", "image/png", STANDARD.encode(&image), StatusCode::NOT_FOUND),
+        ("fork1001", "image/png", "not base64!".into(), StatusCode::BAD_REQUEST),
+        ("fork1001", "image/png", STANDARD.encode(b"not an image"), StatusCode::BAD_REQUEST),
+        ("fork1001", "image/svg+xml", STANDARD.encode(b"<svg/>"), StatusCode::BAD_REQUEST),
+        ("fork1001", "image/png", STANDARD.encode(&image), StatusCode::OK),
+    ] {
+        let request = owner_web_request(Method::POST, &format!("/client/sessions/{id}/terminal-images"),
+            "sm.example.com", Some(&owner), &[("origin", "https://sm.example.com")], &json!({"mime":mime,"data":data}));
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let body = response_json(response).await.1;
+            let path = StdPath::new(body["path"].as_str().unwrap());
+            assert!(path.is_absolute());
+            assert_eq!(fs::read(path).unwrap(), image);
+            fs::remove_file(path).unwrap();
         }
     }
 }

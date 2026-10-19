@@ -190,8 +190,8 @@ impl SessionStore {
                 )?;
             }
             self.write_raw_json_value(&state)?;
+            self.end_work_claims_after_retire(id);
         }
-        self.end_work_claims_after_retire(id);
         Ok(())
     }
 

@@ -80,7 +80,7 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
   if (failDirect) await page.addInitScript(() => { window.failDirect = true; });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
-  const state = { sessions: fixture(), answered: [], retired: [], renamed: [], tickets: 0 };
+  const state = { sessions: fixture(), answered: [], retired: [], renamed: [], tickets: 0, images: [] };
   await page.route('**/*', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -93,6 +93,10 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
       return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
     }
     if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+    if (/\/terminal-images$/.test(url.pathname)) {
+      state.images.push(request.postDataJSON());
+      return route.fulfill({ json: { path: '/tmp/agent/pasted-images/paste-test.png' } });
+    }
     if (/\/browser-attach-ticket$/.test(url.pathname)) {
       state.tickets += 1;
       return route.fulfill({ json: {
@@ -134,6 +138,37 @@ const routeShown = (page) => page.evaluate(() => document.querySelector('.term-r
   ?? (document.querySelector('.term-who')?.title || '').split(' · ').slice(-2).join(' · '));
 const routeTimed = (page) => page.waitForFunction(() => /ms$/.test(document.querySelector('.term-route')?.textContent
   ?? document.querySelector('.term-who')?.title ?? ''));
+
+test('desktop and phone image paste uploads once and types only a bracketed absolute path', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+      const { context, page, state, errors } = await open(browser, { viewport, touch: viewport.width < 900 });
+      await page.goto(`${ORIGIN}/terminal/sm-1776`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      await page.evaluate(() => {
+        const data = new DataTransfer();
+        data.items.add(new File([new Uint8Array([137,80,78,71,13,10,26,10])], 'clipboard.png', { type: 'image/png' }));
+        data.setData('text/plain', 'unwanted accompanying clipboard text');
+        document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      });
+      await page.waitForFunction(() => window.sockets.some(ws => ws.sent.some(frame => frame.type === 'input' && frame.data.includes('paste-test.png'))));
+      assert.equal(state.images.length, 1);
+      assert.equal(state.images[0].mime, 'image/png');
+      assert.equal(state.images[0].data, 'iVBORw0KGgo=');
+      const input = await page.evaluate(() => window.sockets.flatMap(ws => ws.sent).filter(frame => frame.type === 'input').map(frame => frame.data).join(''));
+      assert.equal(input, '\x1b[200~/tmp/agent/pasted-images/paste-test.png\x1b[201~');
+      await page.evaluate(() => {
+        const data = new DataTransfer(); data.setData('text/plain', 'text paste still works');
+        document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      });
+      assert.equal(state.images.length, 1);
+      assert.equal(await page.evaluate(() => window.sockets.flatMap(ws => ws.sent).filter(frame => frame.type === 'input').at(-1).data), 'text paste still works');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
 
 test('switcher, keys and route at desktop and phone sizes', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
