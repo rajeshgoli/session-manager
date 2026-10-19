@@ -1,23 +1,23 @@
-// A Start now check is an owner-readable snapshot, never a capacity reservation.
-export function startNowController(api, id, now = () => performance.now()) {
-  let check = null, checkedAt = 0, busy = false;
-  const path = `/client/queue/jobs/${encodeURIComponent(id)}`;
-  return {
-    get busy() { return busy; },
-    cancel() { check = null; },
-    async inspect() {
-      if (busy) return null;
-      busy = true; check = null;
-      try { const value = await api(`${path}/start-check`); if (value.state !== 'pending') throw new Error('This job is no longer waiting. Refresh its details.'); check = {...value, checked_at: new Date().toISOString()}; checkedAt = now(); return check; }
-      finally { busy = false; }
-    },
-    async confirm(state) {
-      if (busy) return { submitted:false };
-      if (state !== 'pending') { check = null; throw new Error('This job is no longer waiting.'); }
-      if (!check || now() - checkedAt >= 30000) return { submitted:false, check:await this.inspect() };
-      busy = true;
-      try { await api(`${path}/start`, {method:'POST',body:{}});check=null;return {submitted:true}; }
-      finally { busy=false; }
-    },
-  };
+// Start now (sm#2383): one tap starts the job. The server declines, with one
+// sentence, only when starting would endanger the Mac's memory; the owner
+// confirms in place and the retry accepts that risk.
+const inFlight = new Set();
+
+// One request per job at a time, so a row and a panel tapped together still
+// send a single start.
+export async function requestStart(api, id, { acceptRisk = false } = {}) {
+  if (inFlight.has(id)) return { started: false, busy: true };
+  inFlight.add(id);
+  try {
+    const job = await api(`/client/queue/jobs/${encodeURIComponent(id)}/start`, {
+      method: 'POST',
+      body: { ask_if_risky: !acceptRisk },
+    });
+    return { started: true, job };
+  } catch (error) {
+    if (error?.body?.code === 'start_risk') return { started: false, risk: error.body.risk };
+    throw error;
+  } finally {
+    inFlight.delete(id);
+  }
 }

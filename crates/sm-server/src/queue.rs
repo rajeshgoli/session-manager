@@ -7952,6 +7952,10 @@ pub struct QueueStartCheck {
     /// `declared` or `past_runs`.
     pub memory_estimate_source: Option<String>,
     pub past_runs: usize,
+    /// One sentence when starting now endangers the Mac's memory; `None`
+    /// otherwise. Start now asks before taking this risk and nothing else:
+    /// skipping the line and slot limits is what the owner asked for.
+    pub risk: Option<String>,
 }
 
 impl RetainedQueueStore {
@@ -8102,7 +8106,36 @@ fn queue_start_check(
         memory_estimate_bytes: estimate,
         memory_estimate_source: source.map(str::to_owned),
         past_runs: past.map_or(0, |(_, runs)| runs),
+        risk: (job.state == "pending")
+            .then(|| queue_start_memory_risk(available, reserve, estimate))
+            .flatten(),
     }
+}
+
+/// Unknown free memory or an unknown estimate is not a risk to name: admission
+/// does not hold for them either.
+fn queue_start_memory_risk(
+    available: Option<i64>,
+    reserve: i64,
+    estimate: Option<i64>,
+) -> Option<String> {
+    let available = available?;
+    if available < reserve {
+        return Some(format!(
+            "The Mac is already low on memory: {} free, below the {} it keeps in reserve.",
+            memory_amount_text(available),
+            memory_amount_text(reserve)
+        ));
+    }
+    let estimate = estimate?;
+    (estimate.saturating_add(reserve) > available).then(|| {
+        format!(
+            "It needs about {}, and the Mac has {} free beyond its {} reserve.",
+            memory_amount_text(estimate),
+            memory_amount_text(available - reserve),
+            memory_amount_text(reserve)
+        )
+    })
 }
 
 /// Human-readable scheduler context, shared by enqueue/status responses.
@@ -12158,8 +12191,34 @@ mod tests {
                 "1 queued tests job is ahead of this one.".to_owned(),
             ]
         );
+        // Only the memory warning makes Start now ask (sm#2383).
+        assert_eq!(
+            check.risk.as_deref(),
+            Some("It needs about 30.0 GiB, and the Mac has 12.0 GiB free beyond its 8.0 GiB reserve.")
+        );
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn start_now_asks_only_when_memory_is_at_risk() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let reserve = 8 * GIB;
+        // Fits beside the reserve, or nothing is known: no question.
+        assert_eq!(
+            queue_start_memory_risk(Some(40 * GIB), reserve, Some(30 * GIB)),
+            None
+        );
+        assert_eq!(queue_start_memory_risk(None, reserve, Some(30 * GIB)), None);
+        assert_eq!(queue_start_memory_risk(Some(40 * GIB), reserve, None), None);
+        assert_eq!(
+            queue_start_memory_risk(Some(20 * GIB), reserve, Some(30 * GIB)).as_deref(),
+            Some("It needs about 30.0 GiB, and the Mac has 12.0 GiB free beyond its 8.0 GiB reserve.")
+        );
+        assert_eq!(
+            queue_start_memory_risk(Some(4 * GIB), reserve, None).as_deref(),
+            Some("The Mac is already low on memory: 4.0 GiB free, below the 8.0 GiB it keeps in reserve.")
+        );
     }
 
     #[test]

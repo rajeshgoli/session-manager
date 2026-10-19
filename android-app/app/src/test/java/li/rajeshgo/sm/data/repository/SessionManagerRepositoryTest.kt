@@ -96,6 +96,46 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun startNowAsksOnlyAboutMemoryRiskAndKeepsTheServerReason() = kotlinx.coroutines.runBlocking {
+        val seen = mutableListOf<String>()
+        var reply = 200 to """{"id":"job_1","state":"running"}"""
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            val buffer = okio.Buffer()
+            request.body?.writeTo(buffer)
+            seen += "${request.method} ${request.url.encodedPath} ${buffer.readUtf8()}"
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(reply.first).message("x").body(reply.second.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+        val repository = SessionManagerRepository()
+
+        val started = repository.startQueueJobNowWith(service, "job_1", acceptRisk = false).getOrThrow()
+        assertEquals("running", (started as StartNowResult.Started).job.state)
+
+        reply = 409 to """{"detail":"It needs about 30.0 GiB.","code":"start_risk","risk":"It needs about 30.0 GiB."}"""
+        assertEquals(
+            StartNowResult.Risky("It needs about 30.0 GiB."),
+            repository.startQueueJobNowWith(service, "job_1", acceptRisk = false).getOrThrow(),
+        )
+
+        reply = 409 to """{"detail":"It was cancelled."}"""
+        val refused = repository.startQueueJobNowWith(service, "job_1", acceptRisk = true).exceptionOrNull()
+        assertEquals("It was cancelled.", refused?.message)
+
+        assertEquals(
+            listOf(
+                """POST /client/queue/jobs/job_1/start {"ask_if_risky":true}""",
+                """POST /client/queue/jobs/job_1/start {"ask_if_risky":true}""",
+                """POST /client/queue/jobs/job_1/start {"ask_if_risky":false}""",
+            ),
+            seen,
+        )
+    }
+
+    @Test
     fun followRequestsUseTheSpecRoutesAndBodies() = kotlinx.coroutines.runBlocking {
         val seen = mutableListOf<String>()
         val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->

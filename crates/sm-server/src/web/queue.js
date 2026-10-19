@@ -1,8 +1,8 @@
-import { useEffect, useState, useMemo } from 'preact/hooks';
-import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
+import { useEffect, useLayoutEffect, useState, useRef } from 'preact/hooks';
+import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, toast } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
-import { startNowController } from './queue-start.js';
+import { requestStart } from './queue-start.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
 const pct = (value) => typeof value === 'number' ? `${value.toFixed(1)}%` : '—';
@@ -88,10 +88,80 @@ export function HeldBack({ stats, insightOnly = false, onDismiss }) {
   </section>`;
 }
 
+/**
+ * Start now (sm#2383): one tap starts a waiting job. Only a real risk to the
+ * Mac's memory asks first, in a popover anchored to this button; a second
+ * tap on the button, or Start anyway, accepts it. Skipping the line is the
+ * point of the button and never asks.
+ */
+export function StartNow({ job, primary = false }) {
+  const [phase, setPhase] = useState('idle'); // idle | starting | risk | failed
+  const [message, setMessage] = useState('');
+  const [above, setAbove] = useState(false);
+  const root = useRef(null);
+  const pop = useRef(null);
+  const open = phase === 'risk' || phase === 'failed';
+  // Open upward when the scroll area has no room below, so the choice never
+  // needs a scroll to reach.
+  useLayoutEffect(() => {
+    if (!open || !pop.current) { setAbove(false); return; }
+    const box = root.current.closest('.content')?.getBoundingClientRect() ?? { top: 0, bottom: innerHeight };
+    const button = root.current.getBoundingClientRect();
+    const height = pop.current.offsetHeight + 6;
+    setAbove(button.bottom + height > Math.min(box.bottom, innerHeight) && button.top - height >= Math.max(box.top, 0));
+  }, [open, message]);
+  useEffect(() => {
+    if (!open) return;
+    const away = (event) => { if (!root.current?.contains(event.target)) setPhase('idle'); };
+    const escape = (event) => { if (event.key === 'Escape') setPhase('idle'); };
+    document.addEventListener('pointerdown', away);
+    document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('pointerdown', away); document.removeEventListener('keydown', escape); };
+  }, [open]);
+  const start = async (acceptRisk) => {
+    if (phase === 'starting') return;
+    setPhase('starting'); setMessage('');
+    try {
+      const result = await requestStart(api, job.id, { acceptRisk });
+      if (result.busy) { setPhase('idle'); return; } // the other button for this job owns the request
+      if (result.risk) { setPhase('risk'); setMessage(result.risk); return; }
+      setPhase('idle');
+      toast(`Started ${title(job)}`);
+      bus.emit('queue-changed');
+    } catch (error) {
+      setPhase('failed'); setMessage(error.message);
+    }
+  };
+  const starting = phase === 'starting';
+  return html`<span class="q-start" ref=${root} onClick=${(event) => event.stopPropagation()}>
+    <button type="button" class=${`btn ${primary ? 'pri' : 'q-start-btn'}`} disabled=${starting} aria-busy=${starting}
+      aria-label=${primary ? null : `Start ${title(job)} now`} aria-expanded=${open} onClick=${() => start(phase === 'risk')}>
+      ${starting ? html`<i class="q-spin" aria-hidden="true"></i>` : html`<i class="q-play" aria-hidden="true"></i>`}
+      ${primary ? (starting ? 'Starting…' : 'Start now') : 'Start'}
+    </button>
+    ${open ? html`<span ref=${pop} class=${`q-start-pop ${phase}${above ? ' above' : ''}`} role=${phase === 'failed' ? 'alert' : 'dialog'} aria-label="Start now">
+      <strong>${phase === 'risk' ? 'Low on memory' : "Couldn't start"}</strong>
+      <span>${message}</span>
+      ${phase === 'risk' ? html`<small>If memory runs short, sm stops this job first and puts it back in line.</small>` : null}
+      <span class="q-start-acts">
+        <button type="button" class="btn sm" onClick=${() => setPhase('idle')}>${phase === 'risk' ? 'Not now' : 'OK'}</button>
+        ${phase === 'risk' ? html`<button type="button" class="btn sm pri" onClick=${() => start(true)}>Start anyway</button>` : null}
+      </span>
+    </span>` : null}
+  </span>`;
+}
+
+// The details band opens after the element carrying data-open-ref, so a
+// waiting row's wrapper carries it and the band lands below the Start pill.
 function JobRow({ job, now }) {
+  if (job.state !== 'pending') return html`<${JobRowButton} job=${job} now=${now} anchor=${true} />`;
+  return html`<div class="q-job-line" data-open-ref=${`job:${job.id}`}><${JobRowButton} job=${job} now=${now} /><${StartNow} job=${job} /></div>`;
+}
+
+function JobRowButton({ job, now, anchor = false }) {
   const deadline = Date.parse(job.wait_deadline_at) - now;
   const review = reviewJobText(job);
-  return html`<button class="q-job" type="button" data-open-ref=${`job:${job.id}`} onClick=${() => openPanel(`job:${job.id}`)}>
+  return html`<button class="q-job" type="button" data-open-ref=${anchor ? `job:${job.id}` : null} onClick=${() => openPanel(`job:${job.id}`)}>
     ${review ? html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${review.title} <b>${review.reviewer}</b><small>${review.detail}</small>${review.why ? html`<small class="amber">${review.why}</small>` : null}</span>`
       : html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>`}
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
@@ -106,11 +176,8 @@ const QUESTION_DONE = ['completed', 'failed', 'timed_out'];
 
 function JobPanel({ id, controls }) {
   const encoded = encodeURIComponent(id);
-  const startController = useMemo(()=>startNowController(api,id),[id]);
-  const [startCheck,setStartCheck] = useState(null);
-  const [startBusy,setStartBusy] = useState(false);
   const [job, error, reload] = usePoll(() => api(`/queue-jobs/${encoded}`), 5000, [id]);
-  useEffect(()=>{setStartCheck(null);startController.cancel();},[id,job?.state]);
+  useEffect(() => bus.on('queue-changed', reload), [reload]);
   const [log, logError] = usePoll(async () => {
     try { return await api(`/queue-jobs/${encoded}/log?lines=40`); }
     catch (error) {
@@ -163,18 +230,10 @@ function JobPanel({ id, controls }) {
   return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${review ? `${review.title} · round ${job.review.round}` : title(job)}</span>${controls}<span class="s">${review ? job.review.reviewer_label : `${job.type} · ${jobAgentLabel(job)}`}</span></div>
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
-        ${job.state === 'pending' ? html`<button class="btn" disabled=${busy||startBusy} onClick=${async()=>{setStartBusy(true);setFailure('');try{setStartCheck(await startController.inspect());}catch(e){setFailure(e.message);}finally{setStartBusy(false);}}}>${startBusy?'Checking…':'Start now'}</button>` : null}
+        ${job.state === 'pending' ? html`<${StartNow} job=${job} primary=${true} />` : null}
         ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>Cancel</button><button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>` : null}
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
-      ${startCheck && job.state==='pending' ? html`<section class="q-card" aria-label="Start now confirmation"><h3>Start now despite admission limits?</h3><p class="sub">Checked at ${new Date(startCheck.checked_at).toLocaleTimeString()}</p>
-        <p>This overrides admission slots, queue order, performance cooldown and memory admission. Runtime limits still apply; forced jobs can be requeued first under memory pressure.</p>
-        ${startCheck.warnings.length?html`<ul>${startCheck.warnings.map(w=>html`<li>${w}</li>`)}</ul>`:html`<p>No admission warnings in this snapshot.</p>`}
-        <dl class="q-details"><dt>Available memory</dt><dd>${startCheck.memory_available_bytes==null?'Unknown':gb(startCheck.memory_available_bytes)}</dd><dt>Memory reserve</dt><dd>${gb(startCheck.memory_reserve_bytes)}</dd><dt>Estimated memory</dt><dd>${startCheck.memory_estimate_bytes==null?'Unknown':gb(startCheck.memory_estimate_bytes)} · ${startCheck.memory_estimate_source||'unknown source'}${startCheck.past_runs?` · ${startCheck.past_runs} past runs`:''}</dd></dl>
-        <p class="sub">Snapshot expires after 30 seconds. If it expires, confirmation refreshes the check and asks again. Memory is not reserved.</p>
-        <button class="btn" disabled=${startBusy} onClick=${()=>{startController.cancel();setStartCheck(null);}}>Keep waiting</button>
-        <button class="btn danger" disabled=${startBusy||busy} onClick=${async()=>{setStartBusy(true);setFailure('');try{const r=await startController.confirm(job.state);if(r.submitted){setStartCheck(null);bus.emit('queue-changed');reload();}else if(r.check){setStartCheck(r.check);setFailure('Check refreshed. Review these values and confirm again.');}}catch(e){setFailure(e.message);setStartCheck(null);reload();}finally{setStartBusy(false);}}}>${startBusy?'Starting…':'Confirm Start now'}</button>
-      </section>`:null}
       ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>Cancel job</button></section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}

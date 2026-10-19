@@ -1008,12 +1008,19 @@ pub(super) async fn queue_job_start_check(
         RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
             .map_err(queue_lookup_error)?
             .ok_or(ApiError::NotFound("Queue job not found"))?;
+    let check = start_check(&state, &job.id)?;
+    Ok(Json(
+        serde_json::to_value(check).map_err(anyhow::Error::from)?,
+    ))
+}
+
+fn start_check(state: &AppState, job_id: &str) -> Result<crate::queue::QueueStartCheck, ApiError> {
     let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     let utilization_db = expand_home(&state.config.utilization.db_path);
-    let check = RetainedQueueStore::start_check_in_state_dir(
+    RetainedQueueStore::start_check_in_state_dir(
         &queue_state_dir,
-        &job.id,
-        queue_admission_policy(&state),
+        job_id,
+        queue_admission_policy(state),
         |earlier| {
             crate::utilization::peak_running_rss(&utilization_db, earlier).unwrap_or_else(|error| {
                 eprintln!("start check could not read past runs: {error:#}");
@@ -1021,10 +1028,28 @@ pub(super) async fn queue_job_start_check(
             })
         },
     )?
-    .ok_or(ApiError::NotFound("Queue job not found"))?;
-    Ok(Json(
-        serde_json::to_value(check).map_err(anyhow::Error::from)?,
-    ))
+    .ok_or(ApiError::NotFound("Queue job not found"))
+}
+
+/// Body of `POST /client/queue/jobs/{id}/start`. Clients that send no body
+/// (app builds before sm#2383) confirmed beforehand, so the default starts
+/// without asking.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct StartNowBody {
+    /// Decline with `code: "start_risk"` and the risk sentence instead of
+    /// starting when starting now endangers the Mac's memory.
+    ask_if_risky: bool,
+}
+
+/// Plain words for a job Start now finds no longer waiting.
+fn no_longer_waiting(state: &str) -> String {
+    match state {
+        "succeeded" | "failed" | "timed_out" => "It already ran.".to_owned(),
+        "cancelled" => "It was cancelled.".to_owned(),
+        "wait_expired" => "It gave up waiting before it could start.".to_owned(),
+        other => format!("It is no longer waiting ({}).", other.replace('_', " ")),
+    }
 }
 
 /// `POST /client/queue/jobs/{id}/start`: the owner starts a queued job now,
@@ -1036,7 +1061,9 @@ pub(super) async fn force_start_queue_job(
     uri: Uri,
     headers: HeaderMap,
     Path(identifier): Path<String>,
+    body: Option<Json<StartNowBody>>,
 ) -> Result<Json<Value>, ApiError> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
         owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
         if authenticated_user(&headers, &state.config).is_none() {
@@ -1053,6 +1080,21 @@ pub(super) async fn force_start_queue_job(
         RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
             .map_err(queue_lookup_error)?
             .ok_or(ApiError::NotFound("Queue job not found"))?;
+    // Already running is what the owner asked for.
+    if job.state == "running" {
+        return Ok(Json(queue_job_response(&state, job)?));
+    }
+    if job.state != "pending" {
+        return Err(conflict(&no_longer_waiting(&job.state)));
+    }
+    if body.ask_if_risky {
+        if let Some(risk) = start_check(&state, &job.id)?.risk {
+            return Err(ApiError::StatusBody {
+                status: StatusCode::CONFLICT,
+                body: json!({"detail": risk, "code": "start_risk", "risk": risk}),
+            });
+        }
+    }
     let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
     let (started, by_this_call) = RetainedQueueStore::force_start_queue_job_in_state_dir(
@@ -1072,11 +1114,9 @@ pub(super) async fn force_start_queue_job(
                 .unwrap_or_else(|| "it is still waiting".to_owned());
         return Err(conflict(&format!("Couldn't start it yet: {why}")));
     }
-    if !by_this_call {
-        return Err(conflict(&format!(
-            "job is no longer queued ({})",
-            started.state
-        )));
+    // Started by this call, or by a scheduler pass that got there first.
+    if !by_this_call && started.state != "running" {
+        return Err(conflict(&no_longer_waiting(&started.state)));
     }
     Ok(Json(queue_job_response(&state, started)?))
 }
