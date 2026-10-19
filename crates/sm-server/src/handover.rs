@@ -97,6 +97,85 @@ impl Shutdown {
     }
 }
 
+/// Agent runtime launches this process has started and not yet recorded as
+/// applied or failed. The replacement's startup recovery tears down every
+/// launch still recorded `launching`, so the serving process must not hand
+/// over while it is mid-launch: that killed a handoff successor's terminal
+/// a second after it started (#2409).
+#[derive(Debug, Default)]
+pub struct RuntimeLaunchGate {
+    state: std::sync::Mutex<RuntimeLaunchGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeLaunchGateState {
+    in_flight: usize,
+    sealed: bool,
+}
+
+/// Held for the whole launch; dropping it ends the launch.
+#[must_use]
+pub struct RuntimeLaunchGuard<'a>(&'a RuntimeLaunchGate);
+
+impl Drop for RuntimeLaunchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().in_flight -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+impl RuntimeLaunchGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RuntimeLaunchGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Refused once handover has sealed the gate; the replacement serves the
+    /// retry.
+    pub fn begin(&self) -> Result<RuntimeLaunchGuard<'_>> {
+        let mut state = self.lock();
+        if state.sealed {
+            bail!("Session Manager is restarting; retry in a few seconds");
+        }
+        state.in_flight += 1;
+        Ok(RuntimeLaunchGuard(self))
+    }
+
+    /// Refuse new launches and wait for running ones to finish. Returns false,
+    /// and reopens the gate, when launches are still running at the deadline.
+    pub fn seal_and_drain(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.lock();
+        state.sealed = true;
+        while state.in_flight > 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                state.sealed = false;
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        true
+    }
+
+    pub fn unseal(&self) {
+        self.lock().sealed = false;
+    }
+}
+
+/// The serving process's gate. One per process, because every store clone
+/// and server generation shares the same tmux runtime and launch ledger.
+pub fn runtime_launch_gate() -> &'static RuntimeLaunchGate {
+    static GATE: std::sync::OnceLock<RuntimeLaunchGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(RuntimeLaunchGate::default)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -674,6 +753,34 @@ mod macos_launchd {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn launch_gate_waits_for_running_launches_and_refuses_new_ones() {
+        let gate = Arc::new(RuntimeLaunchGate::default());
+        let running = gate.begin().unwrap();
+        // A launch still running at the deadline refuses the handover and
+        // reopens the gate.
+        assert!(!gate.seal_and_drain(Duration::from_millis(20)));
+        drop(gate.begin().unwrap());
+
+        let sealing = {
+            let gate = gate.clone();
+            thread::spawn(move || gate.seal_and_drain(Duration::from_secs(10)))
+        };
+        while gate.begin().is_ok_and(|guard| {
+            drop(guard);
+            true
+        }) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let refused = gate.begin().err().unwrap().to_string();
+        assert!(refused.contains("restarting"), "{refused}");
+        drop(running);
+        assert!(sealing.join().unwrap());
+        assert!(gate.begin().is_err());
+        gate.unseal();
+        drop(gate.begin().unwrap());
+    }
 
     #[test]
     fn passes_listeners_and_rejects_wrong_count() {

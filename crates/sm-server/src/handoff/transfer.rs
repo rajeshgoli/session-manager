@@ -1256,6 +1256,54 @@ mod tests {
         assert!(recovered
             .start_handoff_session_runtime(&successor.id, request, &runtime)
             .is_err());
+        // #2409: with the terminal gone and no provider session written,
+        // Claude provably never received the brief, so the attempt is
+        // superseded and the handoff may launch again. A transcript or a
+        // live terminal keeps the failure for an explicit decision.
+        let before = recovered.load_raw_json_value().unwrap();
+        let mut failed = before.clone();
+        failed["session_runtime_launches"][0]["provider_resume_id"] = json!("provider-2409");
+        let project_dir = recovered.claude_transcript_roots()[0].join(
+            root.canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('/', "-"),
+        );
+        fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join("provider-2409.jsonl");
+        let live_tmux = root.join("live-tmux");
+        fs::write(&live_tmux, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&live_tmux, fs::Permissions::from_mode(0o755)).unwrap();
+        let live_runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(live_tmux.display().to_string());
+        for (written, terminal, relaunch) in [
+            (true, &runtime, false),
+            (false, &live_runtime, false),
+            (false, &runtime, true),
+        ] {
+            recovered.write_raw_json_value(&failed).unwrap();
+            if written {
+                fs::write(&transcript, "{}\n").unwrap();
+            } else {
+                let _ = fs::remove_file(&transcript);
+            }
+            assert_eq!(
+                recovered
+                    .retire_unsubmitted_handoff_launch(&successor.id, terminal)
+                    .unwrap(),
+                relaunch
+            );
+        }
+        assert_eq!(
+            recovered.load_raw_json_value().unwrap()["session_runtime_launches"][0]["status"],
+            "superseded"
+        );
+        assert!(recovered
+            .handoff_runtime_launch_status(&successor.id)
+            .unwrap()
+            .is_none());
+        recovered.write_raw_json_value(&before).unwrap();
         let state = recovered.load_raw_json_value().unwrap();
         assert_eq!(
             state["session_runtime_launches"].as_array().unwrap().len(),

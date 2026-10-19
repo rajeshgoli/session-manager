@@ -2385,6 +2385,27 @@ fn claude_transcript_candidates(
         .collect()
 }
 
+/// True when Claude never started a turn in this provider session: it writes
+/// `<session>.jsonl`, and later `<session>/` for subagents, only once the first
+/// user turn is submitted. With no roots to look in, nothing is proven.
+pub(crate) fn claude_provider_session_unwritten(
+    projects_roots: &[PathBuf],
+    working_dir: &str,
+    provider_session_id: &str,
+) -> bool {
+    // Any answer but "not found" (a permission error, say) proves nothing.
+    let absent = |path: PathBuf| {
+        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    !projects_roots.is_empty()
+        && claude_transcript_project_directories(projects_roots, working_dir)
+            .iter()
+            .all(|project_dir| {
+                absent(project_dir.join(format!("{provider_session_id}.jsonl")))
+                    && absent(project_dir.join(provider_session_id))
+            })
+}
+
 fn claude_transcript_project_directories(
     projects_roots: &[PathBuf],
     working_dir: &str,

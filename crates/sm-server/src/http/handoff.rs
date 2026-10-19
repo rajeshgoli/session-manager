@@ -765,11 +765,22 @@ async fn deliver_successor_brief(
         .session_store
         .handoff_runtime_launch_status(successor_id)?
     {
+        if status == "applied" {
+            return Ok(());
+        }
+        let (store, runtime, id) = (
+            state.session_store.clone(),
+            state.runtime(),
+            successor_id.to_owned(),
+        );
+        let relaunch = tokio::task::spawn_blocking(move || {
+            store.retire_unsubmitted_handoff_launch(&id, &runtime)
+        })
+        .await??;
         anyhow::ensure!(
-            status == "applied",
+            relaunch,
             "handoff runtime launch is {status}; inspect retained diagnostics before recovery"
         );
-        return Ok(());
     }
     let successor = state
         .session_store
@@ -1268,13 +1279,25 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_stopped());
-        assert!(complete_handoff(&state, "pred2342", &successor.id)
-            .await
-            .is_err());
+        // Claude never wrote the provider session and the terminal is gone,
+        // so the brief provably never arrived: one relaunch, never more
+        // (#2409).
+        for _ in 0..2 {
+            assert!(complete_handoff(&state, "pred2342", &successor.id)
+                .await
+                .is_err());
+        }
         let raw: Value =
             serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
-        assert_eq!(raw["session_runtime_launches"].as_array().unwrap().len(), 1);
-        assert_eq!(raw["spawn_launch_intents"].as_array().unwrap().len(), 1);
+        let launches = raw["session_runtime_launches"].as_array().unwrap();
+        assert_eq!(
+            launches
+                .iter()
+                .map(|launch| launch["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["superseded", "failed"]
+        );
+        assert_eq!(raw["spawn_launch_intents"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

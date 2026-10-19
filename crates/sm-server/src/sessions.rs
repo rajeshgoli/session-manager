@@ -1586,6 +1586,7 @@ impl SessionStore {
     }
 
     fn try_apply_waiting_credential_rotation(&self, session_id: &str) -> Result<bool> {
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         let (rotation, session, recovering_launch_id) = {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
@@ -4643,9 +4644,78 @@ impl SessionStore {
         Ok(
             session_runtime_launch_records(&self.load_raw_json_value()?)?
                 .into_iter()
-                .find(|launch| launch.session_id == id && launch.operation_kind == "create")
+                .find(|launch| is_current_create_launch(launch, id))
                 .map(|launch| launch.status),
         )
+    }
+
+    /// A failed Claude successor launch whose terminal is gone and whose
+    /// provider session was never written never received its brief, so
+    /// launching it again cannot duplicate work. Mark the attempt superseded
+    /// so the handoff launches afresh, once; true when it did (#2409).
+    pub(crate) fn retire_unsubmitted_handoff_launch(
+        &self,
+        id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<bool> {
+        let unsubmitted = |launch: &SessionRuntimeLaunchRecord| {
+            launch.status == "failed"
+                && launch.provider == "claude"
+                && launch
+                    .provider_resume_id
+                    .as_deref()
+                    .is_some_and(|provider_id| {
+                        crate::runtime::claude_provider_session_unwritten(
+                            &self.claude_projects_roots,
+                            &launch.working_dir,
+                            provider_id,
+                        )
+                    })
+        };
+        let launches = session_runtime_launch_records(&self.load_raw_json_value()?)?;
+        // One relaunch only: a cause that repeats (a missing worktree, say)
+        // would otherwise relaunch on every sweep.
+        if launches
+            .iter()
+            .any(|launch| launch.session_id == id && launch.status == SUPERSEDED_LAUNCH_STATUS)
+        {
+            return Ok(false);
+        }
+        let Some(launch) = launches
+            .into_iter()
+            .find(|launch| is_current_create_launch(launch, id))
+            .filter(|launch| unsubmitted(launch))
+        else {
+            return Ok(false);
+        };
+        if runtime
+            .for_socket_name(launch.tmux_socket_name.as_deref())
+            .session_exists(&launch.tmux_session)?
+        {
+            return Ok(false);
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if state["handoff_deferred_sessions"][id] != true {
+            return Ok(false);
+        }
+        let mut records = session_runtime_launch_records(&state)?;
+        let Some(record) = records
+            .iter_mut()
+            .find(|record| record.id == launch.id)
+            .filter(|record| unsubmitted(record))
+        else {
+            return Ok(false);
+        };
+        record.status = SUPERSEDED_LAUNCH_STATUS.to_owned();
+        record.updated_at = now_rfc3339();
+        store_session_runtime_launch_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        eprintln!(
+            "handoff successor {id} never received its brief; relaunching after failed launch {}",
+            launch.id
+        );
+        Ok(true)
     }
 
     fn create_core_session_record(
@@ -4767,6 +4837,7 @@ impl SessionStore {
         if provider == "opencode" {
             return self.create_opencode_session_with_runtime(request, log_dir, runtime);
         }
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         if provider == "codex-fork" {
             if let Some(model) = request
                 .model
@@ -4798,7 +4869,7 @@ impl SessionStore {
             // replay a prompt whose provider acceptance may be unknown.
             if let Some(launch) = session_runtime_launch_records(&state)?
                 .iter()
-                .find(|launch| launch.session_id == id && launch.operation_kind == "create")
+                .find(|launch| is_current_create_launch(launch, id))
             {
                 anyhow::ensure!(
                     launch.status == "applied",
@@ -6051,6 +6122,7 @@ impl SessionStore {
         session_id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<Option<CoreRestoreOutcome>> {
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
@@ -15205,6 +15277,15 @@ fn remove_failed_provisional_runtime_session(state: &Value, session_id: &str) ->
         .is_some_and(|session| {
             completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
         })
+}
+
+/// A launch attempt replaced by a later one; it no longer owns recovery.
+const SUPERSEDED_LAUNCH_STATUS: &str = "superseded";
+
+fn is_current_create_launch(launch: &SessionRuntimeLaunchRecord, session_id: &str) -> bool {
+    launch.session_id == session_id
+        && launch.operation_kind == "create"
+        && launch.status != SUPERSEDED_LAUNCH_STATUS
 }
 
 fn mark_runtime_launch_failed(
