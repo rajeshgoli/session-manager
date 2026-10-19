@@ -627,11 +627,14 @@ impl Destination {
             }
             // Apply removes a staged file only by moving it into place.
             let current = safe_path(&self.root, &path, false)?;
-            if !fs::symlink_metadata(&current).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
-            let staged = safe_path(&staging, &path, true)?;
-            if staged.exists() {
+            let placed = fs::symlink_metadata(&current).is_ok_and(|m| m.is_file());
+            let staged = safe_path(&staging, &path, placed)?;
+            if !placed || staged.exists() {
+                // A stopped recovery's rename may not be durable yet: flush its
+                // folders before the journal that would redo it is dropped.
+                let existing =
+                    [current.parent(), staged.parent()].map(|p| p.filter(|p| p.is_dir()));
+                self.touch(&mut touched, existing);
                 continue;
             }
             fs::rename(&current, &staged)?;
@@ -701,6 +704,10 @@ impl Destination {
                     }
                 } else if current.exists() {
                     fs::remove_file(&current)?;
+                } else if let Some(parent) = current.parent().filter(|p| p.is_dir()) {
+                    // A stopped rollback's removal may not be durable yet.
+                    self.touch(&mut touched, [Some(parent)]);
+                    continue;
                 } else {
                     continue;
                 }
