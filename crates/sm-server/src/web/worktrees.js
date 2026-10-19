@@ -68,6 +68,7 @@ export function LeftoverWorktrees() {
     }
   };
   const rows = (data && data.worktrees) || [];
+  const loose = (data?.loose || []).map(row => ({ ...row, bytes: row.size_bytes, repo: '', reason: row.blocked_by || `Deletes after ${new Date(row.deletes_after).toLocaleDateString()}` }));
   const total = rows.reduce((sum, row) => sum + (row.bytes || 0), 0);
   const build = rows.reduce((sum, row) => sum + (row.build_bytes || 0), 0);
   return html`<section class="device-settings" aria-label="Left-over worktrees" aria-busy=${busy}>
@@ -81,5 +82,9 @@ export function LeftoverWorktrees() {
     ${data && !rows.length ? html`<p class="sub">None.</p>` : null}
     ${rows.length ? html`<p>${rows.length} worktree${rows.length === 1 ? '' : 's'} · ${size(total)}${build ? `, ${size(build)} of it build output` : ''}</p>` : null}
     <ul class="device-list">${rows.map((row) => html`<${Row} key=${row.path} row=${row} act=${act} />`)}</ul>
+    <h3>Loose files in ~/worktrees</h3>
+    <p class="sub">Files and folders outside checkouts. sm deletes them after 14 days unless kept, recently changed, or in use.</p>
+    ${data && !loose.length ? html`<p class="sub">None.</p>` : null}
+    <ul class="device-list">${loose.map(row => html`<${Row} key=${row.path} row=${row} act=${act} />`)}</ul>
   </section>`;
 }

@@ -478,6 +478,15 @@ export function linkifyHtml(source) {
 
 export const threadHref = thread => `/inbox?open=thread:${encodeURIComponent(thread.key.replace(/^agent:/, ''))}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`;
 
+/** Open external handoff links in the browser and local docs in the reader. */
+export function openDoc(path) {
+  try {
+    const url = new URL(path, location.origin);
+    if (url.origin === location.origin) openPanel(`doc:${url.pathname}${url.search}${url.hash}`);
+    else if (url.protocol === 'https:' || url.protocol === 'http:') window.open(url.href, '_blank', 'noopener');
+  } catch (_) {}
+}
+
 /** Shared related-item chips. Empty kinds do not occupy space. */
 export function Links({ ticket, tickets = [], prs = [], agent, jobs = [], thread, docs = [] }) {
   const ticketRef = item => `ticket:${item.repo || ticket?.repo}#${item.number}`;
@@ -494,7 +503,7 @@ export function Links({ ticket, tickets = [], prs = [], agent, jobs = [], thread
       onClick=${() => { navigate('/queue'); openPanel(`job:${job.id}`); }}>${job.label || job.id} · ${job.quiet_since ? 'quiet' : job.state === 'running' ? 'running' : 'waiting'} ${age(job.quiet_since || job.since || job.started_at || job.queued_at)}</button>`)}
     ${visibleJobs.length > 3 ? html`<span class="link-chip">+${visibleJobs.length - 3} jobs</span>` : null}
     ${thread ? html`<button class=${`link-chip ${thread.needs_you ? 'magenta' : ''}`} onClick=${() => { location.href = threadHref(thread); }}>Inbox · ${thread.needs_you ? 'question' : thread.count}</button>` : null}
-    ${docs.map(doc => html`<button class="link-chip" onClick=${() => openPanel(`doc:${doc.reader_path}`)}>${doc.title}</button>`)}
+    ${docs.map(doc => html`<button class="link-chip" onClick=${() => openDoc(doc.reader_path)}>${doc.title}</button>`)}
   </div>`;
 }
 

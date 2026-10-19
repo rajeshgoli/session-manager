@@ -230,6 +230,9 @@ pub(super) async fn get_agent_history(
     let next_before = (records.len() > limit).then(|| encode_cursor(&key(&records[limit - 1])));
     records.truncate(limit);
     let mut work = data.agent_work(&records.iter().map(|r| r.id.as_str()).collect());
+    for (id, docs) in state.session_store.handoff_doc_rows()? {
+        work.entry(id).or_default().docs.extend(docs);
+    }
     let mut turns = state
         .session_store
         .turn_message_store()

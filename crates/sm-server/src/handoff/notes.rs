@@ -652,7 +652,94 @@ impl SessionStore {
         )?;
         Ok(())
     }
+    pub fn pending_handoff_source_paths(&self) -> Result<Vec<std::path::PathBuf>> {
+        let state = self.load_raw_json_value()?;
+        Ok(state["handoff_note_sources_pending"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["path"].as_str())
+            .map(expand_home)
+            .collect())
+    }
+    pub fn handoff_doc_rows(&self) -> Result<BTreeMap<String, Vec<crate::work_history::RowDoc>>> {
+        let state = self.load_raw_json_value()?;
+        let mut rows = BTreeMap::<String, Vec<crate::work_history::RowDoc>>::new();
+        for s in state["sessions"].as_array().into_iter().flatten() {
+            let Some(id) = s["id"].as_str() else { continue };
+            let note = &s["handoff"]["note"];
+            if !note.is_object() {
+                continue;
+            }
+            let name = raw_session_display_name(s.as_object().unwrap(), id);
+            let next = s["successor_session_id"].as_str();
+            let next_name = next.map(|n| {
+                raw_session_object(&state, n)
+                    .map(|s| raw_session_display_name(s, n))
+                    .unwrap_or_else(|| n.to_owned())
+            });
+            let superseded = note["superseded_by"].as_str();
+            let target = superseded.unwrap_or(id);
+            let title = if let Some(latest) = superseded {
+                let latest = raw_session_object(&state, latest)
+                    .map(|s| raw_session_display_name(s, latest))
+                    .unwrap_or_else(|| latest.to_owned());
+                format!("Handoff note (overwritten by {latest}'s)")
+            } else if note["kind"] == "path"
+                && !Self::handoff_artifact_path(
+                    &state,
+                    id,
+                    note["value"].as_str().unwrap_or_default(),
+                )
+                .exists()
+            {
+                "Handoff note (file no longer exists)".to_owned()
+            } else {
+                format!(
+                    "Handoff note{}",
+                    next_name.map(|n| format!(" → {n}")).unwrap_or_default()
+                )
+            };
+            let reader_path = if note["kind"] == "link" {
+                note["value"].as_str().unwrap_or_default().to_owned()
+            } else {
+                format!("/docs/~handoff/{target}")
+            };
+            let row = crate::work_history::RowDoc {
+                id: format!("handoff-{id}"),
+                name: format!("Handoff note from {name}"),
+                title,
+                state: "handoff".to_owned(),
+                reader_path,
+                owner_reviews: 0,
+                author_session_id: id.to_owned(),
+                published_at: s["handoff"]["accepted_at"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            };
+            rows.entry(id.to_owned()).or_default().push(row.clone());
+            if let Some(next) = next {
+                let mut incoming = row;
+                incoming.title = format!("Handoff note from {name}");
+                rows.entry(next.to_owned()).or_default().push(incoming);
+            }
+        }
+        Ok(rows)
+    }
     pub fn handoff_note_view(&self, target: &str, line: bool, own: bool) -> Result<Value> {
+        self.handoff_note_view_inner(target, line, own, true)
+    }
+    pub fn handoff_note_page(&self, target: &str) -> Result<Value> {
+        self.handoff_note_view_inner(target, true, false, false)
+    }
+    fn handoff_note_view_inner(
+        &self,
+        target: &str,
+        line: bool,
+        own: bool,
+        messages: bool,
+    ) -> Result<Value> {
         let state = self.load_raw_json_value()?;
         let sessions = state["sessions"]
             .as_array()
@@ -723,7 +810,11 @@ impl SessionStore {
             }
             notes.push(entry);
         }
-        let messages = self.handoff_owner_messages(&state, &ids)?;
+        let messages = if messages {
+            self.handoff_owner_messages(&state, &ids)?
+        } else {
+            vec![]
+        };
         Ok(
             json!({"notes":notes,"owner_messages":messages,"line_note_count":count,"owner_name":self.handoff_owner_name()}),
         )
@@ -1216,6 +1307,41 @@ mod tests {
             source: Some("draft".into()),
             source_path: None,
         }
+    }
+    #[test]
+    fn handoff_doc_rows_cover_links_missing_files_and_overwritten_notes() {
+        let (store, root) = fixture();
+        let mut state = store.load_raw_json_value().unwrap();
+        let mut next = state["sessions"][0].clone();
+        next["id"] = json!("agent002");
+        next["name"] = json!("next");
+        next["friendly_name"] = json!("next");
+        next["predecessor_session_id"] = json!("agent001");
+        state["sessions"][0]["successor_session_id"] = json!("agent002");
+        state["sessions"][0]["handoff"] =
+            json!({"note":{"kind":"link","value":"https://github.com/owner/repo/issues/1"}});
+        state["sessions"].as_array_mut().unwrap().push(next);
+        store.write_raw_json_value(&state).unwrap();
+        let rows = store.handoff_doc_rows().unwrap();
+        assert_eq!(rows["agent001"][0].title, "Handoff note → next");
+        assert_eq!(rows["agent002"][0].title, "Handoff note from test-agent");
+        assert_eq!(
+            rows["agent001"][0].reader_path,
+            "https://github.com/owner/repo/issues/1"
+        );
+        state["sessions"][0]["handoff"]["note"] =
+            json!({"kind":"path","value":root.join("gone.md")});
+        store.write_raw_json_value(&state).unwrap();
+        assert_eq!(
+            store.handoff_doc_rows().unwrap()["agent001"][0].title,
+            "Handoff note (file no longer exists)"
+        );
+        state["sessions"][0]["handoff"]["note"]["superseded_by"] = json!("agent002");
+        store.write_raw_json_value(&state).unwrap();
+        let row = &store.handoff_doc_rows().unwrap()["agent001"][0];
+        assert_eq!(row.title, "Handoff note (overwritten by next's)");
+        assert_eq!(row.reader_path, "/docs/~handoff/agent002");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn handoff_draft_excluded_once_and_never_overwrites_edits() {

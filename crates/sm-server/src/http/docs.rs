@@ -10,6 +10,95 @@ use crate::owner_docs::{
 use axum::http::header::{ETAG, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
 use axum::http::HeaderValue;
 
+pub(super) async fn get_handoff_doc(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_owner_page_read_allowed(&state, &request)?;
+    if crate::local_identity::current().is_some()
+        || ["x-sm-session", "x-sm-session-id"]
+            .iter()
+            .any(|h| request.headers().contains_key(*h))
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "handoff pages are owner-only".into(),
+        });
+    }
+    let browser = request_cloudflare_access_application(&state, &request)
+        == Some(CloudflareAccessApplication::Browser);
+    let task_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(record) = task_state.session_store.get_session(&session_id)? else {
+            return Ok(None);
+        };
+        let view = task_state.session_store.handoff_note_page(&session_id)?;
+        let notes = view["notes"].as_array().cloned().unwrap_or_default();
+        let Some(note) = notes.iter().find(|n| n["session"]["id"] == record.id) else {
+            return Ok(None);
+        };
+        let esc = crate::owner_docs::escape_html;
+        let name = note["session"]["name"].as_str().unwrap_or(&record.id);
+        let next = note["successor"]["name"].as_str().unwrap_or("no successor");
+        let at = note["created_at"].as_str().unwrap_or("time unknown");
+        let context = record
+            .context_used_percentage
+            .map(|p| format!(" · {p:.0}% context"))
+            .unwrap_or_default();
+        let mut header = format!(
+            "<p class=\"sm-meta\">{} → {} · {}{} · note {} of {} in this line</p>",
+            esc(name),
+            esc(next),
+            esc(&at.replace('T', " ").chars().take(16).collect::<String>()),
+            context,
+            note["sequence"],
+            view["line_note_count"]
+        );
+        for other in &notes {
+            if other["session"]["id"] == record.id {
+                continue;
+            }
+            let id = other["session"]["id"].as_str().unwrap_or_default();
+            header.push_str(&format!(
+                "<a href=\"/docs/~handoff/{}\">{}</a> · ",
+                esc(id),
+                esc(other["session"]["name"].as_str().unwrap_or(id))
+            ));
+        }
+        let fallback = note["url"]
+            .as_str()
+            .map(|u| format!("[Open handoff note]({u})"))
+            .unwrap_or_else(|| "Handoff note (file no longer exists)".into());
+        let text = note["text"].as_str().unwrap_or(&fallback);
+        let body = crate::owner_doc_render::render_markdown_with_lines(text);
+        Ok(Some(
+            crate::owner_docs::doc_shell(
+                "Handoff note",
+                &format!(
+                    "{header}<article>{body}</article>{}",
+                    web::reader_injection(browser)
+                ),
+            )
+            .into_bytes(),
+        ))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("handoff page task failed: {e}"))??;
+    let bytes = result.ok_or_else(|| ApiError::Status {
+        status: StatusCode::NOT_FOUND,
+        detail: "Handoff note not found".into(),
+    })?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 mod reopen;
 mod review;
 mod review_replies;
