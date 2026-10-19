@@ -599,6 +599,9 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     let Some(plan) = state.session_store.claim_handoff_start(predecessor_id)? else {
         return Ok(());
     };
+    state
+        .session_store
+        .cleanup_handoff_before_spawn(predecessor_id)?;
     let successor = match create_successor(&state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {
@@ -681,6 +684,9 @@ pub(super) async fn start_retired_autopm_successor(
             return Err(error);
         }
     };
+    state
+        .session_store
+        .cleanup_handoff_before_spawn(&predecessor.id)?;
     let successor = match create_successor(state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {

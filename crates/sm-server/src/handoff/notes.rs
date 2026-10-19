@@ -464,18 +464,31 @@ impl SessionStore {
                 return;
             }
         };
-        if unchanged_only && record.is_none() {
+        // A shared working directory does not make this session the file's owner.
+        let Some((path, sha)) = record else {
+            return;
+        };
+        let other_owner = self.notes_db().and_then(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM handoff_drafts WHERE path=?1 AND session_id<>?2)",
+                params![path, id],
+                |row| row.get::<_, bool>(0),
+            )?)
+        });
+        if other_owner.unwrap_or(true)
+            || (!unchanged_only
+                && session
+                    .get("successor_session_id")
+                    .and_then(Value::as_str)
+                    .is_some())
+        {
+            if !unchanged_only {
+                let _ = self.remove_handoff_draft_record(id);
+            }
             return;
         }
-        let path = record
-            .as_ref()
-            .map(|(path, _)| PathBuf::from(path))
-            .unwrap_or_else(|| {
-                expand_home(&json_text(session.get("working_dir")).unwrap_or_default())
-                    .join(".sm/handoff.md")
-            });
         let sha = if unchanged_only {
-            record.as_ref().map(|(_, sha)| sha.as_str())
+            Some(sha.as_str())
         } else {
             None
         };
@@ -488,6 +501,13 @@ impl SessionStore {
             Ok(false) => {}
             Err(error) => eprintln!("cleaning handoff draft for {id}: {error:#}"),
         }
+    }
+    /// The accepted note is durable, and no successor can yet create a draft.
+    pub fn cleanup_handoff_before_spawn(&self, id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        self.cleanup_handoff_draft(&state, id, false);
+        Ok(())
     }
     pub(super) fn save_handoff_note(
         &self,
@@ -998,7 +1018,15 @@ impl SessionStore {
                     .is_some_and(|p| Path::new(p).starts_with(&legacy))
             })
         {
-            fs::remove_dir_all(legacy)?;
+            match fs::remove_dir(legacy) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
@@ -1501,5 +1529,83 @@ mod tests {
         assert_eq!(state["sessions"][0]["handoff"]["note"], note);
         assert!(state.get("handoff_notes_imported_at").is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn handoff_predecessor_retirement_preserves_the_successors_new_draft() {
+        for stale_predecessor_row in [false, true] {
+            let (store, root) = fixture();
+            let old = store.handoff_draft("agent001").unwrap();
+            let path = Path::new(old["path"].as_str().unwrap());
+            write_draft(path, old["text"].as_str().unwrap()).unwrap();
+            remove_draft(path, None).unwrap();
+            if !stale_predecessor_row {
+                store.remove_handoff_draft_record("agent001").unwrap();
+            }
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut successor = state["sessions"][0].clone();
+            successor["id"] = json!("agent002");
+            successor["name"] = json!("successor");
+            successor["friendly_name"] = json!("successor");
+            successor["predecessor_session_id"] = json!("agent001");
+            state["sessions"][0]["successor_session_id"] = json!("agent002");
+            state["sessions"].as_array_mut().unwrap().push(successor);
+            store.write_raw_json_value(&state).unwrap();
+            let new = store.handoff_draft("agent002").unwrap();
+            write_draft(path, new["text"].as_str().unwrap()).unwrap();
+            fs::write(path, "successor's edited note").unwrap();
+            store.cleanup_handoff_draft(&state, "agent001", false);
+            assert_eq!(fs::read_to_string(path).unwrap(), "successor's edited note");
+            assert!(store.handoff_draft_record("agent002").unwrap().is_some());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn handoff_legacy_directory_cleanup_keeps_changed_and_tracked_sources() {
+        for tracked in [false, true] {
+            let (store, root) = fixture();
+            let legacy = root.join("handoffs");
+            fs::create_dir(&legacy).unwrap();
+            let source = legacy.join("note.md");
+            fs::write(&source, "original").unwrap();
+            if tracked {
+                assert!(Command::new("git")
+                    .arg("init")
+                    .arg(&root)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["add", "handoffs/note.md"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success());
+            }
+            let mut state = store.load_raw_json_value().unwrap();
+            state["sessions"][0]["status"] = json!("stopped");
+            state["sessions"][0]["handoff"] =
+                json!({"state":"done","trigger":"voluntary","note":{"kind":"path","value":source}});
+            store.write_raw_json_value(&state).unwrap();
+            store
+                .maintain_handoff_notes_checkpoint(|stage| {
+                    if stage == "row" && !tracked {
+                        fs::write(&source, "keep changed source")?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(source.exists());
+            assert!(legacy.exists());
+            store.maintain_handoff_notes().unwrap();
+            assert!(source.exists());
+            assert_eq!(
+                store.handoff_note_view("agent001", false, false).unwrap()["notes"][0]["text"],
+                "original"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
