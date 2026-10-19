@@ -61,11 +61,11 @@ pub struct HandoffFacts {
     pub original_brief: Option<String>,
 }
 
-fn raw_handoff_record(session: &Map<String, Value>) -> Option<HandoffRecord> {
+pub(super) fn raw_handoff_record(session: &Map<String, Value>) -> Option<HandoffRecord> {
     HandoffRecord::from_session(session).and_then(Result::ok)
 }
 
-fn write_handoff_record(session: &mut Map<String, Value>, record: &HandoffRecord) {
+pub(super) fn write_handoff_record(session: &mut Map<String, Value>, record: &HandoffRecord) {
     session.insert(policy::STATE_KEY.to_owned(), record.to_json());
 }
 
@@ -1146,6 +1146,137 @@ mod tests {
                 .unwrap(),
             HandoffAcceptOutcome::Conflict("session is not running".to_owned())
         );
+    }
+
+    #[test]
+    fn deferred_handoff_record_recovers_before_launch_and_failed_launch_keeps_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = store("deferred-launch", "idle");
+        let mut raw = store.load_raw_json_value().unwrap();
+        raw["sessions"][1]["autopm_authorized"] = json!(true);
+        store.write_raw_json_value(&raw).unwrap();
+        let note = HandoffNote {
+            kind: NoteKind::Link,
+            value: "https://example.com/note".into(),
+            source: None,
+            source_path: None,
+        };
+        store.accept_handoff("pred0001", "pred0001", &note).unwrap();
+        let plan = store.claim_handoff_start("pred0001").unwrap().unwrap();
+        let root = temp_path("deferred-root");
+        fs::create_dir_all(&root).unwrap();
+        let successor = store
+            .create_handoff_session_record(
+                CreateCoreSessionRequest {
+                    provider: Some(plan.provider),
+                    name: Some(plan.successor_name),
+                    working_dir: Some(root.display().to_string()),
+                    parent_session_id: plan.parent_session_id,
+                    started_by_sm: true,
+                    ..Default::default()
+                },
+                Some(root.clone()),
+                "pred0001",
+                None,
+            )
+            .unwrap();
+        assert!(successor.is_stopped());
+        assert!(store
+            .handoff_runtime_launch_status(&successor.id)
+            .unwrap()
+            .is_none());
+        // Creation and the recovery link commit together. No work has moved.
+        assert_eq!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("pred0001")
+        );
+        let mut recovered = SessionStore::new(store.state_file.clone());
+        recovered.queue_store = store.queue_store.clone();
+        assert_eq!(recovered.recover_interrupted_handoff_starts().unwrap(), 0);
+        assert!(recovered
+            .pending_handoff_work()
+            .unwrap()
+            .contains(&HandoffWork::Resume {
+                predecessor_id: "pred0001".into(),
+                successor_id: successor.id.clone()
+            }));
+        for _ in 0..2 {
+            recovered
+                .transfer_handoff_json("pred0001", &successor.id)
+                .unwrap();
+        }
+        assert_eq!(
+            recovered
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some(successor.id.as_str())
+        );
+        // A rejected launch retains the stopped successor, inherited roles and
+        // children, and its durable launch ledger. Retrying never starts again.
+        let tmux = root.join("tmux");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\ncase \"$1\" in has-session) exit 1;; *) echo rejected >&2; exit 1;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string());
+        let request = CreateCoreSessionRequest {
+            provider: Some("claude".into()),
+            working_dir: Some(root.display().to_string()),
+            initial_message: Some("Accepted brief".into()),
+            ..Default::default()
+        };
+        assert!(recovered
+            .start_handoff_session_runtime(&successor.id, request.clone(), &runtime)
+            .is_err());
+        assert!(recovered
+            .get_session(&successor.id)
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+        assert_eq!(
+            recovered
+                .handoff_runtime_launch_status(&successor.id)
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert!(recovered
+            .start_handoff_session_runtime(&successor.id, request, &runtime)
+            .is_err());
+        let state = recovered.load_raw_json_value().unwrap();
+        assert_eq!(
+            state["session_runtime_launches"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(state["agent_registrations"][0]["session_id"], successor.id);
+        assert_eq!(
+            raw_session_object(&state, &successor.id).unwrap()["autopm_authorized"],
+            true
+        );
+        // Startup refusal to replay an uncertain atomic Claude brief must also
+        // preserve the transferred record (ordinary provisional spawns differ).
+        let mut state = state;
+        state["session_runtime_launches"][0]["status"] = json!("launching");
+        state["session_runtime_launches"][0]["force_initial_prompt_stdin"] = json!(true);
+        recovered.write_raw_json_value(&state).unwrap();
+        recovered.recover_session_runtime_launches().unwrap();
+        assert!(recovered
+            .get_session(&successor.id)
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

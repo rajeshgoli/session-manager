@@ -16444,11 +16444,13 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket);
-    let app = runtime_app_with_command(
+    let app = runtime_app_with_structured_claude_provider(
         &state_file,
         &log_dir,
         _tmux_guard.0.as_str(),
-        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nruntime:%s\n>" "$line"; done' runtime-sh"#,
+        true,
+        false,
+        false,
     );
     for (id, name, parent) in [
         ("handparent", "hand-parent", Value::Null),
@@ -16465,12 +16467,13 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
                 "parent_session_id": parent,
                 "model": "opus",
                 "reasoning_effort": "high",
-                "initial_message": format!("{id} up")
+                "initial_message": format!("{id} up"),
+                "spawn_prompt_source": {"kind":"stdin"}
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{payload}");
-        wait_for_output_contains(app.clone(), id, &format!("runtime:{id} up")).await;
+        wait_for_output_contains(app.clone(), id, &format!("received:{id} up")).await;
     }
     let hook = |event: &str, at: &str| {
         json!({
@@ -16548,7 +16551,7 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
     wait_for_output_contains(
         app.clone(),
         &successor_id,
-        "runtime:[sm handoff] You are taking over from hand-pred (handpred)",
+        "received:[sm handoff] You are taking over from hand-pred (handpred)",
     )
     .await;
     wait_for_output_contains(
@@ -16578,6 +16581,28 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
     assert_eq!(stored_successor["model"], "opus");
     assert_eq!(stored_successor["reasoning_effort"], "high");
     assert_eq!(stored_successor["predecessor_session_id"], "handpred");
+    let launch = raw_state["session_runtime_launches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|launch| launch["session_id"] == successor_id)
+        .unwrap();
+    assert_eq!(launch["force_initial_prompt_stdin"], true);
+    assert_eq!(launch["status"], "applied");
+    let prompt = launch["initial_message"].as_str().unwrap();
+    assert!(prompt.contains(&format!("Read it first: {note}")));
+    assert!(prompt.ends_with("Start from the note's next steps."));
+    assert!(!prompt.contains("Run `sm handoff show`, then continue"));
+    let intent = raw_state["spawn_launch_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|intent| intent["session_id"] == successor_id)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(intent["artifact"]["path"].as_str().unwrap()).unwrap(),
+        prompt
+    );
 
     // A message to the retired agent reaches its successor (D.8).
     let (status, payload) = post_json(
@@ -16591,7 +16616,7 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
         payload["forwarded"],
         format!("hand-pred handed off; delivered to hand-pred-h2 ({successor_id}).")
     );
-    wait_for_output_contains(app.clone(), &successor_id, "runtime:after handoff").await;
+    wait_for_output_contains(app.clone(), &successor_id, "received:after handoff").await;
 }
 
 #[tokio::test]
@@ -21515,9 +21540,15 @@ pending = b''
 while True:
     pending += os.read(fd, 4096)
     start, end = b'\x1b[200~', b'\x1b[201~\r'
-    if not pending.startswith(start) or not pending.endswith(end):
-        continue
-    line = pending[len(start):-len(end)].decode('utf-8')
+    if pending.startswith(start):
+        if not pending.endswith(end):
+            continue
+        line = pending[len(start):-len(end)].decode('utf-8')
+    else:
+        # Ordinary messages can use unbracketed single-line terminal input.
+        if not pending.endswith(b'\r'):
+            continue
+        line = pending[:-1].decode('utf-8')
     pending = b''
     print('received:' + line, flush=True)
     if {acknowledgement}:
