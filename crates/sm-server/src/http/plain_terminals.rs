@@ -181,6 +181,11 @@ fn create_locked(
     let t = Terminal {
         id: id.clone(),
         cwd,
+        name: payload["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
         created_by_user: owner,
         created_by_device: device,
         created_via: via.into(),
@@ -334,6 +339,8 @@ pub(super) async fn route(
         Ok(
             json!({"ssh_host":host,"ssh_port":port,"ssh_user":user,"tmux_session":t.tmux_session,
             "tmux_socket_name":runtime.socket_name(),
+            "lan_probe_url":format!("https://{}:{}/client/terminal/probe", state.config.terminal_direct.lan.hostname, state.config.terminal_direct.lan.port),
+            "server_instance":state.server_instance,
             "command":format!("ssh -t{port_flag} {target} tmux{socket} attach-session -t {}",t.tmux_session)}),
         )
     });

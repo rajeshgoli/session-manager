@@ -106,6 +106,7 @@ fun CreateSessionSheet(
     onAgentTypeChange: (String?) -> Unit = {},
     /** Opens New agent on this folder and first message, such as an artifact investigation brief (sm#2266). */
     prefill: CreateSessionRequest? = null,
+    onCreateTerminal: ((String, String?) -> Unit)? = null,
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
     // The agent fields open on the bug defaults once they arrive.
@@ -122,6 +123,7 @@ fun CreateSessionSheet(
     var provider by rememberSaveable(sheetKey) { mutableStateOf(template.provider) }
     var model by rememberSaveable(sheetKey) { mutableStateOf(template.model.orEmpty()) }
     var effort by rememberSaveable(sheetKey) { mutableStateOf(template.reasoningEffort.orEmpty()) }
+    var terminal by rememberSaveable(sheetKey) { mutableStateOf(false) }
     var otherType by rememberSaveable(sheetKey) { mutableStateOf(false) }
     var selectedTypeName by rememberSaveable(sheetKey) { mutableStateOf(ticket?.selectedType) }
     var typesInitialized by rememberSaveable(sheetKey) { mutableStateOf(false) }
@@ -148,7 +150,7 @@ fun CreateSessionSheet(
     LaunchedEffect(selectedType?.name, typesInitialized) {
         if (typesInitialized) onAgentTypeChange(selectedType?.name)
     }
-    val customConfig = !typesLoading && selectedType == null
+    val customConfig = !terminal && !typesLoading && selectedType == null
     var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name ?: prefill?.name.orEmpty()) }
@@ -219,9 +221,9 @@ fun CreateSessionSheet(
                 Text("Agent type", style = MaterialTheme.typography.titleSmall)
                 agentTypes.forEach { choice ->
                     FilterChip(
-                        selected = selectedType == choice,
+                        selected = !terminal && selectedType == choice,
                         onClick = {
-                            selectedTypeName = choice.name; otherType = false; provider = choice.provider; model = choice.model; effort = choice.effort
+                            terminal = false; selectedTypeName = choice.name; otherType = false; provider = choice.provider; model = choice.model; effort = choice.effort
                             customModel = false
                         },
                         enabled = !busy && !typesLoading,
@@ -233,14 +235,17 @@ fun CreateSessionSheet(
                     )
                 }
                 if (ticket?.whenReady != true && bug == null) local?.models?.firstOrNull()?.let { loaded ->
-                    FilterChip(selected = provider == "opencode", onClick = {
-                        otherType = true; provider = "opencode"; model = loaded; effort = ""; customModel = false
+                    FilterChip(selected = !terminal && provider == "opencode", onClick = {
+                        terminal = false; otherType = true; provider = "opencode"; model = loaded; effort = ""; customModel = false
                     }, enabled = !busy && local?.canStartLocal == true, label = { Text("Local ($loaded)") })
-                    local?.reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                    if (!terminal) local?.reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 }
-                FilterChip(selected = customConfig, onClick = { otherType = true }, enabled = !busy && !typesLoading, label = { Text("Other") })
-                if (typesLoading) Text("Loading agent types…", style = MaterialTheme.typography.bodySmall)
-                if (typesError) TextButton(onClick = { typesAttempt++ }, enabled = !busy) { Text("Couldn't load agent types · Retry") }
+                FilterChip(selected = customConfig, onClick = { terminal = false; otherType = true }, enabled = !busy && !typesLoading, label = { Text("Other") })
+                if (onCreateTerminal != null && source == null && ticket == null && bug == null) {
+                    FilterChip(selected = terminal, onClick = { terminal = true }, enabled = !busy, label = { Text("▹ Terminal") })
+                }
+                if (!terminal && typesLoading) Text("Loading agent types…", style = MaterialTheme.typography.bodySmall)
+                if (!terminal && typesError) TextButton(onClick = { typesAttempt++ }, enabled = !busy) { Text("Couldn't load agent types · Retry") }
                 if (customConfig) {
                     val providers = if (startLike) listOf("claude", "codex-fork") else listOf("claude", "codex")
                     SessionChoice("Provider", provider, (providers + listOf(provider).filter { it != "opencode" }).distinct(), !busy) {
@@ -258,7 +263,7 @@ fun CreateSessionSheet(
                     }
                 }
                 if (!startLike) {
-                    SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
+                    SessionChoice(if (terminal) "Directory" else "Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
                         if (it == "Other directory…") customDirectory = true else { directory = it; customDirectory = false }
                     }
                     if (customDirectory) OutlinedTextField(directory, { directory = it }, label = { Text("Absolute directory path") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -270,9 +275,9 @@ fun CreateSessionSheet(
                     Text("Named from the new ticket, as Start does", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     OutlinedTextField(name, { name = it }, label = { Text(if (ticket != null) "Name" else "Name · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                    OutlinedTextField(prompt, { prompt = it }, label = { Text(if (ticket != null) "Brief" else "First message · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = if (ticket != null) 8 else 5)
+                    if (!terminal) OutlinedTextField(prompt, { prompt = it }, label = { Text(if (ticket != null) "Brief" else "First message · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = if (ticket != null) 8 else 5)
                 }
-                extra?.invoke(!busy)
+                if (!terminal) extra?.invoke(!busy)
             }
             bug?.filedIssue?.let { issue ->
                 val uriHandler = LocalUriHandler.current
@@ -287,11 +292,13 @@ fun CreateSessionSheet(
             val agentReady = directory.trim().startsWith('/') && !typesLoading && !localBlocked
             val enabled = !busy && if (bug != null) {
                 bugText.isNotBlank() && (!bugAgent || (bug.defaults != null && bug.agentNote == null && agentReady))
-            } else agentReady
+            } else if (terminal) directory.trim().startsWith('/') else agentReady
             Button(
                 onClick = {
                     if (bug != null) {
                         onFile(BugFiling(bugText, bugScreenshot, if (bugAgent) BugAgentChoice(provider, model.ifBlank { null }, effort.ifBlank { null }, null) else null))
+                    } else if (terminal) {
+                        onCreateTerminal?.invoke(directory.trim(), name.trim().ifBlank { null })
                     } else {
                         onCreate(CreateSessionRequest(provider, directory.trim(), model.ifBlank { null }, effort.ifBlank { null }, name.trim().ifBlank { null }, prompt.trim().ifBlank { null }))
                     }
@@ -300,6 +307,7 @@ fun CreateSessionSheet(
                 modifier = Modifier.fillMaxWidth().height(52.dp),
             ) {
                 val label = when {
+                    terminal -> "Create terminal"
                     bug == null -> if (ticket?.whenReady == true) "Start when ready" else if (ticket != null) "Start" else "Create session"
                     bugLocked -> "Start"
                     bugAgent -> "File and start"

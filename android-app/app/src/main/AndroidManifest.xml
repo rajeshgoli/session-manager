@@ -59,6 +59,7 @@
                 <data android:path="/artifacts" />
             </intent-filter>
         </activity>
+        <receiver android:name=".util.TermuxCommandResultReceiver" android:exported="false" />
         <service
             android:name=".push.FollowMessagingService"
             android:exported="false">

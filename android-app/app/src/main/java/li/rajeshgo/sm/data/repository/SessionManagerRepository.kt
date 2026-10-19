@@ -5,6 +5,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -12,6 +15,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
+import li.rajeshgo.sm.data.model.toShellSession
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
@@ -313,19 +317,63 @@ class SessionManagerRepository(
             val obligationsById = obligations.await()
             val allJobs = jobs.await()
             val watchById = watch.await()
-            sessions.await().map { session -> session.copy(
+            sessions.await().filterNot { it.kind == "shell" || it.provider == "shell" }.map { session -> session.copy(
                 obligations = obligationsById[session.id],
                 jobs = allJobs.filter { it.isAwaitedBy(session.id) },
                 facts = watchById[session.id]?.facts,
                 lastTicket = watchById[session.id]?.lastTicket,
                 attention = watchById[session.id]?.attention,
-            ) }
+            ) } + watchById.values.filter { it.kind == "shell" }.map { it.toShellSession() }
         } }) { ScreenCache.watch = it }
     }
 
     /** ✓ Answered (spec 1782 C4): clears the agent's open questions without telling it. */
     suspend fun answerNeedsYou(baseUrl: String, token: String, sessionId: String): Result<li.rajeshgo.sm.data.model.AgentFacts?> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).answerNeedsYou(sessionId).facts }.mapFailure(::classifyWriteFailure)
+    }
+
+    /** No bearer token or client certificate crosses onto the LAN probe. Match this server, as the web picker does. */
+    suspend fun plainTerminalAtHome(route: li.rajeshgo.sm.data.model.PlainTerminalRoute): Boolean =
+        withTimeoutOrNull(700) {
+            // Asynchronous I/O lets the coroutine deadline also bound a slow DNS lookup.
+            suspendCancellableCoroutine { continuation ->
+                val client = OkHttpClient.Builder().callTimeout(700, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .followRedirects(false).followSslRedirects(false).build()
+                val call = client.newCall(Request.Builder().url(route.lanProbeUrl).build())
+                continuation.invokeOnCancellation { call.cancel() }
+                call.enqueue(object : okhttp3.Callback {
+                    override fun onFailure(call: okhttp3.Call, error: IOException) { continuation.resume(false) }
+                    override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                        val matches = response.use {
+                            runCatching {
+                                it.isSuccessful && json.parseToJsonElement(it.body?.string().orEmpty()).jsonObject["instance"]?.jsonPrimitive?.content == route.serverInstance
+                            }.getOrDefault(false)
+                        }
+                        continuation.resume(matches)
+                    }
+                })
+            }
+        } ?: false
+
+    suspend fun createPlainTerminal(baseUrl: String, token: String, cwd: String, name: String?) = withContext(Dispatchers.IO) {
+        api(baseUrl, token).createPlainTerminal(li.rajeshgo.sm.data.model.CreatePlainTerminal(cwd, name))
+    }
+
+    suspend fun plainTerminalRoute(baseUrl: String, token: String, id: String, where: String) = withContext(Dispatchers.IO) {
+        api(baseUrl, token, readTimeoutSeconds = 30).plainTerminalRoute(id, li.rajeshgo.sm.data.model.PlainTerminalRouteRequest(where))
+    }
+
+    suspend fun deviceSshKeys(baseUrl: String, token: String, deviceId: String) = withContext(Dispatchers.IO) {
+        api(baseUrl, token).deviceSshKeys(deviceId).keys
+    }
+
+    suspend fun registerDeviceSshKey(baseUrl: String, token: String, deviceId: String, publicKey: String) = withContext(Dispatchers.IO) {
+        api(baseUrl, token).registerDeviceSshKey(deviceId, li.rajeshgo.sm.data.model.RegisterDeviceSshKey(publicKey))
+    }
+
+    suspend fun retirePlainTerminal(baseUrl: String, token: String, id: String) = withContext(Dispatchers.IO) {
+        val response = api(baseUrl, token).retirePlainTerminal(id)
+        if (!response.isSuccessful) throw HttpException(response)
     }
 
     suspend fun createSession(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.CreateSessionRequest): Result<li.rajeshgo.sm.data.model.CreatedSession> = withContext(Dispatchers.IO) {

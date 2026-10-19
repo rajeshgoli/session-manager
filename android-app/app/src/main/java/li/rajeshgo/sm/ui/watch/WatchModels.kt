@@ -151,7 +151,7 @@ private fun String.takeLastUtf8Bytes(maxBytes: Int): String {
 }
 
 fun sessionDisplayName(session: ClientSession): String {
-    return session.friendlyName?.takeIf { it.isNotBlank() } ?: session.name.ifBlank { session.id }
+    return (if (session.kind == "shell") "▹ " else "") + (session.friendlyName?.takeIf { it.isNotBlank() } ?: session.name.ifBlank { session.id })
 }
 
 fun repoKey(workingDir: String): String = workingDir.trim().ifBlank { "unknown" }
@@ -623,6 +623,7 @@ fun agentFactText(session: ClientSession, now: OffsetDateTime = OffsetDateTime.n
  * finished agent reads "#1855 · finished 4h 46m", plus its jobs when it has any.
  */
 fun rowFactsLine(session: ClientSession, now: OffsetDateTime = OffsetDateTime.now()): String {
+    if (session.kind == "shell") return session.facts?.text ?: "last input ${formatAge(session.lastActivity, session.activityState)}"
     val jobs = session.facts?.jobs
     val finished = session.facts?.finished
     val parts = if (attentionSection(session) == "finished" && finished != null) {

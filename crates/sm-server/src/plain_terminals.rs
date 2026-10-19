@@ -42,6 +42,7 @@ impl Limits {
 pub struct Terminal {
     pub id: String,
     pub cwd: String,
+    pub name: Option<String>,
     pub created_by_user: String,
     pub created_by_device: Option<String>,
     pub created_via: String,
@@ -60,6 +61,7 @@ impl Terminal {
         Ok(Self {
             id: row.get(0)?,
             cwd: row.get(1)?,
+            name: row.get(13)?,
             created_by_user: row.get(2)?,
             created_by_device: row.get(3)?,
             created_via: row.get(4)?,
@@ -88,7 +90,7 @@ impl Terminal {
     }
 }
 
-const COLUMNS: &str = "id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,last_attach_at,last_input_at,busy_since,created_at,retired_at,retired_reason";
+const COLUMNS: &str = "id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,last_attach_at,last_input_at,busy_since,created_at,retired_at,retired_reason,name";
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -109,6 +111,16 @@ impl Store {
             created_at TEXT NOT NULL, retired_at TEXT, retired_reason TEXT
         ); CREATE INDEX IF NOT EXISTS plain_terminals_state ON plain_terminals(state);",
         )?;
+        let conn = self.pool.get()?;
+        let has_name = conn
+            .prepare("PRAGMA table_info(plain_terminals)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "name");
+        if !has_name {
+            conn.execute("ALTER TABLE plain_terminals ADD COLUMN name TEXT", [])?;
+        }
         Ok(())
     }
     pub fn list(&self, retired: bool) -> Result<Vec<Terminal>> {
@@ -134,7 +146,7 @@ impl Store {
     }
     /// Reserve before launching. The caller serializes reservation, launch, retire and settings.
     pub fn insert(&self, t: &Terminal) -> Result<()> {
-        self.pool.get()?.execute("INSERT INTO plain_terminals (id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,created_at) VALUES (?1,?2,?3,?4,?5,?6,'live',?7)", params![t.id,t.cwd,t.created_by_user,t.created_by_device,t.created_via,t.tmux_session,t.created_at])?;
+        self.pool.get()?.execute("INSERT INTO plain_terminals (id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,created_at,name) VALUES (?1,?2,?3,?4,?5,?6,'live',?7,?8)", params![t.id,t.cwd,t.created_by_user,t.created_by_device,t.created_via,t.tmux_session,t.created_at,t.name])?;
         Ok(())
     }
     pub fn retire(&self, id: &str, reason: &str) -> Result<()> {

@@ -260,7 +260,9 @@ fun WatchScreen(
         li.rajeshgo.sm.ui.navigation.ReaderLinkRequests.pending = null
     }
     val openAttach: (ClientSession) -> Unit = { session ->
-        if (session.mobileTerminal?.supported == true) {
+        if (session.kind == "shell") {
+            viewModel.openPlainTerminal(session.id)
+        } else if (session.mobileTerminal?.supported == true) {
             viewModel.openMobileTerminal(session) { result ->
                 toast = result.exceptionOrNull()?.message ?: result.getOrNull()
             }
@@ -505,7 +507,15 @@ fun WatchScreen(
         }
 
         if (creating) {
-            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, viewModel::sessionAgentTypes, createBusy, createError, onDismiss = { creating = false }) { request ->
+            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, viewModel::sessionAgentTypes, createBusy, createError, onDismiss = { creating = false }, onCreateTerminal = { cwd, name ->
+                createBusy = true
+                createError = null
+                viewModel.createPlainTerminal(cwd, name) { result ->
+                    createBusy = false
+                    result.onSuccess { creating = false }
+                    result.onFailure { createError = it.message ?: "Could not create terminal" }
+                }
+            }) { request ->
                 createBusy = true
                 createError = null
                 viewModel.createSession(request) { result ->
@@ -515,6 +525,7 @@ fun WatchScreen(
                 }
             }
         }
+        ShellTermuxDialogs(state, viewModel::setupTermuxShell, viewModel::dismissShellSetup, viewModel::dismissShellError)
         state.terminal?.let { terminal ->
             MobileTerminalOverlay(
                 terminal = terminal,
@@ -1324,7 +1335,7 @@ private fun SessionRow(
     if (confirmRetire) androidx.compose.material3.AlertDialog(
         onDismissRequest = { confirmRetire = false },
         title = { Text("Retire ${session.name}?") },
-        text = { Text("Its current turn will end.") },
+        text = { Text(if (session.kind == "shell") "Its shell and running commands will end." else "Its current turn will end.") },
         confirmButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false; onKill() }) { Text("Retire") } },
         dismissButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false }) { Text("Cancel") } },
     )
@@ -1335,6 +1346,10 @@ private fun SessionRow(
     var showHandoffNow by remember(session.id) { mutableStateOf(false) }
     if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, onDismiss = { showHandoff = false })
     if (showHandoffNow) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, { showHandoffNow = false }, showNow = true)
+    if (session.kind == "shell") {
+        ShellWatchCard(session, expanded, onToggleExpanded, onOpenAttach, retire, depth)
+        return
+    }
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val context = LocalContext.current
     val remoteControlUrl = remoteControlUrl(session)
