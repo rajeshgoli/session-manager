@@ -389,6 +389,7 @@ mod review_paired;
 mod review_policies;
 mod review_runs;
 mod settings;
+mod ssh_transport;
 mod watch;
 mod web;
 mod worktrees;
@@ -736,6 +737,9 @@ pub struct AppState {
     /// Terminal attach limits in force; `PUT /client/settings` changes them
     /// and the next attach reads them (sm#1763).
     terminal_limits: Arc<std::sync::RwLock<crate::owner_settings::TerminalLimits>>,
+    ssh_key_gate: Arc<Mutex<()>>,
+    device_ssh_store: crate::device_ssh::Store,
+    ssh_transport: Arc<Mutex<crate::studio_ssh::transport::Runtime>>,
     plain_terminal_store: crate::plain_terminals::Store,
     plain_terminal_gate: Arc<Mutex<()>>,
     plain_terminal_commands: Arc<Mutex<BTreeMap<String, String>>>,
@@ -873,6 +877,10 @@ impl AppState {
         let plain_terminal_store =
             crate::plain_terminals::Store::new(expand_home(&config.usage.db_path));
         plain_terminal_store.ensure_schema()?;
+        let device_ssh_store = crate::device_ssh::Store::new(expand_home(&config.usage.db_path));
+        device_ssh_store.ensure_schema()?;
+        let ssh_transport =
+            crate::studio_ssh::transport::Runtime::load(&config.external_access.studio_ssh)?;
         let terminal_limits = Arc::new(std::sync::RwLock::new(
             crate::owner_settings::terminal_limits(&config, &settings),
         ));
@@ -956,6 +964,9 @@ impl AppState {
             push_sender,
             queue_admission,
             terminal_limits,
+            ssh_key_gate: Arc::new(Mutex::new(())),
+            device_ssh_store,
+            ssh_transport: Arc::new(Mutex::new(ssh_transport)),
             plain_terminal_store,
             plain_terminal_gate: Arc::new(Mutex::new(())),
             plain_terminal_commands: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1019,6 +1030,14 @@ impl AppState {
     pub fn with_listen_port(mut self, port: u16) -> Self {
         self.listen_port = port;
         self
+    }
+
+    pub fn observe_shell_ssh(&self) -> anyhow::Result<()> {
+        ssh_transport::observe(self)
+    }
+
+    pub fn reconcile_shell_ssh(&self) -> anyhow::Result<()> {
+        ssh_transport::reconcile(self)
     }
 
     pub fn reconcile_plain_terminals(&self) -> anyhow::Result<()> {
@@ -2167,6 +2186,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/terminals/{id}", delete(plain_terminals::retire))
         .route("/terminals/{id}/route", post(plain_terminals::route))
+        .route(
+            "/devices/{id}/ssh-keys",
+            get(ssh_transport::list).post(ssh_transport::add),
+        )
+        .route(
+            "/devices/{id}/ssh-keys/{fingerprint}",
+            delete(ssh_transport::remove),
+        )
         .route("/queue", get(web::get_shell_only_page))
         .route("/analytics", get(web::get_shell_only_page))
         .route("/analytics/{view}", get(web::get_shell_only_page))
@@ -9191,22 +9218,29 @@ async fn set_studio_ssh(
             detail: error.body_text(),
         })?;
     let desired = payload.enabled;
-    let cfg = state.config.external_access.studio_ssh.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if desired {
-            studio_ssh::enable(&cfg)
-        } else {
-            studio_ssh::disable(&cfg)
-        }
+    let work_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<StudioSshStatus, String> {
+        let state = work_state;
+        let _gate = state
+            .plain_terminal_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cfg = &state.config.external_access.studio_ssh;
+        studio_ssh::transport::save_manual(cfg, desired).map_err(|e| e.to_string())?;
+        state.studio_ssh_enabled.store(desired, Ordering::SeqCst);
+        state
+            .ssh_transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_policy = None;
+        ssh_transport::reconcile_locked(&state, false).map_err(|e| e.to_string())?;
+        Ok(studio_ssh::status(cfg))
     })
     .await
     .map_err(|error| ApiError::Status {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         detail: format!("studio ssh toggle task failed: {error}"),
     })?;
-    // Record the desired state so the reconcile loop repairs toward it, even if
-    // this individual launchctl call reported a benign nonzero exit.
-    state.studio_ssh_enabled.store(desired, Ordering::SeqCst);
     match result {
         Ok(status) => Ok(Json(status)),
         Err(error) => Ok(Json(studio_ssh_error_status(&state.config, error))),
@@ -9429,6 +9463,18 @@ async fn revoke_mobile_terminal_device(
     for stop in &active_stops {
         stop.store(true, Ordering::SeqCst);
     }
+
+    let work_state = state.clone();
+    let ssh_device = device_key_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let _gate = work_state
+            .ssh_key_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        ssh_transport::revoke_device_locked(&work_state, &ssh_device, None)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
 
     let config = state.config.cloudflare_access.clone();
     let common_name = device_key_id.clone();
@@ -20812,6 +20858,12 @@ mod tests {
             encode(&header, &json!({ "sub": "device", "aud": audience, "iss": "https://team.cloudflareaccess.com", "exp": 4_102_444_800u64,
                 "iat": 1_700_000_000, "common_name": name }), &EncodingKey::from_rsa_pem(test_private_key_pem()).unwrap()).unwrap()
         };
+        let ssh_key = ssh_transport::keys(&state)
+            .add("macbook", &plain_ssh_key())
+            .unwrap();
+        let key_file = expand_home(&state.config.external_access.studio_ssh.device_keys_file);
+        ssh_transport::keys(&state).project(&key_file).unwrap();
+        let ssh_store = ssh_transport::keys(&state);
         let computer = certificate("macbook", "sm-browser-aud");
         let email =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
@@ -20879,6 +20931,15 @@ mod tests {
                 StatusCode::OK
             );
         }
+        assert!(ssh_store
+            .list()
+            .unwrap()
+            .iter()
+            .find(|k| k.fingerprint == ssh_key.fingerprint)
+            .unwrap()
+            .revoked_at
+            .is_some());
+        assert!(fs::read_to_string(key_file).unwrap().is_empty());
         // A browser-audience assertion is still refused on the phone hostname.
         let mut request = public_request_with_host(
             Method::GET,
@@ -22065,8 +22126,9 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 30] = [
+    const OWNER_WEB_READS: [&str; 31] = [
         "/terminals",
+        "/devices/imported/ssh-keys",
         "/artifacts",
         "/artifact-activity",
         "/artifacts/missing",
@@ -22107,6 +22169,16 @@ mod tests {
                 json!({"where":"home"}),
             ),
             (Method::DELETE, "/terminals/term-missing", json!({})),
+            (
+                Method::POST,
+                "/devices/imported/ssh-keys",
+                json!({"public_key":"invalid"}),
+            ),
+            (
+                Method::DELETE,
+                "/devices/imported/ssh-keys/SHA256:missing",
+                json!({}),
+            ),
             (Method::POST, "/backup/allow-deletes", json!({})),
             (Method::POST, "/client/model/load", json!({"key":"fixture"})),
             (Method::POST, "/client/model/unload", json!({})),
@@ -22233,7 +22305,7 @@ mod tests {
                 let (status, response) =
                     response_json(app.clone().oneshot(request).await.unwrap()).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {headers:?}");
-                let detail = if uri.starts_with("/terminals")
+                let detail = if (uri.starts_with("/terminals") || uri.contains("/ssh-keys"))
                     && headers.iter().any(|(h, _)| h.starts_with("x-sm-session"))
                 {
                     "not_owner"
@@ -26560,4 +26632,5 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
     }
     include!("http/browser_terminal_tests.rs");
     include!("http/plain_terminal_tests.rs");
+    include!("http/ssh_transport_tests.rs");
 }

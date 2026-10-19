@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     os::{fd::AsRawFd, unix::net::UnixListener},
     path::PathBuf,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -19,7 +19,7 @@ use sm_server::{
     queue::{QueueRecoverySummary, RetainedQueueStore},
     queue_authority::{QueueAuthorityServer, QueueAuthorityServiceIdentity},
     sessions::{expand_home, SessionStore},
-    studio_ssh, terminal_lan,
+    terminal_lan,
     usage_identity::IdentityPoller,
 };
 use tokio::net::TcpListener;
@@ -33,7 +33,7 @@ fn run_background_pass(name: &str, pass: impl FnOnce()) {
 }
 
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
-const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const REPARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// Owner follows deliver every 5s and sweep for finished targets every
@@ -706,10 +706,26 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
-        // the toggle is on. launchctl is synchronous, so run it on a blocking thread.
-        let studio_ssh_flag = state.studio_ssh_enabled_flag();
-        let studio_ssh_config = state.config().external_access.studio_ssh.clone();
+        // Log accounting and revocation must keep running while launchctl is slow.
+        let ssh_observer = state.clone();
+        let ssh_observer_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if ssh_observer_shutdown.is_stopped() {
+                    break;
+                }
+                let state = ssh_observer.clone();
+                match tokio::task::spawn_blocking(move || state.observe_shell_ssh()).await {
+                    Ok(Ok(())) => {}
+                    result => eprintln!("SSH log observer: {result:?}"),
+                }
+            }
+        });
+
+        let studio_state = state.clone();
         let studio_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(STUDIO_SSH_RECONCILE_INTERVAL);
@@ -719,18 +735,10 @@ async fn main() -> Result<()> {
                 if studio_shutdown.is_stopped() {
                     break;
                 }
-                // Drive toward the desired state in BOTH directions so "off" is
-                // enforced too (a stray enable that raced a disable gets corrected).
-                let desired = studio_ssh_flag.load(Ordering::SeqCst);
-                let config = studio_ssh_config.clone();
-                match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired))
-                    .await
-                {
-                    Ok(status) if status.status == "error" => {
-                        eprintln!("studio-ssh reconcile error: {:?}", status.error);
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("studio-ssh reconcile task failed: {error}"),
+                let state = studio_state.clone();
+                match tokio::task::spawn_blocking(move || state.reconcile_shell_ssh()).await {
+                    Ok(Ok(())) => {}
+                    result => eprintln!("shell SSH reconciliation: {result:?}"),
                 }
             }
         });

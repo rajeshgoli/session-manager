@@ -36,7 +36,7 @@ pub(super) fn enabled(state: &AppState) -> Result<(), ApiError> {
     }
     Ok(())
 }
-fn guard(state: &AppState, request: &Request) -> Result<String, ApiError> {
+pub(super) fn guard(state: &AppState, request: &Request) -> Result<String, ApiError> {
     enabled(state)?;
     if [
         handoff::SESSION_HEADER,
@@ -67,7 +67,7 @@ fn guard(state: &AppState, request: &Request) -> Result<String, ApiError> {
     }
     Ok(owner)
 }
-async fn body(request: Request) -> Result<Value, ApiError> {
+pub(super) async fn body(request: Request) -> Result<Value, ApiError> {
     let bytes = to_bytes(request.into_body(), 16 * 1024)
         .await
         .map_err(|_| ApiError::Status {
@@ -216,6 +216,9 @@ fn create_locked(
         store.retire(&t.id, "tmux_gone")?;
         return Err(e.into());
     }
+    if let Err(e) = ssh_transport::reconcile_locked(state, false) {
+        eprintln!("shell SSH listener: {e:#}");
+    }
     let push_state = state.clone();
     let notice = t.clone();
     // Push delivery never delays creation or holds the lifecycle lock.
@@ -244,6 +247,7 @@ pub(super) async fn retire(
             .get(&id)?
             .ok_or(ApiError::NotFound("Terminal not found"))?;
         retire_locked(state, &t, "owner")?;
+        ssh_transport::reconcile_locked(state, false)?;
         Ok(Json(json!({"id":id,"state":"retired"})))
     })
     .await
@@ -255,37 +259,109 @@ pub(super) async fn route(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     guard(&state, &request)?;
+    let device = ssh_transport::requesting_device(&state, &request)?;
     let payload = body(request).await?;
-    if !matches!(payload["where"].as_str(), Some("home" | "away")) {
-        return Err(ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: "where must be home or away".into(),
-        });
-    }
-    if payload["where"] == "away" {
-        // SSH key admission and on-demand away transport ship in #2334.
-        return Err(ApiError::Status {
+    let away = match payload["where"].as_str() {
+        Some("away") => true,
+        Some("home") => false,
+        _ => {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: "where must be home or away".into(),
+            })
+        }
+    };
+    let work_state = state.clone();
+    let task = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
+        let state = work_state;
+        let _gate = state
+            .plain_terminal_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        enabled(&state)?;
+        let t = store(&state)
+            .get(&id)?
+            .filter(|t| t.state == "live")
+            .ok_or(ApiError::NotFound("Terminal not found"))?;
+        if away {
+            let has_key = ssh_transport::keys(&state)
+                .list()?
+                .iter()
+                .any(|k| Some(&k.device_id) == device.as_ref() && k.revoked_at.is_none());
+            if !has_key {
+                return Err(ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: "no_ssh_key".into(),
+                });
+            }
+            ssh_transport::reconcile_locked(&state, true).map_err(|e| ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: format!("away_unavailable: {e:#}"),
+            })?;
+        }
+        let user = state
+            .config
+            .external_access
+            .ssh_username
+            .clone()
+            .or_else(|| std::env::var("USER").ok())
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: "SSH username is not configured".into(),
+            })?;
+        let host = if away {
+            "studio-away"
+        } else {
+            "studio-lan.rajeshgo.li"
+        };
+        let port = state.config.external_access.studio_ssh.local_sshd_port;
+        let target = if away {
+            host.into()
+        } else {
+            format!("{user}@{host}")
+        };
+        let port_flag = if away {
+            String::new()
+        } else {
+            format!(" -p {port}")
+        };
+        // Shells live on SM's tmux socket. Preserve that target on remote attach too.
+        let runtime = state.runtime();
+        let socket = runtime
+            .socket_name()
+            .map(|name| format!(" -L '{}'", name.replace('\'', "'\"'\"'")))
+            .unwrap_or_default();
+        Ok(
+            json!({"ssh_host":host,"ssh_port":port,"ssh_user":user,"tmux_session":t.tmux_session,
+            "tmux_socket_name":runtime.socket_name(),
+            "command":format!("ssh -t{port_flag} {target} tmux{socket} attach-session -t {}",t.tmux_session)}),
+        )
+    });
+    let ready = async {
+        let response = task
+            .await
+            .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+        if away {
+            loop {
+                let cfg = state.config.external_access.studio_ssh.clone();
+                let status = tokio::task::spawn_blocking(move || studio_ssh::status(&cfg))
+                    .await
+                    .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+                if status.sshd_listening && status.tunnel_running {
+                    break;
+                }
+                enabled(&state)?;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        Ok::<_, ApiError>(Json(response))
+    };
+    tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .map_err(|_| ApiError::Status {
             status: StatusCode::SERVICE_UNAVAILABLE,
             detail: "away_unavailable".into(),
-        });
-    }
-    let t = store(&state)
-        .get(&id)?
-        .filter(|t| t.state == "live")
-        .ok_or(ApiError::NotFound("Terminal not found"))?;
-    let user = state
-        .config
-        .external_access
-        .ssh_username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| ApiError::Status {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            detail: "SSH username is not configured".into(),
-        })?;
-    Ok(Json(
-        json!({"ssh_host":"studio-lan.rajeshgo.li","ssh_port":22222,"ssh_user":user,"tmux_session":t.tmux_session,"command":format!("ssh -t -p 22222 {user}@studio-lan.rajeshgo.li tmux attach-session -t {}",t.tmux_session)}),
-    ))
+        })?
 }
 
 fn push_opened(state: &AppState, t: &Terminal) -> anyhow::Result<()> {
@@ -331,6 +407,7 @@ pub(super) fn retire_all_locked(state: &AppState) -> anyhow::Result<()> {
     for t in store(state).list(false)? {
         retire_locked(state, &t, "kill_switch")?;
     }
+    ssh_transport::reconcile_locked(state, false)?;
     Ok(())
 }
 
@@ -392,6 +469,7 @@ pub(super) fn reconcile_at(state: &AppState, now: OffsetDateTime) -> anyhow::Res
             Err(error) => eprintln!("shell {} inspection inconclusive: {error:#}", t.id),
         }
     }
+    ssh_transport::reconcile_locked(state, false)?;
     Ok(())
 }
 
