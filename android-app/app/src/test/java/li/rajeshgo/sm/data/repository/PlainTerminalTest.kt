@@ -20,13 +20,14 @@ class PlainTerminalTest {
     private val home = PlainTerminalRoute("ssh studio-lan", "https://studio-lan.rajeshgo.li:8443/client/terminal/probe", "server-1", "studio-lan.rajeshgo.li", 22222, "rajesh", "term-abcd")
 
     @Test fun shellRowsKeepTheirFactsAndNeverBecomeAgents() {
-        val shell = json.decodeFromString<WatchStateResponse>("""{"sessions":[{"id":"term-abcd","kind":"shell","name":"zsh · project","state":"working","working_dir":"/tmp/project","last_activity":"2026-10-18T12:00:00Z","facts":{"text":"running · cargo","agent":{"state":"working"}},"attention":{"section":"moving","tone":"neutral"}}]}""").sessions.single().toShellSession()
+        val shell = json.decodeFromString<WatchStateResponse>("""{"sessions":[{"id":"term-abcd","kind":"shell","name":"zsh · project","state":"working","working_dir":"/tmp/project","last_activity":"2026-10-18T12:00:00Z","facts":{"text":"running · cargo","agent":{"state":"working"},"jobs":{"running":0,"waiting":0,"text":null},"you":null,"finished":null},"attention":{"section":"moving","tone":"neutral"}}]}""").sessions.single().toShellSession()
         assertEquals("shell", shell.kind)
         assertEquals("▹ zsh · project", sessionDisplayName(shell))
         assertEquals("running · cargo", rowFactsLine(shell))
         assertEquals("moving", shell.attention?.section)
         assertNull(shell.mobileTerminal)
         assertNull(shell.facts?.you)
+        assertNull(shell.facts?.jobs?.text)
     }
 
     @Test fun createRouteKeysAndRetireUseShellEndpoints() = runBlocking {

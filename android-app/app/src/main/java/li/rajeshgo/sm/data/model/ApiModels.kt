@@ -289,7 +289,7 @@ data class JobsFact(
     val waiting: Int = 0,
     val quiet: Boolean = false,
     val tone: String? = null,
-    val text: String = "No jobs",
+    val text: String? = "No jobs",
 )
 
 /** What the agent needs from the owner: a message, a doc review or an Allow prompt. */
