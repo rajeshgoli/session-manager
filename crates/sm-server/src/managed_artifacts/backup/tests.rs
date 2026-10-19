@@ -926,6 +926,42 @@ fn seed_rejects_managed_adoption_and_cleans_outbox() {
 }
 
 #[test]
+fn new_files_create_no_holding_folders_and_replaced_ones_are_held() {
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::create_dir_all(f.dir.join("data/a/b")).unwrap();
+    fs::write(f.dir.join("data/a/b/prices"), b"prices").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+    let held = |dest: &super::client::Destination| -> Vec<PathBuf> {
+        walkdir(&dest.root.join(".holding"))
+    };
+    // Nothing was replaced, so no folder tree mirrors the new files in holding.
+    assert!(held(&dest)
+        .iter()
+        .all(|p| !p.ends_with("a") && !p.ends_with("b")));
+    fs::write(f.dir.join("data/a/b/prices"), b"new prices").unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+    let kept = held(&dest);
+    let old = kept
+        .iter()
+        .find(|p| p.ends_with("plain/data/a/b/prices"))
+        .unwrap();
+    assert_eq!(fs::read(old).unwrap(), b"prices");
+}
+fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walkdir(&path));
+        }
+        out.push(path);
+    }
+    out
+}
+
+#[test]
 fn reseed_removes_files_absent_from_full_source() {
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
@@ -1816,8 +1852,8 @@ fn holding_fixture(f: &Fixture) -> super::client::Destination {
     dest.apply("first", &first.transfer, &staging, false, 0.1)
         .unwrap();
     dest.confirm("first").unwrap();
-    // The apply's own (empty) holding folder is not part of this fixture.
-    fs::remove_dir_all(dest.root.join(".holding")).unwrap();
+    // A first apply replaces nothing, so it creates no holding folders (#2377).
+    assert!(!dest.root.join(".holding").exists());
     dest.conn.execute("DELETE FROM history", []).unwrap();
     for (n, run) in ["2026-01-03-c", "2026-01-01-a", "2026-01-02-b"]
         .iter()
