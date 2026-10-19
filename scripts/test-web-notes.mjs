@@ -36,7 +36,8 @@ function fakeSocket() {
 }
 function server() {
   const notes = initial.map(note => ({ ...note }));
-  const calls = { starts: [], issues: [] };
+  const calls = { starts: [], issues: [], activities: [] };
+  const activities = [];
   const handler = async route => {
     const request = route.request();
     const url = new URL(request.url());
@@ -48,6 +49,27 @@ function server() {
     if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
     const method = request.method();
     const json = (body, status = 200) => route.fulfill({ status, json: body });
+    if (url.pathname === '/notes/activity') {
+      const grouped = new Map();
+      for (const event of activities) {
+        const previous = grouped.get(event.note_id);
+        grouped.set(event.note_id, { ...event, count: (previous?.count || 0) + 1 });
+      }
+      return json([...grouped.values()].map(({ body, ...event }) => event));
+    }
+    const activityPath = url.pathname.match(/^\/notes\/([^/]+)\/activity(?:\/([^/]+))?$/);
+    if (activityPath) {
+      const [, noteId, eventId] = activityPath;
+      if (method === 'POST') {
+        const input = request.postDataJSON(); calls.activities.push(input);
+        if (handler.failActivityOnce) { handler.failActivityOnce = false; return json({ detail: 'History temporarily unavailable' }, 503); }
+        let event = activities.find(row => row.id === input.id);
+        if (!event) { event = { ...input, note_id: noteId, at: stamp(), chars: [...input.body].length }; activities.push(event); }
+        return json(event);
+      }
+      if (eventId) return json({ body: activities.find(row => row.id === eventId && row.note_id === noteId)?.body });
+      return json(activities.filter(row => row.note_id === noteId).slice().reverse().map(({ body, ...event }) => event));
+    }
     if (url.pathname === '/notes/search') {
       const hold = handler.holdNextSearch;
       handler.holdNextSearch = null;
@@ -102,6 +124,7 @@ function server() {
   };
   handler.calls = calls;
   handler.notes = notes;
+  handler.activities = activities;
   return handler;
 }
 
@@ -626,6 +649,101 @@ test('Back and Forward keep their entries, and New clears an active search', asy
     await page.getByRole('button', { name: '+ New' }).click();
     await page.locator('.notes-editor textarea').waitFor();
     assert.equal(await page.getByRole('searchbox', { name: 'Search notes' }).inputValue(), '');
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('note activity remembers destinations, selections and earlier text in every layout', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const shots = process.env.SHOTS_DIR;
+  if (shots) await mkdir(shots, { recursive: true });
+  try {
+    for (const width of [1440, 390]) for (const colorScheme of ['light', 'dark']) {
+      const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 1000 }, colorScheme });
+      await context.addInitScript(fakeSocket);
+      const handler = server();
+      await context.route('**/*', handler);
+      const page = await context.newPage();
+      const errors = []; page.on('pageerror', err => errors.push(err.message));
+      await page.goto(`${origin}/notes`);
+      await page.locator('.note-card-main').first().click();
+      const editor = page.locator('.notes-editor textarea');
+      const selected = '# Entry signal\nUse the opening range to identify the first clean break.';
+      await editor.fill(`${selected}\n\nKeep this private scratch paragraph in Notes.`);
+      await editor.evaluate((node, end) => { node.focus(); node.setSelectionRange(0, end); }, selected.length);
+      await page.locator('.notes-editor .notes-actions').getByText('File ticket').click();
+      await page.locator('.notes-popover input').fill('rajeshgoli/session-manager');
+      await page.locator('.notes-popover').getByRole('button', { name: 'File ticket', exact: true }).click();
+      await page.locator('.note-activity-summary').waitFor();
+      assert.equal(handler.activities[0].body, selected, 'only the selected text is remembered');
+      await editor.fill('# Entry signal\nA revised note with a different entry condition.');
+      await page.locator('.notes-editor-bar strong').click();
+      await page.waitForFunction(() => document.querySelector('.notes-status')?.textContent?.startsWith('Saved'));
+      await page.reload();
+      await page.locator('.notes-editor textarea').waitFor();
+      await page.locator('.note-activity-heading').click();
+      await page.getByRole('button', { name: /View text used/ }).click();
+      assert.equal(await page.locator('.note-activity-snapshot pre').textContent(), selected, 'editing and reload preserve the text actually used');
+      await page.locator('.notes-editor .notes-actions').getByText('Start agent').click();
+      await page.locator('.notes-popover').getByRole('button', { name: 'Start', exact: true }).click();
+      await page.waitForFunction(() => document.querySelectorAll('.note-activity-row').length === 2);
+      assert.equal(handler.activities[1].kind, 'agent_started');
+      assert.equal(handler.activities[1].target, 'started');
+      await page.goto(`${origin}/terminal/agent`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      await page.keyboard.press('Meta+j');
+      await page.locator('.term-panel .note-card-main').first().waitFor();
+      if (!await page.locator('.term-panel .notes-editor').count()) await page.locator('.term-panel .note-card-main').first().click();
+      await page.locator('.term-panel .notes-editor textarea').fill('Wait for confirmation before entering.');
+      await page.locator('.term-panel .notes-editor .notes-actions').getByText('Type into terminal').click();
+      await page.waitForFunction(() => document.querySelector('.note-activity-heading')?.textContent.includes('3'));
+      assert.equal(handler.activities[2].kind, 'terminal_added');
+      assert.equal(handler.activities[2].target, 'agent');
+      assert.equal(handler.activities[2].body, 'Wait for confirmation before entering.');
+      await page.goto(`${origin}/notes`);
+      await page.locator('.notes-editor textarea').waitFor();
+      await page.locator('.note-activity-heading').click();
+      await page.waitForFunction(() => document.querySelectorAll('.note-activity-row').length === 3);
+      await page.locator('.note-activity-heading').click();
+      await page.locator('.note-activity-summary').click();
+      await page.waitForFunction(() => document.querySelector('.note-activity-heading')?.getAttribute('aria-expanded') === 'true');
+      await page.locator('.note-activity-heading').click();
+      await page.locator('.note-activity-summary').click();
+      await page.waitForFunction(() => document.querySelector('.note-activity-heading')?.getAttribute('aria-expanded') === 'true');
+      assert.ok(await page.getByText('Added to terminal', { exact: true }).count());
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'activity introduces no horizontal overflow');
+      if (shots) {
+        await page.locator('.notes-columns').evaluate(node => { node.scrollTop = 0; });
+        await page.screenshot({ path: `${shots}/notes-activity-${width}-${colorScheme}.png`, fullPage: true });
+        if (width < 900) {
+          await page.locator('.note-activity').scrollIntoViewIfNeeded();
+          await page.screenshot({ path: `${shots}/notes-activity-detail-${width}-${colorScheme}.png` });
+        }
+      }
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('history retries save only the activity without repeating the ticket action', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext();
+    const handler = server(); handler.failActivityOnce = true;
+    await context.route('**/*', handler);
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card-main').first().click();
+    await page.locator('.notes-editor .notes-actions').getByText('File ticket').click();
+    await page.locator('.notes-popover input').fill('rajeshgoli/session-manager');
+    await page.locator('.notes-popover').getByRole('button', { name: 'File ticket', exact: true }).click();
+    await page.getByRole('button', { name: 'Save activity', exact: true }).click();
+    await page.locator('.note-activity-summary').waitFor();
+    assert.equal(handler.calls.issues.length, 1);
+    assert.equal(handler.calls.activities.length, 2);
+    assert.equal(handler.calls.activities[0].id, handler.calls.activities[1].id);
+    assert.equal(handler.activities.length, 1);
     await context.close();
   } finally { await browser.close(); }
 });

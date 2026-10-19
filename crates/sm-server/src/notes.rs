@@ -12,6 +12,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
+pub mod activity;
+
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -87,6 +89,7 @@ impl NotesStore {
             CREATE TABLE IF NOT EXISTS note_revisions(note_id TEXT NOT NULL, version INTEGER NOT NULL,
               body TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY(note_id,version));
             CREATE INDEX IF NOT EXISTS notes_updated ON notes(deleted_at,updated_at DESC);")?;
+        activity::ensure_schema(&conn)?;
         prune(&conn)?;
         Ok(conn)
     }
@@ -384,6 +387,10 @@ fn prune(conn: &Connection) -> Result<()> {
     let purge = (OffsetDateTime::now_utc() - time::Duration::days(30)).format(&Rfc3339)?;
     conn.execute(
         "DELETE FROM note_revisions WHERE note_id IN (SELECT id FROM notes WHERE deleted_at<?1)",
+        [&purge],
+    )?;
+    conn.execute(
+        "DELETE FROM note_activity WHERE note_id IN (SELECT id FROM notes WHERE deleted_at<?1)",
         [&purge],
     )?;
     conn.execute("DELETE FROM notes WHERE deleted_at<?1", [&purge])?;

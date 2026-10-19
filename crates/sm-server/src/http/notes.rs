@@ -2,7 +2,7 @@
 use super::*;
 use crate::notes::{NotesStore, Save, MAX_BODY};
 
-fn guard(
+pub(super) fn guard(
     state: &AppState,
     headers: &HeaderMap,
     peer: SocketAddr,
