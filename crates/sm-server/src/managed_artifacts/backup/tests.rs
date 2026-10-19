@@ -1445,6 +1445,49 @@ fn failed_seed_application_keeps_destination_staging() {
 }
 
 #[test]
+fn failed_seed_returns_more_than_one_batch_of_placed_files_to_staging() {
+    // Recovery moves files back 512 at a time under one barrier each (#2403).
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    for i in 0..1100 {
+        let dir = f.dir.join(format!("data/a/{}", i % 7));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("f{i}")), format!("source {i}")).unwrap();
+    }
+    fs::write(f.dir.join("data/zzz"), b"source").unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    fs::write(
+        dest.directory("plain/data").unwrap().join("zzz"),
+        b"untracked",
+    )
+    .unwrap();
+    let error = super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("untracked destination file differs"));
+    let staging = seed_staging(&dest).unwrap();
+    for i in 0..1100 {
+        let path = format!("plain/data/a/{}/f{i}", i % 7);
+        assert_eq!(
+            fs::read(staging.join(&path)).unwrap(),
+            format!("source {i}").as_bytes()
+        );
+        assert!(!dest.root.join(&path).exists(), "{path} left in place");
+    }
+    assert!(dest.records().unwrap().is_empty());
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/zzz")).unwrap(),
+        b"untracked"
+    );
+    fs::remove_file(dest.root.join("plain/data/zzz")).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+    assert_eq!(
+        fs::read(dest.root.join("plain/data/a/3/f10")).unwrap(),
+        b"source 10"
+    );
+}
+
+#[test]
 fn failed_seed_rolls_back_files_already_replaced() {
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];

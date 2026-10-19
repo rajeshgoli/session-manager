@@ -575,17 +575,7 @@ impl Destination {
             .into_iter()
             .flatten();
         match touched {
-            // Folders safe_path created must reach their own parents too.
-            Some(touched) => {
-                for parent in parents {
-                    touched.extend(
-                        parent
-                            .ancestors()
-                            .take_while(|dir| dir.starts_with(&self.root))
-                            .map(Path::to_path_buf),
-                    );
-                }
-            }
+            Some(touched) => self.touch(touched, parents.map(Some)),
             None => {
                 for parent in parents {
                     File::open(parent)?.sync_all()?;
@@ -627,22 +617,51 @@ impl Destination {
             .query_map([&run], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let staging = self.directory(&format!(".incoming/{id}"))?;
+        // One barrier per 512 moves, as apply does (#2317): a move a crash loses
+        // leaves the file in place, and the next recovery moves it again (#2403).
+        let mut touched = BTreeSet::new();
+        let mut moved = 0;
         for path in paths {
             if records.get(&path).is_none_or(|r| r.target.is_some()) {
                 continue;
             }
             // Apply removes a staged file only by moving it into place.
             let current = safe_path(&self.root, &path, false)?;
-            let staged = safe_path(&staging, &path, true)?;
-            if staged.exists() || !fs::symlink_metadata(&current).is_ok_and(|m| m.is_file()) {
+            let placed = fs::symlink_metadata(&current).is_ok_and(|m| m.is_file());
+            let staged = safe_path(&staging, &path, placed)?;
+            if !placed || staged.exists() {
+                // A stopped recovery's rename may not be durable yet: flush its
+                // folders before the journal that would redo it is dropped.
+                let existing =
+                    [current.parent(), staged.parent()].map(|p| p.filter(|p| p.is_dir()));
+                self.touch(&mut touched, existing);
                 continue;
             }
             fs::rename(&current, &staged)?;
-            for parent in [current.parent(), staged.parent()].into_iter().flatten() {
-                File::open(parent)?.sync_all()?;
+            self.touch(&mut touched, [current.parent(), staged.parent()]);
+            moved += 1;
+            if moved % 512 == 0 {
+                super::outbox::barrier(&touched, &File::open(&self.root)?)?;
+                touched.clear();
             }
         }
-        Ok(())
+        super::outbox::barrier(&touched, &File::open(&self.root)?)
+    }
+    /// Add each folder and its ancestors inside the destination to `touched`:
+    /// folders safe_path created must reach their own parents too.
+    fn touch<'a>(
+        &self,
+        touched: &mut BTreeSet<PathBuf>,
+        parents: impl IntoIterator<Item = Option<&'a Path>>,
+    ) {
+        for parent in parents.into_iter().flatten() {
+            touched.extend(
+                parent
+                    .ancestors()
+                    .take_while(|dir| dir.starts_with(&self.root))
+                    .map(Path::to_path_buf),
+            );
+        }
     }
     /// Reverse every journaled change before requesting a delta from the still
     /// confirmed head. Keep history intact until all file repairs are durable.
@@ -657,11 +676,16 @@ impl Destination {
                     Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Repairs become durable under one barrier before history is
+            // dropped, instead of a folder sync per row (#2403).
+            let mut touched = BTreeSet::new();
             for (path, body) in &rows {
-                let current = safe_path(&self.root, path, true)?;
                 let old: Option<FileRecord> =
                     body.as_ref().map(|b| serde_json::from_str(b)).transpose()?;
-                if let Some(record) = old.as_ref().filter(|r| r.target.is_none()) {
+                let restore = old.as_ref().filter(|r| r.target.is_none());
+                // Only a restored file needs its folders; a new file is just removed.
+                let current = safe_path(&self.root, path, restore.is_some())?;
+                if let Some(record) = restore {
                     let held = safe_path(&self.root, &format!(".holding/{run}/{path}"), false)?;
                     if held.exists() {
                         verify(&held, record)?;
@@ -680,9 +704,16 @@ impl Destination {
                     }
                 } else if current.exists() {
                     fs::remove_file(&current)?;
+                } else if let Some(parent) = current.parent().filter(|p| p.is_dir()) {
+                    // A stopped rollback's removal may not be durable yet.
+                    self.touch(&mut touched, [Some(parent)]);
+                    continue;
+                } else {
+                    continue;
                 }
-                File::open(current.parent().context("missing backup parent")?)?.sync_all()?;
+                self.touch(&mut touched, [current.parent()]);
             }
+            super::outbox::barrier(&touched, &File::open(&self.root)?)?;
             let tx = self.conn.transaction()?;
             for (path, body) in rows {
                 if let Some(body) = body {
