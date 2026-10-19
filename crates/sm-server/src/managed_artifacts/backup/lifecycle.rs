@@ -411,16 +411,26 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
     }
     expire(manager, epoch())?;
     let mut conn = manager.store.open()?;
+    let before = row(&conn, device, id)?;
+    let body = serde_json::to_string(ack)?;
+    if before["ack_json"].as_str() == Some(&body) {
+        return Ok(());
+    }
+    ensure!(before["state"] == "ready", "backup request is not ready");
+    let coverage = if ack.applied {
+        measure_coverage(&conn, manager, &before)?
+    } else {
+        Coverage::default()
+    };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let r = row(&tx, device, id)?;
-    let body = serde_json::to_string(ack)?;
     if r["ack_json"].as_str() == Some(&body) {
         return Ok(());
     }
     ensure!(r["state"] == "ready", "backup request is not ready");
     if ack.applied {
         confirm(&tx, device, id)?;
-        mark_covered(&tx, manager, &r)?;
+        coverage.persist(&tx)?;
         if ack.fetched_bytes > 0 {
             record_rate(&tx, device, "fetch", ack.fetched_bytes, ack.fetch_seconds)?;
         }
@@ -567,18 +577,61 @@ pub fn missed_alerts(manager: &ManagedArtifacts, at: i64) -> Result<()> {
     Ok(())
 }
 
-// Update display stamps only for scope roots that are still unchanged. Missing
-// or modified local data never invalidates a remote confirmation.
+#[derive(Default)]
+pub(super) struct Coverage {
+    static_paths: Vec<(PathBuf, String)>,
+    artifacts: Vec<(String, Value, Option<String>)>,
+}
+impl Coverage {
+    /// No filesystem work here: callers may persist inside their confirmation
+    /// transaction. Never copy a content stamp published after verification.
+    pub(super) fn persist(self, conn: &Connection) -> Result<()> {
+        for (path, stamp) in self.static_paths {
+            conn.execute(
+                "UPDATE backup_static SET backed_up_at=?2,backup_stamp=?3 WHERE path=?1",
+                params![path.to_string_lossy(), now(), stamp],
+            )?;
+        }
+        for (root, artifact, stamp) in self.artifacts {
+            conn.execute(
+                "UPDATE artifacts SET backed_up_at=?3,backup_stamp=?4 WHERE root=?1 AND name=?2 AND state=?5 AND location=?6 AND content_stamp IS ?7 AND op IS NULL",
+                params![root, artifact["name"].as_str(), now(), stamp,
+                    artifact["state"].as_str(), artifact["location"].as_str(),
+                    artifact["content_stamp"].as_str()],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// Missing or modified local data never invalidates a remote confirmation.
 pub(super) fn mark_covered(
     conn: &Connection,
     manager: &ManagedArtifacts,
     request: &Value,
 ) -> Result<()> {
+    measure_coverage(conn, manager, request)?.persist(conn)
+}
+
+/// Snapshot artifact versions before scanning. Scans must run outside a writer
+/// transaction; persistence checks the snapshot again under SQLite's write lock.
+pub(super) fn measure_coverage(
+    conn: &Connection,
+    manager: &ManagedArtifacts,
+    request: &Value,
+) -> Result<Coverage> {
+    let mut result = Coverage::default();
     let covered: Vec<Value> =
         serde_json::from_str(request["coverage_json"].as_str().unwrap_or("[]"))?;
     for scope in covered {
         let source = PathBuf::from(scope["source"].as_str().context("coverage source")?);
         let stamp = scope["stamp"].as_str().context("coverage stamp")?;
+        let mut artifacts = Vec::new();
+        for root in &manager.config.roots {
+            for a in artifact_store::query(conn,"SELECT name,state,location,content_stamp FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
+                artifacts.push((root, a));
+            }
+        }
         // Re-measure with the exclusions the preparation stamp used.
         let static_identity = manager
             .config
@@ -599,25 +652,44 @@ pub(super) fn mark_covered(
         for path in &manager.config.backup.static_paths {
             let path = crate::sessions::expand_home(path);
             if fs::canonicalize(&path).is_ok_and(|p| p == source) {
-                conn.execute(
-                    "UPDATE backup_static SET backed_up_at=?2,backup_stamp=?3 WHERE path=?1",
-                    params![path.to_string_lossy(), now(), stamp],
-                )?;
+                result.static_paths.push((path, stamp.to_owned()));
             }
         }
-        for root in &manager.config.roots {
-            for a in artifact_store::query(conn,"SELECT name,state,content_stamp FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
-                let name=a["name"].as_str().context("artifact name")?;
-                let path=if a["state"]=="frozen" {PathBuf::from(&root.cold_store).join(".frozen").join(name)} else {PathBuf::from(&root.path).join(name)};
-                // A link into another source is backed up as the link itself (#2354).
-                let link=a["state"]!="frozen" && fs::canonicalize(&root.path).is_ok_and(|r|r.join(name)==source);
-                if link || fs::canonicalize(path).is_ok_and(|p|p==source) {
-                    conn.execute("UPDATE artifacts SET backed_up_at=?3,backup_stamp=content_stamp WHERE root=?1 AND name=?2",params![root.path,name,now()])?;
-                }
+        for (root, a) in artifacts {
+            let name = a["name"].as_str().context("artifact name")?;
+            let path = if a["state"] == "frozen" {
+                PathBuf::from(&root.cold_store).join(".frozen").join(name)
+            } else {
+                PathBuf::from(&root.path).join(name)
+            };
+            // A link into another source is backed up as the link itself (#2354).
+            let link = a["state"] != "frozen"
+                && fs::canonicalize(&root.path).is_ok_and(|r| r.join(name) == source);
+            if link || fs::canonicalize(path).is_ok_and(|p| p == source) {
+                // Frozen stamps describe the original tree, not compressed
+                // files. Live stamps describe the measurement path, which
+                // may be a symlink even when backup reads its target.
+                let backup_stamp = if a["state"] == "frozen" {
+                    a["content_stamp"].as_str().map(str::to_owned)
+                } else {
+                    let base = if a["location"] == "cold" {
+                        &root.cold_store
+                    } else {
+                        &root.path
+                    };
+                    let measured_path = PathBuf::from(base).join(name);
+                    if fs::symlink_metadata(measured_path).is_ok_and(|m| m.file_type().is_symlink())
+                    {
+                        Some(crate::managed_artifacts::scan::Size::default().stamp())
+                    } else {
+                        Some(stamp.to_owned())
+                    }
+                };
+                result.artifacts.push((root.path.clone(), a, backup_stamp));
             }
         }
     }
-    Ok(())
+    Ok(result)
 }
 
 fn rfc3339(at: i64) -> Result<String> {
