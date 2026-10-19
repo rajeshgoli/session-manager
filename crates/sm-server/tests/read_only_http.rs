@@ -16427,6 +16427,101 @@ async fn runtime_core_replays_retained_urgent_rows_with_interrupt_semantics() {
 }
 
 #[tokio::test]
+async fn runtime_core_handoff_plain_codex_keeps_the_queued_brief() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let socket = format!(
+        "sm-codex-handoff-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(socket.clone());
+    fs::create_dir_all(&log_dir).unwrap();
+    let provider = log_dir.join("fake-codex-handoff");
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    fs::write(
+        &provider,
+        format!(
+            r#"#!/usr/bin/env python3
+import datetime, json, os, pathlib, sys
+root = pathlib.Path({sessions_root:?}) / datetime.datetime.now(datetime.timezone.utc).strftime('%Y/%m/%d')
+root.mkdir(parents=True, exist_ok=True)
+sid = 'thread-' + os.environ['CLAUDE_SESSION_MANAGER_ID']
+event = dict(type='session_meta', payload=dict(id=sid, cwd=os.getcwd(),
+    timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat()))
+(root / ('rollout-' + sid + '.jsonl')).write_text(json.dumps(event) + '\n')
+print('› ', end='', flush=True)
+for line in sys.stdin:
+    print('runtime:' + line.rstrip('\n') + '\n› ', end='', flush=True)
+"#,
+            sessions_root = sessions_root.display().to_string()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        &socket,
+        &provider.display().to_string(),
+    );
+    let (status, body) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id":"codexhand", "name":"codex-hand", "provider":"codex",
+            "working_dir":working_dir.display().to_string()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["provider_resume_id"], "thread-codexhand");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"][0]["status"] = json!("idle");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let (status, body) = post_json(app.clone(), "/sessions/codexhand/handoff", json!({
+        "requester_session_id":"codexhand", "note":{"kind":"link","value":"https://example.com/next"}
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut done = Value::Null;
+    for _ in 0..100 {
+        let (_, body) = get_json(app.clone(), "/sessions/codexhand").await;
+        if body["handoff"]["state"] == "done" {
+            done = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        done["handoff"]["state"],
+        "done",
+        "{}",
+        fs::read_to_string(&state_file).unwrap()
+    );
+    let successor = done["handoff"]["successor"]["id"].as_str().unwrap();
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launch = state["session_runtime_launches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|launch| launch["session_id"] == successor)
+        .unwrap();
+    assert_eq!(launch["status"], "applied");
+    assert_eq!(launch["force_initial_prompt_stdin"], false);
+    assert!(launch["initial_message"].is_null());
+    assert_ne!(state["handoff_deferred_sessions"][successor], true);
+    wait_for_output_contains(app, successor, "Handoff note: run `sm handoff show`").await;
+}
+
+#[tokio::test]
 async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
     if !tmux_available() {
         return;

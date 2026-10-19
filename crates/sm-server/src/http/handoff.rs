@@ -734,7 +734,7 @@ async fn wait_for_successor_readiness(state: &Arc<AppState>, successor: &Session
 }
 
 fn supports_handoff_launch_prompt(node: &str, provider: &str) -> bool {
-    node == "primary" && matches!(provider, "claude" | "codex" | "codex-fork")
+    node == "primary" && matches!(provider, "claude" | "codex-fork")
 }
 
 /// Atomic prompt transport, after every obligation store has transferred.
@@ -1296,11 +1296,11 @@ mod tests {
 
     #[test]
     fn handoff_launch_prompt_is_limited_to_local_prompt_providers() {
-        for provider in ["claude", "codex", "codex-fork"] {
+        for provider in ["claude", "codex-fork"] {
             assert!(supports_handoff_launch_prompt("primary", provider));
             assert!(!supports_handoff_launch_prompt("remote", provider));
         }
-        for provider in ["opencode", "shell", "codex-app"] {
+        for provider in ["codex", "opencode", "shell", "codex-app"] {
             assert!(!supports_handoff_launch_prompt("primary", provider));
         }
     }

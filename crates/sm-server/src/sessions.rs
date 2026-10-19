@@ -1145,12 +1145,16 @@ impl SessionStore {
         if !matches!(launch.status.as_str(), "prepared" | "launching") {
             return Ok(());
         }
-        if launch.provider == "claude" && launch.force_initial_prompt_stdin {
+        let deferred_handoff = state["handoff_deferred_sessions"][&launch.session_id] == true;
+        if launch.force_initial_prompt_stdin
+            && (launch.provider == "claude"
+                || (launch.provider == "codex-fork" && deferred_handoff))
+        {
             // A restart cannot determine whether tmux delivered the immutable
             // first brief before the process died. Replaying it risks
             // duplicate work, so retain the artifact and require an explicit
             // recovery decision instead.
-            if state["handoff_deferred_sessions"][&launch.session_id] == true {
+            if deferred_handoff {
                 // This record owns transferred work. A surviving process must
                 // stop before its durable record can truthfully say stopped.
                 let teardown = self
@@ -1165,7 +1169,7 @@ impl SessionStore {
                         reason: "runtime recovery is disabled".into(),
                     });
                 if let RestoreTmuxTeardownOutcome::Inconclusive { reason } = teardown {
-                    let reason = format!("failed to confirm interrupted Claude handoff teardown: {reason}; the runtime may still be live; prompt replay is forbidden");
+                    let reason = format!("failed to confirm interrupted {} handoff teardown: {reason}; the runtime may still be live; prompt replay is forbidden", launch.provider);
                     mark_runtime_launch_failed(
                         &mut state,
                         launch_id,
@@ -1190,7 +1194,7 @@ impl SessionStore {
                 launch_id,
                 &launch.session_id,
                 launch.operation_kind == "create",
-                "refusing to recover an unacknowledged Claude spawn brief because it may already have been submitted",
+                &format!("refusing to recover an unacknowledged {} spawn brief because it may already have been submitted", if launch.provider == "claude" { "Claude" } else { &launch.provider }),
             )?;
             self.write_raw_json_value(&state)?;
             return Ok(());

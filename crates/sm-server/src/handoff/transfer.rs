@@ -1272,49 +1272,53 @@ mod tests {
         state["session_runtime_launches"][0]["status"] = json!("launching");
         state["session_runtime_launches"][0]["force_initial_prompt_stdin"] = json!(true);
         let tmux_log = root.join("recovery-tmux.log");
-        for (response, stopped) in [
-            ("exit 0", true),
-            ("echo \"can't find session: successor\" >&2; exit 1", true),
-            (
-                "echo 'error connecting to socket (No such file or directory)' >&2; exit 1",
-                false,
-            ),
-        ] {
-            fs::write(
-                &tmux,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{response}\n",
-                    tmux_log.display()
+        for provider in ["claude", "codex-fork"] {
+            state["session_runtime_launches"][0]["provider"] = json!(provider);
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            session_object_mut(sessions, &successor.id)
+                .unwrap()
+                .insert("provider".into(), json!(provider));
+            for (response, stopped) in [
+                ("exit 0", true),
+                ("echo \"can't find session: successor\" >&2; exit 1", true),
+                (
+                    "echo 'error connecting to socket (No such file or directory)' >&2; exit 1",
+                    false,
                 ),
-            )
-            .unwrap();
-            let recovered = recovered
-                .clone()
-                .with_delivery_runtime(Some(runtime.clone()));
-            recovered.write_raw_json_value(&state).unwrap();
-            recovered.recover_session_runtime_launches().unwrap();
-            let session = recovered.get_session(&successor.id).unwrap().unwrap();
-            assert_eq!(session.is_stopped(), stopped);
-            assert_eq!(session.status, if stopped { "stopped" } else { "error" });
-            let after = recovered.load_raw_json_value().unwrap();
-            assert_eq!(after["agent_registrations"][0]["session_id"], successor.id);
-            assert_eq!(after["session_runtime_launches"][0]["status"], "failed");
-            if !stopped {
-                assert!(after["sessions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|s| s["id"] == successor.id)
-                    .unwrap()["stopped_at"]
-                    .is_null());
+            ] {
+                fs::write(
+                    &tmux,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{response}\n",
+                        tmux_log.display()
+                    ),
+                )
+                .unwrap();
+                let recovered = recovered
+                    .clone()
+                    .with_delivery_runtime(Some(runtime.clone()));
+                recovered.write_raw_json_value(&state).unwrap();
+                recovered.recover_session_runtime_launches().unwrap();
+                let session = recovered.get_session(&successor.id).unwrap().unwrap();
+                assert_eq!(session.is_stopped(), stopped);
+                assert_eq!(session.status, if stopped { "stopped" } else { "error" });
+                let after = recovered.load_raw_json_value().unwrap();
+                assert_eq!(after["agent_registrations"][0]["session_id"], successor.id);
+                assert_eq!(after["session_runtime_launches"][0]["status"], "failed");
+                if !stopped {
+                    assert!(after["sessions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s["id"] == successor.id)
+                        .unwrap()["stopped_at"]
+                        .is_null());
+                }
             }
         }
         assert_eq!(
             fs::read_to_string(&tmux_log).unwrap(),
-            format!(
-                "kill-session -t ={0}\nkill-session -t ={0}\nkill-session -t ={0}\n",
-                successor.tmux_session
-            )
+            format!("kill-session -t ={}\n", successor.tmux_session).repeat(6)
         );
         // Missing runtime authority also keeps the session visibly uncertain.
         recovered.write_raw_json_value(&state).unwrap();
