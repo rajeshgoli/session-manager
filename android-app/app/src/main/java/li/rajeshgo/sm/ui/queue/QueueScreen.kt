@@ -626,9 +626,14 @@ internal fun StartNowFeedback(state: StartNowState, snackbar: SnackbarHostState,
     val message = state.message
     LaunchedEffect(message?.id) {
         message ?: return@LaunchedEffect
-        viewModel.startMessageShown(message)
-        snackbar.currentSnackbarData?.dismiss()
-        snackbar.showSnackbar(message.text, withDismissAction = message.error)
+        // Acknowledge only after the snackbar ends: clearing the message
+        // changes this effect's key and would cancel the snackbar mid-show.
+        try {
+            snackbar.currentSnackbarData?.dismiss()
+            snackbar.showSnackbar(message.text, withDismissAction = message.error)
+        } finally {
+            viewModel.startMessageShown(message)
+        }
     }
 }
 

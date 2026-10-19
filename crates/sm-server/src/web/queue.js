@@ -123,7 +123,7 @@ export function StartNow({ job, primary = false }) {
     setPhase('starting'); setMessage('');
     try {
       const result = await requestStart(api, job.id, { acceptRisk });
-      if (result.busy) return;
+      if (result.busy) { setPhase('idle'); return; } // the other button for this job owns the request
       if (result.risk) { setPhase('risk'); setMessage(result.risk); return; }
       setPhase('idle');
       toast(`Started ${title(job)}`);
