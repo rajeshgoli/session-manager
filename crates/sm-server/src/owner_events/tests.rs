@@ -258,6 +258,29 @@ fn resolve_names_targets_and_falls_back_to_the_template() {
             "{method} {route}"
         );
     };
+    check(
+        "GET",
+        "/notes/activity",
+        &[],
+        ("note.activity_previews", None, None),
+    );
+    for (method, route, values, action) in [
+        ("GET", "/notes/{id}/activity", vec!["n1"], "note.activity"),
+        (
+            "GET",
+            "/notes/{id}/activity/{event}",
+            vec!["n1", "e1"],
+            "note.activity_event",
+        ),
+        (
+            "POST",
+            "/notes/{id}/activity",
+            vec!["n1"],
+            "note.activity_record",
+        ),
+    ] {
+        check(method, route, &values, (action, Some("note"), Some("n1")));
+    }
     let session = "/client/sessions/{session_id}";
     check(
         "GET",

@@ -271,10 +271,11 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .collect();
         let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
-        // Raw source bytes, excluding vendors. main at 6617273 totals 421,524
-        // bytes, already past the old 392 KiB; the Artifacts freeze and thaw
-        // views (sm#2325) add 13,863. 448 KiB leaves ~3% headroom.
-        const BUDGET: usize = 448 * 1024;
+        // Raw source bytes, excluding vendors. main at dd80ebfc totals
+        // 472,236 bytes after Notes activity (#2390), Studio terminal recovery
+        // (#2389), and queue Start now (#2396). 476 KiB leaves ~3% headroom
+        // for these shipped features while continuing to bound source growth.
+        const BUDGET: usize = 476 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",
