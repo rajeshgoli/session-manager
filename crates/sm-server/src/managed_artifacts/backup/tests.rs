@@ -1045,6 +1045,151 @@ fn seed_refuses_active_pull_before_changing_destination() {
 }
 
 #[test]
+fn seed_allows_thaw_and_input_submission_during_destination_work() {
+    use crate::managed_artifacts::{ops, submission};
+    let mut f = Fixture::new();
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    f.artifact("input", "frozen", false, false, 0);
+    fs::write(f.dir.join("data/prices"), b"prices").unwrap();
+    let root = &f.manager.config.roots[0];
+    let request = serde_json::from_value(serde_json::json!({
+        "job_type":"background", "label":"reader", "notify_session_id":"reader",
+        "cwd":f.dir, "argv":["/usr/bin/true"], "env":{}, "timeout_seconds":60
+    }))
+    .unwrap();
+    let prepared = submission::PreparedSubmission::prepare(
+        &f.manager,
+        root,
+        submission::Declarations {
+            inputs: vec!["input".into()],
+            ..Default::default()
+        },
+        &request,
+    )
+    .unwrap();
+    let make_writer = |id: &'static str| -> Box<dyn FnOnce()> {
+        let manager = f.manager.clone();
+        let prepared = prepared.clone();
+        let queue_path = f.dir.join("queue.db");
+        Box::new(move || {
+            // This independent connection must acquire the writer immediately
+            // while seed is paused at either end of destination application.
+            let mut queue = rusqlite::Connection::open(queue_path).unwrap();
+            queue.busy_timeout(std::time::Duration::ZERO).unwrap();
+            submission::attach_store(&queue, &manager.store).unwrap();
+            let tx = queue
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("seed must leave the artifact writer available");
+            prepared.persist(&tx, id).unwrap();
+            tx.commit().unwrap();
+            ops::request(
+                &manager,
+                &manager.config.roots[0],
+                "input",
+                "thawing",
+                "reader",
+            )
+            .unwrap();
+        })
+    };
+    seed::BEFORE_APPLY.with(|hook| *hook.borrow_mut() = Some(make_writer("before")));
+    seed::AFTER_APPLY.with(|hook| *hook.borrow_mut() = Some(make_writer("after")));
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    let id = seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+    assert_eq!(
+        dest.state().unwrap().confirmed.as_deref(),
+        Some(id.as_str())
+    );
+    let conn = f.manager.store.open().unwrap();
+    let reservations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM artifact_job_reservations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(reservations, 2);
+    assert_eq!(
+        f.manager.store.detail(&root.path, "input").unwrap()["op"],
+        "thawing"
+    );
+}
+
+#[test]
+fn seed_rolls_back_when_a_pull_starts_or_head_changes_during_application() {
+    for advance_head in [false, true] {
+        let mut f = Fixture::new();
+        f.manager.config.backup.enabled = true;
+        f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+        fs::write(f.dir.join("data/prices"), b"original").unwrap();
+        let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+        let first = seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+        let records = dest.records().unwrap();
+        fs::write(f.dir.join("data/prices"), b"replacement").unwrap();
+        let manager = f.manager.clone();
+        let base = first.clone();
+        seed::AFTER_APPLY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if advance_head {
+                    let mut conn = manager.store.open().unwrap();
+                    let tx = conn.transaction().unwrap();
+                    save_manifest(
+                        &tx,
+                        "backup-mini",
+                        &Manifest {
+                            manifest_id: "competing-seed".into(),
+                            base: Some(base),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    confirm(&tx, "backup-mini", "competing-seed").unwrap();
+                    tx.commit().unwrap();
+                } else {
+                    assert!(matches!(
+                        lifecycle::request(&manager, "backup-mini", Some(&base)).unwrap(),
+                        lifecycle::RequestResult::Open(_)
+                    ));
+                }
+            }));
+        });
+        let error = seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap_err();
+        assert!(
+            error.to_string().contains(if advance_head {
+                "backup head changed"
+            } else {
+                "remote backup request is active"
+            }),
+            "{error:#}"
+        );
+        assert_eq!(dest.records().unwrap(), records);
+        assert_eq!(
+            fs::read(dest.root.join("plain/data/prices")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            dest.state().unwrap().confirmed.as_deref(),
+            Some(first.as_str())
+        );
+        assert!(dest.meta("pending_seed").unwrap().is_none());
+        let staging = seed_staging(&dest).unwrap();
+        assert_eq!(
+            fs::read(staging.join("plain/data/prices")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            confirmed(&f.manager.store.open().unwrap(), "backup-mini")
+                .unwrap()
+                .unwrap()
+                .manifest_id,
+            if advance_head {
+                "competing-seed"
+            } else {
+                &first
+            }
+        );
+    }
+}
+
+#[test]
 fn failed_seed_application_keeps_destination_staging() {
     let mut f = Fixture::new();
     f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
