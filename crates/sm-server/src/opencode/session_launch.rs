@@ -130,6 +130,7 @@ impl SessionStore {
         runtime: &TmuxRuntime,
         predecessor: Option<&str>,
     ) -> Result<SessionRecord> {
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         let driver = self.opencode_driver()?;
         let max_wait = request.max_wait_seconds.unwrap_or(300);
         if max_wait == 0 {
@@ -255,6 +256,7 @@ impl SessionStore {
         id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<Option<CoreRestoreOutcome>> {
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         let _launch_guard = self.lock_clear_operation(id)?;
         let driver = self.opencode_driver()?;
         let (original, expected_authority) = {
