@@ -53,19 +53,31 @@ pub struct Scope {
 impl Scope {
     /// A loose file at an artifact root's top level is a one-file scope whose
     /// only entry is [`FILE_ENTRY`], keeping the remote layout of
-    /// `packed/<segment>/<path>`.
+    /// `packed/<segment>/<path>`. An artifact linking into another backed-up
+    /// source is a one-link scope the same way.
     pub fn inventory(&self) -> Result<Vec<archive::Entry>> {
         let m = fs::symlink_metadata(&self.source)?;
-        if m.is_file() {
+        if m.is_file() || m.file_type().is_symlink() {
             use std::os::unix::fs::MetadataExt;
+            let target = if m.is_file() {
+                None
+            } else {
+                let target = fs::read_link(&self.source)?;
+                Some(
+                    target
+                        .to_str()
+                        .context("artifact link is not UTF-8")?
+                        .to_owned(),
+                )
+            };
             return Ok(vec![archive::Entry {
                 path: FILE_ENTRY.into(),
-                kind: "file".into(),
-                size: m.len(),
+                kind: if m.is_file() { "file" } else { "symlink" }.into(),
+                size: if m.is_file() { m.len() } else { 0 },
                 mtime: m.mtime(),
                 mtime_nsec: m.mtime_nsec(),
                 mode: m.mode() & 0o7777,
-                target: None,
+                target,
             }]);
         }
         let entries = archive::inventory_excluding(&self.source, |p| self.exclude.skips(p))?;
@@ -78,7 +90,7 @@ impl Scope {
     }
     /// The local file behind an inventory entry.
     pub fn path_of(&self, relative: &str) -> PathBuf {
-        if self.source.is_file() {
+        if fs::symlink_metadata(&self.source).is_ok_and(|m| !m.is_dir()) {
             self.source.clone()
         } else {
             self.source.join(relative)
@@ -152,6 +164,10 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
         static_scope.estimated_bytes = measured.data_bytes;
         scopes.push(static_scope);
     }
+    // Every source the backup reads, included or not: an artifact that links
+    // into one is kept as the link, so the data is never read twice.
+    let mut covered: Vec<PathBuf> = scopes.iter().map(|s| s.source.clone()).collect();
+    let mut artifacts = Vec::new();
     for root in &manager.config.roots {
         for a in manager.store.list(&root.path)? {
             if !matches!(a["state"].as_str(), Some("live" | "frozen" | "unrecorded")) {
@@ -178,27 +194,42 @@ pub fn collect_scope(manager: &ManagedArtifacts, device: &str) -> Result<Vec<Sco
                 source.is_dir() || source.is_file(),
                 "backup artifact must be a directory or file"
             );
-            let bytes = if a["state"] == "frozen" {
-                scan::measure(&source)?.data_bytes
-            } else {
-                // A loose file is unrecorded, so always in scope; its estimate stays raw.
-                let ratio = if source.is_file() {
-                    1.0
-                } else {
-                    // The ratio only sizes the estimate; an artifact written
-                    // during sampling falls back to its last ratio.
-                    score::ratio(manager, root, &a).unwrap_or_else(|_| {
-                        a["ratio_estimate"]
-                            .as_f64()
-                            .filter(|r| r.is_finite() && *r > 0.0)
-                            .unwrap_or(1.0)
-                    })
-                };
-                (scan::measure(&source)?.data_bytes as f64 / ratio).ceil() as u64
-            };
-            if included(&conn, &a, bytes, rate)? {
-                scopes.push(scope(config, source, &identity, bytes, Exclude::default())?);
+            let link = a["state"] != "frozen"
+                && fs::symlink_metadata(&identity).is_ok_and(|m| m.file_type().is_symlink());
+            if !link {
+                covered.push(source.clone());
             }
+            artifacts.push((root, a, identity, source, link));
+        }
+    }
+    for (root, a, identity, source, link) in artifacts {
+        if link && covered.iter().any(|c| source.starts_with(c)) {
+            let parent = identity.parent().context("artifact link has no parent")?;
+            let file_name = identity.file_name().context("artifact link has no name")?;
+            let at = fs::canonicalize(parent)?.join(file_name);
+            scopes.push(scope(config, at, &identity, 0, Exclude::default())?);
+            continue;
+        }
+        let bytes = if a["state"] == "frozen" {
+            scan::measure(&source)?.data_bytes
+        } else {
+            // A loose file is unrecorded, so always in scope; its estimate stays raw.
+            let ratio = if source.is_file() {
+                1.0
+            } else {
+                // The ratio only sizes the estimate; an artifact written
+                // during sampling falls back to its last ratio.
+                score::ratio(manager, root, &a).unwrap_or_else(|_| {
+                    a["ratio_estimate"]
+                        .as_f64()
+                        .filter(|r| r.is_finite() && *r > 0.0)
+                        .unwrap_or(1.0)
+                })
+            };
+            (scan::measure(&source)?.data_bytes as f64 / ratio).ceil() as u64
+        };
+        if included(&conn, &a, bytes, rate)? {
+            scopes.push(scope(config, source, &identity, bytes, Exclude::default())?);
         }
     }
     validate_scopes(&scopes)?;
@@ -230,7 +261,9 @@ pub(super) fn validate_scopes(scopes: &[Scope]) -> Result<()> {
         for b in &scopes[i + 1..] {
             ensure!(
                 !a.source.starts_with(&b.source) && !b.source.starts_with(&a.source),
-                "overlapping backup sources"
+                "overlapping backup sources: {} and {}",
+                a.source.display(),
+                b.source.display()
             );
         }
     }
