@@ -295,7 +295,7 @@ impl OwnerPushStore {
         Ok(rows)
     }
 
-    fn record_token_error(
+    pub(crate) fn record_token_error(
         &self,
         token: &PushToken,
         error: &str,

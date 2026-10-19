@@ -41,6 +41,7 @@ pub struct AppConfig {
     pub public_edge: PublicEdgeConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub terminal_direct: TerminalDirectConfig,
+    pub terminal_limits: crate::plain_terminals::Limits,
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
@@ -106,6 +107,7 @@ impl Default for AppConfig {
             public_edge: PublicEdgeConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
             terminal_direct: TerminalDirectConfig::default(),
+            terminal_limits: Default::default(),
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
@@ -2243,6 +2245,8 @@ struct RawConfig {
     #[serde(default)]
     terminal_direct: TerminalDirectConfig,
     #[serde(default)]
+    terminal_limits: crate::plain_terminals::Limits,
+    #[serde(default)]
     bug_reports: RawBugReportsConfig,
     #[serde(default)]
     tmux: TmuxConfig,
@@ -2398,6 +2402,7 @@ impl From<RawConfig> for AppConfig {
             public_edge: raw.public_edge,
             mobile_terminal: raw.mobile_terminal,
             terminal_direct: raw.terminal_direct,
+            terminal_limits: raw.terminal_limits.clamped(),
             tmux: raw.tmux,
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,

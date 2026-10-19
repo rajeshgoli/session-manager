@@ -688,6 +688,24 @@ async fn main() -> Result<()> {
             });
         }
 
+        let plain_state = state.clone();
+        let plain_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if plain_shutdown.is_stopped() {
+                    break;
+                }
+                let state = plain_state.clone();
+                match tokio::task::spawn_blocking(move || state.reconcile_plain_terminals()).await {
+                    Ok(Ok(())) => {}
+                    result => eprintln!("plain terminal reconciliation: {result:?}"),
+                }
+            }
+        });
+
         // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
         // the toggle is on. launchctl is synchronous, so run it on a blocking thread.
         let studio_ssh_flag = state.studio_ssh_enabled_flag();

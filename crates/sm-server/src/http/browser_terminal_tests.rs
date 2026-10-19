@@ -132,12 +132,12 @@ async fn browser_terminal_ticket_is_short_lived_single_use_and_bound_to_login() 
     let mut frame = browser_terminal_frame(&ticket);
     // Even knowing the internal device marker cannot bypass upgrade authentication.
     frame.device_key_id = Some("browser".into());
-    assert!(consume_terminal_ticket(&state, &frame, None).is_err());
-    assert!(consume_terminal_ticket(&state, &frame, Some("outsider@example.com")).is_err());
+    assert!(consume_terminal_ticket(&state, &frame, None, false).is_err());
+    assert!(consume_terminal_ticket(&state, &frame, Some("outsider@example.com"), false).is_err());
     let (_, attach, _) =
-        consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com")).unwrap();
+        consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com"), false).unwrap();
     remove_mobile_terminal_active_attach(&state, &attach);
-    assert!(consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com")).is_err());
+    assert!(consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com"), false).is_err());
     let ticket = mint_browser_terminal_ticket(&state).await;
     state
         .mobile_terminal_tickets
@@ -149,7 +149,8 @@ async fn browser_terminal_ticket_is_short_lived_single_use_and_bound_to_login() 
     assert!(consume_terminal_ticket(
         &state,
         &browser_terminal_frame(&ticket),
-        Some("rajeshgoli@gmail.com")
+        Some("rajeshgoli@gmail.com"),
+        false
     )
     .is_err());
 }
@@ -178,8 +179,8 @@ async fn browser_terminal_does_not_remove_phone_signature_requirement() {
     let ticket = mint_mobile_attach_ticket(&state, &key, "phone-proof").await;
     let mut frame = signed_mobile_terminal_auth_frame(&key, &ticket, "ws-proof");
     frame.signature = None;
-    assert!(consume_terminal_ticket(&state, &frame, None).is_err());
-    assert!(consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com")).is_err());
+    assert!(consume_terminal_ticket(&state, &frame, None, false).is_err());
+    assert!(consume_terminal_ticket(&state, &frame, Some("rajeshgoli@gmail.com"), false).is_err());
     assert!(browser_terminal::direct_ticket_email(&state, &frame).is_err());
 }
 
@@ -426,7 +427,8 @@ async fn browser_terminal_authenticated_websocket_echoes_input_and_detaches() {
     assert!(consume_terminal_ticket(
         &state,
         &browser_terminal_frame(&ticket),
-        Some("rajeshgoli@gmail.com")
+        Some("rajeshgoli@gmail.com"),
+        false
     )
     .is_err());
     client

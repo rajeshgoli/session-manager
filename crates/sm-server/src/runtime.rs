@@ -747,12 +747,14 @@ impl TmuxRuntime {
         let client_dir = env::current_exe()
             .ok()
             .and_then(|server| managed_client_dir(&server));
-        command = managed_session_command(
-            &command,
-            &spec.session_id,
-            spec.session_credential.as_deref(),
-            client_dir.as_deref(),
-        );
+        if spec.provider != "shell" {
+            command = managed_session_command(
+                &command,
+                &spec.session_id,
+                spec.session_credential.as_deref(),
+                client_dir.as_deref(),
+            );
+        }
 
         self.ensure_server_anchor()?;
 
@@ -1612,7 +1614,10 @@ impl TmuxRuntime {
         Ok(())
     }
 
-    fn tmux_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Command> {
+    pub(crate) fn tmux_command<'a>(
+        &self,
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Command> {
         refuse_default_tmux_socket_under_test_isolation(
             &self.tmux_binary,
             self.socket_name.as_deref(),
@@ -1633,6 +1638,9 @@ impl TmuxRuntime {
     }
 
     fn launch_command(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<String> {
+        if spec.provider == "shell" {
+            return Ok("exec env -u SESSION_MANAGER_ID -u CLAUDE_SESSION_MANAGER_ID -u SM_SESSION_CREDENTIAL -u CLAUDECODE /bin/zsh -l".into());
+        }
         let mut parts = match spec.provider.as_str() {
             "claude" => command_parts(&self.claude_command, &self.claude_args),
             "codex" => command_parts(&self.codex_command, &self.codex_args),

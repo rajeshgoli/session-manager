@@ -44,6 +44,10 @@ pub(super) async fn put_settings(
     let work_state = state.clone();
     let settings = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
         let state = work_state;
+        let _plain_gate = state
+            .plain_terminal_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let autopm_before = body
             .get("autopm")
             .map(|_| state.session_store.owner_settings())
@@ -83,6 +87,9 @@ pub(super) async fn put_settings(
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             crate::owner_settings::terminal_limits(&state.config, &settings);
+        if !plain_terminals::limits(&state)?.enabled {
+            plain_terminals::retire_all_locked(&state)?;
+        }
         if next != current && state.config.rust_core.runtime_enabled {
             admit_now(&state, &queue_state_dir, next);
         }
@@ -112,7 +119,13 @@ fn with_switches(state: &AppState, mut settings: Value) -> Value {
 
 /// Config's terminal limits, which a `null` owner value falls back to.
 fn terminal_config_limits(state: &AppState) -> Value {
-    crate::owner_settings::TerminalLimits::from_config(&state.config).to_json()
+    let mut value = crate::owner_settings::TerminalLimits::from_config(&state.config).to_json();
+    let limits = state.config.terminal_limits;
+    value["plain_terminal_enabled"] = json!(limits.enabled);
+    value["max_plain_terminals"] = json!(limits.max_plain_terminals);
+    value["idle_reap_minutes"] = json!(limits.idle_reap_minutes);
+    value["tunnel_linger_minutes"] = json!(limits.tunnel_linger_minutes);
+    value
 }
 
 /// The settings object with `terminal_config_limits` added, so the phone

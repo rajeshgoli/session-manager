@@ -31,6 +31,7 @@ mod history;
 mod merge_holds;
 mod model;
 mod queue_artifacts;
+mod shell;
 mod watch;
 
 #[derive(Parser)]
@@ -59,6 +60,8 @@ enum Command {
     Remind(RemindArgs),
     Wait(WaitArgs),
     Spawn(SpawnArgs),
+    /// Open, list, or retire plain login shells
+    Shell(shell::ShellArgs),
     Fork(ForkArgs),
     New(NewArgs),
     Name(NameArgs),
@@ -1235,6 +1238,7 @@ fn run() -> Result<()> {
             restore_session(&client, args)?;
         }
         Command::Recover(args) => recover(&client, args)?,
+        Command::Shell(args) => shell::run(&client, args)?,
         Command::Attach(args) => attach_session(&client, &args.session_id)?,
         Command::Clear(args) => {
             let requester_session_id = optional_current_session_id();

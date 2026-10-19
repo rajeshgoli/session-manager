@@ -384,6 +384,7 @@ mod messages;
 mod notes;
 mod opencode_readers;
 mod owner_events;
+mod plain_terminals;
 mod review_paired;
 mod review_policies;
 mod review_runs;
@@ -735,6 +736,9 @@ pub struct AppState {
     /// Terminal attach limits in force; `PUT /client/settings` changes them
     /// and the next attach reads them (sm#1763).
     terminal_limits: Arc<std::sync::RwLock<crate::owner_settings::TerminalLimits>>,
+    plain_terminal_store: crate::plain_terminals::Store,
+    plain_terminal_gate: Arc<Mutex<()>>,
+    plain_terminal_commands: Arc<Mutex<BTreeMap<String, String>>>,
     /// Auto PM switches, read live (sm#2174, spec 2170 B.1).
     autopm_switches: Arc<crate::autopm::switches::Switches>,
     /// The health guard's in-memory counts since the last minute (B.4).
@@ -865,6 +869,9 @@ impl AppState {
             &expand_home(&config.queue_runner_state_dir().to_string_lossy()),
             crate::owner_settings::queue_admission_policy(&config, &settings),
         );
+        let plain_terminal_store =
+            crate::plain_terminals::Store::new(expand_home(&config.usage.db_path));
+        plain_terminal_store.ensure_schema()?;
         let terminal_limits = Arc::new(std::sync::RwLock::new(
             crate::owner_settings::terminal_limits(&config, &settings),
         ));
@@ -948,6 +955,9 @@ impl AppState {
             push_sender,
             queue_admission,
             terminal_limits,
+            plain_terminal_store,
+            plain_terminal_gate: Arc::new(Mutex::new(())),
+            plain_terminal_commands: Arc::new(Mutex::new(BTreeMap::new())),
             autopm_switches,
             autopm_counters: Arc::new(crate::autopm::guard::Counters::default()),
             autopm_git: Arc::new(autopm::GhGit),
@@ -1008,6 +1018,10 @@ impl AppState {
     pub fn with_listen_port(mut self, port: u16) -> Self {
         self.listen_port = port;
         self
+    }
+
+    pub fn reconcile_plain_terminals(&self) -> anyhow::Result<()> {
+        plain_terminals::reconcile(self)
     }
 
     pub fn drain_background_retry_wakes(&self) -> anyhow::Result<usize> {
@@ -2146,6 +2160,12 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(watch::get_watch_page))
         .route("/watch", get(watch::get_watch_page))
         .route("/watch/state", get(watch::get_watch_state))
+        .route(
+            "/terminals",
+            get(plain_terminals::list).post(plain_terminals::create),
+        )
+        .route("/terminals/{id}", delete(plain_terminals::retire))
+        .route("/terminals/{id}/route", post(plain_terminals::route))
         .route("/queue", get(web::get_shell_only_page))
         .route("/analytics", get(web::get_shell_only_page))
         .route("/analytics/{view}", get(web::get_shell_only_page))
@@ -9544,7 +9564,12 @@ async fn mobile_terminal_websocket(
         None
     };
     let authorized_email = browser_email.as_deref().or(direct_email.as_deref());
-    match consume_terminal_ticket(&state, &auth_frame, authorized_email) {
+    match consume_terminal_ticket(
+        &state,
+        &auth_frame,
+        authorized_email,
+        direct_route.is_some(),
+    ) {
         Ok((ticket, attach_id, stop)) => {
             if let Some(route) = direct_route {
                 eprintln!(
@@ -10073,7 +10098,10 @@ where
                     *close_reason = "failed_to_deliver_terminal_input".to_owned();
                     return Ok(true);
                 }
-                if terminal_frame_submits_input(frame) {
+                if ticket.provider == "shell" {
+                    let _ = plain_terminals::store(state).input(session_id);
+                }
+                if ticket.provider != "shell" && terminal_frame_submits_input(frame) {
                     if owner_input {
                         owner_events::record_terminal_input(state, session_id);
                     }
@@ -10106,7 +10134,10 @@ where
                 *close_reason = "failed_to_deliver_terminal_key".to_owned();
                 return Ok(true);
             }
-            if terminal_frame_submits_input(frame) {
+            if ticket.provider == "shell" {
+                let _ = plain_terminals::store(state).input(session_id);
+            }
+            if ticket.provider != "shell" && terminal_frame_submits_input(frame) {
                 if owner_input {
                     owner_events::record_terminal_input(state, session_id);
                 }
@@ -15449,13 +15480,14 @@ fn consume_mobile_terminal_ticket(
     state: &AppState,
     frame: &MobileTerminalAuthFrame,
 ) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
-    consume_terminal_ticket(state, frame, None)
+    consume_terminal_ticket(state, frame, None, false)
 }
 
 fn consume_terminal_ticket(
     state: &AppState,
     frame: &MobileTerminalAuthFrame,
     browser_email: Option<&str>,
+    home: bool,
 ) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
     if !mobile_terminal_enabled(state) {
         return Err(ApiError::Status {
@@ -15474,6 +15506,13 @@ fn consume_terminal_ticket(
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let ticket =
         mobile_terminal_ticket_for_consume(state, &ticket_id, &ticket_secret, &device_key_id, now)?;
+    let _plain_gate = (ticket.provider == "shell").then(|| {
+        state
+            .plain_terminal_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    });
+    plain_terminals::relay_allowed(state, &ticket, home)?;
     match ticket.kind {
         TerminalTicketKind::Browser => {
             if browser_email != Some(ticket.actor_email.as_str())
@@ -15525,7 +15564,7 @@ fn consume_terminal_ticket(
         }
     }
 
-    let Some(session) = state.session_store.get_session(&ticket.session_id)? else {
+    let Some(session) = plain_terminals::browser_session(state, &ticket.session_id)? else {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is no longer attachable".to_owned(),
@@ -15914,6 +15953,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/"
         || path == "/watch"
         || path == "/watch/state"
+        || path == "/terminals"
+        || path.starts_with("/terminals/")
         || path == "/queue"
         || path == "/analytics"
         || path.starts_with("/analytics/")
@@ -22011,7 +22052,8 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 29] = [
+    const OWNER_WEB_READS: [&str; 30] = [
+        "/terminals",
         "/artifacts",
         "/artifact-activity",
         "/artifacts/missing",
@@ -22045,6 +22087,13 @@ mod tests {
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
         vec![
+            (Method::POST, "/terminals", json!({"cwd":"/tmp"})),
+            (
+                Method::POST,
+                "/terminals/term-missing/route",
+                json!({"where":"home"}),
+            ),
+            (Method::DELETE, "/terminals/term-missing", json!({})),
             (Method::POST, "/backup/allow-deletes", json!({})),
             (Method::POST, "/client/model/load", json!({"key":"fixture"})),
             (Method::POST, "/client/model/unload", json!({})),
@@ -22171,6 +22220,13 @@ mod tests {
                 let (status, response) =
                     response_json(app.clone().oneshot(request).await.unwrap()).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {headers:?}");
+                let detail = if uri.starts_with("/terminals")
+                    && headers.iter().any(|(h, _)| h.starts_with("x-sm-session"))
+                {
+                    "not_owner"
+                } else {
+                    detail
+                };
                 assert_eq!(response["detail"], detail, "{method} {uri} {headers:?}");
             }
         }
@@ -26234,7 +26290,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert_eq!(body["terminal_limits"]["per_user"], Value::Null);
         assert_eq!(
             body["terminal_config_limits"],
-            json!({"per_user": 3, "per_session": 4, "global": 100, "max_attach_seconds": 86_400})
+            json!({"per_user": 3, "per_session": 4, "global": 100, "max_attach_seconds": 86_400, "plain_terminal_enabled":true,"max_plain_terminals":4,"idle_reap_minutes":180,"tunnel_linger_minutes":15})
         );
         assert_eq!(state.terminal_limits.read().unwrap().per_user, 3);
         let (status, body) = put(
@@ -26428,4 +26484,5 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert!(html.contains("hands off at 45%") || html.contains("handoff off"));
     }
     include!("http/browser_terminal_tests.rs");
+    include!("http/plain_terminal_tests.rs");
 }
