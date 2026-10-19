@@ -4,6 +4,7 @@ pub(crate) fn terminal() -> Terminal {
     Terminal {
         id: "term-abcd".into(),
         cwd: "/tmp".into(),
+        name: None,
         created_by_user: "owner".into(),
         created_by_device: None,
         created_via: "cli".into(),
@@ -43,11 +44,15 @@ fn records_survive_reopen_and_retire_preserves_history() {
     let path = dir.join("usage.db");
     let store = Store::new(path.clone());
     store.ensure_schema().unwrap();
-    store.insert(&terminal()).unwrap();
+    let mut named = terminal();
+    named.name = Some("Benchmarks".into());
+    store.insert(&named).unwrap();
+    store.ensure_schema().unwrap();
     store.observe("term-abcd", true, true).unwrap();
     store.input("term-abcd").unwrap();
     let reopened = Store::new(path);
     let t = reopened.get("term-abcd").unwrap().unwrap();
+    assert_eq!(t.name.as_deref(), Some("Benchmarks"));
     assert!(t.busy_since.is_some() && t.last_attach_at.is_some() && t.last_input_at.is_some());
     reopened.retire("term-abcd", "owner").unwrap();
     assert!(reopened.list(false).unwrap().is_empty());

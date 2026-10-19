@@ -360,7 +360,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        out.push(json!({"id":t.id,"kind":"shell","provider":"shell","name":format!("zsh · {basename}"),"mark":"▹",
+        out.push(json!({"id":t.id,"kind":"shell","provider":"shell","name":t.name.clone().unwrap_or_else(|| format!("zsh · {basename}")),"mark":"▹",
             "state":if stopped {"stopped"} else if busy {"working"} else {"idle"},
             "working_dir":t.cwd,"repo":t.cwd,"node":state.config.nodes.default_node,"depth":0,"group":t.id,
             "last_activity":last,"activity_since":t.busy_since.as_deref().unwrap_or(last),

@@ -246,6 +246,7 @@ data class ClientSession(
     val primaryAction: PrimaryAction? = null,
     @SerialName("remote_control")
     val remoteControl: RemoteControlLink? = null,
+    val kind: String = "agent",
     /** From `/watch/state`, joined by id: the server's three facts and attention section (spec 1782 B). */
     val facts: AgentFacts? = null,
     val attention: AgentAttention? = null,
@@ -258,6 +259,11 @@ data class WatchStateResponse(val sessions: List<WatchStateSession> = emptyList(
 @Serializable
 data class WatchStateSession(
     val id: String,
+    val kind: String = "agent",
+    val name: String = "",
+    val state: String = "idle",
+    @SerialName("working_dir") val workingDir: String = "",
+    @SerialName("last_activity") val lastActivity: String = "",
     @SerialName("last_ticket") val lastTicket: SessionClaim? = null,
     val facts: AgentFacts? = null,
     val attention: AgentAttention? = null,
@@ -269,6 +275,7 @@ data class AgentFacts(
     val jobs: JobsFact? = null,
     val you: YouFact? = null,
     val finished: FinishedFact? = null,
+    val text: String? = null,
 )
 
 /** `working`, `idle` or `stopped`, since [since]. */
@@ -282,7 +289,7 @@ data class JobsFact(
     val waiting: Int = 0,
     val quiet: Boolean = false,
     val tone: String? = null,
-    val text: String = "No jobs",
+    val text: String? = "No jobs",
 )
 
 /** What the agent needs from the owner: a message, a doc review or an Allow prompt. */

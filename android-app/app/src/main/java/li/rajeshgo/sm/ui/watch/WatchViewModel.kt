@@ -88,6 +88,9 @@ data class WatchUiState(
     val studioSshBusy: Boolean = false,
     val studioSshError: String? = null,
     val terminal: TerminalUiState? = null,
+    val shellSetupId: String? = null,
+    val shellAttachStatus: String? = null,
+    val shellAttachError: String? = null,
     val lastSync: String? = null,
     val error: String? = null,
     /** Agents and queue jobs the owner follows (sm#1569). */
@@ -371,6 +374,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     }
 
     fun loadDetail(session: ClientSession) {
+        if (session.kind == "shell") return
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()
@@ -496,6 +500,69 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         )
     }
 
+    fun createPlainTerminal(cwd: String, name: String?, onComplete: (Result<Unit>) -> Unit) {
+        viewModelScope.launch {
+            val result = try {
+                val created = sessionRepository.createPlainTerminal(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), cwd, name)
+                refresh()
+                openPlainTerminal(created.id)
+                Result.success(Unit)
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { Result.failure(sessionRepository.classifyWriteFailure(error)) }
+            onComplete(result)
+        }
+    }
+
+    fun openPlainTerminal(id: String) {
+        if (_uiState.value.shellAttachStatus != null) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(shellAttachStatus = "Checking Termux setup…", shellAttachError = null)
+            try {
+                val keys = sessionRepository.deviceSshKeys(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), deviceKeyManager.deviceKeyId())
+                if (keys.none { it.revokedAt == null }) {
+                    _uiState.value = _uiState.value.copy(shellSetupId = id)
+                } else attachPlainTerminal(id)
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { _uiState.value = _uiState.value.copy(shellAttachError = error.message ?: "Could not open Termux") }
+            finally { _uiState.value = _uiState.value.copy(shellAttachStatus = null) }
+        }
+    }
+
+    fun dismissShellSetup() { _uiState.value = _uiState.value.copy(shellSetupId = null, shellAttachError = null) }
+    fun dismissShellError() { _uiState.value = _uiState.value.copy(shellAttachError = null) }
+
+    fun setupTermuxShell() {
+        val id = _uiState.value.shellSetupId ?: return
+        if (_uiState.value.shellAttachStatus != null) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(shellAttachStatus = "Setting up Termux…", shellAttachError = null)
+            try {
+                val base = settingsRepository.serverUrl.first()
+                val token = settingsRepository.accessToken.first()
+                val home = sessionRepository.plainTerminalRoute(base, token, id, "home")
+                val stdout = li.rajeshgo.sm.util.TermuxCommandResultReceiver.run(getApplication(), li.rajeshgo.sm.util.termuxShellSetupScript(home))
+                sessionRepository.registerDeviceSshKey(base, token, deviceKeyManager.deviceKeyId(), li.rajeshgo.sm.util.termuxPublicKey(stdout))
+                _uiState.value = _uiState.value.copy(shellSetupId = null)
+                attachPlainTerminal(id, home)
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) { _uiState.value = _uiState.value.copy(shellAttachError = error.message ?: "Termux setup failed") }
+            finally { _uiState.value = _uiState.value.copy(shellAttachStatus = null) }
+        }
+    }
+
+    private suspend fun attachPlainTerminal(id: String, readyHome: li.rajeshgo.sm.data.model.PlainTerminalRoute? = null) {
+        val base = settingsRepository.serverUrl.first()
+        val token = settingsRepository.accessToken.first()
+        val home = readyHome ?: sessionRepository.plainTerminalRoute(base, token, id, "home")
+        _uiState.value = _uiState.value.copy(shellAttachStatus = "Checking home network…")
+        val route = if (sessionRepository.plainTerminalAtHome(home)) home else {
+            _uiState.value = _uiState.value.copy(shellAttachStatus = "Opening tunnel…")
+            sessionRepository.plainTerminalRoute(base, token, id, "away")
+        }
+        li.rajeshgo.sm.util.launchTermuxAttach(getApplication(), li.rajeshgo.sm.data.model.TermuxAttachMetadata(
+            supported = true, sshCommand = route.command, tmuxSession = route.tmuxSession)).getOrThrow()
+    }
+
     fun createSession(request: li.rajeshgo.sm.data.model.CreateSessionRequest, onComplete: (Result<String>) -> Unit) {
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
@@ -517,7 +584,9 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             val result = if (serverUrl.isBlank() || accessToken.isBlank()) {
                 Result.failure(IllegalStateException(SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE))
             } else {
-                sessionRepository.retireSession(serverUrl, accessToken, sessionId)
+                if (_uiState.value.sessions.any { it.id == sessionId && it.kind == "shell" }) {
+                    runCatching { sessionRepository.retirePlainTerminal(serverUrl, accessToken, sessionId) }
+                } else sessionRepository.retireSession(serverUrl, accessToken, sessionId)
             }
             if (result.exceptionOrNull() is SessionManagerAuthException) {
                 settingsRepository.clearAuth()
@@ -544,6 +613,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     }
 
     fun openMobileTerminal(session: ClientSession, onComplete: (Result<String>) -> Unit) {
+        if (session.kind == "shell") { openPlainTerminal(session.id); return }
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()

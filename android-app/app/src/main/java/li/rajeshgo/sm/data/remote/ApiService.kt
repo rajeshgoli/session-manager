@@ -30,6 +30,21 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @POST("terminals")
+    suspend fun createPlainTerminal(@Body request: li.rajeshgo.sm.data.model.CreatePlainTerminal): li.rajeshgo.sm.data.model.PlainTerminalCreated
+
+    @DELETE("terminals/{id}")
+    suspend fun retirePlainTerminal(@Path("id") id: String): retrofit2.Response<Unit>
+
+    @POST("terminals/{id}/route")
+    suspend fun plainTerminalRoute(@Path("id") id: String, @Body request: li.rajeshgo.sm.data.model.PlainTerminalRouteRequest): li.rajeshgo.sm.data.model.PlainTerminalRoute
+
+    @GET("devices/{id}/ssh-keys")
+    suspend fun deviceSshKeys(@Path("id") id: String): li.rajeshgo.sm.data.model.DeviceSshKeys
+
+    @POST("devices/{id}/ssh-keys")
+    suspend fun registerDeviceSshKey(@Path("id") id: String, @Body request: li.rajeshgo.sm.data.model.RegisterDeviceSshKey): kotlinx.serialization.json.JsonObject
+
     @GET("notes/search")
     suspend fun searchOwnerNotes(@Query("q") query: String): List<li.rajeshgo.sm.data.model.OwnerNoteHit>
 
