@@ -1553,6 +1553,33 @@ fn lane_with_goal(board: &Value, goal: i64) -> Option<Value> {
 }
 
 #[tokio::test]
+async fn notes_issue_is_on_board_before_any_github_pass() {
+    let f = bug_fixture();
+    let (status, created) = owner_request(
+        &f,
+        "POST",
+        "/github/issues",
+        Some(json!({"repo": REPO, "title": "A note becomes a ticket", "body": "Details"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    // No refresh or board worker runs in this fixture. The filing response
+    // must be sufficient to populate the next board read.
+    let snapshot = board(&f).await;
+    let ticket = snapshot["other"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["tickets"].as_array().unwrap())
+        .find(|ticket| ticket["number"] == created["number"])
+        .expect("new Notes issue on board immediately");
+    assert_eq!(ticket["repo"], REPO);
+    assert_eq!(ticket["title"], "A note becomes a ticket");
+    assert_eq!(ticket["url"], created["url"]);
+    assert_eq!(ticket["state"], "ready");
+}
+
+#[tokio::test]
 async fn bug_report_validation() {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let f = bug_fixture();

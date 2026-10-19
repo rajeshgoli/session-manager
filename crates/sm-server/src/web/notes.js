@@ -72,6 +72,7 @@ function NoteActions({ text, summary, canType, onType, repos }) {
         const issue = issueParts(content);
         if (!issue.title) throw new Error('The first line must contain a title.');
         const created = await api('/github/issues', { method: 'POST', body: { repo, ...issue } });
+        bus.emit('board-changed');
         store('sm-notes-last-repo', repo);
         toast(`Filed #${created.number}`, () => window.open(created.url, '_blank', 'noopener'));
       }

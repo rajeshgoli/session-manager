@@ -317,13 +317,36 @@ pub(super) async fn create_issue(
         if !(configured || claimed || lane) {
             return Err(bad("repository is not known to sm"));
         }
-        state
+        let (number, url) = state
             .board_source
             .create_issue(&repo, &issue.title, &issue.body)
             .map_err(|detail| ApiError::Status {
                 status: StatusCode::BAD_GATEWAY,
                 detail,
-            })
+            })?;
+        // Creation already gives us these facts. Do not wait for a GitHub
+        // list query to discover the issue before the board can show it.
+        let _guard = state
+            .board_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let store = board::board_store(state);
+        let now = time::OffsetDateTime::now_utc();
+        store.upsert_nodes(
+            &[&crate::board::sync::RefNode {
+                repo,
+                number,
+                title: issue.title,
+                url: url.clone(),
+                state: "open".into(),
+                state_reason: None,
+                closed_at: None,
+            }],
+            now,
+        )?;
+        let recomputed = store.recompute(&board::outside(state)?, now)?;
+        board::send_alerts(state, &recomputed);
+        Ok((number, url))
     })
     .await?;
     Ok(Json(json!({"number":number,"url":url})))
