@@ -200,6 +200,8 @@ async fn plain_terminal_busy_jobs_restart_adoption_idle_reap_and_watch() {
     assert_eq!(row["kind"], "shell");
     assert_eq!(row["attention"]["section"], "moving");
     assert!(row["facts"]["you"].is_null());
+    // The Android app decodes jobs.text as a non-null string; null breaks the whole Watch page.
+    assert_eq!(row["facts"]["jobs"]["text"], "No jobs");
     // A fresh server state re-adopts the surviving tmux runtime.
     let restarted = AppState::new(state.config.clone());
     restarted.reconcile_plain_terminals().unwrap();

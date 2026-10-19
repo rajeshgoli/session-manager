@@ -364,7 +364,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "state":if stopped {"stopped"} else if busy {"working"} else {"idle"},
             "working_dir":t.cwd,"repo":t.cwd,"node":state.config.nodes.default_node,"depth":0,"group":t.id,
             "last_activity":last,"activity_since":t.busy_since.as_deref().unwrap_or(last),
-            "facts":{"text":fact,"tone":"neutral","agent":{"state":if busy {"working"} else {"idle"},"since":last,"text":fact},"jobs":{"running":0,"waiting":0,"text":null},"you":null,"finished":null,"note":null},"attention":{"section":section,"tone":"neutral","reason":null,"sort_key":t.created_at},
+            "facts":{"text":fact,"tone":"neutral","agent":{"state":if busy {"working"} else {"idle"},"since":last,"text":fact},"jobs":{"running":0,"waiting":0,"text":"No jobs"},"you":null,"finished":null,"note":null},"attention":{"section":section,"tone":"neutral","reason":null,"sort_key":t.created_at},
             "claims":[],"docs":[],"waiting_on":[],"jobs":[],"attach":format!("sm shell {}",t.cwd)}));
     }
     Ok(json!({
