@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const strip = (text) => text.replace(/^import .*;\n/gm, '').replace(/^export /gm, '');
 const web = (name) => readFile(new URL(`../crates/sm-server/src/web/${name}`, import.meta.url), 'utf8');
 // The route module runs for real; it finds no direct entry and uses the relay.
-const source = strip(await web('terminal-route.js')) + strip(await web('terminal.js'));
+const source = strip(await web('terminal-route.js')) + strip(await web('terminal-images.js')) + strip(await web('terminal.js'));
 function fixture(direct = [], { storage, probes } = {}) {
   let minted = 0;
   const states = [], timers = new Map(), sockets = [];
@@ -20,6 +20,7 @@ function fixture(direct = [], { storage, probes } = {}) {
     attach() { this.readyState = 1; this.onopen(); this.onmessage({data:JSON.stringify({type:'status',state:'attached'})}); }
   }
   class Terminal {
+    constructor() { this.options = {}; }
     loadAddon() {} open() {} resize() {} reset() {} focus() {} dispose() {}
     onData() { return {dispose() {}}; } attachCustomKeyEventHandler() {}
   }
@@ -28,13 +29,15 @@ function fixture(direct = [], { storage, probes } = {}) {
     window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},WebLinksAddon:{WebLinksAddon:class {}},addEventListener(){},removeEventListener(){},
       innerWidth:1440,matchMedia:()=>({matches:false}),sessionStorage:storage},
     getComputedStyle:()=>({fontSize:'15px'}),document:{documentElement:{}},performance:{now:()=>0},
+    CONTRAST_FLOOR:4.5, THEME_KEY:'theme', isLight:()=>false, terminalTheme:()=>({background:'#000'}),
+    matchMedia:()=>({addEventListener(){},removeEventListener(){}}), MutationObserver:class {observe(){} disconnect(){}},
     setInterval:()=>0,clearInterval(){},config:{},stored:(key,fallback)=>fallback,store(){},sectionAgents:()=>[],
     SECTION_LABEL:{},SECTION_TONE:{},youFact:()=>null,jobsFact:()=>null,agentFact:()=>null,markAnswered(){},
     ResizeObserver:class {observe(){} disconnect(){}},
-    useRef:()=>({current:null}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
+    useRef:()=>({current:{style:{},addEventListener(){},removeEventListener(){}}}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
     useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
     api:async()=>({ws_url:'/client/terminal',ticket_id:`test-${++minted}`,ticket_secret:'test',server_instance:'inst',direct}),
-    fetch:async()=>({ok:true,json:async()=>({instance:probes?probes.shift()??'inst':'inst'})}),AbortController,
+    fetch:async()=>({ok:true,json:async()=>({instance:probes?probes.shift()??'inst':'inst'})}),AbortController,toast(){},
     setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),
   });
   vm.runInContext(source+'\nTerminalPage({id:"test",open:false});',context);

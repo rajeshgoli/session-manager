@@ -49,6 +49,8 @@ mod handoff_store;
 mod handoff_transfer;
 #[path = "owner_settings/store.rs"]
 mod owner_settings_store;
+#[path = "terminal_images.rs"]
+mod terminal_images;
 use crate::handoff::policy::HandoffDefaults;
 use handoff_store::{handoff_session_ref, handoff_view_for_record};
 pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};
@@ -4541,6 +4543,9 @@ impl SessionStore {
     /// Retire and kill end the session's work claims (sm#1452). A failure is
     /// logged; the next claims sync ends them.
     fn end_work_claims_after_retire(&self, session_id: &str) {
+        if let Err(error) = self.cleanup_terminal_images(session_id) {
+            eprintln!("removing terminal images of retired session {session_id} failed: {error:#}");
+        }
         let Some(queue) = &self.queue_store else {
             return;
         };

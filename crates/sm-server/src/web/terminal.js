@@ -6,6 +6,7 @@ import { BugButton } from './bug.js';
 import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
+import { installImagePaste } from './terminal-images.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -245,6 +246,12 @@ export function TerminalPage({ id, open }) {
       focus: () => terminal.focus(),
       redraw: () => { redraw(); terminal.focus(); },
     };
+    const removeImagePaste = installImagePaste(host.current, {
+      connection: () => !stopped && live ? socket : null,
+      upload: (body) => api(`/client/sessions/${encodeURIComponent(id)}/terminal-images`, { method: 'POST', body }),
+      paste: (path) => control.current?.paste(path),
+      report: toast,
+    });
     // Round trips (G3): the bridge answers each ping from its loop, without the PTY.
     const ping = () => {
       if (!live) return;
@@ -382,6 +389,9 @@ export function TerminalPage({ id, open }) {
         return false;
       }
       // The page handles ⌘\ and ⌘⌥↑/↓ (G1).
+      // Let the browser deliver Ctrl+V as a clipboard event, including images,
+      // instead of asking the remote agent to read the server's clipboard.
+      if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'v') return false;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') return false;
       if (event.metaKey && (event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
       return true;
@@ -397,6 +407,7 @@ export function TerminalPage({ id, open }) {
     fitNow();
     connect();
     return () => {
+      removeImagePaste();
       stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };

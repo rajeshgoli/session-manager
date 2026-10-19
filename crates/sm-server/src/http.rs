@@ -2389,6 +2389,10 @@ pub fn router(state: AppState) -> Router {
             "/client/sessions/{session_id}/browser-attach-ticket",
             post(browser_terminal::create_ticket),
         )
+        .route(
+            "/client/sessions/{session_id}/terminal-images",
+            post(browser_terminal::upload_image),
+        )
         .route("/client/sessions/{session_id}", get(get_client_session))
         .route("/autopm/events", get(owner_events::list_events))
         .route("/autopm/switches", get(autopm::list_switches))

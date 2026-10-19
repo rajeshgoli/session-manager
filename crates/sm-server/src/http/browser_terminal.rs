@@ -1,6 +1,67 @@
 //! Browser-only terminal tickets. The phone signature path remains separate.
 use super::*;
 
+/// Upload uses the same owner login and same-origin write check as minting a
+/// terminal ticket. No caller-controlled filename or filesystem path is used.
+pub(super) async fn upload_image(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &request)?;
+    if !mobile_terminal_enabled(&state) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Terminal attach is disabled".into(),
+        });
+    }
+    let session = resolve_session_or_registry_role(&state, &session_id)?
+        .ok_or(ApiError::NotFound("Session not found"))?;
+    if session.is_stopped() {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is not running".into(),
+        });
+    }
+    if attach_descriptor_payload(session.clone())["attach_supported"] != true {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Terminal attach is not supported".into(),
+        });
+    }
+    // Bound the encoded request before JSON parsing or base64 allocation.
+    let body = to_bytes(request.into_body(), 14 * 1024 * 1024)
+        .await
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            detail: "Image exceeds the 10 MiB limit".into(),
+        })?;
+    #[derive(Deserialize)]
+    struct Image {
+        mime: String,
+        data: String,
+    }
+    let image: Image = serde_json::from_slice(&body).map_err(|_| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: "Invalid image upload".into(),
+    })?;
+    let path = board::blocking(&state, move |state| {
+        let bytes = STANDARD.decode(&image.data).map_err(|_| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Invalid image encoding".into(),
+        })?;
+        state
+            .session_store
+            .save_terminal_image(&session.id, &image.mime, &bytes)
+            .map_err(|error| ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: error.to_string(),
+            })
+    })
+    .await?;
+    Ok(Json(json!({"path": path})))
+}
+
 pub(super) fn denied(detail: &str) -> ApiError {
     ApiError::Status {
         status: StatusCode::UNAUTHORIZED,

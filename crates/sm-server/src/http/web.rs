@@ -54,6 +54,7 @@ const ASSETS: &[Asset] = &[
     asset!("worktrees.js", JS),
     asset!("devices.css", "text/css; charset=utf-8"),
     asset!("terminal.js", JS),
+    asset!("terminal-images.js", JS),
     asset!("terminal-route.js", JS),
     asset!("terminal-theme.js", JS),
     asset!("vendor/xterm.js", JS),
