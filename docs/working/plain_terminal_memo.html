@@ -135,57 +135,46 @@
 <tbody>
 <tr><td>1. Who may <b>create</b> a terminal seat?</td><td><b>Owner devices only</b> (<code>mobile_terminal_owner: true</code> users); attach to an existing one follows the same rule.</td><td>Creation is the remote-execution decision; you are the only human, so widening the circle buys nothing and costs a threat surface.</td></tr>
 <tr><td>2. Kill switch.</td><td><b>One global toggle, default on</b>, living beside the existing attach limits in web/mobile Settings; flips without restart.</td><td>Honors your posture (ship enabled), and the settings surface proves one-flag disable is already the pattern for terminal risk.</td></tr>
-<tr><td>3. Where do I start one?</td><td><b>Web + phone: "New terminal" → pick a directory (Home or a recent project folder) → the terminal opens on it.</b> Desktop: <code>sm shell [dir]</code> creates one and prints its terminal URL; local-terminal auto-open is a later refinement.</td><td>Directory is the only argument worth asking for; everything else (name, shell, env) gets sane defaults.</td></tr>
+<tr><td>3. Where do I start one?</td><td><b>No create button on either client.</b> Desktop: <code>sm shell [dir]</code> in any real terminal — the plain way in. Phone: the existing New session sheet grows a Terminal type; picking it asks for a folder and opens the terminal screen. Web stays viewer-and-attacher.</td><td>Creation already lives in exactly two places (CLI, New session sheet); a third is new chrome for no new power, and directory is the only argument worth asking for.</td></tr>
 <tr><td>4. How long does an unattended shell live?</td><td><b>Reap after 3 hours with no attach and no typing</b>; Retire button always; cap of 4 live terminal seats.</td><td>Forgotten shells are the one realistic abuse path without a new compromise — your phone is the intended threat, and it is the thing you lose in a cab.</td></tr>
 <tr><td>5. What does the phone keyboard do?</td><td><b>Keep today's phone keys (Esc, Tab, Shift+Tab, arrows, Ctrl-C) and add a Ctrl modifier</b> so a second press makes Ctrl+D/L/Z/U possible; soft keyboard sends raw bytes as it does now.</td><td>Ctrl-D to exit, Ctrl-L to clear, Ctrl-Z to suspend are 90% of interactive shell need; the row exists, it is one key wider.</td></tr>
-<tr><td>6. Do terminal seats get watched like agents?</td><td><b>Listed under their own Terminals section with a "last input" fact; never pinged.</b> No attention rules, no reminder targets, no queue or contention interaction.</td><td>You asked for legibility, not accountability: you want to see that it is open, not to be messaged because zsh is idle.</td></tr>
+<tr><td>6. Do terminal seats get watched like agents?</td><td><b>Plain rows where today's sessions already are — the terminal switcher and the Watch list — marked ▹ with a "last input" fact; never pinged.</b> No new section header, no attention rules, no reminder targets, no queue or contention interaction.</td><td>You asked for legibility, not accountability: you want to see that it is open, not to be messaged because zsh is idle.</td></tr>
 <tr><td>7. Is shell output logged?</td><td><b>Yes, identically to agent pane logs</b>, same retention.</td><td>Consistency, and the post-incident question "what ran" has an answer; per-command audit UI stays out of scope.</td></tr>
 <tr><td>8. What stays out?</td><td><b>Termux changes (the phone-local shell), non-owner users, per-command audit UI, non-macOS hosts.</b></td><td>Each is a product of its own; none blocks the five use cases in Appendix C.</td></tr>
 </tbody>
 </table>
 
 <h3>What it looks like</h3>
-<p>Two figures carry the decisions above: the web terminal page, and four phone screens. Everything not marked new is today's screen, unchanged.</p>
+<p>Two figures carry the decisions above: the web terminal page, and three phone screens. Everything not marked new is today's screen, unchanged. The rule for both: no new buttons, no new screens. A terminal is one more row where today's sessions already are, and the one new thing — a way to make a shell — hangs off surfaces that already create things.</p>
 
 <figure>
 <svg viewBox="0 0 860 330" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
   <rect x="1" y="1" width="858" height="328" rx="8" fill="#fcfcfb" stroke="#e2e1dc"/>
   <rect x="1" y="1" width="858" height="34" rx="8" fill="#f4f3f0"/>
-  <text x="16" y="23" font-weight="600" fill="#0b0b0b">sm</text><text x="44" y="23" fill="#0b0b0b">zsh · session-manager</text>
-  <rect x="694" y="8" width="150" height="20" rx="4" fill="#fff" stroke="#2a78d6"/><text x="769" y="22" text-anchor="middle" fill="#2a78d6">+ New terminal</text>
+  <text x="16" y="23" font-weight="600" fill="#0b0b0b">sm</text><text x="44" y="23" fill="#0b0b0b">zsh · session-manager</text><text x="200" y="23" font-size="10" fill="#8a8880">direct · 41 ms</text>
   <line x1="200" y1="35" x2="200" y2="329" stroke="#e2e1dc"/>
   <text x="14" y="56" font-size="10" fill="#8a8880" letter-spacing=".08em">MOVING</text>
   <text x="14" y="76" fill="#0b0b0b">the-snow-man</text><text x="14" y="91" font-size="11" fill="#008300">Working 4m</text>
-  <text x="14" y="116" font-size="10" fill="#8a8880" letter-spacing=".08em">IDLE · 1</text>
+  <text x="14" y="116" font-size="10" fill="#8a8880" letter-spacing=".08em">IDLE · 3</text>
   <text x="14" y="136" fill="#0b0b0b">draco</text><text x="14" y="151" font-size="11" fill="#52514e">Idle 12m</text>
-  <rect x="6" y="166" width="188" height="108" rx="6" fill="none" stroke="#2a78d6" stroke-dasharray="4 3"/>
-  <text x="14" y="184" font-size="10" fill="#2a78d6" letter-spacing=".08em">TERMINALS · 2 (new)</text>
-  <rect x="10" y="192" width="180" height="38" rx="4" fill="#e3eefb"/>
-  <text x="16" y="208" fill="#0b0b0b">zsh · session-manager</text><text x="16" y="223" font-size="11" fill="#52514e">open · last input 1m</text>
-  <text x="16" y="248" fill="#0b0b0b">zsh · ~</text><text x="16" y="263" font-size="11" fill="#52514e">open · last input 2h 40m</text>
+  <rect x="6" y="164" width="188" height="40" rx="4" fill="#e3eefb"/>
+  <text x="14" y="180" fill="#0b0b0b">zsh · session-manager</text><text x="14" y="195" font-size="11" fill="#52514e">open · last input 1m</text>
+  <text x="14" y="222" fill="#0b0b0b">zsh · ~</text><text x="14" y="237" font-size="11" fill="#52514e">open · last input 2h 40m</text>
+  <text x="14" y="262" font-size="10" fill="#8a8880">open shells sit in Idle with a ▹ dot,</text><text x="14" y="276" font-size="10" fill="#8a8880">plain rows — no section, no badge</text>
   <rect x="212" y="46" width="636" height="272" rx="6" fill="#1b1b19"/>
   <g font-family="SF Mono,Menlo,monospace" font-size="12" fill="#e6e4de">
     <text x="226" y="70">rajesh@studio session-manager % git status -sb</text>
     <text x="226" y="88" fill="#5cc95c">## main...origin/main</text>
     <text x="226" y="106">rajesh@studio session-manager % gh pr checks 2322</text>
     <text x="226" y="124" fill="#5cc95c">✓ codex review   pass</text>
-    <text x="226" y="142">rajesh@studio session-manager % ▌</text>
+    <text x="226" y="142">rajesh@studio session-manager ▌</text>
   </g>
-  <rect x="604" y="40" width="240" height="190" rx="8" fill="#fff" stroke="#2a78d6"/>
-  <text x="618" y="62" font-weight="600" fill="#0b0b0b">Open a terminal in</text>
-  <text x="618" y="86" fill="#0b0b0b">⌂  Home</text>
-  <text x="618" y="104" font-size="10" fill="#8a8880" letter-spacing=".08em">RECENT PROJECTS</text>
-  <text x="618" y="124" fill="#0b0b0b">▸  session-manager</text>
-  <text x="618" y="144" fill="#0b0b0b">▸  fractal-algo-rust</text>
-  <text x="618" y="164" fill="#0b0b0b">▸  worktrees/sm-2314-…</text>
-  <rect x="618" y="178" width="212" height="22" rx="4" fill="#f4f3f0" stroke="#e2e1dc"/><text x="626" y="193" fill="#8a8880">or type a path…</text>
-  <text x="618" y="220" font-size="11" fill="#52514e">Opens and attaches here. 2 of 4 open.</text>
 </svg>
-<figcaption>Web terminal page (decisions 3, 4, 6). Terminal seats get their own section in the left switcher, under the agents, with a "last input" fact and no attention colours: sm never pings about an idle shell. "+ New terminal" opens the folder picker; choosing a folder creates the seat and attaches in the same pane. The picker shows how many of the 4 allowed seats are open.</figcaption>
+<figcaption>Web terminal page, unchanged chrome. A shell is a switcher row like any other: ⌘⌥↑/↓ or a click opens it, Retire works the same, RTT and route readout are today's. The web app grows no create button — on desktop you make shells with <code>sm shell</code> (any real terminal), so the web stays viewer-and-attacher, which is all it is today.</figcaption>
 </figure>
 
 <figure>
-<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+<svg viewBox="0 0 660 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
   <g>
     <rect x="4" y="4" width="200" height="410" rx="22" fill="#fcfcfb" stroke="#8a8880"/>
     <text x="104" y="34" text-anchor="middle" font-weight="600" fill="#0b0b0b">Watch</text>
@@ -193,24 +182,25 @@
     <text x="18" y="82" fill="#0b0b0b">the-snow-man</text><text x="18" y="97" font-size="11" fill="#008300">Working 4m</text>
     <text x="18" y="122" font-size="10" fill="#8a8880" letter-spacing=".08em">IDLE</text>
     <text x="18" y="142" fill="#0b0b0b">draco</text><text x="18" y="157" font-size="11" fill="#52514e">Idle 12m</text>
-    <rect x="10" y="172" width="188" height="96" rx="6" fill="none" stroke="#2a78d6" stroke-dasharray="4 3"/>
-    <text x="18" y="190" font-size="10" fill="#2a78d6" letter-spacing=".08em">TERMINALS (new)</text>
-    <text x="18" y="210" fill="#0b0b0b">zsh · session-manager</text><text x="18" y="225" font-size="11" fill="#52514e">open · last input 1m</text>
-    <text x="18" y="247" fill="#0b0b0b">zsh · ~</text><text x="18" y="262" font-size="11" fill="#52514e">open · last input 2h 40m</text>
+    <text x="18" y="182" fill="#0b0b0b">▹ zsh · session-manager</text><text x="18" y="197" font-size="11" fill="#52514e">open · last input 1m</text>
+    <text x="18" y="222" fill="#0b0b0b">▹ zsh · ~</text><text x="18" y="237" font-size="11" fill="#52514e">open · last input 2h 40m</text>
+    <text x="18" y="268" font-size="10" fill="#8a8880">plain rows in the same list; tap opens</text>
     <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">1 · Watch list</text>
   </g>
   <g transform="translate(218,0)">
     <rect x="4" y="4" width="200" height="410" rx="22" fill="#fcfcfb" stroke="#8a8880"/>
-    <text x="18" y="34" font-weight="600" fill="#0b0b0b">Terminal</text>
-    <rect x="160" y="18" width="26" height="22" rx="5" fill="#fff" stroke="#2a78d6"/><text x="173" y="34" text-anchor="middle" fill="#2a78d6" font-size="15">+</text>
-    <rect x="4" y="210" width="200" height="204" rx="16" fill="#fff" stroke="#2a78d6"/>
-    <text x="18" y="236" font-weight="600" fill="#0b0b0b">Open a terminal in</text>
-    <text x="18" y="262" fill="#0b0b0b">⌂  Home</text>
-    <text x="18" y="282" font-size="10" fill="#8a8880" letter-spacing=".08em">RECENT PROJECTS</text>
-    <text x="18" y="302" fill="#0b0b0b">▸  session-manager</text>
-    <text x="18" y="324" fill="#0b0b0b">▸  fractal-algo-rust</text>
-    <text x="18" y="346" fill="#0b0b0b">▸  worktrees/sm-2314-…</text>
-    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">2 · "+" opens the folder sheet</text>
+    <text x="18" y="34" font-weight="600" fill="#0b0b0b">New session</text>
+    <text x="18" y="58" font-size="10" fill="#8a8880" letter-spacing=".08em">AGENT TYPE</text>
+    <text x="18" y="80" fill="#0b0b0b">Claude Code · Opus 4.5</text>
+    <text x="18" y="102" fill="#0b0b0b">Codex · gpt-5.x-codex</text>
+    <rect x="12" y="116" width="184" height="30" rx="5" fill="#e3eefb"/>
+    <text x="18" y="136" fill="#0b0b0b">▹ Terminal — plain zsh</text>
+    <text x="18" y="170" font-size="10" fill="#8a8880" letter-spacing=".08em">DIRECTORY</text>
+    <text x="18" y="192" fill="#0b0b0b">⌂  Home</text>
+    <text x="18" y="214" fill="#0b0b0b">▸  session-manager</text>
+    <text x="18" y="236" fill="#0b0b0b">▸  fractal-algo-rust</text>
+    <text x="18" y="270" font-size="10" fill="#8a8880">this sheet exists today for agents;</text><text x="18" y="284" font-size="10" fill="#8a8880">Terminal is one more type line, and</text><text x="18" y="298" font-size="10" fill="#8a8880">replaces the model step with a folder</text>
+    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">2 · New session sheet</text>
   </g>
   <g transform="translate(436,0)">
     <rect x="4" y="4" width="200" height="410" rx="22" fill="#1b1b19" stroke="#8a8880"/>
@@ -229,24 +219,8 @@
     <rect x="160" y="338" width="36" height="24" rx="5" fill="#6db1f7"/><text x="178" y="354" text-anchor="middle" font-size="10" font-weight="600" fill="#1b1b19">Ctrl</text>
     <text x="104" y="400" text-anchor="middle" font-size="11" fill="#b1afa7">3 · Ctrl armed: next key is Ctrl+key</text>
   </g>
-  <g transform="translate(654,0)">
-    <rect x="4" y="4" width="200" height="410" rx="22" fill="#fcfcfb" stroke="#8a8880"/>
-    <text x="18" y="34" font-weight="600" fill="#0b0b0b">Settings · Terminal limits</text>
-    <text x="18" y="66" fill="#52514e">Attach time limit</text><text x="186" y="66" text-anchor="end" fill="#0b0b0b">24h</text>
-    <text x="18" y="88" fill="#52514e">Attaches per session</text><text x="186" y="88" text-anchor="end" fill="#0b0b0b">4</text>
-    <rect x="10" y="102" width="188" height="118" rx="6" fill="none" stroke="#2a78d6" stroke-dasharray="4 3"/>
-    <text x="18" y="120" font-size="10" fill="#2a78d6" letter-spacing=".08em">NEW</text>
-    <text x="18" y="142" fill="#0b0b0b">Plain terminals</text>
-    <rect x="150" y="130" width="36" height="18" rx="9" fill="#008300"/><circle cx="177" cy="139" r="7" fill="#fff"/>
-    <text x="18" y="166" fill="#52514e">Max open terminals</text><text x="186" y="166" text-anchor="end" fill="#0b0b0b">4</text>
-    <text x="18" y="188" fill="#52514e">Close idle after</text><text x="186" y="188" text-anchor="end" fill="#0b0b0b">3h</text>
-    <text x="18" y="210" fill="#52514e">no attach, no typing</text>
-    <rect x="18" y="236" width="172" height="30" rx="6" fill="#fff" stroke="#e34948"/><text x="104" y="256" text-anchor="middle" fill="#e34948">Kill all terminals (2)</text>
-    <text x="104" y="284" text-anchor="middle" font-size="10" fill="#8a8880">asks once to confirm</text>
-    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">4 · Kill switch and limits</text>
-  </g>
 </svg>
-<figcaption>Phone (decisions 2–6). 1: terminals get their own Watch section; tapping a row opens today's terminal screen. 2: "+" on the terminal screen opens the folder sheet; choosing a folder creates the seat and attaches. 3: today's key row gains one Ctrl key; tap it to arm it (highlighted), and the next letter goes as Ctrl+letter (Ctrl-D exits, Ctrl-L clears). 4: the kill switch and the two new limits sit in the existing Terminal limits section, on the phone and on the web; flipping them needs no restart.</figcaption>
+<figcaption>Phone. 1: shells sit in the Watch list as plain rows (▹ marks a terminal; a tap opens the existing terminal screen, and the card's "Open terminal" pill works unchanged). 2: creation reuses the app's own New session sheet — Terminal joins the agent-type list, and a folder line replaces the model step; no new button, no new screen. 3: today's key row gains one Ctrl key; tap to arm, and the next letter goes as Ctrl+letter (Ctrl-D exits, Ctrl-L clears).</figcaption>
 </figure>
 
 <h3>The security position, stated so it can be re-read in public</h3>
@@ -257,6 +231,7 @@
 <h3>FAQ — what changed since your go-ahead on 18 Oct</h3>
 <p>You approved scope (plain zsh, web + mobile, same device-cert guard). This memo adds four things you did not ask for, each so the design closes: the idle reaper and the cap of four (decision 4 — a plain shell is the first feature here that is more dangerous lingering than launching); the kill switch, default on (decision 2 — your posture, made reparable); the Ctrl modifier (decision 5 — without it the phone terminal is a bad shell); and owner-only creation (decision 1 — the smallest honest circle). Nothing here contradicts your ruling; it builds on it.</p>
 <p><strong>Revision 2:</strong> adds "What it looks like", mocks of the web terminal page and the phone screens. No decision changed.</p>
+<p><strong>Revision 3:</strong> the mocks are redrawn to match the app as it is, after the owner's review. The "+ New terminal" button, the dedicated Terminals section, and the terminal-screen "+" sheet are gone: shells are ordinary rows, and creation hangs off the two surfaces that already create sessions — CLI on desktop, the New session sheet on phone. Decision 3 now says "no create button" outright; decision 6 drops the new section.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -276,7 +251,7 @@
   created_at         TEXT NOT NULL,
   retired_at         TEXT
 );</code></pre>
-<p><b>A.2 — Listing.</b> <code>/watch/state</code> session entries gain shell terminals with <code>kind: "shell"</code>, name <code>term-<n></code> (n = per-user counter), cwd, and a last-activity fact. The web terminal switcher and the phone terminal list group them in a <i>Terminals</i> section (after Agent sections, before Idle).</p>
+<p><b>A.2 — Listing.</b> <code>/watch/state</code> session entries gain shell terminals with <code>kind: "shell"</code>, name <code>zsh · <cwd tail></code>, cwd, and a last-activity fact. They render in the web terminal switcher and the phone Watch list as ordinary rows inside the existing sections — a shell typed at recently reads as moving, otherwise idle — with a ▹ dot and neutral tone, never an attention badge (decision 6).</p>
 <p><b>A.3 — Endpoints.</b> Create: <code>POST /terminals</code> body <code>{ "cwd": "~" | path }</code> → 201 with the terminal id and terminal URL. Retire: <code>DELETE /terminals/{id}</code>. Both owner-gated (decision 1). Attach: no new endpoint — the existing per-session <code>attach-ticket</code> and <code>/client/terminal</code> must accept <code>kind: "shell"</code> targets (today they resolve agent sessions; the identity of the guard chain is what must not change — see B.3). Directory picker source: the existing project-folder discovery that feeds launch defaults, plus Home.</p>
 <p><b>A.4 — Launch plumbing.</b> Reuse <code>TmuxRuntime::create_session</code> with command <code>/bin/zsh -l</code> in the requested cwd. Do <b>not</b> wrap in <code>managed_session_command</code>: terminal seats are unmanaged on purpose — no <code>CLAUDE_SESSION_MANAGER_ID</code>, so <code>sm</code> commands typed there are unattributed reads (precedent: <code>sm watch</code> from a plain terminal, operator docs). Pane logging uses the existing session-log path unchanged (decision 7). Kill uses existing <code>kill_session</code>.</p>
 <p><b>A.5 — Config.</b> <code>terminal_limits</code> gains: <code>plain_terminal_enabled</code> (default <b>true</b>), <code>max_plain_terminals</code> (default 4), <code>idle_reap_minutes</code> (default 180). Owner-editable at runtime like the other four limits; values outside documented ranges rejected.</p>
@@ -289,15 +264,15 @@
 <p>B.5 — Required tests: toggle-off blocks create and attach (both clients); non-owner create denied; revoked device denied; proof replay denied; cap enforced; reaper retires exactly on the A.5 semantics (idle window, input resets); restart re-adopts unretired terminals whose tmux session is still alive and retires the rest.</p>
 
 <h3>C. Web user experience</h3>
-<p>C.1 — Terminal page: Terminals section in the switcher; rows show name, cwd tail, last-input fact. "New terminal" button in the page header opens a picker (Home, then recent project folders, then an entered path); creating immediately attaches in the same view.</p>
+<p>C.1 — Terminal page: no new controls. Shell seats are switcher rows (name <code>zsh · <cwd tail></code>, fact = last input) inside the section their state implies; opening, Retire, RTT readout and route choice behave as for agents. Creating on desktop is CLI-only: <code>sm shell [dir]</code> in any real terminal creates the seat and prints a terminal URL that opens this same page.</p>
 <p>C.2 — Desktop gets full xterm.js behavior (real keyboard, no key row). RTT readout and route choice (relay vs direct localhost/LAN, <code>terminal-route.js</code>) work unchanged for shells.</p>
 <p>C.3 — Retire: same control as agent Retire. Killed seats drop from the switcher and list within one poll.</p>
 <p>C.4 — Settings: the three new limit fields appear on the existing Terminal limits section, same validation and no-restart semantics.</p>
 <p>C.5 — Target use cases the UX must serve without leaving the terminal page: (1) check on a build you started in a terminal; (2) run <code>gh</code>/<code>git</code> while away from the Mac; (3) open a shell in a project to steer a manual deploy step; (4) use the Mac's tmux session from the browser on another machine at home; (5) kill the shell when done.</p>
 
 <h3>D. Mobile user experience</h3>
-<p>D.1 — Watch list: Terminals section; row fact = "open · last input 12m". Tap → the existing terminal attach screen (it already keys off <code>mobile_terminal.supported</code>); "Open terminal" pill unchanged in wording.</p>
-<p>D.2 — Create: terminal screen's top-bar "+" → directory sheet (Home + recent project folders) → creates and attaches. No separate launch window, no model/tier prompt (there is no model).</p>
+<p>D.1 — Watch list: shells are ordinary rows (▹ dot, fact line "open · last input 12m") inside the existing sections. Tap → the existing terminal attach screen (it already keys off <code>mobile_terminal.supported</code>); "Open terminal" pill unchanged in wording.</p>
+<p>D.2 — Create: the app's existing New session sheet (opened from the app menu, used today for agents) gains a "Terminal — plain zsh" line in the agent-type picker; choosing it replaces the model step with a folder line (Home + recent projects). Creating attaches straight into the terminal screen.</p>
 <p>D.3 — Keys: phone-key row becomes Esc | Tab | Shift+Tab | ↑ | ↓ | Ctrl-C | <b>Ctrl</b>. The Ctrl key is a sticky modifier: armed for one next keypress, shows armed state visually; Ctrl+letter uses the same send-keys plumbing as existing combos. Layout change keeps every current key reachable; the row stays one row under portrait width or the modifier lives above the row.</p>
 <p>D.4 — Terminal limits: the three new fields join <code>TerminalLimitsSection</code>, and a "Kill all terminal seats" affordance exists next to the toggle (one action, two taps, confirms).</p>
 
@@ -313,7 +288,7 @@
 <p><b>Precedent for non-agent panes?</b> The test suite already launches bare shell fixtures (<code>runtime-sh</code> entries in read_only_http.rs) to exercise the launch plumbing, confirming the plumbing is provider-agnostic; this memo promotes that to product.</p>
 <p><b>Why does the phone keep a Ctrl-C button and get Ctrl-D/L/Z via modifier instead of buttons?</b> Ctrl-C is common enough to keep one tap; the rest are a modifier's worth of frequency, and the key row width is the scarcest real estate on the screen.</p>
 <p><b>What if I want the shell to have my agent tools' context (sm id)?</b> Deliberately absent: unattributed keeps <code>sm</code> reads safe to type there. A future "pilot this shell as a managed session" could add attribution back; it is not needed for C.5.</p>
-<p><b>Cost/split hint for implementation</b>: three natural tickets — (1) server: shell seat, endpoints, reaper, limits, tests; (2) web: switcher/New terminal/Settings; (3) mobile: section, create sheet, Ctrl modifier, limits UI. (1) blocks the others; (2) and (3) are independent.</p>
+<p><b>Cost/split hint for implementation</b>: three natural tickets — (1) server: shell seat, endpoints, reaper, limits, tests; (2) web: switcher rows for shell seats, settings fields; (3) mobile: watch-list rows, New session sheet type line, Ctrl modifier, limits UI. (1) blocks the others; (2) and (3) are independent.</p>
 
 <style id="memo-dark-style">
   :root[data-theme="dark"] {
