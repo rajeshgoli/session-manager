@@ -170,6 +170,43 @@ test('desktop and phone image paste uploads once and types only a bracketed abso
   } finally { await browser.close(); }
 });
 
+test('macOS Control+V pastes browser images and text, and explains denied clipboard access', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { context, page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'platform', { value: 'MacIntel' });
+      window.clipboardReads = 0;
+      window.clipboardMode = 'image';
+      Object.defineProperty(navigator.clipboard, 'read', { value: async () => {
+        window.clipboardReads++;
+        if (window.clipboardMode === 'denied') throw new DOMException('Denied', 'NotAllowedError');
+        if (window.clipboardMode === 'text') return [{ types: ['text/plain'], getType: async () => new Blob(['browser clipboard text'], { type: 'text/plain' }) }];
+        return [{ types: ['image/png'], getType: async () => new Blob([new Uint8Array([137,80,78,71,13,10,26,10])], { type: 'image/png' }) }];
+      } });
+    });
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Control+v');
+    await page.waitForFunction(() => window.sockets.some(ws => ws.sent.some(frame => frame.type === 'input' && frame.data.includes('paste-test.png'))), null, { timeout: 3000 });
+    assert.equal(state.images.length, 1);
+    assert.equal(await page.evaluate(() => window.clipboardReads), 1);
+    assert.equal(await page.evaluate(() => window.sockets.flatMap(ws => ws.sent).filter(frame => frame.type === 'input').map(frame => frame.data).join('')), '\x1b[200~/tmp/agent/pasted-images/paste-test.png\x1b[201~');
+    await page.evaluate(() => { window.clipboardMode = 'text'; });
+    await page.keyboard.press('Control+v');
+    await page.waitForFunction(() => window.sockets.flatMap(ws => ws.sent).filter(frame => frame.type === 'input').at(-1)?.data === 'browser clipboard text');
+    await page.evaluate(() => { window.clipboardMode = 'denied'; });
+    await page.keyboard.press('Control+v');
+    await page.getByText('Could not read the browser clipboard. Allow clipboard access, or paste with Cmd+V.', { exact: true }).waitFor();
+    assert.equal(state.images.length, 1);
+    assert.equal(await page.evaluate(() => window.clipboardReads), 3);
+    assert.equal(await page.evaluate(() => window.sockets.flatMap(ws => ws.sent).filter(frame => frame.type === 'input').length), 2);
+    assert.deepEqual(errors, []);
+    await context.close();
+  } finally { await browser.close(); }
+});
+
 test('switcher, keys and route at desktop and phone sizes', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   const shots = SHOTS;
