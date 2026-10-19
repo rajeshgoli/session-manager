@@ -430,16 +430,30 @@ pub fn probe_health(address: SocketAddr) -> Result<()> {
         },
         address.port(),
     );
-    let mut stream = TcpStream::connect_timeout(&probe, Duration::from_secs(1))?;
-    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    // Share one budget across connect, write and read. Final-window retries
+    // must finish before even an older replacement's 35-second decision wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut stream = TcpStream::connect_timeout(&probe, probe_time_remaining(deadline)?)?;
+    stream.set_write_timeout(Some(probe_time_remaining(deadline)?))?;
     stream.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    stream.set_read_timeout(Some(probe_time_remaining(deadline)?))?;
     let mut response = [0; 64];
     let bytes = stream.read(&mut response)?;
     if !response[..bytes].starts_with(b"HTTP/1.1 200") {
         bail!("replacement health check failed");
     }
     Ok(())
+}
+
+fn probe_time_remaining(deadline: std::time::Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "replacement health probe exceeded its one-second budget",
+        ));
+    }
+    Ok(remaining)
 }
 
 pub fn await_stable_serving(stream: &mut UnixStream, address: SocketAddr) -> Result<()> {
@@ -456,11 +470,21 @@ fn await_stable_serving_for(
     let mut consecutive_timeouts = 0;
     // Scheduling delays must not let an unchecked replacement pass the window.
     let mut first_probe = true;
-    while first_probe || std::time::Instant::now() < deadline {
+    // A timeout near the window's end gets the same retry allowance as an
+    // earlier timeout. Commit still requires a successful final probe. With
+    // one-second probes and no post-window pacing, this adds at most three
+    // seconds to the window, below the peer's 35-second decision timeout.
+    while first_probe || std::time::Instant::now() < deadline || consecutive_timeouts != 0 {
         first_probe = false;
         let mut byte = [0];
-        let check_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        if readable_before(stream, check_deadline.min(deadline))? {
+        let now = std::time::Instant::now();
+        let check_deadline = if now < deadline {
+            (now + Duration::from_secs(1)).min(deadline)
+        } else {
+            // Keep observing peer closure without delaying recovery probes.
+            now + Duration::from_millis(1)
+        };
+        if readable_before(stream, check_deadline)? {
             match stream.read(&mut byte) {
                 Ok(0) => bail!("replacement closed handover connection"),
                 Ok(_) => bail!("replacement sent unexpected handover data"),
@@ -479,20 +503,15 @@ fn await_stable_serving_for(
                     )
                 });
                 consecutive_timeouts += 1;
-                if !timed_out || consecutive_timeouts >= 3 || std::time::Instant::now() >= deadline
-                {
+                if !timed_out || consecutive_timeouts >= 3 {
                     return Err(error).context("probing replacement health");
                 }
                 eprintln!(
                     "replacement health probe timed out ({consecutive_timeouts}/3); \
-                     retrying within stability window: {error:#}"
+                     retrying before handover decision: {error:#}"
                 );
             }
         }
-    }
-    // The deadline can expire between iterations after a tolerated timeout.
-    if consecutive_timeouts != 0 {
-        bail!("replacement health did not recover before stability window ended");
     }
     Ok(())
 }
@@ -851,14 +870,36 @@ mod tests {
     }
 
     #[test]
-    fn health_timeout_at_window_end_requests_rollback() {
+    fn health_timeout_at_window_end_recovers_before_commit() {
         let (result, probes) = check_health_sequence(
-            &[true],
+            &[true, true, false],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_millis(10),
+        );
+        result.unwrap();
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn persistent_health_timeout_at_window_end_requests_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[true, true, true],
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             Duration::from_millis(10),
         );
         assert!(result.is_err());
-        assert_eq!(probes, 1);
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn unhealthy_response_after_window_end_timeout_requests_rollback() {
+        let (result, probes) = check_health_sequence(
+            &[true, false],
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_millis(10),
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("health check failed"));
+        assert_eq!(probes, 2);
     }
 
     #[test]
