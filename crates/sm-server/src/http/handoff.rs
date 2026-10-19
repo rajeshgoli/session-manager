@@ -573,7 +573,7 @@ pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
     });
 }
 
-/// Start the successor, then move the work (Appendices F and G).
+/// Create the successor, move the work, then launch (Appendices F and G).
 pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> anyhow::Result<()> {
     // Every Claude turn end lands here; most have no handoff to start, and
     // this read is served from the parsed-state cache.
@@ -614,34 +614,11 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
             .session_store
             .record_opencode_handoff_successor(predecessor_id, &successor.id)?;
     }
-    if state.config.rust_core.runtime_enabled {
-        // Claude takes seconds to show its composer, and a brief typed before
-        // then is lost (#1927). Handoff notices are delivered ready-fenced as
-        // well, so a timeout here leaves the brief queued for the retry sweep.
-        let runtime = state
-            .runtime()
-            .for_socket_name(successor.tmux_socket_name.as_deref());
-        let (tmux_session, provider) = (successor.tmux_session.clone(), successor.provider.clone());
-        let store = state.session_store.clone();
-        let successor_id = successor.id.clone();
-        let ready = tokio::task::spawn_blocking(move || {
-            if provider == "opencode" {
-                if store.opencode_http_ready(&successor_id)? {
-                    Ok(())
-                } else {
-                    anyhow::bail!("Opencode successor is not ready")
-                }
-            } else {
-                runtime.wait_for_initial_brief_readiness(&tmux_session, &provider)
-            }
-        })
-        .await?;
-        if let Err(error) = ready {
-            eprintln!(
-                "handoff successor {} not ready for its brief: {error:#}",
-                successor.id
-            );
-        }
+    if !state
+        .session_store
+        .handoff_uses_launch_prompt(&successor.id)?
+    {
+        wait_for_successor_readiness(&state, &successor).await;
     }
     complete_handoff(&state, predecessor_id, &successor.id).await
 }
@@ -694,19 +671,14 @@ pub(super) async fn start_retired_autopm_successor(
             return Err(anyhow::anyhow!(error));
         }
     };
-    wait_for_successor_readiness(state, &successor).await;
-    if let Some(retired_at) = predecessor.completed_at.as_deref() {
-        super::claims::work_claim_store(state)
-            .reopen_retired_claims(&predecessor.id, retired_at)?;
+    if !state
+        .session_store
+        .handoff_uses_launch_prompt(&successor.id)?
+    {
+        wait_for_successor_readiness(state, &successor).await;
     }
     let brief = move_work(state, &state.session_store, &predecessor.id, &successor.id)?;
-    state.session_store.queue_handoff_notice(
-        &predecessor.id,
-        &successor.id,
-        &brief.text,
-        &execute::brief_message_id(&predecessor.id),
-        &[&successor.id, &predecessor.id],
-    )?;
+    deliver_successor_brief(state, &predecessor.id, &successor.id, &brief).await?;
     if let Some((branch, base)) = detached_worktree {
         let working_dir = expand_home(&predecessor.working_dir).display().to_string();
         let text = format!(
@@ -725,7 +697,7 @@ pub(super) async fn start_retired_autopm_successor(
         .session_store
         .hand_off_pending_messages(&predecessor.id, &successor.id)?;
     state.session_store.finish_handoff(&predecessor.id)?;
-    Ok(Some(successor))
+    state.session_store.get_session(&successor.id)
 }
 
 async fn wait_for_successor_readiness(state: &Arc<AppState>, successor: &SessionRecord) {
@@ -761,9 +733,131 @@ async fn wait_for_successor_readiness(state: &Arc<AppState>, successor: &Session
     }
 }
 
+fn supports_handoff_launch_prompt(node: &str, provider: &str) -> bool {
+    node == "primary" && matches!(provider, "claude" | "codex-fork")
+}
+
+/// Atomic prompt transport, after every obligation store has transferred.
+async fn deliver_successor_brief(
+    state: &Arc<AppState>,
+    predecessor_id: &str,
+    successor_id: &str,
+    brief: &PreparedBrief,
+) -> anyhow::Result<()> {
+    if !state
+        .session_store
+        .handoff_uses_launch_prompt(successor_id)?
+    {
+        return state.session_store.queue_handoff_notice(
+            predecessor_id,
+            successor_id,
+            &brief.text,
+            &execute::brief_message_id(predecessor_id),
+            &[successor_id, predecessor_id],
+        );
+    }
+    if let Some(status) = state
+        .session_store
+        .handoff_runtime_launch_status(successor_id)?
+    {
+        anyhow::ensure!(
+            status == "applied",
+            "handoff runtime launch is {status}; inspect retained diagnostics before recovery"
+        );
+        return Ok(());
+    }
+    let successor = state
+        .session_store
+        .get_session(successor_id)?
+        .ok_or_else(|| anyhow::anyhow!("handoff successor disappeared"))?;
+    let view = state
+        .session_store
+        .handoff_note_view(predecessor_id, false, false)?;
+    let prompt = launch_prompt(&brief.ordinary, &view);
+    let (prompt, intent_id, sha256) = accept_spawn_brief(
+        state,
+        Some(&prompt),
+        SpawnBriefSource {
+            kind: "stdin".into(),
+            path: None,
+        },
+        successor.provider.clone(),
+        successor.model.clone(),
+        successor.reasoning_effort.clone(),
+        successor.friendly_name.clone(),
+        successor.parent_session_id.clone(),
+        Some(successor.node.clone()),
+        Some(successor.working_dir.clone()),
+    )
+    .map_err(|error| anyhow::anyhow!(api_error_reason(&error)))?;
+    let payload = CreateCoreSessionRequest {
+        provider: Some(successor.provider.clone()),
+        working_dir: Some(successor.working_dir.clone()),
+        model: successor.model.clone(),
+        reasoning_effort: successor.reasoning_effort.clone(),
+        initial_message: Some(prompt),
+        spawn_brief: Some(SpawnBriefBinding { intent_id, sha256 }),
+        started_by_sm: true,
+        ..Default::default()
+    };
+    let (store, runtime, id) = (
+        state.session_store.clone(),
+        state
+            .runtime()
+            .for_socket_name(successor.tmux_socket_name.as_deref()),
+        successor_id.to_owned(),
+    );
+    tokio::task::spawn_blocking(move || {
+        store.start_handoff_session_runtime(&id, payload, &runtime)
+    })
+    .await??;
+    Ok(())
+}
+
+fn launch_prompt(ordinary: &str, view: &Value) -> String {
+    let mut lines = ordinary
+        .lines()
+        .filter(|line| {
+            !line.starts_with("Handoff note: ")
+                && *line != "Read the handoff note first, then continue the work."
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    lines.push(String::new());
+    for note in view["notes"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "=== Handoff note from {} ({}), {} ===\n{}",
+            note["session"]["name"].as_str().unwrap_or_default(),
+            note["session"]["id"].as_str().unwrap_or_default(),
+            note["created_at"].as_str().unwrap_or_default(),
+            note["url"]
+                .as_str()
+                .map(|url| format!("Read it first: {url}"))
+                .unwrap_or_else(|| note["text"]
+                    .as_str()
+                    .unwrap_or("Handoff note (file no longer exists)")
+                    .to_owned()),
+        ));
+    }
+    // Reuse the CLI's message formatting, keeping note bytes untouched.
+    let mut messages = view.clone();
+    messages["notes"] = json!([]);
+    messages["line_note_count"] = json!(0);
+    let text = crate::sessions::handoff_notes::render_notes(&messages);
+    if !text.is_empty() {
+        lines.push(format!("\n{text}"));
+    }
+    lines.push("\n=== End of handoff ===".into());
+    if view["line_note_count"].as_u64().unwrap_or(0) > 1 {
+        lines.push("Earlier notes in this line: sm handoff show --line".into());
+    }
+    lines.push("Start from the note's next steps.".into());
+    lines.join("\n")
+}
+
 /// F.2: the same provider, model, effort, worktree, machine and parent,
-/// through the core create path. No initial prompt: the brief follows the
-/// transfer. The error is the D.6 reason.
+/// through the core create path. Local prompt-capable providers defer runtime
+/// startup until after the transfer. The error is the D.6 reason.
 async fn create_successor(
     state: &Arc<AppState>,
     plan: &SuccessorPlan,
@@ -786,6 +880,20 @@ async fn create_successor(
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let created = if state.config.rust_core.runtime_enabled {
+        if supports_handoff_launch_prompt(&plan.node, &plan.provider) {
+            ensure_core_runtime_provider_supported(&payload)
+                .and_then(|()| ensure_core_runtime_request_node_supported(state, &payload))
+                .map_err(|error| api_error_reason(&error))?;
+            return state
+                .session_store
+                .create_handoff_session_record(
+                    payload,
+                    log_dir,
+                    &plan.predecessor_id,
+                    state.runtime().socket_name(),
+                )
+                .map_err(|error| format!("{error:#}"));
+        }
         if plan.provider == "opencode" {
             ensure_core_runtime_request_node_supported(state, &payload)
                 .map_err(|e| api_error_reason(&e))?;
@@ -861,13 +969,7 @@ async fn complete_handoff(
     .await??;
     // Step 3: the successor never acts before it holds the work, and reads
     // the brief before any message it inherits.
-    state.session_store.queue_handoff_notice(
-        predecessor_id,
-        successor_id,
-        &brief.text,
-        &execute::brief_message_id(predecessor_id),
-        &[successor_id, predecessor_id],
-    )?;
+    deliver_successor_brief(state, predecessor_id, successor_id, &brief).await?;
     state
         .session_store
         .hand_off_pending_messages(predecessor_id, successor_id)?;
@@ -904,6 +1006,7 @@ async fn complete_handoff(
 }
 
 struct PreparedBrief {
+    ordinary: String,
     text: String,
     parent_session_id: Option<String>,
     facts: crate::sessions::HandoffFacts,
@@ -917,6 +1020,15 @@ fn move_work(
     predecessor_id: &str,
     successor_id: &str,
 ) -> anyhow::Result<PreparedBrief> {
+    // Retired Auto PM handoffs can restart before their retired claims reopen.
+    if let Some(predecessor) = store.get_session(predecessor_id)? {
+        if predecessor.auto_retired() {
+            if let Some(retired_at) = predecessor.completed_at.as_deref() {
+                claims::work_claim_store(state)
+                    .reopen_retired_claims(predecessor_id, retired_at)?;
+            }
+        }
+    }
     store.transfer_handoff_json(predecessor_id, successor_id)?;
     let successor_name = store
         .get_session(successor_id)?
@@ -939,6 +1051,11 @@ fn move_work(
     crate::owner_push::OwnerPushStore::new(crate::owner_push::push_db_path(&state.config))
         .hand_off_follows(predecessor_id, successor_id, &successor_name)?;
 
+    if store.handoff_uses_launch_prompt(successor_id)? {
+        // Retarget pending input without draining it: the successor is still
+        // stopped, and its first input must be the atomic launch prompt.
+        queue.hand_off_messages(predecessor_id, successor_id)?;
+    }
     let facts = store.handoff_facts(predecessor_id, successor_id)?;
     let held = claims.claims_for_session(successor_id, true)?;
     let branch = held.iter().find_map(|view| view.claim.branch.clone());
@@ -961,6 +1078,7 @@ fn move_work(
         original_brief: facts.original_brief.clone(),
     };
     Ok(PreparedBrief {
+        ordinary: brief.text(),
         text: brief
             .text()
             .replace(
@@ -1011,7 +1129,181 @@ async fn retire_predecessor(
 
 #[cfg(test)]
 mod tests {
-    use super::origin_matches_host;
+    use super::*;
+
+    #[tokio::test]
+    async fn deferred_handoff_restart_transfers_before_attempting_atomic_launch() {
+        let root = std::env::temp_dir().join(format!(
+            "sm-handoff-launch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state_file = root.join("sessions.json");
+        std::fs::write(
+            &state_file,
+            json!({"sessions":[
+                {"id":"pred2342", "name":"worker", "provider":"claude", "working_dir":root,
+                 "tmux_session":"pred2342", "status":"idle", "node":"primary",
+             "created_at":"2026-10-18T00:00:00Z", "last_activity":"2026-10-18T00:00:00Z"},
+                {"id":"child2342", "name":"child", "provider":"claude", "working_dir":root,
+                 "tmux_session":"child2342", "status":"running", "parent_session_id":"pred2342",
+             "created_at":"2026-10-18T00:00:00Z", "last_activity":"2026-10-18T00:00:00Z"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file.display().to_string();
+        config.sm_send.db_path = root.join("queue.db").display().to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let state = Arc::new(AppState::new(config.clone()));
+        let note = HandoffNote {
+            kind: crate::handoff::execute::NoteKind::Text,
+            value: "Continue child2342; preserve `$(literal)` exactly.".into(),
+            source: Some("file".into()),
+            source_path: None,
+        };
+        state
+            .session_store
+            .accept_handoff("pred2342", "pred2342", &note)
+            .unwrap();
+        state
+            .session_store
+            .claim_handoff_start("pred2342")
+            .unwrap()
+            .unwrap();
+        // Missing working directory rejects runtime creation, after the launch
+        // ledger is written. A private socket keeps this away from live tmux.
+        let successor = state
+            .session_store
+            .create_handoff_session_record(
+                CreateCoreSessionRequest {
+                    provider: Some("claude".into()),
+                    working_dir: Some(root.join("missing").display().to_string()),
+                    ..Default::default()
+                },
+                Some(root.clone()),
+                "pred2342",
+                Some(&format!("sm-2342-{}", std::process::id())),
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .session_store
+                .get_session("child2342")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("pred2342")
+        );
+        state
+            .session_store
+            .queue_handoff_notice(
+                "pred2342",
+                "pred2342",
+                "Inherited input",
+                "pending2342",
+                &[],
+            )
+            .unwrap();
+        drop(state);
+        let state = Arc::new(AppState::new(config));
+        assert!(state
+            .session_store
+            .pending_handoff_work()
+            .unwrap()
+            .contains(&HandoffWork::Resume {
+                predecessor_id: "pred2342".into(),
+                successor_id: successor.id.clone()
+            }));
+        assert!(complete_handoff(&state, "pred2342", &successor.id)
+            .await
+            .is_err());
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let queued = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
+            .pending_messages_for_target(&successor.id, 20)
+            .unwrap();
+        assert!(queued
+            .iter()
+            .any(|message| message.text == "Inherited input"));
+        assert!(!queued
+            .iter()
+            .any(|message| message.id == execute::brief_message_id("pred2342")));
+        let launch = &raw["session_runtime_launches"][0];
+        assert_eq!(launch["session_id"], successor.id);
+        assert_eq!(launch["force_initial_prompt_stdin"], true);
+        let prompt = launch["initial_message"].as_str().unwrap();
+        assert!(prompt.contains("Children: child (child2342)"), "{prompt}");
+        assert!(prompt.contains(&note.value));
+        let artifact = &raw["spawn_launch_intents"][0]["artifact"];
+        assert_eq!(
+            std::fs::read_to_string(artifact["path"].as_str().unwrap()).unwrap(),
+            prompt
+        );
+        assert_eq!(
+            state
+                .session_store
+                .get_session("child2342")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some(successor.id.as_str())
+        );
+        assert!(state
+            .session_store
+            .get_session(&successor.id)
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+        assert!(complete_handoff(&state, "pred2342", &successor.id)
+            .await
+            .is_err());
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(raw["session_runtime_launches"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["spawn_launch_intents"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handoff_launch_prompt_keeps_note_and_owner_messages_verbatim() {
+        let view = json!({
+            "notes": [{"session":{"name":"worker","id":"pred"},
+                "created_at":"2026-10-18T00:00:00Z", "text":"  Next: `$(literal)`\nHandoff note: keep this line\n"}],
+            "owner_name":"Rajesh", "owner_messages":[{"at":"2026-10-18T00:01:00Z",
+                "source":"inbox reply", "session":{"name":"worker"}, "text":"Do #2342\nexactly."}],
+            "line_note_count":2
+        });
+        let ordinary = "[sm handoff] Taking over\nHandoff note: handoff_notes:pred\nYou now hold: ticket #2342\nRead the handoff note first, then continue the work.";
+        assert_eq!(launch_prompt(ordinary, &view), "[sm handoff] Taking over\nYou now hold: ticket #2342\n\n=== Handoff note from worker (pred), 2026-10-18T00:00:00Z ===\n  Next: `$(literal)`\nHandoff note: keep this line\n\n\n=== Rajesh's messages to this line, verbatim (oldest first) ===\n[2026-10-18T00:01:00Z · inbox reply · worker] Do #2342\nexactly.\n\n=== End of handoff ===\nEarlier notes in this line: sm handoff show --line\nStart from the note's next steps.");
+        let mut link = view;
+        link["notes"][0]["url"] = json!("https://example.com/note");
+        link["owner_messages"] = json!([]);
+        link["line_note_count"] = json!(1);
+        let prompt = launch_prompt(ordinary, &link);
+        assert!(prompt.contains("Read it first: https://example.com/note"));
+        assert!(!prompt.contains("verbatim"));
+        assert!(!prompt.contains("Earlier notes"));
+    }
+
+    #[test]
+    fn handoff_launch_prompt_is_limited_to_local_prompt_providers() {
+        for provider in ["claude", "codex-fork"] {
+            assert!(supports_handoff_launch_prompt("primary", provider));
+            assert!(!supports_handoff_launch_prompt("remote", provider));
+        }
+        for provider in ["codex", "opencode", "shell", "codex-app"] {
+            assert!(!supports_handoff_launch_prompt("primary", provider));
+        }
+    }
 
     #[test]
     fn origin_must_match_host() {

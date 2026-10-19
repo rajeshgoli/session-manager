@@ -1145,17 +1145,56 @@ impl SessionStore {
         if !matches!(launch.status.as_str(), "prepared" | "launching") {
             return Ok(());
         }
-        if launch.provider == "claude" && launch.force_initial_prompt_stdin {
+        let deferred_handoff = state["handoff_deferred_sessions"][&launch.session_id] == true;
+        if launch.force_initial_prompt_stdin
+            && (launch.provider == "claude"
+                || (launch.provider == "codex-fork" && deferred_handoff))
+        {
             // A restart cannot determine whether tmux delivered the immutable
             // first brief before the process died. Replaying it risks
             // duplicate work, so retain the artifact and require an explicit
             // recovery decision instead.
+            if deferred_handoff {
+                // This record owns transferred work. A surviving process must
+                // stop before its durable record can truthfully say stopped.
+                let teardown = self
+                    .delivery_runtime
+                    .as_ref()
+                    .map(|runtime| {
+                        runtime
+                            .for_socket_name(launch.tmux_socket_name.as_deref())
+                            .teardown_session_for_restore(&launch.tmux_session)
+                    })
+                    .unwrap_or_else(|| RestoreTmuxTeardownOutcome::Inconclusive {
+                        reason: "runtime recovery is disabled".into(),
+                    });
+                if let RestoreTmuxTeardownOutcome::Inconclusive { reason } = teardown {
+                    let reason = format!("failed to confirm interrupted {} handoff teardown: {reason}; the runtime may still be live; prompt replay is forbidden", launch.provider);
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        false,
+                        &reason,
+                    )?;
+                    let session = session_object_mut(
+                        ensure_sessions_array_mut(&mut state)?,
+                        &launch.session_id,
+                    )
+                    .context("handoff successor disappeared")?;
+                    session.insert("status".into(), json!("error"));
+                    session.insert("stopped_at".into(), Value::Null);
+                    session.insert("error_message".into(), json!(reason));
+                    self.write_raw_json_value(&state)?;
+                    return Ok(());
+                }
+            }
             mark_runtime_launch_failed(
                 &mut state,
                 launch_id,
                 &launch.session_id,
                 launch.operation_kind == "create",
-                "refusing to recover an unacknowledged Claude spawn brief because it may already have been submitted",
+                &format!("refusing to recover an unacknowledged {} spawn brief because it may already have been submitted", if launch.provider == "claude" { "Claude" } else { &launch.provider }),
             )?;
             self.write_raw_json_value(&state)?;
             return Ok(());
@@ -4574,6 +4613,42 @@ impl SessionStore {
         request: CreateCoreSessionRequest,
         log_dir: Option<PathBuf>,
     ) -> Result<SessionRecord> {
+        self.create_core_session_record(request, log_dir, None)
+    }
+
+    /// Persist a stopped successor and its recovery link in one state write.
+    /// No runtime exists until the handoff transfer has completed.
+    pub(crate) fn create_handoff_session_record(
+        &self,
+        request: CreateCoreSessionRequest,
+        log_dir: Option<PathBuf>,
+        predecessor_id: &str,
+        socket: Option<&str>,
+    ) -> Result<SessionRecord> {
+        self.create_core_session_record(request, log_dir, Some((predecessor_id, socket)))
+    }
+
+    pub(crate) fn handoff_uses_launch_prompt(&self, id: &str) -> Result<bool> {
+        Ok(self.load_raw_json_value()?["handoff_deferred_sessions"][id] == true)
+    }
+
+    /// None means no launch was attempted; otherwise the launch ledger owns
+    /// recovery and prompt replay is forbidden here.
+    pub(crate) fn handoff_runtime_launch_status(&self, id: &str) -> Result<Option<String>> {
+        Ok(
+            session_runtime_launch_records(&self.load_raw_json_value()?)?
+                .into_iter()
+                .find(|launch| launch.session_id == id && launch.operation_kind == "create")
+                .map(|launch| launch.status),
+        )
+    }
+
+    fn create_core_session_record(
+        &self,
+        request: CreateCoreSessionRequest,
+        log_dir: Option<PathBuf>,
+        handoff: Option<(&str, Option<&str>)>,
+    ) -> Result<SessionRecord> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         if let Some(parent_id) = request.parent_session_id.as_deref() {
@@ -4586,18 +4661,47 @@ impl SessionStore {
                 &naming_sessions,
                 &request,
                 log_dir.as_deref(),
-                false,
-                None,
+                handoff.is_some(),
+                handoff.and_then(|(_, socket)| socket),
             )?;
+            let mut record = record;
+            if let Some((predecessor_id, _)) = handoff {
+                record.status = "stopped".into();
+                record.stopped_at = Some(now_rfc3339());
+                let predecessor = session_object_mut(sessions, predecessor_id)
+                    .context("handoff predecessor disappeared")?;
+                let mut transfer = handoff_transfer::raw_handoff_record(predecessor)
+                    .context("handoff record disappeared")?;
+                anyhow::ensure!(
+                    transfer.state == crate::handoff::policy::HandoffPhase::Spawning,
+                    "handoff is no longer spawning"
+                );
+                transfer.state = crate::handoff::policy::HandoffPhase::Transferring;
+                transfer.successor_session_id = Some(record.id.clone());
+                handoff_transfer::write_handoff_record(predecessor, &transfer);
+            }
             sessions.push(serde_json::to_value(&record)?);
             record
         };
+        if handoff.is_some() {
+            if !state["handoff_deferred_sessions"].is_object() {
+                state["handoff_deferred_sessions"] = json!({});
+            }
+            state["handoff_deferred_sessions"][&record.id] = json!(true);
+        }
         let log_file = record
             .log_file
             .as_deref()
             .map(expand_home)
             .ok_or_else(|| anyhow::anyhow!("fixture session missing log file"))?;
-        append_log_line(&log_file, "[sm-rust] fixture session created")?;
+        append_log_line(
+            &log_file,
+            if handoff.is_some() {
+                "[sm-rust] deferred handoff session created"
+            } else {
+                "[sm-rust] fixture session created"
+            },
+        )?;
         if let Some(initial_message) = request
             .initial_message
             .as_deref()
@@ -4624,6 +4728,25 @@ impl SessionStore {
         request: CreateCoreSessionRequest,
         log_dir: Option<PathBuf>,
         runtime: &TmuxRuntime,
+    ) -> Result<SessionRecord> {
+        self.create_or_start_core_session(request, log_dir, runtime, None)
+    }
+
+    pub(crate) fn start_handoff_session_runtime(
+        &self,
+        id: &str,
+        request: CreateCoreSessionRequest,
+        runtime: &TmuxRuntime,
+    ) -> Result<SessionRecord> {
+        self.create_or_start_core_session(request, None, runtime, Some(id))
+    }
+
+    fn create_or_start_core_session(
+        &self,
+        request: CreateCoreSessionRequest,
+        log_dir: Option<PathBuf>,
+        runtime: &TmuxRuntime,
+        existing_id: Option<&str>,
     ) -> Result<SessionRecord> {
         let (provider, working_dir) = {
             let _guard = self.write_guard()?;
@@ -4660,7 +4783,32 @@ impl SessionStore {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
         let naming_sessions = sessions_with_registered_aliases(&state);
-        let mut record = {
+        let mut record = if let Some(id) = existing_id {
+            anyhow::ensure!(
+                state["handoff_deferred_sessions"][id] == true,
+                "session is not a deferred handoff successor"
+            );
+            let record = raw_session_object(&state, id).context("handoff successor disappeared")?;
+            // The launch ledger owns recovery once an attempt is durable. Never
+            // replay a prompt whose provider acceptance may be unknown.
+            if let Some(launch) = session_runtime_launch_records(&state)?
+                .iter()
+                .find(|launch| launch.session_id == id && launch.operation_kind == "create")
+            {
+                anyhow::ensure!(
+                    launch.status == "applied",
+                    "handoff runtime launch {} is {}: {}",
+                    launch.id,
+                    launch.status,
+                    launch
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("awaiting recovery")
+                );
+                return Ok(serde_json::from_value(Value::Object(record.clone()))?);
+            }
+            serde_json::from_value::<SessionRecord>(Value::Object(record.clone()))?
+        } else {
             self.build_core_session_record(
                 &naming_sessions,
                 &request,
@@ -4762,7 +4910,14 @@ impl SessionStore {
         });
         record.status = "stopped".to_owned();
         record.stopped_at = Some(now_rfc3339());
-        ensure_sessions_array_mut(&mut state)?.push(serde_json::to_value(&record)?);
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        if let Some(id) = existing_id {
+            let current =
+                session_object_mut(sessions, id).context("handoff successor disappeared")?;
+            current.extend(serde_json::to_value(&record)?.as_object().unwrap().clone());
+        } else {
+            sessions.push(serde_json::to_value(&record)?);
+        }
         if let Some(brief) = request.spawn_brief.as_ref() {
             bind_spawn_launch_intent_in_state(&mut state, &brief.intent_id, &record.id)?;
         }
@@ -4829,8 +4984,8 @@ impl SessionStore {
                     "session runtime launch failed: session={} provider={}: {failure_reason}",
                     record.id, record.provider
                 );
-                let remove_provisional_session =
-                    remove_failed_provisional_runtime_session(&state, &record.id);
+                let remove_provisional_session = existing_id.is_none()
+                    && remove_failed_provisional_runtime_session(&state, &record.id);
                 mark_runtime_launch_failed(
                     &mut state,
                     &launch_id,
@@ -4868,7 +5023,8 @@ impl SessionStore {
                     let teardown_error = runtime.kill_session(&record.tmux_session).err();
                     let _guard = self.write_guard()?;
                     let mut state = self.load_raw_json_value()?;
-                    let remove_provisional_session = teardown_error.is_none()
+                    let remove_provisional_session = existing_id.is_none()
+                        && teardown_error.is_none()
                         && remove_failed_provisional_runtime_session(&state, &record.id);
                     let failure_reason = match teardown_error.as_ref() {
                         Some(teardown_error) => format!(
@@ -4935,7 +5091,17 @@ impl SessionStore {
         current_record.status = "running".to_owned();
         current_record.stopped_at = None;
         current_record.last_activity = now_rfc3339();
-        *session = serde_json::to_value(&current_record)?;
+        let updated = serde_json::to_value(&current_record)?;
+        if existing_id.is_some() {
+            // Transferred metadata can include raw-only fields such as Auto PM
+            // authorization. Starting a runtime must preserve them.
+            session
+                .as_object_mut()
+                .unwrap()
+                .extend(updated.as_object().unwrap().clone());
+        } else {
+            *session = updated;
+        }
         record = current_record;
         mark_runtime_launch_applied(&mut state, &launch_id, record.provider_resume_id.as_deref())?;
         if let Err(error) = self.write_raw_json_value(&state) {
@@ -14990,6 +15156,10 @@ fn mark_runtime_launch_failed(
     remove_provisional_session: bool,
     failure_reason: &str,
 ) -> Result<()> {
+    // A deferred handoff already owns transferred work. Keep its stopped
+    // record even when startup/recovery cannot confirm prompt acceptance.
+    let remove_provisional_session =
+        remove_provisional_session && state["handoff_deferred_sessions"][session_id] != true;
     let mut records = session_runtime_launch_records(state)?;
     let record = records
         .iter_mut()
