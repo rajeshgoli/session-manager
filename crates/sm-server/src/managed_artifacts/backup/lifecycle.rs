@@ -411,17 +411,7 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
     }
     expire(manager, epoch())?;
     let mut conn = manager.store.open()?;
-    let before = row(&conn, device, id)?;
     let body = serde_json::to_string(ack)?;
-    if before["ack_json"].as_str() == Some(&body) {
-        return Ok(());
-    }
-    ensure!(before["state"] == "ready", "backup request is not ready");
-    let coverage = if ack.applied {
-        measure_coverage(&conn, manager, &before)?
-    } else {
-        Coverage::default()
-    };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let r = row(&tx, device, id)?;
     if r["ack_json"].as_str() == Some(&body) {
@@ -430,7 +420,6 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
     ensure!(r["state"] == "ready", "backup request is not ready");
     if ack.applied {
         confirm(&tx, device, id)?;
-        coverage.persist(&tx)?;
         if ack.fetched_bytes > 0 {
             record_rate(&tx, device, "fetch", ack.fetched_bytes, ack.fetch_seconds)?;
         }
@@ -496,6 +485,11 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
         }
     }
     tx.commit()?;
+    // Confirm the device first. Display-only scans cannot let an in-flight
+    // acknowledgement expire, and never hold the artifact writer transaction.
+    if ack.applied {
+        mark_covered(&conn, manager, &r)?;
+    }
     cleanup(manager)
 }
 pub fn expire(manager: &ManagedArtifacts, at: i64) -> Result<()> {
@@ -594,10 +588,10 @@ impl Coverage {
         }
         for (root, artifact, stamp) in self.artifacts {
             conn.execute(
-                "UPDATE artifacts SET backed_up_at=?3,backup_stamp=?4 WHERE root=?1 AND name=?2 AND state=?5 AND location=?6 AND content_stamp IS ?7 AND op IS NULL",
+                "UPDATE artifacts SET backed_up_at=?3,backup_stamp=?4 WHERE root=?1 AND name=?2 AND state=?5 AND location=?6 AND content_stamp IS ?7 AND created_at=?8 AND op IS NULL",
                 params![root, artifact["name"].as_str(), now(), stamp,
                     artifact["state"].as_str(), artifact["location"].as_str(),
-                    artifact["content_stamp"].as_str()],
+                    artifact["content_stamp"].as_str(), artifact["created_at"].as_str()],
             )?;
         }
         Ok(())
@@ -620,6 +614,12 @@ pub(super) fn measure_coverage(
     manager: &ManagedArtifacts,
     request: &Value,
 ) -> Result<Coverage> {
+    #[cfg(test)]
+    BEFORE_COVERAGE_MEASURE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let mut result = Coverage::default();
     let covered: Vec<Value> =
         serde_json::from_str(request["coverage_json"].as_str().unwrap_or("[]"))?;
@@ -628,7 +628,7 @@ pub(super) fn measure_coverage(
         let stamp = scope["stamp"].as_str().context("coverage stamp")?;
         let mut artifacts = Vec::new();
         for root in &manager.config.roots {
-            for a in artifact_store::query(conn,"SELECT name,state,location,content_stamp FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
+            for a in artifact_store::query(conn,"SELECT name,state,location,content_stamp,created_at FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
                 artifacts.push((root, a));
             }
         }
@@ -690,6 +690,11 @@ pub(super) fn measure_coverage(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_COVERAGE_MEASURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn rfc3339(at: i64) -> Result<String> {
