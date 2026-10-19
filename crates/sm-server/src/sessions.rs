@@ -7,7 +7,7 @@ use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -140,6 +140,9 @@ pub struct SessionStore {
     /// message queue on a timer, so a message queued without a runtime waits for
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
+    /// Runtime-launch recovery also starts monitors; defer those until the
+    /// complete server generation is ready, including stores cloned by it.
+    codex_fork_event_monitors_enabled: Arc<AtomicBool>,
     credential_rotation_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
@@ -278,6 +281,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
+            codex_fork_event_monitors_enabled: Arc::new(AtomicBool::new(true)),
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1933,6 +1937,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
+            codex_fork_event_monitors_enabled: Arc::new(AtomicBool::new(true)),
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -7163,6 +7168,17 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(crate) fn with_codex_fork_event_monitors_deferred(self) -> Self {
+        self.codex_fork_event_monitors_enabled
+            .store(false, Ordering::Release);
+        self
+    }
+
+    pub(crate) fn enable_codex_fork_event_monitors(&self) {
+        self.codex_fork_event_monitors_enabled
+            .store(true, Ordering::Release);
+    }
+
     pub fn recover_codex_fork_event_monitors(&self) -> Result<usize> {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(0);
@@ -8537,6 +8553,12 @@ impl SessionStore {
         event_stream_path: PathBuf,
         initial_offset: u64,
     ) -> Result<()> {
+        if !self
+            .codex_fork_event_monitors_enabled
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let store = self.clone();
         let thread_session_id = format!(
             "{}-{}",
@@ -23163,6 +23185,59 @@ sleep 30
                 .provider_resume_id
                 .as_deref(),
             Some("new-thread")
+        );
+    }
+
+    #[test]
+    fn failed_server_preparation_does_not_recover_provider_monitors() {
+        let Some(fixture) = CodexForkHandoffFixture::new("failed-server-preparation") else {
+            return;
+        };
+        let mut raw: Value =
+            serde_json::from_slice(&fs::read(&fixture.state_file).unwrap()).unwrap();
+        raw["sessions"][0]["context_total_input_tokens"] = json!(123);
+        fs::write(&fixture.state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.paths.state_file = fixture.state_file.display().to_string();
+        config.sm_send.db_path = fixture
+            .state_file
+            .with_extension("queue.db")
+            .display()
+            .to_string();
+        config.rust_core.runtime_enabled = true;
+        config.usage.enabled = false;
+        // A failure after state construction must leave recovery untouched on
+        // every attempt. With eager recovery, the first attempt clears this
+        // context gauge and starts a monitor that survives the rejected state.
+        for _ in 0..3 {
+            let result: Result<()> =
+                crate::http::AppState::try_new_with_preparation(config.clone(), |state| {
+                    state.prepare_seat_session_reconciliation(i128::MAX)?;
+                    anyhow::bail!("later startup preparation failed")
+                });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("later startup preparation failed"));
+            assert_eq!(
+                fixture
+                    .store()
+                    .get_session("codex001")
+                    .unwrap()
+                    .unwrap()
+                    .context_total_input_tokens,
+                Some(123)
+            );
+        }
+        let _state = crate::http::AppState::try_new(config).unwrap();
+        assert_eq!(
+            fixture
+                .store()
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .context_total_input_tokens,
+            None
         );
     }
 
