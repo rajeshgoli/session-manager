@@ -227,6 +227,7 @@ AuthorizedKeysFile ${AUTHORIZED_KEYS}
 AllowUsers rajesh
 PermitRootLogin no
 UsePAM no
+SetEnv PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 LogLevel VERBOSE
 LogVerbose auth.c:auth_log():*
 EOF
