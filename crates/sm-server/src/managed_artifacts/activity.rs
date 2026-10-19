@@ -190,28 +190,39 @@ pub fn activity(manager: &ManagedArtifacts, as_of: OffsetDateTime) -> Result<Val
     };
     // Operations run one at a time in id order; a waiting operation starts
     // once everything ahead of it finishes.
+    // Running operations finish first; waiting ones follow in id order. One
+    // the runner skipped (no cold-disk capacity) waits without delaying them.
     let mut queue_seconds = Some(0.0f64);
-    let mut in_flight = Vec::new();
-    for (index, o) in active.iter().enumerate() {
+    let mut timing = Vec::new();
+    for o in &active {
         let want = expected(o, &rates)?;
-        let is_running = running(o);
         let elapsed = o
             .started
-            .filter(|_| is_running)
+            .filter(|_| running(o))
             .map(|s| seconds(s, as_of).max(0.0));
-        let starts_in = (!is_running).then_some(queue_seconds).flatten();
-        let left = match elapsed {
-            Some(e) => want.map(|w| (w - e).max(0.0)),
-            None => want,
+        let left = elapsed.map_or(want, |e| want.map(|w| (w - e).max(0.0)));
+        if running(o) {
+            queue_seconds = queue_seconds.zip(left).map(|(q, l)| q + l);
+        }
+        timing.push((want, elapsed, left));
+    }
+    let runs = active.iter().filter(|o| running(o)).count();
+    let waiting = active.len() - runs;
+    let mut waited = 0;
+    let mut in_flight = Vec::new();
+    for (o, (want, elapsed, left)) in active.iter().zip(timing) {
+        let (ahead, behind, starts_in, remaining) = if running(o) {
+            (0, waiting, None, left)
+        } else {
+            let starts = queue_seconds;
+            queue_seconds = starts.zip(left).map(|(q, l)| q + l);
+            waited += 1;
+            (runs + waited - 1, waiting - waited, starts, queue_seconds)
         };
-        // Seconds until this one finishes, counting everything ahead of it.
-        let remaining = queue_seconds.zip(left).map(|(q, l)| q + l);
-        queue_seconds = remaining;
-        let later = &active[index + 1..];
         in_flight.push(json!({
-            "state": if is_running { "running" } else { "waiting" },
-            "ahead": if is_running { 0 } else { index },
-            "behind": later.iter().filter(|a| !is_running || !running(a)).count(),
+            "state": if running(o) { "running" } else { "waiting" },
+            "ahead": ahead,
+            "behind": behind,
             "expected_seconds": want,
             "elapsed_seconds": elapsed,
             "remaining_seconds": remaining,

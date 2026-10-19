@@ -701,7 +701,7 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
                         json!({"operation_id":op.id,"operation":op.kind,"error":format!("{error:#}")}),
                     )?;
                 }
-                tx.execute("UPDATE artifact_operations SET error=?2,phase=CASE WHEN ?3 THEN 'failed' ELSE phase END WHERE id=?1",params![op.id,format!("{error:#}"),abort])?;
+                tx.execute("UPDATE artifact_operations SET error=?2,phase=CASE WHEN ?3 THEN 'failed' ELSE phase END,finished_at=CASE WHEN ?3 THEN ?4 ELSE finished_at END WHERE id=?1",params![op.id,format!("{error:#}"),abort,now()])?;
                 tx.commit()?;
             }
         }
