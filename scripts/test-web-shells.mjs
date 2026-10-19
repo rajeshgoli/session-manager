@@ -54,7 +54,11 @@ async function setup(browser, { width = 1440, home = false, failDirect = false }
     if (req.isNavigationRequest()) return route.fulfill({ body: doc, contentType: 'text/html' });
     if (path === '/client/terminal/probe') return home ? json({ instance: 'one' }) : route.abort();
     if (req.method() !== 'GET') requests.push({ path, method: req.method(), body: req.postData() ? req.postDataJSON() : null });
-    if (path === '/watch/state') return json({ sessions: state.sessions, counts: {} });
+    if (path === '/watch/state') {
+      if (state.watchWait) await state.watchWait;
+      if (state.watchError) return json({ detail: 'watch unavailable' }, 503);
+      return json({ sessions: state.sessions, counts: {} });
+    }
     if (/browser-attach-ticket$/.test(path)) return json({ ws_url: '/client/terminal', ticket_id: 'one', ticket_secret: 'secret', server_instance: 'one',
       direct: home ? [{ url: 'ws://localhost:8420/client/terminal', probe: 'http://localhost:8420/client/terminal/probe' }] : [] });
     if (path === '/terminals' && req.method() === 'POST') {
@@ -84,6 +88,73 @@ async function setup(browser, { width = 1440, home = false, failDirect = false }
   });
   return { page, requests, state, errors };
 }
+
+for (const width of [390, 1440]) test(`Stale terminal links explain the ended state and return to Agents at ${width}px`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const id of ['retired-agent', 'term-retired', 'missing', 'stopped-agent', 'term-stopped']) {
+      const { page, requests, state, errors } = await setup(browser, { width });
+      if (id.includes('stopped')) state.sessions.push({ ...row(id, id.startsWith('term-')), state: 'stopped', attention: { section: 'stopped' } });
+      await page.goto(`${ORIGIN}/terminal/${id}`);
+      await page.waitForSelector('[data-connection="Ended"]');
+      assert.match(await page.locator('.term-notice').innerText(), /ended or could not be found.*stopped or been retired/s);
+      assert.equal(await page.getByRole('button', { name: 'Reconnect', exact: true }).count(), 0);
+      assert.equal(await page.evaluate(() => window.sockets.length), 0);
+      assert.equal(requests.filter(r => /browser-attach-ticket$/.test(r.path)).length, 0);
+      await page.getByRole('link', { name: 'Back to Agents', exact: true }).click();
+      await page.waitForURL(`${ORIGIN}/`);
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('Initial watch failure offers Retry and waits for identity before attaching', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const id of ['agent', 'term-abcd']) {
+      const { page, requests, state, errors } = await setup(browser);
+      state.watchError = true;
+      await page.goto(`${ORIGIN}/terminal/${id}`);
+      await page.waitForSelector('[data-connection="Ended"]');
+      assert.match(await page.locator('.term-notice').innerText(), /Could not load session information/);
+      assert.equal(await page.evaluate(() => window.sockets.length), 0);
+      assert.equal(requests.filter(r => /browser-attach-ticket$/.test(r.path)).length, 0);
+      let release;
+      state.watchWait = new Promise(resolve => { release = resolve; });
+      state.watchError = false;
+      const pending = page.waitForRequest('**/watch/state');
+      await page.getByRole('button', { name: 'Retry', exact: true }).click();
+      await pending;
+      assert.equal(await page.evaluate(() => window.sockets.length), 0);
+      assert.equal(requests.filter(r => /browser-attach-ticket$/.test(r.path)).length, 0);
+      release();
+      if (id === 'agent') await page.waitForSelector('[data-connection="Live"]');
+      else {
+        await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+        assert.equal(await page.evaluate(() => window.sockets.length), 0);
+      }
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('A stopped shell replaces its SSH instructions with an actionable ended state', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await setup(browser);
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+    state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, state: 'stopped' } : s);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await page.waitForSelector('[data-connection="Ended"]');
+    await page.getByRole('link', { name: 'Back to Agents', exact: true }).waitFor();
+    assert.equal(await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).count(), 0);
+    assert.equal(await page.evaluate(() => window.sockets.length), 0);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
 
 for (const width of [390, 1440]) test(`Shell menus, facts, details and explicit tunnel at ${width}px`, async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });

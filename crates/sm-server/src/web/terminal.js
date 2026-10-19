@@ -114,8 +114,8 @@ function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
 export function TerminalPage({ id, open }) {
   const host = useRef(null);
   const control = useRef(null);
-  const [connection, setConnection] = useState('Connecting');
-  const [error, setError] = useState('');
+  const [transportConnection, setConnection] = useState('Connecting');
+  const [transportError, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
   const [route, setRoute] = useState({ label: '', samples: [] });
   const [away, setAway] = useState(false);
@@ -124,11 +124,18 @@ export function TerminalPage({ id, open }) {
   const showKeys = useWidth(touchKeys);
   // Touch screens keep the phone bar and its keys, even a tablet held wide.
   const wide = !useWidth(narrow) && !showKeys;
-  const [doc, , reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
+  const [doc, watchError, reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
   const shell = isShell(agent);
   // Wait for identity before connecting, so a shell can never attach as an agent.
-  const targetKind = agent ? (shell ? 'shell' : 'agent') : null;
+  const targetKind = agent && agent.state !== 'stopped' && agent.attention?.section !== 'stopped'
+    ? (shell ? 'shell' : 'agent') : null;
+  const lookupFailed = !doc && !!watchError;
+  const unavailable = !!doc && !targetKind;
+  const connection = lookupFailed || unavailable ? 'Ended' : targetKind ? transportConnection : 'Connecting';
+  const error = lookupFailed ? 'Could not load session information. Retry to check whether this terminal is still available.'
+    : unavailable ? 'This terminal has ended or could not be found. The session may have stopped or been retired. Choose another session from Agents.'
+    : transportError;
   const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
   // Details, and whatever it links to (a ticket, PR, doc or job), open beside the terminal.
   const split = open ? open.indexOf(':') : -1;
@@ -429,6 +436,7 @@ export function TerminalPage({ id, open }) {
 
   const linked = agent?.remote_control?.url?.startsWith('https://claude.ai/code/');
   const live = connection === 'Live';
+  const shellAway = away && targetKind === 'shell';
   const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
   const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
   // Hand off… and ⋯ live here, not in the Details panel beside this terminal (#2277).
@@ -486,14 +494,16 @@ export function TerminalPage({ id, open }) {
           aria-label=${`${switcher ? 'Fold' : 'Unfold'} agent list`} aria-expanded=${switcher}
           onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>
       </div>
-      <div class="term-body" ref=${host} hidden=${away && shell}></div>
-      ${away && shell ? html`<${ShellAwayPanel} key=${id} id=${id} />` : null}
+      <div class="term-body" ref=${host} hidden=${shellAway}></div>
+      ${shellAway ? html`<${ShellAwayPanel} key=${id} id=${id} />` : null}
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
       ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">
         <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>
-    ${connection !== 'Live' && !(away && shell) ? html`<div class="term-notice" role="status">${error || connection}
-      ${connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
+    ${connection !== 'Live' && !shellAway ? html`<div class="term-notice" role="status">${error || connection}
+      ${lookupFailed ? html`<button type="button" class="btn" onClick=${reload}>Retry</button>`
+        : unavailable ? html`<a class="btn" href="/" onClick=${(event) => { event.preventDefault(); navigate('/'); }}>Back to Agents</a>`
+        : connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
   </div>`;
 }
