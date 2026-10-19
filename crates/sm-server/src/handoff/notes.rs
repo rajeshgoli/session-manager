@@ -375,17 +375,55 @@ impl SessionStore {
             }
             return remove_draft(path, expected);
         }
+        Ok(self
+            .handoff_run_ssh(
+                &node,
+                include_str!("draft_remote.py"),
+                &json!({"draft":draft,"action":action,"expected":expected}),
+            )?
+            .as_bool()
+            .unwrap_or(false))
+    }
+    fn handoff_node(state: &Value, id: &str) -> String {
+        raw_session_object(state, id)
+            .and_then(|s| json_text(s.get("node")))
+            .unwrap_or_else(default_node)
+    }
+    fn handoff_artifact_path(state: &Value, id: &str, path: &str) -> PathBuf {
+        if Self::handoff_node(state, id) == "primary" {
+            expand_home(path)
+        } else {
+            PathBuf::from(path)
+        }
+    }
+    fn handoff_run_ssh(&self, node_name: &str, script: &str, payload: &Value) -> Result<Value> {
         let config = self
             .handoff_config
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("remote draft configuration missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("remote handoff configuration missing"))?;
         let node = config
             .nodes
             .registry
-            .get(&node)
-            .ok_or_else(|| anyhow::anyhow!("unknown node"))?;
-        let mut cmd = Command::new("ssh");
-        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+            .get(node_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown node {node_name}"))?;
+        #[cfg(test)]
+        let program = self
+            .handoff_ssh_program
+            .as_deref()
+            .unwrap_or(Path::new("ssh"));
+        #[cfg(not(test))]
+        let program = Path::new("ssh");
+        let mut cmd = Command::new(program);
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
+        ]);
         if let Some(proxy) = &node.ssh_proxy_command {
             cmd.args(["-o", &format!("ProxyCommand={proxy}")]);
         }
@@ -397,21 +435,100 @@ impl SessionStore {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("node has no ssh destination"))?,
         );
-        let script = include_str!("draft_remote.py");
         let quoted = format!("'{}'", script.replace('\'', "'\\''"));
         cmd.arg(format!("python3 -c {quoted}"));
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()?;
-        child.stdin.take().unwrap().write_all(
-            json!({"draft":draft,"action":action,"expected":expected})
-                .to_string()
-                .as_bytes(),
-        )?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())?;
         let output = child.wait_with_output()?;
-        anyhow::ensure!(output.status.success(), "remote draft operation failed");
-        Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+        anyhow::ensure!(
+            output.status.success(),
+            "handoff operation on node {node_name} failed"
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+    fn read_handoff_artifact(
+        &self,
+        state: &Value,
+        id: &str,
+        path: &Path,
+    ) -> Result<Option<(String, Value)>> {
+        let node = Self::handoff_node(state, id);
+        if node == "primary" {
+            let mut file = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            let mut source = source_snapshot(id, path, &metadata);
+            source["node"] = json!(node);
+            return Ok(Some((text, source)));
+        }
+        let response = self.handoff_run_ssh(
+            &node,
+            include_str!("artifact_remote.py"),
+            &json!({"action":"read","path":path}),
+        )?;
+        if response["exists"] == false {
+            return Ok(None);
+        }
+        let text = response["text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("node returned no artifact text"))?
+            .to_owned();
+        let mut source = response["snapshot"].clone();
+        source["session_id"] = json!(id);
+        source["path"] = json!(path);
+        source["node"] = json!(node);
+        Ok(Some((text, source)))
+    }
+    fn remove_handoff_original(
+        &self,
+        state: &Value,
+        source: &Value,
+    ) -> Result<(bool, Option<String>)> {
+        let id = source["session_id"].as_str().unwrap_or_default();
+        let node = source["node"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| Self::handoff_node(state, id));
+        let path = Path::new(source["path"].as_str().unwrap_or_default());
+        if node != "primary" {
+            let response = self.handoff_run_ssh(
+                &node,
+                include_str!("artifact_remote.py"),
+                &json!({"action":"remove","path":path,"snapshot":source}),
+            )?;
+            return Ok((
+                response["removed"].as_bool().unwrap_or(false),
+                response["reason"].as_str().map(str::to_owned),
+            ));
+        }
+        if !path.exists() {
+            return Ok((true, None));
+        }
+        let before = fs::metadata(path)?;
+        if source["device"].as_u64() == Some(before.dev())
+            && source["inode"].as_u64() == Some(before.ino())
+            && source["size"].as_u64() == Some(before.len())
+            && source["mtime"] == metadata_mtime(&before)
+        {
+            Ok(remove_source(path, &before))
+        } else {
+            Ok((
+                false,
+                Some("device, inode, size or mtime changed since the read".into()),
+            ))
+        }
     }
     pub(super) fn prepare_handoff_ask(
         &self,
@@ -592,9 +709,13 @@ impl SessionStore {
                         notes.push(entry);
                         continue;
                     }
-                    let path = expand_home(note["value"].as_str().unwrap_or_default());
+                    let path = Self::handoff_artifact_path(
+                        &state,
+                        id,
+                        note["value"].as_str().unwrap_or_default(),
+                    );
                     entry["source_path"] = json!(path);
-                    if let Ok(text) = fs::read_to_string(path) {
+                    if let Ok(Some((text, _))) = self.read_handoff_artifact(&state, id, &path) {
                         entry["text"] = json!(text);
                     }
                 }
@@ -653,7 +774,19 @@ impl SessionStore {
                 continue;
             }
             if let Some(path) = json_text(session.get("transcript_path")) {
-                match transcript_messages(&expand_home(&path), &excluded) {
+                let path = Self::handoff_artifact_path(state, id, &path);
+                let inputs = if Self::handoff_node(state, id) == "primary" {
+                    transcript_messages(&path, &excluded)
+                } else {
+                    self.read_handoff_artifact(state, id, &path)
+                        .and_then(|artifact| match artifact {
+                            Some((text, _)) => {
+                                transcript_messages_reader(io::Cursor::new(text), &excluded)
+                            }
+                            None => Ok(vec![]),
+                        })
+                };
+                match inputs {
                     Ok(inputs) => {
                         for (at, text) in inputs {
                             messages.push(
@@ -692,10 +825,16 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 fn transcript_messages(path: &Path, excluded: &BTreeSet<String>) -> Result<Vec<(String, String)>> {
+    transcript_messages_reader(io::BufReader::new(fs::File::open(path)?), excluded)
+}
+fn transcript_messages_reader(
+    reader: impl BufRead,
+    excluded: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>> {
     let mut result: Vec<(String, String)> = vec![];
     let mut enqueued = BTreeMap::<String, usize>::new();
     let mut last_codex: Option<(String, String)> = None;
-    for line in io::BufReader::new(fs::File::open(path)?).lines() {
+    for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -869,7 +1008,7 @@ impl SessionStore {
             .cloned()
             .unwrap_or_default();
         if importing {
-            let mut paths = BTreeMap::<PathBuf, Vec<String>>::new();
+            let mut paths = BTreeMap::<(String, PathBuf), Vec<String>>::new();
             if let Some(sessions) = state["sessions"].as_array() {
                 for session in sessions {
                     let path = if session["handoff"]["note"]["kind"] == "path" {
@@ -885,7 +1024,13 @@ impl SessionStore {
                         })
                     };
                     if let (Some(path), Some(id)) = (path, session["id"].as_str()) {
-                        paths.entry(expand_home(path)).or_default().push(id.into());
+                        paths
+                            .entry((
+                                Self::handoff_node(&state, id),
+                                Self::handoff_artifact_path(&state, id, path),
+                            ))
+                            .or_default()
+                            .push(id.into());
                     }
                 }
             }
@@ -899,9 +1044,15 @@ impl SessionStore {
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             {
                 let (id, path) = row?;
-                paths.entry(expand_home(&path)).or_default().push(id);
+                paths
+                    .entry((
+                        Self::handoff_node(&state, &id),
+                        Self::handoff_artifact_path(&state, &id, &path),
+                    ))
+                    .or_default()
+                    .push(id);
             }
-            for (path, mut ids) in paths {
+            for ((_node, path), mut ids) in paths {
                 ids.sort_by_key(|id| {
                     self.line_ids(&state, id)
                         .iter()
@@ -916,16 +1067,14 @@ impl SessionStore {
                     |r| r.get(0),
                 )?;
                 if !exists {
-                    if !path.is_file() {
+                    let Some((raw_text, source)) =
+                        self.read_handoff_artifact(&state, &id, &path)?
+                    else {
                         continue;
-                    }
-                    let mut original = fs::File::open(&path)?;
-                    let before = original.metadata()?;
-                    let mut bytes = Vec::new();
-                    original.read_to_end(&mut bytes)?;
-                    let text = note_text(&bytes, false)?;
+                    };
+                    let text = note_text(raw_text.as_bytes(), false)?;
                     pending.retain(|s| s["session_id"] != id);
-                    pending.push(source_snapshot(&id, &path, &before));
+                    pending.push(source);
                     state["handoff_note_sources_pending"] = json!(pending);
                     self.write_raw_json_value(&state)?;
                     checkpoint("source")?;
@@ -953,9 +1102,8 @@ impl SessionStore {
                         json!({"kind":"stored","value":format!("handoff_notes:{id}")});
                 }
                 if !pending.iter().any(|s| s["session_id"] == id) {
-                    let before = fs::metadata(&path).ok();
-                    if let Some(before) = before {
-                        pending.push(source_snapshot(&id, &path, &before));
+                    if let Some((_, source)) = self.read_handoff_artifact(&state, &id, &path)? {
+                        pending.push(source);
                     } else {
                         pending.push(json!({"session_id":id,"path":path}));
                     }
@@ -979,24 +1127,7 @@ impl SessionStore {
                 remaining.push(source);
                 continue;
             }
-            let path = expand_home(source["path"].as_str().unwrap_or_default());
-            let (removed, reason) = if !path.exists() {
-                (true, None)
-            } else {
-                let before = fs::metadata(&path)?;
-                if source["device"].as_u64() == Some(before.dev())
-                    && source["inode"].as_u64() == Some(before.ino())
-                    && source["size"].as_u64() == Some(before.len())
-                    && source["mtime"] == metadata_mtime(&before)
-                {
-                    remove_source(&path, &before)
-                } else {
-                    (
-                        false,
-                        Some("device, inode, size or mtime changed since the read".into()),
-                    )
-                }
-            };
+            let (removed, reason) = self.remove_handoff_original(&state, &source)?;
             self.report_handoff_source(id, removed, reason.as_deref())?;
             checkpoint("remove")?;
         }
@@ -1607,5 +1738,103 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+    #[test]
+    fn handoff_remote_notes_transcripts_and_import_stay_on_their_session_node() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut store, root) = fixture();
+        let remote_root = root.join("remote-fs");
+        fs::create_dir_all(&remote_root).unwrap();
+        let ssh = root.join("ssh-stub");
+        fs::write(
+            &ssh,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+root = {remote_root:?}
+r = json.load(sys.stdin)
+if 'path' in r:
+    r['path'] = os.path.join(root, r['path'].lstrip('/'))
+if 'draft' in r:
+    r['draft']['path'] = os.path.join(root, r['draft']['path'].lstrip('/'))
+p = subprocess.run(sys.argv[-1], shell=True, input=json.dumps(r).encode())
+sys.exit(p.returncode)
+"#,
+                remote_root = remote_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.nodes.registry.insert(
+            "remote".into(),
+            crate::config::NodeConfig {
+                id: "remote".into(),
+                ssh: Some("remote.example".into()),
+                ..Default::default()
+            },
+        );
+        store = store.with_handoff_config(&config);
+        store.handoff_ssh_program = Some(ssh);
+        let note_path = root.join("shared-note.md");
+        fs::write(&note_path, "primary note").unwrap();
+        let remote_note = remote_root.join(note_path.strip_prefix("/").unwrap());
+        fs::create_dir_all(remote_note.parent().unwrap()).unwrap();
+        fs::write(&remote_note, "remote note").unwrap();
+        let transcript = "/provider/rollout.jsonl";
+        let remote_transcript = remote_root.join(transcript.trim_start_matches('/'));
+        fs::create_dir_all(remote_transcript.parent().unwrap()).unwrap();
+        fs::write(&remote_transcript,"{\"type\":\"user\",\"timestamp\":\"2026-10-19T00:00:00Z\",\"message\":{\"content\":\"Owner's remote instruction\"}}\n").unwrap();
+        let mut state = store.load_raw_json_value().unwrap();
+        state["sessions"][0]["node"] = json!("remote");
+        state["sessions"][0]["status"] = json!("stopped");
+        state["sessions"][0]["transcript_path"] = json!(transcript);
+        state["sessions"][0]["handoff"] =
+            json!({"state":"done","trigger":"voluntary","note":{"kind":"path","value":note_path}});
+        let mut local = state["sessions"][0].clone();
+        local["id"] = json!("local001");
+        local["name"] = json!("local");
+        local["friendly_name"] = json!("local");
+        local["node"] = json!("primary");
+        local["provider"] = json!("codex-app");
+        local["status"] = json!("working");
+        state["sessions"].as_array_mut().unwrap().push(local);
+        store.write_raw_json_value(&state).unwrap();
+        let view = store.handoff_note_view("agent001", false, false).unwrap();
+        assert_eq!(view["notes"][0]["text"], "remote note");
+        assert_eq!(
+            view["owner_messages"][0]["text"],
+            "Owner's remote instruction"
+        );
+        let draft = json!({"path":"/draft-work/.sm/handoff.md","text":"remote draft"});
+        store
+            .handoff_draft_file(&state, "agent001", &draft, "write", None)
+            .unwrap();
+        assert!(remote_root.join("draft-work/.sm/handoff.md").exists());
+        store
+            .handoff_draft_file(&state, "agent001", &draft, "remove", None)
+            .unwrap();
+        assert!(!remote_root.join("draft-work/.sm/handoff.md").exists());
+        store.maintain_handoff_notes().unwrap();
+        assert!(!remote_note.exists());
+        assert_eq!(fs::read_to_string(&note_path).unwrap(), "primary note");
+        assert_eq!(
+            store.handoff_note_view("agent001", false, false).unwrap()["notes"][0]["text"],
+            "remote note"
+        );
+        assert_eq!(
+            store.handoff_note_view("local001", false, false).unwrap()["notes"][0]["text"],
+            "primary note"
+        );
+        assert_eq!(
+            store
+                .notes_db()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM handoff_notes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

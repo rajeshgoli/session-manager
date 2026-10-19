@@ -124,6 +124,8 @@ pub struct SessionStore {
     reparent_apply_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     handoff_config: Option<Arc<crate::config::AppConfig>>,
+    #[cfg(test)]
+    handoff_ssh_program: Option<PathBuf>,
     owner_answered_wake: Option<OwnerAnsweredWake>,
     opencode_launch: Option<OpencodeLaunchContext>,
     /// Carried on the store rather than read per-request because the codex-fork
@@ -269,6 +271,8 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             handoff_config: None,
+            #[cfg(test)]
+            handoff_ssh_program: None,
             owner_answered_wake: None,
             opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -1883,6 +1887,8 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             handoff_config: None,
+            #[cfg(test)]
+            handoff_ssh_program: None,
             owner_answered_wake: None,
             opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
