@@ -7830,8 +7830,8 @@ fn retry_deferred_artifact_completions_conn(conn: &Connection, message_queue_db_
         if let Err(error) =
             crate::managed_artifacts::queue::complete(conn, &id, Some(message_queue_db_path))
         {
+            // One bad record must not starve the rest.
             eprintln!("artifact completion deferred for {id}: {error:#}");
-            return;
         }
     }
 }
