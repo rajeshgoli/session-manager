@@ -1298,13 +1298,19 @@ mod tests {
             "no-socket-tmux",
             "echo 'error connecting to socket (No such file or directory)' >&2; exit 1",
         );
-        for (written, terminal, relaunch) in [
-            (Some(&transcript), &absent, false),
-            (Some(&nested), &absent, false),
-            (None, &live_runtime, false),
-            (None, &no_socket, false),
-            (None, &absent, true),
+        // A folder that cannot be listed could hold the transcript.
+        let locked = project_dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        for (written, terminal, unlisted, relaunch) in [
+            (Some(&transcript), &absent, false, false),
+            (Some(&nested), &absent, false, false),
+            (None, &live_runtime, false, false),
+            (None, &no_socket, false, false),
+            (None, &absent, true, false),
+            (None, &absent, false, true),
         ] {
+            let mode = if unlisted { 0o000 } else { 0o755 };
+            fs::set_permissions(&locked, fs::Permissions::from_mode(mode)).unwrap();
             recovered.write_raw_json_value(&failed).unwrap();
             let _ = fs::remove_file(&transcript);
             let _ = fs::remove_file(&nested);

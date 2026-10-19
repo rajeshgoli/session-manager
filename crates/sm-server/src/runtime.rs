@@ -2406,9 +2406,8 @@ pub(crate) fn claude_provider_session_unwritten(
             absent(project_dir.join(format!("{provider_session_id}.jsonl")))
                 && absent(project_dir.join(provider_session_id))
         })
-        && claude_nested_transcript_candidates(&project_directories)
-            .iter()
-            .all(|path| {
+        && claude_transcripts_below(&project_directories).is_some_and(|paths| {
+            paths.iter().all(|path| {
                 let modified = fs::metadata(path).and_then(|metadata| metadata.modified());
                 match (modified, launched_at) {
                     (Ok(modified), Some(launched_at)) if modified < launched_at => true,
@@ -2421,6 +2420,37 @@ pub(crate) fn claude_provider_session_unwritten(
                     }),
                 }
             })
+        })
+}
+
+/// Every `.jsonl` below the project directories, or None when any directory
+/// that exists cannot be fully listed, since an unlisted transcript could hold
+/// the turn. A project directory Claude never created holds nothing.
+fn claude_transcripts_below(project_directories: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = project_directories.to_vec();
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && project_directories.contains(&directory) =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if entry.file_type().ok()?.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    Some(files)
 }
 
 fn claude_transcript_project_directories(
