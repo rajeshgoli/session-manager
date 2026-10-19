@@ -1701,6 +1701,41 @@ fn link_into_an_excluded_artifact_is_marked_backed_up() {
 }
 
 #[test]
+fn source_moved_after_scope_collection_waits_and_is_never_deleted() {
+    let f = Fixture::new();
+    fs::write(f.dir.join("projects/a"), b"abc").unwrap();
+    fs::write(f.dir.join("data/b"), b"def").unwrap();
+    let first = f.prepare("first", None);
+    // packed/projects is prepared before plain/data; while it is read, a thaw
+    // or freeze moves the data folder away.
+    let moved = |f: &Fixture| {
+        let data = f.dir.join("data");
+        outbox::AFTER_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| fs::remove_dir_all(&data).unwrap()))
+        });
+    };
+    fs::write(f.dir.join("projects/a"), b"abcd").unwrap();
+    moved(&f);
+    let second = f.prepare("second", Some(&first.manifest));
+    assert!(second.transfer.deleted.is_empty());
+    assert!(second.manifest.files.contains_key("plain/data/b"));
+    assert_eq!(second.deferred, ["plain/data/", "plain/data/b"]);
+    // A seed (no confirmed manifest) leaves it for the first request.
+    fs::create_dir_all(f.dir.join("data")).unwrap();
+    fs::write(f.dir.join("data/b"), b"def").unwrap();
+    moved(&f);
+    let fresh = f.prepare("fresh", None);
+    assert!(fresh.manifest.files.contains_key("packed/projects/a.zst"));
+    assert!(!fresh
+        .manifest
+        .files
+        .keys()
+        .any(|p| p.starts_with("plain/data/")));
+    // ...and its coverage is dropped, so it is not marked backed up.
+    assert_eq!(fresh.deferred, ["plain/data/"]);
+}
+
+#[test]
 fn file_removed_after_inventory_waits_a_night_then_is_deleted() {
     let f = Fixture::new();
     fs::write(f.dir.join("projects/a"), b"a").unwrap();
