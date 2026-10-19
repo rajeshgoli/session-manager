@@ -1498,26 +1498,67 @@ def test_operator_retirement_during_restart(env, missing):
     None, "missing_successor", "stopped_successor", "wrong_predecessor",
     "wrong_actor", "wrong_source", "wrong_authority", "natural_exit",
     "missing_completed_at", "missing_observed_at", "missing_provenance", "null_provenance",
+    "missing_handoff", "null_handoff", "invalid_handoff",
+    "missing_successor_ref", "null_successor_ref", "invalid_successor_ref",
+    "invalid_successor_id", "missing_successor_handoff", "null_successor_handoff",
+    "invalid_successor_handoff", "null_predecessor_ref", "invalid_predecessor_ref",
+    "invalid_predecessor_id",
 ])
 def test_handoff_during_restart_requires_durable_reciprocal_live_successor(env, defect):
+    # SessionResponse exposes lineage through handoff::policy::view_json,
+    # using {id, name} references, rather than the SessionRecord's internal IDs.
     retired = {
         "id": "predecessor", "status": "stopped",
         "agent_task_completed_at": None,
-        "completed_at": "2026-10-07T21:16:11Z", "successor_session_id": "successor",
+        "completed_at": "2026-10-07T21:16:11Z",
+        "handoff": {
+            "enabled": True, "threshold_percent": 35, "source": "default",
+            "has_gauge": True, "display": "→ successor", "state": "done",
+            "successor": {"id": "successor", "name": "successor"},
+            "predecessor": None,
+            "ask_on_codex_review": True, "ask_on_doc_review": True,
+        },
         "terminal_provenance": {
             "cause": "explicit_retire", "authority": "server_lifecycle",
             "source": "handed_off", "observed_at": "2026-10-07T21:16:11Z",
             "actor_session_id": "successor", "tmux_disposition": "killed",
         },
     }
-    successor = {"id": "successor", "status": "working", "predecessor_session_id": "predecessor"}
+    successor = {
+        "id": "successor", "status": "working",
+        "handoff": {
+            "enabled": True, "threshold_percent": 35, "source": "default",
+            "has_gauge": True, "display": "hands off at 35%", "state": None,
+            "successor": None,
+            "predecessor": {"id": "predecessor", "name": "predecessor"},
+            "ask_on_codex_review": True, "ask_on_doc_review": True,
+        },
+    }
     after = [retired, successor]
     if defect == "missing_successor":
         after.remove(successor)
     elif defect == "stopped_successor":
         successor["status"] = "stopped"
     elif defect == "wrong_predecessor":
-        successor["predecessor_session_id"] = "other"
+        successor["handoff"]["predecessor"]["id"] = "other"
+    elif defect == "missing_handoff":
+        retired.pop("handoff")
+    elif defect in {"null_handoff", "invalid_handoff"}:
+        retired["handoff"] = None if defect == "null_handoff" else []
+    elif defect == "missing_successor_ref":
+        retired["handoff"].pop("successor")
+    elif defect in {"null_successor_ref", "invalid_successor_ref"}:
+        retired["handoff"]["successor"] = None if defect == "null_successor_ref" else "successor"
+    elif defect == "invalid_successor_id":
+        retired["handoff"]["successor"]["id"] = []
+    elif defect == "missing_successor_handoff":
+        successor.pop("handoff")
+    elif defect in {"null_successor_handoff", "invalid_successor_handoff"}:
+        successor["handoff"] = None if defect == "null_successor_handoff" else []
+    elif defect in {"null_predecessor_ref", "invalid_predecessor_ref"}:
+        successor["handoff"]["predecessor"] = None if defect == "null_predecessor_ref" else "predecessor"
+    elif defect == "invalid_predecessor_id":
+        successor["handoff"]["predecessor"]["id"] = []
     elif defect in {"wrong_actor", "wrong_source", "wrong_authority", "natural_exit"}:
         key, value = {
             "wrong_actor": ("actor_session_id", "other"),
