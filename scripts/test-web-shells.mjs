@@ -46,7 +46,7 @@ async function setup(browser, { width = 1440, home = false, failDirect = false }
   const errors = [], requests = [];
   page.on('pageerror', e => errors.push(e.message));
   const state = { sessions: [row('agent'), row('term-abcd', true), row('term-busy', true, true)], settings: settings(),
-    keys: [{ fingerprint: 'SHA256:abc+/=', public_key: 'ssh-ed25519 AAAA fixture' }], routeError: null, createError: null };
+    keys: [{ fingerprint: 'SHA256:abc+/=', public_key: 'ssh-ed25519 AAAA fixture' }, { fingerprint: 'SHA256:revoked', revoked_at: '2026-10-19' }], routeError: null, createError: null };
   await page.route('**/*', async route => {
     const req = route.request(), url = new URL(req.url()), path = url.pathname;
     const json = (body, status = 200) => route.fulfill({ json: body, status });
@@ -65,7 +65,7 @@ async function setup(browser, { width = 1440, home = false, failDirect = false }
       const away = req.postDataJSON().where === 'away';
       if (away && state.routeError) return json({ detail: state.routeError }, 409);
       return json({ ssh_host: away ? 'studio-away' : 'studio-lan.rajeshgo.li', ssh_user: 'rajesh', ssh_port: 22222, tmux_session: 'term-abcd',
-        command: away ? 'ssh -t rajesh@studio-away tmux attach-session -t term-abcd' : 'ssh -t -p 22222 rajesh@studio-lan.rajeshgo.li tmux attach-session -t term-abcd' });
+        command: away ? `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd` : `ssh -t -p 22222 rajesh@studio-lan.rajeshgo.li tmux -L 'session-manager' attach-session -t term-abcd` });
     }
     if (/^\/terminals\/[^/]+$/.test(path) && req.method() === 'DELETE') {
       state.sessions = state.sessions.filter(s => s.id !== path.split('/').at(-1)); return json({});
@@ -92,7 +92,7 @@ for (const width of [390, 1440]) test(`Shell menus, facts, details and explicit 
     await page.goto(`${ORIGIN}/terminal/term-abcd`);
     await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
     await page.getByRole('button', { name: 'Copy', exact: true }).click();
-    assert.match(await page.evaluate(() => window.copied), /^ssh -t rajesh@studio-away/);
+    assert.equal(await page.evaluate(() => window.copied), `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd`);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
     assert.equal(await page.getByText('Hand off…', { exact: true }).count(), 0);
@@ -185,6 +185,7 @@ test('New agent Terminal requests only folder; Settings save limits and manage d
     await page.goto(`${ORIGIN}/settings#devices-access`);
     const keys = page.getByRole('region', { name: 'SSH keys for MacBook', exact: true });
     await keys.getByText('SHA256:abc+/=', { exact: true }).waitFor();
+    assert.equal(await keys.getByText('SHA256:revoked', { exact: true }).count(), 0);
     await keys.getByRole('button', { name: 'Add key', exact: true }).click();
     await keys.getByRole('textbox').fill('ssh-rsa not-supported');
     await keys.getByRole('button', { name: 'Save key', exact: true }).click();

@@ -71,7 +71,7 @@ function DeviceSshKeys({ device }) {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
-  const keys = data?.keys || [];
+  const keys = (data?.keys || []).filter(key => key.revoked_at == null);
   const write = async (path, method, body) => {
     setBusy(true); setFailure('');
     try {
@@ -94,7 +94,7 @@ function DeviceSshKeys({ device }) {
     ${error ? html`<p class="device-error" role="alert">Could not load SSH keys: ${error.message}
       <button type="button" class="btn sm" onClick=${reload}>Retry</button></p>` : null}
     ${data && !keys.length ? html`<p class="sub">No SSH keys.</p>` : null}
-    <ul>${keys.filter(key => !key.revoked_at).map(key => html`<li key=${key.fingerprint}>
+    <ul>${keys.map(key => html`<li key=${key.fingerprint}>
       <code>${key.fingerprint}</code>
       <button type="button" class="btn sm danger" disabled=${busy}
         aria-label=${`Remove SSH key ${key.fingerprint}`} onClick=${() => write(`${base}/${encodeURIComponent(key.fingerprint)}`, 'DELETE')}>Remove</button>

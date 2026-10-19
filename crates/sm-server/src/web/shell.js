@@ -24,8 +24,13 @@ export async function createShell(body) {
 }
 // Reading home metadata never opens the tunnel. Open tunnel explicitly asks for away.
 export const homeShellRoute = id => api(`/terminals/${encodeURIComponent(id)}/route`, { method: 'POST', body: { where: 'home' } });
-export const awayShellCommand = route => route?.ssh_user && route?.tmux_session
-  ? `ssh -t ${route.ssh_user}@studio-away tmux attach-session -t ${route.tmux_session}` : '';
+// Keep the server's tmux arguments and quoting, including its configured socket.
+// The studio-away alias supplies the SSH user, port and ProxyCommand.
+export function awayShellCommand(route) {
+  const command = route?.command || '';
+  const tmux = command.indexOf(' tmux ');
+  return tmux < 0 ? '' : `ssh -t studio-away${command.slice(tmux)}`;
+}
 async function copyCommand(command) {
   try { await navigator.clipboard.writeText(command); toast('SSH command copied'); }
   catch { toast(command); }
