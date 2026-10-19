@@ -524,6 +524,14 @@ previous = {s["id"]: s for s in before if s["status"] != "stopped"}
 current = {s["id"]: s for s in after}
 lost = []
 retired = []
+
+def handoff_peer_id(session, relation):
+    # SessionResponse exposes lineage as handoff.{successor,predecessor}.id.
+    handoff = (session or {}).get("handoff")
+    peer = handoff.get(relation) if isinstance(handoff, dict) else None
+    peer_id = peer.get("id") if isinstance(peer, dict) else None
+    return peer_id if isinstance(peer_id, str) else None
+
 for sid, old in previous.items():
     new = current.get(sid)
     if new is not None and new["status"] != "stopped":
@@ -535,14 +543,14 @@ for sid, old in previous.items():
                       and provenance.get("observed_at")
                       and provenance.get("source"))
     operator_retire = explicit_retire and provenance.get("authority") == "operator"
-    successor_id = (new or {}).get("successor_session_id")
+    successor_id = handoff_peer_id(new, "successor")
     successor = current.get(successor_id) if isinstance(successor_id, str) else None
     handoff_retire = (explicit_retire
                       and provenance.get("authority") == "server_lifecycle"
                       and provenance.get("source") == "handed_off"
                       and provenance.get("actor_session_id") == successor_id
                       and successor is not None and successor["status"] != "stopped"
-                      and successor.get("predecessor_session_id") == sid)
+                      and handoff_peer_id(successor, "predecessor") == sid)
     # Completion, operator retirement, or a handoff to a reciprocal live
     # successor accounts for this identity. A stopped status alone does not.
     if (new is not None and new["status"] == "stopped"
