@@ -72,8 +72,11 @@ fn observe_parses_panes_when_the_server_has_no_utf8_locale() {
         "#!/bin/sh\nexec env -u LANG -u LC_ALL -u LC_CTYPE tmux \"$@\"\n",
     )
     .unwrap();
-    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     let socket = format!(
         "sm-2356-{}-{}",
         std::process::id(),
@@ -85,7 +88,15 @@ fn observe_parses_panes_when_the_server_has_no_utf8_locale() {
     })
     .with_tmux_binary_for_test(wrapper.display().to_string());
     let started = std::process::Command::new(&wrapper)
-        .args(["-L", &socket, "new-session", "-d", "-s", "term-abcd", "sleep 30"])
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-s",
+            "term-abcd",
+            "sleep 30",
+        ])
         .status()
         .unwrap();
     assert!(started.success());
