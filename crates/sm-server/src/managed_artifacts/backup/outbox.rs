@@ -458,7 +458,35 @@ pub(super) fn prepare_with_progress(
         manifest
             .holding_days
             .insert(prefix.clone(), scope.holding_days);
-        for entry in scope.inventory()? {
+        let inventory = match scope.inventory() {
+            Ok(entries) => entries,
+            // Moved by a freeze or thaw since the scope was collected: like a
+            // removed file, it waits for the next preparation, never a deletion.
+            Err(e)
+                if e.chain().any(|c| {
+                    c.downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                }) =>
+            {
+                let inside = format!("{prefix}/");
+                for (path, old) in base
+                    .into_iter()
+                    .flat_map(|m| &m.files)
+                    .filter(|(p, _)| p.starts_with(&inside))
+                {
+                    manifest.files.insert(path.clone(), old.clone());
+                    deferred.push(path.clone());
+                }
+                continue;
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "backup source unreadable: {}",
+                    scope.source.display()
+                )))
+            }
+        };
+        for entry in inventory {
             if entry.kind == "directory" || entry.path.split('/').any(|p| p.starts_with("._")) {
                 continue;
             }
