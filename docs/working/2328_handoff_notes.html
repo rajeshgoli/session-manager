@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2328 — sm keeps the handoff note</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2328 — sm keeps the handoff note</h1>
+<p class="sans"><small>Author: sm-2328 <code>c6f0a143</code> · Ticket #2328 · Revision 1 · 2026-10-18</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend that sm take custody of every handoff note written as a file.</b> The agent gives the note to sm with one command, <code>sm handoff &lt;&lt;'EOF'</code> … <code>EOF</code>, the same heredoc habit agents already use for <code>sm send rajesh</code>. sm saves the note in its own state folder, points the successor at that copy, shows it to you on sm.rajeshgo.li, and deletes it 90 days after the line of work ends. The agent no longer picks a location, so it can no longer pick a bad one. The agent's work actually shrinks: today it writes a file and then runs <code>sm handoff --path</code>, two steps; it will run one command. Handoffs posted as a PR or ticket comment (<code>sm handoff --link</code>) are durable already and stay exactly as they are.</p>
+
+<dl class="vocab">
+<dt>Handoff</dt>
+<dd>When an agent's context fills up, sm asks it to stop. It writes down where the work stands and runs <code>sm handoff</code>. sm then starts a fresh agent of the same kind in the same worktree, moves the tickets, PRs and pending wakes onto it, and retires the old one. The old agent is the <b>predecessor</b>; the new one is the <b>successor</b>. Its name gains <code>-h2</code>, <code>-h3</code>, …</dd>
+<dt>Handoff note</dt>
+<dd>What the predecessor writes for the successor. Today it is either a link to a PR or ticket comment, or a path to a file anywhere on disk. sm never reads the file. It only passes the path along.</dd>
+<dt>Line of work</dt>
+<dd>An agent and all its successors, for example <code>far-2221</code> → <code>far-2221-h2</code>. The line <b>ends</b> when its latest agent retires without a successor.</dd>
+<dt>sm state folder</dt>
+<dd><code>~/.local/share/claude-sessions/</code>, where sm keeps its databases. It sits outside every checkout, so no <code>cargo clean</code> or worktree cleanup touches it.</dd>
+<dt>Worktree root</dt>
+<dd><code>~/worktrees</code>, the folder that holds every agent's worktree.</dd>
+<dt>Artifact root</dt>
+<dd><code>~/Artifacts</code>, the fractal-algo-rust data folder that sm's managed-artifacts feature (#1588) tracks. Each subfolder has a record of who owns it and when it expires.</dd>
+</dl>
+
+<h3>What goes wrong today</h3>
+
+<p>I read every handoff sm has recorded: 64 handoffs between 29 Sep and 19 Oct. 46 point at a PR comment (37) or a ticket comment (9). Those live on GitHub and are fine. <b>The other 18 point at files, and every file location has a problem.</b></p>
+
+<table>
+<thead><tr><th>Where the agent wrote the note</th><th>Notes</th><th>Still on disk</th><th>What goes wrong</th></tr></thead>
+<tbody>
+<tr><td>Inside an artifact folder, e.g. <code>~/Artifacts/2170_shape/HANDOFF.md</code></td><td>12</td><td>4</td><td>The note becomes part of a data artifact. It lives and dies with that data, gets backed up with it, and confuses what the folder is. Five successors in the far-1859 line overwrote the same file, so four notes were lost before the folder was deleted.</td></tr>
+<tr><td>Inside the agent's worktree</td><td>4</td><td>0</td><td>An untracked file stops sm from deleting the worktree after the agent retires, because sm deletes only when nothing would be lost. Once the worktree goes, the note goes with it.</td></tr>
+<tr><td>Loose in the worktree root: <code>~/worktrees/2221_HANDOFF.md</code>, the case in this ticket</td><td>1</td><td>1</td><td>It is in no worktree, so no sm cleanup ever looks at it. The same agent left a folder of scripts beside it, <code>~/worktrees/2221_scripts/</code>. Both stay forever.</td></tr>
+<tr><td><code>/tmp</code></td><td>1</td><td>0</td><td>Gone at the next reboot.</td></tr>
+</tbody>
+</table>
+
+<p>13 of the 18 notes are already gone, so for those handoffs sm's record points at nothing. That breaks the one thing the record is for: weeks later, reading why an agent did what it did. The root cause is that sm's ask says <i>"Post what the next agent needs in your PR, ticket, or a file"</i> and names no folder. An agent at 35% context improvises.</p>
+
+<h3>How it works after the change</h3>
+
+<figure>
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="12.5" role="img" aria-label="Today versus after: where the handoff note goes">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <text x="10" y="22" font-weight="700" fill="var(--ink)">Today</text>
+  <rect x="10" y="34" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="85" y="56" text-anchor="middle" fill="var(--ink)">Agent picks a place</text><text x="85" y="74" text-anchor="middle" fill="var(--ink-2)">and writes a file</text>
+  <rect x="200" y="34" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="275" y="56" text-anchor="middle" fill="var(--ink)">sm handoff --path</text><text x="275" y="74" text-anchor="middle" fill="var(--ink-2)">sm stores the path only</text>
+  <rect x="390" y="34" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="465" y="56" text-anchor="middle" fill="var(--ink)">Successor reads</text><text x="465" y="74" text-anchor="middle" fill="var(--ink-2)">the agent's file</text>
+  <rect x="580" y="34" width="170" height="54" rx="6" fill="none" stroke="var(--red)" stroke-width="1.5"/>
+  <text x="665" y="56" text-anchor="middle" fill="var(--red)">File stays forever, or</text><text x="665" y="74" text-anchor="middle" fill="var(--red)">vanishes with its folder</text>
+  <line x1="160" y1="61" x2="198" y2="61" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="350" y1="61" x2="388" y2="61" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="540" y1="61" x2="578" y2="61" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <text x="10" y="142" font-weight="700" fill="var(--ink)">After</text>
+  <rect x="10" y="154" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="85" y="176" text-anchor="middle" fill="var(--ink)">sm handoff &lt;&lt;'EOF'</text><text x="85" y="194" text-anchor="middle" fill="var(--ink-2)">one command</text>
+  <rect x="200" y="154" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--green)" stroke-width="1.5"/>
+  <text x="275" y="176" text-anchor="middle" fill="var(--ink)">sm saves the note in</text><text x="275" y="194" text-anchor="middle" fill="var(--ink-2)">its state folder</text>
+  <rect x="390" y="154" width="150" height="54" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="465" y="176" text-anchor="middle" fill="var(--ink)">Successor reads</text><text x="465" y="194" text-anchor="middle" fill="var(--ink-2)">sm's copy</text>
+  <rect x="580" y="154" width="170" height="54" rx="6" fill="none" stroke="var(--green)" stroke-width="1.5"/>
+  <text x="665" y="176" text-anchor="middle" fill="var(--green)">You read it on the web;</text><text x="665" y="194" text-anchor="middle" fill="var(--green)">sm deletes it at 90 days</text>
+  <line x1="160" y1="181" x2="198" y2="181" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="350" y1="181" x2="388" y2="181" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="540" y1="181" x2="578" y2="181" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <text x="10" y="242" fill="var(--ink-2)">An agent that still writes a file and runs sm handoff --path gets the same result: sm copies the file into its store</text>
+  <text x="10" y="260" fill="var(--ink-2)">and deletes the original as soon as its copy is saved, unless git tracks the file. A --link note is unchanged.</text>
+</svg>
+<figcaption>Figure 1. Where the note goes. The agent's part shrinks to one command. Keeping, showing and deleting the note becomes sm's job.</figcaption>
+</figure>
+
+<p><b>What the agent sees.</b> sm's ask changes from offering three places to offering one command, plus the link form for an agent that already posted on its PR:</p>
+<pre>[sm context management] Your context is at 36%. Stop at a logical point. sm will move your
+claims (ticket #2221, PR #2240) and pending wakes to a fresh agent. Write what the next agent
+needs and give it to sm on stdin:  sm handoff &lt;&lt;'EOF' … EOF  (or, if you already posted it on
+your PR or ticket, sm handoff --link &lt;url&gt;). Then end your turn.</pre>
+
+<p><b>What the successor sees.</b> Its first message names sm's copy, and the command that prints it. If the line has earlier notes, it also names the folder that holds them:</p>
+<pre>[sm handoff] You are taking over from far-2221 (6f7e5a31), which stopped at 36% context.
+Handoff note: ~/.local/share/claude-sessions/handoffs/6f7e5a31/1-far-2221.md (or run: sm handoff show)
+…
+Read the handoff note first, then continue the work.</pre>
+
+<p><b>What you see.</b> Today each agent card on sm.rajeshgo.li shows a line such as <code>→ far-2221-h2</code> after a handoff. That line becomes a link to the note. On the successor's card, <code>took over from far-2221</code> links to the same note. A note given as a link opens the PR or ticket comment. The handoff note is the best status summary an agent ever writes, and today you can reach it only by opening a terminal.</p>
+
+<h3>A worked example: the far-2221 handoff, replayed</h3>
+
+<table>
+<thead><tr><th>Step</th><th>Today (what happened)</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>Agent writes the note</td><td>Writes 7.7 KB to <code>~/worktrees/2221_HANDOFF.md</code>, then runs <code>sm handoff --path ~/worktrees/2221_HANDOFF.md</code>.</td><td>Runs <code>sm handoff &lt;&lt;'EOF'</code> with the same 7.7 KB. sm writes <code>handoffs/6f7e5a31/1-far-2221.md</code>, read-only.</td></tr>
+<tr><td>far-2221-h2 starts</td><td>Its brief names the loose file.</td><td>Its brief names sm's copy.</td></tr>
+<tr><td>far-2221-h2 hands off</td><td>Probably edits the same file in place. The first note is lost.</td><td>Gives sm a second note. sm writes <code>2-far-2221-h2.md</code> beside the first. far-2221-h3 sees both.</td></tr>
+<tr><td>Line ends</td><td>The file stays in <code>~/worktrees</code> forever.</td><td>The notes stay readable on the web for 90 days, then sm deletes the folder.</td></tr>
+</tbody>
+</table>
+
+<h3>Loose files beside the note</h3>
+
+<p>The same agent also left <code>~/worktrees/2221_scripts/</code>: seven scripts and logs that a queue job ran. Custody of notes does not stop this. The worktree root has no owner, so nothing ever cleans it. I recommend giving it the rule you already set for the artifact root in #1588. sm's hourly worktree check lists every entry in <code>~/worktrees</code> that is not a git checkout on the existing <b>leftover worktrees</b> page, the page where sm lists worktrees of retired agents that it has not deleted. sm deletes such an entry 14 days after it first sees it, unless you keep it, it changed in those 14 days, or a running queue job uses it. Today that list has two entries: <code>2221_HANDOFF.md</code> and <code>2221_scripts/</code>.</p>
+
+<h3>Decision surface</h3>
+
+<table>
+<thead>
+<tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. How does the agent give sm a note?</td><td><b>On stdin: <code>sm handoff &lt;&lt;'EOF'</code> … <code>EOF</code>.</b> sm saves it in its state folder. <code>--link</code> stays as it is.</td><td>One command instead of two, and the same habit as <code>sm send rajesh</code>. The agent never chooses a path.</td></tr>
+<tr><td>2. An agent still runs <code>sm handoff --path &lt;file&gt;</code></td><td><b>Keep it working. sm copies the file into its store and deletes the original as soon as the copy is saved, unless git tracks the file.</b></td><td>An agent that ignores the new wording still leaves nothing behind. A file in git already has a home.</td></tr>
+<tr><td>3. How long does sm keep notes?</td><td><b>90 days after the line of work ends, then sm deletes the line's notes.</b></td><td>That covers weeks-later questions about intent. Notes are about 5 KB each, so size is no constraint; 90 days only bounds clutter.</td></tr>
+<tr><td>4. Show notes to you?</td><td><b>Yes, on sm.rajeshgo.li: the handoff line on each agent card links to the note.</b> The app opens that link in the browser until a later app release renders it in-app.</td><td>It is the best status summary an agent writes, and today it is invisible to you.</td></tr>
+<tr><td>5. Loose entries in <code>~/worktrees</code></td><td><b>List them on the leftover worktrees page. Delete each one 14 days after sm first sees it, unless you keep it, it changed in the meantime, or a running queue job uses it.</b></td><td>The same rule you set for <code>~/Artifacts</code> in #1588, applied to the one shared folder nobody owns.</td></tr>
+<tr><td>6. Notes already sitting in <code>~/Artifacts</code> and <code>~/worktrees</code></td><td><b>sm copies the four note files its records point at into its store at deploy. It deletes the originals of the lines that have ended (far-2168, far-2169, far-2170), and deletes the far-2221 original when that line ends.</b> Three older handoff-named files that no record points at stay with their artifact folders and expire with them.</td><td>Every note gets one home, and no live agent loses the file its brief names.</td></tr>
+<tr><td>7. Local agents (opencode, judged by the local model)</td><td><b>Allow <code>sm handoff</code> for them, heredoc included.</b></td><td>The local judge denies <code>sm handoff</code> today. One local agent had to post its handoff as a message instead (draco, 19 Oct).</td></tr>
+</tbody>
+</table>
+
+<h3>What this memo does not change</h3>
+<ul>
+<li><b>When sm asks for a handoff</b>, the thresholds, and how work moves to the successor (spec <code>specs/1651_context_handoff.html</code>). Only the note's storage and the wording of the ask and reminder change.</li>
+<li><b>Other files an agent's work produces.</b> Data belongs in <code>~/Artifacts</code> under #1588's rules. Code belongs in git. A Claude agent's private scratch folder under <code>/private/tmp</code> is outside sm's control. The far-2221 agent ran a queue job inside its scratch folder, and its successor depends on it. If that pattern recurs, it gets its own ticket. Nothing here makes it worse.</li>
+</ul>
+
+<h3>Build plan</h3>
+<p>Three tickets, each sized for one agent (Appendix G):</p>
+<ol>
+<li><b>Custody</b> (server and CLI): the stdin form, copying <code>--path</code> files, the store, the new wording, deleting originals, the 90-day prune, the deploy-time copy, and the local-judge rule.</li>
+<li><b>Notes on the web</b>: the note page and the card links. Starts after ticket 1.</li>
+<li><b>Worktree-root sweep</b>: loose entries on the leftover page and the 14-day deletion. Independent of the other two.</li>
+</ol>
+<p>When tickets 1 and 2 ship, I will ask you to try one thing: press <b>Hand off now</b> on a scratch Claude agent in the app, then open the successor's card on sm.rajeshgo.li. The note should be one tap away, and nothing new should appear in the agent's worktree or in <code>~/worktrees</code>.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. The sm handoff command</a></div>
+<div><a href="#b">B. The note store and persisted shapes</a></div>
+<div><a href="#c">C. Server accept, and removing the original</a></div>
+<div><a href="#d">D. Messages, verbatim</a></div>
+<div><a href="#e">E. Retention</a></div>
+<div><a href="#f">F. Deploy-time copy of existing notes</a></div>
+<div><a href="#g">G. Tickets, file sets, order</a></div>
+<div><a href="#h">H. Local judge rule</a></div>
+<div><a href="#i">I. Notes on sm.rajeshgo.li</a></div>
+<div><a href="#j">J. Worktree-root sweep</a></div>
+<div><a href="#k">K. Test plan</a></div>
+<div><a href="#l">L. Code references</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<p>This document amends <code>specs/1651_context_handoff.html</code> (the context handoff spec, "1651" below). Its Appendix E (the command), D (messages), F.4 (successor brief) and A (persisted <code>note</code>) change as written here. Everything else in 1651 stands. When ticket 1 ships, the implementer edits 1651 in the same PR so that <code>specs/</code> matches the code, and moves this file to <code>specs/2328_handoff_notes.html</code> when the last ticket ships.</p>
+
+<h3 id="a">A. The <code>sm handoff</code> command</h3>
+
+<pre>sm handoff &lt;&lt;'EOF'        # note on stdin (new, preferred)
+…note text…
+EOF
+sm handoff -               # same: note on stdin
+sm handoff --link &lt;url&gt;    # unchanged
+sm handoff --path &lt;file&gt;   # kept: sm copies the file, then removes the original
+sm handoff &lt;file&gt;          # same as --path &lt;file&gt;
+sm handoff show [&lt;session&gt;] # print a stored note (new)</pre>
+
+<p><b>A.1 Choosing the form.</b> <code>--link</code> and <code>--path</code> are mutually exclusive with each other and with a positional argument, as today. With no argument, or the positional <code>-</code>, the note comes from stdin. The stdin read reuses the rule of <code>read_send_text_from</code><sup>[1]</sup>:</p>
+<table>
+<thead><tr><th>Input</th><th>Outcome</th></tr></thead>
+<tbody>
+<tr><td>No argument, stdin is a terminal</td><td>Exit 2: <code>sm handoff needs the note on stdin (sm handoff &lt;&lt;'EOF' … EOF) or --link &lt;url&gt;</code>. Nothing is sent.</td></tr>
+<tr><td>Stdin empty or only whitespace</td><td>Exit 2: <code>handoff note read from stdin is empty; nothing was handed off</code>.</td></tr>
+<tr><td>Stdin larger than 262,144 bytes</td><td>Exit 2: <code>handoff note is &lt;n&gt; bytes; the limit is 262144</code>. The largest note on disk today is 7.7 KB.</td></tr>
+<tr><td>Stdin not valid UTF-8</td><td>Exit 2: <code>handoff note is not valid UTF-8</code>.</td></tr>
+<tr><td>Valid</td><td>POST with <code>note: {"kind":"text","value":"&lt;the text, unmodified&gt;"}</code>.</td></tr>
+</tbody>
+</table>
+
+<p><b>A.2 <code>--path</code>.</b> The CLI checks the path names an existing regular file, as today, and canonicalizes it. It now also reads the file, applying the same size and UTF-8 limits as A.1 (messages say <code>file</code> instead of <code>stdin</code>). It refuses a path inside the note store (B.1) with <code>that file is already in sm's note store; use sm handoff show to read it</code>. It sends <code>note: {"kind":"file","value":"&lt;file text&gt;","source_path":"&lt;canonical path&gt;"}</code>. The CLI reads the file, not the server, so a handoff from an agent on another machine (node <code>macbook</code>) works the same way.</p>
+
+<p><b>A.3 After a successful POST with <code>--path</code></b> the CLI removes the original, unless one of these holds. In each case it leaves the file and adds a line to its output (D.4).</p>
+<ul>
+<li>Git tracks the file: <code>git -C &lt;dir&gt; ls-files --error-unmatch -- &lt;file&gt;</code> exits 0. Example: <code>docs/working/2165_handoff.md</code> committed on a PR branch stays.</li>
+<li>The file changed between the read and the removal (size or mtime differs). The copy in sm is then stale, so the agent must see the file again.</li>
+<li>The removal fails (permissions). The CLI prints the error and still exits 0, because the handoff itself succeeded.</li>
+</ul>
+<p>Removal uses a plain unlink of that one file. It never removes a folder, even an empty one. An untracked file in a directory that is not a git repository, such as <code>~/worktrees/2221_HANDOFF.md</code> or <code>~/Artifacts/2170_shape/HANDOFF.md</code>, is removed.</p>
+
+<p><b>A.4 <code>sm handoff show [&lt;session&gt;]</code>.</b> This prints a stored note to stdout, verbatim. With no argument, it prints the note this session took over with: the note of its <code>predecessor_session_id</code>. With a session id or exact name, it prints that session's note. It calls <code>GET /sessions/{id}/handoff-note</code> (C.4). It exits 1 with <code>&lt;name&gt; has no stored handoff note</code> when the session has no note, or <code>&lt;name&gt;'s handoff note is a link: &lt;url&gt;</code> for a link note. It is a read: any managed session may call it, and so may the owner.</p>
+
+<h3 id="b">B. The note store and persisted shapes</h3>
+
+<p><b>B.1 Layout.</b> The store is <code>&lt;state dir&gt;/handoffs/</code>, where the state dir is the parent of <code>paths.state_file</code>. That is the same derivation spawn briefs use<sup>[2]</sup>; live, it resolves to <code>~/.local/share/claude-sessions/handoffs/</code>. Inside it:</p>
+<pre>handoffs/
+  &lt;line id&gt;/                      # 0700
+    1-&lt;predecessor name&gt;.md       # 0400, the first handoff in the line
+    2-&lt;predecessor name&gt;.md       # the second, …</pre>
+<ul>
+<li><b>Line id</b> is the session id of the line's first agent. sm finds it by following <code>predecessor_session_id</code> back until a record has none. Example: far-2221 is <code>6f7e5a31</code>, so every note of far-2221, far-2221-h2, … lives in <code>handoffs/6f7e5a31/</code>.</li>
+<li><b>Sequence</b> is the number of <code>*.md</code> files already in the folder, plus one. The name is the predecessor's name with any character outside <code>[A-Za-z0-9._-]</code> replaced by <code>_</code>, truncated to 80 bytes.</li>
+<li>sm writes the file through a temp file in the same folder, fsyncs it, and renames it. A replaced note (1651 E: re-running <code>sm handoff</code> in state <code>accepted</code>) overwrites the same sequence number. It does not take a new one.</li>
+<li>The two files from August at the top level of <code>handoffs/</code> come from the old <code>/clear</code> handoff. Ticket 1 deletes them, since their lines ended in August.</li>
+</ul>
+
+<p><b>B.2 Persisted <code>note</code> in the session record's <code>handoff</code> object</b> (1651 Appendix A). Kinds <code>link</code> and <code>path</code> stay readable for old records. New handoffs write only <code>link</code> or <code>stored</code>:</p>
+<pre>"note": {
+  "kind": "link",   "value": "https://github.com/…#issuecomment-…"
+}
+"note": {
+  "kind": "stored",
+  "value": "/Users/rajesh/.local/share/claude-sessions/handoffs/6f7e5a31/1-far-2221.md",
+  "source": "stdin" | "/abs/original/path",
+  "bytes": 7684,
+  "sha256": "…",
+  "source_removed": true | false | null     // null for stdin; set by the CLI report, C.3
+}</pre>
+<p><code>note_value</code><sup>[3]</sup> keeps returning <code>value</code>, so the parent notice (1651 D.7) shows the stored path. <code>HandoffNote::parse</code> accepts request kinds <code>link</code>, <code>text</code> and <code>file</code>. It now rejects <code>path</code> with 400 <code>sm handoff was updated; rerun it (the note goes on stdin)</code>. Only a stale CLI binary sends <code>path</code>.</p>
+
+<h3 id="c">C. Server accept, and removing the original</h3>
+
+<p><b>C.1 Accept.</b> <code>accept_handoff</code><sup>[4]</sup> keeps every state rule of 1651 E. For kind <code>text</code> or <code>file</code>, it writes the store file (B.1) <em>before</em> it records the note, so an accepted record never names a missing file. Then it records the <code>stored</code> note. A store write failure returns 500 <code>could not save the handoff note: &lt;error&gt;</code>, and the state does not change. The response adds <code>"stored_path"</code>.</p>
+
+<p><b>C.2 Successor brief</b> (1651 F.4). The <code>Handoff note:</code> line becomes:</p>
+<ul>
+<li>stored: <code>Handoff note: &lt;stored path, with $HOME shown as ~&gt; (or run: sm handoff show)</code></li>
+<li>link: unchanged, the URL.</li>
+<li>old path records: unchanged, the path.</li>
+</ul>
+<p>When the line's folder holds more than one note, a new line follows: <code>Earlier notes in this line: &lt;folder&gt;</code>. The brief never inlines the note text. Typing kilobytes into a terminal is the fragile path that 1651 removed.</p>
+
+<p><b>C.3 Removal report.</b> After A.3, the CLI sends <code>POST /sessions/{id}/handoff-note/source</code> with <code>{"removed": true|false, "reason": "tracked by git" | "changed after sm read it" | "&lt;unlink error&gt;" | null}</code>. The server sets <code>source_removed</code>. If the report never arrives, the field stays null, which is harmless. It exists so the web page (I) can say "original kept: tracked by git".</p>
+
+<p><b>C.4 Read route.</b> <code>GET /sessions/{id}/handoff-note</code> returns <code>{"kind","value","text"?,"source","line_id","sequence","accepted_at","predecessor":{id,name},"successor":{id,name}|null}</code>. <code>text</code> is present for stored notes. It is readable by any managed session and by the owner. A note holds work status, not secrets, and agents can read each other's worktrees today.</p>
+
+<h3 id="d">D. Messages, verbatim</h3>
+<p>These replace the matching rows of 1651 Appendix D.</p>
+<table>
+<thead><tr><th>Id</th><th>Text</th></tr></thead>
+<tbody>
+<tr><td>D.1 ask</td><td><code>[sm context management] &lt;reason&gt; Stop at a logical point. sm will move your claims (&lt;claims&gt;) and pending wakes to a fresh agent. Write what the next agent needs and give it to sm on stdin: `sm handoff &lt;&lt;'EOF'` … `EOF` (or, if you already posted it on your PR or ticket, `sm handoff --link &lt;url&gt;`). Then end your turn.</code> The <code>&lt;reason&gt;</code> variants are unchanged.</td></tr>
+<tr><td>D.2 reminder</td><td><code>[sm context management] Reminder: your context is at &lt;pct&gt;% and sm asked you to hand off at &lt;asked_pct&gt;%. Finish the current step, then give sm your handoff note: `sm handoff &lt;&lt;'EOF'` … `EOF`, or `sm handoff --link &lt;url&gt;`.</code></td></tr>
+<tr><td>D.4 accepted</td><td>Line 1, by kind. stored from stdin: <code>Handoff accepted. sm saved your note at &lt;stored path&gt;.</code> stored from a file: <code>Handoff accepted. sm saved your note at &lt;stored path&gt; and removed &lt;original&gt;.</code> or <code>… and left &lt;original&gt; in place (&lt;reason&gt;).</code> link: <code>Handoff accepted.</code><br>Line 2, always: <code>End your turn now; sm will start your successor when it ends and retire this session.</code></td></tr>
+<tr><td>D.6 failed</td><td><code>[sm context management] sm could not start your successor: &lt;error&gt;. You still hold all your work. Continue, and run `sm handoff` again to retry.</code> When the note is stored, this sentence is added: <code>Your note is saved; `sm handoff show &lt;your session id&gt;` prints it.</code></td></tr>
+</tbody>
+</table>
+<p>Before the live restart, check that every agent-facing text names only commands the installed CLI has: the stdin form and <code>sm handoff show</code> must ship in the same deploy as D.1.</p>
+
+<h3 id="e">E. Retention</h3>
+<p>Once a day, in a background task (an existing daily sweep may host it), sm deletes every line folder under <code>handoffs/</code> whose line ended more than 90 days ago. A line has ended when its latest agent (follow <code>successor_session_id</code> forward) is stopped or retired and has no successor; the end time is that agent's retire or stop time. A folder whose line id matches no session record is deleted when its newest file is more than 90 days old. Session records keep their <code>note</code> after the prune, so the record still says where the note was. <code>GET /sessions/{id}/handoff-note</code> then returns 410 <code>handoff note deleted after 90 days (line ended &lt;date&gt;)</code>. The 90 is a constant, <code>HANDOFF_NOTE_RETENTION_DAYS</code>, not a setting.</p>
+
+<h3 id="f">F. Deploy-time copy of existing notes</h3>
+<p>On first start after ticket 1 deploys, sm runs a one-time migration, marked done by a top-level key <code>handoff_notes_migrated_at</code> in the session store. For every session record whose note has kind <code>path</code> and whose file exists:</p>
+<ol>
+<li>Copy the file into the store as in B.1, using that record's line. Several records that name the same file (far-2170 and far-2170-h2) get one copy, filed under the latest of them. The earlier record's note is rewritten to the same stored path, because the earlier text was already overwritten.</li>
+<li>Rewrite the record's note to kind <code>stored</code>, with <code>source</code> set to the original path.</li>
+<li>Remove the original, under A.3's git rule, only if the line has ended. Otherwise, add the path to a pending list, <code>handoff_note_sources_pending</code>, in the session store. The E prune task removes each pending original once its line ends.</li>
+</ol>
+<p>As of 19 Oct this touches exactly these files. Ticket 1's PR lists the actual outcome:</p>
+<table>
+<thead><tr><th>Original</th><th>Records</th><th>Line ended?</th><th>Original</th></tr></thead>
+<tbody>
+<tr><td><code>~/Artifacts/2168_e5/HANDOFF.md</code></td><td>far-2168</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/Artifacts/2169_probe/HANDOFF.md</code></td><td>far-2169</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/Artifacts/2170_shape/HANDOFF.md</code></td><td>far-2170, far-2170-h2</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/worktrees/2221_HANDOFF.md</code></td><td>far-2221</td><td>no (far-2221-h2 running)</td><td>pending, then removed when the line ends</td></tr>
+</tbody>
+</table>
+<p>The migration does not touch <code>~/Artifacts/1775_readout/HANDOFF.md</code>, <code>1312_sweep_inspection_a2ea3815/1312-ready-handoff.md</code>, <code>1487_completion_4742e913/1488-handoff.md</code> or <code>956_ordinary_outcomes/handoff</code>. No record names them, so they belong to their artifact folders and expire with them. Records whose file is already gone (13) keep kind <code>path</code>, and the web page shows them as <code>note file no longer exists</code>.</p>
+
+<h3 id="g">G. Tickets, file sets, order</h3>
+<table>
+<thead><tr><th>#</th><th>Scope</th><th>Files</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>1 Custody</td><td>A, B, C, D, E, F, H; amend <code>specs/1651_context_handoff.html</code></td><td><code>bin/sm.rs</code> (HandoffArgs, handoff_note, run_handoff, show), <code>handoff/execute.rs</code> (HandoffNote, Brief, texts), <code>handoff/transfer.rs</code> (accept), <code>handoff/policy.rs</code> (D.1, D.2), new <code>handoff/notes.rs</code> (store, prune, migration), <code>http/handoff.rs</code> (routes), <code>http.rs</code> (route table), <code>scripts/local-judge/service.py</code> and its tests</td><td>—</td></tr>
+<tr><td>2 Web</td><td>I</td><td><code>http/watch.rs</code>, <code>http/watch_client.js</code>, new note page in <code>http/handoff.rs</code> or <code>http/web.rs</code></td><td>1</td></tr>
+<tr><td>3 Worktree root</td><td>J</td><td><code>work_claims/worktrees.rs</code>, <code>http/worktrees.rs</code>, the leftover worktrees page client</td><td>—</td></tr>
+</tbody>
+</table>
+<p>Tickets 1 and 3 share no files and can run in parallel. Model tier: middle (Opus high, or Terra high) for all three. The behaviour is fully specified here.</p>
+
+<h3 id="h">H. Local judge rule</h3>
+<p>Local agents run every shell command past the local judge<sup>[5]</sup>. Its rule stage allows a fixed set of <code>sm</code> verbs, and it rejects any command containing a newline before the rules run, so a heredoc always falls to the model judge. That judge denied <code>sm handoff</code> for draco on 19 Oct. Two changes:</p>
+<ul>
+<li>Add <code>("handoff", "show")</code> to <code>SM_READS</code>.</li>
+<li>Add a heredoc rule, checked before the newline rejection. It allows a command when the first line is exactly <code>sm handoff &lt;&lt;'TAG'</code> or <code>sm handoff &lt;&lt;"TAG"</code> (a quoted delimiter, so the shell expands nothing in the body), TAG matches <code>[A-Za-z_][A-Za-z0-9_]*</code>, the last line is exactly TAG, and the body has no line equal to TAG. The body is data and is not judged. The single-line forms <code>sm handoff --link &lt;http(s) url&gt;</code> and <code>sm handoff --path &lt;file in the checkout&gt;</code> are also allowed, the latter with the same in-checkout check <code>sm doc publish</code> uses. An unquoted <code>&lt;&lt;TAG</code> still goes to the model judge, because the shell expands <code>$(…)</code> in its body.</li>
+</ul>
+<p>The local agent addendum, <code>docs/product/local_agent_addendum.md</code>, gains one line: <code>Hand off with sm handoff &lt;&lt;'EOF' … EOF when sm asks.</code></p>
+
+<h3 id="i">I. Notes on sm.rajeshgo.li</h3>
+<ul>
+<li><b>Route.</b> <code>GET /handoff-notes/{session_id}</code> serves an owner page. It uses the same owner auth as the other web pages, and agents get 403. The page shows a header (<code>far-2221 → far-2221-h2 · 19 Oct 01:27 · 36% context · note 1 of 2 in this line</code>), links to the other notes of the line, and the note rendered as Markdown with the renderer the docs reader already uses. When the source was a file, a footer reads <code>Given as a file: &lt;path&gt; (removed | kept: &lt;reason&gt;)</code>. A link note redirects (302) to its URL. An old <code>path</code> note serves the file if it still exists, else <code>note file no longer exists: &lt;path&gt;</code>. A pruned note says what E's 410 says.</li>
+<li><b>Agent card.</b> The handoff display <code>→ &lt;successor&gt;</code><sup>[6]</sup> becomes a link to <code>/handoff-notes/&lt;this session&gt;</code>. A session with a <code>predecessor_session_id</code> gains a line <code>took over from &lt;predecessor name&gt;</code> that links to <code>/handoff-notes/&lt;predecessor id&gt;</code>. <code>SessionResponse.handoff</code> gains <code>"note_url"</code> on both records, so the app can use it later.</li>
+<li><b>App.</b> No app change in this work. The app's reader sends paths it does not know to the browser, which shows the page.</li>
+</ul>
+
+<h3 id="j">J. Worktree-root sweep</h3>
+<p><b>J.1 What counts.</b> These are the entries directly inside <code>work_claims.worktree_root</code><sup>[7]</sup> (<code>~/worktrees</code>). sm ignores any entry that contains <code>.git</code> (a file or a folder): that is a worktree or a checkout, and the existing cleanup owns it. It also ignores names starting with <code>.</code>, such as <code>.DS_Store</code>. Everything else is a <b>loose entry</b>.</p>
+<p><b>J.2 When.</b> On each hourly cleanup pass (<code>RECHECK_INTERVAL</code><sup>[8]</sup>), sm lists the loose entries. It records each new one in a <code>loose_entries</code> table in the work-claims database: <code>path</code> (primary key), <code>first_seen_at</code>, <code>last_mtime</code> (the newest mtime of anything inside, walked to depth 4), <code>deleted_at</code>, <code>deleted_reason</code>.</p>
+<p><b>J.3 Delete rule.</b> sm deletes a loose entry (<code>rm -rf</code> of that one path) when all of these hold:</p>
+<ul>
+<li><code>first_seen_at</code> is more than 14 days ago;</li>
+<li>the newest mtime inside is more than 14 days ago, so nothing has written to it recently;</li>
+<li>no <code>sm worktree keep</code> names the path. The command already accepts <code>--path</code>, so the keep table covers loose entries too;</li>
+<li>no unfinished queue job has its cwd inside the path, and none has the path as a prefix of any argv element;</li>
+<li>no live session has its working directory inside it.</li>
+</ul>
+<p>An entry that fails a check is re-checked next hour. The first live pass therefore deletes nothing: every entry is first seen then.</p>
+<p><b>J.4 Page.</b> <code>GET /worktrees/leftover</code> gains a list <code>"loose"</code>: <code>{path, size_bytes, first_seen_at, deletes_after, blocked_by: null | "keep" | "recent change" | "queue job &lt;id&gt;" | "session &lt;name&gt;"}</code>. The page shows them under a heading <b>Loose files in ~/worktrees</b>, with the existing Keep and Delete buttons. Delete goes through the existing owner-only <code>POST /worktrees/delete</code>. That route accepts a loose entry path in addition to its current inputs, and skips the git checks for it.</p>
+
+<h3 id="k">K. Test plan</h3>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>A.1 every row: terminal stdin, empty, oversize, non-UTF-8, valid; <code>-</code> positional</td><td>CLI unit tests beside <code>read_send_text_from</code>'s</td></tr>
+<tr><td>A.2 file read, store-path refusal; A.3 removal, git-tracked kept, changed-after-read kept, unlink error still exits 0</td><td>CLI tests with a temp git repo and a temp plain dir</td></tr>
+<tr><td>A.4 show: own predecessor, named session, link note, none</td><td>http test + CLI output test</td></tr>
+<tr><td>B.1 line id across three generations, sequence numbering, replaced note keeps its number, 0700/0400 modes, atomic write</td><td>unit, <code>handoff/notes.rs</code></td></tr>
+<tr><td>B.2 parse: text/file accepted, path rejected with the update message; old records still render</td><td>unit, <code>handoff/execute.rs</code></td></tr>
+<tr><td>C.1 store written before the note is recorded; a write failure leaves the state unchanged</td><td>unit with an unwritable store dir</td></tr>
+<tr><td>C.2 brief lines for stored, link, old path; the "earlier notes" line from the second note on</td><td>snapshot, existing <code>Brief::text</code> tests</td></tr>
+<tr><td>D texts exactly</td><td>snapshot asserts in the policy and execute tests</td></tr>
+<tr><td>E prune: ended more than 90 days ago deleted, 89 days kept, live line kept, orphan folder by mtime, 410 after prune, pending originals removed at line end</td><td>unit with a fixed clock</td></tr>
+<tr><td>F migration: the shared-file case, an ended line removed, a live line pending, a missing file untouched, runs once</td><td>unit on a fixture session store</td></tr>
+<tr><td>H judge: quoted heredoc allowed, unquoted to model, TAG inside the body refused, trailing command after TAG refused, show allowed</td><td><code>scripts/local-judge</code> tests</td></tr>
+<tr><td>I page auth (owner yes, agent 403), link redirect, missing file text, card links, <code>note_url</code></td><td>http tests</td></tr>
+<tr><td>J each delete guard, <code>.git</code> and dot entries skipped, the first pass deletes nothing, page list, Delete route for a loose path</td><td>unit in <code>work_claims/worktrees.rs</code> + http test</td></tr>
+<tr><td>End to end</td><td>Scratch server on a live-state copy: Claude agent, Hand off now, agent runs the heredoc. Check the successor brief, the stored file, the web page, and that nothing appears in the worktree or the worktree root</td></tr>
+</tbody>
+</table>
+
+<h3 id="l">L. Code references</h3>
+<p>Paths are under <code>crates/sm-server/src/</code> unless noted. Functions are named because line numbers drift.</p>
+<ol>
+<li><code>read_send_text_from</code>, <code>bin/sm.rs</code>: stdin rule for <code>sm send</code>. <code>HandoffArgs</code>, <code>handoff_note</code>, <code>run_handoff</code> are in the same file.</li>
+<li><code>persist_spawn_brief_artifact</code>, <code>sessions.rs</code>: state dir = parent of the state file.</li>
+<li><code>HandoffNote</code>, <code>NoteKind</code>, <code>note_value</code>, <code>Brief::text</code>, accepted and failed texts: <code>handoff/execute.rs</code>.</li>
+<li><code>accept_handoff</code>, <code>handoff/transfer.rs</code>; route handler <code>post_handoff</code>, <code>http/handoff.rs</code>.</li>
+<li><code>scripts/local-judge/service.py</code>: <code>SM_READS</code>, <code>workflow_rule</code> (newline rejection), deny ids; policy text <code>scripts/local-judge/policy.md</code>.</li>
+<li>Display strings, including <code>→ &lt;successor&gt;</code>: <code>handoff/policy.rs</code>; ask and reminder texts in the same file.</li>
+<li><code>WorkClaimsConfig::worktree_root_path</code>, <code>config.rs</code>; default <code>~/worktrees</code>.</li>
+<li><code>RECHECK_INTERVAL</code>, <code>run_worktree_cleanup</code>, <code>leftover_worktrees</code>, <code>decide</code>: <code>work_claims/worktrees.rs</code>; routes <code>/worktrees/leftover</code>, <code>/worktrees/keep</code>, <code>/worktrees/delete</code>: <code>http.rs</code>, <code>http/worktrees.rs</code>.</li>
+</ol>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why stdin and not a fixed path the agent writes to, such as <code>$SM_HANDOFF_FILE</code>?</b> A fixed path still leaves the file on the agent's side, with all the cleanup questions this memo removes. It also needs a new environment variable in every provider launch path, and an agent at high context forgets environment variables. Stdin needs nothing new: agents already pipe <code>sm send rajesh &lt;&lt;'EOF'</code> daily, and a heredoc costs the same output tokens as writing the file.</p>
+<p><b>Why not inline the note into the successor's first message?</b> sm delivers that message by typing into the terminal. Notes run to 8 KB, and long terminal input is the fragile path (paste truncation on idle Claude, chunked typing). A path plus <code>sm handoff show</code> costs the successor one read.</p>
+<p><b>Why does the CLI, not the server, read and remove a <code>--path</code> file?</b> Agents on node <code>macbook</code> write files the server cannot see. The CLI always runs where the file is.</p>
+<p><b>Why remove the original right away, not when the successor starts?</b> The copy is already safe in sm, and the successor is told to read sm's copy. A later removal would need the server to reach the agent's machine (see above). It would also leave a window in which an agent edits a file that no longer matters.</p>
+<p><b>Why keep <code>--path</code> at all?</b> Agents carry old habits and old instructions, and repo instruction files (fractal-algo-rust's AGENTS.md) mention handoff files. Refusing <code>--path</code> would make a high-context agent retry. Accepting it and cleaning up costs nothing.</p>
+<p><b>Why does a git-tracked file stay?</b> It is already durable and reviewable, and deleting it would dirty the worktree and could block worktree cleanup.</p>
+<p><b>Should sm snapshot <code>--link</code> notes too?</b> No. PR and ticket comments are durable, and GitHub is the source of truth for them.</p>
+<p><b>Does the managed-artifacts scan need a change?</b> No. With the new wording, agents stop writing notes into artifact folders. The four existing ones are handled by F, and the older unreferenced ones expire with their folders.</p>
+<p><b>Could the worktree-root sweep delete something a running job needs?</b> J.3 checks unfinished queue jobs (cwd and argv), live sessions' working directories, and any change within 14 days. Anything else is listed on the page for 14 days before deletion, and Keep stops it.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
