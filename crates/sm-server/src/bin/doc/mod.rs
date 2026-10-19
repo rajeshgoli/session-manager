@@ -476,9 +476,7 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
             resolved.pr_number.unwrap_or_default()
         );
     }
-    if let Some(ask) = super::handoff_ask(&doc) {
-        println!("{ask}");
-    }
+    super::print_review_handoff_ask(&doc);
     Ok(())
 }
 

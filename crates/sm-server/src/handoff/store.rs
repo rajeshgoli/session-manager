@@ -515,11 +515,10 @@ impl SessionStore {
         };
         let record = HandoffRecord::asked(reason.trigger(), &now_rfc3339(), percent);
         set_handoff_record(&mut state, session_id, Some(&record))?;
+        let text = ask_text(&reason, &self.handoff_claims_text(session_id));
+        let text = self.prepare_handoff_ask(&mut state, session_id, &text, false);
         self.write_raw_json_value(&state)?;
-        Ok(Some(ask_text(
-            &reason,
-            &self.handoff_claims_text(session_id),
-        )))
+        Ok(Some(text))
     }
 
     /// Apply the threshold ask and the reminder to an accepted context sample
@@ -589,12 +588,12 @@ impl SessionStore {
                     .asked_percent
                     .unwrap_or(context.policy.threshold_percent);
                 set_handoff_record(state, session_id, Some(&record))?;
-                self.queue_handoff_message(
-                    state,
-                    session_id,
-                    &reminder_text(used_percentage, asked_percent),
-                    runtime,
-                )?;
+                let reminder = reminder_text(used_percentage, asked_percent);
+                let reminder = match self.handoff_draft_raw(state, session_id) {
+                    Ok(draft) if self.handoff_draft_file(state, session_id, &draft, "write", None).is_ok() => reminder.replace("post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`", &format!("fill in {}, and run `sm handoff`", draft["path"].as_str().unwrap())),
+                    _ => reminder.replace("post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`", "run `sm handoff` to draft your note"),
+                };
+                self.queue_handoff_message(state, session_id, &reminder, runtime)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -659,6 +658,7 @@ impl SessionStore {
                         policy::MESSAGE_CATEGORY,
                     )?;
                 }
+                self.cleanup_handoff_draft(state, session_id, true);
                 set_handoff_record(state, session_id, None)?;
                 self.queue_handoff_message(state, session_id, policy::WITHDRAWN_TEXT, runtime)?;
                 Ok(true)
@@ -692,6 +692,7 @@ impl SessionStore {
         let record = HandoffRecord::asked(reason.trigger(), &now_rfc3339(), reason.percent());
         set_handoff_record(state, session_id, Some(&record))?;
         let text = ask_text(reason, &self.handoff_claims_text(session_id));
+        let text = self.prepare_handoff_ask(state, session_id, &text, true);
         self.queue_handoff_message(state, session_id, &text, runtime)
     }
 
@@ -741,7 +742,7 @@ mod tests {
     use super::*;
     use crate::work_claims::{ClaimSource, HolderState, SessionDirectory, SessionInfo};
 
-    const ASK_TAIL: &str = " Stop at a logical point. sm will move your claims (none) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.";
+    const ASK_TAIL: &str = " Stop at a logical point. sm will move your claims (none) and pending wakes to a fresh agent. Run `sm handoff`; it drafts your note with what sm knows and tells you where.";
 
     fn temp_path(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -756,7 +757,7 @@ mod tests {
         let mut session = json!({
             "id": id,
             "name": format!("{provider}-{id}"),
-            "working_dir": "/repo",
+            "working_dir": "",
             "tmux_session": format!("{provider}-{id}"),
             "provider": provider,
             "status": "running",
@@ -1094,7 +1095,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[1],
-            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
+            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, run `sm handoff` to draft your note."
         );
         assert!(record(&store, "agent001").unwrap().reminded_at.is_some());
         assert_eq!(display(&store, "agent001"), "handoff overdue");

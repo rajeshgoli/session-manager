@@ -19,3 +19,5 @@ later. "No clear ruling" is not an outage; report the command to your parent.
 
 If you cannot continue, report the specific blocker to your parent with
 `sm send`, including what you finished and what remains, then stop and wait.
+
+When sm asks you to hand off, fill in the draft it names and run sm handoff.

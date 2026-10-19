@@ -18,6 +18,7 @@ pub enum HandoffAcceptOutcome {
     Forbidden,
     NotFound,
     Conflict(String),
+    Incomplete(Vec<String>),
 }
 
 /// What a successor is created with (Appendix F.2, F.3).
@@ -106,6 +107,51 @@ fn repoint_array_entries(state: &mut Value, array: &str, keys: &[&str], from: &s
 }
 
 impl SessionStore {
+    /// Retry a failed launch with its existing stored row and provenance intact.
+    pub fn resubmit_handoff(&self, id: &str, requester: &str) -> Result<HandoffAcceptOutcome> {
+        if requester != id {
+            return Ok(HandoffAcceptOutcome::Forbidden);
+        }
+        let _submission = self.lock_opencode_submission(id)?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(session) = session_object_mut(ensure_sessions_array_mut(&mut state)?, id) else {
+            return Ok(HandoffAcceptOutcome::NotFound);
+        };
+        let Some(mut record) = raw_handoff_record(session) else {
+            return Ok(HandoffAcceptOutcome::Conflict(
+                "no failed handoff to resubmit".into(),
+            ));
+        };
+        if record.state != HandoffPhase::Failed
+            || !record.note.as_ref().is_some_and(|n| n["kind"] == "stored")
+        {
+            return Ok(HandoffAcceptOutcome::Conflict(
+                "no failed stored note to resubmit".into(),
+            ));
+        }
+        if raw_session_is_stopped(session)
+            || opencode_lifecycle_pending(session)
+            || (json_text(session.get("provider")).as_deref() == Some("opencode")
+                && record.successor_session_id.is_some())
+        {
+            return Ok(HandoffAcceptOutcome::Conflict(
+                "handoff retry is not ready".into(),
+            ));
+        }
+        record.state = HandoffPhase::Accepted;
+        record.accepted_at = Some(now_rfc3339());
+        record.error = None;
+        record.failed_at = None;
+        record.completeness_warned_at = None;
+        write_handoff_record(session, &record);
+        let ready = raw_session_is_idle(session);
+        // Verify custody before committing acceptance. A missing row must not launch.
+        self.handoff_note_view(id, false, false)?;
+        self.write_raw_json_value(&state)?;
+        Ok(HandoffAcceptOutcome::Accepted { ready })
+    }
+
     /// `sm handoff --link|--path` (Appendix E).
     pub fn accept_handoff(
         &self,
@@ -130,6 +176,11 @@ impl SessionStore {
                 "failed Opencode handoff successor cleanup is still completing".into(),
             ));
         }
+        let requirements = if note.kind == crate::handoff::execute::NoteKind::Text {
+            self.handoff_items(&state, session_id)?
+        } else {
+            Vec::new()
+        };
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(HandoffAcceptOutcome::NotFound);
@@ -172,14 +223,46 @@ impl SessionStore {
                 ..HandoffRecord::asked(HandoffTrigger::Voluntary, &now, None)
             },
         };
+        if note.kind == crate::handoff::execute::NoteKind::Text {
+            crate::sessions::handoff_notes::note_text(note.value.as_bytes(), false)?;
+            if !matches!(note.source.as_deref(), Some("draft" | "file")) {
+                anyhow::bail!("note.source must be draft or file");
+            }
+            if record.completeness_warned_at.is_none()
+                && session.get("handoff_completeness_warned_at").is_none()
+            {
+                let missing =
+                    crate::sessions::handoff_notes::missing_items(&requirements, &note.value);
+                if !missing.is_empty() {
+                    session.insert("handoff_completeness_warned_at".into(), json!(now));
+                    if session.contains_key("handoff") {
+                        let mut warned = record;
+                        warned.completeness_warned_at = Some(now);
+                        write_handoff_record(session, &warned);
+                    }
+                    self.write_raw_json_value(&state)?;
+                    return Ok(HandoffAcceptOutcome::Incomplete(missing));
+                }
+            }
+        }
+        let stored_note = if note.kind == crate::handoff::execute::NoteKind::Text {
+            json!({"kind":"stored", "value":format!("handoff_notes:{session_id}")})
+        } else {
+            note.to_json()
+        };
         let record = HandoffRecord {
             state: HandoffPhase::Accepted,
-            note: Some(note.to_json()),
+            note: Some(stored_note),
             accepted_at: Some(now),
+            completeness_warned_at: None,
             ..record
         };
+        session.remove("handoff_completeness_warned_at");
         write_handoff_record(session, &record);
         let ready = raw_session_is_idle(session);
+        if note.kind == crate::handoff::execute::NoteKind::Text {
+            self.save_handoff_note(&state, session_id, note)?;
+        }
         self.write_raw_json_value(&state)?;
         Ok(HandoffAcceptOutcome::Accepted { ready })
     }
@@ -339,11 +422,15 @@ impl SessionStore {
         record.failed_at = Some(now_rfc3339());
         write_handoff_record(session, &record);
         let runtime = self.delivery_runtime.clone();
+        let mut text = execute::failed_text(error);
+        if record.note.as_ref().is_some_and(|n| n["kind"] == "stored") {
+            text.push_str(" Your note is saved; run `sm handoff` to retry with it.");
+        }
         self.queue_parent_message(
             &mut state,
             session_id,
             session_id,
-            &execute::failed_text(error),
+            &text,
             policy::DELIVERY_MODE,
             policy::MESSAGE_CATEGORY,
             runtime.as_ref(),
@@ -926,6 +1013,8 @@ mod tests {
 
     fn note() -> HandoffNote {
         HandoffNote {
+            source: None,
+            source_path: None,
             kind: NoteKind::Link,
             value: "https://github.com/acme/widgets/pull/9#issuecomment-1".to_owned(),
         }
@@ -1016,6 +1105,8 @@ mod tests {
         ));
         // Accepted again: the note is replaced.
         let corrected = HandoffNote {
+            source: None,
+            source_path: None,
             kind: NoteKind::Path,
             value: "/repo/HANDOFF.md".to_owned(),
         };

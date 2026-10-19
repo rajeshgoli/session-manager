@@ -536,15 +536,27 @@ struct TailArgs {
     after_help = "After your turn ends, sm starts a fresh agent of the same kind in this worktree, moves your claims, children, roles and pending wakes to it, and retires this session. `sm handoff FILE` means `--path FILE`."
 )]
 struct HandoffArgs {
+    #[command(subcommand)]
+    command: Option<HandoffCommand>,
     /// Same as --path.
     #[arg(conflicts_with_all = ["link", "path"])]
     file_path: Option<String>,
     /// URL of the handoff note (a PR or ticket comment).
     #[arg(long, conflicts_with = "path")]
     link: Option<String>,
-    /// File holding the handoff note.
+    /// Import a handoff note file into sm; remove the source unless git tracks it.
     #[arg(long)]
     path: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum HandoffCommand {
+    /// Read the note and the owner's messages received by this line of work.
+    Show {
+        session: Option<String>,
+        #[arg(long)]
+        line: bool,
+    },
 }
 
 #[derive(Args)]
@@ -1478,26 +1490,176 @@ fn retire_response_status(payload: &Value, target_session_id: &str) -> Result<&'
 const PERSON_FLAGS_ONLY: &str = "--title/--blocking only apply to a message to a person";
 
 /// `sm handoff --link|--path` (sm#1651, Appendix E).
-fn run_handoff(client: &ApiClient, args: HandoffArgs) -> Result<()> {
-    let note = handoff_note(args)?;
+fn run_handoff(client: &ApiClient, mut args: HandoffArgs) -> Result<()> {
+    use sm_server::sessions::handoff_notes as notes;
+    if let Some(HandoffCommand::Show { session, line }) = args.command.take() {
+        let own = session.is_none();
+        let target = session.unwrap_or(current_session_id().unwrap_or_default());
+        anyhow::ensure!(
+            !target.is_empty(),
+            "sm handoff show needs a session outside a managed agent"
+        );
+        let view = client.get_json(&format!(
+            "/sessions/{}/handoff-note?line={}&own={}",
+            encode_path_segment(&target),
+            u8::from(line),
+            u8::from(own)
+        ))?;
+        if view["notes"]
+            .as_array()
+            .is_none_or(|notes| notes.is_empty())
+        {
+            bail!("{target} has no handoff note");
+        }
+        println!("{}", notes::render_notes(&view));
+        return Ok(());
+    }
     let session_id = current_session_id()?;
+    let is_link = args.link.is_some();
+    let mut source_file = None;
+    let mut draft_path = None;
+    let mut draft_sha = None;
+    let mut resubmit = false;
+    let note = if is_link {
+        handoff_note(args)?
+    } else {
+        let draft = client.get_json(&format!("/sessions/{session_id}/handoff-draft"))?;
+        let path = PathBuf::from(draft["path"].as_str().context("missing draft path")?);
+        draft_sha = draft["sha256"].as_str().map(str::to_owned);
+        draft_path = Some(path.clone());
+        if let Some(import) = args.path.or(args.file_path) {
+            let absolute =
+                fs::canonicalize(&import).with_context(|| format!("File not found: {import}"))?;
+            let mut original = fs::File::open(&absolute)?;
+            let metadata = original.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "--path must name a regular file: {import}"
+            );
+            let mut bytes = Vec::new();
+            original.read_to_end(&mut bytes)?;
+            let text = notes::note_text(&bytes, false)?;
+            source_file = Some((absolute.clone(), metadata));
+            json!({"kind":"text","value":text,"source":"file","source_path":absolute})
+        } else if !path.exists() {
+            if draft["resubmit"] == true {
+                resubmit = true;
+                Value::Null
+            } else {
+                notes::write_draft(&path, draft["text"].as_str().context("missing draft text")?)?;
+                println!("sm drafted your handoff note at {} with what it knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` again.",path.display());
+                return Ok(());
+            }
+        } else {
+            let bytes = fs::read(&path)?;
+            let original = std::str::from_utf8(&bytes)
+                .map_err(|_| anyhow::anyhow!("handoff note is not valid UTF-8"))?;
+            if draft_sha.as_deref() == Some(notes::digest(original).as_str()) {
+                eprintln!(
+                    "The note at {} is still sm's draft. Fill it in, then run sm handoff again.",
+                    path.display()
+                );
+                process::exit(2);
+            }
+            json!({"kind":"text","value":notes::note_text(&bytes,true)?,"source":"draft"})
+        }
+    };
     let response = client.request(
         "POST",
         &format!("/sessions/{session_id}/handoff"),
-        Some(json!({ "requester_session_id": session_id, "note": note })),
+        Some(if resubmit {
+            json!({"requester_session_id":session_id,"resubmit":true})
+        } else {
+            json!({"requester_session_id":session_id,"note":note})
+        }),
     )?;
-    if !(200..300).contains(&response.status) {
-        let detail = serde_json::from_str::<Value>(&response.body)
-            .ok()
-            .and_then(|body| body["detail"].as_str().map(ToOwned::to_owned))
-            .unwrap_or_else(|| format!("HTTP {}: {}", response.status, response.body));
-        bail!("{detail}");
+    let payload: Value = serde_json::from_str(&response.body)?;
+    if response.status == 409 && payload["error"] == "incomplete" {
+        eprintln!("{}", payload["message"].as_str().unwrap_or_default());
+        process::exit(3);
     }
-    let payload = response.into_json()?;
-    println!(
-        "{}",
-        payload["message"].as_str().unwrap_or("Handoff accepted.")
-    );
+    if !(200..300).contains(&response.status) {
+        bail!("{}", payload["detail"].as_str().unwrap_or(&response.body));
+    }
+    let first = if resubmit {
+        "Handoff accepted. sm saved your note.".into()
+    } else if let Some((path, before)) = source_file {
+        let (removed, reason) = notes::remove_source(&path, &before);
+        if let Some(draft) = draft_path.as_deref() {
+            if let Err(error) = notes::remove_draft(draft, draft_sha.as_deref()) {
+                eprintln!("Draft cleanup: {error:#}");
+            }
+        }
+        let draft_removed = draft_path.as_deref().is_some_and(|p| !p.exists());
+        if let Err(error) = client.request(
+            "POST",
+            &format!("/sessions/{session_id}/handoff-note/source"),
+            Some(json!({"removed":removed,"reason":reason,"draft_removed":draft_removed})),
+        ) {
+            eprintln!("Could not report source cleanup: {error:#}");
+        }
+        if removed {
+            format!(
+                "Handoff accepted. sm saved your note and removed {}.",
+                path.display()
+            )
+        } else {
+            format!(
+                "Handoff accepted. sm saved your note and left {} in place ({}).",
+                path.display(),
+                reason.as_deref().unwrap_or("cleanup failed")
+            )
+        }
+    } else if is_link {
+        "Handoff accepted.".into()
+    } else {
+        let path = draft_path.as_deref().unwrap();
+        match notes::remove_draft(path, None) {
+            Ok(_) => {
+                if let Err(error) = client.request(
+                    "POST",
+                    &format!("/sessions/{session_id}/handoff-note/source"),
+                    Some(json!({"removed":true,"reason":null,"draft_removed":true})),
+                ) {
+                    eprintln!("Could not report draft cleanup: {error:#}");
+                }
+                "Handoff accepted. sm saved your note and deleted the draft.".into()
+            }
+            Err(error) => {
+                format!("Handoff accepted. sm saved your note; draft cleanup failed: {error}.")
+            }
+        }
+    };
+    println!("{first}\nEnd your turn now; sm will start your successor when it ends and retire this session.");
+    Ok(())
+}
+
+fn print_review_handoff_ask(response: &Value) {
+    if let Some(ask) = handoff_ask(response) {
+        match write_review_handoff_draft(response) {
+            Ok(()) => println!("{ask}"),
+            Err(error) => {
+                eprintln!("Could not write the handoff draft: {error:#}");
+                println!("{}", sm_server::sessions::handoff_notes::fallback_ask(ask));
+            }
+        }
+    }
+}
+
+fn write_review_handoff_draft(response: &Value) -> Result<()> {
+    if let Some(draft) = response.get("handoff_draft") {
+        let path = Path::new(
+            draft["path"]
+                .as_str()
+                .context("missing handoff draft path")?,
+        );
+        sm_server::sessions::handoff_notes::write_draft(
+            path,
+            draft["text"]
+                .as_str()
+                .context("missing handoff draft text")?,
+        )?;
+    }
     Ok(())
 }
 
@@ -2366,9 +2528,7 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
     if let Some(warning) = response["claim_warning"].as_str() {
         eprintln!("{warning}");
     }
-    if let Some(ask) = handoff_ask(&response) {
-        println!("{ask}");
-    }
+    print_review_handoff_ask(&response);
     Ok(())
 }
 
@@ -5972,8 +6132,30 @@ mod tests {
     }
 
     #[test]
+    fn handoff_cli_accepts_draft_show_and_path_forms() {
+        for args in [
+            vec!["sm", "handoff"],
+            vec!["sm", "handoff", "show"],
+            vec!["sm", "handoff", "show", "agent001", "--line"],
+            vec!["sm", "handoff", "--path", "/tmp/note.md"],
+            vec!["sm", "handoff", "/tmp/note.md"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["sm", "handoff", "show", "--line"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Handoff(HandoffArgs {
+                command: Some(HandoffCommand::Show { line: true, .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn handoff_note_needs_a_link_or_an_existing_file() {
         let args = |file_path: Option<&str>, link: Option<&str>, path: Option<&str>| HandoffArgs {
+            command: None,
             file_path: file_path.map(ToOwned::to_owned),
             link: link.map(ToOwned::to_owned),
             path: path.map(ToOwned::to_owned),

@@ -380,7 +380,7 @@ fn opencode_outbox_handoff_reservation_holds_new_rows_for_successor() {
     let f = Fixture::new();
     f.create("local1", None).unwrap();
     let note = crate::handoff::execute::HandoffNote::parse(
-        &json!({"kind":"path", "value":"/tmp/handoff.md"}),
+        &json!({"kind":"link", "value":"https://example.com/handoff.md"}),
     )
     .unwrap();
     f.store.accept_handoff("local1", "local1", &note).unwrap();
@@ -456,7 +456,7 @@ fn opencode_outbox_http_wait_does_not_hold_registry_and_handoff_waits_for_submis
     let store = f.store.clone();
     let handoff = thread::spawn(move || {
         let note = crate::handoff::execute::HandoffNote::parse(
-            &json!({"kind":"path", "value":"/tmp/handoff.md"}),
+            &json!({"kind":"link", "value":"https://example.com/handoff.md"}),
         )
         .unwrap();
         store.accept_handoff("local1", "local1", &note).unwrap();

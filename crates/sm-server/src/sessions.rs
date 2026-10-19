@@ -43,6 +43,8 @@ use crate::{
     usage_report::{UsageReport, UsageReportOptions, UsageReportStore, UsageReportTarget},
 };
 
+#[path = "handoff/notes.rs"]
+pub mod handoff_notes;
 #[path = "handoff/store.rs"]
 mod handoff_store;
 #[path = "handoff/transfer.rs"]
@@ -121,6 +123,7 @@ pub struct SessionStore {
     /// racing a completed driver and mistaking its released lease for failure.
     reparent_apply_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
+    handoff_config: Option<Arc<crate::config::AppConfig>>,
     owner_answered_wake: Option<OwnerAnsweredWake>,
     opencode_launch: Option<OpencodeLaunchContext>,
     /// Carried on the store rather than read per-request because the codex-fork
@@ -265,6 +268,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            handoff_config: None,
             owner_answered_wake: None,
             opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -1878,6 +1882,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            handoff_config: None,
             owner_answered_wake: None,
             opencode_launch: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -4543,6 +4548,9 @@ impl SessionStore {
     /// Retire and kill end the session's work claims (sm#1452). A failure is
     /// logged; the next claims sync ends them.
     fn end_work_claims_after_retire(&self, session_id: &str) {
+        if let Ok(state) = self.load_raw_json_value() {
+            self.cleanup_handoff_draft(&state, session_id, false);
+        }
         if let Err(error) = self.cleanup_terminal_images(session_id) {
             eprintln!("removing terminal images of retired session {session_id} failed: {error:#}");
         }
