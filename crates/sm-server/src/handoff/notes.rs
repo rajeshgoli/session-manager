@@ -869,13 +869,23 @@ impl SessionStore {
                 let inputs = if Self::handoff_node(state, id) == "primary" {
                     transcript_messages(&path, &excluded)
                 } else {
-                    self.read_handoff_artifact(state, id, &path)
-                        .and_then(|artifact| match artifact {
-                            Some((text, _)) => {
-                                transcript_messages_reader(io::Cursor::new(text), &excluded)
-                            }
-                            None => Ok(vec![]),
-                        })
+                    self.handoff_run_ssh(
+                        &Self::handoff_node(state, id),
+                        include_str!("transcript_remote.py"),
+                        &json!({"path":path,"excluded":excluded,"harness_tags":HARNESS_TAGS}),
+                    )
+                    .and_then(|value| {
+                        let inputs = serde_json::from_value::<Vec<(String, String)>>(
+                            value["messages"].clone(),
+                        )?;
+                        // Keep the first non-fitting message's position in the
+                        // global merge without transferring its (possibly huge)
+                        // body. It always stops selection if reached.
+                        if let Some(at) = value["cutoff"].as_str() {
+                            messages.push(json!({"at":at,"transcript_cutoff":true}));
+                        }
+                        Ok(inputs)
+                    })
                 };
                 match inputs {
                     Ok(inputs) => {
@@ -893,6 +903,9 @@ impl SessionStore {
         let mut bytes = 0;
         let mut kept = vec![];
         for message in messages.into_iter().rev() {
+            if message["transcript_cutoff"] == true {
+                break;
+            }
             let size = message["text"].as_str().unwrap_or_default().len();
             if bytes + size > 80_000 && !kept.is_empty() {
                 break;
@@ -1866,6 +1879,141 @@ mod tests {
         }
     }
     #[test]
+    fn remote_transcript_filter_matches_local_and_bounds_transfer() {
+        let (_store, root) = fixture();
+        let path = root.join("remote.jsonl");
+        let excluded = BTreeSet::from(["Inbox words".into(), "inbox envelope".into()]);
+        let extract = || {
+            let mut child = Command::new("python3")
+                .args(["-c", include_str!("transcript_remote.py")])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    json!({"path":path,"excluded":excluded,"harness_tags":HARNESS_TAGS})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let mut file = fs::File::create(&path).unwrap();
+        for fixture in [
+            include_str!("fixtures/owner-claude.jsonl"),
+            include_str!("fixtures/owner-codex.jsonl"),
+        ] {
+            writeln!(file, "{fixture}").unwrap();
+        }
+        file.flush().unwrap();
+        let output = extract();
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_value::<Vec<(String, String)>>(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["messages"].clone()
+            )
+            .unwrap(),
+            {
+                let mut messages = transcript_messages(&path, &excluded).unwrap();
+                messages.sort_by(|a, b| a.0.cmp(&b.0));
+                messages
+            }
+        );
+        // Tool traffic dominates the input, but contributes no returned bytes.
+        for i in 0..40 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"assistant","message":{"content":"t".repeat(250_000)}})
+            )
+            .unwrap();
+            writeln!(file, "{}", json!({"type":"user","timestamp":format!("2026-10-19T02:{i:02}:00Z"),"message":{"content":format!("  Owner {i}: é\n{}", "x".repeat(4_000))}})).unwrap();
+        }
+        // Nonmonotonic timestamps must preserve the cap's first-nonfit barrier.
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"user","timestamp":"2026-10-19T00:00:00Z","message":{"content":"older"}})
+        )
+        .unwrap();
+        drop(file);
+        let expected = || {
+            let mut all = transcript_messages(&path, &excluded).unwrap();
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut bytes = 0;
+            let mut kept = vec![];
+            for message in all.into_iter().rev() {
+                if bytes + message.1.len() > 80_000 && !kept.is_empty() {
+                    break;
+                }
+                bytes += message.1.len();
+                kept.push(message);
+            }
+            kept.reverse();
+            kept
+        };
+        let output = extract();
+        assert!(output.status.success());
+        assert!(output.stdout.len() < 90_000);
+        assert!(fs::metadata(&path).unwrap().len() > 10_000_000);
+        assert_eq!(
+            serde_json::from_value::<Vec<(String, String)>>(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["messages"].clone()
+            )
+            .unwrap(),
+            expected()
+        );
+        let oversized = "é".repeat(40_002);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"user","timestamp":"2026-10-20","message":{"content":oversized}})
+        )
+        .unwrap();
+        drop(file);
+        let output = extract();
+        assert!(output.status.success());
+        assert!(output.stdout.len() < oversized.len() + 100);
+        assert_eq!(
+            serde_json::from_value::<Vec<(String, String)>>(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["messages"].clone()
+            )
+            .unwrap(),
+            vec![("2026-10-20".into(), oversized)]
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{{bad json}}").unwrap();
+        drop(file);
+        let output = extract();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        for invalid in [
+            r#"{"type":"assistant","value":NaN}"#,
+            r#"{"type":"assistant","value":"\ud800"}"#,
+            r#"{"type":"assistant","value":1e999}"#,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(transcript_messages(&path, &excluded).is_err());
+            let output = extract();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+        fs::remove_file(&path).unwrap();
+        let output = extract();
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["messages"],
+            json!([])
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn handoff_remote_notes_transcripts_and_import_stay_on_their_session_node() {
         use std::os::unix::fs::PermissionsExt;
         let (mut store, root) = fixture();
@@ -1932,6 +2080,30 @@ sys.exit(p.returncode)
             view["owner_messages"][0]["text"],
             "Owner's remote instruction"
         );
+        // A remote non-fitting message remains a stopping point after merging
+        // with earlier Inbox replies, even though its body is not transferred.
+        let conn = store.notes_db().unwrap();
+        conn.execute_batch("CREATE TABLE owner_message_replies(body TEXT,delivered_text TEXT,delivered_to_session_id TEXT,created_at TEXT,id TEXT);").unwrap();
+        conn.execute("INSERT INTO owner_message_replies VALUES('older inbox','envelope','agent001','2026-10-18','r1')", []).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&remote_transcript)
+            .unwrap();
+        for (at, text) in [
+            ("2026-10-19T01", "x".repeat(79_000)),
+            ("2026-10-19T02", "y".repeat(2_000)),
+        ] {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"user","timestamp":at,"message":{"content":text}})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let view = store.handoff_note_view("agent001", false, false).unwrap();
+        assert_eq!(view["owner_messages"].as_array().unwrap().len(), 1);
+        assert_eq!(view["owner_messages"][0]["text"], "y".repeat(2_000));
         let draft = json!({"path":"/draft-work/.sm/handoff.md","text":"remote draft"});
         store
             .handoff_draft_file(&state, "agent001", &draft, "write", None)
