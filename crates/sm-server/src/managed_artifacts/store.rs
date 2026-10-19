@@ -2,20 +2,32 @@ use super::*;
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension};
 use std::{fs, path::PathBuf, time::Duration};
 
+/// How long an ordinary connection waits for another artifacts.db writer.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct ArtifactStore {
     pub path: PathBuf,
+    busy_timeout: Duration,
 }
 impl ArtifactStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            busy_timeout: BUSY_TIMEOUT,
+        }
+    }
+    /// The same store, whose connections give up on a held writer after `timeout`.
+    pub fn with_busy_timeout(mut self, timeout: Duration) -> Self {
+        self.busy_timeout = timeout;
+        self
     }
     pub fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(&self.path)?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(self.busy_timeout)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(include_str!("schema.sql"))?;
         if !query(&conn, "PRAGMA table_info(artifact_completions)", &[])?
@@ -45,6 +57,19 @@ impl ArtifactStore {
     pub fn detail(&self, root: &str, name: &str) -> Result<Value> {
         detail(&self.open()?, root, name)
     }
+}
+/// Whether `error` is SQLite reporting another connection's lock.
+pub fn is_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
 }
 pub fn query(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(sql)?;
