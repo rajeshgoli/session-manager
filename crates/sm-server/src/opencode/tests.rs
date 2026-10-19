@@ -591,3 +591,33 @@ fn plugin_checks_relative_and_escaping_paths_against_production_judge() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn quiet_event_stream_outlives_the_request_timeout() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).unwrap();
+            request.extend_from_slice(&buf[..n]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .unwrap();
+        // A busy local model can go quiet for longer than any single request.
+        thread::sleep(Duration::from_millis(1500));
+        socket
+            .write_all(b"data: {\"type\":\"session.status\"}\n\n")
+            .unwrap();
+    });
+    let client = Client::new(port, "secret", Duration::from_secs(1)).unwrap();
+    let mut stream = client.event_stream().unwrap();
+    let event = events::read_event(&mut stream).unwrap().unwrap();
+    assert_eq!(event["type"], "session.status");
+    server.join().unwrap();
+}

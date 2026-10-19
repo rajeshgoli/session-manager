@@ -264,6 +264,18 @@ class WallTests(unittest.TestCase):
         self.assertNotEqual(denied.returncode, 0)
         self.assertNotEqual(denied.stdout.strip(), "0")
 
+    @unittest.skipUnless(sys.platform == "darwin", "host service fixture requires macOS")
+    def test_certificate_trust_lookup_is_allowed(self):
+        script = ("import ctypes, sys; lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
+                  "port=ctypes.c_uint.in_dll(lib,'bootstrap_port').value; out=ctypes.c_uint(); "
+                  "rc=lib.bootstrap_look_up(port,b'com.apple.trustd.agent',ctypes.byref(out)); "
+                  "print(rc); sys.exit(0 if rc == 0 else 1)")
+        profile = self.state / "trust-wall.sb"
+        profile.write_text(wall.generate(self.args, set(), 65))
+        allowed = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(profile), PYTHON, "-c", script],
+                                 capture_output=True, text=True, timeout=15)
+        self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+
     @unittest.skipUnless(sys.platform == "darwin", "actual Seatbelt enforcement requires macOS")
     def test_kernel_process_environment_query_is_denied(self):
         secret = "fixture-only-outside-process-secret"
