@@ -1334,6 +1334,246 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deferred_handoff_restore_waits_for_transfer_and_initial_brief_acknowledgement() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = store("restore-during-launch", "idle");
+        store
+            .accept_handoff("pred0001", "pred0001", &note())
+            .unwrap();
+        let plan = store.claim_handoff_start("pred0001").unwrap().unwrap();
+        let root = temp_path("restore-during-launch");
+        fs::create_dir_all(&root).unwrap();
+        let successor = store
+            .create_handoff_session_record(
+                CreateCoreSessionRequest {
+                    provider: Some(plan.provider),
+                    name: Some(plan.successor_name),
+                    working_dir: Some(root.display().to_string()),
+                    parent_session_id: plan.parent_session_id,
+                    ..Default::default()
+                },
+                Some(root.clone()),
+                "pred0001",
+                None,
+            )
+            .unwrap();
+        let tmux = root.join("tmux");
+        let tmux_log = root.join("tmux.log");
+        // This tmux substitute exposes a composer and records submission, but
+        // provider acceptance is withheld until the test writes a transcript.
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$1" in
+  has-session) test -f '{root}/live'; exit $? ;;
+  new-session) touch '{root}/live' ;;
+  kill-session) rm -f '{root}/live' ;;
+  capture-pane) printf '❯ \n' ;;
+  display-message) printf '1,0\n' ;;
+  send-keys) case "$*" in *' -H 0d') touch '{root}/submitted';; esac ;;
+esac
+exit 0
+"#,
+                log = tmux_log.display(),
+                root = root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+        let projects = root.join("projects");
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig {
+            runtime_initial_brief_ready_timeout_ms: Some(2_000),
+            runtime_initial_brief_ack_timeout_ms: Some(10_000),
+            send_keys_settle_ms: Some(0.0),
+            ..Default::default()
+        })
+        .with_tmux_binary_for_test(tmux.display().to_string())
+        .with_claude_transcript_roots(vec![projects.clone()]);
+
+        // Even a discoverable provider identity cannot bypass pending transfer.
+        let mut state = store.load_raw_json_value().unwrap();
+        session_object_mut(
+            ensure_sessions_array_mut(&mut state).unwrap(),
+            &successor.id,
+        )
+        .unwrap()
+        .insert("provider_resume_id".into(), json!("existing-provider-id"));
+        store.write_raw_json_value(&state).unwrap();
+        assert!(matches!(
+            store
+                .restore_core_session_with_runtime(&successor.id, &runtime)
+                .unwrap(),
+            Some(CoreRestoreOutcome::NotStopped)
+        ));
+        assert!(matches!(
+            store.restore_core_session(&successor.id).unwrap(),
+            Some(CoreRestoreOutcome::NotStopped)
+        ));
+        assert!(!tmux_log.exists());
+        assert_eq!(store.load_raw_json_value().unwrap(), state);
+        store
+            .transfer_handoff_json("pred0001", &successor.id)
+            .unwrap();
+        assert!(matches!(
+            store
+                .restore_core_session_with_runtime(&successor.id, &runtime)
+                .unwrap(),
+            Some(CoreRestoreOutcome::NotStopped)
+        ));
+        assert!(!tmux_log.exists());
+
+        let prompt = "One immutable handoff brief";
+        let intent = store
+            .accept_spawn_brief(AcceptSpawnBriefRequest {
+                prompt: prompt.into(),
+                source: SpawnBriefSource {
+                    kind: "stdin".into(),
+                    path: None,
+                },
+                requested_provider: "claude".into(),
+                requested_model: None,
+                requested_reasoning_effort: None,
+                requested_name: None,
+                parent_session_id: None,
+                requested_node: None,
+                requested_working_dir: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let launch_store = store.clone();
+        let launch_runtime = runtime.clone();
+        let id = successor.id.clone();
+        let launch = thread::spawn(move || {
+            launch_store.start_handoff_session_runtime(
+                &id,
+                CreateCoreSessionRequest {
+                    provider: Some("claude".into()),
+                    initial_message: Some(prompt.into()),
+                    spawn_brief: Some(SpawnBriefBinding {
+                        intent_id: intent.id,
+                        sha256: intent.artifact.sha256,
+                    }),
+                    ..Default::default()
+                },
+                &launch_runtime,
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.join("submitted").exists() {
+            assert!(
+                !launch.is_finished(),
+                "launch ended before brief submission"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "brief was never submitted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pending = store.load_raw_json_value().unwrap();
+        assert_eq!(
+            pending["session_runtime_launches"][0]["status"],
+            "launching"
+        );
+        let provider_id = pending["session_runtime_launches"][0]["provider_resume_id"]
+            .as_str()
+            .unwrap();
+        assert!(store
+            .get_session(&successor.id)
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+        assert!(matches!(
+            store
+                .restore_core_session_with_runtime(&successor.id, &runtime)
+                .unwrap(),
+            Some(CoreRestoreOutcome::NotStopped)
+        ));
+        assert_eq!(store.load_raw_json_value().unwrap(), pending);
+        assert_eq!(
+            fs::read_to_string(&tmux_log)
+                .unwrap()
+                .matches("new-session ")
+                .count(),
+            1
+        );
+        assert!(!fs::read_to_string(&tmux_log)
+            .unwrap()
+            .contains("kill-session"));
+
+        let project_dir = projects.join(
+            root.canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .replace('/', "-"),
+        );
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join(format!("{provider_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user", "sessionId": provider_id, "message": {"content": prompt}
+                })
+            ),
+        )
+        .unwrap();
+        let launched = launch.join().unwrap().unwrap();
+        assert!(!launched.is_stopped());
+        assert_eq!(
+            store
+                .handoff_runtime_launch_status(&successor.id)
+                .unwrap()
+                .as_deref(),
+            Some("applied")
+        );
+        assert!(!store
+            .get_session(&successor.id)
+            .unwrap()
+            .unwrap()
+            .is_stopped());
+
+        // Prepared attempts also reject Restore. Applied and failed attempts
+        // permit a deliberate restore, even with a still-transferring parent.
+        let completed = store.load_raw_json_value().unwrap();
+        for status in ["prepared", "applied", "failed"] {
+            let mut state = completed.clone();
+            state["session_runtime_launches"][0]["status"] = json!(status);
+            let session = session_object_mut(
+                ensure_sessions_array_mut(&mut state).unwrap(),
+                &successor.id,
+            )
+            .unwrap();
+            session.insert("status".into(), json!("stopped"));
+            session.insert("stopped_at".into(), json!(now_rfc3339()));
+            store.write_raw_json_value(&state).unwrap();
+            let result = store
+                .restore_core_session_with_runtime(&successor.id, &runtime)
+                .unwrap();
+            if status == "prepared" {
+                assert!(matches!(result, Some(CoreRestoreOutcome::NotStopped)));
+                assert_eq!(store.load_raw_json_value().unwrap(), state);
+            } else {
+                assert!(matches!(result, Some(CoreRestoreOutcome::Restored(_))));
+                let restored = store.load_raw_json_value().unwrap();
+                assert_eq!(
+                    restored["session_runtime_launches"][1]["operation_kind"],
+                    "restore"
+                );
+                assert_eq!(restored["session_runtime_launches"][1]["status"], "applied");
+                assert!(!store
+                    .get_session(&successor.id)
+                    .unwrap()
+                    .unwrap()
+                    .is_stopped());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn the_successor_starts_once_and_only_after_the_turn_ends() {
         let store = store("start", "running");

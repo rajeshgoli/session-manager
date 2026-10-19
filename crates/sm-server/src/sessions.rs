@@ -5997,6 +5997,9 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
+        if deferred_handoff_restore_is_fenced(&state, session_id)? {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
+        }
         let naming_sessions = sessions_with_registered_aliases(&state);
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let new_name = sessions
@@ -6046,6 +6049,12 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
+        // Decide under the same write guard that persists create intent. A
+        // deferred successor stays stopped until its brief is acknowledged,
+        // but that must not authorize a competing restore process.
+        if deferred_handoff_restore_is_fenced(&state, session_id)? {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
+        }
         let snapshot = snapshot_from_raw_value(&state)?;
         let Some(mut record) = snapshot
             .sessions
@@ -13737,6 +13746,33 @@ fn session_lifetime_overlaps(
         i128::MAX
     };
     artifact_end >= seat_start && artifact_start <= seat_end
+}
+
+fn deferred_handoff_restore_is_fenced(state: &Value, session_id: &str) -> Result<bool> {
+    if state["handoff_deferred_sessions"][session_id] != true {
+        return Ok(false);
+    }
+    let launches = session_runtime_launch_records(state)?;
+    let creates = launches
+        .iter()
+        .filter(|launch| launch.session_id == session_id && launch.operation_kind == "create")
+        .collect::<Vec<_>>();
+    if !creates.is_empty() {
+        // Terminal create attempts leave recovery to explicit Restore, even
+        // if the predecessor's handoff is still marked transferring.
+        return Ok(creates
+            .iter()
+            .any(|launch| matches!(launch.status.as_str(), "prepared" | "launching")));
+    }
+    // Before create intent exists, the pending transfer owns the successor.
+    Ok(state["sessions"].as_array().is_some_and(|sessions| {
+        sessions.iter().filter_map(Value::as_object).any(|session| {
+            handoff_transfer::raw_handoff_record(session).is_some_and(|handoff| {
+                handoff.successor_session_id.as_deref() == Some(session_id)
+                    && handoff_fences_delivery_raw(session)
+            })
+        })
+    }))
 }
 
 fn session_restore_is_fenced(state: &Value, session_id: &str) -> bool {
