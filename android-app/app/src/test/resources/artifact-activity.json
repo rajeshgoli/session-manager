@@ -11,7 +11,9 @@
     {"op": {"id": 11, "kind": "thawing", "phase": "failed", "state": "failed", "names": ["1962_chains"], "error": "cold store is not connected", "actor": "sm", "actor_name": "sm"},
      "status": "Failed: cold store is not connected", "step": -1, "name": "1962_chains", "sizes": "", "actor": "sm", "actor_id": null, "saved": null},
     {"op": {"id": 12, "kind": "freezing", "phase": "copying", "state": "running", "names": ["2167_frame_choice"], "behind": 0, "over_estimate": true, "remaining_seconds": 0, "actor": "a4782b6e", "actor_name": "far-2167"},
-     "status": "Running now · taking longer than recent freezing", "step": 1, "name": "2167_frame_choice", "sizes": "", "actor": "far-2167", "actor_id": "a4782b6e", "saved": null}
+     "status": "Running now · taking longer than recent freezing", "step": 1, "name": "2167_frame_choice", "sizes": "", "actor": "far-2167", "actor_id": "a4782b6e", "saved": null},
+    {"op": {"id": 13, "kind": "freezing", "phase": "copying", "state": "running", "names": ["probe_slow"], "behind": 0, "over_estimate": false, "remaining_seconds": 0, "expected_seconds": 1, "elapsed_seconds": 20, "actor": "5432cc6a", "actor_name": "sm-2325"},
+     "status": "Running now · should finish any moment", "step": 1, "name": "probe_slow", "sizes": "", "actor": "sm-2325", "actor_id": "5432cc6a", "saved": null}
   ],
   "savings": [
     {"savings": {"folders": 41, "data_bytes": 3016153560409, "frozen_bytes": 476830448887, "saved_bytes": 2539323111522, "roots": [{"root": "/Users/x/artifacts", "cold_store": "/Volumes/External4TB/artifacts", "folders": 41}]},

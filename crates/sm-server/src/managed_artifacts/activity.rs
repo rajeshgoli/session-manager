@@ -248,7 +248,8 @@ pub fn activity(manager: &ManagedArtifacts, as_of: OffsetDateTime) -> Result<Val
         })
         .map(|o| item(o, json!({"state": o.row["phase"]})))
         .collect();
-    operations.extend(recent.into_iter().rev());
+    // In flight first, in queue order; then finished, newest first.
+    operations.extend(recent);
     let history: Vec<Value> = ops
         .iter()
         .rev()

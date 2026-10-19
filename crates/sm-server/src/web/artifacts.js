@@ -145,7 +145,7 @@ export function ArtifactsPage() {
   // Operations poll on their own, fast while one is queued or copying, so a
   // freeze started from the CLI shows queued, copying, then done (sm#2325).
   const [live,setLive] = useState(false);
-  const [activity] = usePoll(() => api('/artifact-activity'), live ? 4000 : 20000, [live], { background: true });
+  const [activity] = usePoll(() => api('/artifact-activity'), live ? 4000 : 8000, [live], { background: true });
   const ops = activity?.operations || [];
   const inFlight = ops.filter(o => o.state === 'running' || o.state === 'waiting');
   useEffect(() => setLive(inFlight.length > 0), [inFlight.length > 0]);
@@ -204,7 +204,7 @@ export function ArtifactsPage() {
         </div>`)}</section>
         ${!data.backup?.enabled ? html`<p class="artifact-warning">${backupSummary(data.backup)}</p>` : backupCard(data.backup)?.attention ? html`<p class="artifact-warning">${backupCard(data.backup).attention}</p>` : null}
         ${ops.length ? html`<section aria-label="Operations"><h2 class="artifact-heading">${inFlight.length ? `In progress · ${inFlight.length === 1 ? 'one operation' : `${inFlight.length} operations, one at a time`}` : 'Just finished'}</h2>
-          <div class="artifact-ops">${ops.map(op => html`<${Operation} key=${op.id} op=${op} />`)}</div></section>` : null}
+          <div class="artifact-ops">${ops.map(op => html`<${Operation} key=${op.id} op=${op} compact=${op.state === 'done' || op.state === 'failed'} />`)}</div></section>` : null}
         ${decisions.length ? html`<section><h2 class="artifact-heading">Cleanup to review</h2>${renderRows(decisions.slice(0,5))}${decisions.length > 5 ? html`<button class="btn sm" onClick=${()=>setBrowse(true)}>Browse all ${decisions.length} proposals</button>` : null}</section>` : null}
         <h2 class="artifact-heading">Taking up space</h2><p class="artifact-muted">Largest folders over 1 GB</p>
       `}

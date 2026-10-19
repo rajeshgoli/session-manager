@@ -361,7 +361,8 @@ internal fun OperationCard(op: JsonObject) {
                     }
                     Text(opSizes(op), color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                 }
-                Steps(op, tone)
+                // Finished operations drop the steps; the status says done or failed.
+                if (!settled) Steps(op, tone) else Spacer(Modifier.height(10.dp))
                 Text((if (state == "done") "✓ " else "") + opStatus(op), style = MaterialTheme.typography.bodySmall,
                     color = when { state == "done" -> Emerald; state == "failed" || (state == "waiting" && op.text("error").isNotEmpty()) -> Amber; else -> MaterialTheme.colorScheme.onSurface })
                 Text("Asked by ${actorLabel(op)}" + (actorId(op)?.let { " · $it" } ?: "") + " · ${clock(op.text("created_at"))}",

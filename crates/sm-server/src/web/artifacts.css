@@ -52,7 +52,7 @@
 .artifact-steps li.now{color:var(--ink);font-weight:600}
 .artifact-steps li.now .artifact-step-dot{border-color:var(--tone);box-shadow:0 0 0 4px color-mix(in srgb,var(--tone) 22%,transparent)}
 .artifact-steps li.failed .artifact-step-dot{border-color:var(--red)}
-.artifact-op-status{margin:0;font-size:13px;line-height:1.5}
+.artifact-op-status{margin:0;font-size:13px;line-height:1.5}.artifact-op-head+.artifact-op-status{margin-top:10px}
 .is-done .artifact-op-status{color:var(--green,#4ade80)}.is-done .artifact-op-status::before{content:'✓ '}
 .artifact-op-meta{margin:3px 0 0;font-size:12px;color:var(--ink-3)}.artifact-op-meta b{font-weight:500;color:var(--ink-2)}
 .artifact-op code,.artifact-history code{font-size:11px;padding:1px 5px;border-radius:4px;background:var(--panel-2);color:var(--ink-3)}

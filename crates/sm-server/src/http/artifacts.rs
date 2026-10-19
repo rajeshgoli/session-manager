@@ -152,6 +152,7 @@ pub(super) async fn activity(
 fn actor_name(state: &AppState, actor: &str) -> Result<Value, ApiError> {
     Ok(match actor {
         "sm-nightly" => json!("sm nightly"),
+        "sm-pressure" => json!("sm disk pressure"),
         "sm" => json!("sm"),
         a if a.contains('@') => json!(state.config.owner_name),
         a => json!(state.session_store.get_session(a)?.map(|s| s.name)),

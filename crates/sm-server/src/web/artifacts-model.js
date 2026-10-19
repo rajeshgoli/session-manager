@@ -95,6 +95,7 @@ export function opStatus(op) {
   if (op.state === 'running') {
     const behind = op.behind ? ` · ${op.behind} waiting behind it` : '';
     if (op.over_estimate) return `Running now${behind} · taking longer than recent ${opKind(op.kind).now.toLowerCase()}`;
+    if (op.remaining_seconds != null && op.remaining_seconds < 1) return `Running now${behind} · should finish any moment`;
     return `Running now${behind}${left ? ` · about ${left} left` : ''}`;
   }
   if (op.error) return /capacity/.test(op.error) ? 'Waiting for space on the cold disk above its floor' : `Waiting: ${op.error}`;

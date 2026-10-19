@@ -56,7 +56,7 @@ class ArtifactsViewModel(application: Application) : AndroidViewModel(applicatio
                 val signature = ops.joinToString(",") { "${it.number("id")}:${it.text("phase")}" }
                 if (activity != null && seen != null && seen != signature) load()
                 if (activity != null) seen = signature
-                delay(if (ops.any { it.text("state") in listOf("running", "waiting") }) 4000 else 20000)
+                delay(if (ops.any { it.text("state") in listOf("running", "waiting") }) 4000 else 8000)
             }
         }
     }

@@ -153,6 +153,7 @@ fun opStatus(op: JsonObject): String {
         "running" -> {
             val behind = op.number("behind").let { if (it > 0) " · $it waiting behind it" else "" }
             if (op.flag("over_estimate")) "Running now$behind · taking longer than recent ${opKind(op.text("kind")).now.lowercase()}"
+            else if ((op.decimal("remaining_seconds") ?: 1.0) < 1) "Running now$behind · should finish any moment"
             else "Running now$behind" + (left?.let { " · about $it left" } ?: "")
         }
         else -> when {
