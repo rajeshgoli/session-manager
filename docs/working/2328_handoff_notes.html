@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2328 — sm keeps the handoff note</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2328 — sm keeps the handoff note</h1>
+<p class="sans"><small>Author: sm-2328 <code>c6f0a143</code> · Ticket #2328 · Revision 3 · 2026-10-19</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend that sm own the handoff note from start to finish, and that the agent's part be the thing models do best: fill in a file.</b> When sm asks for a handoff, it has already written a draft at <code>.sm/handoff.md</code> in the agent's worktree. The draft is pre-filled with everything sm knows: the agent's tickets and PRs, running queue jobs, pending reviews and children. The agent fills in the rest with its normal file tools, re-reads it, and runs <code>sm handoff</code>, one step in one turn. sm checks the note still covers what it knows, takes it into its own database, and deletes the draft. The successor starts with the note in its first prompt, followed by <b>your own messages to that line of work, word for word</b>, the one thing a summary always blurs. You find the note in the agent's existing Docs list on the app and the web. It opens in the in-app reader, with no new screen and no app release. sm keeps notes indefinitely, as it keeps messages.</p>
+
+<dl class="vocab">
+<dt>Handoff</dt>
+<dd>When an agent's context fills up, sm asks it to stop. It writes down where the work stands and runs <code>sm handoff</code>. sm then starts a fresh agent of the same kind in the same worktree, moves the tickets, PRs and pending wakes onto it, and retires the old one. The old agent is the <b>predecessor</b>; the new one is the <b>successor</b>. Its name gains <code>-h2</code>, <code>-h3</code>, …</dd>
+<dt>Handoff note</dt>
+<dd>What the predecessor writes for the successor. Today it is a link to a PR or ticket comment, or a path to a file anywhere on disk. sm never reads the file. It only passes the path along.</dd>
+<dt>Line of work</dt>
+<dd>An agent and all its successors, for example <code>far-2221</code> → <code>far-2221-h2</code>. The line <b>ends</b> when its latest agent retires without a successor.</dd>
+<dt>Compaction</dt>
+<dd>What Claude Code and Codex do when one agent's context fills up. The tool has the model summarise the conversation, then restarts that same agent on the summary. A handoff does the same job, except that a fresh agent takes over.</dd>
+<dt>Worktree root</dt>
+<dd><code>~/worktrees</code>, the folder that holds every agent's worktree.</dd>
+</dl>
+
+<h3>What goes wrong today</h3>
+
+<p>I read every handoff sm has recorded: 64 handoffs between 29 Sep and 19 Oct. 46 point at a PR comment (37) or a ticket comment (9). Those are durable. <b>The other 18 point at files, and 13 of those files are already gone.</b></p>
+
+<table>
+<thead><tr><th>Where the agent wrote the note</th><th>Notes</th><th>Still on disk</th><th>What goes wrong</th></tr></thead>
+<tbody>
+<tr><td>Inside a <code>~/Artifacts</code> data folder</td><td>12</td><td>4</td><td>The note lives and dies with the data, gets backed up with it, and confuses what the folder is. Five agents in the far-1859 line overwrote the same file, so four notes were lost before the folder was deleted.</td></tr>
+<tr><td>Inside the agent's worktree</td><td>4</td><td>0</td><td>An untracked file stops sm from deleting the worktree after the agent retires. Once the worktree goes, the note goes with it.</td></tr>
+<tr><td>Loose in the worktree root: <code>~/worktrees/2221_HANDOFF.md</code>, the case in this ticket</td><td>1</td><td>1</td><td>It is in no worktree, so no cleanup ever looks at it. A folder of the agent's scripts, <code>~/worktrees/2221_scripts/</code>, sits beside it.</td></tr>
+<tr><td><code>/tmp</code></td><td>1</td><td>0</td><td>Gone at the next reboot.</td></tr>
+</tbody>
+</table>
+
+<p>Location is half the problem. The other half is content. sm's ask says only <i>"Post what the next agent needs"</i>, so every note has a different shape. Your instructions reach the successor only as the predecessor's paraphrase. The far-2221 note opens with "Rajesh's standing instruction for this ticket: build all the code the base run needs". That is a paraphrase of a message you typed into its terminal.</p>
+
+<h3>What compaction already teaches</h3>
+
+<p>Both coding tools solved this problem for their own agents. Codex is open source, so its compaction can be read directly<sup>[N1]</sup>. Claude Code's is closed, but its behaviour is visible.</p>
+
+<table>
+<thead><tr><th style="width:22%"></th><th>Codex compaction</th><th>Claude Code compaction</th><th>sm handoff today</th><th>sm handoff after this memo</th></tr></thead>
+<tbody>
+<tr><td>Who decides what to write</td><td>The tool: a fixed prompt asking for progress and decisions; constraints and user preferences; next steps; critical data and references</td><td>The tool: a fixed list of sections</td><td>The agent improvises</td><td><b>sm's template</b>, with those headings plus sm's own (running jobs, data outside git)</td></tr>
+<tr><td>The user's own words</td><td>Kept <b>verbatim</b>, newest first, up to 20,000 tokens, beside the summary</td><td>The summary is asked to list every user message</td><td>Paraphrased, if at all</td><td><b>Your messages, verbatim</b>, newest first, up to 20,000 tokens. Messages from sm and other agents are left out.</td></tr>
+<tr><td>A review step</td><td>None</td><td>The model drafts an analysis before writing the summary</td><td>None</td><td><b>Draft, re-read, submit.</b> sm checks the note against the PRs, jobs and reviews it knows about.</td></tr>
+<tr><td>Where it lives</td><td>Inside the tool's session</td><td>Inside the tool's session</td><td>Anywhere on disk</td><td><b>sm's database, kept indefinitely</b></td></tr>
+</tbody>
+</table>
+
+<p>The second row is the lesson the current design misses. The tool keeps the user's words itself and never trusts the summary to restate them. sm can do better than Codex here, because sm knows which messages came from you. Your Inbox replies are in sm's database. Your typed terminal input is in the agent's transcript, and sm can subtract everything it typed there itself. So the block holds only you. For far-2221 that is under 1 KB, and the 20,000-token cap almost never binds.</p>
+
+<h3>How a handoff runs</h3>
+
+<figure>
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="12.5" role="img" aria-label="The handoff note's path, step by step">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <text x="10" y="20" font-weight="700" fill="var(--ink-2)">PREDECESSOR</text>
+  <text x="400" y="20" font-weight="700" fill="var(--ink-2)">SM</text>
+  <rect x="400" y="32" width="350" height="44" rx="6" fill="var(--surface-2)" stroke="var(--green)" stroke-width="1.5"/>
+  <text x="412" y="52" fill="var(--ink)">1. Writes a pre-filled draft to <tspan font-family="ui-monospace, Menlo, monospace">.sm/handoff.md</tspan></text>
+  <text x="412" y="68" fill="var(--ink-2)">(claims, jobs, reviews, children), then asks</text>
+  <rect x="10" y="96" width="330" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="22" y="116" fill="var(--ink)">2. Fills in the draft with its file tools,</text>
+  <text x="22" y="132" fill="var(--ink-2)">re-reads it, runs <tspan font-family="ui-monospace, Menlo, monospace">sm handoff</tspan></text>
+  <rect x="400" y="96" width="350" height="44" rx="6" fill="var(--surface-2)" stroke="var(--green)" stroke-width="1.5"/>
+  <text x="412" y="116" fill="var(--ink)">3. Checks the note still covers what sm knows,</text>
+  <text x="412" y="132" fill="var(--ink-2)">stores it, deletes the draft</text>
+  <text x="10" y="196" font-weight="700" fill="var(--ink-2)">SUCCESSOR</text>
+  <text x="400" y="196" font-weight="700" fill="var(--ink-2)">YOU</text>
+  <rect x="10" y="208" width="330" height="60" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="22" y="228" fill="var(--ink)">4. Starts with the note in its first prompt,</text>
+  <text x="22" y="244" fill="var(--ink-2)">then Rajesh's messages to the line,</text>
+  <text x="22" y="260" fill="var(--ink-2)">verbatim</text>
+  <rect x="400" y="208" width="350" height="60" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="412" y="228" fill="var(--ink)">5. "Handoff note" in the agent's Docs list,</text>
+  <text x="412" y="244" fill="var(--ink-2)">Watch and History, app and web; opens in</text>
+  <text x="412" y="260" fill="var(--ink-2)">the in-app reader. Kept indefinitely.</text>
+  <line x1="400" y1="66" x2="342" y2="106" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="340" y1="118" x2="398" y2="118" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="460" y1="140" x2="200" y2="206" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="600" y1="140" x2="600" y2="206" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+</svg>
+<figcaption>Figure 1. One handoff. The agent fills in and re-reads a file, which models are best at. sm supplies the shape and the facts it knows, keeps the note and your words, and cleans up.</figcaption>
+</figure>
+
+<p><b>What the agent sees.</b> sm writes the draft before it asks, so the ask names the file and one command:</p>
+<pre>[sm context management] Your context is at 36%. Stop at a logical point. sm will move your
+claims (ticket #2221, PR #2240) and pending wakes to a fresh agent. Your handoff note is drafted
+at /Users/rajesh/worktrees/2221-c2-run-schedule/.sm/handoff.md with what sm knows. Fill in the
+rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn.</pre>
+<p>The path is in the agent's own worktree, where it already writes files freely, so no permission prompt fires. The <code>.sm/</code> folder is hidden from git, so it never shows up in a commit or blocks worktree cleanup. An agent that has to fix its note does it the normal way, with targeted edits, and never retypes it.</p>
+
+<p><b>The draft</b> has six sections, each with a one-line hint: where the work stands; decisions and dead ends; your instructions, especially any that came through the terminal; what is running and what to do when it lands; next steps in order; and files and data outside git. sm fills in what it knows. The "where the work stands" section lists the tickets, PRs and branch. The "running" section lists each queue job, pending review and child, each followed by a blank for the agent: <i>what to do when it lands</i>. A checklist at the end asks the agent to read the note as if it had never seen the work. Is anything here only clear from your memory? Is anything missing that only you know, such as a promise to Rajesh, a workaround or a flaky test? Appendix B has the text.</p>
+
+<p><b>sm's check.</b> When the agent runs <code>sm handoff</code>, sm makes sure the note still mentions everything sm pre-filled. If the agent deleted an item, sm refuses once and names it:</p>
+<pre>Your note does not mention: queue job 2221-c2-smoke.
+Say what the successor should do about it, then run `sm handoff` again.
+(Run it again unchanged to hand off anyway.)</pre>
+
+<p><b>What the successor sees.</b> It starts with one prompt: sm's usual brief (what it now holds, where it works), then the note, then your messages to the line:</p>
+<pre>[sm handoff] You are taking over from far-2221 (6f7e5a31), which stopped at 36% context.
+Working directory: ~/worktrees/2221-c2-run-schedule (branch ticket/2221-c2-run-schedule)
+You now hold: ticket #2221, PR #2240
+…
+=== Handoff note from far-2221 ===
+# Handoff note — far-2221 (6f7e5a31), 2026-10-19
+## Where the work stands …
+=== Rajesh's messages to this line, verbatim (oldest first) ===
+[2026-10-18 17:52 · terminal] Ensure you have all the code needed to run …</pre>
+<p>sm hands that prompt to the successor at launch, the way <code>sm spawn</code> delivers a large brief, not by typing it into the terminal. <code>sm handoff show</code> prints the same note and messages again, for an agent that later needs to re-read them.</p>
+
+<h3>Where you see the note</h3>
+
+<p>The note joins the place where an agent's documents already appear. The expanded agent on Watch and each card on History have a Docs list. Today it holds the docs the agent published, and a tap opens the in-app reader. The note becomes one more row in that list:</p>
+<ul>
+<li>on the predecessor's History card: <b>Handoff note → far-2221-h2</b>;</li>
+<li>on the successor's Watch entry: <b>Handoff note from far-2221</b>.</li>
+</ul>
+<p>The row looks like every other doc row, and the reader shows the note like every other doc. sm serves both the row and the page, so neither the app nor the web page needs a new element, and the app needs no release. I considered three other places and rejected them. The Inbox would add three items a day you did not ask for. A link on the context-ring line would add a new kind of control to a crowded row. A separate screen would hide the note from where you look at the agent.</p>
+
+<h3>Loose files beside the note</h3>
+
+<p>The far-2221 agent also left <code>~/worktrees/2221_scripts/</code>, seven scripts and logs that a queue job ran. Custody of notes does not stop that. Nothing cleans the worktree root because nothing owns it. I recommend the rule you set for <code>~/Artifacts</code> in #1588. sm's hourly worktree check lists every entry in <code>~/worktrees</code> that is not a git checkout on the existing leftover worktrees page. It deletes such an entry 14 days after first seeing it, unless you keep it, it changed in those 14 days, or a running queue job uses it.</p>
+
+<h3>Decision surface</h3>
+
+<table>
+<thead>
+<tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. How does the agent give sm a note?</td><td><b>sm writes a pre-filled draft to <code>.sm/handoff.md</code> before it asks. The agent fills it in and runs <code>sm handoff</code>.</b> <code>--link</code> stays as it is.</td><td>One step in one turn. Writing and re-reading a file is what models do best, in a folder the agent already owns.</td></tr>
+<tr><td>2. sm checks the note</td><td><b>It must still mention every ticket, PR, queue job, review request and child sm pre-filled. sm refuses once, naming what is missing; a second run hands off anyway.</b></td><td>Catches a deleted item at the cost of one re-read at most.</td></tr>
+<tr><td>3. What the successor starts with</td><td><b>One launch prompt: sm's brief, the note, then only your messages to the line, verbatim: the newest 20,000 tokens of them.</b> Messages from sm and from agents are left out.</td><td>Codex's main lesson, with no extra command for the successor to run.</td></tr>
+<tr><td>4. An agent still runs <code>sm handoff --path &lt;file&gt;</code></td><td><b>Accept it. sm copies the file and deletes the original, unless git tracks it.</b></td><td>Old habits still leave nothing behind.</td></tr>
+<tr><td>5. Where you see notes</td><td><b>As a row in the agent's existing Docs list, on Watch and History, app and web.</b></td><td>No new element, no app release, and the note sits where you already look at the agent.</td></tr>
+<tr><td>6. How long sm keeps notes</td><td><b>Indefinitely, like messages.</b></td><td>About 5 KB each, and useful data to mine later.</td></tr>
+<tr><td>7. Loose entries in <code>~/worktrees</code></td><td><b>List them on the leftover worktrees page and delete each after 14 days, unless you keep it, it changed recently, or a running queue job uses it.</b></td><td>Your #1588 rule for <code>~/Artifacts</code>, applied to the one shared folder nobody owns.</td></tr>
+<tr><td>8. Notes already in <code>~/Artifacts</code> and <code>~/worktrees</code></td><td><b>At deploy, sm imports the four note files its records name. It deletes the originals of the lines that have ended, and far-2221's original when that line ends.</b></td><td>Every note gets one home, and no live agent loses the file its brief names.</td></tr>
+<tr><td>9. Light and dark for docs</td><td><b>Each doc opens in the theme your Appearance setting names. A doc's own toggle button stays and flips that one view.</b></td><td>One default everywhere, with the per-doc switch you use.</td></tr>
+</tbody>
+</table>
+
+<p><b>On decision 9.</b> Today each doc's dark-mode button remembers its own choice, and sm's Appearance setting does not reach docs. The web reader shows docs in a frame it controls, so it sets the doc's theme from your Appearance setting (system, light or dark) each time a doc opens, and again when you change the setting. The app has only a dark theme today, so its reader sets dark. The doc's button still works, and it flips the theme for the view in front of you. The next open starts again from your setting. It is part of #2338 and independent of the handoff work.</p>
+
+<h3>What this memo does not change</h3>
+<ul>
+<li><b>When sm asks for a handoff</b>, the thresholds, and how work moves to the successor (spec <code>specs/1651_context_handoff.html</code>). Only the note, the wording of the ask and reminder, and the successor's first message change.</li>
+<li><b>Other files an agent's work produces.</b> Data belongs in <code>~/Artifacts</code> under #1588's rules, and code belongs in git. A Claude agent's private scratch folder under <code>/private/tmp</code> is outside sm's control. If agents keep running queue jobs from there, that gets its own ticket.</li>
+</ul>
+
+<h3>Build plan</h3>
+<p>Two tickets, each sized for one agent (Appendix L):</p>
+<ol>
+<li><b>#2337, custody</b> (server and CLI): the pre-filled draft, the check, the store, your messages, the successor's launch prompt, <code>sm handoff show</code>, the new wording, <code>--path</code> import, and the deploy-time import.</li>
+<li><b>#2338, the three small pieces</b>: the note as a row in the agent's Docs list (which needs #2337), the worktree-root sweep, and the doc theme from Appearance (neither of which needs it).</li>
+</ol>
+<p>When both ship, I will ask you to try one thing. Press <b>Hand off now</b> on a scratch agent in the app, wait for the <code>-h2</code>, and open "Handoff note" in its Docs list. Then check that nothing new appeared in its worktree or in <code>~/worktrees</code>.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 3 answers your six comments on revision 2.</b></p>
+<ul>
+<li><b>sm pre-fills the draft before it asks</b>, so a handoff takes one step in one turn. sm writes in what it knows (claims, jobs, reviews, children) and leaves blanks for the agent (decision 1).</li>
+<li><b>The successor starts with the note and your messages in its launch prompt.</b> It no longer has to run <code>sm handoff show</code>, which stays only for re-reading (decision 3).</li>
+<li><b>sm keeps notes indefinitely</b>, like messages (decision 6).</li>
+<li><b>Docs keep their own button</b>, and open in your Appearance setting's theme (decision 9).</li>
+<li><b>The local-judge decision is gone.</b> #2326 already allows <code>sm handoff</code> for local agents.</li>
+</ul>
+<p>Revision 2 replaced the heredoc with a file draft, added the compaction lessons, and moved the note into the agent's existing Docs list.</p>
+
+<p class="sans"><small>[N1] Codex compaction: <code>codex-rs/prompts/templates/compact/prompt.md</code> (the prompt) and <code>codex-rs/core/src/compact.rs</code> (<code>COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000</code>; <code>build_compacted_history</code> keeps the newest user messages verbatim beside the summary), github.com/openai/codex, main as of 18 Oct 2026.</small></p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. The sm handoff command</a></div>
+<div><a href="#b">B. The template, verbatim</a></div>
+<div><a href="#c">C. The store, routes and persisted shapes</a></div>
+<div><a href="#d">D. Rajesh's messages</a></div>
+<div><a href="#e">E. Messages, verbatim</a></div>
+<div><a href="#f">F. Retention</a></div>
+<div><a href="#g">G. Deploy-time import</a></div>
+<div><a href="#h">H. Local judge rule</a></div>
+<div><a href="#i">I. The Docs row and reader page</a></div>
+<div><a href="#j">J. Worktree-root sweep</a></div>
+<div><a href="#k">K. Doc theme from Appearance</a></div>
+<div><a href="#l">L. Tickets, file sets, order</a></div>
+<div><a href="#m">M. Test plan</a></div>
+<div><a href="#n">N. Code references</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<p>This document amends <code>specs/1651_context_handoff.html</code> ("1651" below): its Appendix E (the command), D (messages), F.4 (successor brief) and A (persisted <code>note</code>). Everything else in 1651 stands. #2337's PR edits 1651 to match. The last ticket to ship moves this file to <code>specs/2328_handoff_notes.html</code>.</p>
+
+<h3 id="a">A. The <code>sm handoff</code> command and the draft</h3>
+
+<pre>sm handoff                   # submit the draft (creating it first if missing)
+sm handoff --link &lt;url&gt;      # unchanged
+sm handoff --path &lt;file&gt;     # import a file; same as the positional form
+sm handoff &lt;file&gt;
+sm handoff show [&lt;session&gt;] [--line]</pre>
+
+<p><b>A.1 Draft location.</b> The draft is <code>&lt;working dir&gt;/.sm/handoff.md</code>, where the working dir is the session's registered <code>working_dir</code>, never the shell's cwd, which drifts. Whoever writes it (A.2) creates <code>.sm/</code>. When the working dir is inside a git work tree, the writer also appends the line <code>.sm/</code> to the file that <code>git rev-parse --git-path info/exclude</code> names, unless the line is already there. That file is local to the repository, never committed, and shared by all its worktrees, so this happens once per repository.</p>
+
+<p><b>A.2 Who writes the draft, and when.</b> sm writes it <em>before</em> it delivers any ask, so the ask can name it:</p>
+<table>
+<thead><tr><th>Ask</th><th>Writer</th></tr></thead>
+<tbody>
+<tr><td>Context threshold (1651 C.1), reminder (C.2), Hand off now (C.4)</td><td>The server. It writes directly for the primary node. For another node, it writes over that node's existing ssh connection (<code>nodes.registry.&lt;node&gt;.ssh</code>, the connection sm already uses for tmux there). If the write fails, sm sends the E.1b fallback ask instead, and the CLI writes the draft on the agent's first <code>sm handoff</code>.</td></tr>
+<tr><td>Review request (1651 C.3), printed by <code>sm request-codex-review</code> or <code>sm doc publish --review</code></td><td>That CLI, which runs where the agent runs. The server returns the pre-fill (B) in the response, beside <code>handoff_ask</code>.</td></tr>
+<tr><td>Voluntary (the agent runs <code>sm handoff</code> unasked, with no draft)</td><td>The CLI, on that run. It prints E.3 and exits 0. This is the only case that takes two runs.</td></tr>
+</tbody>
+</table>
+<p>An existing draft is never overwritten. A reminder whose draft already exists names it again. When an ask is withdrawn (1651 C.5), sm deletes the draft only if it is still byte-identical to what sm wrote; otherwise it leaves it for the next ask. At retire, sm deletes any draft still present (primary node, or over ssh).</p>
+
+<p><b>A.3 <code>sm handoff</code> with no arguments.</b></p>
+<table>
+<thead><tr><th>Draft</th><th>Outcome</th></tr></thead>
+<tbody>
+<tr><td>Missing, and the handoff state is <code>failed</code> with a stored note</td><td>Resubmit the stored note (D.6): POST <code>{"resubmit": true}</code>, which re-enters <code>accepted</code> with the same note. Print E.4. No draft is created.</td></tr>
+<tr><td>Missing, any other state</td><td>Fetch the pre-fill from <code>GET /sessions/{id}/handoff-draft</code>, write it (A.1), print E.3, exit 0. The handoff state does not change.</td></tr>
+<tr><td>Byte-identical to what sm wrote (the server keeps its sha256 in <code>handoff_drafts</code>, C.1)</td><td>Exit 2: <code>The note at &lt;path&gt; is still sm's draft. Fill it in, then run sm handoff again.</code></td></tr>
+<tr><td>Changed</td><td>Strip HTML comments (<code>&lt;!-- … --&gt;</code>), trim, check the A.5 limits, and POST <code>note: {"kind":"text","value":…,"source":"draft"}</code>. On 200, delete the draft, delete <code>.sm/</code> if empty, print E.4. On 409 <code>incomplete</code> (A.4), print the server's E.5 text, keep the draft, exit 3.</td></tr>
+</tbody>
+</table>
+
+<p><b>A.4 Completeness check (server).</b> The items are the ones the pre-fill lists (B): active ticket claims (<code>ticket #N</code>), active PR claims (<code>PR #N</code>), unfinished queue jobs whose <code>requester_session_id</code> or <code>notify_session_id</code> is the session (<code>queue job &lt;label&gt;</code>, or the job id when there is no label), open review requests the session made (<code>review of PR #N</code>) and live children (<code>child &lt;name&gt;</code>). The server computes them at submission time, so an item that appeared after the draft was written counts too. An item is mentioned when the note contains its number (<code>#N</code>, or a bare <code>N</code> on a word boundary), its label, its job id or its name, ignoring case. If any item is unmentioned and the handoff record has no <code>completeness_warned_at</code>, the server sets that field, changes nothing else, and returns 409 <code>{"error":"incomplete","missing":[…],"message":"&lt;E.5&gt;"}</code>. Any later submission, changed or not, skips the check. A <code>link</code> note is never checked: sm does not read links. Reaching <code>accepted</code> clears the field.</p>
+
+<p><b>A.5 Limits</b> apply to drafts and <code>--path</code> files alike. The note must be valid UTF-8 and at most 262,144 bytes after comment stripping. The errors are <code>handoff note is not valid UTF-8</code> and <code>handoff note is &lt;n&gt; bytes; the limit is 262144</code>. The largest note on disk today is 7.7 KB.</p>
+
+<p><b>A.6 <code>--path</code>.</b> The CLI checks the path names an existing regular file, canonicalizes it, reads it, applies A.5 to the raw file bytes (the bytes that are stored, comments included), and sends <code>note: {"kind":"text","value":…,"source":"file","source_path":"&lt;path&gt;"}</code>. HTML comments are kept here, since the file is the agent's own. A.4 applies. On 200 the CLI removes the original, unless one of these holds. In each case it leaves the file and says why (E.4):</p>
+<ul>
+<li>git tracks it: <code>git -C &lt;dir&gt; ls-files --error-unmatch -- &lt;file&gt;</code> exits 0;</li>
+<li>its device, inode, size or mtime differ from those the CLI recorded when it read the file (the CLI re-stats the path immediately before the unlink), so a replaced file is never removed;</li>
+<li>the unlink fails. The CLI prints the error and still exits 0.</li>
+</ul>
+<p>The CLI removes only that file, never a folder. It reports the outcome with <code>POST /sessions/{id}/handoff-note/source</code> <code>{"removed":bool,"reason":string|null}</code>. A <code>--path</code> handoff also deletes an unchanged sm draft, if one exists.</p>
+
+<p><b>A.7 <code>sm handoff show</code></b> is for re-reading, for example after the successor's own compaction. The launch prompt (C.4) already carries the same content. With no argument, it shows the note the calling session took over with: its predecessor's. With <code>&lt;session&gt;</code> (an id or exact name), it shows that session's note. <code>--line</code> shows every note in the line, oldest first. It calls <code>GET /sessions/{id}/handoff-note</code> (C.3) and prints the C.4 sections <i>Handoff note</i> and <i>Rajesh's messages</i>, followed by <code>Earlier notes in this line: sm handoff show --line</code> when the line has more than one note. For a link note it prints <code>&lt;name&gt; handed off with a link: &lt;url&gt;</code>, then the messages. With no note at all, it exits 1 with <code>&lt;name&gt; has no handoff note</code>. Access follows C.3: an agent may show only notes of its own line.</p>
+
+<h3 id="b">B. The draft, verbatim</h3>
+<p>sm fills in everything in angle brackets except the <code>&lt;!-- … --&gt;</code> hints, which are stripped at submission (A.3). A list with no items is written as <code>- none</code>. Shown for far-2221:</p>
+<pre># Handoff note — far-2221 (6f7e5a31), 2026-10-19
+&lt;!-- sm drafted this with what it knows. Replace each hint with your text; keep sm's lines and
+     add to them. The successor has never seen this work: absolute paths, PR and commit ids,
+     exact commands. --&gt;
+
+## Where the work stands
+- Working directory: /Users/rajesh/worktrees/2221-c2-run-schedule (branch ticket/2221-c2-run-schedule)
+- ticket #2221 — &lt;title&gt;
+- PR #2240 — &lt;title&gt; (&lt;state&gt;)
+&lt;!-- Done (with commits). Half-done, and exactly where you stopped. --&gt;
+
+## Decisions and dead ends
+&lt;!-- Calls made and why, including Rajesh's. What you tried that failed, so it is not retried. --&gt;
+
+## Rajesh's instructions
+&lt;!-- sm gives the successor Rajesh's own messages verbatim. Say how they apply here, and anything
+     he decided that is not in a message (a PR review, a doc review). --&gt;
+
+## Running and waiting
+- queue job 2221-c2-smoke (job_94d86f222e54), log ~/.local/share/claude-sessions/queue-runner/logs/job_94d86f222e54.log
+  → what to do when it lands:
+- queue job 2221-repro-stage-a (job_c3365ade9997), log …
+  → what to do when it lands:
+- review of PR #2240, requested 01:02
+  → what to do when it lands:
+- child: none
+&lt;!-- Also: questions waiting on Rajesh, and anything you must not disturb. --&gt;
+
+## Next steps
+&lt;!-- In order. The first should be doable right after reading this note. --&gt;
+
+## Files and data outside git
+&lt;!-- Artifacts, scratch folders, logs: path and why it matters. --&gt;
+
+&lt;!-- Before you run `sm handoff`, re-read this note as if you had never seen the work:
+     - Does anything here only make sense with your memory? Spell it out.
+     - Is anything only in your context missing: a promise to Rajesh, a workaround, a flaky test?
+     - Would the first next step work with nothing but this note? --&gt;</pre>
+<p><code>GET /sessions/{id}/handoff-draft</code> returns <code>{"path","text","sha256"}</code> and upserts <code>handoff_drafts</code> (C.1). Titles come from the claim records. A title that is not known is omitted, never fetched from GitHub.</p>
+
+<h3 id="c">C. The store, routes and persisted shapes</h3>
+
+<p><b>C.1 Table</b> <code>handoff_notes</code> in <code>message_queue.db</code>, next to the existing handoff override tables:</p>
+<pre>CREATE TABLE handoff_notes (
+  session_id    TEXT PRIMARY KEY,   -- the predecessor
+  line_id       TEXT NOT NULL,      -- session id of the line's first agent
+  sequence      INTEGER NOT NULL,   -- 1, 2, … within the line
+  text          TEXT NOT NULL,
+  source        TEXT NOT NULL,      -- 'draft' | 'file' | 'import'
+  source_path   TEXT,               -- for 'file' and 'import'
+  source_removed INTEGER,           -- NULL until reported; 0/1
+  source_kept_reason TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX handoff_notes_line ON handoff_notes(line_id, sequence);</pre>
+<p><b>Table</b> <code>handoff_drafts</code>, in the same database, holds sm's record of each draft it wrote. It is independent of the handoff record, so it survives a voluntary handoff (no record yet) and a withdrawal (record removed):</p>
+<pre>CREATE TABLE handoff_drafts (
+  session_id TEXT PRIMARY KEY,
+  path       TEXT NOT NULL,
+  sha256     TEXT NOT NULL,     -- of the bytes sm wrote
+  written_at TEXT NOT NULL
+);</pre>
+<p>The row is deleted when the draft is deleted: on submission, on withdrawal of an unchanged draft, and at retire. A draft is "byte-identical to what sm wrote" when its sha256 equals the row's.</p>
+<p><b>Line id</b>: follow <code>predecessor_session_id</code> back until a record has none, and take that record's id. <b>Sequence</b>: one more than the line's current maximum. Resubmitting in state <code>accepted</code> (1651 E) replaces the row's text and keeps its sequence.</p>
+
+<p><b>C.2 Accept.</b> <code>HandoffNote::parse</code> accepts request kinds <code>link</code> and <code>text</code>. It rejects <code>path</code> with 400 <code>sm handoff was updated; run sm handoff again</code>, which only a stale CLI sends. For <code>text</code>, <code>accept_handoff</code> runs A.4, then writes the row and records the note in the same step as the state change. If the row write fails, it returns 500 and the state does not change. The session record's <code>note</code> (1651 A) becomes <code>{"kind":"stored","value":"handoff_notes:&lt;session_id&gt;"}</code>. <code>link</code> is unchanged. Old <code>path</code> records stay readable.</p>
+
+<p><b>C.3 Read.</b> <code>GET /sessions/{id}/handoff-note[?line=1]</code> returns <code>{"notes":[{"session":{id,name},"successor":{id,name}|null,"sequence","kind","text"?,"url"?,"source","source_path","created_at"}],"owner_messages":[…D…],"line_note_count"}</code>. Without <code>line</code>, <code>notes</code> holds the one note. The route resolves its target as A.7 describes, so the CLI can send the caller's own id. The owner may read any session's notes. A managed session may read only sessions in its own line: same <code>line_id</code>, which also covers its predecessor. Any other target gets 403 <code>handoff notes are readable only within your own line of work</code>. The response carries Rajesh's messages, which other agents have no reason to see.</p>
+
+<p><b>C.4 Successor launch prompt</b> (changes 1651 F.4 and the order of 1651 G). sm creates the successor's session record without starting its runtime, runs G (moving the work), then starts the runtime with the launch prompt below as its initial prompt, through the atomic spawn-brief transport<sup>[11]</sup>: persisted to <code>spawn-briefs/&lt;sha256&gt;.md</code> and fed on stdin. The successor still never acts before it holds the work, and nothing is typed into its terminal. If the create path cannot defer the runtime start, #2337 splits it into "create record" and "start runtime". On restart, a record in state <code>transferring</code> whose runtime never started gets it started once G completes. Two cases keep today's path, where the brief is queued as the first message, with the E.6 line in place of the two sections: remote nodes, where the atomic transport is unsupported, and providers whose launch takes no initial prompt. That path keeps 1651 F.4's delivery rules unchanged, including its existing allowance for a category-limited drain. The promise that the successor starts from the note applies to the launch-prompt path. The launch prompt:</p>
+<pre>&lt;1651 F.4 lines, without its "Handoff note:" line and its closing "Read the handoff note first" line&gt;
+
+=== Handoff note from &lt;pred name&gt; (&lt;pred id&gt;), &lt;accepted_at, UTC&gt; ===
+&lt;note text&gt;                         (a link note: "Read it first: &lt;url&gt;")
+
+=== Rajesh's messages to this line, verbatim (oldest first) ===
+[&lt;at, UTC&gt; · terminal | inbox reply · &lt;session name&gt;] &lt;text&gt;
+…
+
+=== End of handoff ===
+Earlier notes in this line: sm handoff show --line      (only when the line has more than one)
+Start from the note's next steps.</pre>
+<p>The messages section is omitted when there are none.</p>
+
+<h3 id="d">D. Rajesh's messages</h3>
+<p><code>owner_messages</code> in C.3 covers every session in the line, newest first, taking messages until the next one would push the total past 20,000 tokens (counted as bytes ÷ 4). The newest message is always included whole, even when it alone exceeds the cap. It returns them oldest first. Each entry is <code>{"at","source":"terminal"|"inbox reply","session":{id,name},"text"}</code>. There are two sources:</p>
+<ol>
+<li><b>Inbox replies</b>: <code>owner_message_replies.body</code> where <code>delivered_to_session_id</code> is in the line.</li>
+<li><b>Terminal input</b>: user-role text inputs in each session's provider transcript (<code>transcript_path</code> on the record). For Claude these are <code>type:"user"</code> records whose content is text, not <code>tool_result</code>, and <code>type:"queue-operation"</code> records with <code>operation:"enqueue"</code>. For codex-fork they are the rollout's user-message events. A transcript input is dropped when any of these holds:
+  <ul>
+  <li>it begins with an envelope that sm or the provider injects: <code>[Input from: </code>, <code>[sm </code>, or one of the tags <code>&lt;task-notification&gt;</code>, <code>&lt;system-reminder&gt;</code>, <code>&lt;command-name&gt;</code>, <code>&lt;command-message&gt;</code>, <code>&lt;command-args&gt;</code>, <code>&lt;local-command-stdout&gt;</code>, <code>&lt;local-command-stderr&gt;</code>, <code>&lt;bash-input&gt;</code>, <code>&lt;bash-stdout&gt;</code>, <code>&lt;bash-stderr&gt;</code>, <code>&lt;user-prompt-submit-hook&gt;</code>, and for codex-fork <code>&lt;environment_context&gt;</code> and <code>&lt;user_instructions&gt;</code> (see the rollout fixture in <code>activity_ledger/tests.rs</code>). The tag list is a constant in code, extended only with a fixture transcript that shows the new tag. Any other text, including text that starts with <code>&lt;</code>, such as an HTML snippet, is kept;</li>
+  <li>after trimming and collapsing whitespace, it equals the text of a <code>message_queue</code> row delivered to that session, the delivered text of an Inbox reply (already counted from source 1), the session's spawn brief, or its handoff brief;</li>
+  <li>an <code>enqueue</code> and a later <code>user</code> record carry the same text, in which case only one is kept.</li>
+  </ul></li>
+</ol>
+<p>Providers without a readable transcript (codex-app, opencode) contribute only source 1. A transcript that fails to parse contributes nothing and logs a warning, and <code>show</code> still prints the note. The far-2221 line today yields one terminal message: "Ensure you have all the code needed to run …".</p>
+
+<h3 id="e">E. Messages, verbatim</h3>
+<table>
+<thead><tr><th>Id</th><th>Text</th></tr></thead>
+<tbody>
+<tr><td>E.1 ask (replaces 1651 D.1)</td><td><code>[sm context management] &lt;reason&gt; Stop at a logical point. sm will move your claims (&lt;claims&gt;) and pending wakes to a fresh agent. Your handoff note is drafted at &lt;draft path&gt; with what sm knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn.</code> The <code>&lt;reason&gt;</code> variants are unchanged, and the review-request asks use the same text. <code>sm handoff --link</code> still works but is no longer advertised.</td></tr>
+<tr><td>E.1b ask, draft not written (A.2)</td><td>As E.1, ending: <code>Run `sm handoff`; it drafts your note with what sm knows and tells you where.</code></td></tr>
+<tr><td>E.2 reminder (replaces D.2)</td><td><code>[sm context management] Reminder: your context is at &lt;pct&gt;% and sm asked you to hand off at &lt;asked_pct&gt;%. Finish the current step, fill in &lt;draft path&gt;, and run `sm handoff`.</code></td></tr>
+<tr><td>E.3 draft created by the CLI</td><td><code>sm drafted your handoff note at &lt;absolute draft path&gt; with what it knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` again.</code></td></tr>
+<tr><td>E.4 accepted (replaces D.4)</td><td>Line 1, by source. draft: <code>Handoff accepted. sm saved your note and deleted the draft.</code> file: <code>Handoff accepted. sm saved your note and removed &lt;path&gt;.</code> or <code>… and left &lt;path&gt; in place (&lt;reason&gt;).</code> link: <code>Handoff accepted.</code><br>Line 2: <code>End your turn now; sm will start your successor when it ends and retire this session.</code></td></tr>
+<tr><td>E.5 incomplete</td><td><code>Your note does not mention: &lt;item&gt;, &lt;item&gt;.</code> newline <code>Say what the successor should do about each, then run `sm handoff` again.</code> newline <code>(Run it again unchanged to hand off anyway.)</code> When the note came from <code>--path</code>, the last two lines name <code>sm handoff --path &lt;path&gt;</code>.</td></tr>
+<tr><td>E.6 fallback brief line (C.4)</td><td><code>Handoff note: run `sm handoff show` (the note, then Rajesh's messages to this line, verbatim).</code></td></tr>
+<tr><td>D.6 failed (amended)</td><td>Unchanged, plus for a stored note: <code>Your note is saved; run `sm handoff` to retry with it.</code> In state <code>failed</code>, a bare <code>sm handoff</code> with no draft present resubmits the stored note instead of creating a template.</td></tr>
+</tbody>
+</table>
+<p>Every command named in E.1–E.6 must ship in the same deploy as E.1. Check this before the live restart.</p>
+
+<h3 id="f">F. Retention</h3>
+<p>sm keeps <code>handoff_notes</code> rows indefinitely, as it keeps messages. They are small (the largest today is 7.7 KB) and worth mining later. A daily background task (an existing daily sweep may host it) removes pending import originals (G step 3) once their line has ended. A line has ended when its latest agent (follow <code>successor_session_id</code> forward) is stopped or retired with no successor. The two August files in <code>&lt;state dir&gt;/handoffs/</code>, left by the old <code>/clear</code> handoff, are imported as notes if a record names them, and then #2337 deletes that folder.</p>
+
+<h3 id="g">G. Deploy-time import</h3>
+<p>On every start after #2337 deploys, until a top-level key <code>handoff_notes_imported_at</code> exists in the session store, sm runs the import below. Each step is idempotent, so a crash at any point is finished by the next start. The row insert is <code>INSERT OR IGNORE</code> on <code>session_id</code>. A record is rewritten only once its row exists. An original is removed only after its record rewrite is durable, and a missing original counts as removed. sm writes the marker only after every record is done. For each session record whose note has kind <code>path</code>, or kind <code>stored</code> with <code>source_path</code> still on disk and its line ended:</p>
+<ol>
+<li>Insert a <code>handoff_notes</code> row with <code>source = 'import'</code>, under that record's line. Several records that name one file (far-2170 and far-2170-h2) produce one row, attached to the latest of them; the earlier records' own text was overwritten and is lost.</li>
+<li>Rewrite the note of the record the row is attached to as kind <code>stored</code>. Each earlier record that named the same file keeps kind <code>path</code>, and gains <code>"superseded_by": "&lt;latest session id&gt;"</code> in its note. Its Docs row (I) reads "Handoff note (overwritten by &lt;latest name&gt;'s)" and opens the surviving note's page.</li>
+<li>Remove the original under A.6's git rule if the line has ended. Otherwise add it to <code>handoff_note_sources_pending</code> in the session store, and F removes it once the line ends.</li>
+</ol>
+<p>A record of kind <code>path</code> whose file no longer exists skips steps 1–3, keeps its note unchanged, and counts as done for the marker.</p>
+<table>
+<thead><tr><th>Original (as of 19 Oct)</th><th>Records</th><th>Line ended?</th><th>Original</th></tr></thead>
+<tbody>
+<tr><td><code>~/Artifacts/2168_e5/HANDOFF.md</code></td><td>far-2168</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/Artifacts/2169_probe/HANDOFF.md</code></td><td>far-2169</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/Artifacts/2170_shape/HANDOFF.md</code></td><td>far-2170, far-2170-h2</td><td>yes</td><td>removed</td></tr>
+<tr><td><code>~/worktrees/2221_HANDOFF.md</code></td><td>far-2221</td><td>no</td><td>pending</td></tr>
+</tbody>
+</table>
+<p>Four handoff-named files that no record names (<code>1775_readout/HANDOFF.md</code>, <code>1312_sweep_inspection_a2ea3815/1312-ready-handoff.md</code>, <code>1487_completion_4742e913/1488-handoff.md</code>, <code>956_ordinary_outcomes/handoff</code>) belong to their artifact folders and expire with them. The 13 records whose file is gone keep kind <code>path</code>. Their Docs row (I) reads "Handoff note (file no longer exists)".</p>
+
+<h3 id="h">H. Local agents</h3>
+<p>No judge change. Since #2326, the local judge's policy lists <code>sm handoff</code> among the commands an agent may run on its own seat<sup>[5]</sup>, which covers <code>sm handoff show</code>. The server writes the draft into the local agent's checkout, which the agent may already write. <code>docs/product/local_agent_addendum.md</code> gains one line: <code>When sm asks you to hand off, fill in the draft it names and run sm handoff.</code> #2337's end-to-end test includes one local agent.</p>
+
+<h3 id="i">I. The Docs row and reader page</h3>
+<ul>
+<li><b>Row.</b> The server adds one entry to the agent's work docs, the <code>AgentWorkDoc</code> list that History cards and the expanded Watch agent already render<sup>[6]</sup>. The predecessor gets <code>{"title":"Handoff note → &lt;successor name&gt;","reader_path":"/docs/~handoff/&lt;predecessor id&gt;","state":"handoff"}</code>. The successor gets <code>{"title":"Handoff note from &lt;predecessor name&gt;", same reader_path}</code>. It sorts after the agent's own docs. A link note uses the URL as <code>reader_path</code>; the app sends that to the browser, as it does every GitHub link today. The implementer confirms both the History and the Watch lists come from the server. If either list is built in the app, that surface waits for a later app release, and this ticket ships the other.</li>
+<li><b>Page.</b> <code>GET /docs/~handoff/{session_id}</code>: <code>~</code> cannot begin a GitHub owner name, so the path cannot collide with a published doc. The route is placed before the <code>/docs/{repo}/…</code> routes. It is owner-only, and agents get 403. It renders the note through the existing Markdown shell (<code>render_markdown_with_lines</code>), so the in-app reader (whose allowlist already covers <code>/docs/</code>) and the web reader show it like any doc. A header line reads <code>far-2221 → far-2221-h2 · 2026-10-19 01:27 · 36% context · note 1 of 2 in this line</code>, with links to the line's other notes. Rajesh's messages are not shown on this page; he wrote them.</li>
+<li><b>No other UI.</b> No change to the agent row, the context ring, the Inbox or the badge.</li>
+</ul>
+
+<h3 id="j">J. Worktree-root sweep</h3>
+<p><b>J.1 What counts.</b> Entries directly inside <code>work_claims.worktree_root</code><sup>[7]</sup> (<code>~/worktrees</code>). An entry containing <code>.git</code> (a file or a folder) is a checkout, which the existing cleanup owns. Names beginning with <code>.</code> are ignored. Everything else is a <b>loose entry</b>.</p>
+<p><b>J.2 When.</b> On each hourly cleanup pass (<code>RECHECK_INTERVAL</code><sup>[8]</sup>), sm upserts loose entries into a <code>loose_entries</code> table in the work-claims database. A row whose path is no longer in the root is deleted on the pass that notices it. A row whose entry's device and inode (<code>dev</code>, <code>ino</code> of the path itself) differ from the stored ones is reset: <code>first_seen_at</code> becomes now. Either way a recreated or replaced entry gets a full 14 days. Its columns are <code>path</code> (primary key), <code>dev</code>, <code>ino</code>, <code>first_seen_at</code>, <code>last_mtime</code>, <code>scan_complete</code>, <code>deleted_at</code> and <code>deleted_reason</code>. <code>last_mtime</code> is the newest mtime of the entry and of every file and folder under it, from a full walk that does not follow symlinks. The walk stops early, with <code>scan_complete = 0</code>, when it finds anything modified within 14 days or after 200,000 entries.</p>
+<p><b>J.3 Delete rule.</b> sm removes the entry (J.3a) when all of these hold: it was first seen more than 14 days ago; the latest walk completed (<code>scan_complete = 1</code>) and found nothing modified within 14 days; no <code>sm worktree keep</code> names it; no unfinished queue job has its cwd inside it or mentions it anywhere in its argv: the entry's absolute path, or its <code>~/</code> form, appears as a substring of any argv element, followed by the end of the element, <code>/</code>, or a character that cannot appear in a path name (whitespace, a quote, <code>;</code>, <code>)</code>, <code>,</code>, <code>:</code>). This catches <code>--output=/Users/rajesh/worktrees/results/file</code> and <code>bash -c 'cat ~/worktrees/results/file'</code>; no live session's working directory is inside it; and it is not, and does not contain, a path in <code>handoff_note_sources_pending</code> (G), which F removes when its line ends. An incomplete walk blocks deletion (<code>blocked_by: "recent change"</code>, or <code>"too large to check"</code> after 200,000 entries). If any check fails, sm re-checks it next hour. The first live pass deletes nothing.</p>
+<p><b>J.3a Removal, bound to the scanned object.</b> sm first renames the entry into <code>&lt;worktree root&gt;/.sm-quarantine/&lt;row id&gt;-&lt;basename&gt;</code>. That folder is on the same filesystem, so the rename is atomic, and its dot name means J.1 ignores it. sm then compares the moved object's <code>dev</code> and <code>ino</code> with those recorded by the pass that completed the walk. If they match, sm deletes the quarantined copy (<code>rm -rf</code>). If they differ, the entry was replaced after the scan: sm renames it back (or, if the original name is taken again, leaves it in quarantine and lists it with <code>blocked_by: "replaced during removal"</code>) and resets its row. Nothing outside the quarantine folder is ever passed to <code>rm -rf</code>.</p>
+<p><b>J.4 Page.</b> <code>GET /worktrees/leftover</code> gains <code>"loose":[{path,size_bytes,first_seen_at,deletes_after,blocked_by:null|"keep"|"recent change"|"pending handoff note"|"queue job &lt;id&gt;"|"session &lt;name&gt;"}]</code>. The page lists them under <b>Loose files in ~/worktrees</b> with the existing Keep and Delete buttons. <code>POST /worktrees/delete</code> accepts a loose path and skips the git checks for it.</p>
+
+<h3 id="k">K. Doc theme from Appearance</h3>
+<ul>
+<li><b>Web reader</b> (<code>web/reader.js</code>, <code>loaded()</code>). After the frame loads, set <code>win.document.documentElement.dataset.theme</code> to <code>light</code> or <code>dark</code>. The value comes from <code>localStorage['sm-theme']</code>, where <code>system</code> resolves through <code>matchMedia('(prefers-color-scheme: dark)')</code>. Re-apply when the outer document's <code>data-theme</code> changes (the attribute is already observed for the terminal) and when the media query changes. The frame is same-origin and unsandboxed, so this works today.</li>
+<li><b>App reader</b> (<code>DocReader.kt</code>). After the page loads, run <code>document.documentElement.dataset.theme='dark'</code>. The app has only a dark theme.</li>
+<li><b>Markdown shell</b> (<code>owner_docs.rs</code>). Key its colours on <code>:root[data-theme=dark]</code>, falling back to <code>prefers-color-scheme</code> when no theme is set.</li>
+<li><b>Memo template</b> (<code>docs/memo_template.html</code>). Keep the toggle button. Change its script in three ways. Selecting light sets <code>data-theme="light"</code> explicitly, never removes the attribute, because the dark fallback below would otherwise keep a dark-OS view dark. Inside sm's reader (<code>window.frameElement</code> is set), do not restore a saved choice; the reader's theme is the default on every open, and the button flips that one view. And redraw the button's label whenever <code>data-theme</code> changes, using a MutationObserver, since the reader sets the theme after the label is first drawn. Also add the dark tokens under <code>@media (prefers-color-scheme: dark) { :root:not([data-theme]) { … } }</code>, so a file opened outside sm follows the OS. Existing docs need no edit: their script restores a saved choice, and the reader then overrides it on load. Only their label can be stale until the first click.</li>
+</ul>
+
+<h3 id="l">L. Tickets, file sets, order</h3>
+<table>
+<thead><tr><th>#</th><th>Scope</th><th>Files</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>#2337 Custody</td><td>A–H; amend 1651</td><td><code>bin/sm.rs</code>, <code>bin/doc/mod.rs</code> (review-request draft), <code>handoff/execute.rs</code>, <code>handoff/transfer.rs</code>, <code>handoff/policy.rs</code>, new <code>handoff/notes.rs</code> (store, draft, check, messages, import), <code>http/handoff.rs</code> (deferred runtime start, launch prompt), <code>http.rs</code>, the node ssh helper for remote drafts, <code>docs/product/local_agent_addendum.md</code></td><td>—</td></tr>
+<tr><td>#2338 Small pieces</td><td>I, J, K</td><td>I: the agent-work docs builder (<code>http/agent_history.rs</code> and the Watch session JSON), new route in <code>http/docs.rs</code>. J: <code>work_claims/worktrees.rs</code>, <code>http/worktrees.rs</code>, leftover page client. K: <code>web/reader.js</code>, <code>owner_docs.rs</code> (shell CSS), <code>android-app/…/DocReader.kt</code>, <code>docs/memo_template.html</code></td><td>#2337, for I only</td></tr>
+</tbody>
+</table>
+<p>J and K share no files with #2337, so that part of #2338 can start at once. Model tier: middle (Opus high, or Terra high). #2337 is the larger. If it will not fit one agent, split C.4 (deferred runtime start and launch prompt) into its own ticket after it. K's Android line needs an APK install, so it ships with the next app release. The web part can ship first.</p>
+
+<h3 id="m">M. Test plan</h3>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>A.1 draft path from the registered working dir; <code>.sm/</code> added to info/exclude once; non-git working dir</td><td>CLI and server tests with a temp repo and worktree</td></tr>
+<tr><td>A.2 server writes before the ask (primary, ssh stub for a remote node, failure gives E.1b); review-request CLI writes; voluntary CLI writes; never overwrites; withdrawal deletes only an unchanged draft; retire deletes</td><td>unit + http + CLI tests</td></tr>
+<tr><td>A.3 each draft state; comments stripped; draft and <code>.sm/</code> deleted on 200, kept on 409. A.4 each item kind detected and missed; refuse once, then accept; link never checked</td><td>CLI tests against a stub server; unit, <code>handoff/notes.rs</code></td></tr>
+<tr><td>A.5 limits; A.6 removal, git-tracked kept, changed-after-read kept, a same-size same-mtime replacement (new inode) kept, unlink error still exits 0, removal reported</td><td>CLI tests</td></tr>
+<tr><td>A.7 show: own predecessor, named session in the line, another line refused (403) for an agent and allowed for the owner, <code>--line</code>, link note, none</td><td>http + CLI output tests</td></tr>
+<tr><td>B draft text exact, including <code>- none</code> lists and omitted unknown titles</td><td>snapshot</td></tr>
+<tr><td>C line id across three generations; sequence; replacement keeps sequence; old <code>path</code> body rejected. C.4 runtime starts only after G; launch prompt exact; restart in <code>transferring</code> starts the runtime; remote node falls back to E.6</td><td>unit + restart test</td></tr>
+<tr><td>D both sources; a codex-fork <code>&lt;environment_context&gt;</code> input dropped; a newest message larger than the cap included whole; every exclusion rule, and a genuine message beginning with <code>&lt;div&gt;</code> kept; enqueue/user dedupe; 20,000-token cap keeps newest; unparsable transcript</td><td>unit with fixture Claude and codex-fork transcripts plus a fixture message_queue</td></tr>
+<tr><td>E texts exact; D.6 retry resubmits the stored note</td><td>snapshots in existing policy/execute tests</td></tr>
+<tr><td>F pending originals removed at line end; notes never pruned</td><td>unit, fixed clock</td></tr>
+<tr><td>G crash after each step then restart completes it once; a missing source skipped and the marker still written; shared-file case (earlier record keeps <code>path</code> with <code>superseded_by</code>), ended vs live line, missing file untouched, runs once</td><td>unit on a fixture session store</td></tr>
+<tr><td>H local agent: the judge passes <code>sm handoff</code> and <code>sm handoff show</code>; the draft is written into its checkout</td><td>end-to-end check with one local agent</td></tr>
+<tr><td>I docs entries on both agents; page auth; route precedence over <code>/docs/{repo}</code>; missing-file row</td><td>http tests</td></tr>
+<tr><td>J every guard, including an entry replaced between the walk and removal (renamed back, row reset), a queue job naming the entry inside <code>--output=…</code> and inside a <code>bash -c</code> string, the pending-handoff-note guard, a path that disappears and returns, an entry replaced with a different inode, a recent file five folders deep and the 200,000-entry cap; symlinks not followed; <code>.git</code> and dot entries skipped; first pass deletes nothing; delete route</td><td>unit + http</td></tr>
+<tr><td>K reader sets theme on load and on change; template button flips one view, light set explicitly on a dark OS, and its label follows; markdown shell both ways</td><td>web reader test; manual app check</td></tr>
+<tr><td>End to end</td><td>Scratch server on a live-state copy: Claude agent, Hand off now. The draft exists before the ask arrives; the agent fills it; the check fires once for a planted queue job. The successor's first prompt holds the note and messages; the Docs row; nothing left in the worktree.</td></tr>
+</tbody>
+</table>
+
+<h3 id="n">N. Code references</h3>
+<p>Paths are under <code>crates/sm-server/src/</code> unless noted. Functions are named because line numbers drift.</p>
+<ol>
+<li><code>HandoffArgs</code>, <code>handoff_note</code>, <code>run_handoff</code>, <code>read_send_text_from</code>: <code>bin/sm.rs</code>.</li>
+<li><code>HandoffNote</code>, <code>NoteKind</code>, <code>note_value</code>, <code>Brief::text</code>, the accepted and failed texts: <code>handoff/execute.rs</code>.</li>
+<li><code>accept_handoff</code>: <code>handoff/transfer.rs</code>. <code>post_handoff</code>: <code>http/handoff.rs</code>.</li>
+<li>Ask and reminder texts, display strings: <code>handoff/policy.rs</code>.</li>
+<li>Local judge policy: <code>scripts/local-judge/policy.md</code> (own-seat <code>sm</code> commands, including <code>sm handoff</code>, since #2326).</li>
+<li><code>AgentWorkDoc</code>: <code>android-app/…/data/model/ApiModels.kt</code>. History rows: <code>android-app/…/ui/history/HistoryScreen.kt</code> (<code>WorkList</code>, <code>DocRow</code>). Watch docs: <code>ui/watch/WatchScreen.kt</code> (<code>AgentWorkSections</code>). Server: <code>http/agent_history.rs</code> (<code>HistoryData::agent_work</code>). In-app allowlist: <code>ui/watch/DocReader.kt</code> (<code>isOwnerPagePath</code>).</li>
+<li><code>WorkClaimsConfig::worktree_root_path</code>: <code>config.rs</code>.</li>
+<li><code>RECHECK_INTERVAL</code>, <code>run_worktree_cleanup</code>, <code>leftover_worktrees</code>: <code>work_claims/worktrees.rs</code>. Routes: <code>http.rs</code>, <code>http/worktrees.rs</code>.</li>
+<li>Delivered-message header <code>[Input from: …]</code>: <code>sessions.rs</code>, <code>queue.rs</code>. Inbox replies: table <code>owner_message_replies</code> (<code>body</code>, <code>delivered_text</code>, <code>delivered_to_session_id</code>) in <code>message_queue.db</code>.</li>
+<li>Reader frame: <code>web/reader.js</code> (<code>loaded</code>). Appearance: <code>web/settings.js</code>, boot script in <code>http/web.rs</code>. Markdown shell: <code>owner_docs.rs</code> (<code>render_markdown_with_lines</code>).</li>
+<li>Atomic spawn-brief transport: <code>specs/1264_spawn_brief_transport.md</code>; <code>persist_spawn_brief_artifact</code>, <code>sessions.rs</code>. Successor creation: <code>create_successor</code>, <code>complete_handoff</code>, <code>http/handoff.rs</code>.</li>
+</ol>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why a draft file in the worktree and not stdin?</b> A heredoc is write-once: to fix one line, the agent retypes the whole note. A file can be re-read and edited in place, and that edit-and-review loop is what the completeness check relies on. Writing inside the worktree raises no permission prompt for any provider, and <code>.sm/</code> is excluded from git, so the draft never reaches a commit and never blocks worktree cleanup. sm deletes it on submission.</p>
+<p><b>Why does sm write the draft before asking, rather than on the first <code>sm handoff</code>?</b> The handoff is coming, so a second command and a second turn would buy nothing. Pre-filling also hands the agent sm's facts (claims, jobs, reviews, children) to annotate instead of recall.</p>
+<p><b>How does sm write a draft for an agent on node <code>macbook</code>?</b> Over the ssh connection it already uses for that node's tmux. If that fails, the ask falls back to E.1b, and the CLI, which always runs where the agent runs, writes the draft.</p>
+<p><b>What if the agent's working directory is a data folder, such as <code>~/Artifacts/2203_chains</code>?</b> The draft sits there until submission, then sm deletes it. A withdrawn ask deletes an unchanged draft, and retire deletes any draft still present.</p>
+<p><b>Why a launch prompt and not a typed first message?</b> Notes run to 8 KB, plus up to 20,000 tokens of your messages. Typing that into a terminal is the fragile path. The atomic spawn-brief transport already delivers large briefs on stdin at launch.</p>
+<p><b>Why only Rajesh's messages?</b> Messages from sm and other agents are mostly wakes and status. Their facts (claims, jobs, reviews) already reach the successor through 1651's brief, and the note covers their meaning. Rajesh's words are the one input a summary distorts.</p>
+<p><b>Why keep <code>--path</code>?</b> Repo instruction files and old habits mention handoff files. Refusing would make a high-context agent retry. Importing costs nothing.</p>
+<p><b>Why not snapshot <code>--link</code> notes?</b> PR and ticket comments are durable, and GitHub is their source of truth.</p>
+<p><b>Could the worktree-root sweep delete something a running job needs?</b> J.3 checks unfinished queue jobs (cwd and argv), live sessions' working directories, and any change within 14 days. An entry also stays listed on the page for 14 days before deletion, and Keep stops it.</p>
+<p><b>Is the completeness check easy to game?</b> Yes: an agent can mention "PR #2240" with nothing useful about it. The check exists to catch forgetting, not to grade the note. It costs one round at most.</p>
+
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
