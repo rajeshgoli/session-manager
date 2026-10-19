@@ -60,6 +60,9 @@ button.a-row { cursor:pointer; } button.a-row:hover { background:var(--panel-2);
 .q-start-acts { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
 .q-start-acts .btn { min-height:28px; padding:2px 12px; }
 .q-actions .q-start-pop { left:0; right:auto; }
+.q-start-pop.above { top:auto; bottom:calc(100% + 6px); animation-name:q-pop-up; }
+@keyframes q-pop-up { from { opacity:0; transform:translateY(4px); } }
 @keyframes q-pop { from { opacity:0; transform:translateY(-4px); } }
-@media (prefers-reduced-motion: reduce) { .q-spin, .q-start-pop { animation:none; } .q-start .btn { transition:none; } }
-@media (max-width:600px) { .q-job-line { gap:8px; } .q-start-btn { min-height:36px; padding:4px 14px 4px 12px; } }
+@media (prefers-reduced-motion: reduce) { .q-spin, .q-start-pop, .q-start-pop.above { animation:none; } .q-start .btn { transition:none; } }
+/* Phones: the title keeps the full width and the pill shares the timeline line. */
+@media (max-width:600px) { .q-job-line { position:relative; } .q-job-line .q-timeline { margin-right:92px; } .q-job-line > .q-start { position:absolute; right:0; bottom:2px; } .q-start-btn { min-height:36px; padding:4px 14px 4px 12px; } }

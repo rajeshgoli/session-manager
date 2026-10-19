@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useState, useRef } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, toast } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
 
@@ -97,8 +97,19 @@ export function HeldBack({ stats, insightOnly = false, onDismiss }) {
 export function StartNow({ job, primary = false }) {
   const [phase, setPhase] = useState('idle'); // idle | starting | risk | failed
   const [message, setMessage] = useState('');
+  const [above, setAbove] = useState(false);
   const root = useRef(null);
+  const pop = useRef(null);
   const open = phase === 'risk' || phase === 'failed';
+  // Open upward when the scroll area has no room below, so the choice never
+  // needs a scroll to reach.
+  useLayoutEffect(() => {
+    if (!open || !pop.current) { setAbove(false); return; }
+    const box = root.current.closest('.content')?.getBoundingClientRect() ?? { top: 0, bottom: innerHeight };
+    const button = root.current.getBoundingClientRect();
+    const height = pop.current.offsetHeight + 6;
+    setAbove(button.bottom + height > Math.min(box.bottom, innerHeight) && button.top - height >= Math.max(box.top, 0));
+  }, [open, message]);
   useEffect(() => {
     if (!open) return;
     const away = (event) => { if (!root.current?.contains(event.target)) setPhase('idle'); };
@@ -128,7 +139,7 @@ export function StartNow({ job, primary = false }) {
       ${starting ? html`<i class="q-spin" aria-hidden="true"></i>` : html`<i class="q-play" aria-hidden="true"></i>`}
       ${primary ? (starting ? 'Starting…' : 'Start now') : 'Start'}
     </button>
-    ${open ? html`<span class=${`q-start-pop ${phase}`} role=${phase === 'failed' ? 'alert' : 'dialog'} aria-label="Start now">
+    ${open ? html`<span ref=${pop} class=${`q-start-pop ${phase}${above ? ' above' : ''}`} role=${phase === 'failed' ? 'alert' : 'dialog'} aria-label="Start now">
       <strong>${phase === 'risk' ? 'Low on memory' : "Couldn't start"}</strong>
       <span>${message}</span>
       ${phase === 'risk' ? html`<small>If memory runs short, sm stops this job first and puts it back in line.</small>` : null}
