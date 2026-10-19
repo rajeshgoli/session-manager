@@ -430,10 +430,22 @@ def workflow_rule(cmd, cwd, agent, hits):
 
 
 def scanned_scripts(command, cwd, agent):
-    """Scripts a command may run, resolved from the command's working directory
-    and from the checkout: a misleading working directory must not hide a script."""
+    """Scripts a command may run, resolved from the command's working directory,
+    any `--cwd` it names, and the checkout: a misleading directory must not hide a script."""
     out, paths = [], set()
-    for base in dict.fromkeys(os.path.realpath(d) for d in (cwd or agent["checkout"], agent["checkout"])):
+    cwd = cwd or agent["checkout"]
+    bases = [cwd, agent["checkout"]]
+    # A runner such as `sm queue run --cwd DIR -- cmd` runs cmd from DIR.
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    for index, token in enumerate(tokens):
+        if token == "--cwd" and index + 1 < len(tokens):
+            bases.append(os.path.join(cwd, os.path.expanduser(tokens[index + 1])))
+        elif token.startswith("--cwd="):
+            bases.append(os.path.join(cwd, os.path.expanduser(token[len("--cwd="):])))
+    for base in dict.fromkeys(os.path.realpath(d) for d in bases):
         for path, text in script_texts(command, base, agent):
             if os.path.isabs(path) and path in paths:
                 continue

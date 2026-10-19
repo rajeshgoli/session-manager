@@ -198,7 +198,7 @@ class JudgeTests(unittest.TestCase):
                     expected = case['decision']
                 self.assertEqual(self.ruling(case['tool'], tin), expected)
                 counts[case['kind']] = counts.get(case['kind'], 0) + 1
-        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [40, 27, 5])
+        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [41, 27, 5])
         if not os.environ.get('SM_JUDGE_TEST_MODEL_URL'):
             self.assertGreater(len(self.model.requests), 40)
             request = self.model.requests[0]
@@ -315,6 +315,8 @@ class JudgeTests(unittest.TestCase):
         shown = self.model.requests[-1]['messages'][0]['content']
         self.assertIn('data=b"x"', shown)
         self.assertIn(f"Working directory: {self.wt / 'sub'}", shown)
+        self.ruling(tin={'command': 'sm queue run --type background --label x --cwd sub -- python upload.py'})
+        self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
 
     def test_git_control_metadata_cannot_be_written(self):
         (self.wt / 'config-link').symlink_to(self.wt / '.git/config')
