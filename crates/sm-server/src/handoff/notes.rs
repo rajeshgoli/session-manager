@@ -276,7 +276,16 @@ impl SessionStore {
         let session =
             raw_session_object(state, id).ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let name = raw_session_display_name(session, id);
-        let dir = expand_home(&json_text(session.get("working_dir")).unwrap_or_default());
+        let previous = self.handoff_draft_record(id)?;
+        // An asked agent edits the file at the recorded path, so a later claim never moves it.
+        let dir = match &previous {
+            Some((path, _)) => Path::new(path)
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+            None => self.handoff_work_dir(state, id)?,
+        };
         anyhow::ensure!(
             dir.is_absolute(),
             "handoff working directory must be absolute"
@@ -328,7 +337,6 @@ impl SessionStore {
             claims = list(false),
             running = list(true)
         );
-        let previous = self.handoff_draft_record(id)?;
         let text = if previous.is_some() {
             session
                 .get("handoff_draft_text")
@@ -346,7 +354,30 @@ impl SessionStore {
         session_object_mut(ensure_sessions_array_mut(state)?, id)
             .unwrap()
             .insert("handoff_draft_text".into(), json!(text));
-        Ok(json!({"path":dir.join(".sm/handoff.md"), "text":text, "sha256":sha}))
+        Ok(json!({"path":path, "text":text, "sha256":sha}))
+    }
+    /// The agent's newest claimed worktree that exists, else its spawn directory.
+    /// An agent spawned in a main checkout that then ran `sm ticket --setup-worktree`
+    /// works in the worktree, so its draft belongs there, not in the main checkout.
+    fn handoff_work_dir(&self, state: &Value, id: &str) -> Result<PathBuf> {
+        let session =
+            raw_session_object(state, id).ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+        let spawn_dir = expand_home(&json_text(session.get("working_dir")).unwrap_or_default());
+        if Self::handoff_node(state, id) != "primary" {
+            return Ok(spawn_dir);
+        }
+        let Some(queue) = &self.queue_store else {
+            return Ok(spawn_dir);
+        };
+        let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf())
+            .claims_for_session(id, true)?;
+        Ok(claims
+            .into_iter()
+            .rev()
+            .filter_map(|view| view.claim.worktree_path)
+            .map(|path| expand_home(&path))
+            .find(|path| path.is_absolute() && path.is_dir())
+            .unwrap_or(spawn_dir))
     }
     pub fn handoff_draft(&self, id: &str) -> Result<Value> {
         let _guard = self.write_guard()?;
@@ -1387,6 +1418,40 @@ mod tests {
         assert!(path.exists());
         remove_draft(path, None).unwrap();
         assert!(!root.join(".sm").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn handoff_draft_goes_to_claimed_worktree_and_stays_there() {
+        let (store, root) = fixture();
+        let claim = |id: &str, number: i64, worktree: &Path, at: &str| {
+            fs::create_dir_all(worktree).unwrap();
+            Connection::open(root.join("messages.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO work_claims(id,repo,number,kind,session_id,source,worktree_path,claimed_at) VALUES(?1,'o/r',?2,'ticket','agent001','explicit',?3,?4)",
+                    params![id, number, worktree.display().to_string(), at],
+                )
+                .unwrap();
+        };
+        claim("c1", 7, &root.join("wt-7"), "2026-10-19T01:00:00Z");
+        let draft = store.handoff_draft("agent001").unwrap();
+        assert_eq!(draft["path"], json!(root.join("wt-7/.sm/handoff.md")));
+        assert!(draft["text"].as_str().unwrap().contains(&format!(
+            "Working directory: {}",
+            root.join("wt-7").display()
+        )));
+        // A later claim never moves a draft the agent may already be editing.
+        claim("c2", 8, &root.join("wt-8"), "2026-10-19T02:00:00Z");
+        let again = store.handoff_draft("agent001").unwrap();
+        assert_eq!(again["path"], draft["path"]);
+        // Without a recorded draft, the newest existing claimed worktree wins.
+        store.remove_handoff_draft_record("agent001").unwrap();
+        let fresh = store.handoff_draft("agent001").unwrap();
+        assert_eq!(fresh["path"], json!(root.join("wt-8/.sm/handoff.md")));
+        fs::remove_dir_all(root.join("wt-8")).unwrap();
+        store.remove_handoff_draft_record("agent001").unwrap();
+        let fallback = store.handoff_draft("agent001").unwrap();
+        assert_eq!(fallback["path"], json!(root.join("wt-7/.sm/handoff.md")));
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
