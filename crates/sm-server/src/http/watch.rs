@@ -321,7 +321,13 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
         {
             continue;
         }
-        if repo_filter.as_deref().is_some_and(|repo| repo != t.cwd) {
+        if repo_filter.as_deref().is_some_and(|repo| {
+            repo != t.cwd
+                && !t
+                    .cwd
+                    .starts_with(&format!("{}/", repo.trim_end_matches('/')))
+        }) || nonempty(&params.node).is_some_and(|node| node != state.config.nodes.default_node)
+        {
             continue;
         }
         let stopped = t.state != "live";

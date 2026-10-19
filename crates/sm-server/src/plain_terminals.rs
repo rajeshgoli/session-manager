@@ -145,6 +145,10 @@ impl Store {
         self.pool.get()?.execute("UPDATE plain_terminals SET busy_since=CASE WHEN ?2 THEN COALESCE(busy_since,?4) ELSE NULL END,last_attach_at=CASE WHEN ?3 THEN ?4 ELSE last_attach_at END WHERE id=?1 AND state='live'", params![id,busy,attached,timestamp()])?;
         Ok(())
     }
+    pub fn attached_at(&self, id: &str, at: &str) -> Result<()> {
+        self.pool.get()?.execute("UPDATE plain_terminals SET last_attach_at=MAX(COALESCE(last_attach_at,?2),?2) WHERE id=?1 AND state='live'",params![id,at])?;
+        Ok(())
+    }
     pub fn input(&self, id: &str) -> Result<()> {
         self.input_at(id, &timestamp())
     }
@@ -171,6 +175,20 @@ pub struct Observation {
     pub attached: bool,
     pub command: String,
     pub last_input_at: Option<String>,
+    pub last_attach_at: Option<String>,
+    pub last_activity_at: Option<OffsetDateTime>,
+}
+
+impl Observation {
+    /// tmux retains session activity after a native client detaches. Output also
+    /// advances it, deliberately delaying cleanup when idle cannot be proved.
+    pub fn idle_expired(&self, now: OffsetDateTime, minutes: i64) -> bool {
+        !self.busy
+            && !self.attached
+            && self
+                .last_activity_at
+                .is_some_and(|at| now - at >= time::Duration::minutes(minutes))
+    }
 }
 
 pub fn exists(runtime: &TmuxRuntime, t: &Terminal) -> Result<bool> {
@@ -214,7 +232,7 @@ pub fn observe(runtime: &TmuxRuntime, t: &Terminal) -> Result<Observation> {
         "-t",
         &format!("={}", t.tmux_session),
         "-F",
-        "#{pane_pid}\t#{pane_dead}\t#{session_attached}\t#{pane_current_command}",
+        "#{pane_pid}\t#{pane_dead}\t#{session_attached}\t#{pane_current_command}\t#{session_last_attached}\t#{session_activity}",
     ])?;
     let output = crate::runtime::command_output_with_timeout(command, Duration::from_secs(3))?;
     if !output.status.success() {
@@ -237,10 +255,12 @@ pub fn observe(runtime: &TmuxRuntime, t: &Terminal) -> Result<Observation> {
         attached: false,
         command: "zsh".into(),
         last_input_at: None,
+        last_attach_at: None,
+        last_activity_at: None,
     };
     for pane in panes {
-        let fields = pane.splitn(4, '\t').collect::<Vec<_>>();
-        if fields.len() != 4 {
+        let fields = pane.splitn(6, '\t').collect::<Vec<_>>();
+        if fields.len() != 6 {
             bail!("invalid pane observation");
         }
         let pid = fields[0].parse::<i32>()?;
@@ -252,7 +272,23 @@ pub fn observe(runtime: &TmuxRuntime, t: &Terminal) -> Result<Observation> {
         if !pids.iter().any(|(p, _)| *p == pid) {
             bail!("shell process missing");
         }
-        if pids.iter().any(|(_, parent)| *parent == pid) {
+        let attached = if fields[4].is_empty() {
+            0
+        } else {
+            fields[4].parse::<i64>()?
+        };
+        if attached > 0 {
+            observation.last_attach_at =
+                Some(OffsetDateTime::from_unix_timestamp(attached)?.format(&Rfc3339)?);
+        }
+        let activity = OffsetDateTime::from_unix_timestamp(fields[5].parse()?)?;
+        observation.last_activity_at = Some(
+            observation
+                .last_activity_at
+                .map_or(activity, |previous| previous.max(activity)),
+        );
+        // exec can replace zsh at the same PID without creating descendants.
+        if !matches!(fields[3], "zsh" | "-zsh") || pids.iter().any(|(_, parent)| *parent == pid) {
             observation.busy = true;
             observation.command = fields[3].into();
         }

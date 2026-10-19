@@ -335,6 +335,10 @@ pub(super) fn retire_all_locked(state: &AppState) -> anyhow::Result<()> {
 }
 
 pub(super) fn reconcile(state: &AppState) -> anyhow::Result<()> {
+    reconcile_at(state, OffsetDateTime::now_utc())
+}
+
+pub(super) fn reconcile_at(state: &AppState, now: OffsetDateTime) -> anyhow::Result<()> {
     if !state.config.rust_core.runtime_enabled {
         return Ok(());
     }
@@ -362,6 +366,9 @@ pub(super) fn reconcile(state: &AppState) -> anyhow::Result<()> {
         match crate::plain_terminals::observe(&runtime, &t) {
             Ok(o) => {
                 store.observe(&t.id, o.busy, o.attached)?;
+                if let Some(at) = &o.last_attach_at {
+                    store.attached_at(&t.id, at)?;
+                }
                 if let Some(at) = &o.last_input_at {
                     store.input_at(&t.id, at)?;
                 }
@@ -369,15 +376,14 @@ pub(super) fn reconcile(state: &AppState) -> anyhow::Result<()> {
                     .plain_terminal_commands
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .insert(t.id.clone(), o.command);
+                    .insert(t.id.clone(), o.command.clone());
                 let current = store.get(&t.id)?.expect("existing terminal");
-                if !o.attached
-                    && current
-                        .idle_expired(OffsetDateTime::now_utc(), limits(state)?.idle_reap_minutes)
+                if o.idle_expired(now, limits(state)?.idle_reap_minutes)
+                    && current.idle_expired(now, limits(state)?.idle_reap_minutes)
                 {
                     // Recheck immediately before teardown; a build or attach may have started.
                     if let Ok(fresh) = crate::plain_terminals::observe(&runtime, &t) {
-                        if !fresh.busy && !fresh.attached {
+                        if fresh.idle_expired(now, limits(state)?.idle_reap_minutes) {
                             retire_locked(state, &t, "idle")?;
                         }
                     }

@@ -235,7 +235,11 @@ async fn plain_terminal_busy_jobs_restart_adoption_idle_reap_and_watch() {
         [&idle],
     )
     .unwrap();
-    state.reconcile_plain_terminals().unwrap();
+    plain_terminals::reconcile_at(
+        &state,
+        OffsetDateTime::now_utc() + time::Duration::minutes(181),
+    )
+    .unwrap();
     assert_eq!(
         store.get(&idle).unwrap().unwrap().retired_reason.as_deref(),
         Some("idle")
@@ -333,6 +337,142 @@ async fn plain_terminal_from_session_push_and_concurrent_cap() {
         let notices = sender.0.lock().unwrap();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0]["kind"], "shell_opened");
+    }
+    assert_eq!(
+        plain_call(
+            &state,
+            Method::DELETE,
+            &format!("/terminals/{id}"),
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn plain_terminal_brief_native_attach_and_exec_root_survive_cleanup() {
+    let (state, _tmux) = plain_test_state();
+    let id = plain_new(&state).await;
+    let store = plain_terminals::store(&state);
+    let t = store.get(&id).unwrap().unwrap();
+    Connection::open(&state.config.usage.db_path)
+        .unwrap()
+        .execute(
+            "UPDATE plain_terminals SET created_at='2020-01-01T00:00:00Z' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let mut ticket = test_mobile_terminal_ticket();
+    ticket.tmux_session = id.clone();
+    ticket.tmux_socket_name = state.runtime().socket_name().map(str::to_owned);
+    let mut pty =
+        start_mobile_terminal_attach_client(&ticket, 24, 80, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+    for _ in 0..80 {
+        if crate::plain_terminals::observe(&state.runtime(), &t).is_ok_and(|o| o.attached) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        crate::plain_terminals::observe(&state.runtime(), &t)
+            .unwrap()
+            .attached
+    );
+    write_mobile_terminal_pty(pty.master.clone(), b"true\r".to_vec())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    state
+        .runtime()
+        .tmux_command(["detach-client", "-s", &id])
+        .unwrap()
+        .output()
+        .unwrap();
+    for _ in 0..80 {
+        if pty.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        pty.child.try_wait().unwrap().is_some(),
+        "native client must detach"
+    );
+    assert!(
+        !crate::plain_terminals::observe(&state.runtime(), &t)
+            .unwrap()
+            .attached
+    );
+    // No lifecycle pass saw this client attached. Persistent tmux activity protects it.
+    state.reconcile_plain_terminals().unwrap();
+    let record = store.get(&id).unwrap().unwrap();
+    assert_eq!(record.state, "live");
+    assert!(record.last_attach_at.is_some());
+    state
+        .runtime()
+        .tmux_command(["send-keys", "-t", &id, "exec sleep 300", "Enter"])
+        .unwrap()
+        .output()
+        .unwrap();
+    for _ in 0..80 {
+        if crate::plain_terminals::observe(&state.runtime(), &t).is_ok_and(|o| o.command == "sleep")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let observed = crate::plain_terminals::observe(&state.runtime(), &t).unwrap();
+    assert!(observed.busy);
+    assert_eq!(observed.command, "sleep");
+    plain_terminals::reconcile_at(
+        &state,
+        OffsetDateTime::now_utc() + time::Duration::minutes(181),
+    )
+    .unwrap();
+    assert_eq!(store.get(&id).unwrap().unwrap().state, "live");
+    assert_eq!(
+        plain_call(
+            &state,
+            Method::DELETE,
+            &format!("/terminals/{id}"),
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn plain_terminal_watch_repo_prefix_and_node_filters_match_agents() {
+    let (state, _tmux) = plain_test_state();
+    let id = plain_new(&state).await;
+    for (query, visible) in [
+        ("repo=/private", true),
+        ("repo=/private/tmp", true),
+        ("repo=/priv", false),
+        ("node=other-node", false),
+    ] {
+        let (status, watch) = plain_call(
+            &state,
+            Method::GET,
+            &format!("/watch/state?{query}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            watch["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == id),
+            visible,
+            "{query}: {watch}"
+        );
     }
     assert_eq!(
         plain_call(
