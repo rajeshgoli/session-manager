@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plain Terminal — zsh seats on web and mobile</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;
+    --orange:     #eb6834;
+    --red:        #e34948;
+    --green:      #008300;
+    --violet:     #4a3aa7;
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>Plain Terminal — zsh seats on web and mobile</h1>
+<p class="meta"><small>Author: <code>c20b80f2</code> (revisions 1–3), <code>sm-2314-h2</code> (revision 4) · doc-only memo, no ticket yet · 2026-10-19</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Conclusion: add a terminal seat — an interactive zsh on the Mac, in the same tmux machinery that carries agents — and attach to it over SSH with a key that lives on the device.</b> At home the phone and laptops reach the Mac over the home network and nothing public is open. Away from home, the Cloudflare SSH tunnel opens only when a device asks to attach, and closes again after use. You start a shell from the web terminal's ⋯ menu ("New shell here"), from the phone's New session sheet, or with <code>sm shell</code>. A shell that is running something is never cleaned up behind your back.</p>
+
+<p>This adopts your hardening idea from the last review. The reason to prefer it over the previous design (attach through the same relay agents use): today a stolen, unlocked phone with a valid device certificate is enough to reach a shell. With SSH, the attacker also needs that device's SSH key, which you can revoke on its own. And at home, no public door opens at all.</p>
+
+<h3>Terms</h3>
+<dl class="vocab">
+  <dt>Terminal seat (shell)</dt><dd>A session record whose tmux pane is a plain login zsh, not an agent. It is listed, opened and retired like a session, and it runs nothing until you type.</dd>
+  <dt>Studio SSH</dt><dd>The existing SSH server for the Mac that you toggle in Settings: a dedicated <code>sshd</code> on <code>127.0.0.1:22222</code>, published through the Cloudflare tunnel <code>studio-ssh.rajeshgo.li</code> and reached with <code>ssh studio-away</code>. It is key-only and off by default.</dd>
+  <dt>Termux</dt><dd>The terminal app on your phone. The sm app already hands it SSH commands to attach to tmux sessions on the Mac. The SSH key it uses lives in Termux, not in the sm app.</dd>
+  <dt>Device key</dt><dd>An SSH public key registered in sm and bound to one device (your phone's Termux, your MacBook). Revoking the device revokes its key.</dd>
+  <dt>Home route / away route</dt><dd>Home: the Mac's address on your home network, <code>studio-lan.rajeshgo.li</code>, which the web terminal already uses for its direct LAN connection. Away: the Cloudflare tunnel.</dd>
+</dl>
+
+<h3>How a shell is reached</h3>
+
+<figure>
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <defs><marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L8 4L0 8z" fill="#52514e"/></marker></defs>
+  <text x="8" y="16" font-size="10" fill="#008300" letter-spacing=".08em">AT HOME — NOTHING PUBLIC OPENS</text>
+  <rect x="8" y="26" width="150" height="54" rx="8" fill="#f4f3f0" stroke="#e2e1dc"/>
+  <text x="83" y="49" text-anchor="middle">Phone · Termux</text><text x="83" y="66" text-anchor="middle" fill="#52514e">or laptop · ssh</text>
+  <rect x="8" y="96" width="150" height="54" rx="8" fill="#f4f3f0" stroke="#e2e1dc"/>
+  <text x="83" y="119" text-anchor="middle">Browser at home</text><text x="83" y="136" text-anchor="middle" fill="#52514e">web terminal page</text>
+  <rect x="230" y="26" width="200" height="54" rx="8" fill="#fff" stroke="#008300"/>
+  <text x="330" y="49" text-anchor="middle" fill="#008300">sshd on the home network</text><text x="330" y="66" text-anchor="middle" fill="#52514e">studio-lan :22222 · device keys only</text>
+  <rect x="230" y="96" width="200" height="54" rx="8" fill="#fff" stroke="#008300"/>
+  <text x="330" y="119" text-anchor="middle" fill="#008300">direct terminal route</text><text x="330" y="136" text-anchor="middle" fill="#52514e">localhost or studio-lan, as today</text>
+  <text x="8" y="186" font-size="10" fill="#eb6834" letter-spacing=".08em">AWAY — TUNNEL OPENS ON REQUEST, CLOSES AFTER USE</text>
+  <rect x="8" y="196" width="150" height="54" rx="8" fill="#f4f3f0" stroke="#e2e1dc"/>
+  <text x="83" y="219" text-anchor="middle">Phone · Termux</text><text x="83" y="236" text-anchor="middle" fill="#52514e">or laptop · ssh</text>
+  <rect x="230" y="196" width="200" height="54" rx="8" fill="#fff" stroke="#eb6834"/>
+  <text x="330" y="219" text-anchor="middle" fill="#eb6834">1 · sm opens the tunnel</text><text x="330" y="236" text-anchor="middle" fill="#52514e">asked through Access + device cert</text>
+  <rect x="470" y="196" width="160" height="54" rx="8" fill="#fff" stroke="#eb6834"/>
+  <text x="550" y="219" text-anchor="middle" fill="#eb6834">2 · studio-away</text><text x="550" y="236" text-anchor="middle" fill="#52514e">tunnel → sshd, device key</text>
+  <rect x="690" y="96" width="160" height="70" rx="8" fill="#fff" stroke="#8a8880"/>
+  <text x="770" y="122" text-anchor="middle">tmux · zsh -l</text><text x="770" y="139" text-anchor="middle" fill="#52514e">the shell, on the Mac</text><text x="770" y="155" text-anchor="middle" fill="#52514e">as your user</text>
+  <line x1="158" y1="53" x2="226" y2="53" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="158" y1="123" x2="226" y2="123" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="158" y1="223" x2="226" y2="223" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="430" y1="223" x2="466" y2="223" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="430" y1="53" x2="686" y2="118" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="430" y1="123" x2="686" y2="128" stroke="#52514e" marker-end="url(#a)"/>
+  <line x1="630" y1="223" x2="686" y2="150" stroke="#52514e" marker-end="url(#a)"/>
+  <text x="8" y="282" font-size="11" fill="#52514e">A browser cannot speak SSH, so the web page attaches shells only on the home routes. Away from home, the page gives you the ssh command instead.</text>
+</svg>
+<figcaption>Green paths exist only on your home network. The orange path is the one public door: sm opens it when a device asks to attach from outside, and only after that request passes the guards that protect the app today (Cloudflare Access plus the device certificate). The SSH login then needs the device's own key.</figcaption>
+</figure>
+
+<h3>Decision surface</h3>
+<p>Each row is one call. I have made every call not reserved to you; confirm or override.</p>
+
+<table>
+<thead>
+<tr><th style="width:21%">Question</th><th>Recommendation</th><th style="width:31%">Why</th></tr>
+</thead>
+<tbody>
+<tr><td>1. How does a device reach a shell?</td><td><b>Over SSH with a key registered for that device:</b> Termux on the phone, ssh on a laptop. The web page attaches shells only on the home routes, never through Cloudflare. Agents keep today's relay.</td><td>A stolen phone needs its SSH key as well as its certificate, and at home nothing public opens.</td></tr>
+<tr><td>2. When is SSH reachable?</td><td><b>Home listener up while at least one shell is open. Tunnel up only after an away device asks to attach; it closes 15 minutes after the last away connection ends, and at once when the last shell closes.</b> The Studio SSH switch stays a manual override ("always on").</td><td>Your idea: nothing public stays open by default, and the public door costs a request through the device certificate to open.</td></tr>
+<tr><td>3. Which SSH keys are accepted?</td><td><b>Only keys registered to sm devices, kept in a key file of their own.</b> Revoking a device deletes its key and drops its open SSH connections.</td><td>Today Studio SSH accepts every key in <code>~/.ssh/authorized_keys</code>, and revoking a device leaves its SSH access in place.</td></tr>
+<tr><td>4. Where do I start a shell?</td><td><b>Web: ⋯ → New shell here</b>, in the folder of the agent you are looking at (the menu that already holds Clone). <b>Phone: New session sheet → Terminal.</b> <b>Desktop: <code>sm shell [dir]</code>.</b></td><td>Every entry point already exists and already creates things. Starting where the agent works is the common case: steering or checking its work.</td></tr>
+<tr><td>5. What happens to a shell running a background task?</td><td><b>It is never cleaned up.</b> Only a shell sitting at an idle prompt, with nothing running under it and nobody attached for 3 hours, is closed. Retire always works. At most 4 shells are open; at the cap, sm names the open ones.</td><td>Your build, tail or deploy survives any length of time. Forgotten idle shells still disappear.</td></tr>
+<tr><td>6. Who may create a shell?</td><td><b>Owner only.</b></td><td>You are the only human; a wider circle adds risk for no use.</td></tr>
+<tr><td>7. Kill switch.</td><td><b>One toggle in Settings, default on.</b> Off closes every shell, the home listener and the tunnel (the tunnel stays up only if you switched Studio SSH on yourself).</td><td>One action undoes the whole feature without a restart.</td></tr>
+<tr><td>8. Do shells show up like agents?</td><td><b>Plain rows in today's lists, marked ▹, with "last input" as the fact. Never pinged.</b></td><td>You want to see a shell is open, not be messaged because zsh is idle.</td></tr>
+<tr><td>9. Is shell output logged?</td><td><b>Yes, like agent panes, with the same retention.</b></td><td>"What ran?" keeps an answer after an incident.</td></tr>
+<tr><td>10. Should agents move to SSH too?</td><td><b>Not now.</b> Revisit after shells have run on SSH for a few weeks.</td><td>See below.</td></tr>
+</tbody>
+</table>
+
+<p><b>On agents over SSH (your question).</b> It would harden agent attach the same way, but it costs three things you use daily. First, the browser: the web terminal cannot attach over SSH, so web attach to agents would end away from home. Second, legibility: sm counts and limits attaches, and shows who is attached, because every attach passes through its relay; an SSH login bypasses sm entirely. Third, the in-app terminal screen and its phone keys would give way to Termux. Shells are the right place to prove the SSH path first, because a shell is the case where arbitrary execution is the point.</p>
+
+<h3>What it looks like</h3>
+
+<figure>
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <rect x="1" y="1" width="858" height="378" rx="6" fill="#0f1117" stroke="#2a2d36"/>
+  <line x1="1" y1="30" x2="859" y2="30" stroke="#2a2d36"/>
+  <text x="12" y="20" font-family="SF Mono,Menlo,monospace" font-weight="700" fill="#5bc8e6">sm</text>
+  <circle cx="40" cy="16" r="3.5" fill="#3fbf6f"/><text x="50" y="20" font-weight="600" fill="#e8e8ea">far-2221-h2</text>
+  <circle cx="148" cy="16" r="8" fill="none" stroke="#3a3d46" stroke-width="2"/><path d="M148 8 A8 8 0 0 1 155 19" fill="none" stroke="#c9b458" stroke-width="2"/><text x="148" y="19" text-anchor="middle" font-size="8" fill="#9a9ca6">31</text>
+  <text x="164" y="20" font-size="11" fill="#3fbf6f">Live</text><text x="196" y="20" font-size="11" fill="#9a9ca6">Direct · 3 ms</text>
+  <g font-size="11" fill="#e8e8ea">
+    <rect x="520" y="7" width="60" height="18" rx="3" fill="none" stroke="#3a3d46"/><text x="550" y="20" text-anchor="middle">Notes ⌘J</text>
+    <rect x="586" y="7" width="46" height="18" rx="3" fill="none" stroke="#3a3d46"/><text x="609" y="20" text-anchor="middle">Details</text>
+    <rect x="638" y="7" width="62" height="18" rx="3" fill="none" stroke="#3a3d46"/><text x="669" y="20" text-anchor="middle">Hand off…</text>
+    <rect x="706" y="7" width="22" height="18" rx="3" fill="#232733" stroke="#5bc8e6"/><text x="717" y="20" text-anchor="middle">⋯</text>
+    <text x="742" y="20" fill="#9a9ca6">↗</text><text x="762" y="20" fill="#9a9ca6">⟳</text><text x="782" y="20" fill="#9a9ca6">●</text>
+    <rect x="800" y="7" width="48" height="18" rx="3" fill="none" stroke="#7a3340"/><text x="824" y="20" text-anchor="middle" fill="#e5707e">Retire</text>
+  </g>
+  <line x1="180" y1="30" x2="180" y2="379" stroke="#2a2d36"/>
+  <g font-size="12">
+    <text x="10" y="50" font-size="9" font-weight="700" fill="#e0a43a" letter-spacing=".08em">WAITING LONG</text>
+    <circle cx="14" cy="64" r="3" fill="#e0a43a"/><text x="22" y="68" font-weight="600" fill="#e8e8ea">kubla</text>
+    <text x="22" y="82" font-size="10" fill="#3fbf6f">▶ 2 running · 5h 15m</text>
+    <text x="10" y="106" font-size="9" font-weight="700" fill="#3fbf6f" letter-spacing=".08em">MOVING</text>
+    <rect x="1" y="112" width="178" height="36" fill="#173a44"/><rect x="1" y="112" width="3" height="36" fill="#5bc8e6"/>
+    <circle cx="14" cy="124" r="3" fill="#3fbf6f"/><text x="22" y="128" font-weight="600" fill="#e8e8ea">far-2221-h2</text>
+    <text x="22" y="142" font-size="10" fill="#3fbf6f">▶ 4 running · 42m</text>
+    <text x="22" y="168" fill="#e8e8ea">▹ zsh · fractal-algo</text>
+    <text x="22" y="182" font-size="10" fill="#3fbf6f">running · cargo bench</text>
+    <text x="10" y="206" font-size="9" font-weight="700" fill="#9a9ca6" letter-spacing=".08em">IDLE</text>
+    <text x="22" y="226" fill="#e8e8ea">▹ zsh · session-manager</text>
+    <text x="22" y="240" font-size="10" fill="#9a9ca6">○ last input 12m</text>
+  </g>
+  <rect x="580" y="32" width="170" height="182" rx="6" fill="#171a22" stroke="#3a3d46"/>
+  <g font-size="12" fill="#e8e8ea">
+    <text x="594" y="54">Hand off now</text><text x="594" y="80">Clone</text>
+    <rect x="584" y="88" width="162" height="24" rx="4" fill="#173a44"/><text x="594" y="105" fill="#5bc8e6" font-weight="600">New shell here</text>
+    <text x="594" y="130">Follow</text><text x="594" y="156">Copy attach command</text><text x="594" y="182">Rename…</text><text x="594" y="206">Pin a note…</text>
+  </g>
+  <g font-family="SF Mono,Menlo,monospace" font-size="11" fill="#c9cad2">
+    <text x="196" y="260">• Ran cargo test -p fractal-engine</text>
+    <text x="196" y="278" fill="#7f8290">  └ test result: ok. 214 passed</text>
+    <text x="196" y="302">• Working (42m · esc to interrupt)</text>
+  </g>
+  <text x="196" y="346" font-size="11" fill="#9a9ca6">New shell here opens zsh in far-2221-h2's worktree, in this same page.</text><text x="196" y="362" font-size="11" fill="#9a9ca6">Away from home, the page shows the ssh command for the shell instead.</text>
+</svg>
+<figcaption>Web terminal page as it is today: top bar, the switcher on the left with its sections, the ⋯ menu. The only new things are the "New shell here" menu item and the ▹ shell rows, which sit in the section their state implies. A shell running a command reads as moving, and one at an idle prompt as idle.</figcaption>
+</figure>
+
+<figure>
+<svg viewBox="0 0 660 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <g>
+    <rect x="4" y="4" width="200" height="410" rx="22" fill="#fcfcfb" stroke="#8a8880"/>
+    <text x="104" y="34" text-anchor="middle" font-weight="600" fill="#0b0b0b">Watch</text>
+    <text x="18" y="62" font-size="10" fill="#8a8880" letter-spacing=".08em">MOVING</text>
+    <text x="18" y="82" fill="#0b0b0b">far-2221-h2</text><text x="18" y="97" font-size="11" fill="#008300">4 running · 42m</text>
+    <text x="18" y="122" fill="#0b0b0b">▹ zsh · fractal-algo</text><text x="18" y="137" font-size="11" fill="#008300">running · cargo bench</text>
+    <text x="18" y="164" font-size="10" fill="#8a8880" letter-spacing=".08em">IDLE</text>
+    <text x="18" y="184" fill="#0b0b0b">▹ zsh · session-manager</text><text x="18" y="199" font-size="11" fill="#52514e">last input 12m</text>
+    <rect x="14" y="214" width="180" height="28" rx="14" fill="#e3eefb"/><text x="104" y="232" text-anchor="middle" fill="#2a78d6">Open in Termux</text>
+    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">1 · Watch list</text>
+  </g>
+  <g transform="translate(218,0)">
+    <rect x="4" y="4" width="200" height="410" rx="22" fill="#fcfcfb" stroke="#8a8880"/>
+    <text x="18" y="34" font-weight="600" fill="#0b0b0b">New session</text>
+    <text x="18" y="58" font-size="10" fill="#8a8880" letter-spacing=".08em">AGENT TYPE</text>
+    <rect x="14" y="66" width="120" height="22" rx="11" fill="none" stroke="#e2e1dc"/><text x="22" y="81" font-size="11" fill="#0b0b0b">Claude · Opus · high</text>
+    <rect x="14" y="94" width="104" height="22" rx="11" fill="none" stroke="#e2e1dc"/><text x="22" y="109" font-size="11" fill="#0b0b0b">Codex · terra · high</text>
+    <rect x="14" y="122" width="74" height="22" rx="11" fill="#2a78d6"/><text x="22" y="137" font-size="11" fill="#fff">▹ Terminal</text>
+    <rect x="94" y="122" width="48" height="22" rx="11" fill="none" stroke="#e2e1dc"/><text x="104" y="137" font-size="11" fill="#0b0b0b">Other</text>
+    <text x="18" y="170" font-size="10" fill="#8a8880" letter-spacing=".08em">DIRECTORY</text>
+    <rect x="14" y="178" width="180" height="28" rx="4" fill="none" stroke="#e2e1dc"/><text x="22" y="196" fill="#0b0b0b">session-manager ▾</text>
+    <text x="18" y="232" font-size="10" fill="#8a8880" letter-spacing=".08em">NAME · OPTIONAL</text>
+    <rect x="14" y="240" width="180" height="28" rx="4" fill="none" stroke="#e2e1dc"/>
+    <text x="18" y="296" font-size="10" fill="#8a8880">Terminal hides model, effort and</text><text x="18" y="310" font-size="10" fill="#8a8880">first message; it needs a folder only</text>
+    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#52514e">2 · New session sheet</text>
+  </g>
+  <g transform="translate(436,0)">
+    <rect x="4" y="4" width="200" height="410" rx="22" fill="#000" stroke="#8a8880"/>
+    <g font-family="SF Mono,Menlo,monospace" font-size="10" fill="#e6e4de">
+      <text x="14" y="36" fill="#8a8880">ssh studio-lan · term-a1b2</text>
+      <text x="14" y="58">% cd fractal-algo</text>
+      <text x="14" y="74">% cargo bench</text>
+      <text x="14" y="90" fill="#b1afa7">  Running benches/fill</text>
+      <text x="14" y="106" fill="#b1afa7">fill/1M  time: 41.2 ms</text>
+      <text x="14" y="122">▌</text>
+    </g>
+    <rect x="4" y="318" width="200" height="56" fill="#1a1a1a"/>
+    <g font-family="SF Mono,Menlo,monospace" font-size="9" fill="#e6e4de" text-anchor="middle">
+      <text x="24" y="338">ESC</text><text x="52" y="338">/</text><text x="78" y="338">-</text><text x="104" y="338">HOME</text><text x="132" y="338">↑</text><text x="158" y="338">END</text><text x="184" y="338">PGUP</text>
+      <text x="24" y="362">TAB</text><text x="52" y="362">CTRL</text><text x="78" y="362">ALT</text><text x="104" y="362">←</text><text x="132" y="362">↓</text><text x="158" y="362">→</text><text x="184" y="362">PGDN</text>
+    </g>
+    <text x="104" y="400" text-anchor="middle" font-size="11" fill="#b1afa7">3 · Termux, attached</text>
+  </g>
+</svg>
+<figcaption>Phone. 1: shells are rows in the Watch list; a shell's card offers "Open in Termux" where an agent's offers "Open terminal". 2: the New session sheet you use for agents gains a Terminal chip, which needs only a folder. 3: Termux attaches over the home listener (or the tunnel when away) and brings its own key row with Ctrl and Alt. The sm app picks the route; you see the shell.</figcaption>
+</figure>
+
+<h3>Hardening, in one place</h3>
+<p>You asked what else I would do. These are the layers, strongest first. The first four are new in this revision; the last was already in revision 3.</p>
+<table>
+<thead><tr><th style="width:36%">Layer</th><th>What it stops</th></tr></thead>
+<tbody>
+<tr><td>SSH key bound to the device (decisions 1, 3)</td><td>A stolen phone with a valid certificate is not enough; the key is revoked on its own.</td></tr>
+<tr><td>Home listener; tunnel only on request (decision 2)</td><td>Nothing public is listening for shells while you are home or not using one.</td></tr>
+<tr><td>Own key file; revocation deletes the key and drops connections (decision 3)</td><td>Old keys in <code>authorized_keys</code> never reach a shell, and a lost device loses access at once.</td></tr>
+<tr><td>A push to your phone when a shell opens, or when anyone logs in over the tunnel</td><td>Use you did not start becomes visible within seconds. I recommend it; it costs one notice type.</td></tr>
+<tr><td>Owner-only creation, cap of 4, idle cleanup, kill switch (decisions 5–7)</td><td>Forgotten shells, and a single action to stop everything.</td></tr>
+</tbody>
+</table>
+<p>What stays true: anyone holding an unlocked registered phone <i>and</i> its Termux key, or a laptop with a registered key, has your user's shell on the Mac. That is the feature. Revocation from the web or the app ends it in one action.</p>
+
+<h3>FAQ — what this revision changes</h3>
+<p><strong>Transport.</strong> Shells now attach over SSH with a device key, not through the relay that carries agents. Revision 3 relied on the device certificate alone. This follows your review.</p>
+<p><strong>Creation on the web.</strong> Revision 3 had no way to start a shell from the web; you asked where. The web terminal's ⋯ menu now holds "New shell here".</p>
+<p><strong>Cleanup.</strong> Revision 3 closed shells after 3 hours without typing, which would have killed a running build. Now only an idle prompt is closed.</p>
+<p><strong>Phone keys.</strong> The Ctrl modifier for the in-app key row is gone. Shells open in Termux, which has its own Ctrl and Alt keys.</p>
+<p><strong>Figures.</strong> The web figure now follows the real page: top bar, switcher sections and ⋯ menu.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. Data model and interfaces</h3>
+<p><b>A.1 — Shell records.</b> A new table in the usage DB, beside <code>seat_sessions</code>. Do not reuse <code>seat_sessions</code>: it maps provider transcripts for the usage ledger, and a shell has none.</p>
+<pre><code>CREATE TABLE IF NOT EXISTS plain_terminals (
+  id                 TEXT PRIMARY KEY,   -- "term-" + 4 hex
+  cwd                TEXT NOT NULL,
+  created_by_user    TEXT NOT NULL,      -- owner user id
+  created_by_device  TEXT,               -- device id, NULL for CLI
+  created_via        TEXT NOT NULL,      -- "web" | "mobile" | "cli"
+  tmux_session       TEXT NOT NULL,
+  state              TEXT NOT NULL,      -- live | retired
+  last_attach_at     TEXT,
+  last_input_at      TEXT,
+  busy_since         TEXT,               -- set while a process runs under the shell (E.1)
+  created_at         TEXT NOT NULL,
+  retired_at         TEXT,
+  retired_reason     TEXT                -- "owner" | "idle" | "kill_switch" | "tmux_gone"
+);
+CREATE TABLE IF NOT EXISTS device_ssh_keys (
+  fingerprint   TEXT PRIMARY KEY,        -- SHA256:… of the public key
+  device_id     TEXT NOT NULL,           -- existing mobile device id, or a named computer
+  public_key    TEXT NOT NULL,           -- one authorized_keys line, no options
+  added_at      TEXT NOT NULL,
+  revoked_at    TEXT
+);</code></pre>
+
+<p><b>A.2 — Listing.</b> <code>/watch/state</code> entries gain shells with <code>kind: "shell"</code>, name <code>zsh · &lt;cwd basename&gt;</code>, and the fact "running · &lt;command&gt;" while busy, otherwise "last input &lt;age&gt;". A busy shell sits in the moving section and an idle one in idle, with a ▹ mark and neutral tone. Shells are never in a waiting section and never raise attention.</p>
+
+<p><b>A.3 — Endpoints.</b> All are owner-gated (decision 6), and each returns 403 <code>plain_disabled</code> when the kill switch is off.</p>
+<table>
+<thead><tr><th>Call</th><th>Body / result</th></tr></thead>
+<tbody>
+<tr><td><code>POST /terminals</code></td><td><code>{"cwd": path, "from_session": id?}</code>. With <code>from_session</code> and no <code>cwd</code>, the shell opens in that session's working directory ("New shell here"). Returns 201 <code>{id, tmux_session, cwd}</code>, or 409 <code>too_many_terminals</code> with the list of open shells.</td></tr>
+<tr><td><code>DELETE /terminals/{id}</code></td><td>Retire: kills the tmux session and marks it retired with reason <code>owner</code>.</td></tr>
+<tr><td><code>POST /terminals/{id}/route</code></td><td><code>{"where": "home" | "away"}</code> → <code>{ssh_host, ssh_port, ssh_user, tmux_session, command}</code>. <code>away</code> starts the tunnel if it is off and returns once it is ready (status <code>on</code>), or 503 after 20 s. <code>home</code> never touches the tunnel.</td></tr>
+<tr><td><code>POST /devices/{id}/ssh-keys</code>, <code>DELETE /devices/{id}/ssh-keys/{fingerprint}</code></td><td>Register or remove one public key for a device. Ed25519 keys only. Registration rewrites the key file (F.2).</td></tr>
+</tbody>
+</table>
+<p>The <code>command</code> field is exactly <code>ssh -t -p &lt;port&gt; &lt;user&gt;@&lt;host&gt; tmux attach-session -t &lt;tmux_session&gt;</code>. At home the host is <code>studio-lan.rajeshgo.li</code> and the port is 22222. Away, the host is <code>studio-away</code>, the alias the Studio SSH setup already installs on a client, with a port-less form for that alias.</p>
+
+<p><b>A.4 — CLI.</b> <code>sm shell [dir]</code> creates a shell (dir defaults to the current directory), prints its id, and attaches in place with <code>tmux attach</code> when run on the Mac. Run elsewhere, it prints the A.3 command. <code>sm shell ls</code> lists shells, and <code>sm shell rm &lt;id&gt;</code> retires one.</p>
+
+<p><b>A.5 — Launch.</b> Use <code>TmuxRuntime::create_session</code> with <code>/bin/zsh -l</code> in the cwd. Do not wrap it in <code>managed_session_command</code>: shells carry no <code>CLAUDE_SESSION_MANAGER_ID</code>, so <code>sm</code> typed there runs unattributed, as from any plain terminal. Pane logging uses the existing session-log path.</p>
+
+<p><b>A.6 — Config.</b> <code>terminal_limits</code> gains <code>plain_terminal_enabled</code> (default true), <code>max_plain_terminals</code> (default 4, range 1–16), <code>idle_reap_minutes</code> (default 180, range 15–1440) and <code>tunnel_linger_minutes</code> (default 15, range 1–120). All are owner-editable at runtime, like the existing limits.</p>
+
+<h3>B. Security: check order, testable as written</h3>
+<p>B.1 — Create (<code>POST /terminals</code>) requires, in order: <code>plain_terminal_enabled</code>; the actor is the owner; the request came through the existing guard chain for its route (Access plus device certificate plus bearer on the public route; localhost or the direct LAN listener for the web page); and the count is below <code>max_plain_terminals</code>. Denials use new reason codes <code>plain_disabled</code>, <code>not_owner</code> and <code>too_many_terminals</code> in the existing audit log.</p>
+<p>B.2 — <code>POST /terminals/{id}/route</code> with <code>away</code> requires the same chain, plus a device that has at least one unrevoked SSH key. A device without a key gets 409 <code>no_ssh_key</code>, and the app offers Termux setup (D.3).</p>
+<p>B.3 — The SSH login itself needs a key from the device key file (F.2). sm never holds private keys.</p>
+<p>B.4 — The web page attaches shells only when its chosen route (<code>terminal-route.js</code>) is localhost or the direct LAN listener. On the Cloudflare route the shell row opens a panel with the A.3 away command and a copy button. The server enforces this too: the relay refuses <code>kind: "shell"</code> targets on any connection that did not arrive on localhost or the LAN listener.</p>
+<p>B.5 — Every shell create, and every SSH login on the tunnel (read from the sshd log, F.4), sends an owner push: "Shell opened · &lt;cwd&gt; · from &lt;device&gt;" or "SSH login over tunnel · &lt;key comment&gt;".</p>
+<p>B.6 — Tests: kill switch off blocks create, route and relay attach, and closes the listener and the tunnel; a non-owner create is denied; <code>away</code> from a device without a key is denied; a revoked key is gone from the key file and its live SSH connection is dropped within 5 s; the relay refuses a shell over the Cloudflare route; and the cap is enforced.</p>
+
+<h3>C. Web user experience</h3>
+<p>C.1 — The ⋯ menu on the terminal page gains "New shell here" after Clone. It calls <code>POST /terminals</code> with <code>from_session</code>, then switches the page to the new shell. On a shell's own page, the ⋯ menu shows "New shell here" (same cwd) and "Copy ssh command". It drops agent-only items: Hand off now, Clone, Follow.</p>
+<p>C.2 — The main page's New agent popover gains a Terminal type that asks for a folder only.</p>
+<p>C.3 — Shell rows follow A.2. Opening a shell on a home route is the ordinary terminal view, with no key row on desktop. On the Cloudflare route, the view is replaced by a panel: "Shells attach over SSH away from home", the away command, Copy, and "Open tunnel" (A.3 <code>away</code>).</p>
+<p>C.4 — The top bar for a shell shows Notes, Details and Retire. Hand off… is hidden.</p>
+<p>C.5 — Settings → Terminal limits gains the four A.6 fields. Settings → Devices lists each device's SSH keys, with Add key (paste a public key) and Remove.</p>
+
+<h3>D. Mobile user experience</h3>
+<p>D.1 — Watch list: shell rows as in A.2. A shell's card shows "Open in Termux" in place of "Open terminal".</p>
+<p>D.2 — Create: the New session sheet gains a Terminal chip among the agent types. With it selected, the sheet shows Directory and Name only. Create calls <code>POST /terminals</code>, then opens Termux as in D.4.</p>
+<p>D.3 — Termux setup, done once per phone. If the device has no SSH key in sm, Open in Termux shows "Set up Termux for shells". That sends Termux a <code>RUN_COMMAND</code> with a result intent. Termux creates <code>~/.ssh/id_ed25519</code> if it is missing and returns the public key. The app registers it with <code>POST /devices/{id}/ssh-keys</code> and writes the Termux <code>~/.ssh/config</code> host entries <code>studio-lan</code> and <code>studio-away</code>. The away entry uses the cloudflared ProxyCommand the Studio SSH setup documents.</p>
+<p>D.4 — Open in Termux: the app probes the LAN listener's probe URL with a 700 ms timeout, the same probe the web terminal uses. On success it asks for <code>route</code> <code>home</code>; otherwise <code>away</code>, showing "Opening tunnel…" until the call returns. It then runs the returned command through the existing <code>TermuxBridge.termuxAttach</code>.</p>
+<p>D.5 — The in-app terminal screen and its key row are unchanged; they are used for agents only.</p>
+
+<h3>E. Lifecycle</h3>
+<p>E.1 — Busy: every minute, sm checks whether the shell's pane process (<code>#{pane_pid}</code>) has any descendant processes. If it has, the shell is busy, <code>busy_since</code> is set, and the row's fact names the foreground command (<code>#{pane_current_command}</code>). Background jobs started with <code>&amp;</code>, and anything under <code>nohup</code> or <code>disown</code>, are descendants until zsh exits, so they count as busy.</p>
+<p>E.2 — Idle cleanup: a shell is retired with reason <code>idle</code> only when all three hold: it is not busy; nobody has been attached (relay or SSH, F.4) for <code>idle_reap_minutes</code>; and no input for <code>idle_reap_minutes</code>. Example: a <code>cargo bench</code> running for 9 hours stays open. A prompt last touched 3 hours ago, with no attach, closes.</p>
+<p>E.3 — Server restart: live shells whose tmux session survived stay live. The rest are marked retired with reason <code>tmux_gone</code>.</p>
+<p>E.4 — Shells never hold queue slots, never take a perf-machine claim, never receive <code>sm send</code>, and never ping.</p>
+
+<h3>F. SSH transport</h3>
+<p>F.1 — Home listener: the Studio SSH sshd config gains a second <code>ListenAddress</code> on the Mac's LAN address, the address <code>studio-lan.rajeshgo.li</code> already resolves to for the direct web terminal. The loopback listener the tunnel uses stays. The LAN listener runs while at least one shell is live, or while the Studio SSH switch is on. sm adds or removes the address and reloads sshd, which keeps existing connections.</p>
+<p>F.2 — Keys: sshd uses <code>AuthorizedKeysFile ~/.config/session-manager/ssh/device_keys</code>, written by sm from <code>device_ssh_keys</code> where <code>revoked_at</code> is null. It is mode 0600 and replaced atomically. Each line carries <code>restrict,pty</code>, so no port forwarding or agent forwarding is allowed. <code>~/.ssh/authorized_keys</code> is no longer read by the Studio SSH sshd. Migration: the setup flow offers to import its current lines as keys of a device named "imported", for you to sort or remove.</p>
+<p>F.3 — Tunnel: the cloudflared agent starts on <code>route</code> <code>away</code>, or when the Studio SSH switch is on. It stops <code>tunnel_linger_minutes</code> after the last SSH connection that came through the tunnel closes. It stops at once when the last shell retires and the switch is off.</p>
+<p>F.4 — Connection tracking: sm reads the sshd log in <code>LogLevel VERBOSE</code>, which records the key fingerprint and source of each accepted login. Logins from loopback are tunnel logins; logins from the LAN are home logins. sm keeps a live connection count per source, plus the last-attach time per shell. Device revocation removes the key (F.2), then terminates sessions whose login fingerprint matches.</p>
+<p>F.5 — Studio SSH is a shipped spec (<code>specs/900_studio_ssh_toggle.md</code>). The implementing ticket updates it in the same PR: the LAN listener, the device key file, and on-demand tunnel start and stop. The switch keeps its meaning of "always on".</p>
+<p>F.6 — Kill switch off: retire all shells, remove the LAN address, stop the tunnel unless the Studio SSH switch is on, and keep the key file.</p>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not a bare tmux window without a seat record?</b> Naming, retirement, logging, the switcher and cleanup all key off session identity. A shell without a record would need a shadow version of each.</p>
+<p><b>Why does the web page attach shells at home but not away?</b> The browser cannot carry an SSH key. At home, reaching the page needs your Access login and your home network. Away, the only door is SSH with a device key.</p>
+<p><b>Why read the sshd log instead of wrapping ssh?</b> A ForceCommand wrapper could record attaches directly, but it would make sm part of every SSH login and break a plain <code>ssh studio-away</code> for other uses. The log already names the key and the source.</p>
+<p><b>Precedent for non-agent panes?</b> The test suite launches bare shell fixtures (<code>runtime-sh</code> in <code>read_only_http.rs</code>), which shows the launch plumbing does not care what runs in the pane.</p>
+<p><b>What happens to the Ctrl modifier from revision 3?</b> Dropped. Shells open in Termux, which has its own key row. The in-app key row serves agents and is unchanged.</p>
+<p><b>Ticket split.</b> (1) Server: shell records, endpoints, busy detection, cleanup, limits, tests. (2) SSH: LAN listener, device key file, on-demand tunnel, sshd log reader, revocation, spec 900 update. (3) Web: ⋯ items, popover type, shell panel, Settings fields and keys. (4) Mobile: Terminal chip, Termux setup and Open in Termux, rows. (1) blocks the rest; (2) blocks the away parts of (3) and (4).</p>
+
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
