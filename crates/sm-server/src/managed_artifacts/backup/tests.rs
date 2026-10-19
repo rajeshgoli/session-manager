@@ -1630,6 +1630,54 @@ fn loose_root_file_is_a_one_file_scope_and_round_trips() {
 }
 
 #[test]
+fn artifact_linking_into_another_is_kept_as_the_link_and_round_trips() {
+    use super::client::Destination;
+    let f = Fixture::new();
+    let root = PathBuf::from(&f.manager.config.roots[0].path);
+    f.artifact("chains", "live", false, false, 0);
+    // An alias of another artifact, and a link to data no other source reads.
+    symlink(root.join("chains"), root.join("alias")).unwrap();
+    fs::create_dir_all(f.dir.join("elsewhere")).unwrap();
+    fs::write(f.dir.join("elsewhere/content"), b"far").unwrap();
+    symlink(f.dir.join("elsewhere"), root.join("far")).unwrap();
+    let conn = f.manager.store.open().unwrap();
+    for name in ["alias", "far"] {
+        conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,?2,'live','root',?2,'hand','owner/repo','now')",params![root.display().to_string(),name]).unwrap();
+    }
+    let scopes = collect_scope(&f.manager, "mini").unwrap();
+    assert_eq!(scopes.len(), 3);
+    let first = prepare(&f.manager, &scopes, None, "first").unwrap();
+    let files = &first.manifest.files;
+    assert_eq!(
+        files["packed/alias/.sm-file"].target.as_deref(),
+        root.join("chains").to_str()
+    );
+    assert!(files.contains_key("packed/chains/content.zst"));
+    assert!(files.contains_key("packed/far/content.zst"));
+    assert_eq!(files.len(), 3);
+    let mut dest = Destination::open(&f.dir.join("remote")).unwrap();
+    let staging = dest
+        .unpack("first", &first.transfer, &first.parts, &first.directory)
+        .unwrap();
+    dest.apply("first", &first.transfer, &staging, false, 0.1)
+        .unwrap();
+    let restored = f.dir.join("restored");
+    dest.restore(&restored, None, &[]).unwrap();
+    assert_eq!(
+        fs::read_link(restored.join("alias")).unwrap(),
+        root.join("chains")
+    );
+    assert_eq!(
+        fs::read(restored.join("chains/content")).unwrap(),
+        b"abcdefg"
+    );
+    assert_eq!(fs::read(restored.join("far/content")).unwrap(), b"far");
+    // An unchanged link is not sent again.
+    let second = prepare(&f.manager, &scopes, Some(&first.manifest), "second").unwrap();
+    assert!(second.transfer.changed.is_empty());
+}
+
+#[test]
 fn file_removed_after_inventory_waits_a_night_then_is_deleted() {
     let f = Fixture::new();
     fs::write(f.dir.join("projects/a"), b"a").unwrap();

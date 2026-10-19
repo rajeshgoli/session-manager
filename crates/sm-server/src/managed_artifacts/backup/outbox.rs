@@ -147,10 +147,19 @@ pub(super) fn staged_index(staging: &Path) -> Result<BTreeMap<String, Staged>> {
 fn sweep(dir: &Path, keep: &std::collections::BTreeSet<PathBuf>, top: bool) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if fs::symlink_metadata(&path)?.is_dir() {
+        // On exFAT, macOS keeps a file's attributes in a `._<name>` sidecar and
+        // unlinks it with the file, so an entry listed above may be gone.
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            metadata => metadata?,
+        };
+        if metadata.is_dir() {
             sweep(&path, keep, false)?;
         } else if !(keep.contains(&path) || top && path.file_name() == Some(INDEX.as_ref())) {
-            fs::remove_file(&path)?;
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
     }
     if !top && fs::read_dir(dir)?.next().is_none() {
