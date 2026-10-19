@@ -71,7 +71,7 @@ pub(super) async fn get_handoff_doc(
             .map(|u| format!("[Open handoff note]({u})"))
             .unwrap_or_else(|| "Handoff note (file no longer exists)".into());
         let text = note["text"].as_str().unwrap_or(&fallback);
-        let body = crate::owner_doc_render::render_markdown_with_lines(text);
+        let body = crate::owner_doc_render::render_markdown_sanitized(text);
         Ok(Some(
             crate::owner_docs::doc_shell(
                 "Handoff note",

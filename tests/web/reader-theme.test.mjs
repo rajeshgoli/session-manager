@@ -40,3 +40,18 @@ test('doc rows open stored pages inside the reader and external notes in a brows
  vm.runInNewContext(`${functionSource}\nopenDoc('/docs/~handoff/agent');openDoc('https://github.com/a/b/issues/1');openDoc('javascript:alert(1)');`,context);
  assert.deepEqual(panels,['doc:/docs/~handoff/agent']);assert.deepEqual(external,[['https://github.com/a/b/issues/1','_blank','noopener']]);
 });
+
+test('fullscreen reader updates its document and navigation on system and cross-tab theme changes',()=>{
+ const source=readFileSync('crates/sm-server/src/web/reader-bar.js','utf8');
+ const nodes=[],listeners={},media={matches:false,addEventListener:(k,f)=>listeners.media=f};
+ const element=tag=>{const el={tag,children:[],style:{},classList:{add(){}},setAttribute(){},append(...items){this.children.push(...items);},attachShadow(){return element('shadow');}};nodes.push(el);return el;};
+ const document={documentElement:{dataset:{}},referrer:'',title:'Note',getElementById:()=>null,querySelector:()=>null,createElement:element,body:element('body'),head:element('head')};
+ const window={addEventListener:(k,f)=>listeners[k]=f};window.top=window;
+ const context={document,window,URL,URLSearchParams,location:{origin:'https://sm.example.com',pathname:'/docs/~handoff/agent',href:'https://sm.example.com/docs/~handoff/agent',search:''},localStorage:{getItem:()=>null},matchMedia:()=>media};
+ vm.runInNewContext(source,context);
+ const barStyle=nodes.find(n=>n.tag==='style');
+ assert.equal(document.documentElement.dataset.theme,'light');assert.match(barStyle.textContent,/background:#fff/);
+ media.matches=true;listeners.media();assert.equal(document.documentElement.dataset.theme,'dark');assert.match(barStyle.textContent,/background:#121219/);
+ listeners.storage({key:'sm-theme',newValue:'light'});assert.equal(document.documentElement.dataset.theme,'light');assert.match(barStyle.textContent,/background:#fff/);
+ listeners.media();assert.equal(document.documentElement.dataset.theme,'light');
+});

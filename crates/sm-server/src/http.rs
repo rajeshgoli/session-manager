@@ -25817,7 +25817,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             .report_handoff_source("agent001", false, None)
             .unwrap();
         let conn = rusqlite::Connection::open(&state.config.sm_send.db_path).unwrap();
-        conn.execute("INSERT INTO handoff_notes(session_id,line_id,sequence,text,source,created_at) VALUES('agent001','agent001',1,'# Next steps\nFinish the ticket','draft','2026-10-19T01:27:00Z')",[]).unwrap();
+        conn.execute("INSERT INTO handoff_notes(session_id,line_id,sequence,text,source,created_at) VALUES('agent001','agent001',1,'# Next steps\nFinish the ticket\n<script>window.pwned=true</script>\n<img src=x onerror=alert(1)>\n[unsafe](javascript:alert%281%29)','draft','2026-10-19T01:27:00Z')",[]).unwrap();
         let obligations = session_obligations(&state).unwrap();
         for (id, title) in [
             ("agent001", "Handoff note → successor"),
@@ -25875,6 +25875,10 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
                 && html.contains("2026-10-19 01:27")
                 && html.contains("note 1 of 1")
         );
+        assert!(!html.contains("<script>window.pwned"));
+        assert!(!html.contains("<img src=x onerror="));
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(html.contains("&lt;script&gt;window.pwned"));
         for header in ["x-sm-session", "x-sm-session-id"] {
             let mut request = local_request(Method::GET, "/docs/~handoff/agent001", Body::empty());
             request

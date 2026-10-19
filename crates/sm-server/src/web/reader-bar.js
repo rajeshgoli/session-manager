@@ -27,12 +27,14 @@
   const style = document.createElement('style');
   let theme = 'system'; try {theme = localStorage.getItem('sm-theme') || theme;} catch (_) {}
   const media = matchMedia('(prefers-color-scheme:dark)');
-  const applyTheme = () => { document.documentElement.dataset.theme = theme === 'dark' || theme === 'system' && media.matches ? 'dark' : 'light'; };
+  const applyTheme = () => {
+    const dark = theme === 'dark' || theme === 'system' && media.matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    style.textContent = `*{box-sizing:border-box}nav{height:36px;display:flex;align-items:center;gap:10px;padding:0 10px;background:${dark?'#121219':'#fff'};color:${dark?'#f5f7fa':'#16171b'};border-bottom:1px solid ${dark?'#2b2b37':'#e0e0d9'};font:12px -apple-system,BlinkMacSystemFont,sans-serif}a{color:${dark?'#5ee7ff':'#0b7a90'};text-decoration:none;white-space:nowrap}strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}button,select{font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:4px;cursor:pointer}button.print-main{margin-right:-10px;border-top-right-radius:0;border-bottom-right-radius:0}button.print-all{border-top-left-radius:0;border-bottom-left-radius:0;border-left:0}select{max-width:85px}small{white-space:nowrap}@media(max-width:600px){small{display:none}nav{gap:6px}strong{font-size:11px}}`;
+  };
   applyTheme();
   media.addEventListener('change', applyTheme);
   window.addEventListener('storage', e => { if (e.key === 'sm-theme') { theme = e.newValue || 'system'; applyTheme(); } });
-  const dark = theme === 'dark' || theme === 'system' && matchMedia('(prefers-color-scheme:dark)').matches;
-  style.textContent = `*{box-sizing:border-box}nav{height:36px;display:flex;align-items:center;gap:10px;padding:0 10px;background:${dark?'#121219':'#fff'};color:${dark?'#f5f7fa':'#16171b'};border-bottom:1px solid ${dark?'#2b2b37':'#e0e0d9'};font:12px -apple-system,BlinkMacSystemFont,sans-serif}a{color:${dark?'#5ee7ff':'#0b7a90'};text-decoration:none;white-space:nowrap}strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}button,select{font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:4px;cursor:pointer}button.print-main{margin-right:-10px;border-top-right-radius:0;border-bottom-right-radius:0}button.print-all{border-top-left-radius:0;border-bottom-left-radius:0;border-left:0}select{max-width:85px}small{white-space:nowrap}@media(max-width:600px){small{display:none}nav{gap:6px}strong{font-size:11px}}`;
   root.append(style);
   const nav = document.createElement('nav'); nav.setAttribute('aria-label','sm reader'); root.append(nav);
   const add = (tag,text,attrs={}) => {
