@@ -473,9 +473,34 @@ def rule_stage(tool, tin, cwd, agent):
 
 # --- judge stage (K.4) ------------------------------------------------------------------------
 
+SCRIPT_SOURCE_BUDGET = 12_000
+
+
+def script_sources(command, agent):
+    """The scanned script files a command runs, as the judge sees them. A file
+    the judge cannot be shown in full is named so it is judged as unseen."""
+    parts, budget, interpreted, inline = [], SCRIPT_SOURCE_BUDGET, False, False
+    for path, text in script_texts(command, agent["checkout"], agent):
+        if not os.path.isabs(path):
+            interpreted |= path == "interpreted-program"
+            inline |= path == "inline-program"
+            continue
+        if text == "eval" or len(text) > budget:
+            parts.append(f"--- {path}: source not shown (unreadable or too large)")
+            continue
+        budget -= len(text)
+        parts.append(f"--- {path}\n{text}")
+    if not parts and interpreted and not inline:
+        parts.append("--- no script file could be shown")
+    return ("Script sources this command runs:\n" + "\n".join(parts) + "\n") if parts else ""
+
+
 def judge_message(tool, tin, agent):
     if tool == "Bash":
         action = tin.get("command") or ""
+        sources = script_sources(action, agent)
+        if sources:
+            action += "\n" + sources
     else:
         action = json.dumps(tin, indent=1)[:4000]
     return (f"Agent: {agent['name']} working ticket #{agent['ticket']} \"{agent['title']}\" "

