@@ -4,6 +4,7 @@ use super::super::{
 };
 use super::*;
 use rusqlite::params;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, os::unix::fs::symlink, path::PathBuf};
 struct Fixture {
@@ -87,6 +88,206 @@ fn seed_staging(dest: &super::client::Destination) -> Option<PathBuf> {
         .collect();
     assert!(staging.len() <= 1, "{staging:?}");
     staging.pop()
+}
+
+#[test]
+fn coverage_preserves_unchanged_live_frozen_and_symlink_versions() {
+    use crate::managed_artifacts::scan;
+    let f = Fixture::new();
+    let root = &f.manager.config.roots[0];
+    let conn = f.manager.store.open().unwrap();
+    for state in ["live", "unrecorded", "frozen"] {
+        f.artifact(state, state, false, false, 0);
+        let source = if state == "frozen" {
+            f.dir.join("cold/.frozen/frozen")
+        } else {
+            f.dir.join("root").join(state)
+        };
+        let measured = scan::measure(&source).unwrap().stamp();
+        // A frozen row retains the original tree's stamp, not its archive stamp.
+        let stored = if state == "frozen" {
+            "original-tree"
+        } else {
+            &measured
+        };
+        conn.execute(
+            "UPDATE artifacts SET content_stamp=?1 WHERE name=?2",
+            params![stored, state],
+        )
+        .unwrap();
+        let request =
+            json!({"coverage_json": json!([{"source":source,"stamp":measured}]).to_string()});
+        lifecycle::mark_covered(&conn, &f.manager, &request).unwrap();
+        let a = f.manager.store.detail(&root.path, state).unwrap();
+        assert_eq!(a["backup_stamp"], stored);
+        assert_eq!(a["backup_due"], false);
+    }
+    fs::write(f.dir.join("data/content"), b"external target").unwrap();
+    for (name, target) in [
+        ("alias", f.dir.join("root/live")),
+        ("far", f.dir.join("data")),
+    ] {
+        symlink(&target, f.dir.join("root").join(name)).unwrap();
+        conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,?2,'live','root',?2,'hand','owner/repo','now')", params![root.path, name]).unwrap();
+        f.manager.measure_one(root, name).unwrap();
+        // Both a link-only scope and a scope reading a link's external target.
+        let source = if name == "alias" {
+            f.dir.join("root/alias")
+        } else {
+            target
+        };
+        let stamp = scan::measure(&source).unwrap().stamp();
+        let request =
+            json!({"coverage_json": json!([{"source":source,"stamp":stamp}]).to_string()});
+        lifecycle::mark_covered(&conn, &f.manager, &request).unwrap();
+        let a = f.manager.store.detail(&root.path, name).unwrap();
+        assert_eq!(a["backup_stamp"], "0:0:0");
+        assert_eq!(a["backup_due"], false);
+    }
+}
+
+#[test]
+fn coverage_does_not_stamp_an_artifact_updated_after_verification() {
+    use crate::managed_artifacts::scan;
+    let f = Fixture::new();
+    let root = &f.manager.config.roots[0];
+    let conn = f.manager.store.open().unwrap();
+    for state in ["live", "frozen"] {
+        f.artifact(state, state, false, false, 0);
+        let source = if state == "frozen" {
+            f.dir.join("cold/.frozen/frozen")
+        } else {
+            f.dir.join("root/live")
+        };
+        let stamp = scan::measure(&source).unwrap().stamp();
+        conn.execute(
+            "UPDATE artifacts SET content_stamp=?1 WHERE name=?2",
+            params![stamp, state],
+        )
+        .unwrap();
+        let request =
+            json!({"coverage_json": json!([{"source":source,"stamp":stamp}]).to_string()});
+        let coverage = lifecycle::measure_coverage(&conn, &f.manager, &request).unwrap();
+        // A separate connection publishes a new measurement in the exact gap.
+        // This also proves verification leaves the artifact writer available.
+        if state == "live" {
+            fs::write(source.join("content"), b"updated after backup verification").unwrap();
+            f.manager.measure_one(root, state).unwrap();
+        } else {
+            let writer = f.manager.store.open().unwrap();
+            writer
+                .execute(
+                    "UPDATE artifacts SET content_stamp='new-version' WHERE name=?1",
+                    [state],
+                )
+                .unwrap();
+        }
+        coverage.persist(&conn).unwrap();
+        let a = f.manager.store.detail(&root.path, state).unwrap();
+        assert!(a["backed_up_at"].is_null());
+        assert!(a["backup_stamp"].is_null());
+        assert_eq!(a["backup_due"], true);
+    }
+}
+
+#[test]
+fn coverage_checks_lifecycle_state_and_does_not_copy_a_stale_live_stamp() {
+    use crate::managed_artifacts::scan;
+    let f = Fixture::new();
+    let root = &f.manager.config.roots[0];
+    f.artifact("live", "live", false, false, 0);
+    let conn = f.manager.store.open().unwrap();
+    let source = f.dir.join("root/live");
+    let stamp = scan::measure(&source).unwrap().stamp();
+    let request = json!({"coverage_json": json!([{"source":source,"stamp":stamp}]).to_string()});
+    for change in ["state='deleted'", "op='freezing'", "location='cold'"] {
+        conn.execute(
+            "UPDATE artifacts SET state='live',op=NULL,location='root'",
+            [],
+        )
+        .unwrap();
+        let coverage = lifecycle::measure_coverage(&conn, &f.manager, &request).unwrap();
+        conn.execute(&format!("UPDATE artifacts SET {change}"), [])
+            .unwrap();
+        coverage.persist(&conn).unwrap();
+        assert!(f.manager.store.detail(&root.path, "live").unwrap()["backed_up_at"].is_null());
+    }
+    conn.execute(
+        "UPDATE artifacts SET state='live',op=NULL,location='root',content_stamp='stale'",
+        [],
+    )
+    .unwrap();
+    lifecycle::mark_covered(&conn, &f.manager, &request).unwrap();
+    let a = f.manager.store.detail(&root.path, "live").unwrap();
+    assert_eq!(a["backup_stamp"], stamp);
+    assert_eq!(a["backup_due"], true);
+}
+
+#[test]
+fn coverage_does_not_stamp_a_replacement_artifact_with_an_equal_stamp() {
+    let f = Fixture::new();
+    let root = &f.manager.config.roots[0];
+    f.artifact("live", "live", false, false, 0);
+    let conn = f.manager.store.open().unwrap();
+    let source = f.dir.join("root/live");
+    let stamp = crate::managed_artifacts::scan::measure(&source)
+        .unwrap()
+        .stamp();
+    f.manager.measure_one(root, "live").unwrap();
+    let request = json!({"coverage_json": json!([{"source":source,"stamp":stamp}]).to_string()});
+    let coverage = lifecycle::measure_coverage(&conn, &f.manager, &request).unwrap();
+    conn.execute("DELETE FROM artifacts WHERE name='live'", [])
+        .unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at,content_stamp) VALUES(?1,'live','live','root','live','hand','owner/repo','replacement',?2)", params![root.path, stamp]).unwrap();
+    coverage.persist(&conn).unwrap();
+    let a = f.manager.store.detail(&root.path, "live").unwrap();
+    assert!(a["backed_up_at"].is_null());
+    assert_eq!(a["backup_due"], true);
+}
+
+#[test]
+fn acknowledgement_confirms_before_coverage_can_cross_the_expiry_deadline() {
+    use super::lifecycle::{self as l, RequestResult};
+    let mut f = Fixture::new();
+    f.manager.config.backup.enabled = true;
+    f.manager.config.backup.static_paths = vec![f.dir.join("data").display().to_string()];
+    fs::write(f.dir.join("data/content"), b"backup").unwrap();
+    let RequestResult::Open(first) = l::request(&f.manager, "mini", None).unwrap() else {
+        panic!()
+    };
+    l::prepare_request(&f.manager, &first.id).unwrap();
+    let manager = f.manager.clone();
+    let id = first.id.clone();
+    l::BEFORE_COVERAGE_MEASURE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let future = time::OffsetDateTime::now_utc().unix_timestamp()
+                + i64::try_from(manager.config.backup.ready_ttl_hours).unwrap() * 3600
+                + 1;
+            l::expire(&manager, future).unwrap();
+            assert_eq!(l::status(&manager, "mini", &id).unwrap().state, "acked");
+        }))
+    });
+    let ack = l::Ack {
+        applied: true,
+        fetched_bytes: 0,
+        fetch_seconds: 0.0,
+        apply_seconds: 1.0,
+        held_deletions: 0,
+        check: None,
+        error: None,
+        update: None,
+        disk: None,
+    };
+    l::acknowledge(&f.manager, "mini", &first.id, &ack).unwrap();
+    let conn = f.manager.store.open().unwrap();
+    assert_eq!(
+        confirmed(&conn, "mini").unwrap().unwrap().manifest_id,
+        first.id
+    );
+    assert!(matches!(
+        l::request(&f.manager, "mini", Some(&first.id)).unwrap(),
+        RequestResult::Open(_)
+    ));
 }
 
 #[test]
