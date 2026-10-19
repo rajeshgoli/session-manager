@@ -382,6 +382,7 @@ mod local_model;
 mod merge_holds;
 mod messages;
 mod notes;
+mod notes_activity;
 mod opencode_readers;
 mod owner_events;
 mod plain_terminals;
@@ -2108,6 +2109,15 @@ pub fn router(state: AppState) -> Router {
         .route("/board/waiting", put(board::put_waiting))
         .route("/notes", get(notes::list).post(notes::create))
         .route("/notes/search", get(notes::search))
+        .route("/notes/activity", get(notes_activity::previews))
+        .route(
+            "/notes/{id}/activity",
+            get(notes_activity::list).post(notes_activity::record),
+        )
+        .route(
+            "/notes/{id}/activity/{event}",
+            get(notes_activity::snapshot),
+        )
         .route("/notes/preview", post(notes::preview))
         .route(
             "/notes/import",
@@ -22140,7 +22150,10 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 31] = [
+    const OWNER_WEB_READS: [&str; 34] = [
+        "/notes/activity",
+        "/notes/missing/activity",
+        "/notes/missing/activity/missing",
         "/terminals",
         "/devices/imported/ssh-keys",
         "/artifacts",
@@ -22176,6 +22189,11 @@ mod tests {
 
     fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
         vec![
+            (
+                Method::POST,
+                "/notes/missing/activity",
+                json!({"id":"a", "kind":"terminal_added", "target":"fork1001", "label":"Agent", "body":"text"}),
+            ),
             (Method::POST, "/terminals", json!({"cwd":"/tmp"})),
             (
                 Method::POST,
@@ -22323,6 +22341,10 @@ mod tests {
                     && headers.iter().any(|(h, _)| h.starts_with("x-sm-session"))
                 {
                     "not_owner"
+                } else if uri.starts_with("/notes/")
+                    && headers.iter().any(|(h, _)| h.starts_with("x-sm-session"))
+                {
+                    "Notes are owner-only"
                 } else {
                     detail
                 };
@@ -22389,6 +22411,73 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("text/html"));
+    }
+
+    #[tokio::test]
+    async fn notes_activity_http_preserves_text_and_hides_deleted_notes() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let call = |method, uri: &str, body: Value| {
+            let request = owner_web_request(
+                method,
+                uri,
+                "sm.example.com",
+                Some(&owner),
+                &[("origin", "https://sm.example.com")],
+                &body,
+            );
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                if response.status() == StatusCode::NO_CONTENT {
+                    (StatusCode::NO_CONTENT, Value::Null)
+                } else {
+                    response_json(response).await
+                }
+            }
+        };
+        let (status, note) = call(Method::POST, "/notes", json!({"body":"Original note"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let path = format!("/notes/{}", note["id"].as_str().unwrap());
+        let activity = format!("{path}/activity");
+        let event = json!({"id":"event-1","kind":"ticket","target":"acme/widgets#42",
+            "label":"A useful ticket","body":"Only the selected text 📝"});
+        for _ in 0..2 {
+            let (status, recorded) = call(Method::POST, &activity, event.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{recorded}");
+        }
+        let (status, rows) = call(Method::GET, &activity, json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert!(
+            rows[0].get("body").is_none(),
+            "list responses omit text snapshots"
+        );
+        let (_, previews) = call(Method::GET, "/notes/activity", json!({})).await;
+        assert_eq!(previews[0]["count"], 1);
+        assert_eq!(previews[0]["note_id"], note["id"]);
+        let (status, _) = call(
+            Method::PUT,
+            &path,
+            json!({"body":"Edited later","if_version":1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = format!("{activity}/event-1");
+        let (status, text) = call(Method::GET, &snapshot, json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text["body"], event["body"]);
+        let mut invalid = event.clone();
+        invalid["target"] = json!("javascript:bad");
+        let (status, _) = call(Method::POST, &activity, invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(Method::DELETE, &path, json!({})).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(Method::GET, &snapshot, json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, previews) = call(Method::GET, "/notes/activity", json!({})).await;
+        assert!(previews.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

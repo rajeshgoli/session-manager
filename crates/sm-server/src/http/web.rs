@@ -38,6 +38,8 @@ const ASSETS: &[Asset] = &[
     asset!("ui.js", JS),
     asset!("start.js", JS),
     asset!("notes.js", JS),
+    asset!("notes-activity.js", JS),
+    asset!("notes-activity.css", "text/css; charset=utf-8"),
     asset!("agents.js", JS),
     asset!("shell.js", JS),
     asset!("queue.js", JS),

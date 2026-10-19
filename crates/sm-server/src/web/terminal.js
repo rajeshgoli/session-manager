@@ -508,7 +508,7 @@ export function TerminalPage({ id, open }) {
       <div class="term-body" ref=${host} hidden=${shellAway}></div>
       ${shellAway ? html`<${ShellAwayPanel} key=${id} id=${id} directError=${directError} onRetry=${() => setAttempt(n => n + 1)} />` : null}
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
-        onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
+        target=${{ id, label: agent?.name || id }} onType=${text => !!control.current?.paste(text)} /></aside>` : null}
       ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">
         <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>

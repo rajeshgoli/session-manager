@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, bus, toast, navigate, openPanel, stored, store, clientNav } from './ui.js';
 import { EFFORTS } from './start.js';
+import { ActivitySummary, NoteActivity, useActivityPreviews, recordNoteActivity } from './notes-activity.js';
 
 const notePath = id => `/notes/${encodeURIComponent(id)}`;
 const firstLine = body => (body.trim().split('\n')[0] || '').replace(/^#+\s*/, '').slice(0, 80);
@@ -35,8 +36,9 @@ function Snippet({ hit }) {
   return parts;
 }
 
-function NoteActions({ text, summary, canType, onType, repos }) {
+function NoteActions({ noteId, text, summary, canType, onType, target, repos }) {
   const [popover, setPopover] = useState(null);
+  const [pending, setPending] = useState(null);
   const [agent, setAgent] = useState(() => stored('sm-notes-last-agent', { provider: 'claude', model: '', effort: '' }));
   const [repo, setRepo] = useState(() => stored('sm-notes-last-repo', ''));
   const [models, setModels] = useState([]);
@@ -52,8 +54,33 @@ function NoteActions({ text, summary, canType, onType, repos }) {
     return () => { active = false; };
   }, [popover, agent.provider]);
   const copy = async e => { e.stopPropagation(); try { await navigator.clipboard.writeText(await text()); toast('Copied note'); } catch (err) { setError(err.message); } };
+  const remember = async (kind, destination, label, content) => {
+    const event = { id: crypto.randomUUID(), kind, target: destination, label, body: content };
+    try { await recordNoteActivity(noteId, event); }
+    catch (_) { setPending(event); setError('Done, but activity wasn’t saved.'); }
+  };
+  const retryActivity = async () => {
+    setBusy(true);
+    try { await recordNoteActivity(noteId, pending); setPending(null); setError(''); }
+    catch (_) { setError('Activity still couldn’t be saved. Your action is already complete.'); }
+    finally { setBusy(false); }
+  };
+  const typeText = async e => {
+    e.stopPropagation();
+    if (busy || pending) return;
+    setBusy(true); setError('');
+    try {
+      const content = await text();
+      if (!content.trim()) throw new Error('Write some text first.');
+      if (!await onType(content)) throw new Error('Terminal is not connected. Nothing was added.');
+      toast(`Added to ${target.label} · press Enter in the terminal to send`);
+      await remember('terminal_added', target.id, target.label, content);
+    } catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
   const run = async e => {
     e?.preventDefault(); e?.stopPropagation();
+    if (busy || pending) return;
     setBusy(true); setError('');
     try {
       const content = await text();
@@ -68,6 +95,7 @@ function NoteActions({ text, summary, canType, onType, repos }) {
         const started = await api('/client/sessions', { method: 'POST', body });
         store('sm-notes-last-agent', agent);
         toast(`Started ${started.name}`, () => openPanel(`agent:${started.id}`));
+        await remember('agent_started', started.id, started.name, content);
       } else {
         const issue = issueParts(content);
         if (!issue.title) throw new Error('The first line must contain a title.');
@@ -75,6 +103,8 @@ function NoteActions({ text, summary, canType, onType, repos }) {
         bus.emit('board-changed');
         store('sm-notes-last-repo', repo);
         toast(`Filed #${created.number}${created.board_note ? ' · Board update pending' : ''}`, () => window.open(created.url, '_blank', 'noopener'));
+        const canonicalRepo = new URL(created.url).pathname.split('/').slice(1, 3).join('/');
+        await remember('ticket', `${canonicalRepo}#${created.number}`, issue.title, content);
       }
       setPopover(null);
     } catch (err) { setError(err.message); }
@@ -88,8 +118,8 @@ function NoteActions({ text, summary, canType, onType, repos }) {
   };
   return html`<div class="notes-actions" onClick=${e => e.stopPropagation()}>
     <button type="button" onClick=${copy}>Copy</button>
-    ${canType ? html`<button type="button" onClick=${async e => { e.stopPropagation(); try { onType(await text()); } catch (err) { setError(err.message); } }}>Type into terminal</button>` : null}
-    <span class="notes-action-wrap"><button type="button" aria-expanded=${popover === 'agent'} onClick=${e => toggle('agent', e)}>Start agent ▾</button>
+    ${canType ? html`<button type="button" disabled=${busy || !!pending} onClick=${typeText}>Type into terminal</button>` : null}
+    <span class="notes-action-wrap"><button type="button" aria-expanded=${popover === 'agent'} disabled=${busy || !!pending} onClick=${e => toggle('agent', e)}>Start agent ▾</button>
       ${popover === 'agent' ? html`<form class="notes-popover" style=${`top:${Math.max(8, position.top)}px;left:${Math.max(8, position.left)}px`} onSubmit=${run}>
         <strong>${firstLine(summary) || summary.slice(0, 80) || 'Empty note'}</strong>
         <label>Provider<select value=${agent.provider} onChange=${e => setAgent({ provider: e.target.value, model: '', effort: '' })}>
@@ -101,7 +131,7 @@ function NoteActions({ text, summary, canType, onType, repos }) {
         ${error ? html`<span class="err">${error}</span>` : null}
         <button class="btn pri" disabled=${busy} type="submit">${busy ? 'Starting…' : 'Start'}</button>
       </form>` : null}</span>
-    <span class="notes-action-wrap"><button type="button" aria-expanded=${popover === 'ticket'} onClick=${e => toggle('ticket', e)}>File ticket ▾</button>
+    <span class="notes-action-wrap"><button type="button" aria-expanded=${popover === 'ticket'} disabled=${busy || !!pending} onClick=${e => toggle('ticket', e)}>File ticket ▾</button>
       ${popover === 'ticket' ? html`<form class="notes-popover" style=${`top:${Math.max(8, position.top)}px;left:${Math.max(8, position.left)}px`} onSubmit=${run}>
         <strong>${firstLine(summary) || summary.slice(0, 80) || 'Empty note'}</strong>
         <label>Repository<input list="notes-repos" value=${repo} onInput=${e => setRepo(e.target.value)} placeholder="owner/repo" required /></label>
@@ -109,10 +139,14 @@ function NoteActions({ text, summary, canType, onType, repos }) {
         ${error ? html`<span class="err">${error}</span>` : null}
         <button class="btn pri" disabled=${busy} type="submit">${busy ? 'Filing…' : 'File ticket'}</button>
       </form>` : null}</span>
+    ${pending ? html`<div class="note-activity-retry" role="status">${error}<button type="button" class="btn sm" disabled=${busy} onClick=${retryActivity}>Save activity</button></div>`
+      : error && !popover ? html`<span class="err" role="alert">${error}</span>` : null}
   </div>`;
 }
 
-export function NotesView({ pane = false, onClose, onType }) {
+export function NotesView({ pane = false, onClose, onType, target }) {
+  const activities = useActivityPreviews();
+  const [activityFocus, setActivityFocus] = useState(null);
   const [compact, setCompact] = useState(() => window.innerWidth < 900);
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState([]);
@@ -313,8 +347,9 @@ export function NotesView({ pane = false, onClose, onType }) {
           <span class="note-title">${hit.title || 'Untitled'}${pinned?.id === hit.id ? ' · Open note' : ''}</span><small>${age(hit.updated_at)}</small>
           <span class="note-snippet"><${Snippet} hit=${hit} /></span>
         </button>
-        <${NoteActions} text=${() => open?.id === hit.id ? selection() : cardText(hit.id)()} summary=${open?.id === hit.id ? selection() : hit.title} canType=${!!onType}
+        <${NoteActions} noteId=${hit.id} target=${target} text=${() => open?.id === hit.id ? selection() : cardText(hit.id)()} summary=${open?.id === hit.id ? selection() : hit.title} canType=${!!onType}
           onType=${onType} repos=${repos} />
+        <${ActivitySummary} event=${activities[hit.id]} onClick=${async () => { await choose(hit.id); setActivityFocus(previous => ({ id: hit.id, token: (previous?.token || 0) + 1 })); }} />
         ${(pane || compact) && open?.id === hit.id ? editorView() : null}
       </article>`)}
       ${!hits.length && !pinned ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
@@ -341,7 +376,8 @@ export function NotesView({ pane = false, onClose, onType }) {
                 const next = t.value.slice(0, at) + '  ' + t.value.slice(t.selectionEnd);
                 edit(next); requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = at + 2; }); }
             }} />`}
-      <${NoteActions} text=${selection} summary=${selection()} canType=${!!onType} onType=${onType} repos=${repos} />
+      <${NoteActions} key=${open.id} noteId=${open.id} target=${target} text=${selection} summary=${selection()} canType=${!!onType} onType=${onType} repos=${repos} />
+      <${NoteActivity} key=${open.id} noteId=${open.id} preview=${activities[open.id]} reveal=${activityFocus?.id === open.id ? activityFocus.token : 0} />
     </div>`;
   }
 }

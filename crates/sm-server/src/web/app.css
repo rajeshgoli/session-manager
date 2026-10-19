@@ -1,5 +1,6 @@
 /* sm web app (spec 1710 appendix A). Every colour is a token with a light and
    a dark value; data-theme is system, light or dark (D2). */
+@import url("./notes-activity.css");
 :root {
   --bg: #F5F5F2; --panel: #FFFFFF; --panel-2: #EEEEE9; --line: #E0E0D9;
   --ink: #16171B; --ink-2: #555864; --ink-3: #8B8D96;
