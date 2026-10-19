@@ -38,7 +38,10 @@ class PlainTerminalTest {
             seen += "${request.method} ${request.url.encodedPath} $body"
             val response = when {
                 request.url.encodedPath.endsWith("/route") -> json.encodeToString(PlainTerminalRoute.serializer(), home)
-                request.method == "POST" && request.url.encodedPath == "/terminals" -> """{"id":"term-abcd","cwd":"/tmp","tmux_session":"term-abcd"}"""
+                request.method == "POST" && request.url.encodedPath == "/terminals" -> {
+                    assertEquals("phone-1", request.header("X-SM-Device-Key-Id"))
+                    """{"id":"term-abcd","cwd":"/tmp","tmux_session":"term-abcd"}"""
+                }
                 request.method == "GET" -> """{"keys":[{"fingerprint":"SHA256:old","revoked_at":"yesterday"},{"fingerprint":"SHA256:live","revoked_at":null}]}"""
                 else -> "{}"
             }
@@ -47,7 +50,7 @@ class PlainTerminalTest {
         }.build()
         val api = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType())).build().create(ApiService::class.java)
-        assertEquals("term-abcd", api.createPlainTerminal(CreatePlainTerminal("/tmp", "Build")).id)
+        assertEquals("term-abcd", api.createPlainTerminal("phone-1", CreatePlainTerminal("/tmp", "Build")).id)
         assertEquals(1, api.deviceSshKeys("phone").keys.count { it.revokedAt == null })
         api.registerDeviceSshKey("phone", RegisterDeviceSshKey("ssh-ed25519 AAAA"))
         assertEquals(home, api.plainTerminalRoute("term-abcd", PlainTerminalRouteRequest("home")))
@@ -58,6 +61,33 @@ class PlainTerminalTest {
             "POST /devices/phone/ssh-keys {\"public_key\":\"ssh-ed25519 AAAA\"}",
             "POST /terminals/term-abcd/route {\"where\":\"home\"}",
             "POST /terminals/term-abcd/route {\"where\":\"away\"}", "DELETE /terminals/term-abcd "), seen)
+    }
+
+    @Test fun retirementClassifiesExpiredAuthAndTransientFailures() = runBlocking {
+        for ((code, failure) in listOf(
+            401 to SessionManagerAuthException::class.java,
+            429 to SessionManagerTransientException::class.java,
+            503 to SessionManagerTransientException::class.java,
+            0 to SessionManagerTransientException::class.java,
+            200 to null,
+            204 to null,
+        )) {
+            var calls = 0
+            val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+                calls++
+                assertEquals("DELETE", chain.request().method)
+                assertEquals("/terminals/term-abcd", chain.request().url.encodedPath)
+                if (code == 0) throw java.io.IOException("Connection lost")
+                okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(code).message("Test").body("{}".toResponseBody("application/json".toMediaType())).build()
+            }.build()
+            val api = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+                .addConverterFactory(json.asConverterFactory("application/json".toMediaType())).build().create(ApiService::class.java)
+            val result = runCatching { SessionManagerRepository().retirePlainTerminalWith(api, "term-abcd") }
+            assertEquals("Write must not be retried", 1, calls)
+            if (failure == null) assertTrue(result.isSuccess)
+            else assertTrue("HTTP $code: ${result.exceptionOrNull()}", failure.isInstance(result.exceptionOrNull()))
+        }
     }
 
     @Test fun setupPreservesPrivateKeyAndOtherHostsAcrossRetries() {

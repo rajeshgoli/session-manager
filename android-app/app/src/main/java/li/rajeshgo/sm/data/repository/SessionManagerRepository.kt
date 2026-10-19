@@ -355,8 +355,8 @@ class SessionManagerRepository(
             }
         } ?: false
 
-    suspend fun createPlainTerminal(baseUrl: String, token: String, cwd: String, name: String?) = withContext(Dispatchers.IO) {
-        api(baseUrl, token).createPlainTerminal(li.rajeshgo.sm.data.model.CreatePlainTerminal(cwd, name))
+    suspend fun createPlainTerminal(baseUrl: String, token: String, deviceKeyId: String, cwd: String, name: String?) = withContext(Dispatchers.IO) {
+        api(baseUrl, token).createPlainTerminal(deviceKeyId, li.rajeshgo.sm.data.model.CreatePlainTerminal(cwd, name))
     }
 
     suspend fun plainTerminalRoute(baseUrl: String, token: String, id: String, where: String) = withContext(Dispatchers.IO) {
@@ -372,8 +372,16 @@ class SessionManagerRepository(
     }
 
     suspend fun retirePlainTerminal(baseUrl: String, token: String, id: String) = withContext(Dispatchers.IO) {
-        val response = api(baseUrl, token).retirePlainTerminal(id)
-        if (!response.isSuccessful) throw HttpException(response)
+        retirePlainTerminalWith(api(baseUrl, token), id)
+    }
+
+    internal suspend fun retirePlainTerminalWith(service: ApiService, id: String) {
+        try {
+            val response = service.retirePlainTerminal(id)
+            if (!response.isSuccessful) throw HttpException(response)
+        } catch (error: Throwable) {
+            throw classifyWriteFailure(error)
+        }
     }
 
     suspend fun createSession(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.CreateSessionRequest): Result<li.rajeshgo.sm.data.model.CreatedSession> = withContext(Dispatchers.IO) {

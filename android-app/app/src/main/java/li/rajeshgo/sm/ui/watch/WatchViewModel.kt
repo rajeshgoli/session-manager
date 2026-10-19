@@ -503,7 +503,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     fun createPlainTerminal(cwd: String, name: String?, onComplete: (Result<Unit>) -> Unit) {
         viewModelScope.launch {
             val result = try {
-                val created = sessionRepository.createPlainTerminal(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), cwd, name)
+                val created = sessionRepository.createPlainTerminal(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), deviceKeyManager.deviceKeyId(), cwd, name)
                 refresh()
                 openPlainTerminal(created.id)
                 Result.success(Unit)

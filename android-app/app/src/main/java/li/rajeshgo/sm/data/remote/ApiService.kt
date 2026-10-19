@@ -31,7 +31,10 @@ import retrofit2.http.Query
 
 interface ApiService {
     @POST("terminals")
-    suspend fun createPlainTerminal(@Body request: li.rajeshgo.sm.data.model.CreatePlainTerminal): li.rajeshgo.sm.data.model.PlainTerminalCreated
+    suspend fun createPlainTerminal(
+        @Header("X-SM-Device-Key-Id") deviceKeyId: String,
+        @Body request: li.rajeshgo.sm.data.model.CreatePlainTerminal,
+    ): li.rajeshgo.sm.data.model.PlainTerminalCreated
 
     @DELETE("terminals/{id}")
     suspend fun retirePlainTerminal(@Path("id") id: String): retrofit2.Response<Unit>

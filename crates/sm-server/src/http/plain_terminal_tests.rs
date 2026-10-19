@@ -48,6 +48,24 @@ async fn plain_new(state: &AppState) -> String {
 }
 
 #[tokio::test]
+async fn plain_terminal_creation_persists_phone_attribution() {
+    let (state, _tmux) = plain_test_state();
+    let mut request = local_request(Method::POST, "/terminals", Body::from(r#"{"cwd":"/tmp"}"#));
+    request.headers_mut().insert(CONTENT_TYPE, "application/json".parse().unwrap());
+    request.headers_mut().insert("x-sm-device-key-id", "phone-1".parse().unwrap());
+    let (status, body) = response_json(router(state.clone()).oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let terminal = plain_terminals::store(&state).get(body["id"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(terminal.created_by_device.as_deref(), Some("phone-1"));
+    assert_eq!(terminal.created_via, "mobile");
+
+    let cli_id = plain_new(&state).await;
+    let cli = plain_terminals::store(&state).get(&cli_id).unwrap().unwrap();
+    assert_eq!(cli.created_by_device, None);
+    assert_eq!(cli.created_via, "cli");
+}
+
+#[tokio::test]
 async fn plain_terminal_limits_cap_nonowner_and_kill_switch() {
     let (state, _tmux) = plain_test_state();
     let mut ids = Vec::new();
