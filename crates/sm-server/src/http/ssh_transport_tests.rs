@@ -98,3 +98,26 @@ async fn plain_terminal_ssh_brief_tunnel_login_push_and_saved_log_position() {
     assert!(restored.connections.is_empty());
     assert!(restored.read_log(cfg,OffsetDateTime::now_utc().unix_timestamp()).unwrap().is_empty(),"restart must not resend old logins");
 }
+
+#[tokio::test]
+async fn plain_terminal_ssh_registration_refuses_revoked_enrollment_after_restart() {
+    let signing_key=SigningKey::random(&mut OsRng);
+    let mut config=mobile_ticket_config(&signing_key);
+    config.rust_core.fixture_writes_enabled=true;
+    config.mobile_terminal.allowed_users.get_mut("local_bypass").unwrap().owner=true;
+    let state=AppState::new(config);
+    let db=mobile_device_db_path(&state.config);
+    mobile_devices::create_pairing_registration(&db,"local_bypass",15).unwrap();
+    let conn=rusqlite::Connection::open(&db).unwrap();
+    conn.execute("INSERT INTO mobile_device_enrollments (user_id,device_id,device_name,public_key_pem,common_name,paired_at,kind) VALUES ('local_bypass','revoked-laptop','Laptop','fixture','revoked-laptop','2026-01-01','computer')",[]).unwrap();
+    let endpoint="/devices/revoked-laptop/ssh-keys";
+    let (status,body)=plain_call(&state,Method::POST,endpoint,json!({"public_key":plain_ssh_key()})).await;
+    assert_eq!(status,StatusCode::OK,"{body}");
+    assert!(mobile_devices::revoke_device(&db,"local_bypass","revoked-laptop").unwrap());
+    ssh_transport::keys(&state).revoke("revoked-laptop",None).unwrap();
+    let restarted=AppState::new(state.config.clone());
+    assert!(!mobile_terminal_device_revoked(&restarted,"local_bypass","revoked-laptop").unwrap(),"database tombstone must work without the in-memory configuration-key set");
+    let (status,body)=plain_call(&restarted,Method::POST,endpoint,json!({"public_key":plain_ssh_key()})).await;
+    assert_eq!(status,StatusCode::BAD_REQUEST,"{body}");
+    assert!(ssh_transport::keys(&restarted).list().unwrap().iter().all(|k|k.revoked_at.is_some()));
+}

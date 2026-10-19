@@ -152,8 +152,7 @@ fn validate_device(state: &AppState, id: &str) -> Result<(), ApiError> {
     }
     for (user_id, user) in &state.config.mobile_terminal.allowed_users {
         if (user.owner || user.mobile_terminal_owner)
-            && mobile_terminal_user_device_exists(state, user_id, id)
-            && !mobile_terminal_device_revoked(state, user_id, id)?
+            && mobile_terminal_device_public_key(state, user_id, user, id)?.is_some()
         {
             return Ok(());
         }

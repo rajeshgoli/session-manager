@@ -64,7 +64,9 @@ On the first upgrade, an absent file adopts the old switch's observed state once
 | Shell kill switch off, Studio SSH on | Off | On | On |
 
 The LAN listener binds the private IPv4 address of the default-route interface, the same
-address used for the direct web terminal. It never binds `0.0.0.0`. Address changes are
+address used for the direct web terminal. It never binds `0.0.0.0`. If no private LAN IPv4
+address is available, only the LAN listener is omitted; requested loopback SSH and tunnel
+startup continue. Address changes are
 reconciled every 30 seconds. A config change sends SIGHUP to the dedicated sshd LaunchAgent,
 so existing SSH connections survive listener reloads. Healthy services are not restarted.
 Retiring the last shell closes the automatic tunnel immediately. Disabling shells retires

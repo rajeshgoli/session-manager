@@ -341,11 +341,7 @@ pub fn apply(cfg: &StudioSshConfig, manual: bool, lan_on: bool, tunnel_on: bool)
         return Ok(());
     }
     save_manual(cfg, manual)?;
-    let lan = if lan_on {
-        Some(crate::terminal_lan::default_route_ipv4()?)
-    } else {
-        None
-    };
+    let lan = lan_address(lan_on, crate::terminal_lan::default_route_ipv4);
     let changed = configure(cfg, lan)?;
     let uid = super::current_uid();
     if lan_on || tunnel_on {
@@ -379,6 +375,24 @@ pub fn apply(cfg: &StudioSshConfig, manual: bool, lan_on: bool, tunnel_on: bool)
     Ok(())
 }
 
+fn lan_address(
+    requested: bool,
+    discover: impl FnOnce() -> Result<std::net::Ipv4Addr>,
+) -> Option<std::net::Ipv4Addr> {
+    if !requested {
+        return None;
+    }
+    match discover() {
+        Ok(address) => Some(address),
+        Err(error) => {
+            eprintln!(
+                "Studio SSH home listener unavailable; loopback/tunnel policy continues: {error:#}"
+            );
+            None
+        }
+    }
+}
+
 pub fn migration_candidates(path: &Path) -> Result<Vec<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(text
@@ -393,6 +407,36 @@ pub fn migration_candidates(path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_lan_address_preserves_loopback_config_for_tunnel_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "sm-2334-no-lan-{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = StudioSshConfig {
+            assets_dir: dir.display().to_string(),
+            ..StudioSshConfig::default()
+        };
+        fs::write(
+            dir.join("sshd_config"),
+            "Port 22222\nListenAddress 192.168.1.2\n",
+        )
+        .unwrap();
+        let address = lan_address(true, || {
+            anyhow::bail!("VPN interface has no private IPv4 address")
+        });
+        assert!(configure(&cfg, address).unwrap());
+        let config = fs::read_to_string(dir.join("sshd_config")).unwrap();
+        assert!(config.contains("ListenAddress 127.0.0.1\n"));
+        assert!(!config.contains("ListenAddress 192.168.1.2"));
+        assert!(lan_address(false, || panic!(
+            "disabled LAN must not discover an address"
+        ))
+        .is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn failed_process_snapshot_retries_login_lines_and_birth_identity_rejects_reuse() {
         let dir = std::env::temp_dir().join(format!(
