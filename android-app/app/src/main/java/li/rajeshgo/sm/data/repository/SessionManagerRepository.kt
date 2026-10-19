@@ -12,6 +12,7 @@ import java.io.IOException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
@@ -41,6 +42,14 @@ open class SessionManagerRequestException(message: String, cause: Throwable? = n
 class SessionManagerAuthException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 class SessionManagerTransientException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 class SessionManagerBackendUnavailableException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
+
+/** What a Start now tap did (sm#2383). */
+sealed interface StartNowResult {
+    data class Started(val job: li.rajeshgo.sm.data.model.SessionJob) : StartNowResult
+
+    /** Not started: starting now endangers the Mac's memory, as [risk] says. */
+    data class Risky(val risk: String) : StartNowResult
+}
 
 const val RETIRE_REQUEST_FAILED_MESSAGE = "Retire request failed"
 private val ACTIVE_WHAT_REQUEST_ID = Regex("""\bbtw-[A-Za-z0-9_-]+\b""")
@@ -559,13 +568,44 @@ class SessionManagerRepository(
         }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun fetchQueueStartCheck(baseUrl: String, token: String, jobId: String): li.rajeshgo.sm.data.model.QueueStartCheck = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getQueueStartCheck(jobId) }
+    /**
+     * Start now (sm#2383). Unless [acceptRisk], the server declines with one
+     * sentence when starting would endanger the Mac's memory; that comes back
+     * as [StartNowResult.Risky], every other refusal as a failure with the
+     * server's reason.
+     */
+    suspend fun startQueueJobNow(
+        baseUrl: String,
+        token: String,
+        jobId: String,
+        acceptRisk: Boolean,
+    ): Result<StartNowResult> = withContext(Dispatchers.IO) {
+        startQueueJobNowWith(api(baseUrl, token), jobId, acceptRisk)
     }
 
-    suspend fun forceStartQueueJob(baseUrl: String, token: String, jobId: String): Result<li.rajeshgo.sm.data.model.SessionJob> = withContext(Dispatchers.IO) {
-        runCatching { api(baseUrl, token).forceStartQueueJob(jobId) }.mapFailure(::classifyWriteFailure)
-    }
+    internal suspend fun startQueueJobNowWith(
+        service: ApiService,
+        jobId: String,
+        acceptRisk: Boolean,
+    ): Result<StartNowResult> =
+        runCatching<StartNowResult> {
+            StartNowResult.Started(
+                service.forceStartQueueJob(
+                    jobId,
+                    li.rajeshgo.sm.data.model.StartNowBody(askIfRisky = !acceptRisk),
+                ),
+            )
+        }.recoverCatching { error ->
+            if (error !is HttpException || error.code() != 409) throw error
+            // The body can be read once: decide here, and keep its reason.
+            val body = runCatching {
+                json.parseToJsonElement(error.response()?.errorBody()?.string().orEmpty()).jsonObject
+            }.getOrNull()
+            val field = { key: String -> body?.get(key)?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } }
+            val risk = field("risk")
+            if (field("code") == "start_risk" && risk != null) return@recoverCatching StartNowResult.Risky(risk)
+            throw SessionManagerRequestException(field("detail") ?: "Couldn't start the job", error)
+        }.mapFailure(::classifyWriteFailure)
 
     suspend fun createMobileAttachTicket(
         baseUrl: String,

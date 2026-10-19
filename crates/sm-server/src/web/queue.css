@@ -41,3 +41,25 @@ button.a-row { cursor:pointer; } button.a-row:hover { background:var(--panel-2);
 .a-composition { display:flex; height:7px; margin:8px 0; min-width:12rem; max-width:40rem; width:100%; }
 .a-composition i { display:block; height:100%; }
 .a-row>span:first-child { flex:1; }
+/* Start now (sm#2383): a waiting row's one-tap start, and its anchored popover. */
+.q-job-line { display:flex; align-items:center; gap:12px; border-bottom:1px solid var(--line); }
+.q-job-line > .q-job { flex:1; min-width:0; border-bottom:0; }
+.q-start { position:relative; display:inline-flex; flex:none; }
+.q-start .btn { min-height:30px; gap:7px; transition:background .15s, filter .15s, transform .1s; }
+.q-start .btn:active:not(:disabled) { transform:scale(.96); }
+.q-start-btn { border-radius:999px; padding:3px 13px 3px 11px; font-weight:600; color:var(--accent); border-color:color-mix(in srgb,var(--accent) 45%,var(--line)); background:color-mix(in srgb,var(--accent) 8%,var(--panel)); }
+.q-start-btn:hover { background:color-mix(in srgb,var(--accent) 16%,var(--panel)); }
+.q-play { display:inline-block; width:0; height:0; margin:0 1.5px; border-left:8px solid currentColor; border-top:5px solid transparent; border-bottom:5px solid transparent; }
+.q-spin { display:inline-block; width:11px; height:11px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:q-spin .7s linear infinite; }
+@keyframes q-spin { to { transform:rotate(360deg); } }
+.q-start-pop { position:absolute; z-index:5; top:calc(100% + 6px); right:0; width:min(300px, calc(100vw - 24px)); display:flex; flex-direction:column; gap:6px; padding:12px 14px; border:1px solid var(--line); border-radius:10px; background:var(--panel); color:var(--ink); box-shadow:0 10px 28px rgba(0,0,0,.2); text-align:left; white-space:normal; line-height:1.45; animation:q-pop .14s ease-out; }
+.q-start-pop.risk { border-color:color-mix(in srgb,var(--amber) 55%,var(--line)); }
+.q-start-pop.risk strong { color:var(--amber); }
+.q-start-pop.failed strong { color:var(--red); }
+.q-start-pop small { color:var(--ink-3); }
+.q-start-acts { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
+.q-start-acts .btn { min-height:28px; padding:2px 12px; }
+.q-actions .q-start-pop { left:0; right:auto; }
+@keyframes q-pop { from { opacity:0; transform:translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) { .q-spin, .q-start-pop { animation:none; } .q-start .btn { transition:none; } }
+@media (max-width:600px) { .q-job-line { gap:8px; } .q-start-btn { min-height:36px; padding:4px 14px 4px 12px; } }

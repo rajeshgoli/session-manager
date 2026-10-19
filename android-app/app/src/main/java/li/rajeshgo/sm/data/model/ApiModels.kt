@@ -669,18 +669,9 @@ data class JobUsage(
     @SerialName("gpu_percent") val gpuPercent: Double? = null,
 )
 
-/** `GET /client/queue/jobs/{id}/start-check`: what Start now overrides (sm#1627). */
+/** `POST /client/queue/jobs/{id}/start` (sm#2383): ask before a memory risk. */
 @Serializable
-data class QueueStartCheck(
-    @SerialName("job_id") val jobId: String,
-    val state: String,
-    val warnings: List<String> = emptyList(),
-    @SerialName("memory_available_bytes") val memoryAvailableBytes: Long? = null,
-    @SerialName("memory_reserve_bytes") val memoryReserveBytes: Long = 0,
-    @SerialName("memory_estimate_bytes") val memoryEstimateBytes: Long? = null,
-    @SerialName("memory_estimate_source") val memoryEstimateSource: String? = null,
-    @SerialName("past_runs") val pastRuns: Int = 0,
-)
+data class StartNowBody(@SerialName("ask_if_risky") val askIfRisky: Boolean)
 
 /** `GET /client/queue` (sm#1609). */
 @Serializable

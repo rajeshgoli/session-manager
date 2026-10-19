@@ -8,13 +8,19 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Memory
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -23,7 +29,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
@@ -47,8 +59,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -108,6 +123,8 @@ fun QueueScreen(
     val resumed = rememberResumed()
     var sheetJob by remember { mutableStateOf<SessionJob?>(null) }
     var now by remember { mutableStateOf(OffsetDateTime.now()) }
+    val snackbar = remember { SnackbarHostState() }
+    StartNowFeedback(state.startNow, snackbar, viewModel)
 
     LaunchedEffect(Unit) { viewModel.refreshStats() }
     LaunchedEffect(resumed) {
@@ -200,6 +217,13 @@ fun QueueScreen(
                                 reason = reviewJobLine(job) ?: queuedReason(job),
                                 prefix = job.position?.toString(),
                                 onClick = { sheetJob = job; viewModel.loadLog(job) },
+                                trailing = {
+                                    StartPill(
+                                        title = jobTitle(job),
+                                        starting = job.id in state.startNow.starting,
+                                        onClick = { viewModel.startNow(job) },
+                                    )
+                                },
                             )
                         }
                     }
@@ -207,6 +231,10 @@ fun QueueScreen(
             }
         }
 
+        SnackbarHost(
+            snackbar,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(start = 16.dp, end = 16.dp, bottom = 96.dp),
+        )
         Box(
             modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp, vertical = 16.dp),
         ) {
@@ -252,10 +280,9 @@ internal fun QueueJobSheet(
         ask = state.asks[job.id],
         cancelError = state.cancelError,
         followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
-        startNow = state.startNow?.takeIf { it.jobId == job.id },
-        onCheckStartNow = { viewModel.checkStartNow(current) },
+        starting = current.id in state.startNow.starting,
+        startError = state.startNow.failed?.takeIf { it.first == current.id }?.second,
         onStartNow = { viewModel.startNow(current) },
-        onDismissStartNow = viewModel::dismissStartNow,
         onFollow = { viewModel.follow(current) },
         onCancel = { note -> viewModel.cancel(current, note) { close() } },
         onAsk = { question -> viewModel.ask(current, question) },
@@ -350,27 +377,40 @@ internal fun JobRow(
     progress: Float? = null,
     prefix: String? = null,
     prefixColor: Color = Cyan,
+    trailing: (@Composable () -> Unit)? = null,
 ) {
-    Column(
+    Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp, horizontal = 2.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            prefix?.let {
-                Text(it, color = prefixColor, fontWeight = FontWeight.Bold, modifier = Modifier.width(20.dp))
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                prefix?.let {
+                    Text(it, color = prefixColor, fontWeight = FontWeight.Bold, modifier = Modifier.width(20.dp))
+                }
+                Text(
+                    title,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(" · $agent", color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Text(title, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            Text(" · $agent", color = TextSecondary, maxLines = 1)
+            Text(line, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            progress?.let {
+                LinearProgressIndicator(
+                    progress = { it },
+                    modifier = Modifier.fillMaxWidth().height(3.dp).padding(top = 2.dp),
+                    color = Cyan,
+                    trackColor = PanelMuted,
+                )
+            }
         }
-        Text(line, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-        reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-        progress?.let {
-            LinearProgressIndicator(
-                progress = { it },
-                modifier = Modifier.fillMaxWidth().height(3.dp).padding(top = 2.dp),
-                color = Cyan,
-                trackColor = PanelMuted,
-            )
+        trailing?.let {
+            Spacer(Modifier.width(12.dp))
+            it()
         }
     }
     HorizontalDivider(color = Border.copy(alpha = 0.5f))
@@ -408,10 +448,9 @@ private fun JobSheet(
     ask: AskState?,
     cancelError: String?,
     followMessage: String?,
-    startNow: StartNowState?,
-    onCheckStartNow: () -> Unit,
+    starting: Boolean,
+    startError: String?,
     onStartNow: () -> Unit,
-    onDismissStartNow: () -> Unit,
     onFollow: () -> Unit,
     onCancel: (String?) -> Unit,
     onAsk: (String) -> Unit,
@@ -428,6 +467,26 @@ private fun JobSheet(
         ) {
             Text(jobTitle(job), style = MaterialTheme.typography.titleLarge)
             Text(listOfNotNull(job.type, job.state, jobAgentLabel(job)).joinToString(" · "), color = TextSecondary)
+            // The sheet's main action for a waiting job (sm#2383).
+            if (job.state == "pending") {
+                Button(
+                    onClick = onStartNow,
+                    enabled = !starting,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(top = 4.dp),
+                ) {
+                    if (starting) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = LocalContentColor.current)
+                        Spacer(Modifier.width(10.dp))
+                        Text("Starting…")
+                    } else {
+                        Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Start now", fontWeight = FontWeight.SemiBold)
+                    }
+                }
+                startError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
+            }
             job.review?.let { review ->
                 Detail("Reviews", "${review.repo} PR #${review.prNumber} · round ${review.round}")
                 review.reviewerLabel?.let { Detail("Reviewer", it) }
@@ -449,7 +508,6 @@ private fun JobSheet(
             if (job.state == "running" && job.ownerForcedAt != null) {
                 Detail("Started", "Early, by you. If the Mac runs low on memory, sm stops this run first and puts the job back in line.")
             }
-            if (job.state == "pending") startNow?.let { StartNowCard(it, onStartNow, onDismissStartNow) }
             job.endedSummary?.let { Detail("What happened", it) }
 
             // Also on stopped jobs: "why did it stop?" is worth asking.
@@ -492,9 +550,6 @@ private fun JobSheet(
             cancelError?.let { Text(it, color = Rose) }
             followMessage?.let { Text(it, color = TextSecondary) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 24.dp)) {
-                if (job.state == "pending" && startNow == null) {
-                    OutlinedButton(onClick = onCheckStartNow) { Text("Start now") }
-                }
                 if (active) {
                     OutlinedButton(onClick = { confirming = true }) { Text("Cancel", color = Rose) }
                     // The server follows only jobs that have not finished.
@@ -513,32 +568,67 @@ private fun JobSheet(
     }
 }
 
-/** The warnings the owner weighs before overriding the queue (sm#1627). */
+/** A waiting row's one-tap start (sm#2383). */
 @Composable
-private fun StartNowCard(state: StartNowState, onStart: () -> Unit, onDismiss: () -> Unit) {
-    Surface(color = Amber.copy(alpha = 0.08f), shape = RoundedCornerShape(12.dp)) {
-        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Start now?", style = MaterialTheme.typography.titleSmall, color = Amber)
-            val check = state.check
-            when {
-                check == null && state.error == null -> Text("Checking what this skips…", color = TextMuted)
-                check != null && check.warnings.isEmpty() -> Text("Nothing is holding it back right now.", color = TextSecondary)
-                check != null -> check.warnings.forEach { Text("• $it", color = Amber, style = MaterialTheme.typography.bodyMedium) }
-            }
-            check?.let { Text(startNowMemoryLine(it), style = MaterialTheme.typography.bodySmall, color = TextSecondary) }
-            Text(
-                "If the Mac runs low on memory, sm stops this run first and puts the job back in line.",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextMuted,
-            )
-            state.error?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onStart, enabled = check != null && !state.starting) {
-                    Text(if (state.starting) "Starting…" else "Start anyway")
-                }
-                OutlinedButton(onClick = onDismiss) { Text("Keep waiting") }
-            }
+internal fun StartPill(title: String, starting: Boolean, onClick: () -> Unit) {
+    FilledTonalButton(
+        onClick = onClick,
+        enabled = !starting,
+        shape = RoundedCornerShape(99.dp),
+        contentPadding = PaddingValues(start = 10.dp, end = 14.dp),
+        colors = ButtonDefaults.filledTonalButtonColors(
+            containerColor = Cyan.copy(alpha = 0.14f),
+            contentColor = Cyan,
+            disabledContainerColor = Cyan.copy(alpha = 0.08f),
+            disabledContentColor = Cyan.copy(alpha = 0.7f),
+        ),
+        modifier = Modifier.heightIn(min = 36.dp).semantics { contentDescription = "Start $title now" },
+    ) {
+        if (starting) {
+            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = Cyan)
+        } else {
+            Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
         }
+        Spacer(Modifier.width(4.dp))
+        Text(if (starting) "Starting" else "Start", fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/**
+ * Start now's answers (sm#2383): asks before a memory risk, then says once
+ * what happened. Skipping the line never asks; that is what the tap meant.
+ */
+@Composable
+internal fun StartNowFeedback(state: StartNowState, snackbar: SnackbarHostState, viewModel: QueueViewModel) {
+    state.risk?.let { risk ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissStartRisk,
+            icon = { Icon(Icons.Rounded.Memory, contentDescription = null, tint = Amber) },
+            title = { Text("Low on memory") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(risk.text)
+                    Text(
+                        "If memory runs short, sm stops ${jobTitle(risk.job)} first and puts it back in line.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.startNow(risk.job, acceptRisk = true) }) {
+                    Text("Start anyway", fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = { TextButton(onClick = viewModel::dismissStartRisk) { Text("Not now") } },
+        )
+    }
+    val message = state.message
+    LaunchedEffect(message?.id) {
+        message ?: return@LaunchedEffect
+        viewModel.startMessageShown(message)
+        snackbar.currentSnackbarData?.dismiss()
+        snackbar.showSnackbar(message.text, withDismissAction = message.error)
     }
 }
 

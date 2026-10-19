@@ -19,7 +19,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.QueueOverview
-import li.rajeshgo.sm.data.model.QueueStartCheck
 import li.rajeshgo.sm.data.model.QueueStats
 import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.data.model.UtilizationSeries
@@ -27,6 +26,7 @@ import li.rajeshgo.sm.data.repository.ScreenCache
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.data.repository.StartNowResult
 import li.rajeshgo.sm.data.repository.WhatRequestBusyException
 
 /** What the job sheet shows for an Ask agent request. */
@@ -41,13 +41,22 @@ data class AskState(
     val askedAtMs: Long = 0,
 )
 
-/** Start now for one job: the check, then the start (sm#1627). */
+/**
+ * Start now (sm#2383): the jobs being started, the memory risk waiting for
+ * the owner's yes, and the last outcome to show once.
+ */
 data class StartNowState(
-    val jobId: String,
-    val check: QueueStartCheck? = null,
-    val starting: Boolean = false,
-    val error: String? = null,
+    val starting: Set<String> = emptySet(),
+    val risk: StartRisk? = null,
+    val message: StartMessage? = null,
+    /** Job id to why its last start failed, for the job sheet, which hides snackbars. */
+    val failed: Pair<String, String>? = null,
 )
+
+data class StartRisk(val job: SessionJob, val text: String)
+
+/** [id] makes each outcome a new snackbar, even with the same text. */
+data class StartMessage(val text: String, val error: Boolean, val id: Long = System.nanoTime())
 
 data class QueueUiState(
     val overview: QueueOverview? = null,
@@ -63,7 +72,7 @@ data class QueueUiState(
     val signedOut: Boolean = false,
     val log: Pair<String, String>? = null,
     val cancelError: String? = null,
-    val startNow: StartNowState? = null,
+    val startNow: StartNowState = StartNowState(),
     /** Result of Follow for the open sheet: job id to message. */
     val followMessage: Pair<String, String>? = null,
     /** The latest Ask agent request per job id. */
@@ -162,45 +171,57 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Loads what Start now would override, for the confirmation. */
-    fun checkStartNow(job: SessionJob) {
-        _uiState.value = _uiState.value.copy(startNow = StartNowState(job.id))
-        viewModelScope.launch {
-            val (url, token) = credentials() ?: return@launch
-            val next = runCatching { repository.fetchQueueStartCheck(url, token, job.id) }.fold(
-                onSuccess = { StartNowState(job.id, check = it) },
-                onFailure = { error ->
-                    if (handleAuth(error)) return@launch
-                    StartNowState(job.id, error = error.message ?: "Couldn't check this job")
-                },
-            )
-            if (_uiState.value.startNow?.jobId == job.id) _uiState.value = _uiState.value.copy(startNow = next)
+    /**
+     * One tap starts [job] past every queue rule (sm#2383). Only a memory
+     * risk stops to ask, through [StartNowState.risk]; [acceptRisk] is the
+     * owner's yes. A started job moves to Running at once.
+     */
+    fun startNow(job: SessionJob, acceptRisk: Boolean = false) {
+        if (job.id in _uiState.value.startNow.starting) return
+        _uiState.update {
+            it.copy(startNow = it.startNow.copy(starting = it.startNow.starting + job.id, risk = null, failed = null))
         }
-    }
-
-    /** Starts the job past every queue rule, then refreshes. */
-    fun startNow(job: SessionJob) {
-        val current = _uiState.value.startNow?.takeIf { it.jobId == job.id } ?: StartNowState(job.id)
-        _uiState.value = _uiState.value.copy(startNow = current.copy(starting = true, error = null))
         viewModelScope.launch {
-            val (url, token) = credentials() ?: return@launch
-            repository.forceStartQueueJob(url, token, job.id)
-                .onSuccess {
-                    _uiState.value = _uiState.value.copy(startNow = null)
-                    refresh()
-                }
-                .onFailure { error ->
-                    if (!handleAuth(error)) {
-                        _uiState.value = _uiState.value.copy(
-                            startNow = current.copy(starting = false, error = error.message ?: "Couldn't start the job"),
-                        )
+            val outcome = credentials()?.let { (url, token) -> repository.startQueueJobNow(url, token, job.id, acceptRisk) }
+            val done = { change: (StartNowState) -> StartNowState ->
+                _uiState.update { it.copy(startNow = change(it.startNow.copy(starting = it.startNow.starting - job.id))) }
+            }
+            outcome ?: return@launch done { it }
+            outcome.onSuccess { result ->
+                when (result) {
+                    is StartNowResult.Started -> {
+                        _uiState.update { state ->
+                            state.copy(
+                                overview = state.overview?.let { overview ->
+                                    overview.copy(
+                                        queued = overview.queued.filterNot { it.id == job.id },
+                                        running = overview.running.filterNot { it.id == job.id } + result.job,
+                                    )
+                                },
+                            )
+                        }
+                        done { it.copy(message = StartMessage("Started ${jobTitle(job)}", error = false)) }
+                        refresh()
                     }
+                    is StartNowResult.Risky -> done { it.copy(risk = StartRisk(job, result.risk)) }
                 }
+            }.onFailure { error ->
+                if (handleAuth(error)) return@onFailure done { it }
+                val reason = error.message ?: "Couldn't start ${jobTitle(job)}"
+                done { it.copy(message = StartMessage(reason, error = true), failed = job.id to reason) }
+            }
         }
     }
 
-    fun dismissStartNow() {
-        _uiState.value = _uiState.value.copy(startNow = null)
+    fun dismissStartRisk() {
+        _uiState.update { it.copy(startNow = it.startNow.copy(risk = null)) }
+    }
+
+    fun startMessageShown(message: StartMessage) {
+        _uiState.update { state ->
+            if (state.startNow.message?.id != message.id) state
+            else state.copy(startNow = state.startNow.copy(message = null))
+        }
     }
 
     /** Cancels, then refreshes at once; [onDone] runs only on success. */
@@ -256,7 +277,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Resets what belongs to one opening of the sheet; Ask agent answers are kept. */
     fun clearSheetState() {
-        _uiState.value = _uiState.value.copy(log = null, cancelError = null, followMessage = null, startNow = null)
+        _uiState.value = _uiState.value.copy(log = null, cancelError = null, followMessage = null)
     }
 
     fun refreshUsage(hours: Int = _uiState.value.usageHours) {

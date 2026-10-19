@@ -212,23 +212,6 @@ class QueueModelsTest {
         assertEquals(listOf("Sep 28 11:00 – 11:05", "No samples (server down)"), tooltip)
     }
 
-    @Test
-    fun startNowMemoryLineNamesFreeReserveAndEstimate() {
-        val gib = 1024L * 1024 * 1024
-        val check = li.rajeshgo.sm.data.model.QueueStartCheck(
-            jobId = "job",
-            state = "pending",
-            memoryAvailableBytes = 20 * gib,
-            memoryReserveBytes = 8 * gib,
-            memoryEstimateBytes = 30 * gib,
-            memoryEstimateSource = "past_runs",
-        )
-        assertEquals("Free now 20 GiB · 8 GiB reserve · needs ~30 GiB (most past runs used)", startNowMemoryLine(check))
-        assertEquals(
-            "Free now unknown · 8 GiB reserve",
-            startNowMemoryLine(check.copy(memoryAvailableBytes = null, memoryEstimateBytes = null)),
-        )
-    }
 
     @Test
     fun stoppedLinkShowsOnlyWhenAJobStopped() {
