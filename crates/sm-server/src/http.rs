@@ -2200,6 +2200,7 @@ pub fn router(state: AppState) -> Router {
         .route("/settings", get(web::get_shell_only_page))
         .route("/terminal/{session_id}", get(web::get_shell_only_page))
         .route("/assets/{*name}", get(web::get_asset))
+        .route("/docs/~handoff/{session_id}", get(docs::get_handoff_doc))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -7743,6 +7744,17 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
                     .unwrap_or(Value::Null),
                 _ => Value::Null,
             };
+        }
+    }
+    for (id, docs) in state.session_store.handoff_doc_rows()? {
+        let entry = sessions
+            .entry(id.clone())
+            .or_insert_with(|| new_obligation_entry(&id));
+        for doc in docs {
+            entry["docs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::to_value(doc)?);
         }
     }
     messages::project_messages(&mut sessions, &messages, &state.config.owner_name);
@@ -25845,6 +25857,197 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             );
         }
         request
+    }
+
+    #[tokio::test]
+    async fn handoff_docs_appear_on_both_surfaces_and_pages_are_owner_only() {
+        let mut config = google_auth_config();
+        let state_file = write_session_state("agent001", "stopped");
+        let mut raw: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let mut next = raw["sessions"][0].clone();
+        next["id"] = json!("agent002");
+        next["name"] = json!("successor");
+        next["status"] = json!("running");
+        next["predecessor_session_id"] = json!("agent001");
+        raw["sessions"][0]["successor_session_id"] = json!("agent002");
+        raw["sessions"][0]["context_used_percentage"] = json!(36);
+        raw["sessions"][0]["handoff"] = json!({"state":"done","trigger":"voluntary","accepted_at":"2026-10-19T01:27:00Z","note":{"kind":"stored","value":"handoff_notes:agent001"}});
+        raw["sessions"].as_array_mut().unwrap().push(next);
+        raw["handoff_notes_imported_at"] = json!("2026-10-19T01:27:00Z");
+        fs::write(&state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+        config.paths.state_file = state_file.clone();
+        config.sm_send.db_path = PathBuf::from(&state_file)
+            .with_extension("notes.db")
+            .display()
+            .to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let state = google_auth_state_with(config);
+        state
+            .session_store
+            .report_handoff_source("agent001", false, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(&state.config.sm_send.db_path).unwrap();
+        conn.execute("INSERT INTO handoff_notes(session_id,line_id,sequence,text,source,created_at) VALUES('agent001','agent001',1,'# Next steps\nFinish the ticket\n<script>window.pwned=true</script>\n<img src=x onerror=alert(1)>\n[unsafe](javascript:alert%281%29)','draft','2026-10-19T01:27:00Z')",[]).unwrap();
+        let obligations = session_obligations(&state).unwrap();
+        for (id, title) in [
+            ("agent001", "Handoff note → successor"),
+            ("agent002", "Handoff note from codex-fork-agent001"),
+        ] {
+            let doc = &obligations["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == id)
+                .unwrap()["docs"][0];
+            assert_eq!(doc["title"], title);
+            assert_eq!(doc["reader_path"], "/docs/~handoff/agent001");
+            assert_eq!(doc["state"], "handoff");
+        }
+        let app = router(state);
+        let (status, history) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/history/agents?format=json",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(
+            history["agents"][0]["work"]["docs"][0]["reader_path"],
+            "/docs/~handoff/agent001"
+        );
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/docs/~handoff/agent001",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            html.contains("<h1")
+                && html.contains("Next steps")
+                && html.contains("Finish the ticket")
+        );
+        assert!(
+            html.contains("36% context")
+                && html.contains("2026-10-19 01:27")
+                && html.contains("note 1 of 1")
+        );
+        assert!(!html.contains("<script>window.pwned"));
+        assert!(!html.contains("<img src=x onerror="));
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(html.contains("&lt;script&gt;window.pwned"));
+        for header in ["x-sm-session", "x-sm-session-id"] {
+            let mut request = local_request(Method::GET, "/docs/~handoff/agent001", Body::empty());
+            request
+                .headers_mut()
+                .insert(header, "agent002".parse().unwrap());
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/docs/~handoff/absent",
+                    Body::empty()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.oneshot(public_request(
+                Method::GET,
+                "/docs/~handoff/agent001",
+                Body::empty()
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn loose_entries_are_listed_and_deleted_through_the_existing_routes() {
+        let mut config = google_auth_config();
+        let state_file = write_session_state("agent001", "running");
+        let root = PathBuf::from(&state_file)
+            .parent()
+            .unwrap()
+            .join("worktrees");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let path = root.join("orphan.md");
+        fs::write(&path, "loose note").unwrap();
+        config.paths.state_file = state_file.clone();
+        config.work_claims.worktree_root = root.display().to_string();
+        config.sm_send.db_path = PathBuf::from(&state_file)
+            .with_extension("messages.db")
+            .display()
+            .to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let state = google_auth_state_with(config);
+        let store = claims::work_claim_store(&state);
+        crate::work_claims::worktrees::loose::sweep(
+            &store,
+            &crate::work_claims::worktrees::loose::Context {
+                root: &root,
+                sessions: &[],
+                jobs: &[],
+                pending: &[],
+                now: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .unwrap();
+        let app = router(state);
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/worktrees/leftover",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["loose"][0]["path"], path.display().to_string());
+        for (uri, body) in [
+            (
+                "/worktrees/keep",
+                json!({"path":path,"reason":"read later"}),
+            ),
+            ("/worktrees/delete", json!({"path":path})),
+        ] {
+            let mut request = local_request(Method::POST, uri, Body::from(body.to_string()));
+            request
+                .headers_mut()
+                .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        assert!(!path.exists());
     }
 
     #[tokio::test]

@@ -2007,7 +2007,7 @@ pub fn render_doc_page(path: &str, title: &str, bytes: &[u8], injection: &str) -
     }
 }
 
-fn doc_shell(title: &str, body: &str) -> String {
+pub(crate) fn doc_shell(title: &str, body: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -2016,7 +2016,12 @@ fn doc_shell(title: &str, body: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-:root {{ color-scheme: light dark; }}
+:root {{ color-scheme: light; color: #20201e; background: #fcfcfb; }}
+:root[data-theme=dark] {{ color-scheme: dark; color: #e6e4de; background: #1b1b19; }}
+@media screen and (prefers-color-scheme: dark) {{
+  :root:not([data-theme]) {{ color-scheme: dark; color: #e6e4de; background: #1b1b19; }}
+}}
+@media print {{ :root, :root[data-theme=dark] {{ color-scheme: light; color: #20201e; background: white; }} }}
 body {{ margin: 0 auto; max-width: 46rem; padding: 1.5rem 1rem 4rem;
   font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
 pre, code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }}

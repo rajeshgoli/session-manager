@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, registerPanel, closePanel, openPanel, bus, typingIn, clientNav } from './ui.js';
 
 // The ask thread's refresh is the reader's own read, never the owner's (spec 2170 A.5).
+import { followReaderTheme } from './reader-theme.js';
+
 const BACKGROUND = { 'x-sm-bg': '1' };
 
 export function shellName(path = location.pathname) {
@@ -22,6 +24,7 @@ export function readerPath(value) {
 }
 export function Reader({ id, controls, onBack = closePanel }) {
   const frame = useRef(null);
+  useEffect(() => followReaderTheme(frame.current), []);
   const [current, setCurrent] = useState(id);
   const [doc, setDoc] = useState(null);
   const [error, setError] = useState('');

@@ -13,6 +13,8 @@
 //! `RECHECK_INTERVAL`, so a later merge or push frees it (sm#1987). A crash
 //! only delays the work.
 
+pub mod loose;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,

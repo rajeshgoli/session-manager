@@ -575,6 +575,7 @@ private fun DocReaderWebView(
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) = onLoading(true)
 
                     override fun onPageFinished(view: WebView, url: String?) {
+                        view.evaluateJavascript("document.documentElement.dataset.theme='dark'", null)
                         onLoading(false)
                         // WebView reports the URL as the title of a page without one.
                         if (!load.failed) onLoaded(view.title?.takeIf { it.isNotBlank() && it != url })

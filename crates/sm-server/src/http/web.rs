@@ -69,6 +69,7 @@ const ASSETS: &[Asset] = &[
     asset!("reviews.js", JS),
     asset!("inbox.js", JS),
     asset!("reader.js", JS),
+    asset!("reader-theme.js", JS),
     asset!("history.js", JS),
     asset!("guestbook.js", JS),
     asset!("reader-bar.js", JS),

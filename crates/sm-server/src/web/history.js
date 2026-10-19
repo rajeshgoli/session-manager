@@ -1,11 +1,11 @@
 import { useState, useRef, useLayoutEffect } from 'preact/hooks';
-import { html, api, usePoll, openPanel, registerPanel, Seg, navigate, toast, Links, LinkedText, linkifyHtml, providerLabel, age, basename } from './ui.js';
+import { html, api, usePoll, openPanel, openDoc, registerPanel, Seg, navigate, toast, Links, LinkedText, linkifyHtml, providerLabel, age, basename } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 
 export function WorkLinks({ work = {} }) {
   return html`<div class="work-links">
     ${[...(work.tickets || []), ...(work.prs || [])].map(item => html`<button class="btn sm" onClick=${() => openPanel(`ticket:${item.repo || work.repo}#${item.number}`)}>#${item.number} ${item.title}</button>`)}
-    ${(work.docs || []).map(doc => html`<button class="btn sm" onClick=${() => openPanel(`doc:${doc.reader_path}`)}>${doc.title || doc.name}</button>`)}
+    ${(work.docs || []).map(doc => html`<button class="btn sm" onClick=${() => openDoc(doc.reader_path)}>${doc.title || doc.name}</button>`)}
   </div>`;
 }
 export function HistoryPage({ path }) {

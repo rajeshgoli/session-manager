@@ -25,6 +25,39 @@ use crate::work_claims::{
 const RETIRE_CLEANUP_WAIT: Duration = Duration::from_secs(10);
 const CLEANUP_PENDING: &str = "cleanup pending";
 
+use crate::work_claims::worktrees::loose;
+
+fn loose_inputs(
+    state: &AppState,
+) -> anyhow::Result<(PathBuf, Vec<crate::queue::QueueJobRecord>, Vec<PathBuf>)> {
+    let root = state.config.work_claims.worktree_root_path();
+    let root = fs::canonicalize(&root).unwrap_or(root);
+    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
+        &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+            .join("queue_runner.db"),
+        QueueJobFilters::default(),
+    )?;
+    Ok((
+        root,
+        jobs,
+        state.session_store.pending_handoff_source_paths()?,
+    ))
+}
+fn loose_path_key(state: &AppState, path: &str) -> Option<String> {
+    let root = state.config.work_claims.worktree_root_path();
+    let root = fs::canonicalize(&root).unwrap_or(root);
+    let p = std::path::Path::new(path);
+    if (p.parent() == Some(root.as_path())
+        || p.parent() == Some(root.join(".sm-quarantine").as_path()))
+        && p.file_name()
+            .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
+    {
+        Some(path.to_owned())
+    } else {
+        keep_path_key(path)
+    }
+}
+
 fn bad_request(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::BAD_REQUEST,
@@ -142,7 +175,7 @@ pub(super) async fn post_worktree_keep(
         &payload.requester_session_id,
         "/worktrees/keep",
     )?;
-    let Some(path) = keep_path_key(&payload.path) else {
+    let Some(path) = loose_path_key(&state, &payload.path) else {
         return Err(bad_request("path must be absolute"));
     };
     let store = work_claim_store(&state);
@@ -270,10 +303,10 @@ pub(super) async fn get_leftover_worktrees(
         )?;
     }
     if !expand_home(&state.config.sm_send.db_path).exists() {
-        return Ok(Json(json!({ "worktrees": [] })));
+        return Ok(Json(json!({ "worktrees": [], "loose": [] })));
     }
     let task_state = state.clone();
-    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let sessions = cleanup_sessions(&task_state)?;
         let leftovers = leftover_worktrees(&work_claim_store(&task_state), &sessions)?;
         let paths = leftovers
@@ -281,7 +314,7 @@ pub(super) async fn get_leftover_worktrees(
             .map(|leftover| leftover.path.clone())
             .collect::<Vec<_>>();
         let sizes = leftover_sizes(&paths);
-        Ok(leftovers
+        let rows = leftovers
             .into_iter()
             .map(|leftover| {
                 let size = sizes.get(&leftover.path).copied();
@@ -290,11 +323,30 @@ pub(super) async fn get_leftover_worktrees(
                 row["build_bytes"] = json!(size.map(|size| size.build_bytes));
                 row
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let (root, jobs, pending) = loose_inputs(&task_state)?;
+        let mut loose = loose::list(
+            &work_claim_store(&task_state),
+            &loose::Context {
+                root: &root,
+                sessions: &sessions,
+                jobs: &jobs,
+                pending: &pending,
+                now: time::OffsetDateTime::now_utc(),
+            },
+        )?;
+        let paths = loose.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
+        let sizes = leftover_sizes(&paths);
+        for row in &mut loose {
+            if let Some(size) = sizes.get(&row.path) {
+                row.size_bytes = size.bytes;
+            }
+        }
+        Ok(json!({"worktrees":rows,"loose":loose}))
     })
     .await
     .map_err(|error| anyhow::anyhow!("leftover worktrees task failed: {error}"))??;
-    Ok(Json(json!({ "worktrees": rows })))
+    Ok(Json(rows))
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,12 +379,28 @@ pub(super) async fn post_worktree_delete(
         Some("build") => DeleteScope::BuildOutput,
         Some(other) => return Err(bad_request(format!("unknown scope {other}"))),
     };
-    let Some(path) = keep_path_key(&payload.path) else {
+    let Some(path) = loose_path_key(&state, &payload.path) else {
         return Err(bad_request("path must be absolute"));
     };
     let task_state = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let sessions = cleanup_sessions(&task_state)?;
+        let (root, jobs, pending) = loose_inputs(&task_state)?;
+        if scope == DeleteScope::Worktree {
+            if let Some(outcome) = loose::delete(
+                &work_claim_store(&task_state),
+                &loose::Context {
+                    root: &root,
+                    sessions: &sessions,
+                    jobs: &jobs,
+                    pending: &pending,
+                    now: time::OffsetDateTime::now_utc(),
+                },
+                std::path::Path::new(&path),
+            )? {
+                return Ok(outcome);
+            }
+        }
         delete_leftover(
             &work_claim_store(&task_state),
             &sessions,
@@ -401,6 +469,23 @@ pub(super) fn run_cleanup_pass(state: &AppState) -> anyhow::Result<()> {
             ..CleanupRequest::default()
         },
     )?;
+    static LAST_LOOSE: StdMutex<Option<Instant>> = StdMutex::new(None);
+    let mut last = LAST_LOOSE.lock().unwrap_or_else(|p| p.into_inner());
+    if last.is_some_and(|at| at.elapsed() < RECHECK_INTERVAL) {
+        return Ok(());
+    }
+    let (root, jobs, pending) = loose_inputs(state)?;
+    loose::sweep(
+        &work_claim_store(state),
+        &loose::Context {
+            root: &root,
+            sessions: &sessions,
+            jobs: &jobs,
+            pending: &pending,
+            now: time::OffsetDateTime::now_utc(),
+        },
+    )?;
+    *last = Some(Instant::now());
     Ok(())
 }
 
