@@ -2385,6 +2385,74 @@ fn claude_transcript_candidates(
         .collect()
 }
 
+/// True when Claude never started a turn in this provider session: it writes
+/// `<session>.jsonl`, and later `<session>/` for subagents, only once the first
+/// user turn is submitted. Nested layouts are found by the session id inside
+/// any transcript modified since `launched_at`. With no roots to look in, or a
+/// candidate that cannot be read, nothing is proven.
+pub(crate) fn claude_provider_session_unwritten(
+    projects_roots: &[PathBuf],
+    working_dir: &str,
+    provider_session_id: &str,
+    launched_at: Option<std::time::SystemTime>,
+) -> bool {
+    // Any answer but "not found" (a permission error, say) proves nothing.
+    let absent = |path: PathBuf| {
+        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    let project_directories = claude_transcript_project_directories(projects_roots, working_dir);
+    !projects_roots.is_empty()
+        && project_directories.iter().all(|project_dir| {
+            absent(project_dir.join(format!("{provider_session_id}.jsonl")))
+                && absent(project_dir.join(provider_session_id))
+        })
+        && claude_transcripts_below(&project_directories).is_some_and(|paths| {
+            paths.iter().all(|path| {
+                let modified = fs::metadata(path).and_then(|metadata| metadata.modified());
+                match (modified, launched_at) {
+                    (Ok(modified), Some(launched_at)) if modified < launched_at => true,
+                    (Err(_), _) => false,
+                    // The id is a generated UUID, so any mention counts.
+                    _ => fs::read(path).is_ok_and(|bytes| {
+                        !bytes
+                            .windows(provider_session_id.len())
+                            .any(|window| window == provider_session_id.as_bytes())
+                    }),
+                }
+            })
+        })
+}
+
+/// Every `.jsonl` below the project directories, or None when any directory
+/// that exists cannot be fully listed, since an unlisted transcript could hold
+/// the turn. A project directory Claude never created holds nothing.
+fn claude_transcripts_below(project_directories: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = project_directories.to_vec();
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && project_directories.contains(&directory) =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if entry.file_type().ok()?.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    Some(files)
+}
+
 fn claude_transcript_project_directories(
     projects_roots: &[PathBuf],
     working_dir: &str,

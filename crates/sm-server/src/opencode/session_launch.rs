@@ -181,6 +181,9 @@ impl SessionStore {
                 ))
             })?;
         request.id = Some(id.clone());
+        // Taken after seat admission, which can wait minutes: a restart waits
+        // only for launches that have begun.
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         // Recovery uses this same lock. Acquire it before publishing any
         // provisional record so a reader cannot recover a half-started launch.
         let _launch_guard = self.lock_clear_operation(&id)?;
@@ -255,6 +258,7 @@ impl SessionStore {
         id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<Option<CoreRestoreOutcome>> {
+        let _launch = crate::handover::runtime_launch_gate().begin()?;
         let _launch_guard = self.lock_clear_operation(id)?;
         let driver = self.opencode_driver()?;
         let (original, expected_authority) = {

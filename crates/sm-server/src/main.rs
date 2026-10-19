@@ -265,6 +265,8 @@ async fn main() -> Result<()> {
     let btw_workers = BtwWorkers::default();
     let mut resuming_old_slot = false;
     'generations: loop {
+        // A refused or rolled-back handover leaves this process serving.
+        handover::runtime_launch_gate().unseal();
         let shutdown = Shutdown::default();
         sm_server::queue::set_live_queue_shutdown(shutdown.clone());
         // No generation workers start until every fallible state preparation
@@ -846,9 +848,12 @@ async fn main() -> Result<()> {
                 }
                 resuming_old_slot = true;
                 shutdown.stop();
-                let (lan_result, drain_result) = tokio::join!(
+                let (lan_result, drain_result, launches_drained) = tokio::join!(
                     lan_control.pause(),
                     tokio::time::timeout(Duration::from_secs(10), &mut server_task),
+                    tokio::task::spawn_blocking(|| {
+                        handover::runtime_launch_gate().seal_and_drain(Duration::from_secs(10))
+                    }),
                 );
                 let lan_listener = match lan_result {
                     Ok(listener) => listener,
@@ -869,6 +874,12 @@ async fn main() -> Result<()> {
                     let _ = handover_acceptor.join();
                     if !btw_workers.is_empty() {
                         eprintln!("handover refused: /btw worker started during request drain");
+                        drop(stream);
+                        inherited_lan = lan_listener;
+                        continue 'generations;
+                    }
+                    if !launches_drained.unwrap_or(false) {
+                        eprintln!("handover refused: an agent was still starting after 10 seconds; retry the restart");
                         drop(stream);
                         inherited_lan = lan_listener;
                         continue 'generations;

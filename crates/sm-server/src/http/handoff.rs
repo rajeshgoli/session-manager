@@ -765,11 +765,22 @@ async fn deliver_successor_brief(
         .session_store
         .handoff_runtime_launch_status(successor_id)?
     {
+        if status == "applied" {
+            return Ok(());
+        }
+        let (store, runtime, id) = (
+            state.session_store.clone(),
+            state.runtime(),
+            successor_id.to_owned(),
+        );
+        let relaunch = tokio::task::spawn_blocking(move || {
+            store.retire_unsubmitted_handoff_launch(&id, &runtime)
+        })
+        .await??;
         anyhow::ensure!(
-            status == "applied",
+            relaunch,
             "handoff runtime launch is {status}; inspect retained diagnostics before recovery"
         );
-        return Ok(());
     }
     let successor = state
         .session_store
@@ -1268,6 +1279,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_stopped());
+        // No tmux server answers here, so the old terminal is not provably
+        // gone and the brief is never replayed (#2409).
         assert!(complete_handoff(&state, "pred2342", &successor.id)
             .await
             .is_err());
