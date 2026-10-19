@@ -764,7 +764,16 @@ impl AppState {
             .with_claude_transcript_roots(self.session_store.claude_transcript_roots())
     }
 
-    pub fn try_new(mut config: AppConfig) -> anyhow::Result<Self> {
+    pub fn try_new(config: AppConfig) -> anyhow::Result<Self> {
+        Self::try_new_with_preparation(config, Ok)
+    }
+
+    /// Complete all fallible preparation before recovering persistent workers.
+    /// A rejected state must not leave monitors behind when startup retries.
+    pub fn try_new_with_preparation<T>(
+        mut config: AppConfig,
+        prepare: impl FnOnce(Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         if let Some(root) = test_isolation_root_from_environment()? {
             config.isolate_test_paths(&root)?;
         }
@@ -781,6 +790,7 @@ impl AppState {
         let board_wake = Arc::new(board::BoardWake::default());
         let codex_board_wake = board_wake.clone();
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+            .with_codex_fork_event_monitors_deferred()
             .with_owner_answered_wake(Arc::new(move || board::wake_recompute(&codex_board_wake)))
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
@@ -841,17 +851,11 @@ impl AppState {
         if let Err(error) = session_store.reconcile_reparent_notifications() {
             eprintln!("reparent notification recovery failed: {error:#}");
         }
-        if let Err(error) = session_store.recover_session_credential_rotation_workers() {
-            eprintln!("session credential rotation recovery failed: {error:#}");
-        }
         if let Err(error) = session_store.strip_legacy_handoff_fields() {
             eprintln!("removing old /clear handoff fields failed: {error:#}");
         }
         if let Err(error) = session_store.recover_interrupted_handoff_starts() {
             eprintln!("handoff start recovery failed: {error:#}");
-        }
-        if let Err(error) = session_store.recover_codex_fork_event_monitors() {
-            eprintln!("codex-fork event monitor recovery failed: {error:#}");
         }
         let push_sender: Option<Arc<dyn crate::owner_push::PushSender>> =
             match crate::push_fcm::FcmSender::from_config(&config) {
@@ -934,7 +938,7 @@ impl AppState {
         } else {
             None
         };
-        Ok(Self {
+        let state = Self {
             managed_artifacts,
             #[cfg(target_os = "macos")]
             local_walls: None,
@@ -991,7 +995,17 @@ impl AppState {
             autopm_switches,
             autopm_counters: Arc::new(crate::autopm::guard::Counters::default()),
             autopm_git: Arc::new(autopm::GhGit),
-        })
+        };
+        let session_store = state.session_store.clone();
+        let prepared = prepare(state)?;
+        session_store.enable_codex_fork_event_monitors();
+        if let Err(error) = session_store.recover_session_credential_rotation_workers() {
+            eprintln!("session credential rotation recovery failed: {error:#}");
+        }
+        if let Err(error) = session_store.recover_codex_fork_event_monitors() {
+            eprintln!("codex-fork event monitor recovery failed: {error:#}");
+        }
+        Ok(prepared)
     }
 
     pub fn with_autopm_git(mut self, git: Arc<dyn crate::autopm::experiments::Git>) -> Self {

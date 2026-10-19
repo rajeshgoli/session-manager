@@ -1022,51 +1022,53 @@ fn initialize_generation(
         None
     };
 
-    let state = AppState::try_new(config.clone())
-        .context("failed to initialize server state")?
-        .with_listen_port(port)
-        .with_shutdown(shutdown.clone())
-        .with_btw_workers(btw_workers.clone());
-    #[cfg(target_os = "macos")]
-    let state = if let Some(walls) = &local_walls {
-        state.with_local_walls(walls.clone())
-    } else {
-        state
-    };
-    let local_model = if config.rust_core.runtime_enabled {
-        state.register_local_model()?;
-        Some(
-            sm_server::local_model::live(queue_state_dir)
-                .context("local model registration missing")?,
-        )
-    } else {
-        None
-    };
-    // Capture the artifact boundary before serving. The background scan may run
-    // alongside live creates, but it must not attribute their new artifacts
-    // against this startup snapshot of the seat registry.
-    let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let reconciliation_snapshot = state
-        .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
-        .context("failed to snapshot sessions for usage ledger reconciliation")?;
-
-    let poller = if state.config().usage.enabled {
-        Some(Arc::new(IdentityPoller::new(
-            expand_home(&state.config().usage.db_path),
-            expand_home("~/.claude.json"),
-            expand_home("~/.codex/auth.json"),
-        )?))
-    } else {
-        None
-    };
-    Ok(InitializedGeneration {
-        state,
-        reconciliation_snapshot,
-        poller,
-        local_model,
+    AppState::try_new_with_preparation(config.clone(), |state| {
+        let state = state
+            .with_listen_port(port)
+            .with_shutdown(shutdown.clone())
+            .with_btw_workers(btw_workers.clone());
         #[cfg(target_os = "macos")]
-        local_walls,
+        let state = if let Some(walls) = &local_walls {
+            state.with_local_walls(walls.clone())
+        } else {
+            state
+        };
+        let local_model = if config.rust_core.runtime_enabled {
+            state.register_local_model()?;
+            Some(
+                sm_server::local_model::live(queue_state_dir)
+                    .context("local model registration missing")?,
+            )
+        } else {
+            None
+        };
+        // Capture the artifact boundary before serving. The background scan may run
+        // alongside live creates, but it must not attribute their new artifacts
+        // against this startup snapshot of the seat registry.
+        let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let reconciliation_snapshot = state
+            .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
+            .context("failed to snapshot sessions for usage ledger reconciliation")?;
+
+        let poller = if state.config().usage.enabled {
+            Some(Arc::new(IdentityPoller::new(
+                expand_home(&state.config().usage.db_path),
+                expand_home("~/.claude.json"),
+                expand_home("~/.codex/auth.json"),
+            )?))
+        } else {
+            None
+        };
+        Ok(InitializedGeneration {
+            state,
+            reconciliation_snapshot,
+            poller,
+            local_model,
+            #[cfg(target_os = "macos")]
+            local_walls,
+        })
     })
+    .context("failed to initialize server state")
 }
 
 fn write_active_slot(state_dir: &std::path::Path) -> Result<()> {
