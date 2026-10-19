@@ -469,6 +469,8 @@ pub(super) fn prepare_with_progress(
                 }) =>
             {
                 let inside = format!("{prefix}/");
+                // Its own entry drops its coverage even with no earlier files.
+                deferred.push(inside.clone());
                 for (path, old) in base
                     .into_iter()
                     .flat_map(|m| &m.files)

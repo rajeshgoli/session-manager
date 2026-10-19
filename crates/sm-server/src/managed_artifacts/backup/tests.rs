@@ -1719,7 +1719,7 @@ fn source_moved_after_scope_collection_waits_and_is_never_deleted() {
     let second = f.prepare("second", Some(&first.manifest));
     assert!(second.transfer.deleted.is_empty());
     assert!(second.manifest.files.contains_key("plain/data/b"));
-    assert_eq!(second.deferred, vec!["plain/data/b".to_string()]);
+    assert_eq!(second.deferred, ["plain/data/", "plain/data/b"]);
     // A seed (no confirmed manifest) leaves it for the first request.
     fs::create_dir_all(f.dir.join("data")).unwrap();
     fs::write(f.dir.join("data/b"), b"def").unwrap();
@@ -1731,6 +1731,8 @@ fn source_moved_after_scope_collection_waits_and_is_never_deleted() {
         .files
         .keys()
         .any(|p| p.starts_with("plain/data/")));
+    // ...and its coverage is dropped, so it is not marked backed up.
+    assert_eq!(fresh.deferred, ["plain/data/"]);
 }
 
 #[test]
