@@ -430,6 +430,18 @@ impl ReadableDocError {
 }
 
 pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
+    // Take the writer lock before inspecting columns: other connections may
+    // initialize this schema concurrently, including on a brand-new queue DB.
+    // Keep column additions and their backfills atomic as well.
+    // Queue enqueue helpers can call us inside their caller's write transaction.
+    let tx = if conn.is_autocommit() {
+        Some(rusqlite::Transaction::new_unchecked(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    } else {
+        None
+    };
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS owner_docs (
@@ -566,6 +578,9 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
              forwarded_at TEXT NOT NULL
          );",
     )?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -2249,6 +2264,59 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         (OwnerDocStore::new(dir.join("message_queue.db")), dir)
+    }
+
+    #[test]
+    fn concurrent_schema_initialization_preserves_publish_backfill() {
+        for legacy in [false, true] {
+            let (store, dir) = store();
+            if legacy {
+                store.publish(publish(Some(7), "a", "1"), |_| true).unwrap();
+                let conn = Connection::open(&store.db_path).unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE owner_doc_publishes DROP COLUMN checkout_root;
+                     ALTER TABLE owner_doc_publishes DROP COLUMN review_dismissed_at;
+                     ALTER TABLE owner_doc_publishes DROP COLUMN pr_number;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN posted_at;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN reopen_target;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN assigned_session_id;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN assigned_pr_number;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN target_base;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN target_tip;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN target_pr;
+                     ALTER TABLE owner_doc_reviews DROP COLUMN replies_closed_at;",
+                )
+                .unwrap();
+            }
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let conn = Connection::open(&store.db_path).unwrap();
+                            conn.busy_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
+                            barrier.wait();
+                            init_owner_docs_schema(&conn)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().unwrap().unwrap();
+                }
+            });
+            let conn = store.open_write().unwrap();
+            if legacy {
+                let pr: i64 = conn
+                    .query_row("SELECT pr_number FROM owner_doc_publishes", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(pr, 7);
+            }
+            drop(conn);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn publish(pr: Option<i64>, commit: &str, blob: &str) -> PublishOwnerDoc {
