@@ -2062,6 +2062,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/allow-deletes", post(backup::allow_deletes))
         .route("/artifacts", get(artifacts::list).post(artifacts::create))
         .route("/artifacts/{name}", get(artifacts::show))
+        .route("/artifact-activity", get(artifacts::activity))
         .route(
             "/artifacts/{name}/owner-action",
             post(artifacts::owner_action),
@@ -22006,8 +22007,9 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 28] = [
+    const OWNER_WEB_READS: [&str; 29] = [
         "/artifacts",
+        "/artifact-activity",
         "/artifacts/missing",
         "/claims",
         "/claims?session=fork1001&active=false",

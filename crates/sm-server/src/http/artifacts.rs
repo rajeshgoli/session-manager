@@ -78,6 +78,7 @@ pub(super) async fn list(
             let mut value = svc.store.detail(&root.path, a["name"].as_str().unwrap())?;
             backup_estimate(svc, &mut value);
             markdown_fields(&mut value);
+            ma::activity::enrich(root, &mut value);
             if let Some(epic) = value["epic"].as_str() {
                 let e = epics.entry(epic.into()).or_default();
                 e.0 += value["disk_bytes"].as_u64().unwrap_or(0);
@@ -118,7 +119,44 @@ pub(super) async fn show(
     let mut detail = svc.store.detail(&root.path, &name).map_err(refusal)?;
     backup_estimate(svc, &mut detail);
     markdown_fields(&mut detail);
+    ma::activity::enrich(root, &mut detail);
     Ok(Json(detail).into_response())
+}
+
+/// Freeze, thaw and move operations in flight and finished, and what freezing
+/// saved (sm#2325). Small enough for the Artifacts page to poll every few seconds.
+pub(super) async fn activity(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_owner_page_read_allowed(&state, &request)?;
+    tokio::task::spawn_blocking(move || {
+        let svc = service(&state)?;
+        let mut value = ma::activity::activity(svc, time::OffsetDateTime::now_utc())?;
+        let mut names: BTreeMap<String, Value> = BTreeMap::new();
+        for list in ["operations", "history"] {
+            for item in value[list].as_array_mut().into_iter().flatten() {
+                let actor = item["actor"].as_str().unwrap_or_default().to_owned();
+                if !names.contains_key(&actor) {
+                    names.insert(actor.clone(), actor_name(&state, &actor)?);
+                }
+                item["actor_name"] = names[&actor].clone();
+            }
+        }
+        Ok(Json(value).into_response())
+    })
+    .await?
+}
+
+/// Who asked: a session's name, the owner for an owner action, or sm itself.
+fn actor_name(state: &AppState, actor: &str) -> Result<Value, ApiError> {
+    Ok(match actor {
+        "sm-nightly" => json!("sm nightly"),
+        "sm-pressure" => json!("sm disk pressure"),
+        "sm" => json!("sm"),
+        a if a.contains('@') => json!(state.config.owner_name),
+        a => json!(state.session_store.get_session(a)?.map(|s| s.name)),
+    })
 }
 
 /// Reuse the guestbook renderer: no raw HTML or remote images, safe link targets.

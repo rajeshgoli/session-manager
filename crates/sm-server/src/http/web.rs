@@ -266,9 +266,10 @@ mod tests {
             .filter(|asset| asset.content_type == JS && !asset.name.starts_with("vendor/"))
             .collect();
         let own: usize = assets.iter().map(|asset| asset.body.len()).sum();
-        // Raw source bytes, excluding vendors. The shipped app at c72302b3
-        // totals 395,357 bytes; 392 KiB leaves ~1.5% headroom for small fixes.
-        const BUDGET: usize = 392 * 1024;
+        // Raw source bytes, excluding vendors. main at 6617273 totals 421,524
+        // bytes, already past the old 392 KiB; the Artifacts freeze and thaw
+        // views (sm#2325) add 13,863. 448 KiB leaves ~3% headroom.
+        const BUDGET: usize = 448 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

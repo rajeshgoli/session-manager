@@ -38,10 +38,12 @@ fun largestArtifacts(rows: List<JsonObject>): List<JsonObject> = artifactInvento
     .filter { !artifactNeedsDecision(it) && !artifactNeedsAgent(it) && (measuredArtifactBytes(it) ?: -1L) >= GB }.take(5)
 fun artifactSummary(a: JsonObject): String = when {
     a.text("investigating").isNotEmpty() -> "Agent investigating"
+    artifactOp(a) != null -> artifactOp(a)!!
     artifactNeedsAgent(a) -> if (a.text("state") == "deleted") "Folder missing · agent follow-up needed" else "Storage issue · agent follow-up needed"
     artifactNeedsDecision(a) -> "Cleanup proposed · review before deleting"
     a.text("state") == "unrecorded" -> "Needs an agent's record"
-    a.text("state") == "frozen" -> "Compressed · restored when needed"
+    a.text("state") == "frozen" -> "Frozen" + (placementDisk(a)?.let { " on $it" } ?: "") +
+        ((a["saved_bytes"] as? JsonPrimitive)?.longOrNull?.takeIf { it > 0 }?.let { " · saved ${storageSize(it)}" } ?: "") + " · thawed when needed"
     a.flag("hot") -> "In recent use"
     else -> "Saved work"
 }
@@ -118,4 +120,116 @@ fun backupCard(backup: JsonObject?): BackupCard? {
 
 fun artifactReport(a: JsonObject): String? = (a["report"] as? JsonObject)?.text("detail_json")?.let { text ->
     runCatching { Json.parseToJsonElement(text).jsonObject.text("note").ifBlank { text } }.getOrDefault(text)
+}
+
+// ---- freeze, thaw and move (sm#2325); wording matches the web page ----------
+data class OpKind(val icon: String, val now: String, val past: String)
+fun opKind(kind: String): OpKind = when (kind) {
+    "freezing" -> OpKind("freeze", "Freezing", "Froze")
+    "thawing" -> OpKind("thaw", "Thawing", "Thawed")
+    "moving" -> OpKind("move", "Moving to cold disk", "Moved to cold disk")
+    else -> OpKind("move", kind, kind)
+}
+val OP_STEPS = listOf("Queued", "Copying", "Finishing", "Done")
+/** The step an operation has reached: queued 0, copying 1, finishing 2, done 3, failed -1. */
+fun opStep(op: JsonObject): Int = when (op.text("phase")) {
+    "copying" -> 1; "prepared", "cleanup" -> 2; "done" -> 3; "failed" -> -1; else -> 0
+}
+/** "45 s", "12 min", "1 h 20 min". */
+fun span(seconds: Double?): String? {
+    if (seconds == null || !seconds.isFinite()) return null
+    if (seconds < 60) return "${Math.round(seconds).coerceAtLeast(1)} s"
+    val minutes = Math.round(seconds / 60)
+    return if (minutes < 60) "$minutes min" else "${minutes / 60} h" + if (minutes % 60 != 0L) " ${minutes % 60} min" else ""
+}
+private fun JsonObject.long(key: String): Long? = (get(key) as? JsonPrimitive)?.doubleOrNull?.toLong()
+/** The line under an operation: where it is in line and when it will finish. */
+fun opStatus(op: JsonObject): String {
+    val left = span(op.decimal("remaining_seconds"))
+    val error = op.text("error")
+    return when (op.text("state")) {
+        "done" -> "Done" + (span(op.decimal("seconds"))?.let { " · took $it" } ?: "")
+        "failed" -> "Failed: ${error.ifEmpty { "no reason recorded" }}"
+        "running" -> {
+            val behind = op.number("behind").let { if (it > 0) " · $it waiting behind it" else "" }
+            if (op.flag("over_estimate")) "Running now$behind · taking longer than recent ${opKind(op.text("kind")).now.lowercase()}"
+            else if ((op.decimal("remaining_seconds") ?: 1.0) < 1) "Running now$behind · should finish any moment"
+            else "Running now$behind" + (left?.let { " · about $it left" } ?: "")
+        }
+        else -> when {
+            error.contains("capacity") -> "Waiting for space on the cold disk above its floor"
+            error.isNotEmpty() -> "Waiting: $error"
+            else -> {
+                val ahead = op.number("ahead")
+                val starts = span(op.decimal("starts_in_seconds"))
+                "Waiting · " + (if (ahead > 0) "$ahead ahead" else "next in line") +
+                    (if (starts != null && ahead > 0) " · starts in about $starts" else "") + (left?.let { " · done in about $it" } ?: "")
+            }
+        }
+    }
+}
+fun opTook(op: JsonObject): String? = span(op.decimal("seconds"))
+/** How far an estimated copy has run, 0–1, or null without an estimate. */
+fun opProgress(op: JsonObject): Float? {
+    val expected = op.decimal("expected_seconds") ?: return null
+    val elapsed = op.decimal("elapsed_seconds") ?: return null
+    return if (op.text("state") != "running" || expected <= 0) null else (elapsed / expected).toFloat().coerceAtMost(0.97f)
+}
+/** Who asked for it: a session name with its id, the owner, or sm. */
+fun actorLabel(op: JsonObject): String = op.text("actor_name").takeIf { it.isNotEmpty() && it != op.text("actor") } ?: op.text("actor")
+fun actorId(op: JsonObject): String? = op.text("actor").takeIf { actorLabel(op) != it && Regex("^[0-9a-f]{8}$").matches(it) }
+fun clock(at: String): String = if (at.isEmpty()) "" else localTime(at)
+fun day(at: String): String = runCatching {
+    DateTimeFormatter.ofPattern("MMM d", Locale.US).format(Instant.parse(at).atZone(ZoneId.systemDefault()))
+}.getOrDefault(at.take(10))
+fun opNames(op: JsonObject): List<String> = (op["names"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+fun opName(op: JsonObject): String = opNames(op).let { if (it.size > 1) "${it[0]} + ${it.size - 1} more" else it.firstOrNull() ?: "operation ${op.number("id")}" }
+/** "344 GB → 37.6 GB" for a freeze, the data size otherwise. */
+fun opSizes(op: JsonObject): String {
+    val data = op.long("data_bytes")
+    val frozen = op.long("frozen_bytes")
+    return if (op.text("kind") == "freezing" && data != null && frozen != null) "${storageSize(data)} → ${storageSize(frozen)}"
+    else data?.let(::storageSize) ?: ""
+}
+fun opSaved(op: JsonObject): Long? {
+    val data = op.long("data_bytes") ?: return null
+    val frozen = op.long("frozen_bytes") ?: return null
+    return if (op.text("kind") == "freezing" && op.text("state") == "done") (data - frozen).coerceAtLeast(0) else null
+}
+fun ratio(data: Long?, frozen: Long?): String? {
+    if (data == null || frozen == null || data == 0L || frozen == 0L) return null
+    val r = data.toDouble() / frozen
+    return (if (r < 10) String.format(Locale.US, "%.1f", r) else String.format(Locale.US, "%.0f", r)) + "×"
+}
+/** The savings line under the big number. */
+fun savingsLine(s: JsonObject?): String {
+    val folders = s?.number("folders") ?: 0
+    if (s == null || folders == 0L) return "No frozen folders"
+    val disks = s.rows("roots").filter { it.number("folders") > 0 }.map { diskName(buildJsonObject { put("path", it.text("cold_store")) }) }.distinct()
+    return "$folders frozen ${if (folders == 1L) "folder" else "folders"} · ${storageSize(s.long("data_bytes"))} of data in ${storageSize(s.long("frozen_bytes"))} of archives" +
+        if (disks.isEmpty()) "" else " on ${disks.joinToString(", ")}"
+}
+private fun placementDisk(a: JsonObject): String? = (a["placement"] as? JsonObject)?.let { diskName(buildJsonObject { put("path", it.text("disk_path")) }) }
+/** Where a folder's bytes are, in the owner's words. */
+fun placementLabel(a: JsonObject): String? {
+    val p = a["placement"] as? JsonObject ?: return null
+    val disk = placementDisk(a)
+    return if (a.text("state") == "frozen") "Archive on $disk" else disk + if (p.text("disk") == "cold") " (cold disk)" else ""
+}
+/** How long a thaw should take, and the last one measured. */
+fun thawTime(a: JsonObject): String? {
+    val eta = span(a.decimal("thaw_eta_seconds"))?.let { "about $it" }
+    val last = (a["last_thaw"] as? JsonObject)?.let { t -> span(t.decimal("seconds"))?.let { "last $it on ${day(t.text("at"))}" } }
+    return listOfNotNull(eta, last).joinToString(" · ").ifEmpty { null }
+}
+/** A folder with an operation running or waiting on it. */
+fun artifactOp(a: JsonObject): String? {
+    val op = a.text("op").ifEmpty { return null }
+    val operation = a["operation"] as? JsonObject
+    val phase = when {
+        operation?.text("phase") == "queued" -> "queued"
+        operation != null && opStep(operation) == 2 -> "finishing"
+        else -> "copying"
+    }
+    return "${opKind(op).now} · $phase"
 }

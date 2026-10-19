@@ -297,6 +297,10 @@ interface ApiService {
     @GET("artifacts")
     suspend fun getArtifacts(): kotlinx.serialization.json.JsonObject
 
+    /** Freeze, thaw and move operations, history and savings (sm#2325). */
+    @GET("artifact-activity")
+    suspend fun getArtifactActivity(): kotlinx.serialization.json.JsonObject
+
     @POST("artifacts/{name}/owner-action")
     suspend fun artifactOwnerAction(@Path("name") name: String, @Body body: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 

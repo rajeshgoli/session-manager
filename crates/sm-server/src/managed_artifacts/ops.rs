@@ -534,6 +534,13 @@ fn cleanup(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
             "UPDATE artifacts SET op=NULL WHERE root=?1 AND name=?2",
             params![op.root.path, m.name],
         )?;
+        // History keeps the sizes this operation saw after later ones change them.
+        let a = artifact(&tx, &op.root.path, &m.name)?;
+        let frozen = if op.kind == "freezing" {
+            a["frozen_bytes"].clone()
+        } else {
+            Value::Null
+        };
         event(
             &tx,
             &op.root.path,
@@ -544,7 +551,7 @@ fn cleanup(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
                 _ => "moved",
             },
             &op.actor,
-            json!({"operation_id":op.id}),
+            json!({"operation_id":op.id,"data_bytes":a["data_bytes"],"frozen_bytes":frozen}),
         )?;
     }
     if op.kind == "thawing" {
@@ -631,62 +638,72 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
             let _ = request(manager, root, a["name"].as_str().context("thaw name")?, "thawing", "sm");
         }
     }
-    for row in store::query(
+    // A request made while this pass holds the lock finds it taken and returns;
+    // look again after each batch so it runs now, not at the next scan (sm#2325).
+    let mut after = 0i64;
+    loop {
+        let rows = store::query(
         &conn,
-        "SELECT * FROM artifact_operations WHERE phase NOT IN ('done','failed') ORDER BY id",
-        &[],
-    )? {
-        let root = manager
-            .config
-            .roots
-            .iter()
-            .find(|r| Some(r.path.as_str()) == row["root"].as_str())
-            .context("operation root no longer configured")?
-            .clone();
-        if !moves::cold_mounted(&root) {
-            continue;
+        "SELECT * FROM artifact_operations WHERE phase NOT IN ('done','failed') AND id>?1 ORDER BY id",
+        &[&after],
+    )?;
+        if rows.is_empty() {
+            break;
         }
-        let op = Operation {
-            id: row["id"].as_i64().context("operation id")?,
-            root,
-            kind: row["kind"].as_str().context("kind")?.into(),
-            phase: row["phase"].as_str().context("phase")?.into(),
-            members: serde_json::from_str(row["members_json"].as_str().context("members")?)?,
-            actor: row["actor"].as_str().unwrap_or("sm").into(),
-        };
-        if let Err(error) = run(manager, &op) {
-            let mut db = manager.store.open()?;
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let phase: String = tx.query_row(
-                "SELECT phase FROM artifact_operations WHERE id=?1",
-                [op.id],
-                |r| r.get(0),
-            )?;
-            // Committed operations retain both their journal and op exclusion.
-            // Their remaining swaps/cleanup are idempotent on the next pass.
-            let abort =
-                matches!(phase.as_str(), "queued" | "copying") && moves::cold_mounted(&op.root);
-            if abort {
-                discard_staging(&op)?;
+        for row in rows {
+            after = row["id"].as_i64().context("operation id")?;
+            let root = manager
+                .config
+                .roots
+                .iter()
+                .find(|r| Some(r.path.as_str()) == row["root"].as_str())
+                .context("operation root no longer configured")?
+                .clone();
+            if !moves::cold_mounted(&root) {
+                continue;
             }
-            for m in &op.members {
+            let op = Operation {
+                id: row["id"].as_i64().context("operation id")?,
+                root,
+                kind: row["kind"].as_str().context("kind")?.into(),
+                phase: row["phase"].as_str().context("phase")?.into(),
+                members: serde_json::from_str(row["members_json"].as_str().context("members")?)?,
+                actor: row["actor"].as_str().unwrap_or("sm").into(),
+            };
+            if let Err(error) = run(manager, &op) {
+                let mut db = manager.store.open()?;
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let phase: String = tx.query_row(
+                    "SELECT phase FROM artifact_operations WHERE id=?1",
+                    [op.id],
+                    |r| r.get(0),
+                )?;
+                // Committed operations retain both their journal and op exclusion.
+                // Their remaining swaps/cleanup are idempotent on the next pass.
+                let abort =
+                    matches!(phase.as_str(), "queued" | "copying") && moves::cold_mounted(&op.root);
                 if abort {
-                    tx.execute(
-                        "UPDATE artifacts SET op=NULL WHERE root=?1 AND name=?2",
-                        params![op.root.path, m.name],
+                    discard_staging(&op)?;
+                }
+                for m in &op.members {
+                    if abort {
+                        tx.execute(
+                            "UPDATE artifacts SET op=NULL WHERE root=?1 AND name=?2",
+                            params![op.root.path, m.name],
+                        )?;
+                    }
+                    event(
+                        &tx,
+                        &op.root.path,
+                        &m.name,
+                        "op_failed",
+                        &op.actor,
+                        json!({"operation_id":op.id,"operation":op.kind,"error":format!("{error:#}")}),
                     )?;
                 }
-                event(
-                    &tx,
-                    &op.root.path,
-                    &m.name,
-                    "op_failed",
-                    &op.actor,
-                    json!({"operation_id":op.id,"operation":op.kind,"error":format!("{error:#}")}),
-                )?;
+                tx.execute("UPDATE artifact_operations SET error=?2,phase=CASE WHEN ?3 THEN 'failed' ELSE phase END,finished_at=CASE WHEN ?3 THEN ?4 ELSE finished_at END WHERE id=?1",params![op.id,format!("{error:#}"),abort,now()])?;
+                tx.commit()?;
             }
-            tx.execute("UPDATE artifact_operations SET error=?2,phase=CASE WHEN ?3 THEN 'failed' ELSE phase END WHERE id=?1",params![op.id,format!("{error:#}"),abort])?;
-            tx.commit()?;
         }
     }
     Ok(())
