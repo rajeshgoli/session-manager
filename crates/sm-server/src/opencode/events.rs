@@ -558,17 +558,18 @@ impl Client {
             .context("opencode returned invalid message history")
     }
 
-    /// Bound each stream connection to twenty seconds, then reconnect and
-    /// backfill. This also bounds a stalled reader's wait before it can check
-    /// retirement. ureq's body timeout is total duration, not idle duration.
+    /// Bound each stream connection to twenty seconds from the call, then
+    /// reconnect and backfill. This also bounds a stalled reader's wait before
+    /// it can check retirement. ureq keeps the receive-response deadline
+    /// (counted from the headers) armed while the body is read, so setting it
+    /// would end every quiet stream after the request timeout.
     pub fn event_stream(&self) -> Result<BufReader<impl std::io::Read + '_>> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
             .proxy(None)
             .timeout_connect(Some(self.request_timeout))
-            .timeout_recv_response(Some(self.request_timeout))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(20)))
+            .timeout_global(Some(EVENT_STREAM_LIFETIME))
             .build()
             .into();
         let response = agent
@@ -587,6 +588,9 @@ impl Client {
         Ok(BufReader::new(response.into_body().into_reader()))
     }
 }
+
+/// How long one `/event` connection lives before the reader rotates it.
+pub const EVENT_STREAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Read one complete SSE frame; heartbeats and other fields carry no event.
 /// Size limits apply to lines as well as frames before allocation can grow.

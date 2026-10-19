@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     opencode::{
-        events::{read_event, Activity},
+        events::{read_event, Activity, EVENT_STREAM_LIFETIME},
         Client, OpencodeConfig, RuntimeBinding,
     },
     sessions::OpencodeEventInput,
@@ -455,13 +455,17 @@ fn read_connection(
     if !continue_reading(state, id)? {
         return Ok(());
     }
-    state.session_store.recover_opencode_effects(id)?;
+    state
+        .session_store
+        .recover_opencode_effects(id)
+        .context("effects recovery")?;
     dispatch_stop(state, handle, id)?;
     let session = state
         .session_store
         .get_session(id)?
         .context("opencode session disappeared")?;
     let (client, config) = client_and_config(state, &session)?;
+    let opened = Instant::now();
     let mut stream = client.event_stream().context("event stream connect")?;
     if let Some(worker) = readers
         .workers
@@ -477,7 +481,6 @@ fn read_connection(
         .session_store
         .recover_opencode_launch_for_session(id)
         .context("launch recovery")?;
-    let connected = Instant::now();
     let mut conversation = resync(state, handle, id, &client, &config)?;
     state
         .session_store
@@ -488,9 +491,9 @@ fn read_connection(
         let event = match read_event(&mut stream) {
             Ok(Some(event)) => event,
             Ok(None) => break,
-            // The stream body deliberately rotates at twenty seconds.
-            Err(_) if connected.elapsed() >= Duration::from_secs(20) => break,
-            Err(error) => return Err(error),
+            // The stream deliberately rotates at its lifetime.
+            Err(_) if opened.elapsed() >= EVENT_STREAM_LIFETIME => break,
+            Err(error) => return Err(error.context("event stream read")),
         };
         if !continue_reading(state, id)? {
             break;

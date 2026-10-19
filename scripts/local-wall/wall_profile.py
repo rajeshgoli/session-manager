@@ -355,6 +355,10 @@ def generate(args, listeners, minimum_tmp_length):
     # keychain access, application launching or other privileged operations to
     # them. IPC needed by local tools uses private Unix sockets or admitted TCP.
     lines.extend(["(deny mach-lookup)", "(deny mach-register)", "(deny appleevent-send)"])
+    # trustd only evaluates certificate trust; it holds no secrets. Go TLS
+    # clients such as gh verify through it and fail with OSStatus -26276.
+    lines.append('(allow mach-lookup (global-name "com.apple.trustd") '
+                 '(global-name "com.apple.trustd.agent"))')
     # Negative filter protects siblings created AFTER this snapshot. An allow
     # for our directory alone would not override a denial of the entire root.
     # realpath() needs metadata on the root to resolve our own state. Listing
