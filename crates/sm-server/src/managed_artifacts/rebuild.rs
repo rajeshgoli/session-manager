@@ -367,14 +367,9 @@ fn advance(
                 RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&execution.queue_dir,&execution.messages,execution.cancel_grace,execution.policy)?;
                 return Ok(());
             }
-            if job.state != "succeeded" {
-                bail!(
-                    "recipe step {} ended {} (job {job_id})",
-                    index + 1,
-                    job.state
-                );
-            }
-            // Completion must release the artifact reservation before advancing.
+            // Terminal queue state is committed before artifact completion.
+            // Wait for reservation release before reporting failure as retryable
+            // as well as before advancing a successful step.
             let reserved: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM artifact_job_reservations WHERE job_id=?1)",
                 [job_id],
@@ -382,6 +377,13 @@ fn advance(
             )?;
             if reserved {
                 return Ok(());
+            }
+            if job.state != "succeeded" {
+                bail!(
+                    "recipe step {} ended {} (job {job_id})",
+                    index + 1,
+                    job.state
+                );
             }
             continue;
         }

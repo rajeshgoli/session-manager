@@ -1097,6 +1097,80 @@ fn rebuild_refuses_live_artifacts_and_deleted_external_inputs() {
 }
 
 #[test]
+fn failed_rebuild_waits_for_output_reservation_release_before_notifying() {
+    let f = Fixture::new();
+    rebuild_fixture(&f, "exit 9");
+    let result =
+        super::super::rebuild::start(&f.manager, &f.root, "out", "maker", rebuild_execution(&f))
+            .unwrap();
+    let id = result["rebuild_id"].as_str().unwrap();
+    // Install a replay job without launching a worker so the terminal-state /
+    // artifact-completion boundary remains under the test's control.
+    let request = f.request();
+    let mut prepared = PreparedSubmission::prepare(
+        &f.manager,
+        &f.root,
+        submission::Declarations {
+            outputs: vec!["out".into()],
+            disk_bytes: Some(1024),
+            ..Default::default()
+        },
+        &request,
+    )
+    .unwrap();
+    prepared.rebuild = Some((id.into(), 0));
+    let job = RetainedQueueStore::create_queue_job_with_artifacts(
+        &f.state(),
+        request,
+        300,
+        None,
+        Some((&f.manager, &prepared)),
+    )
+    .unwrap();
+    let conn = f.conn();
+    admit(&conn, &job.id).unwrap();
+    conn.execute(
+        "UPDATE artifact_rebuilds SET state='running' WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET state='failed',exit_code=9,finished_at=?2 WHERE id=?1",
+        params![job.id, now()],
+    )
+    .unwrap();
+
+    super::super::rebuild::resume(&f.manager).unwrap();
+    let status: (String, bool) = conn
+        .query_row(
+            "SELECT state,notified FROM artifact_rebuilds WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, ("running".into(), false));
+    assert!(super::super::rebuild::start(
+        &f.manager,
+        &f.root,
+        "out",
+        "maker",
+        rebuild_execution(&f)
+    )
+    .is_err());
+
+    complete(&conn, &job.id, Some(&f.messages())).unwrap();
+    assert_eq!(await_rebuild(&f, id), "failed");
+    assert!(super::super::rebuild::start(
+        &f.manager,
+        &f.root,
+        "out",
+        "maker",
+        rebuild_execution(&f)
+    )
+    .is_ok());
+}
+
+#[test]
 fn failed_rebuild_can_retry_without_reusing_partial_output() {
     let f = Fixture::new();
     let permit = f.dir.join("permit");
