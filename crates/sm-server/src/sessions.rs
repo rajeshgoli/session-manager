@@ -4669,6 +4669,9 @@ impl SessionStore {
                             &self.claude_projects_roots,
                             &launch.working_dir,
                             provider_id,
+                            OffsetDateTime::parse(&launch.created_at, &Rfc3339)
+                                .ok()
+                                .map(std::time::SystemTime::from),
                         )
                     })
         };

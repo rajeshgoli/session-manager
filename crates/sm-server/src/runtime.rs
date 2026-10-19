@@ -2387,22 +2387,39 @@ fn claude_transcript_candidates(
 
 /// True when Claude never started a turn in this provider session: it writes
 /// `<session>.jsonl`, and later `<session>/` for subagents, only once the first
-/// user turn is submitted. With no roots to look in, nothing is proven.
+/// user turn is submitted. Nested layouts are found by the session id inside
+/// any transcript modified since `launched_at`. With no roots to look in, or a
+/// candidate that cannot be read, nothing is proven.
 pub(crate) fn claude_provider_session_unwritten(
     projects_roots: &[PathBuf],
     working_dir: &str,
     provider_session_id: &str,
+    launched_at: Option<std::time::SystemTime>,
 ) -> bool {
     // Any answer but "not found" (a permission error, say) proves nothing.
     let absent = |path: PathBuf| {
         fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     };
+    let project_directories = claude_transcript_project_directories(projects_roots, working_dir);
     !projects_roots.is_empty()
-        && claude_transcript_project_directories(projects_roots, working_dir)
+        && project_directories.iter().all(|project_dir| {
+            absent(project_dir.join(format!("{provider_session_id}.jsonl")))
+                && absent(project_dir.join(provider_session_id))
+        })
+        && claude_nested_transcript_candidates(&project_directories)
             .iter()
-            .all(|project_dir| {
-                absent(project_dir.join(format!("{provider_session_id}.jsonl")))
-                    && absent(project_dir.join(provider_session_id))
+            .all(|path| {
+                let modified = fs::metadata(path).and_then(|metadata| metadata.modified());
+                match (modified, launched_at) {
+                    (Ok(modified), Some(launched_at)) if modified < launched_at => true,
+                    (Err(_), _) => false,
+                    // The id is a generated UUID, so any mention counts.
+                    _ => fs::read(path).is_ok_and(|bytes| {
+                        !bytes
+                            .windows(provider_session_id.len())
+                            .any(|window| window == provider_session_id.as_bytes())
+                    }),
+                }
             })
 }
 

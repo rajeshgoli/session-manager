@@ -1277,16 +1277,25 @@ mod tests {
         fs::set_permissions(&live_tmux, fs::Permissions::from_mode(0o755)).unwrap();
         let live_runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
             .with_tmux_binary_for_test(live_tmux.display().to_string());
+        let nested = project_dir.join("nested").join("other-name.jsonl");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        // Another agent's transcript in the same project never blocks.
+        fs::write(
+            project_dir.join("other.jsonl"),
+            "{\"sessionId\":\"other\"}\n",
+        )
+        .unwrap();
         for (written, terminal, relaunch) in [
-            (true, &runtime, false),
-            (false, &live_runtime, false),
-            (false, &runtime, true),
+            (Some(&transcript), &runtime, false),
+            (Some(&nested), &runtime, false),
+            (None, &live_runtime, false),
+            (None, &runtime, true),
         ] {
             recovered.write_raw_json_value(&failed).unwrap();
-            if written {
-                fs::write(&transcript, "{}\n").unwrap();
-            } else {
-                let _ = fs::remove_file(&transcript);
+            let _ = fs::remove_file(&transcript);
+            let _ = fs::remove_file(&nested);
+            if let Some(path) = written {
+                fs::write(path, "{\"sessionId\":\"provider-2409\"}\n").unwrap();
             }
             assert_eq!(
                 recovered
