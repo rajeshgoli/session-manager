@@ -263,28 +263,44 @@ async fn main() -> Result<()> {
         authority_server.socket_path().display()
     );
     let btw_workers = BtwWorkers::default();
+    let mut resuming_old_slot = false;
     'generations: loop {
-        if takeover_stream.is_some() {
-            // The inherited Unix listener still reports the previous binder's
-            // PID to LOCAL_PEERPID. Publish this process's listener before it
-            // serves queue authority requests during the rollback window.
-            authority_server.rebind_after_handover()?;
-        }
         let shutdown = Shutdown::default();
         sm_server::queue::set_live_queue_shutdown(shutdown.clone());
+        // No generation workers start until every fallible state preparation
+        // step succeeds. Failed attempts drop their state while the outer
+        // listener remains bound, so queued connections survive the retry.
+        let InitializedGeneration {
+            state,
+            reconciliation_snapshot,
+            poller,
+            local_model,
+            #[cfg(target_os = "macos")]
+            local_walls,
+        } = initialize_with_retry(
+            resuming_old_slot.then_some(ROLLBACK_INITIALIZATION_RETRY),
+            || {
+                if takeover_stream.is_some() || resuming_old_slot {
+                    // LOCAL_PEERPID must report this process after handover.
+                    authority_server.rebind_after_handover()?;
+                }
+                if resuming_old_slot {
+                    write_active_slot(handover_dir)?;
+                }
+                initialize_generation(
+                    &config,
+                    args.port,
+                    &queue_state_dir,
+                    &shutdown,
+                    &btw_workers,
+                )
+            },
+        )
+        .await?;
         #[cfg(target_os = "macos")]
-        let local_walls = if config.rust_core.runtime_enabled {
-            let directory = sm_server::config::test_isolation_root_from_environment()?
-                .map(|root| root.join("local-egress"))
-                .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
-            let walls = Arc::new(sm_server::local_wall::recovery::GenerationWalls::new(
-                queue_state_dir.clone(),
-                expand_home(&config.local_judge.python),
-                SocketAddr::from(([127, 0, 0, 1], args.port)),
-                &config.local_host.base_url,
-                sm_server::local_egress::ServiceClient::new(directory, std::env::current_exe()?),
-                sm_server::local_judge::LocalJudgeRuntime::from_config(&config),
-            )?);
+        let _local_wall_guard = local_walls.as_ref().map(|walls| walls.guard());
+        #[cfg(target_os = "macos")]
+        if let Some(walls) = &local_walls {
             match walls.reconcile() {
                 Ok(failures) => {
                     for failure in failures {
@@ -311,28 +327,12 @@ async fn main() -> Result<()> {
                     }
                 }
             });
-            Some(walls)
-        } else {
-            None
-        };
-        #[cfg(target_os = "macos")]
-        let _local_wall_guard = local_walls.as_ref().map(|walls| walls.guard());
+        }
         let authority_thread = authority_server.spawn(shutdown.clone())?;
         let (handover_tx, mut handover_rx) = tokio::sync::mpsc::channel(1);
         let handover_acceptor =
             handover::spawn_acceptor(&handover_listener, shutdown.clone(), handover_tx)?;
 
-        let state = AppState::try_new(config.clone())
-            .context("failed to initialize server state")?
-            .with_listen_port(args.port)
-            .with_shutdown(shutdown.clone())
-            .with_btw_workers(btw_workers.clone());
-        #[cfg(target_os = "macos")]
-        let state = if let Some(walls) = &local_walls {
-            state.with_local_walls(walls.clone())
-        } else {
-            state
-        };
         if config.managed_artifacts.enabled {
             let artifact_state = state.clone();
             let artifact_shutdown = shutdown.clone();
@@ -353,7 +353,6 @@ async fn main() -> Result<()> {
             });
         }
         if config.rust_core.runtime_enabled {
-            state.register_local_model()?;
             let reload_dir = queue_state_dir.clone();
             let reload_shutdown = shutdown.clone();
             thread::spawn(move || loop {
@@ -369,9 +368,7 @@ async fn main() -> Result<()> {
             });
         }
 
-        if config.rust_core.runtime_enabled {
-            let model = sm_server::local_model::live(&queue_state_dir)
-                .context("local model registration missing")?;
+        if let Some(model) = local_model {
             let judge = sm_server::local_judge::LocalJudgeRuntime::from_config(&config);
             let judge_shutdown = shutdown.clone();
             thread::spawn(move || loop {
@@ -569,13 +566,6 @@ async fn main() -> Result<()> {
                 thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
             });
         }
-        // Capture the artifact boundary before serving. The background scan may run
-        // alongside live creates, but it must not attribute their new artifacts
-        // against this startup snapshot of the seat registry.
-        let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let reconciliation_snapshot = state
-            .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
-            .context("failed to snapshot sessions for usage ledger reconciliation")?;
         let reconciliation_state = state.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(error) =
@@ -585,14 +575,9 @@ async fn main() -> Result<()> {
             }
         });
 
-        if state.config().usage.enabled {
+        if let Some(poller) = poller {
             let poll_interval = state.config().usage.poll_interval_secs.max(1);
             let scan_interval = state.config().usage.scan_interval_secs.max(1);
-            let poller = Arc::new(IdentityPoller::new(
-                expand_home(&state.config().usage.db_path),
-                expand_home("~/.claude.json"),
-                expand_home("~/.codex/auth.json"),
-            )?);
             let identity_poller = poller.clone();
             let identity_shutdown = shutdown.clone();
             tokio::spawn(async move {
@@ -859,6 +844,7 @@ async fn main() -> Result<()> {
                     drop(stream);
                     continue;
                 }
+                resuming_old_slot = true;
                 shutdown.stop();
                 let (lan_result, drain_result) = tokio::join!(
                     lan_control.pause(),
@@ -871,7 +857,6 @@ async fn main() -> Result<()> {
                         lan_control.stop().await;
                         drop(authority_thread);
                         let _ = handover_acceptor.join();
-                        write_active_slot(handover_dir)?;
                         continue 'generations;
                     }
                 };
@@ -916,7 +901,6 @@ async fn main() -> Result<()> {
                     if let Err(error) = result {
                         eprintln!("handover rolled back: {error:#}");
                     }
-                    authority_server.rebind_after_handover()?;
                     btw_workers.block_recovery();
                     let _ = handover::send_decision(&mut stream, handover::Decision::Rollback);
                     let recovery_workers = btw_workers.clone();
@@ -927,7 +911,6 @@ async fn main() -> Result<()> {
                         }
                         recovery_workers.allow_recovery();
                     });
-                    write_active_slot(handover_dir)?;
                     inherited_lan = lan_listener;
                     continue 'generations;
                 }
@@ -947,6 +930,143 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct InitializationRetry {
+    timeout: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+const ROLLBACK_INITIALIZATION_RETRY: InitializationRetry = InitializationRetry {
+    timeout: Duration::from_secs(5 * 60),
+    initial_delay: Duration::from_secs(1),
+    max_delay: Duration::from_secs(10),
+};
+
+/// Cold starts (including replacements) fail immediately. Only a process that
+/// previously served may wait for shared state to become usable again.
+async fn initialize_with_retry<T>(
+    retry: Option<InitializationRetry>,
+    mut initialize: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let started = tokio::time::Instant::now();
+    let mut delay = retry.map_or(Duration::ZERO, |policy| policy.initial_delay);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match initialize() {
+            Ok(state) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "rollback initialization recovered after {attempt} attempts ({:?})",
+                        started.elapsed()
+                    );
+                }
+                return Ok(state);
+            }
+            Err(error) => {
+                let Some(policy) = retry else {
+                    return Err(error);
+                };
+                let remaining = policy.timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    eprintln!("rollback initialization attempt {attempt} failed; retry limit reached: {error:#}");
+                    return Err(error).context("rollback initialization retry limit reached");
+                }
+                let wait = delay.min(remaining);
+                eprintln!("rollback initialization attempt {attempt} failed; retrying in {wait:?}: {error:#}");
+                tokio::time::sleep(wait).await;
+                // Do not start another potentially slow operation at the deadline.
+                if started.elapsed() >= policy.timeout {
+                    return Err(error).context("rollback initialization retry limit reached");
+                }
+                delay = delay.saturating_mul(2).min(policy.max_delay);
+            }
+        }
+    }
+}
+
+struct InitializedGeneration {
+    state: AppState,
+    reconciliation_snapshot: sm_server::sessions::SeatSessionReconciliationSnapshot,
+    poller: Option<Arc<IdentityPoller>>,
+    local_model: Option<Arc<sm_server::local_model::ModelHost>>,
+    #[cfg(target_os = "macos")]
+    local_walls: Option<Arc<sm_server::local_wall::recovery::GenerationWalls>>,
+}
+
+fn initialize_generation(
+    config: &AppConfig,
+    port: u16,
+    queue_state_dir: &std::path::Path,
+    shutdown: &Shutdown,
+    btw_workers: &BtwWorkers,
+) -> Result<InitializedGeneration> {
+    #[cfg(target_os = "macos")]
+    let local_walls = if config.rust_core.runtime_enabled {
+        let directory = sm_server::config::test_isolation_root_from_environment()?
+            .map(|root| root.join("local-egress"))
+            .unwrap_or_else(|| expand_home("~/.local/share/claude-sessions/local-egress"));
+        let walls = Arc::new(sm_server::local_wall::recovery::GenerationWalls::new(
+            queue_state_dir.to_path_buf(),
+            expand_home(&config.local_judge.python),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            &config.local_host.base_url,
+            sm_server::local_egress::ServiceClient::new(directory, std::env::current_exe()?),
+            sm_server::local_judge::LocalJudgeRuntime::from_config(config),
+        )?);
+        Some(walls)
+    } else {
+        None
+    };
+
+    let state = AppState::try_new(config.clone())
+        .context("failed to initialize server state")?
+        .with_listen_port(port)
+        .with_shutdown(shutdown.clone())
+        .with_btw_workers(btw_workers.clone());
+    #[cfg(target_os = "macos")]
+    let state = if let Some(walls) = &local_walls {
+        state.with_local_walls(walls.clone())
+    } else {
+        state
+    };
+    let local_model = if config.rust_core.runtime_enabled {
+        state.register_local_model()?;
+        Some(
+            sm_server::local_model::live(queue_state_dir)
+                .context("local model registration missing")?,
+        )
+    } else {
+        None
+    };
+    // Capture the artifact boundary before serving. The background scan may run
+    // alongside live creates, but it must not attribute their new artifacts
+    // against this startup snapshot of the seat registry.
+    let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let reconciliation_snapshot = state
+        .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
+        .context("failed to snapshot sessions for usage ledger reconciliation")?;
+
+    let poller = if state.config().usage.enabled {
+        Some(Arc::new(IdentityPoller::new(
+            expand_home(&state.config().usage.db_path),
+            expand_home("~/.claude.json"),
+            expand_home("~/.codex/auth.json"),
+        )?))
+    } else {
+        None
+    };
+    Ok(InitializedGeneration {
+        state,
+        reconciliation_snapshot,
+        poller,
+        local_model,
+        #[cfg(target_os = "macos")]
+        local_walls,
+    })
 }
 
 fn write_active_slot(state_dir: &std::path::Path) -> Result<()> {
@@ -994,7 +1114,158 @@ fn raised_open_file_soft_limit(soft: u64, hard: u64, target: u64) -> Option<u64>
 
 #[cfg(test)]
 mod tests {
-    use super::raised_open_file_soft_limit;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_initialization_failure_stops_at_five_minutes() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = Vec::new();
+        let result: Result<()> = initialize_with_retry(Some(ROLLBACK_INITIALIZATION_RETRY), || {
+            attempts.push(started.elapsed().as_secs());
+            anyhow::bail!("persistent shared-state failure")
+        })
+        .await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("rollback initialization retry limit reached"));
+        assert!(error.contains("persistent shared-state failure"));
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+        assert_eq!(&attempts[..6], &[0, 1, 3, 7, 15, 25]);
+        assert_eq!(attempts.last(), Some(&295));
+        assert!(attempts.windows(2).all(|pair| pair[1] - pair[0] <= 10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_start_and_replacement_initialization_fail_without_retry() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let result: Result<()> = initialize_with_retry(None, || {
+            attempts += 1;
+            anyhow::bail!("cold startup failure")
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "cold startup failure");
+        assert_eq!(attempts, 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    // This exercises real AppState recovery and HTTP, without launchd or live
+    // stores. The listener survives stopping the old generation and two failed
+    // initializations, then answers a request queued during the outage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_initialization_recovers_on_retained_listener() {
+        use std::{
+            fs,
+            io::{Read, Write},
+            net::TcpStream,
+        };
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = sm_server::config::test_isolation_root_from_environment()
+            .unwrap()
+            .expect("run through scripts/test-rust-isolated.sh")
+            .join("rollback-initialization");
+        fs::create_dir_all(&root).unwrap();
+        let _fixture = Fixture(root.clone());
+        let mut config = AppConfig::default();
+        config.paths.state_file = root.join("sessions.json").to_string_lossy().into_owned();
+        config.rust_core.runtime_enabled = false;
+        config.usage.enabled = false;
+        config.terminal_direct.lan.enabled = false;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let btw_workers = BtwWorkers::default();
+
+        fn serve(
+            listener: &std::net::TcpListener,
+            state: AppState,
+            shutdown: &Shutdown,
+        ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+            let serving = TcpListener::from_std(listener.try_clone().unwrap()).unwrap();
+            let mut stopped = shutdown.subscribe();
+            tokio::spawn(async move {
+                axum::serve(
+                    serving,
+                    router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.changed().await;
+                })
+                .await
+            })
+        }
+
+        let old_shutdown = Shutdown::default();
+        let old =
+            initialize_generation(&config, address.port(), &root, &old_shutdown, &btw_workers)
+                .unwrap();
+        let old_server = serve(&listener, old.state, &old_shutdown);
+        tokio::task::spawn_blocking(move || handover::probe_health(address))
+            .await
+            .unwrap()
+            .unwrap();
+        old_shutdown.stop();
+        old_server.await.unwrap().unwrap();
+
+        // The replacement left state temporarily unreadable. Both retry failures
+        // must come from real initialization, rather than a synthetic error.
+        let state_file = PathBuf::from(&config.paths.state_file);
+        fs::write(&state_file, "invalid session state").unwrap();
+        let mut queued = TcpStream::connect(address).unwrap();
+        queued
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        queued
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let response = tokio::task::spawn_blocking(move || {
+            let mut response = String::new();
+            queued.read_to_string(&mut response).unwrap();
+            response
+        });
+        let shutdown = Shutdown::default();
+        let mut attempts = 0;
+        let recovered = initialize_with_retry(
+            Some(InitializationRetry {
+                timeout: Duration::from_secs(2),
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(20),
+            }),
+            || {
+                attempts += 1;
+                let bind_error = std::net::TcpListener::bind(address).unwrap_err();
+                assert_eq!(bind_error.kind(), std::io::ErrorKind::AddrInUse);
+                if attempts == 3 {
+                    fs::remove_file(&state_file).unwrap();
+                }
+                let result =
+                    initialize_generation(&config, address.port(), &root, &shutdown, &btw_workers);
+                if attempts < 3 {
+                    assert!(
+                        result.is_err(),
+                        "corrupt session state must fail initialization"
+                    );
+                }
+                result
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let server = serve(&listener, recovered.state, &shutdown);
+        assert!(response.await.unwrap().starts_with("HTTP/1.1 200"));
+        tokio::task::spawn_blocking(move || handover::probe_health(address))
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.stop();
+        server.await.unwrap().unwrap();
+    }
 
     const UNLIMITED: u64 = nix::libc::RLIM_INFINITY;
 
