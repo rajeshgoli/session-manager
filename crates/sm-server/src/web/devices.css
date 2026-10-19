@@ -4,7 +4,7 @@
 .device-settings p { margin: 0 0 12px; }
 .device-sign-in { padding-bottom: 12px; }
 .device-list { list-style: none; margin: 0; padding: 0; }
-.device-list > li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.device-list > li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
 .device-description { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
 .device-description > span { color: var(--ink-2); font-size: .9rem; }
 .device-list > li > button { flex-shrink: 0; }
@@ -24,3 +24,11 @@
 .worktree-keep { display: flex; flex-wrap: wrap; gap: 6px; }
 .worktree-keep input { min-width: 10rem; }
 @media (max-width: 600px) { .worktree-actions { justify-content: flex-start; max-width: none; } }
+
+.device-ssh { flex: 1 0 100%; min-width: 0; order: 1; }
+.device-ssh h4 { margin: 0 0 6px; font-size: .9rem; }
+.device-ssh ul { list-style: none; padding: 0; margin: 0 0 8px; }
+.device-ssh li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.device-ssh code { overflow-wrap: anywhere; min-width: 0; }
+.device-ssh-paste { display: block; margin-bottom: 8px; }
+.device-ssh textarea { display: block; width: 100%; margin-top: 6px; }

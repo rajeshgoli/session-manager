@@ -1,0 +1,201 @@
+// Plain shell web journeys. Run with node --test; PLAYWRIGHT_MODULE may point to playwright-core/index.mjs.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile, mkdir } from 'node:fs/promises';
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const assets = new URL('../crates/sm-server/src/web/', import.meta.url);
+const ORIGIN = 'https://sm.test';
+const doc = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="/assets/vendor/xterm.css">
+<script type="importmap">{"imports":{"preact":"/assets/vendor/preact.module.js","preact/hooks":"/assets/vendor/hooks.module.js","htm":"/assets/vendor/htm.module.js"}}</script>
+<script id="sm-config" type="application/json">{"inbox_token":"fixture","refresh_seconds":3}</script>
+<script type="module" src="/assets/app.js"></script></head><body><div id="app"></div></body></html>`;
+const cwd = '/Users/r/projects/session-manager';
+const row = (id, shell = false, busy = false) => ({
+  id, name: shell ? 'zsh · session-manager' : id, kind: shell ? 'shell' : 'agent', provider: shell ? 'shell' : 'claude',
+  state: busy ? 'working' : 'idle', working_dir: cwd, repo: cwd, claims: [], jobs: [], docs: [], waiting_on: [],
+  facts: shell ? { text: busy ? 'running · cargo bench' : 'last input 12m', agent: { state: busy ? 'working' : 'idle' } }
+    : { agent: { state: 'idle' }, jobs: { text: 'No jobs' } },
+  attention: { section: busy ? 'moving' : 'idle', order_key: id },
+});
+const settings = () => ({ new_agent: { provider: 'claude', claude: {}, codex: {}, workspaces: [cwd], agent_types: [] },
+  terminal_limits: {}, terminal_config_limits: { plain_terminal_enabled: true, max_plain_terminals: 4, idle_reap_minutes: 180, tunnel_linger_minutes: 15 } });
+function sockets() {
+  window.sockets = [];
+  window.WebSocket = class {
+    static OPEN = 1;
+    constructor(url) {
+      this.url = url; this.readyState = 0; window.sockets.push(this);
+      setTimeout(() => {
+        if (window.failDirect) { this.readyState = 3; this.onclose({ code: 1006 }); return; }
+        this.readyState = 1; this.onopen();
+      }, 5);
+    }
+    send(text) {
+      const frame = JSON.parse(text);
+      if (frame.type === 'auth') setTimeout(() => this.onmessage({ data: JSON.stringify({ type: 'status', state: 'attached' }) }), 5);
+    }
+    close() { this.readyState = 3; }
+  };
+  navigator.clipboard.writeText = async text => { window.copied = text; };
+}
+async function setup(browser, { width = 1440, home = false, failDirect = false } = {}) {
+  const page = await browser.newPage({ viewport: { width, height: 1000 } });
+  await page.addInitScript(sockets);
+  await page.addInitScript(value => { window.failDirect = value; }, failDirect);
+  const errors = [], requests = [];
+  page.on('pageerror', e => errors.push(e.message));
+  const state = { sessions: [row('agent'), row('term-abcd', true), row('term-busy', true, true)], settings: settings(),
+    keys: [{ fingerprint: 'SHA256:abc+/=', public_key: 'ssh-ed25519 AAAA fixture' }, { fingerprint: 'SHA256:revoked', revoked_at: '2026-10-19' }], routeError: null, createError: null };
+  await page.route('**/*', async route => {
+    const req = route.request(), url = new URL(req.url()), path = url.pathname;
+    const json = (body, status = 200) => route.fulfill({ json: body, status });
+    if (path.startsWith('/assets/')) return route.fulfill({ body: await readFile(new URL(path.slice(8), assets)), contentType: path.endsWith('.css') ? 'text/css' : 'text/javascript' });
+    if (req.isNavigationRequest()) return route.fulfill({ body: doc, contentType: 'text/html' });
+    if (path === '/client/terminal/probe') return home ? json({ instance: 'one' }) : route.abort();
+    if (req.method() !== 'GET') requests.push({ path, method: req.method(), body: req.postData() ? req.postDataJSON() : null });
+    if (path === '/watch/state') return json({ sessions: state.sessions, counts: {} });
+    if (/browser-attach-ticket$/.test(path)) return json({ ws_url: '/client/terminal', ticket_id: 'one', ticket_secret: 'secret', server_instance: 'one',
+      direct: home ? [{ url: 'ws://localhost:8420/client/terminal', probe: 'http://localhost:8420/client/terminal/probe' }] : [] });
+    if (path === '/terminals' && req.method() === 'POST') {
+      if (state.createError) return json(state.createError, 409);
+      return json({ id: 'term-abcd', cwd }, 201);
+    }
+    if (/^\/terminals\/[^/]+\/route$/.test(path)) {
+      const away = req.postDataJSON().where === 'away';
+      if (away && state.routeError) return json({ detail: state.routeError }, 409);
+      return json({ ssh_host: away ? 'studio-away' : 'studio-lan.rajeshgo.li', ssh_user: 'rajesh', ssh_port: 22222, tmux_session: 'term-abcd',
+        command: away ? `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd` : `ssh -t -p 22222 rajesh@studio-lan.rajeshgo.li tmux -L 'session-manager' attach-session -t term-abcd` });
+    }
+    if (/^\/terminals\/[^/]+$/.test(path) && req.method() === 'DELETE') {
+      state.sessions = state.sessions.filter(s => s.id !== path.split('/').at(-1)); return json({});
+    }
+    if (path === '/client/settings') {
+      if (req.method() === 'PUT') Object.assign(state.settings.terminal_limits, req.postDataJSON().terminal_limits);
+      return json(state.settings);
+    }
+    if (path === '/client/devices') return json({ devices: [{ user_id: 'owner', device_key_id: 'macbook', device_name: 'MacBook', kind: 'computer' }] });
+    if (/^\/devices\/macbook\/ssh-keys/.test(path)) {
+      if (req.method() === 'POST') state.keys.push({ fingerprint: 'SHA256:new', public_key: req.postDataJSON().public_key });
+      if (req.method() === 'DELETE') state.keys = state.keys.filter(k => k.fingerprint !== decodeURIComponent(path.split('/').at(-1)));
+      return json({ keys: state.keys });
+    }
+    return json({});
+  });
+  return { page, requests, state, errors };
+}
+
+for (const width of [390, 1440]) test(`Shell menus, facts, details and explicit tunnel at ${width}px`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, requests, state, errors } = await setup(browser, { width });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+    await page.getByRole('button', { name: 'Copy', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.copied), `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd`);
+    assert.equal(await page.evaluate(() => window.sockets.length), 0);
+    assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
+    assert.equal(await page.getByText('Hand off…', { exact: true }).count(), 0);
+    await page.getByRole('button', { name: 'More', exact: true }).click();
+    assert.equal(await page.getByRole('button', { name: 'Clone', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: 'Follow', exact: true }).count(), 0);
+    await page.getByRole('button', { name: 'Copy ssh command', exact: true }).click();
+    assert.match(await page.evaluate(() => window.copied), /studio-away/);
+    state.routeError = 'no_ssh_key';
+    await page.getByRole('button', { name: 'Open tunnel', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: 'Add an SSH public key' }).waitFor();
+    state.routeError = null;
+    await page.getByRole('button', { name: 'Open tunnel', exact: true }).click();
+    await page.getByText('Tunnel open. Run the SSH command to attach.').waitFor();
+    await page.getByRole('button', { name: 'Details', exact: true }).click();
+    await page.getByRole('heading', { name: 'Folder', exact: true }).waitFor();
+    assert.equal(await page.locator('.term-panel textarea').count(), 0);
+    assert.equal(await page.locator('.term-panel').getByText('Hand off…', { exact: true }).count(), 0);
+    await page.getByRole('button', { name: 'Close details', exact: true }).click();
+    if (width === 1440) {
+      const busy = page.locator('.sw-row').filter({ hasText: 'running · cargo bench' });
+      assert.equal(await busy.locator('.sw-shell').textContent(), '▹');
+      assert.equal(await busy.locator('.sw-fact').getAttribute('class'), 'sw-fact muted');
+    }
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-away-${width}.png` }); }
+    await page.getByRole('button', { name: 'Retire', exact: true }).click();
+    await page.getByRole('button', { name: 'Retire', exact: true }).click();
+    await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
+    assert.ok(requests.some(r => r.path === '/terminals/term-abcd' && r.method === 'DELETE'));
+    assert.ok(!requests.some(r => /\/sessions\/term-abcd\/(retire|restore)/.test(r.path)));
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+for (const failDirect of [false, true]) test(`Home shell attaches directly; failure never opens public relay: ${failDirect}`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await setup(browser, { home: true, failDirect });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    if (failDirect) await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+    else await page.waitForSelector('[data-connection="Live"]');
+    const urls = await page.evaluate(() => window.sockets.map(s => s.url));
+    assert.deepEqual(urls, ['ws://localhost:8420/client/terminal']);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Agent New shell here follows Clone, reports cap, then opens shell from that session', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, requests, state, errors } = await setup(browser);
+    await page.goto(`${ORIGIN}/terminal/agent`);
+    await page.waitForSelector('[data-connection="Live"]');
+    await page.getByRole('button', { name: 'More', exact: true }).click();
+    const buttons = await page.locator('.pop.menu button').allTextContents();
+    assert.equal(buttons[buttons.indexOf('Clone') + 1], 'New shell here');
+    state.createError = { detail: 'too_many_terminals', terminals: [{ id: 'term-old', cwd }] };
+    await page.getByRole('button', { name: 'New shell here', exact: true }).click();
+    await page.getByText(/Too many open shells.*term-old/).waitFor();
+    state.createError = null;
+    await page.getByRole('button', { name: 'New shell here', exact: true }).click();
+    await page.waitForURL('**/terminal/term-abcd');
+    assert.deepEqual(requests.filter(r => r.path === '/terminals').at(-1).body, { from_session: 'agent' });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('New agent Terminal requests only folder; Settings save limits and manage device keys', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, requests, errors } = await setup(browser);
+    await page.goto(`${ORIGIN}/`);
+    await page.getByRole('button', { name: 'New agent', exact: true }).click();
+    await page.getByRole('button', { name: /▹ Terminal/ }).click();
+    assert.equal(await page.getByText('First message', { exact: true }).count(), 0);
+    assert.equal(await page.locator('.pop input').count(), 0);
+    assert.equal(await page.getByText('Model', { exact: true }).count(), 0);
+    await page.getByRole('button', { name: 'Start', exact: true }).click();
+    await page.waitForURL('**/terminal/term-abcd');
+    assert.deepEqual(requests.find(r => r.path === '/terminals').body, { cwd });
+    await page.goto(`${ORIGIN}/settings#terminals`);
+    const limit = page.getByRole('spinbutton', { name: 'Open shells', exact: true });
+    await limit.fill('6'); await limit.blur();
+    await page.waitForResponse(r => new URL(r.url()).pathname === '/client/settings' && r.request().method() === 'PUT');
+    assert.equal(requests.filter(r => r.path === '/client/settings').at(-1).body.terminal_limits.max_plain_terminals, 6);
+    assert.equal(await page.getByRole('spinbutton', { name: 'Close idle shells after (minutes)', exact: true }).getAttribute('min'), '15');
+    assert.equal(await page.getByRole('spinbutton', { name: 'Close unused SSH tunnel after (minutes)', exact: true }).getAttribute('max'), '120');
+    await page.getByRole('switch', { name: 'Enable plain shells', exact: true }).click();
+    await page.waitForFunction(() => document.body.textContent.includes('Saved'));
+    await page.goto(`${ORIGIN}/settings#devices-access`);
+    const keys = page.getByRole('region', { name: 'SSH keys for MacBook', exact: true });
+    await keys.getByText('SHA256:abc+/=', { exact: true }).waitFor();
+    assert.equal(await keys.getByText('SHA256:revoked', { exact: true }).count(), 0);
+    await keys.getByRole('button', { name: 'Add key', exact: true }).click();
+    await keys.getByRole('textbox').fill('ssh-rsa not-supported');
+    await keys.getByRole('button', { name: 'Save key', exact: true }).click();
+    await keys.getByText('Paste one Ed25519 public key beginning with ssh-ed25519.').waitFor();
+    await keys.getByRole('textbox').fill('ssh-ed25519 AAAA test-device');
+    await keys.getByRole('button', { name: 'Save key', exact: true }).click();
+    await keys.getByText('SHA256:new', { exact: true }).waitFor();
+    await keys.getByRole('button', { name: 'Remove SSH key SHA256:abc+/=', exact: true }).click();
+    await keys.getByText('SHA256:abc+/=', { exact: true }).waitFor({ state: 'detached' });
+    assert.ok(requests.some(r => r.path === '/devices/macbook/ssh-keys/SHA256%3Aabc%2B%2F%3D' && r.method === 'DELETE'));
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

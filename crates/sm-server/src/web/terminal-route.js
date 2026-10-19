@@ -17,6 +17,9 @@ export function relayRoute(ticket, location) {
   return { url: url.href, direct: false, label: loopback(location.hostname) ? 'Direct' : 'Cloudflare' };
 }
 
+/** Shells can use the browser only through localhost or the selected direct listener. */
+export const shellBrowserAllowed = route => !!route.direct || loopback(new URL(route.url).hostname);
+
 /** The remembered route, if it is under ten minutes old and names this server instance. */
 function remembered(storage, instance, now) {
   try {

@@ -99,6 +99,9 @@ const TERMINAL_LIMITS = [
   ['per_user', 'Open terminals (you)', 1, 256, 'How many terminals you can have open at once, across the web and the phone.'],
   ['per_session', 'Viewers per agent', 1, 256, 'How many terminals can show the same agent at once.'],
   ['global', 'Open terminals (everyone)', 1, 256, 'All terminals on this server at once.'],
+  ['max_plain_terminals', 'Open shells', 1, 16, 'Maximum live shells. At the limit, close one before opening another.'],
+  ['idle_reap_minutes', 'Close idle shells after (minutes)', 15, 1440, 'Closes only idle prompts with no attached viewer or running process.'],
+  ['tunnel_linger_minutes', 'Close unused SSH tunnel after (minutes)', 1, 120, 'Time after the last away SSH connection ends. Studio SSH always-on overrides this.'],
   ['max_attach_seconds', 'Longest session (seconds)', 60, 86400, 'A terminal closes after this long; reconnect to continue.'],
 ];
 const terminalLimit = (value, min, max) => {
@@ -347,8 +350,11 @@ function Reviews({ data, write }) {
 }
 
 function TerminalLimits({ data, config, write }) {
-  return html`<h2>Terminals</h2><p class="sub">Shared with the phone. Changes apply to the next terminal you open. Reset restores the configured value shown in the field.
+  return html`<h2>Terminals</h2><p class="sub">Shared with the phone. Shell settings apply immediately; viewer limits apply to the next terminal you open. Reset restores the configured value shown in the field.
     A terminal that stops answering for 30 seconds closes on its own.</p>
+    <${Field} label="Enable plain shells" type="checkbox" initial=${data.plain_terminal_enabled ?? config.plain_terminal_enabled ?? true}
+      hint="Turning this off immediately retires every shell and closes shell SSH access. Studio SSH always-on keeps its tunnel."
+      save=${value => write('/client/settings', { terminal_limits: { plain_terminal_enabled: value } })} />
     <div class="settings-grid">${TERMINAL_LIMITS.map(([key, label, min, max, hint]) => html`<${Field}
       label=${label} type="number" min=${String(min)} max=${String(max)} initial=${data[key]} placeholder=${String(config[key] ?? '')} reset=${true} hint=${hint}
       save=${value => write('/client/settings', { terminal_limits: { [key]: terminalLimit(value, min, max) } })} />`)}</div>`;

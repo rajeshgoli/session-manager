@@ -176,6 +176,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             await page.locator('.details-band').waitFor();
             if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
             const actions = page.locator('.details-band .acts');
+            await actions.waitFor();
             assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button, :scope > .retire-action > button').allInnerTexts(),
               ['Open in Claude ↗', '⌨ Terminal', 'Retire', 'Hand off…', '⋯']);
             if (shots) await page.screenshot({ path: `${shots}/retire-band-${viewport.width}-${colorScheme}.png`, fullPage: true });
@@ -193,7 +194,7 @@ test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone siz
             await actions.getByRole('button', { name: 'More' }).click();
             const menu = actions.locator('.pop.menu');
             assert.deepEqual(await menu.locator(':scope > button').allInnerTexts(),
-              ['Hand off now', 'Clone', 'Follow', 'Copy attach command', 'Rename…', 'Pin a note…']);
+              ['Hand off now', 'Clone', 'New shell here', 'Follow', 'Copy attach command', 'Rename…', 'Pin a note…']);
             const menuBox = await menu.boundingBox();
             const bandBox = await page.locator('.details-band').boundingBox();
             assert.ok(menuBox.x >= bandBox.x && menuBox.x + menuBox.width <= bandBox.x + bandBox.width,

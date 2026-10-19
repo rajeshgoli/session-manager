@@ -2,7 +2,7 @@
 // Spec 1782 G3 and G4 item 3: which socket the web terminal opens, and the round-trip text.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chooseRoute, relayRoute, medianMs, routeText } from '../../crates/sm-server/src/web/terminal-route.js';
+import { chooseRoute, relayRoute, shellBrowserAllowed, medianMs, routeText } from '../../crates/sm-server/src/web/terminal-route.js';
 
 const page = { href: 'https://sm.example.com/terminal/abc', protocol: 'https:', hostname: 'sm.example.com' };
 const LOCAL = { url: 'ws://localhost:8420/client/terminal', probe: 'http://localhost:8420/client/terminal/probe' };
@@ -105,4 +105,14 @@ test('round trip: the median of the last three, in whole ms', () => {
   assert.equal(routeText('Direct', []), 'Direct');
   assert.equal(routeText('Direct', [2.9, 3.4, 12]), 'Direct · 3 ms');
   assert.equal(routeText('Cloudflare', [61, 48, 52]), 'Cloudflare · 52 ms');
+});
+
+
+test('shell browser attach permits chosen direct listeners and loopback only', () => {
+  assert.equal(shellBrowserAllowed({ url: LOCAL.url, direct: true }), true);
+  assert.equal(shellBrowserAllowed({ url: LAN.url, direct: true }), true);
+  for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+    assert.equal(shellBrowserAllowed({ url: `ws://${host}:8420/client/terminal`, direct: false }), true);
+  }
+  assert.equal(shellBrowserAllowed({ url: 'wss://sm.example.com/client/terminal', direct: false }), false);
 });

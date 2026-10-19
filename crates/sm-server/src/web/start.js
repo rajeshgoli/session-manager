@@ -4,6 +4,8 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, Popover, Seg, homeRelative, openPanel, toast } from './ui.js';
 import { TypePicker, OTHER_TYPE, agentTypes, matchType } from './launch-fields.js';
+import { createShell, shellError } from './shell.js';
+const TERMINAL_TYPE = '__terminal__';
 
 export const EFFORTS = {
   claude: ['low', 'medium', 'high', 'max'],
@@ -113,6 +115,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   const [busy, setBusy] = useState(false);
   const [other, setOther] = useState(false);
   const [allFolders, setAllFolders] = useState(false);
+  const [terminal, setTerminal] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -141,7 +144,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
 
   const folder = form && (form.workspace === OTHER ? form.otherWorkspace.trim() : form.workspace);
   useEffect(() => {
-    if (!form) return undefined;
+    if (!form || terminal) return undefined;
     // A slower answer for an earlier provider or folder must not replace this one.
     let current = true;
     const query = new URLSearchParams({ provider: form.provider });
@@ -150,7 +153,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
       .then((value) => current && setModels(value.models || []))
       .catch(() => current && setModels([]));
     return () => { current = false; };
-  }, [form && form.provider, folder]);
+  }, [form && form.provider, folder, terminal]);
 
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
   const switchProvider = (provider) => {
@@ -160,7 +163,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
   };
 
   const start = async () => {
-    if (localBlocked(local, form.provider)) { setError(local?.reason || 'no local model loaded'); return; }
+    if (!terminal && localBlocked(local, form.provider)) { setError(local?.reason || 'no local model loaded'); return; }
     if (!validWorkspace(folder)) {
       setError('Choose a workspace: an absolute path or ~/ path.');
       setExpanded(true);
@@ -168,6 +171,12 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     }
     setBusy(true);
     setError(null);
+    if (terminal) {
+      try { await createShell({ cwd: folder }); onClose(); }
+      catch (e) { setError(shellError(e)); }
+      finally { setBusy(false); }
+      return;
+    }
     const body = { provider: form.provider, working_dir: folder };
     if (form.model) body.model = form.model;
     if (form.provider === 'opencode') {
@@ -208,14 +217,16 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     const summary = [form.model || providerDefaultModel(form.provider), ...(form.provider === 'opencode' ? [] : [form.effort || 'default effort']), homeRelative(folder) || 'no workspace'];
     const modelOptions = models.includes(form.model) || !form.model ? models : [form.model, ...models];
     const matched = matchType(agentTypes(settings), { ...form, reasoning_effort: form.effort });
-    const chosen = other ? OTHER_TYPE : form.provider === 'opencode' ? LOCAL_TYPE : matched || OTHER_TYPE;
+    const chosen = terminal ? TERMINAL_TYPE : other ? OTHER_TYPE : form.provider === 'opencode' ? LOCAL_TYPE : matched || OTHER_TYPE;
     const pick = (type) => {
+      setTerminal(false);
       setOther(!type);
       if (type) set({ provider: type.provider, model: type.model, effort: type.effort });
     };
     content = html`
       <${TypePicker} settings=${settings} value=${chosen} onPick=${pick}
-        extra=${localPreset(local, model => { setOther(false); set({ provider: 'opencode', model, effort: null }); })} />
+        extra=${[localPreset(local, model => { setTerminal(false); setOther(false); set({ provider: 'opencode', model, effort: null }); }),
+          { key: TERMINAL_TYPE, title: '▹ Terminal', detail: 'zsh in a folder', onPick: () => { setTerminal(true); setError(null); } }].filter(Boolean)} />
       ${chosen === OTHER_TYPE
         ? html`
           <${Seg} label="Provider" value=${form.provider} onChange=${switchProvider} options=${providerOptions(local)} />
@@ -228,7 +239,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
             <${Seg} label="Effort" value=${form.effort || ''} onChange=${(value) => set({ effort: value || null })}
               options=${[{ value: '', label: 'default' }, ...(EFFORTS[form.provider] || []).map((e) => ({ value: e, label: e }))]} /></div>`}`
         : null}
-      ${expanded
+      ${expanded || terminal
         ? html`
           <div class="fld"><span class="l">Workspace</span>
             <select class="inp" value=${form.workspace} onChange=${(e) => {
@@ -246,11 +257,11 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
                 value=${form.otherWorkspace} onInput=${(e) => set({ otherWorkspace: e.target.value })} /></div>`
             : null}
           ${settings.workspace_error ? html`<p class="muted">${settings.workspace_error}</p>` : null}
-          <div class="fld"><span class="l">Name</span>
+          ${terminal ? null : html`<div class="fld"><span class="l">Name</span>
             <input class="inp" placeholder="sm picks one" value=${form.name} onInput=${(e) => set({ name: e.target.value })} /></div>
           <div class="fld top"><span class="l">First message</span>
             <textarea class="inp" rows="4" placeholder="Optional" value=${form.message}
-              onInput=${(e) => set({ message: e.target.value })}></textarea></div>`
+              onInput=${(e) => set({ message: e.target.value })}></textarea></div>`}`
         : html`
           <div class="line"><span>${summary.join(' · ')}</span>
             <button type="button" class="link-btn" onClick=${() => setExpanded(true)}>Change</button></div>
@@ -258,7 +269,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
       ${error ? html`<p class="err">${error}</p>` : null}
       <div class="row">
         <button type="button" class="btn" onClick=${onClose}>Cancel</button>
-        <button type="button" class="btn pri" disabled=${busy || localBlocked(local, form.provider)} onClick=${start}>${busy ? (form.provider === 'opencode' && !local?.models?.length ? 'Loading model…' : 'Starting…') : 'Start'}</button>
+        <button type="button" class="btn pri" disabled=${busy || (!terminal && localBlocked(local, form.provider))} onClick=${start}>${busy ? (!terminal && form.provider === 'opencode' && !local?.models?.length ? 'Loading model…' : 'Starting…') : 'Start'}</button>
       </div>`;
   }
   return html`<${Popover} onClose=${onClose} align="right">
