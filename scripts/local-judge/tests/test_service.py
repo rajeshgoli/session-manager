@@ -317,6 +317,8 @@ class JudgeTests(unittest.TestCase):
         self.assertIn(f"Working directory: {self.wt / 'sub'}", shown)
         self.ruling(tin={'command': 'sm queue run --type background --label x --cwd sub -- python upload.py'})
         self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
+        self.ruling(tin={'command': 'python -m sub.upload'})
+        self.assertIn('data=b"x"', self.model.requests[-1]['messages'][0]['content'])
 
     def test_git_control_metadata_cannot_be_written(self):
         (self.wt / 'config-link').symlink_to(self.wt / '.git/config')

@@ -445,8 +445,14 @@ def scanned_scripts(command, cwd, agent):
             bases.append(os.path.join(cwd, os.path.expanduser(tokens[index + 1])))
         elif token.startswith("--cwd="):
             bases.append(os.path.join(cwd, os.path.expanduser(token[len("--cwd="):])))
+    # `python -m pkg.mod` runs pkg/mod.py (or pkg/mod/__main__.py) from the
+    # working directory; show it like any other script file.
+    modules = [tokens[i + 1] for i, t in enumerate(tokens[:-1]) if t == "-m"]
     for base in dict.fromkeys(os.path.realpath(d) for d in bases):
-        for path, text in script_texts(command, base, agent):
+        runs = [command] + [f"python3 {os.path.join(base, *m.split('.'))}{suffix}"
+                            for m in modules if re.fullmatch(r"[\w.]+", m)
+                            for suffix in (".py", "/__main__.py")]
+        for path, text in (item for run in runs for item in script_texts(run, base, agent)):
             if os.path.isabs(path) and path in paths:
                 continue
             paths.add(path)
