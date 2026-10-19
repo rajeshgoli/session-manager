@@ -105,6 +105,37 @@ function server() {
   return handler;
 }
 
+test('filing a bug immediately signals the mounted board to reload', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.route('**/*', server());
+    await context.route('**/client/bug-reports', route => route.fulfill({ json: {
+      issue: { repo: 'rajeshgoli/session-manager', number: 43, url: 'https://github.com/rajeshgoli/session-manager/issues/43' },
+      on_board: true, started: null, start_error: null,
+    } }));
+    const page = await context.newPage();
+    await page.goto(`${origin}/notes`);
+    await page.locator('.note-card').first().waitFor();
+    await page.evaluate(async () => {
+      const { h, render } = await import('/assets/vendor/preact.module.js');
+      const { bus } = await import('/assets/ui.js');
+      const { TicketStart } = await import('/assets/board-start.js');
+      window.boardChanges = 0;
+      bus.on('board-changed', () => { window.boardChanges++; });
+      const host = document.createElement('div');
+      host.className = 'board-start-overlay';
+      document.body.append(host);
+      render(h(TicketStart, { mode: 'bug', bug: { page: 'Board' }, onClose: () => render(null, host) }), host);
+    });
+    await page.getByRole('textbox', { name: "What's wrong" }).fill('A filed bug should appear immediately');
+    await page.getByRole('button', { name: 'File bug', exact: true }).click();
+    await page.waitForFunction(() => window.boardChanges === 1);
+    assert.equal(await page.locator('.bug-report').count(), 0);
+    await context.close();
+  } finally { await browser.close(); }
+});
+
 test('page, terminal pane, actions and a version conflict', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   const shots = process.env.SHOTS_DIR;
@@ -140,8 +171,14 @@ test('page, terminal pane, actions and a version conflict', async () => {
       await page.locator('.notes-popover').waitFor();
       if (shots) await page.screenshot({ path: `${shots}/notes-ticket-${width}-${colorScheme}.png` });
       if (width === 1440 && colorScheme === 'light') {
+        await page.evaluate(async () => {
+          window.boardChanges = 0;
+          const { bus } = await import('/assets/ui.js');
+          bus.on('board-changed', () => { window.boardChanges++; });
+        });
         await page.locator('.notes-popover input').fill('rajeshgoli/session-manager');
         await page.locator('.notes-popover').getByRole('button', { name: 'File ticket' }).click();
+        await page.waitForFunction(() => window.boardChanges === 1);
         assert.equal(handler.calls.issues[0].title, 'Review loop brief');
         assert.match(handler.calls.issues[0].body, /Request a review/);
         await page.locator('.note-card').first().locator('.notes-actions').first().getByText('Start agent').click();
@@ -182,7 +219,7 @@ test('page, terminal pane, actions and a version conflict', async () => {
       await terminalContext.route('**/*', server());
       const terminal = await terminalContext.newPage();
       await terminal.goto(`${origin}/terminal/agent`);
-      await terminal.getByText('Live', { exact: true }).waitFor();
+      await terminal.locator('.term-page[data-connection="Live"]').waitFor();
       await terminal.keyboard.press('Meta+j');
       await terminal.locator('.term-panel .note-card').first().waitFor();
       await terminal.locator('.term-panel input[type=search]').fill('loop');

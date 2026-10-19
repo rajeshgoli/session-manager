@@ -1,6 +1,6 @@
 // Ticket Start uses the server-rendered name and brief, shared with the phone.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
+import { html, api, bus, config, Popover, Seg, Toggle, homeRelative, toast, openPanel, stored, store, trimPageData } from './ui.js';
 import { EFFORTS, useLocalModel, useOpen, localBlocked, ensureLocalLoaded, localPreset, localModelName, providerOptions, LocalModelField, LOCAL_TYPE } from './start.js';
 import { TypePicker, OTHER_TYPE, agentTypes, typeConfig, matchType } from './launch-fields.js';
 import { ReviewerEditor, reviewerText, switchKind } from './reviews.js';
@@ -212,6 +212,7 @@ export function TicketStart({ ticket, mode = 'start', bug = null, onClose, onSta
         if (!open.current) return;
       }
       const result = await api('/client/bug-reports', { method: 'POST', body });
+      bus.emit('board-changed');
       if (result.start_error) { setFiled(result); setError(result.start_error); return; }
       onClose();
       toast(filedText(result), result.started ? () => openPanel(`agent:${result.started.session_id}`) : () => window.open(result.issue.url, '_blank', 'noopener'));
