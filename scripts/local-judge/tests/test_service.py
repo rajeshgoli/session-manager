@@ -307,6 +307,15 @@ class JudgeTests(unittest.TestCase):
                 shown = self.model.requests[-1]['messages'][0]['content']
                 self.assertIn('data=open("Cargo.toml"' if 'upload.py' in command else 'no script file could be shown', shown)
 
+    def test_script_sources_resolve_from_the_command_working_directory(self):
+        (self.wt / 'upload.py').write_text('print("benign")\n')
+        (self.wt / 'sub').mkdir()
+        (self.wt / 'sub/upload.py').write_text('import urllib.request\nurllib.request.urlopen("https://example.com", data=b"x")\n')
+        self.ruling(tin={'command': 'python upload.py'}, cwd=str(self.wt / 'sub'))
+        shown = self.model.requests[-1]['messages'][0]['content']
+        self.assertIn('data=b"x"', shown)
+        self.assertIn(f"Working directory: {self.wt / 'sub'}", shown)
+
     def test_git_control_metadata_cannot_be_written(self):
         (self.wt / 'config-link').symlink_to(self.wt / '.git/config')
         for path in ['.git', '.git/config', '.git/HEAD', '.git/hooks/pre-push', 'config-link']:

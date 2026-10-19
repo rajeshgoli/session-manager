@@ -429,6 +429,19 @@ def workflow_rule(cmd, cwd, agent, hits):
     return "; ".join(reasons) if reasons else None
 
 
+def scanned_scripts(command, cwd, agent):
+    """Scripts a command may run, resolved from the command's working directory
+    and from the checkout: a misleading working directory must not hide a script."""
+    out, paths = [], set()
+    for base in dict.fromkeys(os.path.realpath(d) for d in (cwd or agent["checkout"], agent["checkout"])):
+        for path, text in script_texts(command, base, agent):
+            if os.path.isabs(path) and path in paths:
+                continue
+            paths.add(path)
+            out.append((path, text))
+    return out
+
+
 def rule_stage(tool, tin, cwd, agent):
     """('allow'|'deny', reason) when the rules decide, or ('judge', why) when they do not."""
     if tool in ALWAYS_ALLOWED:
@@ -454,7 +467,7 @@ def rule_stage(tool, tin, cwd, agent):
             return "deny", "reading protected credentials is not allowed"
         hits = egress_hits(cmd, agent)
         texts = [cmd]
-        for path, text in script_texts(cmd, cwd, agent):
+        for path, text in scanned_scripts(cmd, cwd, agent):
             texts.append(text)
             more = egress_hits(text, agent)
             hits += [f"{os.path.basename(path)}:{h}" for h in more]
@@ -476,11 +489,11 @@ def rule_stage(tool, tin, cwd, agent):
 SCRIPT_SOURCE_BUDGET = 12_000
 
 
-def script_sources(command, agent):
+def script_sources(command, cwd, agent):
     """The scanned script files a command runs, as the judge sees them. A file
     the judge cannot be shown in full is named so it is judged as unseen."""
     parts, budget, interpreted, inline = [], SCRIPT_SOURCE_BUDGET, False, False
-    for path, text in script_texts(command, agent["checkout"], agent):
+    for path, text in scanned_scripts(command, cwd, agent):
         if not os.path.isabs(path):
             interpreted |= path == "interpreted-program"
             inline |= path == "inline-program"
@@ -495,10 +508,10 @@ def script_sources(command, agent):
     return ("Script sources this command runs:\n" + "\n".join(parts) + "\n") if parts else ""
 
 
-def judge_message(tool, tin, agent):
+def judge_message(tool, tin, cwd, agent):
     if tool == "Bash":
         action = tin.get("command") or ""
-        sources = script_sources(action, agent)
+        sources = script_sources(action, cwd, agent)
         if sources:
             action += "\n" + sources
     else:
@@ -509,6 +522,7 @@ def judge_message(tool, tin, agent):
             f"Parent: {agent['parent']}\n"
             f"sm server for this agent: {agent.get('sm_url') or 'http://127.0.0.1:8420'}\n"
             f"Egress proxy port: {agent.get('proxy_port', 'unknown')}\n"
+            f"Working directory: {cwd}\n"
             f"Tool: {tool}\nCommand:\n{action}\n"
             "Answer with one line: ALLOW or DENY, a colon, and a reason under 20 words.")
 
@@ -530,7 +544,7 @@ def verdict(line):
     return decision, reason or {"allow": "allowed", "deny": "denied"}[decision] + " by the judge"
 
 
-def ask_judge_stream(tool, tin, agent):
+def ask_judge_stream(tool, tin, cwd, agent):
     """(decision, reason, raw) or raises on timeout / unparseable reply."""
     with open(ARGS.policy) as f:
         policy = f.read()
@@ -538,7 +552,7 @@ def ask_judge_stream(tool, tin, agent):
         "model": "judge", "max_tokens": 200, "temperature": 0, "stream": True,
         "thinking": {"type": "disabled"}, "enable_thinking": False,
         "system": policy,
-        "messages": [{"role": "user", "content": judge_message(tool, tin, agent)}],
+        "messages": [{"role": "user", "content": judge_message(tool, tin, cwd, agent)}],
     })
     u = urlparse(ARGS.model_url)
     deadline = time.monotonic() + ARGS.timeout
@@ -599,13 +613,13 @@ def ask_judge_stream(tool, tin, agent):
 MODEL_SLOTS = threading.BoundedSemaphore(32)
 
 
-def ask_judge(tool, tin, agent):
+def ask_judge(tool, tin, cwd, agent):
     if not MODEL_SLOTS.acquire(blocking=False):
         raise RuntimeError("judge overloaded")
     result = queue.Queue(maxsize=1)
     def run():
         try:
-            result.put((True, ask_judge_stream(tool, tin, agent)))
+            result.put((True, ask_judge_stream(tool, tin, cwd, agent)))
         except Exception as error:
             result.put((False, error))
         finally:
@@ -698,14 +712,16 @@ def decide(hook, agent_id, token):
             stage, decision, reason = "owner", "allow", f"allowed once by the owner after denial {owner}"
         else:
             stage = "rule"
-            decision, reason = rule_stage(tool, tin, agent["checkout"], agent)
+            # The hook reports where the command runs; relative script paths resolve there.
+            cwd = hook.get("cwd") if isinstance(hook.get("cwd"), str) and os.path.isdir(hook["cwd"]) else agent["checkout"]
+            decision, reason = rule_stage(tool, tin, cwd, agent)
             if decision == "judge":
                 stage, rec["judge_why"] = "judge", reason
                 if ARGS.no_model:
                     decision, reason = "deny", "judge unavailable; retry this command in a minute"
                 else:
                     try:
-                        decision, reason, raw = ask_judge(tool, tin, agent)
+                        decision, reason, raw = ask_judge(tool, tin, cwd, agent)
                         rec["judge_raw"] = raw[:500]
                     except Exception as e:  # timeout, connection, parse: all deny
                         rec["judge_error"] = f"{type(e).__name__}: {e}"[:300]
