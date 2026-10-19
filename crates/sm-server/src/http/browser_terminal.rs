@@ -195,7 +195,7 @@ pub(super) async fn create_ticket(
         });
     }
     ensure_mobile_terminal_ticket_runtime_enabled(&state)?;
-    let session = resolve_session_or_registry_role(&state, &session_id)?
+    let session = plain_terminals::browser_session(&state, &session_id)?
         .ok_or(ApiError::NotFound("Session not found"))?;
     if session.is_stopped() {
         return Err(ApiError::Status {

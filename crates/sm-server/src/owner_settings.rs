@@ -54,11 +54,14 @@ const QUEUE_LIMITS: [&str; 6] = [
 const QUEUE_LIMIT_MAX: i64 = 16;
 /// Each terminal limit and its allowed range. A value out of range is refused
 /// in a `PUT` and clamped when it comes from config.
-pub const TERMINAL_LIMITS: [(&str, i64, i64); 4] = [
+pub const TERMINAL_LIMITS: [(&str, i64, i64); 7] = [
     ("per_user", 1, 256),
     ("per_session", 1, 256),
     ("global", 1, 256),
     ("max_attach_seconds", 60, 86_400),
+    ("max_plain_terminals", 1, 16),
+    ("idle_reap_minutes", 15, 1440),
+    ("tunnel_linger_minutes", 1, 120),
 ];
 const AGENT_NAME_MAX_CHARS: usize = 32;
 /// Auto-retire delay range in minutes (sm#1839, spec 1821 E2).
@@ -111,6 +114,10 @@ pub fn defaults() -> Value {
             "per_session": null,
             "global": null,
             "max_attach_seconds": null,
+            "plain_terminal_enabled": null,
+            "max_plain_terminals": null,
+            "idle_reap_minutes": null,
+            "tunnel_linger_minutes": null,
         },
         "reviews": {
             "reviewer": { "kind": "github_codex" },
@@ -533,6 +540,9 @@ fn validate_queue_limits(value: &Value) -> Result<(), String> {
 }
 
 fn validate_terminal_limits(value: &Value) -> Result<(), String> {
+    if !value["plain_terminal_enabled"].is_null() && !value["plain_terminal_enabled"].is_boolean() {
+        return Err("terminal_limits.plain_terminal_enabled must be a boolean, or null".into());
+    }
     for (limit, min, max) in TERMINAL_LIMITS {
         let value = &value[limit];
         if !value.is_null()

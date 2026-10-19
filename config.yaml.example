@@ -217,6 +217,13 @@ public_edge:
 # Optional Android in-app HTTPS terminal attach. Disabled by default because it
 # exposes an interactive shell path; enable only for explicitly registered users
 # and app-generated device public keys.
+# Plain login shells; owner settings can override these without a restart.
+terminal_limits:
+  plain_terminal_enabled: true
+  max_plain_terminals: 4       # 1–16 open shells
+  idle_reap_minutes: 180      # 15–1440; never reap a busy or attached shell
+  tunnel_linger_minutes: 15   # 1–120; used by the SSH transport
+
 mobile_terminal:
   enabled: false
   allowed_users:

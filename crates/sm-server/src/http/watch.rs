@@ -315,6 +315,58 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "attach": format!("sm attach {}", name(v)),
         }));
     }
+    for t in plain_terminals::store(state).list(include_stopped)? {
+        if nonempty(&params.session).is_some_and(|id| id != t.id)
+            || nonempty(&params.role).is_some()
+        {
+            continue;
+        }
+        if repo_filter.as_deref().is_some_and(|repo| {
+            repo != t.cwd
+                && !t
+                    .cwd
+                    .starts_with(&format!("{}/", repo.trim_end_matches('/')))
+        }) || nonempty(&params.node).is_some_and(|node| node != state.config.nodes.default_node)
+        {
+            continue;
+        }
+        let stopped = t.state != "live";
+        let busy = t.busy_since.is_some();
+        let section = if stopped {
+            "stopped"
+        } else if busy {
+            "moving"
+        } else {
+            "idle"
+        };
+        if !stopped {
+            live += 1;
+            *counts.entry(section.into()).or_default() += 1;
+        }
+        let command = state
+            .plain_terminal_commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&t.id)
+            .cloned()
+            .unwrap_or_else(|| "command".into());
+        let last = t.last_input_at.as_deref().unwrap_or(&t.created_at);
+        let fact = if busy {
+            format!("running · {command}")
+        } else {
+            format!("last input {}", facts_age(last, now))
+        };
+        let basename = std::path::Path::new(&t.cwd)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        out.push(json!({"id":t.id,"kind":"shell","provider":"shell","name":format!("zsh · {basename}"),"mark":"▹",
+            "state":if stopped {"stopped"} else if busy {"working"} else {"idle"},
+            "working_dir":t.cwd,"repo":t.cwd,"node":state.config.nodes.default_node,"depth":0,"group":t.id,
+            "last_activity":last,"activity_since":t.busy_since.as_deref().unwrap_or(last),
+            "facts":{"text":fact,"tone":"neutral","agent":{"state":if busy {"working"} else {"idle"},"since":last,"text":fact},"jobs":{"running":0,"waiting":0,"text":null},"you":null,"finished":null,"note":null},"attention":{"section":section,"tone":"neutral","reason":null,"sort_key":t.created_at},
+            "claims":[],"docs":[],"waiting_on":[],"jobs":[],"attach":format!("sm shell {}",t.cwd)}));
+    }
     Ok(json!({
         "schema_version": WATCH_SCHEMA_VERSION,
         "generated_at": generated_at(now),
