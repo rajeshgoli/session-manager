@@ -620,6 +620,8 @@ pub struct HandoffRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub failed_at: Option<String>,
+    #[serde(default)]
+    pub completeness_warned_at: Option<String>,
 }
 
 impl HandoffRecord {
@@ -635,6 +637,7 @@ impl HandoffRecord {
             successor_session_id: None,
             error: None,
             failed_at: None,
+            completeness_warned_at: None,
         }
     }
 

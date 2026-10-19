@@ -2,7 +2,7 @@ use super::*;
 
 fn accept(f: &Fixture) {
     let note = crate::handoff::execute::HandoffNote::parse(
-        &json!({"kind":"path","value":"/tmp/local-handoff.md"}),
+        &json!({"kind":"link", "value":"https://example.com/local-handoff.md"}),
     )
     .unwrap();
     assert!(matches!(
@@ -84,7 +84,7 @@ fn failed_opencode_handoff_recovers_empty_successor_teardown_before_a_fresh_ask(
         }]
     );
     let note = crate::handoff::execute::HandoffNote::parse(
-        &json!({"kind":"path","value":"/tmp/again.md"}),
+        &json!({"kind":"link", "value":"https://example.com/again.md"}),
     )
     .unwrap();
     assert!(matches!(

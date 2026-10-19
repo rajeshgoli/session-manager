@@ -82,7 +82,13 @@ pub(super) fn add_review_handoff_ask(
         return;
     };
     match state.session_store.review_handoff_ask(requester, ask) {
-        Ok(Some(text)) => response["handoff_ask"] = json!(text),
+        Ok(Some(text)) => {
+            response["handoff_ask"] = json!(text);
+            match state.session_store.handoff_draft(requester) {
+                Ok(draft) => response["handoff_draft"] = draft,
+                Err(error) => eprintln!("handoff review draft: {error:#}"),
+            }
+        }
         Ok(None) => {}
         Err(error) => eprintln!("handoff ask for {requester} failed: {error:#}"),
     }
@@ -290,12 +296,23 @@ pub(super) async fn post_handoff(
         .get("requester_session_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let note = HandoffNote::parse(body.get("note").unwrap_or(&Value::Null))
-        .map_err(|detail| status(StatusCode::BAD_REQUEST, detail))?;
-    match state
-        .session_store
-        .accept_handoff(&session_id, requester, &note)?
-    {
+    let note = if body["resubmit"] == true {
+        None
+    } else {
+        Some(
+            HandoffNote::parse(body.get("note").unwrap_or(&Value::Null))
+                .map_err(|detail| status(StatusCode::BAD_REQUEST, detail))?,
+        )
+    };
+    let outcome = match note.as_ref() {
+        Some(note) => state
+            .session_store
+            .accept_handoff(&session_id, requester, note)?,
+        None => state
+            .session_store
+            .resubmit_handoff(&session_id, requester)?,
+    };
+    match outcome {
         HandoffAcceptOutcome::Accepted { ready } => {
             if ready {
                 kick_handoff(state.clone(), session_id);
@@ -305,6 +322,10 @@ pub(super) async fn post_handoff(
                 "message": execute::ACCEPTED_TEXT,
             })))
         }
+        HandoffAcceptOutcome::Incomplete(missing) => Err(ApiError::StatusBody {
+            status: StatusCode::CONFLICT,
+            body: json!({"error":"incomplete","missing":missing,"message":incomplete_text(&missing, note.as_ref().and_then(|n|n.source_path.as_deref()))}),
+        }),
         HandoffAcceptOutcome::Forbidden => Err(status(
             StatusCode::FORBIDDEN,
             "sm handoff is self-directed only",
@@ -312,6 +333,126 @@ pub(super) async fn post_handoff(
         HandoffAcceptOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         HandoffAcceptOutcome::Conflict(detail) => Err(status(StatusCode::CONFLICT, detail)),
     }
+}
+
+fn incomplete_text(missing: &[String], path: Option<&str>) -> String {
+    let command = path
+        .map(|path| format!("sm handoff --path {path}"))
+        .unwrap_or_else(|| "sm handoff".into());
+    format!("Your note does not mention: {}.\nSay what the successor should do about each, then run `{command}` again.\n(Run it again unchanged to hand off anyway.)", missing.join(", "))
+}
+
+const SAME_LINE_ONLY: &str = "handoff notes are readable only within your own line of work";
+fn ensure_note_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    id: &str,
+) -> Result<(), ApiError> {
+    if let Some(requester) =
+        header_text(headers, SESSION_HEADER).or_else(|| header_text(headers, "x-sm-session-id"))
+    {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            headers,
+            Some(peer),
+            &format!("/sessions/{id}/handoff-note"),
+        )?;
+        let line = state.session_store.handoff_line_id(&requester)?;
+        if line.is_none() || line != state.session_store.handoff_line_id(id)? {
+            return Err(status(StatusCode::FORBIDDEN, SAME_LINE_ONLY));
+        }
+        Ok(())
+    } else {
+        ensure_owner(state, headers, peer, "/sessions/handoff-note", None)
+    }
+}
+
+pub(super) async fn get_handoff_draft(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    ensure_note_access(&state, &headers, peer, &id)?;
+    ensure_core_writes_enabled(&state)?;
+    if header_text(&headers, SESSION_HEADER).is_some_and(|requester| requester != id) {
+        return Err(status(
+            StatusCode::FORBIDDEN,
+            "drafts are self-directed only",
+        ));
+    }
+    if state.session_store.get_session(&id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    let session = state.session_store.get_session(&id)?.unwrap();
+    if session
+        .handoff
+        .as_ref()
+        .is_some_and(|h| h["state"] == "failed" && h["note"]["kind"] == "stored")
+    {
+        let sha = state
+            .session_store
+            .handoff_draft_record(&id)?
+            .map(|(_, sha)| sha);
+        return Ok(Json(
+            json!({"path":expand_home(&session.working_dir).join(".sm/handoff.md"),"sha256":sha,"resubmit":true}),
+        ));
+    }
+    Ok(Json(state.session_store.handoff_draft(&id)?))
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct HandoffNoteQuery {
+    #[serde(default)]
+    line: Option<String>,
+    #[serde(default)]
+    own: Option<String>,
+}
+
+pub(super) async fn get_handoff_note(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HandoffNoteQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_note_access(&state, &headers, peer, &id)?;
+    if state.session_store.handoff_line_id(&id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    Ok(Json(state.session_store.handoff_note_view(
+        &id,
+        query.line.as_deref() == Some("1"),
+        query.own.as_deref() == Some("1"),
+    )?))
+}
+
+pub(super) async fn post_handoff_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_note_access(&state, &headers, peer, &id)?;
+    ensure_core_writes_enabled(&state)?;
+    if header_text(&headers, SESSION_HEADER).is_some_and(|requester| requester != id) {
+        return Err(status(
+            StatusCode::FORBIDDEN,
+            "source reports are self-directed only",
+        ));
+    }
+    let removed = body["removed"]
+        .as_bool()
+        .ok_or_else(|| status(StatusCode::BAD_REQUEST, "removed must be boolean"))?;
+    state
+        .session_store
+        .report_handoff_source(&id, removed, body["reason"].as_str())?;
+    if body["draft_removed"] == true {
+        state.session_store.remove_handoff_draft_record(&id)?;
+    }
+    Ok(Json(json!({"ok":true})))
 }
 
 /// Handoffs this process is driving, so the sweep never runs one twice.
@@ -360,6 +501,23 @@ pub(super) fn kick_handoff(state: Arc<AppState>, session_id: String) {
 /// its handoff. The Claude Stop hook and `sm handoff` itself kick
 /// a handoff directly, so this is the backstop, not the fast path.
 pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
+    let maintenance_state = state.clone();
+    tokio::spawn(async move {
+        let mut daily = tokio::time::interval(Duration::from_secs(86400));
+        loop {
+            daily.tick().await;
+            if maintenance_state.shutdown().is_stopped() {
+                return;
+            }
+            let store = maintenance_state.session_store.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || store.maintain_handoff_notes())
+                .await
+                .unwrap_or_else(|e| Err(e.into()))
+            {
+                eprintln!("handoff note maintenance: {error:#}");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -441,6 +599,9 @@ pub(super) async fn run_handoff(state: Arc<AppState>, predecessor_id: &str) -> a
     let Some(plan) = state.session_store.claim_handoff_start(predecessor_id)? else {
         return Ok(());
     };
+    state
+        .session_store
+        .cleanup_handoff_before_spawn(predecessor_id)?;
     let successor = match create_successor(&state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {
@@ -503,6 +664,8 @@ pub(super) async fn start_retired_autopm_successor(
                 .to_string()
         });
     let note = HandoffNote {
+        source: None,
+        source_path: None,
         kind: crate::handoff::execute::NoteKind::Path,
         value: note_path,
     };
@@ -521,6 +684,9 @@ pub(super) async fn start_retired_autopm_successor(
             return Err(error);
         }
     };
+    state
+        .session_store
+        .cleanup_handoff_before_spawn(&predecessor.id)?;
     let successor = match create_successor(state, &plan).await {
         Ok(successor) => successor,
         Err(error) => {
@@ -795,7 +961,16 @@ fn move_work(
         original_brief: facts.original_brief.clone(),
     };
     Ok(PreparedBrief {
-        text: brief.text(),
+        text: brief
+            .text()
+            .replace(
+                &format!("Handoff note: {}", facts.note),
+                &crate::sessions::handoff_notes::fallback_brief(&state.config.owner_name),
+            )
+            .replace(
+                "Read the handoff note first, then continue the work.",
+                "Run `sm handoff show`, then continue the work.",
+            ),
         parent_session_id: facts.parent_session_id.clone(),
         facts,
     })

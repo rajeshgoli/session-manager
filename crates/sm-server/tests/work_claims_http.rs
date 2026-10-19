@@ -568,7 +568,7 @@ async fn review_requests_carry_the_handoff_ask_above_the_floor() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["handoff_ask"],
-        "[sm context management] Your context is at 24% and you just requested a review of PR #9, a good point to hand off. Stop at a logical point. sm will move your claims (PR #9) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn."
+        "[sm context management] Your context is at 24% and you just requested a review of PR #9, a good point to hand off. Stop at a logical point. sm will move your claims (PR #9) and pending wakes to a fresh agent. Your handoff note is drafted at /repo/.sm/handoff.md with what sm knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn."
     );
     // A second request in state `asked` does nothing new.
     let (status, body) = request(
@@ -1205,7 +1205,7 @@ async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
         "POST",
         "/sessions/eng00002/handoff",
         Some(json!({"requester_session_id": "eng00001",
-                    "note": {"kind": "path", "value": note.display().to_string()}})),
+                    "note": {"kind": "text", "source":"file", "source_path":note.display().to_string(), "value":"ticket #1 PR #9 eng00002"}})),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -1215,7 +1215,7 @@ async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
         "POST",
         "/sessions/eng00001/handoff",
         Some(json!({"requester_session_id": "eng00001",
-                    "note": {"kind": "path", "value": note.display().to_string()}})),
+                    "note": {"kind": "text", "source":"file", "source_path":note.display().to_string(), "value":"ticket #1 PR #9 eng00002"}})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1276,17 +1276,13 @@ async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
 
     let brief = queued_texts(&f, &successor).join("\n---\n");
     assert!(
-        brief.contains(&format!(
-            "[sm handoff] You are taking over from eng00001-agent (eng00001).\nHandoff note: {}\nWorking directory: /repo (branch 1-item-1)\nYou now hold: ticket #1, PR #9\n",
-            note.display()
-        )),
+        brief.contains("[sm handoff] You are taking over from eng00001-agent (eng00001).\nHandoff note: run `sm handoff show` (the note, then Owner's messages to this line, verbatim).\nWorking directory: /repo (branch 1-item-1)\nYou now hold: ticket #1, PR #9\n"),
         "{brief}"
     );
     let notice = queued_texts(&f, "lead0001").join("\n");
     assert!(
         notice.contains(&format!(
-            "[sm handoff] eng00001-agent (eng00001) handed off to eng00001-agent-h2 ({successor}). Note: {}",
-            note.display()
+            "[sm handoff] eng00001-agent (eng00001) handed off to eng00001-agent-h2 ({successor}). Note: sm handoff show eng00001"
         )),
         "{notice}"
     );

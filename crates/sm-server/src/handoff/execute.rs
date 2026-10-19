@@ -37,12 +37,15 @@ pub const MAX_FORWARD_HOPS: usize = 32;
 pub struct HandoffNote {
     pub kind: NoteKind,
     pub value: String,
+    pub source: Option<String>,
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteKind {
     Link,
     Path,
+    Text,
 }
 
 impl HandoffNote {
@@ -51,14 +54,21 @@ impl HandoffNote {
     pub fn parse(value: &Value) -> Result<Self, String> {
         let kind = match value.get("kind").and_then(Value::as_str) {
             Some("link") => NoteKind::Link,
-            Some("path") => NoteKind::Path,
-            _ => return Err("note.kind must be link or path".to_owned()),
+            Some("path") => return Err("sm handoff was updated; run sm handoff again".into()),
+            Some("text") => NoteKind::Text,
+            _ => return Err("note.kind must be link or text".to_owned()),
         };
         let text = value
             .get("value")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
+            .map(|text| {
+                if kind == NoteKind::Text {
+                    text
+                } else {
+                    text.trim()
+                }
+            })
+            .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| "note.value is required".to_owned())?;
         match kind {
             NoteKind::Link if !(text.starts_with("https://") || text.starts_with("http://")) => {
@@ -69,9 +79,31 @@ impl HandoffNote {
             }
             _ => {}
         }
+        if kind == NoteKind::Text {
+            crate::sessions::handoff_notes::note_text(text.as_bytes(), false)
+                .map_err(|e| e.to_string())?;
+            if !matches!(value["source"].as_str(), Some("draft" | "file")) {
+                return Err("note.source must be draft or file".into());
+            }
+            if value["source"] == "file"
+                && !value["source_path"]
+                    .as_str()
+                    .is_some_and(|p| std::path::Path::new(p).is_absolute())
+            {
+                return Err("note.source_path must be absolute".into());
+            }
+        }
         Ok(Self {
             kind,
             value: text.to_owned(),
+            source: value
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            source_path: value
+                .get("source_path")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -80,6 +112,7 @@ impl HandoffNote {
             "kind": match self.kind {
                 NoteKind::Link => "link",
                 NoteKind::Path => "path",
+                NoteKind::Text => "text",
             },
             "value": self.value,
         })
@@ -88,6 +121,13 @@ impl HandoffNote {
 
 /// The note's link or path as the texts show it.
 pub fn note_value(note: Option<&Value>) -> String {
+    if let Some(id) = note
+        .filter(|n| n["kind"] == "stored")
+        .and_then(|n| n["value"].as_str())
+        .and_then(|s| s.strip_prefix("handoff_notes:"))
+    {
+        return format!("sm handoff show {id}");
+    }
     note.and_then(|note| note.get("value"))
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -230,9 +270,19 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
 /// Columns a handoff leaves alone, with the reason.
 pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     (
+        "handoff_drafts",
+        "session_id",
+        "temporary predecessor draft; removed with its file",
+    ),
+    (
         "review_policies",
         "set_by_session_id",
         "history of who chose the policy",
+    ),
+    (
+        "handoff_notes",
+        "session_id",
+        "historical predecessor note, retained indefinitely",
     ),
     ("work_claims", "parent_session_id", "the parent is the same"),
     ("work_claims", "ended_by_session_id", "history"),
@@ -375,6 +425,14 @@ mod tests {
         assert_eq!(link.kind, NoteKind::Link);
         assert!(HandoffNote::parse(&json!({"kind": "link", "value": "ftp://x"})).is_err());
         assert!(HandoffNote::parse(&json!({"kind": "path", "value": "notes.md"})).is_err());
+        assert_eq!(
+            HandoffNote::parse(&json!({"kind":"path","value":"/notes.md"})).unwrap_err(),
+            "sm handoff was updated; run sm handoff again"
+        );
+        assert!(
+            HandoffNote::parse(&json!({"kind":"text","value":"next steps","source":"draft"}))
+                .is_ok()
+        );
         assert!(HandoffNote::parse(&json!({"kind": "file", "value": "/a"})).is_err());
         assert!(HandoffNote::parse(&json!({"kind": "path"})).is_err());
     }

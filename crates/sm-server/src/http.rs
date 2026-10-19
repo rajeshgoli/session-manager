@@ -778,6 +778,7 @@ impl AppState {
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
+            .with_handoff_config(&config)
             .with_codex_fork_create_startup_timeout(std::time::Duration::from_secs(
                 config.codex_fork.create_startup_timeout_seconds,
             ));
@@ -2355,6 +2356,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/handoff",
             post(handoff::post_handoff),
+        )
+        .route(
+            "/sessions/{session_id}/handoff-draft",
+            get(handoff::get_handoff_draft),
+        )
+        .route(
+            "/sessions/{session_id}/handoff-note",
+            get(handoff::get_handoff_note),
+        )
+        .route(
+            "/sessions/{session_id}/handoff-note/source",
+            post(handoff::post_handoff_source),
         )
         .route(
             "/sessions/{session_id}/handoff-policy",
@@ -21678,7 +21691,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["schema_version"], 1);
         let (status, body) = browser_host_get(&app, "/client/board", Some(&owner)).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["lanes"].is_array());
         // Legacy JSON retains its session-cookie guard; the browser app uses
         // /client/board. Both JSON negotiation forms must still return JSON.
@@ -25760,6 +25773,68 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             );
         }
         request
+    }
+
+    #[tokio::test]
+    async fn handoff_notes_reject_other_lines_but_allow_successors_and_owner() {
+        let mut config = google_auth_config();
+        let state_file = write_session_state("agent001", "running");
+        let mut raw: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let mut next = raw["sessions"][0].clone();
+        next["id"] = json!("agent002");
+        next["name"] = json!("successor");
+        next["predecessor_session_id"] = json!("agent001");
+        raw["sessions"][0]["successor_session_id"] = json!("agent002");
+        raw["sessions"][0]["handoff"] = json!({"state":"done","trigger":"voluntary","note":{"kind":"link","value":"https://example.com/note"}});
+        let mut other = next.clone();
+        other["id"] = json!("other001");
+        other["predecessor_session_id"] = Value::Null;
+        raw["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .extend([next, other]);
+        fs::write(&state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+        config.paths.state_file = state_file.clone();
+        config.sm_send.db_path = PathBuf::from(state_file)
+            .with_extension("notes.db")
+            .display()
+            .to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let app = router(google_auth_state_with(config));
+        for (requester, expected) in [
+            (Some("other001"), StatusCode::FORBIDDEN),
+            (Some("agent002"), StatusCode::OK),
+            (None, StatusCode::OK),
+        ] {
+            let headers = requester
+                .map(|id| vec![("x-sm-session", id)])
+                .unwrap_or_default();
+            let (status, body) = response_json(
+                app.clone()
+                    .oneshot(handoff_json_request(
+                        local_request(
+                            Method::GET,
+                            "/sessions/agent001/handoff-note?line=1",
+                            Body::empty(),
+                        ),
+                        &headers,
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+            if expected == StatusCode::FORBIDDEN {
+                assert_eq!(
+                    body["detail"],
+                    "handoff notes are readable only within your own line of work"
+                );
+            } else {
+                assert_eq!(body["notes"][0]["url"], "https://example.com/note");
+            }
+        }
     }
 
     #[tokio::test]

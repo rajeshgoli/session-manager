@@ -1,0 +1,5 @@
+{"type": "response_item", "timestamp": "2026-10-19T00:00:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>"}]}}
+{"type": "response_item", "timestamp": "2026-10-19T00:00:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<user_instructions>\n# Repository instructions\n</user_instructions>"}]}}
+{"type": "event_msg", "timestamp": "2026-10-19T01:00:00Z", "payload": {"type": "user_message", "message": "Terminal words"}}
+{"type": "response_item", "timestamp": "2026-10-19T01:00:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Terminal words"}]}}
+{"type": "event_msg", "payload": {"type": "user_message", "message": "inbox envelope"}}

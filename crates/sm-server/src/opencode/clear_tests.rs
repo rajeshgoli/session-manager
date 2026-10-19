@@ -246,7 +246,7 @@ fn opencode_clear_does_not_abort_idle_and_checks_authorization_and_handoff() {
         .unwrap();
     assert!(matches!(unauthorized, CoreClearOutcome::Unauthorized(_)));
     let note = crate::handoff::execute::HandoffNote::parse(
-        &json!({"kind":"path", "value":"/tmp/handoff.md"}),
+        &json!({"kind":"link", "value":"https://example.com/handoff.md"}),
     )
     .unwrap();
     f.store.accept_handoff("local1", "local1", &note).unwrap();
@@ -324,7 +324,7 @@ fn opencode_clear_retains_switch_until_usage_mapping_can_commit() {
     );
     assert!(!send(&f, "later input").delivered);
     let note = crate::handoff::execute::HandoffNote::parse(
-        &json!({"kind":"path", "value":"/tmp/note.md"}),
+        &json!({"kind":"link", "value":"https://example.com/note.md"}),
     )
     .unwrap();
     assert!(matches!(
