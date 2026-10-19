@@ -95,7 +95,6 @@ impl Fixture {
 #[test]
 fn device_keys_real_sshd_selective_revocation_restart_and_linger() {
     let mut f = Fixture::new();
-    f.key("host");
     let a = f.key("phone");
     let b = f.key("laptop");
     f.key("unregistered");
@@ -125,7 +124,27 @@ fn device_keys_real_sshd_selective_revocation_restart_and_linger() {
         .unwrap()
         .lines()
         .all(|l| l.starts_with("restrict,pty ssh-ed25519 ")));
-    fs::write(f.dir.join("sshd_config"),format!("Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPidFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAuthorizedKeysFile /must/not/read/authorized_keys\nAllowUsers {}\nPermitRootLogin no\nUsePAM no\nStrictModes no\nPerSourcePenalties no\nLogLevel VERBOSE\n",f.port,f.dir.join("host").display(),f.dir.join("sshd.pid").display(),f.user)).unwrap();
+    let installer =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/setup_studio_ssh.sh");
+    assert!(Command::new("bash")
+        .arg(installer)
+        .arg("--sshd-assets-only")
+        .env("STUDIO_SSH_ASSETS_DIR", &f.dir)
+        .env("STUDIO_SSH_AUTHORIZED_KEYS", &cfg.device_keys_file)
+        .env("STUDIO_SSH_PORT", f.port.to_string())
+        .stdout(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+    let fixture_config = fs::read_to_string(f.dir.join("sshd_config"))
+        .unwrap()
+        .replace("AllowUsers rajesh", &format!("AllowUsers {}", f.user));
+    // The fixture lives below world-writable /tmp; production keeps ownership checks enabled.
+    fs::write(
+        f.dir.join("sshd_config"),
+        format!("{fixture_config}\nStrictModes no\nPerSourcePenalties no\n"),
+    )
+    .unwrap();
     assert!(transport::configure(&cfg, None).unwrap());
     assert!(!transport::configure(&cfg, None).unwrap());
     let server = Command::new("/usr/sbin/sshd")
@@ -158,6 +177,16 @@ fn device_keys_real_sshd_selective_revocation_restart_and_linger() {
         "client: {}\nsshd: {}",
         String::from_utf8_lossy(&login.stderr),
         fs::read_to_string(f.dir.join("sshd.err.log")).unwrap()
+    );
+    let tmux = f
+        .ssh("phone", "tmux -V")
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        tmux.status.success(),
+        "noninteractive SSH must find Homebrew tmux: {}",
+        String::from_utf8_lossy(&tmux.stderr)
     );
     assert!(!f.ssh("unregistered", "true").status().unwrap().success());
     // Options must precede the host, so use a fresh client for the password-only denial.

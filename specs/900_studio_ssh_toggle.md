@@ -163,6 +163,11 @@ loaded sshd LaunchAgent once so its arguments use `-E`. This one-time deployment
 disconnect existing SSH logins. Normal listener changes use SIGHUP and preserve them.
 The setup output offers the key-import preview and explicit import endpoint.
 
+The dedicated sshd sets <code>PATH</code> to `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+with `SetEnv`, so noninteractive SSH commands can find Homebrew tmux without sourcing the
+owner's interactive shell configuration. The real SSH regression runs the installer and
+executes `tmux -V` through its generated configuration.
+
 The client alias remains:
 
 ```sshconfig
