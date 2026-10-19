@@ -39,28 +39,32 @@ function sockets() {
   };
   navigator.clipboard.writeText = async text => { window.copied = text; };
 }
-async function setup(browser, { width = 1440, home = false, failDirect = false } = {}) {
-  const page = await browser.newPage({ viewport: { width, height: 1000 } });
+async function setup(browser, { width = 1440, home = false, failDirect = false, colorScheme = 'light', rememberedRelay = false } = {}) {
+  const page = await browser.newPage({ viewport: { width, height: 1000 }, colorScheme });
   await page.addInitScript(sockets);
+  if (rememberedRelay) await page.addInitScript(() => sessionStorage.setItem('sm-term-route', JSON.stringify({ url: 'relay', instance: 'one', at: Date.now() })));
   await page.addInitScript(value => { window.failDirect = value; }, failDirect);
   const errors = [], requests = [];
   page.on('pageerror', e => errors.push(e.message));
   const state = { sessions: [row('agent'), row('term-abcd', true), row('term-busy', true, true)], settings: settings(),
-    keys: [{ fingerprint: 'SHA256:abc+/=', public_key: 'ssh-ed25519 AAAA fixture' }, { fingerprint: 'SHA256:revoked', revoked_at: '2026-10-19' }], routeError: null, createError: null };
+    keys: [{ fingerprint: 'SHA256:abc+/=', public_key: 'ssh-ed25519 AAAA fixture' }, { fingerprint: 'SHA256:revoked', revoked_at: '2026-10-19' }], routeError: null, createError: null, home, probes: 0 };
   await page.route('**/*', async route => {
     const req = route.request(), url = new URL(req.url()), path = url.pathname;
     const json = (body, status = 200) => route.fulfill({ json: body, status });
     if (path.startsWith('/assets/')) return route.fulfill({ body: await readFile(new URL(path.slice(8), assets)), contentType: path.endsWith('.css') ? 'text/css' : 'text/javascript' });
-    if (req.isNavigationRequest()) return route.fulfill({ body: doc, contentType: 'text/html' });
-    if (path === '/client/terminal/probe') return home ? json({ instance: 'one' }) : route.abort();
+    if (req.isNavigationRequest()) return route.fulfill({ body: doc.replace('<html>', `<html data-theme="${colorScheme}">`), contentType: 'text/html' });
+    if (path === '/client/terminal/probe') {
+      state.probes++;
+      return state.home ? route.fulfill({ json: { instance: 'one' }, headers: { 'access-control-allow-origin': ORIGIN } }) : route.abort();
+    }
     if (req.method() !== 'GET') requests.push({ path, method: req.method(), body: req.postData() ? req.postDataJSON() : null });
     if (path === '/watch/state') {
       if (state.watchWait) await state.watchWait;
       if (state.watchError) return json({ detail: 'watch unavailable' }, 503);
-      return json({ sessions: state.sessions, counts: {} });
+      return json({ sessions: state.sessions, counts: state.counts || {} });
     }
     if (/browser-attach-ticket$/.test(path)) return json({ ws_url: '/client/terminal', ticket_id: 'one', ticket_secret: 'secret', server_instance: 'one',
-      direct: home ? [{ url: 'ws://localhost:8420/client/terminal', probe: 'http://localhost:8420/client/terminal/probe' }] : [] });
+      direct: [{ url: 'ws://localhost:8420/client/terminal', probe: 'http://localhost:8420/client/terminal/probe' }] });
     if (path === '/terminals' && req.method() === 'POST') {
       if (state.createError) return json(state.createError, 409);
       return json({ id: 'term-abcd', cwd }, 201);
@@ -131,7 +135,7 @@ test('Initial watch failure offers Retry and waits for identity before attaching
       release();
       if (id === 'agent') await page.waitForSelector('[data-connection="Live"]');
       else {
-        await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+        await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
         assert.equal(await page.evaluate(() => window.sockets.length), 0);
       }
       assert.deepEqual(errors, []);
@@ -145,52 +149,52 @@ test('A stopped shell replaces its SSH instructions with an actionable ended sta
   try {
     const { page, state, errors } = await setup(browser);
     await page.goto(`${ORIGIN}/terminal/term-abcd`);
-    await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+    await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
     state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, state: 'stopped' } : s);
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await page.waitForSelector('[data-connection="Ended"]');
     await page.getByRole('link', { name: 'Back to Agents', exact: true }).waitFor();
-    assert.equal(await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).count(), 0);
+    assert.equal(await page.getByRole('heading', { name: 'Connect to your shell' }).count(), 0);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
 
-for (const width of [390, 1440]) test(`Shell menus, facts, details and explicit tunnel at ${width}px`, async () => {
+for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) test(`Shell Close header and connection card at ${width}px in ${colorScheme}`, async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
-    const { page, requests, state, errors } = await setup(browser, { width });
+    const { page, requests, state, errors } = await setup(browser, { width, colorScheme });
     await page.goto(`${ORIGIN}/terminal/term-abcd`);
-    await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
-    await page.getByRole('button', { name: 'Copy', exact: true }).click();
+    await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
+    await page.getByRole('button', { name: 'Copy SSH command', exact: true }).click();
     assert.equal(await page.evaluate(() => window.copied), `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd`);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
     assert.equal(await page.getByText('Hand off…', { exact: true }).count(), 0);
-    await page.getByRole('button', { name: 'More', exact: true }).click();
-    assert.equal(await page.getByRole('button', { name: 'Clone', exact: true }).count(), 0);
-    assert.equal(await page.getByRole('button', { name: 'Follow', exact: true }).count(), 0);
-    await page.getByRole('button', { name: 'Copy ssh command', exact: true }).click();
-    assert.match(await page.evaluate(() => window.copied), /studio-away/);
+    assert.deepEqual(await page.locator('.term-bar button').allTextContents(), [' Close']);
+    assert.equal(await page.getByRole('button', { name: 'Details', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: 'More', exact: true }).count(), 0);
     state.routeError = 'no_ssh_key';
     await page.getByRole('button', { name: 'Open tunnel', exact: true }).click();
     await page.getByRole('alert').filter({ hasText: 'Add an SSH public key' }).waitFor();
     state.routeError = null;
     await page.getByRole('button', { name: 'Open tunnel', exact: true }).click();
-    await page.getByText('Tunnel open. Run the SSH command to attach.').waitFor();
-    await page.getByRole('button', { name: 'Details', exact: true }).click();
-    await page.getByRole('heading', { name: 'Folder', exact: true }).waitFor();
-    assert.equal(await page.locator('.term-panel textarea').count(), 0);
-    assert.equal(await page.locator('.term-panel').getByText('Hand off…', { exact: true }).count(), 0);
-    await page.getByRole('button', { name: 'Close details', exact: true }).click();
+    await page.getByText('Tunnel open', { exact: true }).waitFor();
     if (width === 1440) {
       const busy = page.locator('.sw-row').filter({ hasText: 'running · cargo bench' });
       assert.equal(await busy.locator('.sw-shell').textContent(), '▹');
       assert.equal(await busy.locator('.sw-fact').getAttribute('class'), 'sw-fact muted');
     }
-    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-away-${width}.png` }); }
-    await page.getByRole('button', { name: 'Retire', exact: true }).click();
-    await page.getByRole('button', { name: 'Retire', exact: true }).click();
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-away-${width}-${colorScheme}.png` }); }
+    const headerClose = page.getByRole('button', { name: 'Close shell', exact: true });
+    await headerClose.click();
+    await page.getByRole('alertdialog', { name: 'Close this shell?', exact: true }).waitFor();
+    if (process.env.SHOTS_DIR) await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-close-${width}-${colorScheme}.png` });
+    await page.getByRole('button', { name: 'Keep open', exact: true }).click();
+    assert.equal(requests.filter(r => r.method === 'DELETE').length, 0);
+    await headerClose.click();
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Close shell', exact: true }).click();
     await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
     assert.ok(requests.some(r => r.path === '/terminals/term-abcd' && r.method === 'DELETE'));
     assert.ok(!requests.some(r => /\/sessions\/term-abcd\/(retire|restore)/.test(r.path)));
@@ -203,7 +207,7 @@ for (const failDirect of [false, true]) test(`Home shell attaches directly; fail
   try {
     const { page, errors } = await setup(browser, { home: true, failDirect });
     await page.goto(`${ORIGIN}/terminal/term-abcd`);
-    if (failDirect) await page.getByRole('heading', { name: 'Shells attach over SSH away from home' }).waitFor();
+    if (failDirect) await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
     else await page.waitForSelector('[data-connection="Live"]');
     const urls = await page.evaluate(() => window.sockets.map(s => s.url));
     assert.deepEqual(urls, ['ws://localhost:8420/client/terminal']);
@@ -267,6 +271,73 @@ test('New agent Terminal requests only folder; Settings save limits and manage d
     await keys.getByRole('button', { name: 'Remove SSH key SHA256:abc+/=', exact: true }).click();
     await keys.getByText('SHA256:abc+/=', { exact: true }).waitFor({ state: 'detached' });
     assert.ok(requests.some(r => r.path === '/devices/macbook/ssh-keys/SHA256%3Aabc%2B%2F%3D' && r.method === 'DELETE'));
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+
+test('Studio shell ignores remembered Cloudflare route and uses localhost', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await setup(browser, { home: true, rememberedRelay: true });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.waitForSelector('[data-connection="Live"]');
+    assert.ok(state.probes > 0);
+    assert.deepEqual(await page.evaluate(() => window.sockets.map(s => s.url)), ['ws://localhost:8420/client/terminal']);
+    assert.deepEqual(await page.locator('.term-bar button').allTextContents(), [' Close']);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+for (const failDirect of [false, true]) test(`Shell can retry a local connection after ${failDirect ? 'a failed socket' : 'an unavailable probe'}`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, requests, errors } = await setup(browser, { home: failDirect, failDirect });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
+    if (failDirect) await page.getByText('The local connection ended before the shell could open.', { exact: false }).waitFor();
+    state.home = true;
+    await page.evaluate(() => { window.failDirect = false; });
+    await page.getByRole('button', { name: 'Connect in browser', exact: true }).click();
+    await page.waitForSelector('[data-connection="Live"]');
+    assert.ok(state.probes >= 2);
+    assert.ok((await page.evaluate(() => window.sockets.map(s => s.url))).every(url => url === 'ws://localhost:8420/client/terminal'));
+    assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) test(`Terminals use distinct tiles and a dedicated switcher group at ${width}px in ${colorScheme}`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await setup(browser, { width, colorScheme });
+    state.counts = { idle: 2, moving: 1, live: 3, needs_you: 0 };
+    state.sessions = state.sessions.map(s => s.kind === 'shell' ? { ...s, claims: [{ title: 'Should never be a shell ticket', kind: 'ticket', number: 99 }] } : s);
+    await page.goto(`${ORIGIN}/`);
+    const terminals = page.getByRole('region', { name: 'Terminals', exact: true });
+    await terminals.getByText('2 open', { exact: true }).waitFor();
+    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
+    assert.equal(await page.locator('.acard').count(), 1);
+    assert.equal(await terminals.locator('.ring, .prov, .tk, .ttl').count(), 0);
+    assert.equal(await terminals.getByText('Should never be a shell ticket', { exact: true }).count(), 0);
+    assert.equal((await page.locator('.sum').innerText()).replace(/\s+/g, ' ').trim(), '0 needs you · 1 idle');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    if (process.env.SHOTS_DIR) {
+      await mkdir(process.env.SHOTS_DIR, { recursive: true });
+      await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-tiles-${width}-${colorScheme}.png`, fullPage: true });
+    }
+    await page.getByRole('radio', { name: 'By repo', exact: true }).click();
+    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
+    assert.equal(await page.locator('.acard').count(), 1);
+    await terminals.locator('a[href="/terminal/term-abcd"]').click();
+    await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
+    if (width < 900) await page.getByRole('button', { name: 'Unfold session list', exact: true }).click();
+    await page.getByText('Terminals', { exact: true }).waitFor();
+    const sections = (await page.locator('.term-switch .sw-sec').allTextContents()).map(text => text.trim());
+    assert.ok(sections.includes('Terminals'));
+    assert.ok(!sections.includes('Moving'), 'a running shell does not create a moving agent section');
+    assert.ok(sections.some(text => text.startsWith('Idle · 1')), 'only the real agent is idle');
+    assert.equal(await page.locator('.sw-row').count(), 2, 'both shells remain visible even with Idle folded');
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

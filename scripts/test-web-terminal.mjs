@@ -234,7 +234,7 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
           if (phone) {
             // G1: hidden by default below 900 px; the edge bar opens it over the terminal.
             assert.equal(await page.locator('.term-switch').count(), 0);
-            await page.getByRole('button', { name: 'Unfold agent list' }).click();
+            await page.getByRole('button', { name: 'Unfold session list' }).click();
           }
           await page.locator('.sw-row').first().waitFor();
           assert.deepEqual(await page.locator('.sw-sec').allInnerTexts(), ['NEEDS YOU', 'FINISHED', 'MOVING', 'WAITING', 'IDLE · 3 ›']);
@@ -306,13 +306,13 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
     // Unfold and fold by the edge bar, twice: the terminal is always right of the list.
     for (let round = 0; round < 2; round += 1) {
-      await page.getByRole('button', { name: 'Unfold agent list' }).click();
+      await page.getByRole('button', { name: 'Unfold session list' }).click();
       await page.locator('.term-switch').waitFor();
       assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'true');
       const list = await box('.term-switch-wrap'), open = await box('.term-edge');
       assert.ok(Math.abs(open.x - list.width) <= 1, 'the edge bar sits at the list\'s right edge');
       assert.ok(Math.abs((await box('.term-body')).x - (open.x + open.width)) <= 1, 'the terminal sits right of the list');
-      await page.getByRole('button', { name: 'Fold agent list' }).click();
+      await page.getByRole('button', { name: 'Fold session list' }).click();
       await page.waitForFunction(() => !document.querySelector('.term-switch'));
       assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
     }

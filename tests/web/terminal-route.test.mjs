@@ -85,6 +85,17 @@ test('a remembered direct route to another server instance probes again', async 
   assert.equal(JSON.parse(storage.items.get('sm-term-route')).instance, 'inst-2');
 });
 
+test('a fresh shell choice rechecks localhost even when Cloudflare was remembered', async () => {
+  const storage = memory();
+  const now = Date.parse('2026-10-19T17:00:00Z');
+  await chooseRoute(ticket(), { location: page, fetchImpl: fakeFetch({}).impl, storage, now });
+  const fetch = fakeFetch({ [LOCAL.probe]: 'inst-1' });
+  const route = await chooseRoute(ticket(), { location: page, fetchImpl: fetch.impl, storage, now: now + 1000, fresh: true });
+  assert.equal(route.url, LOCAL.url);
+  assert.equal(route.direct, true);
+  assert.deepEqual(fetch.calls, [LOCAL.probe, LAN.probe]);
+});
+
 test('no direct list, no instance, or no storage falls back safely', async () => {
   const fetch = fakeFetch({ [LOCAL.probe]: 'inst-1' });
   assert.equal((await chooseRoute({ ws_url: '/client/terminal' }, { location: page, fetchImpl: fetch.impl, storage: memory() })).direct, false);

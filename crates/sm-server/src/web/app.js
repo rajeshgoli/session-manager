@@ -489,7 +489,8 @@ function Palette({ onClose }) {
       const out = PAGES.map(pageItem);
       if (watch.status === 'fulfilled') {
         for (const agent of watch.value.sessions || []) {
-          out.push({ kind: 'Agent', label: agent.name, detail: basename(agent.repo), run: () => openPanel(`agent:${agent.id}`) });
+          out.push({ kind: agent.kind === 'shell' ? 'Terminal' : 'Agent', label: agent.name, detail: basename(agent.repo),
+            run: () => agent.kind === 'shell' ? navigate(`/terminal/${encodeURIComponent(agent.id)}`) : openPanel(`agent:${agent.id}`) });
         }
       }
       if (board.status === 'fulfilled') {

@@ -7,7 +7,7 @@ import {
   openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
-import { isShell, shellFact, ShellMenu, createShell, shellError } from './shell.js';
+import { isShell, shellFact, ShellMenu, ShellTiles, createShell, shellError } from './shell.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -52,7 +52,7 @@ export function edgeTone(agent) {
 
 /** Non-empty sections in order, each sorted by attention. */
 export function sectionAgents(sessions) {
-  const sorted = [...sessions].sort(attentionOrder);
+  const sorted = sessions.filter(session => !isShell(session)).sort(attentionOrder);
   return SECTIONS
     .map((section) => ({ section, agents: sorted.filter((agent) => sectionOf(agent) === section) }))
     .filter((group) => group.agents.length);
@@ -85,6 +85,18 @@ export function summaryCounts(counts) {
   return Object.keys(COUNT_LABEL)
     .map((section) => ({ section, n: c[section === 'you' ? 'needs_you' : section] || 0, label: COUNT_LABEL[section] }))
     .filter(({ section, n }) => n > 0 || section === 'you');
+}
+
+/** Watch counts also include shells; the Agents summary describes agents only. */
+export function agentCounts(counts, sessions) {
+  const result = { ...counts };
+  for (const shell of sessions.filter(isShell)) {
+    if (shell.state === 'stopped' || shell.attention?.section === 'stopped') continue;
+    const key = shell.attention?.section === 'you' ? 'needs_you' : shell.attention?.section;
+    if (key) result[key] = Math.max(0, (result[key] || 0) - 1);
+    result.live = Math.max(0, (result.live || 0) - 1);
+  }
+  return result;
 }
 
 /** "● Working 3m" or "○ Idle 7m". */
@@ -421,7 +433,8 @@ export function AgentsPage({ openRef }) {
   if (!doc) {
     return html`<div class="content">${error ? html`<p class="err">${error.message}</p>` : html`<p class="muted">Loading…</p>`}</div>`;
   }
-  const sessions = doc.sessions || [];
+  const sessions = (doc.sessions || []).filter(session => !isShell(session));
+  const shells = (doc.sessions || []).filter(session => isShell(session) && session.state !== 'stopped');
   const titles = stored(TITLES_KEY, true) !== false;
   const order = [];
   const card = (agent, depth = 0) => {
@@ -454,7 +467,7 @@ export function AgentsPage({ openRef }) {
     <${HostRestartBanner} />
     <div class="toolbar">
       <div class="sum">
-        ${summaryCounts(doc.counts).map(({ section, n, label }, index) => html`${index ? html`<span class="dot">·</span>` : null}
+        ${summaryCounts(agentCounts(doc.counts, doc.sessions || [])).map(({ section, n, label }, index) => html`${index ? html`<span class="dot">·</span>` : null}
           <button type="button" class=${`plain-btn ${n ? SECTION_TONE[section] : ''}`}
             onClick=${() => { chooseView('attention'); setJump(section); }}><b>${n}</b> ${label}</button>`)}
       </div>
@@ -464,10 +477,11 @@ export function AgentsPage({ openRef }) {
       <${Seg} label="Show" value=${filter} onChange=${choose}
         options=${[{ value: 'live', label: 'Live' }, { value: 'stopped', label: 'With stopped' }]} />
     </div>
-    ${!sessions.some((agent) => agent.state !== 'stopped')
+    ${!shells.length && !sessions.some((agent) => agent.state !== 'stopped')
       ? html`<p class="empty">No live agents. Start one with New agent.</p>`
       : null}
     ${body}
+    <${ShellTiles} shells=${shells} now=${now} />
   </div>`;
 }
 
@@ -522,6 +536,7 @@ function useAgentKeys(keys, setCursor, reload) {
  * parent one step in (D6.1).
  */
 export function groupAgents(sessions) {
+  sessions = sessions.filter(session => !isShell(session));
   const byId = new Map(sessions.map((agent) => [agent.id, agent]));
   const children = new Map();
   const roots = [];
