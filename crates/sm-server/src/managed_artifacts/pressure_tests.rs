@@ -10,10 +10,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        // The clock alone collides between parallel tests on macOS (microsecond resolution).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "sm-pressure-{}-{}",
+            "sm-pressure-{}-{}-{}",
             std::process::id(),
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(dir.join("root")).unwrap();
         fs::create_dir(dir.join("cold")).unwrap();

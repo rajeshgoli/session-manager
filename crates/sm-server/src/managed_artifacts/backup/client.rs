@@ -492,7 +492,6 @@ impl Destination {
             self.set_meta(&key, &run)?;
             run
         };
-        let holding = safe_path(&self.root, &format!(".holding/{run}/{path}"), true)?;
         if old.is_none() && current.exists() {
             ensure!(
                 new.is_some_and(
@@ -504,6 +503,13 @@ impl Destination {
         if old == new {
             return Ok(None);
         }
+        // Holding folders exist only for a previous file that moves there: a
+        // new file needs none, and on exFAT each folder costs a written cluster.
+        let holding = safe_path(
+            &self.root,
+            &format!(".holding/{run}/{path}"),
+            old.is_some_and(|r| r.target.is_none()),
+        )?;
         let days = manifest
             .holding_days
             .get(&prefix(path)?)
@@ -544,9 +550,10 @@ impl Destination {
             holding,
         } = change;
         let consume = touched.is_some();
+        let held = old.is_some_and(|r| r.target.is_none());
         // A deterministic holding path makes the filesystem half of the journal
         // repeatable when a process dies between rename and SQLite commit.
-        if old.is_some_and(|r| r.target.is_none()) && !holding.exists() {
+        if held && !holding.exists() {
             ensure!(current.is_file(), "previous backup file missing: {path}");
             fs::rename(current, holding)?;
         }
@@ -564,7 +571,9 @@ impl Destination {
         } else if current.exists() {
             fs::remove_file(current)?;
         }
-        let parents = [current.parent(), holding.parent()].into_iter().flatten();
+        let parents = [current.parent(), holding.parent().filter(|_| held)]
+            .into_iter()
+            .flatten();
         match touched {
             // Folders safe_path created must reach their own parents too.
             Some(touched) => {
