@@ -4691,10 +4691,14 @@ impl SessionStore {
         else {
             return Ok(false);
         };
-        if runtime
-            .for_socket_name(launch.tmux_socket_name.as_deref())
-            .session_exists(&launch.tmux_session)?
-        {
+        // Only tmux's explicit "can't find session" proves the terminal gone;
+        // a missing socket can hide a live server.
+        if !matches!(
+            runtime
+                .for_socket_name(launch.tmux_socket_name.as_deref())
+                .probe_session_for_restore(&launch.tmux_session),
+            crate::runtime::RestoreTmuxLivenessOutcome::Absent
+        ) {
             return Ok(false);
         }
         let _guard = self.write_guard()?;

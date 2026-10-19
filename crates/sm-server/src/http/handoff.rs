@@ -1279,25 +1279,15 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_stopped());
-        // Claude never wrote the provider session and the terminal is gone,
-        // so the brief provably never arrived: one relaunch, never more
-        // (#2409).
-        for _ in 0..2 {
-            assert!(complete_handoff(&state, "pred2342", &successor.id)
-                .await
-                .is_err());
-        }
+        // No tmux server answers here, so the old terminal is not provably
+        // gone and the brief is never replayed (#2409).
+        assert!(complete_handoff(&state, "pred2342", &successor.id)
+            .await
+            .is_err());
         let raw: Value =
             serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
-        let launches = raw["session_runtime_launches"].as_array().unwrap();
-        assert_eq!(
-            launches
-                .iter()
-                .map(|launch| launch["status"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["superseded", "failed"]
-        );
-        assert_eq!(raw["spawn_launch_intents"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["session_runtime_launches"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["spawn_launch_intents"].as_array().unwrap().len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 

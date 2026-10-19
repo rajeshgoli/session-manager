@@ -1285,11 +1285,25 @@ mod tests {
             "{\"sessionId\":\"other\"}\n",
         )
         .unwrap();
+        let stub_runtime = |name: &str, body: &str| {
+            let path = root.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+                .with_tmux_binary_for_test(path.display().to_string())
+        };
+        let absent = stub_runtime("absent-tmux", "echo \"can't find session: x\" >&2; exit 1");
+        // A missing socket can hide a live server, so it proves nothing.
+        let no_socket = stub_runtime(
+            "no-socket-tmux",
+            "echo 'error connecting to socket (No such file or directory)' >&2; exit 1",
+        );
         for (written, terminal, relaunch) in [
-            (Some(&transcript), &runtime, false),
-            (Some(&nested), &runtime, false),
+            (Some(&transcript), &absent, false),
+            (Some(&nested), &absent, false),
             (None, &live_runtime, false),
-            (None, &runtime, true),
+            (None, &no_socket, false),
+            (None, &absent, true),
         ] {
             recovered.write_raw_json_value(&failed).unwrap();
             let _ = fs::remove_file(&transcript);
