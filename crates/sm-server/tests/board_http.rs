@@ -1553,6 +1553,60 @@ fn lane_with_goal(board: &Value, goal: i64) -> Option<Value> {
 }
 
 #[tokio::test]
+async fn notes_issue_in_claim_only_repo_remains_in_board_read_set() {
+    let f = fixture_config(|config| {
+        config.board.repos.clear();
+        config.google_auth.session_cookie_secret = Some("board-test-secret".into());
+        config.google_auth.allowlist_emails = vec!["owner@example.com".into()];
+    });
+    f.claim(2, "eng00001");
+    let (status, created) = owner_request(
+        &f,
+        "POST",
+        "/github/issues",
+        Some(json!({"repo":REPO,"title":"Claim-only repo","body":"Text"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let snapshot = board(&f).await;
+    assert!(snapshot["other"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["tickets"].as_array().unwrap())
+        .any(|ticket| ticket["number"] == created["number"]));
+    let store = BoardStore::new(f.dir.join("message_queue.db"));
+    assert!(store.read_set(&Default::default()).unwrap().contains(REPO));
+}
+
+#[tokio::test]
+async fn notes_creation_stays_successful_when_board_caching_fails() {
+    let f = bug_fixture();
+    BoardStore::new(f.dir.join("message_queue.db"))
+        .ensure_schema()
+        .unwrap();
+    Connection::open(f.dir.join("message_queue.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_board_cache BEFORE INSERT ON board_items BEGIN
+            SELECT RAISE(FAIL, 'injected board cache failure'); END;",
+        )
+        .unwrap();
+    let (status, created) = owner_request(
+        &f,
+        "POST",
+        "/github/issues",
+        Some(json!({"repo":REPO,"title":"Filed despite cache failure","body":"Text"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert!(created["number"].is_i64());
+    assert!(created["url"].is_string());
+    assert!(created["board_note"].is_string());
+    assert_eq!(f.board.created.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn notes_issue_is_on_board_before_any_github_pass() {
     let f = bug_fixture();
     let (status, created) = owner_request(

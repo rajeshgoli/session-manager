@@ -654,6 +654,7 @@ impl BoardStore {
         let Some(conn) = self.open_read()? else {
             return Ok(repos);
         };
+        repos.extend(notes_repos(&conn)?);
         for lane in active_lanes(&conn)? {
             repos.insert(lane.goal.0);
         }
@@ -841,6 +842,19 @@ impl BoardStore {
             "DELETE FROM board_events WHERE ts < ?1",
             params![format_ts(now - EVENT_RETENTION)],
         )?)
+    }
+
+    /// An issue just created by Notes also opts its repository into future reads.
+    pub fn record_created_issue(&self, node: &RefNode, now: OffsetDateTime) -> Result<()> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_ref(&tx, node, &format_ts(now))?;
+        tx.execute(
+            "INSERT INTO board_settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO NOTHING",
+            params![format!("notes_repo:{}", node.repo), node.repo],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn upsert_nodes(&self, nodes: &[&RefNode], now: OffsetDateTime) -> Result<()> {
@@ -1423,6 +1437,18 @@ fn replace_parent(conn: &Connection, key: &Key, parent: Option<Key>, now: &str) 
 }
 
 /// The standing Bugs ticket as `board_settings` records it (spec 1859 A5).
+fn notes_repos(conn: &Connection) -> Result<BTreeSet<String>> {
+    if !table_exists(conn, "board_settings")? {
+        return Ok(BTreeSet::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT value FROM board_settings WHERE key GLOB 'notes_repo:*'")?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(rows)
+}
+
 fn bugs_goal(conn: &Connection) -> Result<Option<Key>> {
     let value: Option<String> = conn
         .query_row(
@@ -1720,6 +1746,7 @@ fn load_input(conn: &Connection, outside: &Outside) -> Result<ModelInput> {
         .map(|sync| sync.repo.clone())
         .collect();
     input.read_repos = outside.config_repos.iter().cloned().collect();
+    input.read_repos.extend(notes_repos(conn)?);
     for lane in &input.lanes {
         input.read_repos.insert(lane.goal.0.clone());
     }

@@ -299,7 +299,7 @@ pub(super) async fn create_issue(
     if issue.title.trim().is_empty() {
         return Err(bad("title is required"));
     }
-    let (number, url) = board::blocking(&state, move |state| {
+    let (number, url, board_note) = board::blocking(&state, move |state| {
         let configured = state
             .config
             .board
@@ -324,30 +324,40 @@ pub(super) async fn create_issue(
                 status: StatusCode::BAD_GATEWAY,
                 detail,
             })?;
-        // Creation already gives us these facts. Do not wait for a GitHub
-        // list query to discover the issue before the board can show it.
-        let _guard = state
-            .board_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-        let store = board::board_store(state);
-        let now = time::OffsetDateTime::now_utc();
-        store.upsert_nodes(
-            &[&crate::board::sync::RefNode {
-                repo,
-                number,
-                title: issue.title,
-                url: url.clone(),
-                state: "open".into(),
-                state_reason: None,
-                closed_at: None,
-            }],
-            now,
-        )?;
-        let recomputed = store.recompute(&board::outside(state)?, now)?;
-        board::send_alerts(state, &recomputed);
-        Ok((number, url))
+        // Once GitHub creates the issue, a local cache failure must not make
+        // retrying the form create a duplicate issue.
+        let cached = (|| -> anyhow::Result<()> {
+            let _guard = state
+                .board_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+            let store = board::board_store(state);
+            let now = time::OffsetDateTime::now_utc();
+            store.record_created_issue(
+                &crate::board::sync::RefNode {
+                    repo,
+                    number,
+                    title: issue.title,
+                    url: url.clone(),
+                    state: "open".into(),
+                    state_reason: None,
+                    closed_at: None,
+                },
+                now,
+            )?;
+            let recomputed = store.recompute(&board::outside(state)?, now)?;
+            board::send_alerts(state, &recomputed);
+            Ok(())
+        })();
+        let board_note = cached.err().map(|error| {
+            eprintln!("Notes issue {url}: board update failed: {error:#}");
+            board::request_pass(state);
+            "Issue filed; board update pending."
+        });
+        Ok((number, url, board_note))
     })
     .await?;
-    Ok(Json(json!({"number":number,"url":url})))
+    Ok(Json(
+        json!({"number":number,"url":url,"board_note":board_note}),
+    ))
 }
