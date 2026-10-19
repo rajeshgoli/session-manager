@@ -7,7 +7,7 @@ import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText,
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
-import { isShell, shellFact, ShellMenu, ShellAwayPanel } from './shell.js';
+import { isShell, shellFact, ShellCloseButton, ShellAwayPanel } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -52,6 +52,11 @@ export function switcherGroups(sessions, currentId, idleOpen) {
     const shown = section !== 'idle' || idleOpen ? agents : agents.filter((a) => a.id === currentId);
     return { section, count: agents.length, agents: shown };
   });
+  const shells = live.filter(isShell).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  if (shells.length) {
+    const idle = groups.findIndex(group => group.section === 'idle');
+    groups.splice(idle < 0 ? groups.length : idle, 0, { section: 'terminals', count: shells.length, agents: shells });
+  }
   return { groups, order: groups.flatMap((g) => g.agents) };
 }
 
@@ -86,12 +91,12 @@ function useWidth(test) {
 }
 
 function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
-  return html`<nav class="term-switch" aria-label="Agents">
+  return html`<nav class="term-switch" aria-label="Sessions">
     ${groups.map(({ section, count, agents }) => html`
       ${section === 'idle'
         ? html`<button type="button" class="sw-sec muted" aria-expanded=${idleOpen} onClick=${toggleIdle}>
             ${SECTION_LABEL.idle} · ${count} ${idleOpen ? '⌄' : '›'}</button>`
-        : html`<div class=${`sw-sec ${SECTION_TONE[section]}`}>${SECTION_LABEL[section]}</div>`}
+        : html`<div class=${`sw-sec ${section === 'terminals' ? 'muted sw-terminals-heading' : SECTION_TONE[section]}`}>${section === 'terminals' ? 'Terminals' : SECTION_LABEL[section]}</div>`}
       ${agents.map((agent) => {
         const fact = switcherFact(agent);
         const label = fact.tone === 'cyan' ? 'read' : 'answered';
@@ -119,6 +124,7 @@ export function TerminalPage({ id, open }) {
   const [attempt, setAttempt] = useState(0);
   const [route, setRoute] = useState({ label: '', samples: [] });
   const [away, setAway] = useState(false);
+  const [directError, setDirectError] = useState('');
   const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
   const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
   const showKeys = useWidth(touchKeys);
@@ -186,6 +192,7 @@ export function TerminalPage({ id, open }) {
   useEffect(() => {
     if (!targetKind) return;
     setAway(false);
+    setDirectError('');
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
       lineHeight: 1.12, scrollback: 10000, minimumContrastRatio: CONTRAST_FLOOR,
@@ -290,13 +297,13 @@ export function TerminalPage({ id, open }) {
       timer = setTimeout(() => connect(), Math.min(10000, 500 * 2 ** Math.min(retries++, 5)));
     };
     // A direct socket that ends before attaching uses a fresh ticket through the relay (G4).
-    const fallback = (ws, instance) => {
+    const fallback = (ws, instance, message = 'The local connection ended before the shell could open.') => {
       clearTimeout(handshakeTimer);
       if (switching) directSwitch = false;
       if (socket === ws) socket = null;
       ws.close();
       rememberRoute(session(), 'relay', instance, Date.now());
-      if (shell) { setAway(true); setConnection('SSH'); return; }
+      if (shell) { setDirectError(message); setAway(true); setConnection('SSH'); return; }
       connect(true);
     };
     // On the relay soon after a direct socket, probe for the direct path a few times and
@@ -329,7 +336,7 @@ export function TerminalPage({ id, open }) {
         const ticket = await api(`/client/sessions/${encodeURIComponent(id)}/browser-attach-ticket`, { method: 'POST' });
         if (stopped) return;
         const chosen = relayOnly ? relayRoute(ticket, location)
-          : await chooseRoute(ticket, { location, fetchImpl: (url, init) => fetch(url, init), storage: session() });
+          : await chooseRoute(ticket, { location, fetchImpl: (url, init) => fetch(url, init), storage: session(), fresh: shell });
         if (stopped) return;
         samples = [];
         setRoute({ label: chosen.label, samples });
@@ -343,7 +350,7 @@ export function TerminalPage({ id, open }) {
         // attempt without another automatic signing request after 30 seconds.
         handshakeTimer = setTimeout(() => {
           if (stopped || socket !== ws || live) return;
-          if (chosen.direct) { fallback(ws, ticket.server_instance); return; }
+          if (chosen.direct) { fallback(ws, ticket.server_instance, 'The local connection took too long to open. Please try again.'); return; }
           ended = true; socket = null;
           setConnection('Ended');
           setError('Terminal connection timed out. Check any sign-in or Keychain prompt. If device certificates were just enabled, quit and reopen your browser; otherwise choose Reconnect.');
@@ -379,7 +386,7 @@ export function TerminalPage({ id, open }) {
               if (!stopped && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'output_ack', sequence: frame.sequence }));
             });
           } else if (frame.type === 'exit' || frame.type === 'error') {
-            if (chosen.direct && !attached) { fallback(ws, ticket.server_instance); return; }
+            if (chosen.direct && !attached) { fallback(ws, ticket.server_instance, frame.message || frame.reason); return; }
             clearTimeout(handshakeTimer);
             ended = true; live = false; stopPing(); setConnection('Ended');
             setError(frame.message || frame.reason || '');
@@ -440,7 +447,7 @@ export function TerminalPage({ id, open }) {
   const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
   const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
   // Hand off… and ⋯ live here, not in the Details panel beside this terminal (#2277).
-  const menus = (compact) => shell ? html`<${ShellMenu} key=${id} shell=${agent} away=${away} small align="right" />` : agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
+  const menus = (compact) => agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
   // Desktop (#2242): who and how full on the left; connection words only when not live,
   // with the route in the dot's tooltip; actions on the right, Retire last.
@@ -465,7 +472,11 @@ export function TerminalPage({ id, open }) {
     </div>`;
 
   return html`<div class="term-page" data-connection=${connection}>
-    ${wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
+    ${shell ? html`<div class="term-bar term-shell-bar" onClick=${refocus}>
+      <span class="term-who"><span class="muted">▹</span><span class="t" title=${agent.name}>${agent.name}</span></span>
+      <span class="sp"></span>
+      ${targetKind === 'shell' ? html`<${ShellCloseButton} key=${id} shell=${agent} onClosed=${() => navigate('/')} />` : null}
+    </div>` : wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
       ${notes}
@@ -490,12 +501,12 @@ export function TerminalPage({ id, open }) {
       <div class="term-side">
         ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
           idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
-        <button type="button" class="term-edge" title=${`${switcher ? 'Fold' : 'Unfold'} agent list (⌘\\)`}
-          aria-label=${`${switcher ? 'Fold' : 'Unfold'} agent list`} aria-expanded=${switcher}
+        <button type="button" class="term-edge" title=${`${switcher ? 'Fold' : 'Unfold'} session list (⌘\\)`}
+          aria-label=${`${switcher ? 'Fold' : 'Unfold'} session list`} aria-expanded=${switcher}
           onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>
       </div>
       <div class="term-body" ref=${host} hidden=${shellAway}></div>
-      ${shellAway ? html`<${ShellAwayPanel} key=${id} id=${id} />` : null}
+      ${shellAway ? html`<${ShellAwayPanel} key=${id} id=${id} directError=${directError} onRetry=${() => setAttempt(n => n + 1)} />` : null}
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
       ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">

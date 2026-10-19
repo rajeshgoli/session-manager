@@ -118,6 +118,16 @@ test('the summary strip drops zero counts except needs you', () => {
   assert.deepEqual(summaryCounts({ needs_you: 2, waiting_long: 1, waiting: 4 }).map((c) => c.section), ['you', 'waiting_long', 'waiting']);
 });
 
+test('shells stay out of agent sections, repo groups and summary counts', () => {
+  const idle = agent('terminal', 'idle', '1', {}, { kind: 'shell' });
+  const busy = agent('busy-terminal', 'moving', '2', {}, { kind: 'shell', state: 'working' });
+  assert.deepEqual(sectionAgents([fixtures.idle, idle, busy]).map(group => group.agents.map(a => a.name)), [[fixtures.idle.name]]);
+  assert.deepEqual(groupAgents([fixtures.idle, idle, busy]).flatMap(group => group.agents.map(a => a.agent.name)), [fixtures.idle.name]);
+  const counts = { idle: 2, moving: 1, live: 3, needs_you: 0 };
+  assert.deepEqual(agents.namespace.agentCounts(counts, [fixtures.idle, idle, busy]), { idle: 1, moving: 0, live: 1, needs_you: 0 });
+  assert.equal(counts.idle, 2, 'the shared watch response stays unchanged');
+});
+
 test('By repo puts busy repos first and children after their parent', () => {
   const parent = agent('parent', 'idle', '1', {}, { repo: '/r/b' });
   const child = agent('child', 'moving', '1', {}, { repo: '/r/b', parent_session_id: 'parent' });

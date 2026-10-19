@@ -75,13 +75,14 @@ async function probe(fetchImpl, url, instance, ms) {
  * take the first, in list order, whose instance matches the ticket's; a probe
  * that answers with another instance is someone else's server and is skipped.
  * With no match, use the relay. A route remembered within ten minutes skips
- * the probes, unless the server instance has changed since.
+ * the probes, unless the server instance has changed since. `fresh` ignores
+ * that memory: shells must check for home access even after an agent used Cloudflare.
  */
-export async function chooseRoute(ticket, { location, fetchImpl, storage, now = Date.now(), ms = PROBE_MS }) {
+export async function chooseRoute(ticket, { location, fetchImpl, storage, now = Date.now(), ms = PROBE_MS, fresh = false }) {
   const relay = relayRoute(ticket, location);
   const direct = Array.isArray(ticket.direct) ? ticket.direct : [];
   if (!ticket.server_instance || !direct.length) return relay;
-  const known = remembered(storage, ticket.server_instance, now);
+  const known = fresh ? null : remembered(storage, ticket.server_instance, now);
   if (known === 'relay') return relay;
   if (known && direct.some((entry) => entry.url === known)) return { url: known, direct: true, label: 'Direct' };
   const found = await findDirect(ticket, { fetchImpl, ms });
