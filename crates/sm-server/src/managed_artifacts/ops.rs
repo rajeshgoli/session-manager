@@ -534,6 +534,13 @@ fn cleanup(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
             "UPDATE artifacts SET op=NULL WHERE root=?1 AND name=?2",
             params![op.root.path, m.name],
         )?;
+        // History keeps the sizes this operation saw after later ones change them.
+        let a = artifact(&tx, &op.root.path, &m.name)?;
+        let frozen = if op.kind == "freezing" {
+            a["frozen_bytes"].clone()
+        } else {
+            Value::Null
+        };
         event(
             &tx,
             &op.root.path,
@@ -544,7 +551,7 @@ fn cleanup(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
                 _ => "moved",
             },
             &op.actor,
-            json!({"operation_id":op.id}),
+            json!({"operation_id":op.id,"data_bytes":a["data_bytes"],"frozen_bytes":frozen}),
         )?;
     }
     if op.kind == "thawing" {

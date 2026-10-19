@@ -593,6 +593,9 @@ const ICONS = {
   external: '<path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/>',
   terminal: '<rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/>',
   more: '<circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/>',
+  freeze: '<path d="M8 1.8v12.4M2.6 4.9l10.8 6.2M2.6 11.1l10.8-6.2M6.3 2.8 8 4.4l1.7-1.6M6.3 13.2 8 11.6l1.7 1.6M2.4 7 4.6 7.6 4 9.8M13.6 9 11.4 8.4l.6-2.2"/>',
+  thaw: '<circle cx="8" cy="8" r="2.8"/><path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M3.5 12.5l1.1-1.1M11.4 4.6l1.1-1.1"/>',
+  move: '<path d="M2.5 8h9M8.5 4.5 12 8l-3.5 3.5M13.8 3v10"/>',
 };
 
 export function Icon({ name, size = 16 }) {

@@ -1,0 +1,32 @@
+{
+  "operations": [
+    {"op": {"id": 7, "kind": "freezing", "phase": "copying", "state": "running", "names": ["1977_chains"], "behind": 2, "remaining_seconds": 372, "expected_seconds": 900, "elapsed_seconds": 528, "data_bytes": 293667123301, "actor": "71a9e65a", "actor_name": "far-2203"},
+     "status": "Running now · 2 waiting behind it · about 6 min left", "step": 1, "name": "1977_chains", "sizes": "294 GB", "actor": "far-2203", "actor_id": "71a9e65a", "saved": null},
+    {"op": {"id": 8, "kind": "thawing", "phase": "queued", "state": "waiting", "names": ["2002_chains", "2002_labels"], "ahead": 1, "starts_in_seconds": 372, "remaining_seconds": 590, "data_bytes": 377000000000, "actor": "rajeshgoli@example.com", "actor_name": "Rajesh"},
+     "status": "Waiting · 1 ahead · starts in about 6 min · done in about 10 min", "step": 0, "name": "2002_chains + 1 more", "sizes": "377 GB", "actor": "Rajesh", "actor_id": null, "saved": null},
+    {"op": {"id": 9, "kind": "moving", "phase": "queued", "state": "waiting", "names": ["2034_clusters"], "ahead": 0, "error": "Waiting for cold-store capacity above the floor and reservations", "actor": "sm-nightly", "actor_name": "sm nightly"},
+     "status": "Waiting for space on the cold disk above its floor", "step": 0, "name": "2034_clusters", "sizes": "", "actor": "sm nightly", "actor_id": null, "saved": null},
+    {"op": {"id": 10, "kind": "freezing", "phase": "done", "state": "done", "names": ["2051_money"], "seconds": 531, "data_bytes": 344195152884, "frozen_bytes": 37642525705, "actor": "71a9e65a", "actor_name": null},
+     "status": "Done · took 9 min", "step": 3, "name": "2051_money", "sizes": "344 GB → 38 GB", "actor": "71a9e65a", "actor_id": null, "saved": 306552627179},
+    {"op": {"id": 11, "kind": "thawing", "phase": "failed", "state": "failed", "names": ["1962_chains"], "error": "cold store is not connected", "actor": "sm", "actor_name": "sm"},
+     "status": "Failed: cold store is not connected", "step": -1, "name": "1962_chains", "sizes": "", "actor": "sm", "actor_id": null, "saved": null},
+    {"op": {"id": 12, "kind": "freezing", "phase": "copying", "state": "running", "names": ["2167_frame_choice"], "behind": 0, "over_estimate": true, "remaining_seconds": 0, "actor": "a4782b6e", "actor_name": "far-2167"},
+     "status": "Running now · taking longer than recent freezing", "step": 1, "name": "2167_frame_choice", "sizes": "", "actor": "far-2167", "actor_id": "a4782b6e", "saved": null}
+  ],
+  "savings": [
+    {"savings": {"folders": 41, "data_bytes": 3016153560409, "frozen_bytes": 476830448887, "saved_bytes": 2539323111522, "roots": [{"root": "/Users/x/artifacts", "cold_store": "/Volumes/External4TB/artifacts", "folders": 41}]},
+     "line": "41 frozen folders · 3.0 TB of data in 477 GB of archives on External4TB", "ratio": "6.3×"},
+    {"savings": {"folders": 0, "data_bytes": 0, "frozen_bytes": 0, "saved_bytes": 0, "roots": []}, "line": "No frozen folders", "ratio": null}
+  ],
+  "artifacts": [
+    {"artifact": {"name": "1977_chains", "state": "frozen", "data_bytes": 293667123301, "frozen_bytes": 13641070107, "saved_bytes": 280026053194, "thaw_eta_seconds": 176,
+       "placement": {"disk": "cold", "disk_path": "/Volumes/External4TB/artifacts", "path": "/Volumes/External4TB/artifacts/.frozen/1977_chains"}},
+     "summary": "Frozen on External4TB · saved 280 GB · thawed when needed", "placement": "Archive on External4TB", "thaw": "about 3 min"},
+    {"artifact": {"name": "2034_clusters", "state": "live", "location": "cold", "op": "freezing", "operation": {"phase": "queued"},
+       "placement": {"disk": "cold", "disk_path": "/Volumes/External4TB/artifacts", "path": "/Volumes/External4TB/artifacts/2034_clusters"}},
+     "summary": "Freezing · queued", "placement": "External4TB (cold disk)", "thaw": null},
+    {"artifact": {"name": "2171_chains", "state": "live", "op": "thawing", "operation": {"phase": "cleanup"},
+       "placement": {"disk": "root", "disk_path": "/Users/x/artifacts", "path": "/Users/x/artifacts/2171_chains"}},
+     "summary": "Thawing · finishing", "placement": "Mac storage", "thaw": null}
+  ]
+}

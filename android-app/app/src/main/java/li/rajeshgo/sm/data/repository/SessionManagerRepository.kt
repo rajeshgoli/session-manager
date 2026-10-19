@@ -745,6 +745,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getArtifacts() }
     }
 
+    suspend fun fetchArtifactActivity(baseUrl: String, token: String): kotlinx.serialization.json.JsonObject = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getArtifactActivity() }
+    }
+
     suspend fun artifactOwnerAction(baseUrl: String, token: String, name: String, body: kotlinx.serialization.json.JsonObject): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).artifactOwnerAction(name, body); Unit }.mapFailure(::classifyWriteFailure)
     }

@@ -383,8 +383,9 @@ pub fn clip(value: &str) -> String {
 
 /// Routes the clients poll; without any client header these are background
 /// (A.4).
-const POLL_ROUTES: [&str; 6] = [
+const POLL_ROUTES: [&str; 7] = [
     "/watch/state",
+    "/artifact-activity",
     "/client/host-status",
     "/client/board/badge",
     "/client/utilization/series",
@@ -540,6 +541,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/artifacts", "artifact.list", None),
     ("POST", "/artifacts", "artifact.create", None),
     ("GET", "/artifacts/{name}", "artifact.open", Some("artifact")),
+    ("GET", "/artifact-activity", "artifact.activity", None),
     ("POST", "/artifacts/{name}/{action}", "artifact.action", Some("artifact")),
     ("GET", "/claims", "claim.list", None),
     ("POST", "/claims", "claim.take", None),

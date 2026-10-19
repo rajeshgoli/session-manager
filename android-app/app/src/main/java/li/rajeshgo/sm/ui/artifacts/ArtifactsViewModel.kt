@@ -32,6 +32,8 @@ data class InvestigationStart(val request: li.rajeshgo.sm.data.model.CreateSessi
 
 data class ArtifactsState(
     val data: JsonObject? = null,
+    /** Operations, history and savings from /artifact-activity (sm#2325). */
+    val activity: JsonObject? = null,
     val error: String? = null,
     val busy: Boolean = false,
     val investigation: InvestigationStart? = null,
@@ -42,7 +44,31 @@ class ArtifactsViewModel(application: Application) : AndroidViewModel(applicatio
     private val repository = SessionManagerRepository(settings)
     private val mutable = MutableStateFlow(ArtifactsState())
     val state: StateFlow<ArtifactsState> = mutable
-    init { viewModelScope.launch { while (true) { load(); delay(60000) } } }
+    init {
+        viewModelScope.launch { while (true) { load(); delay(60000) } }
+        // Fast while an operation is queued or copying, so a freeze started from
+        // the CLI shows queued, copying, then done; a phase change reloads the folders.
+        viewModelScope.launch {
+            var seen: String? = null
+            while (true) {
+                val activity = loadActivity()
+                val ops = activity?.rows("operations").orEmpty()
+                val signature = ops.joinToString(",") { "${it.number("id")}:${it.text("phase")}" }
+                if (activity != null && seen != null && seen != signature) load()
+                if (activity != null) seen = signature
+                delay(if (ops.any { it.text("state") in listOf("running", "waiting") }) 4000 else 20000)
+            }
+        }
+    }
+    private suspend fun loadActivity(): JsonObject? = try {
+        val url = settings.serverUrl.first()
+        val token = settings.accessToken.first()
+        if (url.isBlank() || token.isBlank()) null
+        else repository.fetchArtifactActivity(url, token).also { mutable.value = mutable.value.copy(activity = it) }
+    } catch (e: Exception) {
+        if (e is CancellationException) throw e
+        null
+    }
     private suspend fun load() {
         try {
             val url = settings.serverUrl.first()
