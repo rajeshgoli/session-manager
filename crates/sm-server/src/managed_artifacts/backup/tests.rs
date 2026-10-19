@@ -1678,6 +1678,29 @@ fn artifact_linking_into_another_is_kept_as_the_link_and_round_trips() {
 }
 
 #[test]
+fn link_into_an_excluded_artifact_is_marked_backed_up() {
+    let f = Fixture::new();
+    let root = PathBuf::from(&f.manager.config.roots[0].path);
+    // Rebuildable and cheap, so out of scope; the link to it is still backed up.
+    f.artifact("chains", "live", true, false, 0);
+    symlink(root.join("chains"), root.join("alias")).unwrap();
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("INSERT INTO artifacts(root,name,state,location,set_id,origin,repo,created_at) VALUES(?1,'alias','live','root','alias','hand','owner/repo','now')",params![root.display().to_string()]).unwrap();
+    let mut dest = super::client::Destination::open(&f.dir.join("remote")).unwrap();
+    super::seed::seed(&f.manager, "backup-mini", &mut dest, None, false).unwrap();
+    let backed_up = |name: &str| -> bool {
+        conn.query_row(
+            "SELECT backed_up_at IS NOT NULL FROM artifacts WHERE name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(backed_up("alias"));
+    assert!(!backed_up("chains"));
+}
+
+#[test]
 fn file_removed_after_inventory_waits_a_night_then_is_deleted() {
     let f = Fixture::new();
     fs::write(f.dir.join("projects/a"), b"a").unwrap();

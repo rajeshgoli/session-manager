@@ -609,7 +609,9 @@ pub(super) fn mark_covered(
             for a in artifact_store::query(conn,"SELECT name,state,content_stamp FROM artifacts WHERE root=?1 AND state IN ('live','frozen','unrecorded') AND op IS NULL",&[&root.path])? {
                 let name=a["name"].as_str().context("artifact name")?;
                 let path=if a["state"]=="frozen" {PathBuf::from(&root.cold_store).join(".frozen").join(name)} else {PathBuf::from(&root.path).join(name)};
-                if fs::canonicalize(path).is_ok_and(|p|p==source) {
+                // A link into another source is backed up as the link itself (#2354).
+                let link=a["state"]!="frozen" && fs::canonicalize(&root.path).is_ok_and(|r|r.join(name)==source);
+                if link || fs::canonicalize(path).is_ok_and(|p|p==source) {
                     conn.execute("UPDATE artifacts SET backed_up_at=?3,backup_stamp=content_stamp WHERE root=?1 AND name=?2",params![root.path,name,now()])?;
                 }
             }
