@@ -435,13 +435,13 @@ def scanned_scripts(command, cwd, agent):
     out, paths = [], set()
     cwd = cwd or agent["checkout"]
     bases = [cwd, agent["checkout"]]
-    # A runner such as `sm queue run --cwd DIR -- cmd` runs cmd from DIR.
+    # `cd DIR && cmd` and runners such as `sm queue run --cwd DIR -- cmd` run cmd from DIR.
     try:
         tokens = shlex.split(command)
     except ValueError:
         tokens = []
     for index, token in enumerate(tokens):
-        if token == "--cwd" and index + 1 < len(tokens):
+        if token in ("--cwd", "cd") and index + 1 < len(tokens):
             bases.append(os.path.join(cwd, os.path.expanduser(tokens[index + 1])))
         elif token.startswith("--cwd="):
             bases.append(os.path.join(cwd, os.path.expanduser(token[len("--cwd="):])))
@@ -449,9 +449,11 @@ def scanned_scripts(command, cwd, agent):
     # working directory; show it like any other script file.
     modules = [tokens[i + 1] for i, t in enumerate(tokens[:-1]) if t == "-m"]
     for base in dict.fromkeys(os.path.realpath(d) for d in bases):
-        runs = [command] + [f"python3 {os.path.join(base, *m.split('.'))}{suffix}"
+        # Importing pkg.mod first runs each package's __init__.py.
+        runs = [command] + [f"python3 {os.path.join(base, *m.split('.')[:n])}{suffix}"
                             for m in modules if re.fullmatch(r"[\w.]+", m)
-                            for suffix in (".py", "/__main__.py")]
+                            for n in range(1, len(m.split('.')) + 1)
+                            for suffix in (".py", "/__init__.py", "/__main__.py")]
         for path, text in (item for run in runs for item in script_texts(run, base, agent)):
             if os.path.isabs(path) and path in paths:
                 continue
