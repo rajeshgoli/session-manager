@@ -250,6 +250,7 @@ export function TerminalPage({ id, open }) {
       connection: () => !stopped && live ? socket : null,
       upload: (body) => api(`/client/sessions/${encodeURIComponent(id)}/terminal-images`, { method: 'POST', body }),
       paste: (path) => control.current?.paste(path),
+      pasteText: (text) => terminal.paste(text),
       report: toast,
     });
     // Round trips (G3): the bridge answers each ping from its loop, without the PTY.
@@ -388,10 +389,10 @@ export function TerminalPage({ id, open }) {
         if (event.type === 'keydown') { event.preventDefault(); back(); }
         return false;
       }
-      // The page handles ⌘\ and ⌘⌥↑/↓ (G1).
       // Let the browser deliver Ctrl+V as a clipboard event, including images,
-      // instead of asking the remote agent to read the server's clipboard.
+      // on Windows/Linux. On macOS the capture handler reads it explicitly.
       if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'v') return false;
+      // The page handles ⌘\ and ⌘⌥↑/↓ (G1).
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') return false;
       if (event.metaKey && (event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
       return true;
