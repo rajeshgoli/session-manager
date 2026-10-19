@@ -226,7 +226,9 @@ pub fn retire_runtime(runtime: &TmuxRuntime, t: &Terminal) -> Result<()> {
 /// A child implies a descendant. Even a stopped or background child protects the shell.
 /// Failed or malformed probes return errors, never an idle observation.
 pub fn observe(runtime: &TmuxRuntime, t: &Terminal) -> Result<Observation> {
+    // -u: without a UTF-8 locale (launchd sets none) tmux prints each tab as `_`.
     let command = runtime.tmux_command([
+        "-u",
         "list-panes",
         "-s",
         "-t",
