@@ -7,6 +7,7 @@ import {
   openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
+import { isShell, shellFact, ShellMenu, createShell, shellError } from './shell.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -41,6 +42,7 @@ export function attentionOrder(a, b) {
 
 /** The card's left edge: its section colour, red for quiet or stalled, the line colour when idle. */
 export function edgeTone(agent) {
+  if (isShell(agent)) return 'line';
   const section = sectionOf(agent);
   const reason = agent.attention && agent.attention.reason;
   if (section === 'waiting_long' && (reason === 'quiet' || reason === 'stalled')) return 'red';
@@ -88,6 +90,7 @@ export function summaryCounts(counts) {
 /** "● Working 3m" or "○ Idle 7m". */
 export function agentFact(agent, now = Date.now()) {
   const fact = (agent.facts && agent.facts.agent) || { state: agent.state === 'stopped' ? 'stopped' : 'idle' };
+  if (isShell(agent)) return shellFact(agent, now);
   const since = age(fact.since, now);
   if (fact.state === 'working') return { text: `● Working ${since}`.trim(), tone: 'green' };
   if (fact.state === 'parked') return { text: fact.text || 'Parked: model yielded', tone: 'amber' };
@@ -201,6 +204,13 @@ export function RetireButton({ agent, onRetired, small = false }) {
     if (busy) return;
     setBusy(true);
     try {
+      if (isShell(agent)) {
+        await api(`/terminals/${encodeURIComponent(agent.id)}`, { method: 'DELETE' });
+        toast(`Retired ${agent.name}`);
+        setAsking(false);
+        onRetired?.(true);
+        return;
+      }
       await api(`/sessions/${encodeURIComponent(agent.id)}/retire`, {
         method: 'POST', body: ifFinishedIdle ? { if_finished_idle: true } : {},
       });
@@ -245,6 +255,10 @@ export function RetireButton({ agent, onRetired, small = false }) {
 
 /** The Agent, Jobs and You facts (1782 F), shared by the card and the details band. */
 function Facts({ agent, now, onAnswered, onRetired, cardSection }) {
+  if (isShell(agent)) {
+    const fact = shellFact(agent, now);
+    return html`<span class="facts"><span class="fa muted" title=${fact.text}>${fact.text}</span></span>`;
+  }
   const working = agentFact(agent, now);
   const jobs = jobsFact(agent);
   const you = youFact(agent, now);
@@ -550,15 +564,15 @@ function AgentCard({ agent, depth, now, showRepo, titles, selected, cursor, onAn
   return html`<div class=${cls} data-open-ref=${`agent:${agent.id}`} style=${depth > 1 ? `margin-left:${depth * 18}px` : ''} role="button" tabindex="0"
     onClick=${() => openPanel(`agent:${agent.id}`)}
     onKeyDown=${(event) => event.key === 'Enter' && event.target === event.currentTarget && openPanel(`agent:${agent.id}`)}>
-    <${Ring} percent=${agent.context_percent} />
+    ${isShell(agent) ? html`<span class="ring none">▹</span>` : html`<${Ring} percent=${agent.context_percent} />`}
     <span class="nm" title=${agent.name}>${agent.name}</span>
     <span class="icons">
       ${live ? iconButton('Terminal (t)', 'terminal', () => openTerminal(agent)) : null}
       ${linked ? iconButton('Open in Claude (c)', 'external', () => openInClaude(agent)) : null}
     </span>
     ${title ? html`<span class="ttl" title=${title}>${title}</span>` : null}
-    <span class="ln"><span class=${`prov ${agent.provider === 'opencode' ? 'local' : codex ? 'codex' : 'claude'}`}>${providerLabel(agent.provider).toUpperCase()}</span>
-      <span class="tk"> ${ticketText(agent)}</span>
+    <span class="ln"><span class=${`prov ${isShell(agent) ? 'muted' : agent.provider === 'opencode' ? 'local' : codex ? 'codex' : 'claude'}`}>${isShell(agent) ? 'TERMINAL' : providerLabel(agent.provider).toUpperCase()}</span>
+      ${isShell(agent) ? null : html`<span class="tk"> ${ticketText(agent)}</span>`}
       ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
     <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} onRetired=${onRetired} cardSection=${section} />
   </div>`;
@@ -578,10 +592,9 @@ export function detailClaims(active = [], retained = []) {
 
 function useAgent(id) {
   const [doc, error, reload] = usePoll(async () => {
-    const [watch, history] = await Promise.all([
-      api(`/watch/state?session=${encodeURIComponent(id)}`),
-      api(`/claims?session=${encodeURIComponent(id)}&active=false`),
-    ]);
+    const watch = await api(`/watch/state?session=${encodeURIComponent(id)}`);
+    const shell = (watch.sessions || []).some(s => s.id === id && isShell(s));
+    const history = shell ? {} : await api(`/claims?session=${encodeURIComponent(id)}&active=false`);
     return { ...watch, retainedClaims: history.claims };
   }, refreshMs(), [id]);
   const agent = doc && (doc.sessions || []).find((session) => session.id === id);
@@ -597,6 +610,10 @@ export function AgentPanel({ id, controls, beside }) {
     return html`<div class="phd"><span class="ring none">–</span><span class="t">${loading ? 'Loading…' : 'Agent'}</span>
       ${controls}<span class="s">${error ? error.message : ''}</span></div>`;
   }
+  if (isShell(agent)) return html`<div class="phd"><span class="ring none">▹</span><span class="t">${agent.name}</span>${controls}
+      <span class="s">Terminal · ${shellFact(agent, now).text}</span></div>
+    ${beside === 'terminal' ? null : html`<${AgentActions} agent=${agent} onSaved=${reload} onRetired=${done => { if (done) closePanel(); reload(); }} />`}
+    <div class="pbody"><h3>Folder</h3><p class="mono">${homeRelative(agent.working_dir || agent.repo)}</p></div>`;
   const since = agent.state === 'stopped' ? agent.last_activity : agent.activity_since || agent.last_activity;
   const parts = [
     providerLabel(agent.provider),
@@ -642,6 +659,7 @@ export function AgentMenus({ agent, onSaved, compact = false, small = false, ali
   const live = agent.state !== 'stopped';
   const close = () => setMenu(null);
   const btn = small ? 'btn sm' : 'btn';
+  if (isShell(agent)) return html`<${ShellMenu} shell=${agent} small=${small} align=${align} />`;
   return html`${live && !compact
       ? html`<span class="anchor"><button type="button" class=${btn} data-pop-anchor
           onClick=${() => setMenu(menu === 'handoff' ? null : 'handoff')}>Hand off…</button>
@@ -718,6 +736,12 @@ function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
     <button type="button" onClick=${() => { onClose(); newAgent({
       provider: agent.provider, model: agent.model, effort: agent.reasoning_effort, workspace: agent.working_dir,
     }); }}>Clone</button>
+    <button type="button" disabled=${busy} onClick=${async () => {
+      setBusy(true);
+      try { await createShell({ from_session: agent.id }); onClose(); }
+      catch (error) { toast(shellError(error)); }
+      finally { setBusy(false); }
+    }}>New shell here</button>
     <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
     <button type="button" onClick=${() => setEditing('rename')}>Rename…</button>

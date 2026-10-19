@@ -835,3 +835,12 @@ button.sw-sec { cursor: pointer; }
  .board-presetbar .launch-presets { width:100%; }
  .launch-presets { display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
+
+/* A public shell route shows instructions in the terminal's place. */
+.shell-away { grid-area: term; min-width: 0; overflow: auto; padding: 32px; background: var(--panel); color: var(--ink); }
+.shell-away h2 { font-size: 1.2rem; margin: 0 0 16px; }
+.shell-away p { max-width: 42rem; }
+.shell-away pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; background: var(--bg); border: 1px solid var(--line); }
+.shell-away .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+.sw-shell { font-size: 1rem; text-align: center; }
+@media (max-width: 600px) { .shell-away { padding: 20px; } }

@@ -3,10 +3,11 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store, toast } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
-import { chooseRoute, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
+import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
+import { isShell, shellFact, ShellMenu, ShellAwayPanel } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -34,6 +35,7 @@ const session = () => { try { return window.sessionStorage; } catch (e) { return
 
 /** The row's second line: the you or finished text (with its ✓), else jobs or a review round, else the agent fact. */
 export function switcherFact(agent, now = Date.now()) {
+  if (isShell(agent)) return shellFact(agent, now);
   const you = youFact(agent, now);
   if (you) return you;
   const jobs = agent.facts && agent.facts.jobs;
@@ -95,7 +97,7 @@ function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
         const label = fact.tone === 'cyan' ? 'read' : 'answered';
         return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
             class=${`sw-row${agent.id === currentId ? ' cur' : ''}`} onClick=${() => pick(agent)}>
-          <i class=${`sw-dot ${SECTION_TONE[section]}`}></i>
+          ${isShell(agent) ? html`<span class="sw-shell muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[section]}`}></i>`}
           <span class="sw-nm" title=${agent.name}>${agent.name}</span>
           ${fact.dismissible
             ? html`<button type="button" class=${`icon-btn ok ${fact.tone}`} title=${`Mark ${label}`} aria-label=${`Mark ${agent.name} ${label}`}
@@ -116,6 +118,7 @@ export function TerminalPage({ id, open }) {
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
   const [route, setRoute] = useState({ label: '', samples: [] });
+  const [away, setAway] = useState(false);
   const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
   const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
   const showKeys = useWidth(touchKeys);
@@ -123,6 +126,9 @@ export function TerminalPage({ id, open }) {
   const wide = !useWidth(narrow) && !showKeys;
   const [doc, , reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
+  const shell = isShell(agent);
+  // Wait for identity before connecting, so a shell can never attach as an agent.
+  const targetKind = agent ? (shell ? 'shell' : 'agent') : null;
   const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
   // Details, and whatever it links to (a ticket, PR, doc or job), open beside the terminal.
   const split = open ? open.indexOf(':') : -1;
@@ -171,6 +177,8 @@ export function TerminalPage({ id, open }) {
   }, []);
 
   useEffect(() => {
+    if (!targetKind) return;
+    setAway(false);
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
       lineHeight: 1.12, scrollback: 10000, minimumContrastRatio: CONTRAST_FLOOR,
@@ -212,7 +220,7 @@ export function TerminalPage({ id, open }) {
     const fitNow = () => {
       clearTimeout(resizeTimer);
       const size = fit.proposeDimensions();
-      if (!size) return false;
+      if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return false;
       // At least 11 columns, so the nudge stays within the bridge's 10-column floor.
       terminal.resize(Math.max(11, Math.min(300, size.cols)), Math.max(2, Math.min(120, size.rows)));
       const now = `${terminal.cols}x${terminal.rows}`;
@@ -281,6 +289,7 @@ export function TerminalPage({ id, open }) {
       if (socket === ws) socket = null;
       ws.close();
       rememberRoute(session(), 'relay', instance, Date.now());
+      if (shell) { setAway(true); setConnection('SSH'); return; }
       connect(true);
     };
     // On the relay soon after a direct socket, probe for the direct path a few times and
@@ -288,6 +297,7 @@ export function TerminalPage({ id, open }) {
     // relay for ten minutes. Away from this machine's network no direct socket ran
     // recently, so nothing is probed.
     const watchDirect = (ws, ticket) => {
+      if (shell) return;
       if (!directSwitch || !recentlyDirect(session(), Date.now())) return;
       const next = (i) => {
         if (i >= DIRECT_RETRY_MS.length) return;
@@ -316,6 +326,9 @@ export function TerminalPage({ id, open }) {
         if (stopped) return;
         samples = [];
         setRoute({ label: chosen.label, samples });
+        if (shell && !shellBrowserAllowed(chosen)) {
+          setAway(true); setConnection('SSH'); return;
+        }
         const ws = new WebSocket(chosen.url);
         socket = ws;
         let ended = false, attached = false;
@@ -412,23 +425,23 @@ export function TerminalPage({ id, open }) {
       stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
-  }, [id, attempt]);
+  }, [id, attempt, targetKind]);
 
   const linked = agent?.remote_control?.url?.startsWith('https://claude.ai/code/');
   const live = connection === 'Live';
   const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
   const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
   // Hand off… and ⋯ live here, not in the Details panel beside this terminal (#2277).
-  const menus = (compact) => agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
+  const menus = (compact) => shell ? html`<${ShellMenu} key=${id} shell=${agent} away=${away} small align="right" />` : agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
   // Desktop (#2242): who and how full on the left; connection words only when not live,
   // with the route in the dot's tooltip; actions on the right, Retire last.
   const desktopBar = () => html`<div class="term-bar wide" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <span class="term-who" title=${[agent?.state, connection, live && route.label ? routeText(route.label, route.samples) : ''].filter(Boolean).join(' · ')}>
-        <i class=${`sw-dot ${SECTION_TONE[agent?.attention?.section] || 'muted'}`}></i>
+        ${shell ? html`<span class="muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[agent?.attention?.section] || 'muted'}`}></i>`}
         <span class="t">${agent ? agent.name : id}</span>
-        ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
+        ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
       </span>
       ${live ? null : html`<span class="term-connection" role="status">${connection}</span>`}
       <span class="sp"></span>
@@ -448,12 +461,12 @@ export function TerminalPage({ id, open }) {
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
       ${notes}
-      ${agent ? html`<${Ring} percent=${agent.context_percent} />` : null}
+      ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
       <span class="t">${agent ? agent.name : id}</span><span class="sub term-state">${agent ? agent.state : ''}</span>
       <span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>
       ${connection === 'Live' && route.label
         ? html`<span class="term-route" title="Route and round-trip time">${routeText(route.label, route.samples)}</span>` : null}
-      ${showKeys ? html`<span class="term-keys">${keys.map(([label, key]) => html`<button type="button" class="btn sm" disabled=${connection !== 'Live'}
+      ${showKeys && !shell ? html`<span class="term-keys">${keys.map(([label, key]) => html`<button type="button" class="btn sm" disabled=${connection !== 'Live'}
         onClick=${() => control.current?.key(key)}>${label}</button>`)}
         <button type="button" class="btn sm" disabled=${connection !== 'Live'} onClick=${() => control.current?.model()}>/model</button></span>` : null}
       <span class="sp"></span>
@@ -473,13 +486,14 @@ export function TerminalPage({ id, open }) {
           aria-label=${`${switcher ? 'Fold' : 'Unfold'} agent list`} aria-expanded=${switcher}
           onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>
       </div>
-      <div class="term-body" ref=${host}></div>
+      <div class="term-body" ref=${host} hidden=${away && shell}></div>
+      ${away && shell ? html`<${ShellAwayPanel} key=${id} id=${id} />` : null}
       ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
         onType=${text => { if (!control.current?.paste(text)) toast('Terminal is not connected'); }} /></aside>` : null}
       ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">
         <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>
-    ${connection !== 'Live' ? html`<div class="term-notice" role="status">${error || connection}
+    ${connection !== 'Live' && !(away && shell) ? html`<div class="term-notice" role="status">${error || connection}
       ${connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
   </div>`;
 }

@@ -26,7 +26,7 @@ export function TypePicker({ settings, value = null, onPick, other = true, extra
     aria-pressed=${value === key} disabled=${disabled} onClick=${pick}><b>${title}</b><span>${detail}</span></button>`;
   return html`<div class="launch-presets" role="group" aria-label="Agent type">
     ${agentTypes(settings).map(t => button(t.name, t.name, exactConfig(typeConfig(t)), () => onPick(t)))}
-    ${extra ? button(extra.key, extra.title, extra.detail, extra.onPick, extra.disabled) : null}
+    ${(Array.isArray(extra) ? extra : extra ? [extra] : []).map(card => button(card.key, card.title, card.detail, card.onPick, card.disabled))}
     ${other ? button(OTHER_TYPE, 'Other', 'Choose provider, model and effort', () => onPick(null)) : null}
   </div>`;
 }

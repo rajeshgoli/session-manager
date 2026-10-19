@@ -39,6 +39,7 @@ const ASSETS: &[Asset] = &[
     asset!("start.js", JS),
     asset!("notes.js", JS),
     asset!("agents.js", JS),
+    asset!("shell.js", JS),
     asset!("queue.js", JS),
     asset!("artifacts.js", JS),
     asset!("artifacts-model.js", JS),

@@ -1,0 +1,86 @@
+// Plain shell presentation and owner actions (plain_terminal_memo, appendix C).
+import { useEffect, useState } from 'preact/hooks';
+import { html, api, age, navigate, Popover, toast } from './ui.js';
+
+export const isShell = row => row?.kind === 'shell';
+export function shellFact(shell, now = Date.now()) {
+  const fact = shell.facts?.agent;
+  const text = shell.facts?.text || fact?.text;
+  return { text: text || `last input ${age(fact?.since || shell.last_activity, now) || 'now'}`, tone: 'muted' };
+}
+export function shellError(error) {
+  if (error.message === 'plain_disabled') return 'Plain shells are disabled in Settings → Terminals.';
+  if (error.message === 'no_ssh_key') return 'Add an SSH public key for this device in Settings → Devices & access.';
+  if (error.message === 'too_many_terminals') {
+    const open = error.payload?.terminals || error.body?.terminals || [];
+    return `Too many open shells. Retire one first.${open.length ? ` Open: ${open.map(t => `${t.id} · ${t.cwd}`).join(', ')}` : ''}`;
+  }
+  return error.message;
+}
+export async function createShell(body) {
+  const result = await api('/terminals', { method: 'POST', body });
+  navigate(`/terminal/${encodeURIComponent(result.id)}`);
+  return result;
+}
+// Reading home metadata never opens the tunnel. Open tunnel explicitly asks for away.
+export const homeShellRoute = id => api(`/terminals/${encodeURIComponent(id)}/route`, { method: 'POST', body: { where: 'home' } });
+export const awayShellCommand = route => route?.ssh_user && route?.tmux_session
+  ? `ssh -t ${route.ssh_user}@studio-away tmux attach-session -t ${route.tmux_session}` : '';
+async function copyCommand(command) {
+  try { await navigator.clipboard.writeText(command); toast('SSH command copied'); }
+  catch { toast(command); }
+}
+
+export function ShellMenu({ shell, away = false, small = false, align }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const action = async fn => {
+    setBusy(true);
+    try { await fn(); setOpen(false); }
+    catch (error) { toast(shellError(error)); }
+    finally { setBusy(false); }
+  };
+  return html`<span class="anchor"><button type="button" class=${small ? 'btn sm' : 'btn'} data-pop-anchor aria-label="More"
+    onClick=${() => setOpen(!open)}>⋯</button>
+    ${open ? html`<${Popover} align=${align} onClose=${() => setOpen(false)} className="menu">
+      <button type="button" disabled=${busy} onClick=${() => action(() => createShell({ cwd: shell.working_dir || shell.repo }))}>New shell here</button>
+      <button type="button" disabled=${busy} onClick=${() => action(async () => {
+        const route = await homeShellRoute(shell.id);
+        await copyCommand(away ? awayShellCommand(route) : route.command);
+      })}>Copy ssh command</button>
+    <//>` : null}</span>`;
+}
+
+export function ShellAwayPanel({ id }) {
+  const [command, setCommand] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [opened, setOpened] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let current = true;
+    setError('');
+    homeShellRoute(id).then(route => { if (current) setCommand(awayShellCommand(route)); })
+      .catch(error => { if (current) setError(shellError(error)); });
+    return () => { current = false; };
+  }, [id, attempt]);
+  const open = async () => {
+    setBusy(true); setError(''); setOpened(false);
+    try {
+      const route = await api(`/terminals/${encodeURIComponent(id)}/route`, { method: 'POST', body: { where: 'away' } });
+      setCommand(route.command); setOpened(true);
+    } catch (error) { setError(shellError(error)); }
+    finally { setBusy(false); }
+  };
+  return html`<section class="shell-away" aria-label="Shell SSH access">
+    <h2>Shells attach over SSH away from home</h2>
+    <p>Open the tunnel, then run this command in your terminal using this device's SSH key.</p>
+    ${command ? html`<pre>${command}</pre>` : html`<p class="sub">${error ? 'SSH command unavailable.' : 'Loading SSH command…'}</p>`}
+    <div class="row"><button type="button" class="btn" disabled=${!command} onClick=${() => copyCommand(command)}>Copy</button>
+      <button type="button" class="btn pri" disabled=${busy} onClick=${open}>${busy ? 'Opening tunnel…' : 'Open tunnel'}</button>
+      ${!command && error ? html`<button type="button" class="btn" onClick=${() => setAttempt(n => n + 1)}>Retry</button>` : null}</div>
+    ${opened ? html`<p role="status">Tunnel open. Run the SSH command to attach.</p>` : null}
+    ${error ? html`<p class="err" role="alert">${error}</p>` : null}
+    <a href="/settings#devices-access" onClick=${e => { e.preventDefault(); navigate('/settings#devices-access'); }}>Manage device SSH keys</a>
+  </section>`;
+}
