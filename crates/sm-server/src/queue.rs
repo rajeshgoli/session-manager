@@ -1746,14 +1746,25 @@ impl RetainedQueueStore {
             );
             return get_queue_job_conn(&conn, job_id);
         }
-        if let Some(reason) = crate::managed_artifacts::queue::admit(&conn, job_id)? {
+        // An artifact store that cannot be read or written holds this job
+        // with that reason rather than failing the whole pass (sm#2378).
+        let artifact_hold = match crate::managed_artifacts::queue::admit(&conn, job_id) {
+            Ok(reason) => reason,
+            Err(error) => {
+                eprintln!("artifact admission deferred for {job_id}: {error:#}");
+                let ids = BTreeSet::from([job_id.to_owned()]);
+                hold_for_scheduler_error_conn(&conn, &ids, ARTIFACT_STORE_HOLD, &error)?;
+                Some(ARTIFACT_STORE_HOLD.to_owned())
+            }
+        };
+        if let Some(reason) = artifact_hold {
             mark_pending_queue_jobs_holding_conn(&conn, Some(job_id), &reason)?;
             schedule_queue_admission_retry(
                 state_dir.to_path_buf(),
                 message_queue_db_path.to_path_buf(),
                 cancel_grace_seconds,
                 admission_policy,
-                30,
+                ARTIFACT_STORE_RETRY_SECONDS,
             );
             return get_queue_job_conn(&conn, job_id);
         }
@@ -1773,13 +1784,24 @@ impl RetainedQueueStore {
             UPDATE queue_jobs
             SET state = 'running',
                 holding_reason = NULL,
+                termination_detail_json = CASE
+                    WHEN json_extract(termination_detail_json, '$.cause') IN (?5, ?6) THEN NULL
+                    ELSE termination_detail_json
+                END,
                 started_at = ?2,
                 pid = ?3,
                 process_group_id = ?3,
                 process_limit = ?4
             WHERE id = ?1 AND state = 'pending'
             "#,
-            params![job_id, now_rfc3339(), pid, process_limit],
+            params![
+                job_id,
+                now_rfc3339(),
+                pid,
+                process_limit,
+                ARTIFACT_STORE_HOLD,
+                SCHEDULER_ERROR_HOLD
+            ],
         )?;
         // Read the record before the monitor starts: a job that exits at
         // once could otherwise be finished by the monitor first, and the
@@ -1909,7 +1931,8 @@ impl RetainedQueueStore {
             )?;
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
+            hold_unexplained_pending_jobs_for_scheduler_error(state_dir, error);
             schedule_queue_admission_retry(
                 state_dir.to_path_buf(),
                 message_queue_db_path.to_path_buf(),
@@ -2241,6 +2264,7 @@ impl RetainedQueueStore {
         }
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
+        retry_deferred_artifact_completions_conn(&conn, message_queue_db_path);
         retry_unnotified_queue_job_completions_conn(
             &conn,
             message_queue_db_path,
@@ -4559,9 +4583,18 @@ fn admit_pending_queue_jobs_conn(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let admission_policy = live_admission_policy(state_dir, admission_policy);
-    crate::managed_artifacts::queue::repair(conn, Some(message_queue_db_path))?;
+    // Deadlines first: a job gives up on time, and its requester hears why,
+    // whatever a later step of this pass fails on (sm#2378).
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
+    // Artifact repair guards only jobs that declare artifacts. While the
+    // artifact store is unavailable those jobs wait under their own reason;
+    // every other job is admitted as usual.
+    let artifact_store_error =
+        crate::managed_artifacts::queue::repair(conn, Some(message_queue_db_path)).err();
+    if let Some(error) = &artifact_store_error {
+        eprintln!("queue artifact repair deferred: {error:#}");
+    }
     // Validate before clearing any existing holds: after a restart, preserved
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
@@ -4586,6 +4619,17 @@ fn admit_pending_queue_jobs_conn(
     let mut summary = QueueAdmissionSummary {
         requeued,
         ..QueueAdmissionSummary::default()
+    };
+    let artifact_blocked = match &artifact_store_error {
+        Some(error) => {
+            let ids = pending_artifact_queue_job_ids_conn(conn)?;
+            summary.held += hold_for_scheduler_error_conn(conn, &ids, ARTIFACT_STORE_HOLD, error)?;
+            if !ids.is_empty() {
+                summary.retry_after_seconds = Some(ARTIFACT_STORE_RETRY_SECONDS);
+            }
+            ids
+        }
+        None => BTreeSet::new(),
     };
     // Every pass must make progress. A candidate that was already tried in this
     // pass and is still eligible did not start (for example, its record vanished
@@ -4615,7 +4659,8 @@ fn admit_pending_queue_jobs_conn(
         jobs.retain(|job| {
             job.state != "pending"
                 || (!local_wall_waits_for_restoration(job, state_dir)
-                    && !attempted_candidates.contains(&job.id))
+                    && !attempted_candidates.contains(&job.id)
+                    && !artifact_blocked.contains(&job.id))
         });
         if !jobs.iter().any(|job| job.state == "pending") {
             break;
@@ -5720,6 +5765,99 @@ fn mark_pending_queue_jobs_holding_conn(
         )?
     };
     Ok(updated)
+}
+
+/// Hold for a job that declares artifacts while the artifact store cannot be
+/// read or written (for example, a backup holds its write lock).
+pub const ARTIFACT_STORE_HOLD: &str = "artifact_store_unavailable";
+/// Hold for a pending job the scheduler could not evaluate because its pass
+/// failed.
+pub const SCHEDULER_ERROR_HOLD: &str = "scheduler_error";
+const ARTIFACT_STORE_RETRY_SECONDS: u64 = 30;
+
+fn pending_artifact_queue_job_ids_conn(conn: &Connection) -> Result<BTreeSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT j.id FROM queue_jobs j JOIN queue_artifact_submissions s ON s.job_id = j.id WHERE j.state = 'pending'",
+    )?;
+    let ids = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// Holds `ids` under `cause` and records the error on each job, so status and
+/// the give-up wake can say what blocked it and since when. `since` survives
+/// repeated passes that fail the same way.
+fn hold_for_scheduler_error_conn(
+    conn: &Connection,
+    ids: &BTreeSet<String>,
+    cause: &str,
+    error: &anyhow::Error,
+) -> Result<usize> {
+    let text: String = format!("{error:#}").chars().take(500).collect();
+    let now = now_rfc3339();
+    let mut held = 0;
+    for id in ids {
+        held += conn.execute(
+            r#"
+            UPDATE queue_jobs
+            SET holding_reason = ?2,
+                termination_detail_json = json_object(
+                    'cause', ?2,
+                    'error', ?3,
+                    'since', CASE
+                        WHEN json_extract(termination_detail_json, '$.cause') = ?2
+                        THEN COALESCE(json_extract(termination_detail_json, '$.since'), ?4)
+                        ELSE ?4
+                    END
+                )
+            WHERE id = ?1 AND state = 'pending'
+            "#,
+            params![id, cause, text, now],
+        )?;
+    }
+    Ok(held)
+}
+
+/// After a failed pass, names the failure on every pending job the pass left
+/// without a reason. Best effort: the queue database itself may be the
+/// failure.
+fn hold_unexplained_pending_jobs_for_scheduler_error(state_dir: &Path, error: &anyhow::Error) {
+    let result = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).and_then(|conn| {
+        let ids = {
+            let mut statement = conn.prepare(
+                "SELECT id FROM queue_jobs WHERE state = 'pending' AND holding_reason IS NULL",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+            ids
+        };
+        hold_for_scheduler_error_conn(&conn, &ids, SCHEDULER_ERROR_HOLD, error)
+    });
+    if let Err(hold_error) = result {
+        eprintln!("queue scheduler error not recorded on pending jobs: {hold_error:#}");
+    }
+}
+
+/// One-line account of what kept a job from starting, from the detail the
+/// scheduler recorded on it. `None` when nothing was recorded.
+pub fn queue_wait_blocker_text(detail: &JsonValue) -> Option<String> {
+    let since = detail["since"]
+        .as_str()
+        .map(|since| format!(" since {since}"))
+        .unwrap_or_default();
+    let error = detail["error"].as_str().unwrap_or("unknown error");
+    match detail["cause"].as_str()? {
+        "concurrency_cap" => Some(concurrency_cap_wait_text(detail)),
+        ARTIFACT_STORE_HOLD => Some(format!(
+            "artifact store was unavailable{since} ({error}); this job declares artifacts, so it could not start"
+        )),
+        SCHEDULER_ERROR_HOLD => Some(format!(
+            "scheduler could not evaluate this job{since} ({error})"
+        )),
+        _ => None,
+    }
 }
 
 fn mark_pending_queue_jobs_behind_running_perf_conn(
@@ -7657,6 +7795,47 @@ fn retry_unnotified_queue_job_completions_conn(
     Ok(notified)
 }
 
+/// Finishes artifact bookkeeping that a job's completion deferred because the
+/// artifact store was unavailable. At most every 30 seconds: each attempt
+/// waits out the store's busy timeout while a long writer holds it.
+fn retry_deferred_artifact_completions_conn(conn: &Connection, message_queue_db_path: &Path) {
+    static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST_ATTEMPT.lock().unwrap_or_else(|e| e.into_inner());
+        if last
+            .is_some_and(|at| at.elapsed() < StdDuration::from_secs(ARTIFACT_STORE_RETRY_SECONDS))
+        {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let ids = conn
+        .prepare(
+            "SELECT s.job_id FROM queue_artifact_submissions s JOIN queue_jobs j ON j.id = s.job_id
+             WHERE s.completed = 0 AND j.state NOT IN ('pending', 'running')",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(error) => {
+            eprintln!("deferred artifact completions not listed: {error:#}");
+            return;
+        }
+    };
+    for id in ids {
+        if let Err(error) =
+            crate::managed_artifacts::queue::complete(conn, &id, Some(message_queue_db_path))
+        {
+            // One bad record must not starve the rest.
+            eprintln!("artifact completion deferred for {id}: {error:#}");
+        }
+    }
+}
+
 fn record_queue_job_completion_notification_conn(
     conn: &Connection,
     job: &QueueJobRuntimeRecord,
@@ -7672,7 +7851,14 @@ fn record_queue_job_completion_notification_conn(
     if !conn.is_autocommit() {
         return Ok(false);
     }
-    crate::managed_artifacts::queue::complete(conn, &job.id, message_queue_db_path)?;
+    // The wake does not wait for artifact bookkeeping: a long artifact-store
+    // writer would otherwise silence it for hours. The completion retry loop
+    // finishes the bookkeeping once the store is writable (sm#2378).
+    if let Err(error) =
+        crate::managed_artifacts::queue::complete(conn, &job.id, message_queue_db_path)
+    {
+        eprintln!("artifact completion deferred for {}: {error:#}", job.id);
+    }
     let Some(completion_notified_at) = queue_job_completion_notified_at(
         job,
         state,
@@ -8063,7 +8249,26 @@ pub fn queue_hold_explanation(
             "waiting for resource budget metadata".into(),
             "This legacy performance job has no complete recorded resource budget and cannot be started safely; resubmit it with explicit CPU, memory, and time budgets.".into(),
         ),
-        "" => ("reason not yet reported".into(), "The job is queued, but the scheduler has not reported a hold reason yet. Check sm queue status for updated scheduler context.".into()),
+        ARTIFACT_STORE_HOLD | SCHEDULER_ERROR_HOLD => {
+            let detail = job.termination_detail.as_ref().filter(|detail| detail["cause"].as_str() == Some(reason));
+            let error = detail.and_then(|d| d["error"].as_str()).unwrap_or("no error recorded");
+            let since = detail.and_then(|d| d["since"].as_str()).map(|s| format!(" since {s}")).unwrap_or_default();
+            if reason == ARTIFACT_STORE_HOLD {
+                ("waiting for the artifact store".into(), format!(
+                    "This job declares managed artifacts, and the artifact store has been unavailable{since} ({error}). Jobs without artifacts are not affected. Admission retries every {ARTIFACT_STORE_RETRY_SECONDS} seconds; the job gives up at its queue deadline."
+                ))
+            } else {
+                ("waiting for the scheduler to recover".into(), format!(
+                    "The scheduler's pass failed{since} ({error}), so it could not evaluate this job. It retries every 30 seconds; the job gives up at its queue deadline. If this persists, report it as an sm bug."
+                ))
+            }
+        }
+        "" if queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
+            .is_some_and(|elapsed| elapsed > job.max_wait_seconds) => (
+            "scheduler stalled".into(),
+            "The scheduler has not evaluated this job, and its queue deadline has passed, so the scheduler is stalled. Report it as an sm bug with this job id.".into(),
+        ),
+        "" => ("not yet evaluated".into(), "The job is queued; the scheduler evaluates it on its next pass.".into()),
         other => (format!("waiting for {}", other.replace('_', " ")), format!("Scheduler hold: {}.", other.replace('_', " "))),
     };
     let blocker_seconds = blockers
@@ -8206,16 +8411,19 @@ fn queue_job_completion_text_with_policy(
                 job.max_wait_seconds
             )
         } else {
-            if let Some(detail) = job
+            if let Some(blocker) = job
                 .termination_detail_json
                 .as_deref()
-                .filter(|_| reason == "concurrency_cap")
                 .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+                .filter(|detail| detail["cause"].as_str() == Some(reason))
+                .and_then(|detail| queue_wait_blocker_text(&detail))
             {
-                wait_note = format!(
-                    ". Never started: the {}. Resubmit with a longer --max-wait to keep waiting.",
-                    concurrency_cap_wait_text(&detail)
-                );
+                let advice = match reason {
+                    ARTIFACT_STORE_HOLD => "Resubmit once the artifact store is free, or with a longer --max-wait to keep waiting",
+                    SCHEDULER_ERROR_HOLD => "This is an sm fault, not your job's. Resubmit; if it happens again, report it as an sm bug with this job id",
+                    _ => "Resubmit with a longer --max-wait to keep waiting",
+                };
+                wait_note = format!(". Never started: the {blocker}. {advice}.");
             }
             format!(" wait_reason={reason} max_wait={}s", job.max_wait_seconds)
         }
@@ -9558,21 +9766,199 @@ mod tests {
             TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&state_dir).unwrap();
-        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
-        init_queue_jobs_schema(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO queue_artifact_context(id,config_json) VALUES(1,'invalid config')",
-            [],
+        let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+            &state_dir,
+            plain_request("waits"),
+            300,
         )
         .unwrap();
-        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,QueueAdmissionPolicy::default()).is_err());
+        // A service cap that leaves no slot for other work fails the pass.
+        let invalid = QueueAdmissionPolicy {
+            max_running_jobs: 1,
+            service_max_concurrent: 1,
+            ..QueueAdmissionPolicy::default()
+        };
+        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,invalid).is_err());
         assert!(queue_admission_retries()
             .lock()
             .unwrap()
             .contains_key(&state_dir));
         release_queue_admission_retry(&state_dir);
+        // sm#2378: the job says why it waits instead of "no reason yet".
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let held = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(held.holding_reason.as_deref(), Some(SCHEDULER_ERROR_HOLD));
+        let detail = held.termination_detail.clone().unwrap();
+        assert!(detail["error"]
+            .as_str()
+            .unwrap()
+            .contains("service capacity"));
+        let explanation =
+            queue_hold_explanation(&held, &[], QueueAdmissionPolicy::default()).unwrap();
+        assert_eq!(
+            explanation["summary"],
+            "waiting for the scheduler to recover"
+        );
+        assert!(explanation["detail"]
+            .as_str()
+            .unwrap()
+            .contains("service capacity"));
         drop(conn);
         std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    fn plain_request(label: &str) -> CreateQueueJob {
+        CreateQueueJob {
+            local_submitter: None,
+            job_type: "tests".into(),
+            label: label.into(),
+            requester_session_id: Some("requester".into()),
+            notify_session_id: "notify".into(),
+            cwd: "/tmp".into(),
+            argv: Some(vec!["/usr/bin/true".into()]),
+            script: None,
+            env: BTreeMap::new(),
+            timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
+            rank_tickets: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_artifact_store_holds_only_artifact_jobs_and_deadlines_still_fire() {
+        // sm#2378: a backup held the artifact store's write lock for hours and
+        // every queue job sat pending past its deadline with no wake.
+        let state_dir = unique_temp_path("queue-artifact-store-down");
+        let messages = state_dir.join("messages.db");
+        let create = |label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+                &state_dir,
+                plain_request(label),
+                300,
+            )
+            .unwrap()
+        };
+        let plain = create("plain");
+        let artifact = create("artifact");
+        let overdue = create("overdue");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        // Repair cannot build its artifact manager from this context.
+        conn.execute(
+            "INSERT INTO queue_artifact_context(id,config_json) VALUES(1,'invalid config')",
+            [],
+        )
+        .unwrap();
+        // Its own config keeps completion off the default (live) artifact
+        // store; the unparseable submission makes that bookkeeping fail.
+        let artifact_config =
+            serde_json::json!({"db_path": state_dir.join("artifacts.db")}).to_string();
+        conn.execute(
+            "INSERT INTO queue_artifact_submissions(job_id,config_json,prepared_json) VALUES(?1,?2,'{}')",
+            params![artifact.id, artifact_config],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            params![overdue.id],
+        )
+        .unwrap();
+
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &messages,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        release_queue_admission_retry(&state_dir);
+
+        let job = |id: &str| get_queue_job_conn(&conn, id).unwrap().unwrap();
+        assert_ne!(job(&plain.id).state, "pending");
+        assert_eq!(job(&overdue.id).state, "wait_expired");
+        assert!(get_queue_job_runtime_conn(&conn, &overdue.id)
+            .unwrap()
+            .unwrap()
+            .completion_notified_at
+            .is_some());
+        let held = job(&artifact.id);
+        assert_eq!(held.state, "pending");
+        assert_eq!(held.holding_reason.as_deref(), Some(ARTIFACT_STORE_HOLD));
+        let detail = held.termination_detail.clone().unwrap();
+        assert_eq!(detail["cause"], ARTIFACT_STORE_HOLD);
+        let since = detail["since"].as_str().unwrap().to_owned();
+        let explanation =
+            queue_hold_explanation(&held, &[], QueueAdmissionPolicy::default()).unwrap();
+        assert_eq!(explanation["summary"], "waiting for the artifact store");
+        assert!(explanation["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Jobs without artifacts are not affected"));
+
+        // A later failing pass keeps the first failure time.
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &messages,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        release_queue_admission_retry(&state_dir);
+        assert_eq!(
+            job(&artifact.id).termination_detail.unwrap()["since"],
+            since.as_str()
+        );
+
+        // At its deadline it gives up and the wake names the blocker.
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            params![artifact.id],
+        )
+        .unwrap();
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &messages,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        release_queue_admission_retry(&state_dir);
+        let expired = job(&artifact.id);
+        assert_eq!(expired.state, "wait_expired");
+        assert_eq!(expired.holding_reason.as_deref(), Some(ARTIFACT_STORE_HOLD));
+        let blocker =
+            queue_wait_blocker_text(expired.termination_detail.as_ref().unwrap()).unwrap();
+        assert!(blocker.starts_with("artifact store was unavailable since "));
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_job_that_starts_drops_its_scheduler_hold_detail() {
+        let state_dir = unique_temp_path("queue-hold-detail-cleared");
+        let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+            &state_dir,
+            plain_request("recovers"),
+            300,
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let ids = BTreeSet::from([job.id.clone()]);
+        hold_for_scheduler_error_conn(&conn, &ids, SCHEDULER_ERROR_HOLD, &anyhow::anyhow!("boom"))
+            .unwrap();
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            &state_dir,
+            &state_dir.join("messages.db"),
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        let started = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_ne!(started.state, "pending");
+        assert!(started.termination_detail.is_none());
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

@@ -126,13 +126,22 @@ pub fn repair(conn: &Connection, messages: Option<&Path>) -> Result<()> {
     }
     // Artifact-side-only submission commits must not retain in-use protection
     // forever. Keep the records and failure history, never delete their files.
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("UPDATE artifact_jobs SET state='failed' WHERE job_id IN (SELECT r.job_id FROM artifact_job_reservations r LEFT JOIN queue_jobs q ON q.id=r.job_id WHERE q.id IS NULL)",[])?;
-    tx.execute(
-        "DELETE FROM artifact_job_reservations WHERE job_id NOT IN (SELECT id FROM queue_jobs)",
+    // Every admission pass runs this, so write only when there is an orphan:
+    // a write waits behind any long artifact-store writer (sm#2378).
+    let orphaned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artifact_job_reservations WHERE job_id NOT IN (SELECT id FROM queue_jobs))",
         [],
+        |r| r.get(0),
     )?;
-    tx.commit()?;
+    if orphaned {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("UPDATE artifact_jobs SET state='failed' WHERE job_id IN (SELECT r.job_id FROM artifact_job_reservations r LEFT JOIN queue_jobs q ON q.id=r.job_id WHERE q.id IS NULL)",[])?;
+        tx.execute(
+            "DELETE FROM artifact_job_reservations WHERE job_id NOT IN (SELECT id FROM queue_jobs)",
+            [],
+        )?;
+        tx.commit()?;
+    }
     let rows=store::query(conn,"SELECT s.job_id,j.state FROM queue_artifact_submissions s JOIN queue_jobs j ON j.id=s.job_id WHERE s.completed=0 OR EXISTS(SELECT 1 FROM artifact_job_reservations r WHERE r.job_id=s.job_id)",&[])?;
     for row in rows {
         let id = row["job_id"].as_str().context("job id")?;

@@ -17740,7 +17740,9 @@ fn queue_job_response_with_names(
         "termination_reason": termination_reason,
         "memory_guard": job.termination_detail.as_ref().filter(|_| job.state == "memory_exceeded"),
         "process_guard": job.termination_detail.as_ref().filter(|_| job.state == "process_limit_exceeded"),
-        "wait_blockers": job.termination_detail.as_ref().filter(|_| job.state == "wait_expired"),
+        // Only the blocker of the hold the job gave up under; an earlier,
+        // recovered hold's detail can linger until the job starts.
+        "wait_blockers": job.termination_detail.as_ref().filter(|detail| job.state == "wait_expired" && detail.get("cause").and_then(Value::as_str) == job.holding_reason.as_deref()),
         "cancel_detail": job.termination_detail.as_ref().filter(|detail| {
             job.state == "cancelled" && detail.get("kind").and_then(Value::as_str) == Some("cancel")
         }),

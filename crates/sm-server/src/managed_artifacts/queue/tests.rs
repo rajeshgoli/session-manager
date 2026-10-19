@@ -1301,3 +1301,68 @@ fn disk_hold_is_cleared_when_readmission_waits_for_a_writer() {
         .unwrap();
     assert_eq!(count, 0);
 }
+#[test]
+fn a_long_artifact_store_writer_holds_only_artifact_jobs() {
+    // sm#2378: a backup seed held the artifact store's write lock for hours;
+    // every admission pass failed and no queue job started or gave up.
+    let f = Fixture::new();
+    let artifact = f.submit(f.declarations("out"));
+    let plain = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+        &f.state(),
+        f.request(),
+        300,
+    )
+    .unwrap();
+    // A live server finished the one-time history import long ago.
+    repair(&f.conn(), Some(&f.messages())).unwrap();
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    let store = f.manager.store.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = store.open().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; UPDATE artifact_meta SET value=value")
+            .unwrap();
+        locked.send(()).unwrap();
+        wait_release.recv().unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    wait_locked.recv().unwrap();
+    // Constructing a manager and repairing read only while nothing changed.
+    ManagedArtifacts::new(&f.manager.config).unwrap();
+    repair(&f.conn(), Some(&f.messages())).unwrap();
+    RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        &f.state(),
+        &f.messages(),
+        0,
+        crate::queue::QueueAdmissionPolicy::default(),
+    )
+    .unwrap();
+    let job = |id: &str| {
+        RetainedQueueStore::get_queue_job_from_path(&f.state().join("queue_runner.db"), id)
+            .unwrap()
+            .unwrap()
+    };
+    assert_ne!(job(&plain.id).state, "pending");
+    let held = job(&artifact.id);
+    assert_eq!(held.state, "pending");
+    assert_eq!(
+        held.holding_reason.as_deref(),
+        Some(crate::queue::ARTIFACT_STORE_HOLD)
+    );
+    assert!(held.termination_detail.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .contains("locked"));
+
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        &f.state(),
+        &f.messages(),
+        0,
+        crate::queue::QueueAdmissionPolicy::default(),
+    )
+    .unwrap();
+    assert_ne!(job(&artifact.id).state, "pending");
+    assert!(Path::new(&f.root.path).join("out").is_dir());
+}

@@ -134,15 +134,21 @@ impl ManagedArtifacts {
             store: ArtifactStore::new(crate::sessions::expand_home(&config.db_path)),
         };
         let mut conn = manager.store.open()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cold_days = manager.config.cold_after_days.to_string();
+        let mut current = true;
         for root in &manager.config.roots {
-            store::set_meta(
-                &tx,
-                &format!("cold_days:{}", root.path),
-                &manager.config.cold_after_days.to_string(),
-            )?;
+            current &= store::meta(&conn, &format!("cold_days:{}", root.path))?.as_deref()
+                == Some(cold_days.as_str());
         }
-        tx.commit()?;
+        // Read first: a long-running writer such as a backup seed must not
+        // stall every caller that only constructs a manager (sm#2378).
+        if !current {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for root in &manager.config.roots {
+                store::set_meta(&tx, &format!("cold_days:{}", root.path), &cold_days)?;
+            }
+            tx.commit()?;
+        }
         Ok(manager)
     }
     pub fn create(

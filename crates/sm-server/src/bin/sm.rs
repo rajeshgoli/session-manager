@@ -2340,11 +2340,8 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     if let Some(line) = queue_stop_line(&payload) {
         println!("{line}");
     }
-    if payload["wait_blockers"].is_object() {
-        println!(
-            "Never started: the {}",
-            sm_server::queue::concurrency_cap_wait_text(&payload["wait_blockers"])
-        );
+    if let Some(blocker) = sm_server::queue::queue_wait_blocker_text(&payload["wait_blockers"]) {
+        println!("Never started: the {blocker}");
     }
     if let Some(guard) = payload["memory_guard"].as_object() {
         let bytes = |key: &str| {

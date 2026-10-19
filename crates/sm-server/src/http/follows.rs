@@ -1063,6 +1063,15 @@ pub(super) async fn force_start_queue_job(
         queue_admission_policy(&state),
     )?
     .ok_or(ApiError::NotFound("Queue job not found"))?;
+    if started.state == "pending" {
+        // Start now overrides queue rules, not safety holds such as an
+        // unavailable artifact store; say which one kept it waiting.
+        let why =
+            crate::queue::queue_hold_explanation(&started, &[], queue_admission_policy(&state))
+                .and_then(|holding| holding["detail"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "it is still waiting".to_owned());
+        return Err(conflict(&format!("Couldn't start it yet: {why}")));
+    }
     if !by_this_call {
         return Err(conflict(&format!(
             "job is no longer queued ({})",
