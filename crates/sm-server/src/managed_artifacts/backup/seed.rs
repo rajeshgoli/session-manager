@@ -5,7 +5,7 @@
 use super::{client::Destination, lifecycle, *};
 use crate::managed_artifacts::{archive, ManagedArtifacts};
 use anyhow::{ensure, Context};
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::json;
 use std::{
     fs::{self, File},
@@ -49,6 +49,23 @@ struct Journal {
 thread_local! { pub(super) static FAIL_AFTER_SOURCE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_ADOPTION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { pub(super) static BEFORE_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { pub(super) static AFTER_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+
+fn check_head(conn: &Connection, device: &str, previous: &Option<String>) -> Result<()> {
+    let active: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM backup_requests WHERE device=?1 AND state IN ('preparing','ready'))", [device], |r| r.get(0))?;
+    ensure!(
+        !active,
+        "remote backup request is active; seed confirmation deferred; retry after the request finishes"
+    );
+    ensure!(
+        confirmed(conn, device)?.map(|m| m.manifest_id) == *previous,
+        "backup head changed during seed; retry"
+    );
+    Ok(())
+}
 fn pending(dest: &Destination) -> Result<Option<Journal>> {
     dest.meta("pending_seed")?
         .map(|body| serde_json::from_str(&body).map_err(Into::into))
@@ -268,19 +285,11 @@ pub(super) fn seed_inner(
             ))
         })
     });
-    // Hold the source-store write transaction from the active-request check
-    // through confirmation so no pull can start against the previous head.
-    let mut conn = manager.store.open()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM backup_requests WHERE device=?1 AND state IN ('preparing','ready'))",[device],|r|r.get(0))?;
-    ensure!(
-        !active,
-        "remote backup request is active; seed confirmation deferred"
-    );
-    ensure!(
-        confirmed(&tx, device)?.map(|m| m.manifest_id) == previous,
-        "backup head changed during seed preparation; retry"
-    );
+    // Fail early for an existing pull, but do not hold the shared artifact
+    // database's writer while verifying or applying files on the backup disk.
+    // Confirmation checks again under a write transaction and rolls back the
+    // destination if a remote request or another seed won the race.
+    check_head(&conn, device, &previous)?;
     let mut journal = Journal {
         id: id.clone(),
         manifest: prepared.manifest.clone(),
@@ -373,6 +382,12 @@ pub(super) fn seed_inner(
         .cloned()
         .collect();
     prepared.transfer.base = previous.clone();
+    #[cfg(test)]
+    BEFORE_APPLY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     if let Err(error) = dest.apply_seed(&id, &prepared.transfer, &staging) {
         dest.return_seed_staging(&id, &prepared.manifest.files)
             .context("return staged files after failed seed application")?;
@@ -383,6 +398,12 @@ pub(super) fn seed_inner(
     let mut source_committed = false;
     let at = time::OffsetDateTime::now_utc().unix_timestamp();
     let confirmation = (|| -> Result<()> {
+        #[cfg(test)]
+        AFTER_APPLY.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let destination_tx = dest.conn.transaction()?;
         // Register only verified adopted files omitted from the transfer. Changed
         // files still go through normal apply and history retention.
@@ -394,13 +415,11 @@ pub(super) fn seed_inner(
             }
         }
         prepared.manifest.base = previous.clone();
+        let mut conn = manager.store.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_head(&tx, device, &previous)?;
         save_manifest(&tx, device, &prepared.manifest)?;
         confirm(&tx, device, &id)?;
-        lifecycle::mark_covered(
-            &tx,
-            manager,
-            &json!({"coverage_json":serde_json::to_string(&coverage)?}),
-        )?;
         tx.execute("INSERT INTO backup_requests(id,device,state,base,created_at,ready_at,acked_at,config_json,outbox,manifest_id,parts_json,transfer_json,ack_json) VALUES(?1,?2,'acked',?3,?4,?4,?4,?5,?6,?1,?7,?8,?9)",params![id,device,previous,at,serde_json::to_string(&manager.config)?,prepared.directory.to_string_lossy(),serde_json::to_string(&prepared.parts)?,serde_json::to_string(&prepared.transfer)?,json!({"applied":true,"seed":true,"fetched_bytes":0}).to_string()])?;
         tx.commit()?;
         source_committed = true;
@@ -422,6 +441,13 @@ pub(super) fn seed_inner(
         return Err(error);
     }
     resolve(dest, &journal, true)?;
+    // Display stamps re-scan source trees. They do not participate in atomic
+    // backup confirmation and must not hold the artifact database writer.
+    lifecycle::mark_covered(
+        &conn,
+        manager,
+        &json!({"coverage_json":serde_json::to_string(&coverage)?}),
+    )?;
     lifecycle::expire(manager, at)?;
     if staging.exists() {
         fs::remove_dir_all(staging)?;
