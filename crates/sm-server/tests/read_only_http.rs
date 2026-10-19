@@ -16617,6 +16617,55 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
         format!("hand-pred handed off; delivered to hand-pred-h2 ({successor_id}).")
     );
     wait_for_output_contains(app.clone(), &successor_id, "received:after handoff").await;
+
+    // Model a restart after the successor accepted the prompt but before the
+    // server durably acknowledged it. Recovery must stop the actual surviving
+    // process before retaining its transferred record as stopped.
+    let successor_tmux = stored_successor["tmux_session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut interrupted: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launch = interrupted["session_runtime_launches"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|launch| launch["session_id"] == successor_id)
+        .unwrap();
+    launch["status"] = json!("launching");
+    fs::write(&state_file, interrupted.to_string()).unwrap();
+    drop(app);
+    let recovered = runtime_app_with_structured_claude_provider(
+        &state_file,
+        &log_dir,
+        _tmux_guard.0.as_str(),
+        true,
+        false,
+        false,
+    );
+    let (_, session) = get_json(recovered, &format!("/sessions/{successor_id}")).await;
+    assert_eq!(session["status"], "stopped");
+    assert!(!std::process::Command::new("tmux")
+        .args([
+            "-L",
+            _tmux_guard.0.as_str(),
+            "has-session",
+            "-t",
+            &format!("={successor_tmux}")
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let recovered: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(
+        recovered["session_runtime_launches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]

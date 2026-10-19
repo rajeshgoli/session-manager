@@ -925,7 +925,9 @@ fn original_brief_path(state: &Value, session_id: &str) -> Option<String> {
             .flatten()
             .find(|intent| json_text(intent.get("session_id")).as_deref() == Some(id.as_str()))
             .and_then(|intent| json_text(intent.get("artifact")?.get("path")));
-        if path.is_some() {
+        // Deferred successors bind their generated handoff prompt as a spawn
+        // artifact. It is transport history, not the original task brief.
+        if path.is_some() && state["handoff_deferred_sessions"][&id] != true {
             return path;
         }
         current = raw_session_object(state, &id)
@@ -1269,13 +1271,62 @@ mod tests {
         let mut state = state;
         state["session_runtime_launches"][0]["status"] = json!("launching");
         state["session_runtime_launches"][0]["force_initial_prompt_stdin"] = json!(true);
+        let tmux_log = root.join("recovery-tmux.log");
+        for (response, stopped) in [
+            ("exit 0", true),
+            ("echo \"can't find session: successor\" >&2; exit 1", true),
+            (
+                "echo 'error connecting to socket (No such file or directory)' >&2; exit 1",
+                false,
+            ),
+        ] {
+            fs::write(
+                &tmux,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{response}\n",
+                    tmux_log.display()
+                ),
+            )
+            .unwrap();
+            let recovered = recovered
+                .clone()
+                .with_delivery_runtime(Some(runtime.clone()));
+            recovered.write_raw_json_value(&state).unwrap();
+            recovered.recover_session_runtime_launches().unwrap();
+            let session = recovered.get_session(&successor.id).unwrap().unwrap();
+            assert_eq!(session.is_stopped(), stopped);
+            assert_eq!(session.status, if stopped { "stopped" } else { "error" });
+            let after = recovered.load_raw_json_value().unwrap();
+            assert_eq!(after["agent_registrations"][0]["session_id"], successor.id);
+            assert_eq!(after["session_runtime_launches"][0]["status"], "failed");
+            if !stopped {
+                assert!(after["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == successor.id)
+                    .unwrap()["stopped_at"]
+                    .is_null());
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(&tmux_log).unwrap(),
+            format!(
+                "kill-session -t ={0}\nkill-session -t ={0}\nkill-session -t ={0}\n",
+                successor.tmux_session
+            )
+        );
+        // Missing runtime authority also keeps the session visibly uncertain.
         recovered.write_raw_json_value(&state).unwrap();
         recovered.recover_session_runtime_launches().unwrap();
-        assert!(recovered
-            .get_session(&successor.id)
-            .unwrap()
-            .unwrap()
-            .is_stopped());
+        assert_eq!(
+            recovered
+                .get_session(&successor.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "error"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1583,12 +1634,36 @@ mod tests {
     fn the_original_brief_follows_the_lineage_back() {
         let store = store("lineage", "idle");
         store.transfer_handoff_json("pred0001", "succ0001").unwrap();
-        let state = store.load_raw_json_value().unwrap();
-        assert_eq!(
-            original_brief_path(&state, "succ0001").as_deref(),
-            Some("/briefs/pred.md")
-        );
+        let mut state = store.load_raw_json_value().unwrap();
+        state["spawn_launch_intents"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "session_id":"succ0001", "artifact":{"path":"/briefs/handoff-h2.md"}
+            }));
+        let mut third = state["sessions"][4].clone();
+        third["id"] = json!("third001");
+        third["predecessor_session_id"] = json!("succ0001");
+        state["sessions"].as_array_mut().unwrap().push(third);
+        state["spawn_launch_intents"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "session_id":"third001", "artifact":{"path":"/briefs/handoff-h3.md"}
+            }));
+        state["handoff_deferred_sessions"] = json!({"succ0001":true,"third001":true});
+        for id in ["succ0001", "third001"] {
+            assert_eq!(
+                original_brief_path(&state, id).as_deref(),
+                Some("/briefs/pred.md")
+            );
+        }
         assert_eq!(original_brief_path(&state, "child001"), None);
+        state["spawn_launch_intents"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert_eq!(original_brief_path(&state, "third001"), None);
     }
 
     #[test]

@@ -1150,6 +1150,41 @@ impl SessionStore {
             // first brief before the process died. Replaying it risks
             // duplicate work, so retain the artifact and require an explicit
             // recovery decision instead.
+            if state["handoff_deferred_sessions"][&launch.session_id] == true {
+                // This record owns transferred work. A surviving process must
+                // stop before its durable record can truthfully say stopped.
+                let teardown = self
+                    .delivery_runtime
+                    .as_ref()
+                    .map(|runtime| {
+                        runtime
+                            .for_socket_name(launch.tmux_socket_name.as_deref())
+                            .teardown_session_for_restore(&launch.tmux_session)
+                    })
+                    .unwrap_or_else(|| RestoreTmuxTeardownOutcome::Inconclusive {
+                        reason: "runtime recovery is disabled".into(),
+                    });
+                if let RestoreTmuxTeardownOutcome::Inconclusive { reason } = teardown {
+                    let reason = format!("failed to confirm interrupted Claude handoff teardown: {reason}; the runtime may still be live; prompt replay is forbidden");
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        false,
+                        &reason,
+                    )?;
+                    let session = session_object_mut(
+                        ensure_sessions_array_mut(&mut state)?,
+                        &launch.session_id,
+                    )
+                    .context("handoff successor disappeared")?;
+                    session.insert("status".into(), json!("error"));
+                    session.insert("stopped_at".into(), Value::Null);
+                    session.insert("error_message".into(), json!(reason));
+                    self.write_raw_json_value(&state)?;
+                    return Ok(());
+                }
+            }
             mark_runtime_launch_failed(
                 &mut state,
                 launch_id,
