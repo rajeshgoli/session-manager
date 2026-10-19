@@ -16,13 +16,14 @@
 #
 # Usage:
 #   scripts/setup_studio_ssh.sh            # real run (orchestrator runs this)
+#   scripts/setup_studio_ssh.sh --local-only # upgrade sshd/plists without DNS or toggle changes
 #   scripts/setup_studio_ssh.sh --dry-run  # print every action, touch nothing outward-facing
 #   scripts/setup_studio_ssh.sh --sshd-assets-only   # only step 3 (local sshd assets); used for verification
 #
 # Test/override env vars (all default to the frozen spec constants; the orchestrator's
 # plain run uses the defaults and produces spec-exact output):
 #   STUDIO_SSH_ASSETS_DIR   sshd assets dir      (default ~/.local/share/session-manager/studio-ssh)
-#   STUDIO_SSH_AUTHORIZED_KEYS  AuthorizedKeysFile (default /Users/rajesh/.ssh/authorized_keys)
+#   STUDIO_SSH_AUTHORIZED_KEYS  AuthorizedKeysFile (default ~/.config/session-manager/ssh/device_keys)
 #   STUDIO_SSH_PORT         loopback sshd port   (default 22222)
 #   STUDIO_SSH_LA_DIR       LaunchAgents dir     (default ~/Library/LaunchAgents)
 #
@@ -49,7 +50,7 @@ LAUNCHD_DOMAIN="gui/${UID_NUM}"
 
 SSHD_PORT="${STUDIO_SSH_PORT:-22222}"
 ASSETS_DIR="${STUDIO_SSH_ASSETS_DIR:-${HOME}/.local/share/session-manager/studio-ssh}"
-AUTHORIZED_KEYS="${STUDIO_SSH_AUTHORIZED_KEYS:-/Users/rajesh/.ssh/authorized_keys}"
+AUTHORIZED_KEYS="${STUDIO_SSH_AUTHORIZED_KEYS:-${HOME}/.config/session-manager/ssh/device_keys}"
 LA_DIR="${STUDIO_SSH_LA_DIR:-${HOME}/Library/LaunchAgents}"
 
 CF_DIR="${REPO_DIR}/.local/studio-ssh/cloudflared"
@@ -64,6 +65,7 @@ TUNNEL_PLIST="${LA_DIR}/${TUNNEL_LABEL}.plist"
 
 DRY_RUN=0
 SSHD_ASSETS_ONLY=0
+LOCAL_ONLY=0
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -207,6 +209,11 @@ setup_sshd_assets() {
     chmod 600 "${HOST_KEY}" 2>/dev/null || true
   fi
 
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mkdir -p "$(dirname "${AUTHORIZED_KEYS}")"
+    touch "${AUTHORIZED_KEYS}"
+    chmod 600 "${AUTHORIZED_KEYS}"
+  fi
   write_file "${SSHD_CONFIG}" <<EOF
 Port ${SSHD_PORT}
 ListenAddress 127.0.0.1
@@ -221,6 +228,7 @@ AllowUsers rajesh
 PermitRootLogin no
 UsePAM no
 LogLevel VERBOSE
+LogVerbose auth.c:auth_log():*
 EOF
   log "Wrote ${SSHD_CONFIG}"
 }
@@ -244,6 +252,8 @@ setup_plists() {
     <array>
         <string>${SSHD_BIN}</string>
         <string>-D</string>
+        <string>-E</string>
+        <string>${ASSETS_DIR}/sshd.err.log</string>
         <string>-f</string>
         <string>${SSHD_CONFIG}</string>
     </array>
@@ -266,6 +276,11 @@ setup_plists() {
 </plist>
 EOF
   log "Wrote ${SSHD_PLIST}"
+
+  # A local sshd upgrade must not repoint the tunnel at another checkout's credentials.
+  if [[ "${LOCAL_ONLY}" -eq 1 ]]; then
+    return 0
+  fi
 
   write_file "${TUNNEL_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -363,6 +378,7 @@ main() {
     case "$1" in
       --dry-run)          DRY_RUN=1 ;;
       --sshd-assets-only) SSHD_ASSETS_ONLY=1 ;;
+      --local-only)       LOCAL_ONLY=1 ;;
       -h|--help)          usage; exit 0 ;;
       *) warn "Unknown argument: $1"; usage; exit 2 ;;
     esac
@@ -376,6 +392,15 @@ main() {
   if [[ "${SSHD_ASSETS_ONLY}" -eq 1 ]]; then
     setup_sshd_assets
     step "Done (sshd assets only)."
+    exit 0
+  fi
+
+  if [[ "${LOCAL_ONLY}" -eq 1 ]]; then
+    setup_sshd_assets
+    setup_plists
+    log "Local sshd assets installed; tunnel plist, credentials, DNS and switch state are unchanged."
+    log "Offer to import existing Ed25519 keys: GET /devices/imported/ssh-keys."
+    log 'Accept with POST /devices/imported/ssh-keys {"import_authorized_keys":true}.'
     exit 0
   fi
 

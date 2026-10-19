@@ -260,6 +260,7 @@
 <p><strong>Creation on the web.</strong> Revision 3 had no way to start a shell from the web; you asked where. The web terminal's ⋯ menu now holds "New shell here".</p>
 <p><strong>Cleanup.</strong> Revision 3 closed shells after 3 hours without typing, which would have killed a running build. Now only an idle prompt is closed.</p>
 <p><strong>Phone keys.</strong> The Ctrl modifier for the in-app key row is gone. Shells open in Termux, which has its own Ctrl and Alt keys.</p>
+<p><strong>SSH command.</strong> The returned command explicitly selects Session Manager's tmux server, so the laptop and phone reach the shell that was created.</p>
 <p><strong>Figures.</strong> The web figure now follows the real page: top bar, switcher sections and ⋯ menu.</p>
 
 <hr class="appendix-divider">
@@ -299,10 +300,10 @@ CREATE TABLE IF NOT EXISTS device_ssh_keys (
 <tr><td><code>POST /terminals</code></td><td><code>{"cwd": path, "from_session": id?}</code>. With <code>from_session</code> and no <code>cwd</code>, the shell opens in that session's working directory ("New shell here"). Returns 201 <code>{id, tmux_session, cwd}</code>, or 409 <code>too_many_terminals</code> with the list of open shells.</td></tr>
 <tr><td><code>DELETE /terminals/{id}</code></td><td>Retire: kills the tmux session and marks it retired with reason <code>owner</code>.</td></tr>
 <tr><td><code>POST /terminals/{id}/route</code></td><td><code>{"where": "home" | "away"}</code> → <code>{ssh_host, ssh_port, ssh_user, tmux_session, command}</code>. <code>away</code> starts the tunnel if it is off and returns once it is ready (status <code>on</code>), or 503 after 20 s. <code>home</code> never touches the tunnel.</td></tr>
-<tr><td><code>POST /devices/{id}/ssh-keys</code>, <code>DELETE /devices/{id}/ssh-keys/{fingerprint}</code></td><td>Register or remove one public key for a device. Ed25519 keys only. Registration rewrites the key file (F.2).</td></tr>
+<tr><td><code>POST /devices/{id}/ssh-keys</code>, <code>DELETE /devices/{id}/ssh-keys/{fingerprint}</code></td><td>Register or remove one public key for a device. Ed25519 keys only. Registration rewrites the key file (F.2). <code>GET /devices/{id}/ssh-keys</code> lists keys; for <code>imported</code> it also returns compatible <code>import_candidates</code>. An explicit <code>POST</code> with <code>{"import_authorized_keys":true}</code> imports that preview under <code>imported</code>.</td></tr>
 </tbody>
 </table>
-<p>The <code>command</code> field is exactly <code>ssh -t -p &lt;port&gt; &lt;user&gt;@&lt;host&gt; tmux attach-session -t &lt;tmux_session&gt;</code>. At home the host is <code>studio-lan.rajeshgo.li</code> and the port is 22222. Away, the host is <code>studio-away</code>, the alias the Studio SSH setup already installs on a client, with a port-less form for that alias.</p>
+<p>The <code>command</code> field is exactly <code>ssh -t -p &lt;port&gt; &lt;user&gt;@&lt;host&gt; tmux -L '&lt;tmux_socket_name&gt;' attach-session -t &lt;tmux_session&gt;</code>. At home the host is <code>studio-lan.rajeshgo.li</code> and the port is 22222. Away, the host is <code>studio-away</code>, the alias the Studio SSH setup already installs on a client, with a port-less form for that alias. The response also includes <code>tmux_socket_name</code>; omit <code>-L</code> when it is null. This selects the same tmux server that owns the shell.</p>
 
 <p><b>A.4 — CLI.</b> <code>sm shell [dir]</code> creates a shell (dir defaults to the current directory), prints its id, and attaches in place with <code>tmux attach</code> when run on the Mac. Run elsewhere, it prints the A.3 command. <code>sm shell ls</code> lists shells, and <code>sm shell rm &lt;id&gt;</code> retires one.</p>
 

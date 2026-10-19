@@ -594,7 +594,7 @@ fn sync_address_record(config: &AppConfig, lan: &TerminalDirectLanConfig) -> Res
     Cloudflare::new(config, &lan.hostname)?.sync_a(&lan.hostname, ip)
 }
 
-fn default_route_ipv4() -> Result<Ipv4Addr> {
+pub(crate) fn default_route_ipv4() -> Result<Ipv4Addr> {
     let output = Command::new("route")
         .args(["-n", "get", "default"])
         .output()

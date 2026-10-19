@@ -42,6 +42,7 @@ pub mod codex_events;
 pub mod codex_requests;
 pub mod config;
 pub mod device_identity;
+pub mod device_ssh;
 pub mod doc_markdown;
 pub mod email;
 pub mod google_auth;

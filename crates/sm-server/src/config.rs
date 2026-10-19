@@ -383,6 +383,28 @@ impl AppConfig {
             &default_activity_db_path(),
             &instance,
         )?;
+        let ssh = &mut self.external_access.studio_ssh;
+        ssh.assets_dir = isolate_path_from_protected_root(
+            &ssh.assets_dir,
+            &default_studio_ssh_assets_dir(),
+            &instance,
+            Path::new("studio-ssh"),
+            &expand_home_for_path_match(&default_studio_ssh_assets_dir()),
+        )?;
+        ssh.device_keys_file = isolate_path_from_protected_root(
+            &ssh.device_keys_file,
+            &default_studio_ssh_device_keys_file(),
+            &instance,
+            Path::new("ssh/device_keys"),
+            &expand_home_for_path_match(&default_studio_ssh_device_keys_file()),
+        )?;
+        ssh.legacy_authorized_keys_file = isolate_path_from_protected_root(
+            &ssh.legacy_authorized_keys_file,
+            &default_studio_ssh_legacy_keys_file(),
+            &instance,
+            Path::new("ssh/authorized_keys"),
+            &expand_home_for_path_match(&default_studio_ssh_legacy_keys_file()),
+        )?;
         // Tests never send real pushes with the live key.
         self.push.fcm.service_account_path = None;
         self.bug_reports.db_path = isolate_path_from_protected_root(
@@ -908,6 +930,12 @@ pub struct ExternalAccessConfig {
 /// at runtime.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StudioSshConfig {
+    #[serde(default = "default_studio_ssh_assets_dir")]
+    pub assets_dir: String,
+    #[serde(default = "default_studio_ssh_device_keys_file")]
+    pub device_keys_file: String,
+    #[serde(default = "default_studio_ssh_legacy_keys_file")]
+    pub legacy_authorized_keys_file: String,
     #[serde(default = "default_studio_ssh_hostname")]
     pub hostname: String,
     #[serde(default = "default_studio_ssh_local_sshd_port")]
@@ -921,12 +949,25 @@ pub struct StudioSshConfig {
 impl Default for StudioSshConfig {
     fn default() -> Self {
         Self {
+            assets_dir: default_studio_ssh_assets_dir(),
+            device_keys_file: default_studio_ssh_device_keys_file(),
+            legacy_authorized_keys_file: default_studio_ssh_legacy_keys_file(),
             hostname: default_studio_ssh_hostname(),
             local_sshd_port: default_studio_ssh_local_sshd_port(),
             sshd_launch_agent_label: default_studio_ssh_sshd_launch_agent_label(),
             tunnel_launch_agent_label: default_studio_ssh_tunnel_launch_agent_label(),
         }
     }
+}
+
+fn default_studio_ssh_assets_dir() -> String {
+    "~/.local/share/session-manager/studio-ssh".into()
+}
+fn default_studio_ssh_device_keys_file() -> String {
+    "~/.config/session-manager/ssh/device_keys".into()
+}
+fn default_studio_ssh_legacy_keys_file() -> String {
+    "~/.ssh/authorized_keys".into()
 }
 
 fn default_studio_ssh_hostname() -> String {
@@ -3039,6 +3080,12 @@ mod tests {
             &config.app_artifacts.root_dir,
             &config.utilization.db_path,
             &config.activity.db_path,
+            &config.external_access.studio_ssh.assets_dir,
+            &config.external_access.studio_ssh.device_keys_file,
+            &config
+                .external_access
+                .studio_ssh
+                .legacy_authorized_keys_file,
         ];
         for path in durable_paths {
             assert!(

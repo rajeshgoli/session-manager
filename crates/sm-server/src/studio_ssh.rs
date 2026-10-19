@@ -1,13 +1,15 @@
-//! On-demand "Studio SSH" toggle.
+//! Studio SSH manual override, observed LaunchAgent status and shell-driven transport.
 //!
 //! Drives two per-user `launchd` agents through `launchctl`:
-//!   * a dedicated loopback `sshd` bound to `127.0.0.1:<local_sshd_port>`, and
+//!   * a dedicated `sshd` on loopback and, while needed, the home LAN, and
 //!   * a `cloudflared` tunnel that publishes it at `<hostname>`.
 //!
 //! The functions here are pure/synchronous (they shell out to `launchctl` and do
 //! a TCP probe) and take a [`StudioSshConfig`] by reference. `launchctl` exits
 //! nonzero for several benign conditions (bootstrapping an already-loaded agent,
 //! booting out an agent that is not loaded); those are treated as non-fatal.
+
+pub mod transport;
 
 use std::{
     net::{SocketAddr, TcpStream},
@@ -25,7 +27,7 @@ use crate::config::StudioSshConfig;
 /// contract shared with the Android app and the web UI — do not rename them.
 #[derive(Debug, Clone, Serialize)]
 pub struct StudioSshStatus {
-    /// Desired state: both LaunchAgents are loaded/enabled in launchd.
+    /// Desired manual always-on state, independent of automatic shell access.
     pub enabled: bool,
     /// Observed lifecycle: `"off" | "starting" | "on" | "error"`.
     pub status: String,
@@ -53,7 +55,7 @@ pub fn status(cfg: &StudioSshConfig) -> StudioSshStatus {
     let uid = current_uid();
     let sshd_loaded = agent_loaded(uid, &cfg.sshd_launch_agent_label);
     let tunnel_loaded = agent_loaded(uid, &cfg.tunnel_launch_agent_label);
-    let enabled = sshd_loaded && tunnel_loaded;
+    let enabled = transport::manual_enabled(cfg);
 
     let sshd_listening = sshd_loaded && tcp_listening(cfg.local_sshd_port);
     let tunnel_running = tunnel_loaded && agent_running(uid, &cfg.tunnel_launch_agent_label);
@@ -81,6 +83,7 @@ pub fn status(cfg: &StudioSshConfig) -> StudioSshStatus {
 /// the tunnel takes a moment to connect). Errors only on genuinely fatal
 /// `launchctl` failures.
 pub fn enable(cfg: &StudioSshConfig) -> Result<StudioSshStatus, String> {
+    transport::save_manual(cfg, true).map_err(|e| e.to_string())?;
     let uid = current_uid();
     enable_agent(uid, &cfg.sshd_launch_agent_label)?;
     enable_agent(uid, &cfg.tunnel_launch_agent_label)?;
@@ -89,6 +92,7 @@ pub fn enable(cfg: &StudioSshConfig) -> Result<StudioSshStatus, String> {
 
 /// Disable the toggle: boot out + disable the tunnel agent, then the sshd agent.
 pub fn disable(cfg: &StudioSshConfig) -> Result<StudioSshStatus, String> {
+    transport::save_manual(cfg, false).map_err(|e| e.to_string())?;
     let uid = current_uid();
     disable_agent(uid, &cfg.tunnel_launch_agent_label)?;
     disable_agent(uid, &cfg.sshd_launch_agent_label)?;
@@ -134,6 +138,10 @@ fn enable_agent(uid: u32, label: &str) -> Result<(), String> {
     let plist = plist_path(label);
     let plist_str = plist.to_string_lossy().into_owned();
 
+    // Never restart a healthy sshd: this would disrupt authentication and listener reloads.
+    if agent_running(uid, label) {
+        return Ok(());
+    }
     // `enable` clears a prior `disable`; it is idempotent, so ignore its exit.
     let _ = run_launchctl(&["enable", &target]);
 
@@ -192,6 +200,9 @@ fn disable_agent(uid: u32, label: &str) -> Result<(), String> {
 
 /// True when `launchctl print gui/<uid>/<label>` succeeds (agent is loaded).
 fn agent_loaded(uid: u32, label: &str) -> bool {
+    if crate::config::test_isolation_active() {
+        return false;
+    }
     run_launchctl(&["print", &service_target(uid, label)]).success
 }
 
@@ -268,6 +279,13 @@ fn describe(result: &LaunchctlResult) -> String {
 }
 
 fn run_launchctl(args: &[&str]) -> LaunchctlResult {
+    if crate::config::test_isolation_active() {
+        return LaunchctlResult {
+            success: false,
+            stdout: String::new(),
+            stderr: "LaunchAgents disabled under test isolation".into(),
+        };
+    }
     let mut command = Command::new("launchctl");
     command.args(args);
     match crate::child_output::output_with_timeout(command, LAUNCHCTL_TIMEOUT) {

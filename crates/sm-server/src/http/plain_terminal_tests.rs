@@ -72,7 +72,7 @@ async fn plain_terminal_limits_cap_nonowner_and_kill_switch() {
     assert!(body["command"]
         .as_str()
         .unwrap()
-        .ends_with(&format!("tmux attach-session -t {}", ids[0])));
+        .ends_with(&format!("attach-session -t {}", ids[0])));
     let outsider =
         test_browser_access_assertion("sm-browser-aud", "outsider@example.com", 4_102_444_800);
     let response = router(state.clone())
