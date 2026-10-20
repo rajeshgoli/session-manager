@@ -627,12 +627,11 @@ fn opencode_failed_restore_preserves_auto_retirement_and_can_retry_after_reopen(
                 }))
                 .unwrap();
         }
-        assert!(
-            f.store
-                .restore_core_session_with_runtime("local1", &f.runtime)
-                .is_err(),
-            "{stage}"
-        );
+        let error = f
+            .store
+            .restore_core_session_with_runtime("local1", &f.runtime)
+            .unwrap_err();
+        assert_eq!(f.launches().len(), 2, "{stage}: {error:#}");
         let reopened = SessionStore::new(f.driver.path.clone())
             .with_delivery_runtime(Some(f.runtime.clone()))
             .with_opencode_launch_driver(f.driver.clone());

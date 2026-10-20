@@ -98,6 +98,13 @@ impl Stub {
             let mut handlers = Vec::new();
             for stream in listener.incoming() {
                 if worker_stopped.load(Ordering::Acquire) {
+                    // Consume the wake client's FIN before closing our side.
+                    // Simultaneous close can leave the server port in TIME_WAIT.
+                    let mut stream = stream.unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let _ = std::io::copy(&mut stream, &mut std::io::sink());
                     break;
                 }
                 // A readiness request can retain its health response while
@@ -176,7 +183,8 @@ impl Stub {
 impl Drop for Stub {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        let wake = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        wake.shutdown(std::net::Shutdown::Write).unwrap();
         self.worker.take().unwrap().join().unwrap();
     }
 }
@@ -344,6 +352,8 @@ fn stub_leaves_connection_close_to_client_and_port_is_rebindable() {
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     ));
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(stream.read(&mut [0]).unwrap(), 0);
     drop(stream);
     drop(stub);
     let _rebound = TcpListener::bind(("127.0.0.1", port)).unwrap();
