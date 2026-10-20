@@ -471,13 +471,29 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
     }
     if args.review {
         println!(
-            "Review requested. {} is notified in the sm app; the review arrives as a GitHub PR review on #{}, and sm wakes you with [sm review].",
-            doc["owner_name"].as_str().unwrap_or("The owner"),
-            resolved.pr_number.unwrap_or_default()
+            "{}",
+            review_request_line(
+                &doc,
+                doc["owner_name"].as_str().unwrap_or("The owner"),
+                resolved.pr_number.unwrap_or_default()
+            )
         );
     }
     super::print_review_handoff_ask(&doc);
     Ok(())
+}
+
+/// What a `--review` publish tells the agent (sm#2466): a repeat of a
+/// request the owner was already notified of sends no new notification.
+fn review_request_line(doc: &Value, owner: &str, pr: i64) -> String {
+    if doc["review_round"]["repeats"].as_bool() == Some(true) {
+        return format!(
+            "Review request updated. {owner} was already notified of your earlier request for this doc and has not reviewed since, so this revision sends no new notification. Republishing does not notify {owner} again; the review arrives as a GitHub PR review on #{pr}, and sm wakes you with [sm review]."
+        );
+    }
+    format!(
+        "Review requested. {owner} is notified in the sm app; the review arrives as a GitHub PR review on #{pr}, and sm wakes you with [sm review]."
+    )
 }
 
 /// The repo's main checkout: the parent of git's common dir, run in `dir`.

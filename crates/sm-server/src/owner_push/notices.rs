@@ -436,11 +436,11 @@ fn random_base32(len: usize) -> String {
 /// The rest of the server, as notice delivery sees it.
 pub trait NoticeWorld {
     /// Whether the notice's subject still wants the owner (appendix F2): a
-    /// message still new, read or needs-you; a review request still the
-    /// doc's latest publish and still requested.
+    /// message still new, read or needs-you; a review request still in the
+    /// doc's current review round, and the doc still requested (sm#2466).
     fn still_wanted(&self, notice: &Notice) -> Result<bool>;
     /// Whether the owner opened the notice's subject after the notice was
-    /// created: the message, or the requested revision of the doc.
+    /// created: the message, or the requested or newest revision of the doc.
     fn opened(&self, notice: &Notice) -> Result<bool>;
     /// The sender's unread messages to the owner, for `unread_count`.
     fn unread_count(&self, notice: &Notice) -> Result<i64>;

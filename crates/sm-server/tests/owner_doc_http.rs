@@ -593,8 +593,17 @@ async fn review_request_creates_notice() {
             "/docs/widgets/specs/memo.md?version=bbbbbbbbbbbb".to_owned(),
         )]
     );
-    // Each --review publish gets its own notice.
-    publish(&f, "author01", "c", true, None).await;
+    assert_eq!(reviewed["review_round"]["repeats"], false);
+    // A request the owner was already notified of is not pushed again
+    // (sm#2466).
+    let repeat = publish(&f, "author01", "c", true, None).await;
+    assert_eq!(repeat["review_round"]["repeats"], true);
+    assert_eq!(repeat["state"], "review_requested");
+    assert_eq!(notices(&f).len(), 1);
+    // After the owner's review, the next request notifies again.
+    post_review(&f, reviewed["id"].as_str().unwrap(), "sub1", None);
+    let next_round = publish(&f, "author01", "a", true, None).await;
+    assert_eq!(next_round["review_round"]["repeats"], false);
     assert_eq!(notices(&f).len(), 2);
     // A relative checkout root is dropped.
     let relative = publish(&f, "author01", "a", false, Some(Path::new("repo"))).await;
@@ -615,6 +624,13 @@ async fn dismiss_review_clears_waiting() {
     assert_eq!(meta["state"], "new");
     let (status, _) = request(&f.app, "POST", &format!("/docs/{id}/dismiss-review"), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "nothing left to dismiss");
+    // The next request on the PR asks again, without a second notification
+    // (sm#2466).
+    let again = publish(&f, "author01", "b", true, None).await;
+    assert_eq!(again["review_round"]["repeats"], true);
+    assert_eq!(again["state"], "review_requested");
+    assert_eq!(waiting_on(&f, "author01").await[0]["kind"], "owner_review");
+    assert_eq!(notices(&f).len(), 1, "only the first request notified");
 
     // A retired author's request is omitted from waiting on its own.
     let f = fixture();
