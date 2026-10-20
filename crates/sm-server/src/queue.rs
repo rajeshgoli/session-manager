@@ -4943,7 +4943,12 @@ fn concurrency_cap_wait_detail(
     let summary = |other: &QueueJobRuntimeRecord| serde_json::json!({"id": other.id, "label": other.label, "type": other.job_type});
     let running = jobs
         .iter()
-        .filter(|other| other.state == "running" && (global || other.job_type == job.job_type))
+        .filter(|other| {
+            // Shell jobs take no slot, so they never hold another job back.
+            other.state == "running"
+                && other.job_type != shell::SHELL_JOB_TYPE
+                && (global || other.job_type == job.job_type)
+        })
         .map(summary)
         .collect::<Vec<_>>();
     let ahead = jobs
@@ -13579,6 +13584,24 @@ mod tests {
         assert_eq!(detail["running"].as_array().unwrap().len(), 2);
         assert_eq!(detail["queued_ahead_count"], 1);
         assert_eq!(detail["queued_ahead"][0]["id"], queued[0].id.as_str());
+        // At the global limit a running shell job is still not a blocker.
+        let mut with_shell = jobs.clone();
+        let mut shell_job = jobs.iter().find(|j| j.state == "running").unwrap().clone();
+        shell_job.id = "shell-job".into();
+        shell_job.job_type = shell::SHELL_JOB_TYPE.into();
+        with_shell.push(shell_job);
+        let held = jobs.iter().find(|j| j.id == queued[1].id).unwrap();
+        let tight = QueueAdmissionPolicy {
+            max_running_jobs: 2,
+            ..policy
+        };
+        let snapshot = concurrency_cap_wait_detail(held, &with_shell, tight);
+        assert_eq!(snapshot["limit_scope"], "global");
+        assert!(snapshot["running"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|job| job["id"] != "shell-job"));
         let notifications = RetainedQueueStore::new(message_queue_db)
             .pending_messages_for_target_by_category("notify", "queue-completion", 10)
             .unwrap();
