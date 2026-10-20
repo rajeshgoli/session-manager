@@ -833,14 +833,31 @@ mod tests {
     #[test]
     fn connection_limit_refuses_excess_peers_and_shutdown_unblocks_workers() {
         let fixture = fixture();
+        let lease = fixture
+            .service
+            .state
+            .pool
+            .bind(IpVersion::V4, 0, false)
+            .unwrap();
         let mut clients = Vec::new();
         for _ in 0..MAX_CONNECTIONS {
             let mut stream = client(&fixture.service);
-            stream.write_all(b"S").unwrap();
+            // A retained lease keeps the worker alive without a partial-frame
+            // deadline expiring while the remaining peers are admitted.
+            let (reply, _descriptors) = exchange(
+                &mut stream,
+                Request::Retain {
+                    ip: IpVersion::V4,
+                    port: lease.port(),
+                },
+            );
+            assert_eq!(reply.errno, 0);
             clients.push(stream);
         }
         let mut excess = client(&fixture.service);
         assert_eq!(excess.read(&mut [0]).unwrap(), 0);
+        // Also leave one worker blocked partway through a fresh request.
+        clients[0].write_all(b"S").unwrap();
         let start = Instant::now();
         drop(fixture.service);
         assert!(start.elapsed() < Duration::from_secs(1));

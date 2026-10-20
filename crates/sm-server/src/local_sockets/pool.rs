@@ -389,11 +389,32 @@ mod tests {
             let mut bytes = [0; 3];
             server.read_exact(&mut bytes).unwrap();
             assert_eq!(&bytes, b"own");
-            drop(client);
+            // Finish the client-initiated close before releasing the listener.
+            // Dropping both endpoints together can make the server an active
+            // closer and leave its port unavailable during TIME_WAIT.
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert_eq!(server.read(&mut [0]).unwrap(), 0);
             drop(server);
+            assert_eq!(client.read(&mut [0]).unwrap(), 0);
+            drop(client);
             drop(lease);
             assert!(pool.connect(ip, port).is_err());
-            let rebound = pool.bind(ip, port, true).unwrap();
+            // EOF does not guarantee that the kernel has processed the final
+            // close-handshake ACK. Wait only for that transient bind conflict.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let rebound = loop {
+                match pool.bind(ip, port, true) {
+                    Ok(lease) => break lease,
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{ip:?}:{port}: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            };
             assert_eq!(rebound.port(), port);
         }
     }
