@@ -1317,12 +1317,31 @@ pub fn recent_agent_process_kills(
     )
 }
 
+pub(crate) fn recent_agent_process_kills_conn(
+    conn: &Connection,
+    session_id: Option<&str>,
+) -> Result<Vec<AgentProcessKill>> {
+    list_kills_since(
+        conn,
+        session_id,
+        &(OffsetDateTime::now_utc() - LISTED_KILL_WINDOW)
+            .format(&Rfc3339)
+            .unwrap_or_default(),
+    )
+}
+
 fn list_kills_since(
     conn: &Connection,
     session_id: Option<&str>,
     since: &str,
 ) -> Result<Vec<AgentProcessKill>> {
-    init_kills_schema(conn)?;
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='agent_process_kills')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(Vec::new());
+    }
     let mut statement = conn.prepare(
         r#"
         SELECT killed_at, session_id, session_name, pid, command, memory_bytes, limit_bytes, descendants

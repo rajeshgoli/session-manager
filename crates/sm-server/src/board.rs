@@ -613,6 +613,17 @@ impl BoardStore {
         let Some(conn) = self.open_read()? else {
             return Ok(BTreeMap::new());
         };
+        Self::ticket_ranks_conn(&conn)
+    }
+
+    pub(crate) fn ticket_ranks_conn(conn: &Connection) -> Result<BTreeMap<Key, TicketRank>> {
+        if !conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='board_ticket_ranks')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(BTreeMap::new());
+        }
         let mut statement = conn.prepare(
             "SELECT r.repo, r.number, r.rank, r.lane_id, l.goal_repo, l.goal_number,
                     IFNULL(i.title, '')

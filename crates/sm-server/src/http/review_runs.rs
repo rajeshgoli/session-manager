@@ -37,12 +37,34 @@ pub(super) fn failure_lines(r: &CodexReviewRequestRegistration) -> String {
 /// I2: a review job's `review` field — which request it serves and why this
 /// reviewer. `why` is `default` for the chosen reviewer, otherwise the step
 /// before it and the reason it failed.
+#[cfg(test)]
 pub(super) fn job_fields(state: &AppState, job: &QueueJobRecord) -> Result<Option<Value>> {
+    job_fields_with_context(
+        state,
+        job,
+        &mut QueueResponseContext::new(state).map_err(|e| anyhow::anyhow!("{e:?}"))?,
+    )
+}
+
+pub(super) fn job_fields_with_context(
+    state: &AppState,
+    job: &QueueJobRecord,
+    context: &mut QueueResponseContext,
+) -> Result<Option<Value>> {
     if job.job_type != "review" {
         return Ok(None);
     }
-    let queue_db = queue_dir(state).join("queue_runner.db");
-    let Some(owner) = RetainedQueueStore::queue_job_owner_from_path(&queue_db, &job.id)? else {
+    use rusqlite::OptionalExtension;
+    let Some(conn) = context.queue.as_ref() else {
+        return Ok(None);
+    };
+    let owner: Option<String> = conn
+        .query_row("SELECT owner FROM queue_jobs WHERE id=?1", [&job.id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    let Some(owner) = owner else {
         return Ok(None);
     };
     let Some((id, index)) = owner
@@ -52,8 +74,10 @@ pub(super) fn job_fields(state: &AppState, job: &QueueJobRecord) -> Result<Optio
     else {
         return Ok(None);
     };
-    let db = expand_home(&state.config.sm_send.db_path);
-    let Some(r) = RetainedQueueStore::get_codex_review_request_from_path(&db, id)? else {
+    let Some(messages) = context.messages.as_ref() else {
+        return Ok(None);
+    };
+    let Some(r) = crate::queue::get_codex_review_request_conn(messages, id)? else {
         return Ok(None);
     };
     let chain: Vec<Value> =
@@ -81,11 +105,17 @@ pub(super) fn job_fields(state: &AppState, job: &QueueJobRecord) -> Result<Optio
         .requester_session_id
         .clone()
         .unwrap_or_else(|| r.notify_session_id.clone());
-    let author_name = state
-        .session_store
-        .get_session(&author)?
-        .map(session_display_name)
-        .unwrap_or(author);
+    let author_name = if let Some(name) = context.review_authors.get(&author) {
+        name.clone()
+    } else {
+        let name = state
+            .session_store
+            .get_session(&author)?
+            .map(session_display_name)
+            .unwrap_or_else(|| author.clone());
+        context.review_authors.insert(author, name.clone());
+        name
+    };
     Ok(Some(json!({
         "request_id": r.id, "repo": r.repo, "pr_number": r.pr_number, "round": r.round,
         "reviewer_label": chain.get(index).map(review::label).or(r.reviewer_label),

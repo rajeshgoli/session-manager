@@ -7983,28 +7983,34 @@ async fn list_queue_jobs(
         None
     };
 
-    let queue_state_dir = state.config.queue_runner_state_dir();
-    let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
-    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
-        &queue_db_path,
-        QueueJobFilters {
-            notify_session_id: notify_session_id.clone(),
-            job_type: query
-                .job_type
-                .as_ref()
-                .and_then(|value| trimmed(&Some(value.clone()))),
-            state: query
-                .state
-                .as_ref()
-                .and_then(|value| trimmed(&Some(value.clone()))),
-            include_terminal: query.include_terminal,
-            finished_since: None,
-        },
-    )?;
+    let mut context = QueueResponseContext::new(&state)?;
+    let filters = QueueJobFilters {
+        notify_session_id: notify_session_id.clone(),
+        job_type: query
+            .job_type
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone()))),
+        state: query
+            .state
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone()))),
+        include_terminal: query.include_terminal,
+        limit: query.limit,
+        ..Default::default()
+    };
+    let total = if query.limit.is_some_and(|limit| limit > 0) {
+        context
+            .queue
+            .as_ref()
+            .map(|conn| crate::queue::count_queue_jobs_conn(conn, &filters))
+            .transpose()?
+    } else {
+        None
+    };
+    let jobs = context.jobs(filters)?;
     // Include all active jobs even for a filtered listing: another agent's
     // test/performance job may be holding this agent's queue.
-    let active =
-        RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
+    let active = context.jobs(QueueJobFilters::default())?;
     let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
     let (names, current_session_ids) = queue_session_names(&state, !query.current_sessions_only)?;
     let mut response_jobs = Vec::with_capacity(jobs.len());
@@ -8019,21 +8025,82 @@ async fn list_queue_jobs(
                 continue;
             }
         }
-        response_jobs.push(queue_job_response_named(&state, job, &active, &names)?);
+        response_jobs.push(queue_job_response_named(
+            &state,
+            job,
+            &active,
+            &names,
+            &mut context,
+        )?);
     }
     // Processes sm killed in agents' own shells for exceeding the per-process
     // memory limit (#2137); a read failure must not hide the job listing.
-    let kills = crate::agent_memory_guard::recent_agent_process_kills(
-        &queue_db_path,
-        notify_session_id.as_deref(),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("queue listing could not read agent process kills: {error:#}");
-        Vec::new()
-    });
-    Ok(Json(
-        json!({ "jobs": response_jobs, "agent_process_kills": kills }),
-    ))
+    let kills = context
+        .queue
+        .as_ref()
+        .map(|conn| {
+            crate::agent_memory_guard::recent_agent_process_kills_conn(
+                conn,
+                notify_session_id.as_deref(),
+            )
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .unwrap_or_else(|error| {
+            eprintln!("queue listing could not read agent process kills: {error:#}");
+            Vec::new()
+        });
+    let mut response = json!({ "jobs": response_jobs, "agent_process_kills": kills });
+    if let Some(total) = total {
+        response["total"] = json!(total);
+    }
+    Ok(Json(response))
+}
+
+struct QueueResponseContext {
+    queue: Option<rusqlite::Connection>,
+    messages: Option<rusqlite::Connection>,
+    ticket_ranks: BTreeMap<(String, i64), crate::board::TicketRank>,
+    review_authors: BTreeMap<String, String>,
+}
+
+impl QueueResponseContext {
+    fn new(state: &AppState) -> Result<Self, ApiError> {
+        fn read(path: &std::path::Path) -> anyhow::Result<Option<rusqlite::Connection>> {
+            if !path.exists() {
+                return Ok(None);
+            }
+            let conn = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            Ok(Some(conn))
+        }
+        let queue = read(
+            &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+                .join("queue_runner.db"),
+        )?;
+        let messages = read(&expand_home(&state.config.sm_send.db_path))?;
+        let ticket_ranks = messages
+            .as_ref()
+            .map(crate::board::BoardStore::ticket_ranks_conn)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            queue,
+            messages,
+            ticket_ranks,
+            review_authors: BTreeMap::new(),
+        })
+    }
+
+    fn jobs(&self, filters: QueueJobFilters) -> anyhow::Result<Vec<QueueJobRecord>> {
+        self.queue
+            .as_ref()
+            .map(|conn| crate::queue::list_queue_jobs_conn(conn, filters))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
 }
 
 fn queue_job_response_named(
@@ -8041,6 +8108,7 @@ fn queue_job_response_named(
     job: QueueJobRecord,
     active: &[QueueJobRecord],
     names: &BTreeMap<String, String>,
+    context: &mut QueueResponseContext,
 ) -> Result<Value, ApiError> {
     let requester_name = job
         .requester_session_id
@@ -8051,7 +8119,7 @@ fn queue_job_response_named(
         .notify_session_id
         .as_ref()
         .map(|id| names.get(id.trim()).unwrap_or(id).clone());
-    queue_job_response_with_names(state, job, active, requester_name, notify_name)
+    queue_job_response_with_names(state, job, active, requester_name, notify_name, context)
 }
 
 /// Display names for session ids, aliases and names, from one registry
@@ -8124,15 +8192,11 @@ async fn client_queue(
             "[year]-[month]-[day]T[hour]:[minute]:[second]"
         ))
         .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
-    let queue_db_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
-        .join("queue_runner.db");
-    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
-        &queue_db_path,
-        QueueJobFilters {
-            finished_since: Some(since_text),
-            ..Default::default()
-        },
-    )?;
+    let mut context = QueueResponseContext::new(&state)?;
+    let jobs = context.jobs(QueueJobFilters {
+        finished_since: Some(since_text),
+        ..Default::default()
+    })?;
     let active: Vec<QueueJobRecord> = jobs
         .iter()
         .filter(|job| matches!(job.state.as_str(), "pending" | "running"))
@@ -8151,7 +8215,8 @@ async fn client_queue(
         .unwrap_or_default();
     let mut running_json = Vec::with_capacity(running.len());
     for job in &running {
-        let mut value = queue_job_response_named(&state, (*job).clone(), &active, &names)?;
+        let mut value =
+            queue_job_response_named(&state, (*job).clone(), &active, &names, &mut context)?;
         // A shell job's use is the agent memory guard's own measurement.
         let shell = job.job_type == crate::queue::shell::SHELL_JOB_TYPE;
         if let (false, Some(usage), Some(object)) =
@@ -8163,8 +8228,11 @@ async fn client_queue(
     }
 
     let mut queued_json = Vec::new();
-    let ticket_ranks =
-        crate::queue::queue_ticket_ranks(&expand_home(&state.config.sm_send.db_path));
+    let ticket_ranks = context
+        .ticket_ranks
+        .iter()
+        .map(|(key, rank)| (key.clone(), rank.rank))
+        .collect();
     for (index, id) in crate::queue::pending_queue_job_consideration_order(&active, &ticket_ranks)
         .iter()
         .enumerate()
@@ -8179,7 +8247,8 @@ async fn client_queue(
                 at.format(&time::format_description::well_known::Rfc3339)
                     .ok()
             });
-        let mut value = queue_job_response_named(&state, job.clone(), &active, &names)?;
+        let mut value =
+            queue_job_response_named(&state, job.clone(), &active, &names, &mut context)?;
         if let Some(object) = value.as_object_mut() {
             object.insert("position".into(), json!(index + 1));
             object.insert("wait_deadline_at".into(), json!(deadline));
@@ -8201,7 +8270,8 @@ async fn client_queue(
     ended.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
     let mut ended_json = Vec::new();
     for (_, job, reason, summary) in ended.into_iter().take(CLIENT_QUEUE_ENDED_LIMIT) {
-        let mut value = queue_job_response_named(&state, job.clone(), &active, &names)?;
+        let mut value =
+            queue_job_response_named(&state, job.clone(), &active, &names, &mut context)?;
         if let Some(object) = value.as_object_mut() {
             object.insert("ended_reason".into(), json!(reason));
             object.insert("ended_summary".into(), json!(summary));
@@ -8221,7 +8291,7 @@ async fn client_queue(
             .ok(),
         "owner_name": state.config.owner_name,
         "host": host,
-        "local_model": crate::local_model::queue_card(&expand_home(&state.config.queue_runner_state_dir().to_string_lossy()))?,
+        "local_model": crate::local_model::queue_card_with_queue_conn(&expand_home(&state.config.queue_runner_state_dir().to_string_lossy()), context.queue.as_ref(), context.messages.as_ref())?,
         "slots": {
             // Shell jobs were found already running and take no slot.
             "running": running.len() - count(crate::queue::shell::SHELL_JOB_TYPE),
@@ -17088,6 +17158,8 @@ struct CreateBtwHttpRequest {
 #[derive(Debug, Deserialize)]
 struct ListQueueJobsQuery {
     #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
     notify_target: Option<String>,
     #[serde(default, rename = "type")]
     job_type: Option<String>,
@@ -17687,7 +17759,7 @@ fn codex_review_request_response(
 
 /// Appendix H3: the board lane the job counts toward now, if any.
 fn queue_job_lane(
-    state: &AppState,
+    ranks: &BTreeMap<(String, i64), crate::board::TicketRank>,
     job: &QueueJobRecord,
 ) -> Result<Option<crate::board::TicketRank>, ApiError> {
     let Some(tickets) = job
@@ -17697,7 +17769,6 @@ fn queue_job_lane(
     else {
         return Ok(None);
     };
-    let ranks = board::board_store(state).ticket_ranks()?;
     Ok(tickets
         .iter()
         .filter_map(|ticket| ranks.get(ticket))
@@ -17723,6 +17794,7 @@ fn queue_job_response_with_context(
     job: QueueJobRecord,
     active: &[QueueJobRecord],
 ) -> Result<Value, ApiError> {
+    let context = &mut QueueResponseContext::new(state)?;
     let requester_name = match job.requester_session_id.as_deref() {
         Some(session_id) => state
             .session_store
@@ -17738,7 +17810,7 @@ fn queue_job_response_with_context(
             .or_else(|| Some(session_id.to_owned())),
         None => None,
     };
-    queue_job_response_with_names(state, job, active, requester_name, notify_name)
+    queue_job_response_with_names(state, job, active, requester_name, notify_name, context)
 }
 
 fn queue_job_response_with_names(
@@ -17747,6 +17819,7 @@ fn queue_job_response_with_names(
     active: &[QueueJobRecord],
     requester_name: Option<String>,
     notify_name: Option<String>,
+    context: &mut QueueResponseContext,
 ) -> Result<Value, ApiError> {
     let quiet = crate::utilization::quiet::status(
         &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
@@ -17755,7 +17828,7 @@ fn queue_job_response_with_names(
     );
     let termination_reason =
         crate::queue::queue_job_termination_reason(&job.state, job.termination_detail.as_ref());
-    let lane = queue_job_lane(state, &job)?;
+    let lane = queue_job_lane(&context.ticket_ranks, &job)?;
     let exit_evidence = if job.exit_code.is_some() {
         "recorded"
     } else if matches!(
@@ -17827,13 +17900,9 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
-    if job.state == "pending" {
-        let conn = crate::queue::open_queue_jobs_connection(
-            &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
-                .join("queue_runner.db"),
-        )?;
+    if let (true, Some(conn)) = (job.state == "pending", context.queue.as_ref()) {
         if let Some(remaining) = crate::managed_artifacts::queue::remaining(
-            &conn,
+            conn,
             &job.id,
             job.holding_reason.as_deref(),
         )? {
@@ -17854,7 +17923,7 @@ fn queue_job_response_with_names(
         state.config.queue_runner.cancel_grace_seconds
     ));
     // 1768 I2: what a review job reviews, for whom, and why this reviewer.
-    response["review"] = review_runs::job_fields(state, &job)
+    response["review"] = review_runs::job_fields_with_context(state, &job, context)
         .unwrap_or_else(|error| {
             eprintln!("review fields for queue job {} failed: {error:#}", job.id);
             None
@@ -24810,6 +24879,106 @@ mod tests {
             assert_eq!(body["available"], available);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn queue_list_golden_and_bounded_large_history() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let dir = std::env::temp_dir().join(format!("sm-2430-http-{}", std::process::id()));
+        config.queue_runner.state_dir = dir.to_string_lossy().into_owned();
+        config.queue_runner.configured = true;
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        config.utilization.enabled = false;
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &dir,
+            crate::queue::CreateQueueJob {
+                local_submitter: None,
+                job_type: "tests".into(),
+                label: "golden".into(),
+                requester_session_id: None,
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 900,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+                rank_tickets: None,
+            },
+        )
+        .unwrap();
+        let conn = Connection::open(dir.join("queue_runner.db")).unwrap();
+        conn.execute("UPDATE queue_jobs SET state='succeeded', queued_at='2026-01-01T00:00:00Z', finished_at='2026-01-01T00:01:00Z', exit_code=0, log_path=NULL WHERE id=?1", [&job.id]).unwrap();
+        let app = router(AppState::new(config));
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/queue-jobs?include_terminal=true",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, mut body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["jobs"][0]["id"] = json!("JOB");
+        let golden: Value = serde_json::from_str(r#"{ "agent_process_kills": [], "jobs": [{
+            "id":"JOB", "type":"tests", "label":"golden", "requester_session_id":null,
+            "local_agent_id":null, "requester_name":null, "notify_session_id":"notify", "notify_name":"notify",
+            "cwd":"/tmp", "argv":["true"], "script_path":null, "timeout_seconds":900,
+            "max_wait_seconds":300, "cpu_percent":null, "gpu_percent":null, "memory_bytes":null,
+            "state":"succeeded", "holding":null, "holding_reason":null, "owner_forced_at":null,
+            "quiet_alerted_at":null, "lane_rank":null, "lane_goal":null,
+            "queued_at":"2026-01-01T00:00:00Z", "started_at":null, "finished_at":"2026-01-01T00:01:00Z",
+            "pid":null, "process_group_id":null, "exit_code":0, "exit_evidence":"recorded",
+            "ended_reason":null, "ended_summary":null, "termination_reason":null, "memory_guard":null,
+            "process_guard":null, "wait_blockers":null, "cancel_detail":null, "process_limit":null,
+            "peak_process_count":null, "readable_log_path":null, "log_path":null,
+            "stop_grace_seconds":null, "stop_requested_at":null, "stop_signal":null, "stop_deadline_at":null,
+            "review":null, "cpu_seconds":null, "gpu_seconds":null, "footprint_bytes":null, "rss_bytes":null,
+            "log_updated_at":null, "quiet_since":null, "low_cpu":false
+        }]}"#).unwrap();
+        assert_eq!(body, golden);
+        crate::queue::seed_terminal_job_history(&conn, &job.id, 16000);
+        let started = std::time::Instant::now();
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/queue-jobs?include_terminal=true&limit=200",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, limited) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{limited}");
+        assert_eq!(limited["jobs"].as_array().unwrap().len(), 200);
+        assert_eq!(limited["total"], 16001);
+        let mut newest = limited["jobs"][0].clone();
+        newest["id"] = json!("JOB");
+        assert_eq!(newest, golden["jobs"][0]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/queue-jobs?include_terminal=true&limit=0",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let unlimited: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(unlimited["jobs"].as_array().unwrap().len(), 16001);
+        assert!(unlimited.get("total").is_none());
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

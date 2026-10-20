@@ -99,6 +99,23 @@ fn ready(host: &ModelHost) -> ModelRecord {
     m
 }
 #[test]
+fn queue_reload_retry_skips_queue_reads_unless_yielded() {
+    let (host, _, root) = fixture();
+    let mut model = ready(&host);
+    let host = Arc::new(host);
+    let key = fs::canonicalize(&root).unwrap();
+    hosts().lock().unwrap().insert(key.clone(), host.clone());
+    // A read would fail, so success proves the periodic pass skipped it.
+    fs::write(root.join("queue_runner.db"), "invalid SQLite").unwrap();
+    assert!(retry_reload(&root).is_ok());
+    model.state = "yielded".into();
+    host.save(&model).unwrap();
+    assert!(retry_reload(&root).is_err());
+    hosts().lock().unwrap().remove(&key);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn measured_flash_reservation_and_identifier_match_spec() {
     let (host, _, root) = fixture();
     let m = host.prepare(request(FLASH_KEY, None, None, None)).unwrap();
