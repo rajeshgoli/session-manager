@@ -837,13 +837,25 @@ button.sw-sec { cursor: pointer; }
  .launch-presets { display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
 
-/* Plain shells have one header action and a focused connection recovery card. */
-.term-shell-bar { height: 48px; flex-basis: 48px; padding: 0 18px; gap: 12px; }
-.term-shell-bar .sp { flex: 1; }
-.term-shell-bar .term-who { flex: 0 1 auto; }
-.term-shell-bar .t { max-width: none; }
-.shell-close > button { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; }
-.term-bar .shell-close-confirm { top: 56px; display: flex; flex-direction: column; gap: 8px; padding: 16px; width: min(21rem, calc(100vw - 24px)); max-width: min(21rem, calc(100vw - 24px)); box-shadow: var(--shadow); }
+/* Plain shells share the agent bar: the name renames in place, Hide sends the shell to a tray. */
+.shell-name { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin: 0 -6px; padding: 3px 6px; border: 1px solid transparent; border-radius: 6px; background: none; color: var(--ink); font: inherit; font-weight: 650; cursor: text; transition: background .12s, border-color .12s; }
+.shell-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shell-name svg { flex: none; color: var(--ink-3); opacity: 0; transition: opacity .12s; }
+.shell-name:hover { background: var(--panel-2); }
+.shell-name:hover svg, .shell-name:focus-visible svg { opacity: 1; }
+.shell-name:focus-visible { outline: none; border-color: var(--accent); }
+.shell-name-input { min-width: 0; max-width: min(22rem, 40vw); margin: 0 -6px; padding: 3px 6px; border: 1px solid var(--accent); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; font-weight: 650; outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.shell-name-input::placeholder { color: var(--ink-3); font-weight: 500; }
+.shell-hidden-pill { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink-3); font-size: .8rem; font-weight: 500; }
+.sw-tray { display: block; width: 100%; padding: 6px 12px 4px 30px; border: 0; background: none; color: var(--ink-3); font: 500 .867rem var(--ui); text-align: left; cursor: pointer; }
+.sw-tray:hover { color: var(--ink); }
+.sw-row.sw-hidden .sw-nm, .sw-row.sw-hidden .sw-shell { color: var(--ink-3); }
+.terminal-tray { display: inline-flex; align-items: center; gap: 6px; margin-top: 14px; padding: 4px 2px; border: 0; background: none; color: var(--ink-3); font: 500 .867rem var(--ui); cursor: pointer; }
+.terminal-tray:hover { color: var(--ink); }
+.terminal-tray + .terminal-tiles { margin-top: 10px; }
+.terminal-tile.is-hidden { border-style: dashed; background: transparent; }
+.terminal-tile.is-hidden strong { color: var(--ink-2); }
+.term-bar .shell-close-confirm { top: 44px; display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 8px; padding: 16px; width: min(21rem, calc(100vw - 24px)); max-width: min(21rem, calc(100vw - 24px)); box-shadow: var(--shadow); }
 .shell-close-confirm > span { font-size: .9rem; color: var(--ink-2); }
 .shell-close-confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .shell-away { grid-area: term; min-width: 0; overflow: auto; display: grid; align-items: center; padding: 36px; background: var(--bg); color: var(--ink); }
@@ -880,9 +892,6 @@ button.sw-sec { cursor: pointer; }
 .terminal-tile-fact { margin-top: 5px; font-size: .8rem; color: var(--ink-2); }
 .terminal-tile > svg { flex: none; color: var(--ink-3); }
 @media (max-width: 600px) {
-  .term-shell-bar { padding: 0 12px; overflow: visible; }
-  .term-shell-bar .term-who { flex-shrink: 1; }
-  .term-shell-bar .t { max-width: none; }
   .shell-away { padding: 20px 14px; align-items: start; }
   .shell-connect-card { margin: 0 auto; padding: 24px 20px; border-radius: 12px; }
   .shell-command { gap: 8px; padding: 12px; }

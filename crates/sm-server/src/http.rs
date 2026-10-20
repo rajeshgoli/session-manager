@@ -2225,7 +2225,10 @@ pub fn router(state: AppState) -> Router {
             "/terminals",
             get(plain_terminals::list).post(plain_terminals::create),
         )
-        .route("/terminals/{id}", delete(plain_terminals::retire))
+        .route(
+            "/terminals/{id}",
+            delete(plain_terminals::retire).patch(plain_terminals::update),
+        )
         .route("/terminals/{id}/route", post(plain_terminals::route))
         .route(
             "/devices/{id}/ssh-keys",

@@ -5,6 +5,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.*
 import li.rajeshgo.sm.data.remote.ApiService
+import li.rajeshgo.sm.ui.watch.hiddenShells
+import li.rajeshgo.sm.ui.watch.isHiddenShell
 import li.rajeshgo.sm.ui.watch.rowFactsLine
 import li.rajeshgo.sm.ui.watch.sessionDisplayName
 import li.rajeshgo.sm.util.termuxPublicKey
@@ -28,6 +30,16 @@ class PlainTerminalTest {
         assertNull(shell.mobileTerminal)
         assertNull(shell.facts?.you)
         assertNull(shell.facts?.jobs?.text)
+    }
+
+    @Test fun hiddenShellsLeaveTheSectionsForTheTray() {
+        val rows = json.decodeFromString<WatchStateResponse>("""{"sessions":[
+            {"id":"term-a","kind":"shell","name":"zsh · a","state":"idle","hidden":true},
+            {"id":"term-b","kind":"shell","name":"bench","state":"idle"},
+            {"id":"term-c","kind":"shell","name":"zsh · c","state":"stopped","hidden":true}]}""").sessions.map { it.toShellSession() }
+        assertEquals(listOf(true, false, false), rows.map(::isHiddenShell))
+        assertEquals(listOf("term-a"), hiddenShells(rows, "all", "").map { it.id })
+        assertEquals(emptyList<String>(), hiddenShells(rows, "all", "bench").map { it.id })
     }
 
     @Test fun createRouteKeysAndRetireUseShellEndpoints() = runBlocking {
@@ -56,11 +68,18 @@ class PlainTerminalTest {
         assertEquals(home, api.plainTerminalRoute("term-abcd", PlainTerminalRouteRequest("home")))
         api.plainTerminalRoute("term-abcd", PlainTerminalRouteRequest("away"))
         assertTrue(api.retirePlainTerminal("term-abcd").isSuccessful)
+        val repository = SessionManagerRepository()
+        repository.updatePlainTerminalWith(api, "term-abcd", "  bench runner ", null)
+        repository.updatePlainTerminalWith(api, "term-abcd", " ", true)
+        repository.updatePlainTerminalWith(api, "term-abcd", null, false)
         assertEquals(listOf(
             "POST /terminals {\"cwd\":\"/tmp\",\"name\":\"Build\"}", "GET /devices/phone/ssh-keys ",
             "POST /devices/phone/ssh-keys {\"public_key\":\"ssh-ed25519 AAAA\"}",
             "POST /terminals/term-abcd/route {\"where\":\"home\"}",
-            "POST /terminals/term-abcd/route {\"where\":\"away\"}", "DELETE /terminals/term-abcd "), seen)
+            "POST /terminals/term-abcd/route {\"where\":\"away\"}", "DELETE /terminals/term-abcd ",
+            "PATCH /terminals/term-abcd {\"name\":\"bench runner\"}",
+            "PATCH /terminals/term-abcd {\"name\":null,\"hidden\":true}",
+            "PATCH /terminals/term-abcd {\"hidden\":false}"), seen)
     }
 
     @Test fun retirementClassifiesExpiredAuthAndTransientFailures() = runBlocking {

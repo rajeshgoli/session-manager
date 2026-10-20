@@ -612,6 +612,22 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         }
     }
 
+    /** Rename (blank restores the default) or hide a shell, then refresh the list (sm#2460). */
+    fun updateShell(sessionId: String, name: String? = null, hidden: Boolean? = null, onComplete: (Result<Unit>) -> Unit) {
+        viewModelScope.launch {
+            val serverUrl = settingsRepository.serverUrl.first()
+            val accessToken = settingsRepository.accessToken.first()
+            val result = if (serverUrl.isBlank() || accessToken.isBlank()) {
+                Result.failure(IllegalStateException(SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE))
+            } else sessionRepository.updatePlainTerminal(serverUrl, accessToken, sessionId, name, hidden)
+            if (result.isSuccess && hidden != null) {
+                _uiState.value = _uiState.value.copy(sessions = _uiState.value.sessions.map { if (it.id == sessionId) it.copy(hidden = hidden) else it })
+            }
+            onComplete(result)
+            if (result.isSuccess) refresh()
+        }
+    }
+
     fun openMobileTerminal(session: ClientSession, onComplete: (Result<String>) -> Unit) {
         if (session.kind == "shell") { openPlainTerminal(session.id); return }
         viewModelScope.launch {

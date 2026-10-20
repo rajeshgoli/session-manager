@@ -16,6 +16,7 @@ pub(crate) fn terminal() -> Terminal {
         created_at: "2026-01-01T00:00:00Z".into(),
         retired_at: None,
         retired_reason: None,
+        hidden_at: None,
     }
 }
 #[test]

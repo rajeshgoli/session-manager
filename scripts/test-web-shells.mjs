@@ -75,6 +75,15 @@ async function setup(browser, { width = 1440, home = false, failDirect = false, 
       return json({ ssh_host: away ? 'studio-away' : 'studio-lan.rajeshgo.li', ssh_user: 'rajesh', ssh_port: 22222, tmux_session: 'term-abcd',
         command: away ? `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd` : `ssh -t -p 22222 rajesh@studio-lan.rajeshgo.li tmux -L 'session-manager' attach-session -t term-abcd` });
     }
+    if (/^\/terminals\/[^/]+$/.test(path) && req.method() === 'PATCH') {
+      const id = path.split('/').at(-1), body = req.postDataJSON();
+      if (body.name?.length > 40) return json({ detail: 'name_too_long' }, 400);
+      state.sessions = state.sessions.map(s => s.id !== id ? s : { ...s,
+        ...('name' in body ? { name: body.name?.trim() || 'zsh · session-manager', named: !!body.name?.trim() } : {}),
+        ...('hidden' in body ? { hidden: body.hidden } : {}) });
+      const t = state.sessions.find(s => s.id === id);
+      return json({ id, name: t.name, named: !!t.named, hidden: !!t.hidden });
+    }
     if (/^\/terminals\/[^/]+$/.test(path) && req.method() === 'DELETE') {
       state.sessions = state.sessions.filter(s => s.id !== path.split('/').at(-1)); return json({});
     }
@@ -170,10 +179,13 @@ for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) te
     assert.equal(await page.evaluate(() => window.copied), `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd`);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
+    // The shell bar is the agent bar: sm home, Notes, Details, Hide and ⋯; Close sits where Retire does, in red.
     assert.equal(await page.getByText('Hand off…', { exact: true }).count(), 0);
-    assert.deepEqual(await page.locator('.term-bar button').allTextContents(), [' Close']);
-    assert.equal(await page.getByRole('button', { name: 'Details', exact: true }).count(), 0);
-    assert.equal(await page.getByRole('button', { name: 'More', exact: true }).count(), 0);
+    await page.locator('.term-bar .term-home').waitFor();
+    for (const name of ['Details', 'Hide', 'More', 'Close shell']) assert.equal(await page.locator('.term-bar').getByRole('button', { name, exact: true }).count(), 1, name);
+    assert.equal(await page.locator('.term-bar .ring').count(), 0);
+    assert.match(await page.locator('.term-bar').getByRole('button', { name: 'Close shell', exact: true }).getAttribute('class'), /\bdanger\b/);
+    assert.equal(await page.locator('.term-bar .term-connection').count(), 0, 'the SSH card already says how to connect');
     state.routeError = 'no_ssh_key';
     await page.getByRole('button', { name: 'Open tunnel', exact: true }).click();
     await page.getByRole('alert').filter({ hasText: 'Add an SSH public key' }).waitFor();
@@ -284,7 +296,8 @@ test('Studio shell ignores remembered Cloudflare route and uses localhost', asyn
     await page.waitForSelector('[data-connection="Live"]');
     assert.ok(state.probes > 0);
     assert.deepEqual(await page.evaluate(() => window.sockets.map(s => s.url)), ['ws://localhost:8420/client/terminal']);
-    assert.deepEqual(await page.locator('.term-bar button').allTextContents(), [' Close']);
+    await page.locator('.term-bar .term-home').waitFor();
+    await page.locator('.term-bar').getByRole('button', { name: 'Close shell', exact: true }).waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
@@ -338,6 +351,102 @@ for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) te
     assert.ok(!sections.includes('Moving'), 'a running shell does not create a moving agent section');
     assert.ok(sections.some(text => text.startsWith('Idle · 1')), 'only the real agent is idle');
     assert.equal(await page.locator('.sw-row').count(), 2, 'both shells remain visible even with Idle folded');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+for (const width of [390, 1440]) test(`Shell renames in place from the bar and from ⋯ at ${width}px`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, requests, state, errors } = await setup(browser, { width, home: true });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.waitForSelector('[data-connection="Live"]');
+    const patches = () => requests.filter(r => r.method === 'PATCH');
+    await page.getByRole('button', { name: 'Rename zsh · session-manager', exact: true }).click();
+    const field = page.getByRole('textbox', { name: 'Shell name', exact: true });
+    assert.equal(await field.inputValue(), 'zsh · session-manager');
+    await page.waitForFunction(() => { const el = document.activeElement; return el?.classList.contains('shell-name-input') && el.selectionEnd - el.selectionStart === el.value.length; });
+    await field.fill('throwaway');
+    await field.press('Escape');
+    await page.getByRole('button', { name: 'Rename zsh · session-manager', exact: true }).waitFor();
+    assert.equal(patches().length, 0);
+    await page.getByRole('button', { name: 'Rename zsh · session-manager', exact: true }).click();
+    await field.fill('  bench runner ');
+    await field.press('Enter');
+    await page.getByRole('button', { name: 'Rename bench runner', exact: true }).waitFor();
+    assert.deepEqual(patches().at(-1), { path: '/terminals/term-abcd', method: 'PATCH', body: { name: 'bench runner' } });
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-renamed-${width}.png` }); }
+    // ⋯ › Rename… edits the same name in the bar; blank restores the default.
+    await page.getByRole('button', { name: 'More', exact: true }).click();
+    await page.getByRole('button', { name: 'Rename…', exact: true }).click();
+    await field.fill('');
+    await field.press('Enter');
+    await page.getByRole('button', { name: 'Rename zsh · session-manager', exact: true }).waitFor();
+    assert.deepEqual(patches().at(-1).body, { name: null });
+    // Too long: the server refuses, the field stays open with the text.
+    await page.getByRole('button', { name: 'Rename zsh · session-manager', exact: true }).click();
+    await field.evaluate(el => el.removeAttribute('maxlength'));
+    await field.fill('x'.repeat(41));
+    await field.press('Enter');
+    await page.getByText('Shell names are at most 40 characters.').waitFor();
+    assert.equal(await field.inputValue(), 'x'.repeat(41));
+    assert.equal(state.sessions.find(s => s.id === 'term-abcd').name, 'zsh · session-manager');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+for (const width of [390, 1440]) test(`Hide sends a shell to the tray and Undo brings it back at ${width}px`, async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, requests, state, errors } = await setup(browser, { width, home: true });
+    await page.goto(`${ORIGIN}/terminal/term-abcd`);
+    await page.waitForSelector('[data-connection="Live"]');
+    await page.locator('.term-bar').getByRole('button', { name: 'Hide', exact: true }).click();
+    await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
+    assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: true });
+    assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, true);
+    // In the switcher it waits folded under Hidden; the other shell stays.
+    if (width < 900) await page.getByRole('button', { name: 'Unfold session list', exact: true }).click();
+    const tray = page.getByRole('button', { name: /Hidden · 1/ });
+    await tray.waitFor();
+    assert.equal(await page.locator('.sw-row').filter({ hasText: 'cargo bench' }).count(), 1);
+    assert.equal(await page.locator('.sw-row.sw-hidden').count(), 0);
+    await tray.click();
+    await page.locator('.sw-row.sw-hidden').waitFor();
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-tray-${width}.png` }); }
+    // Opening a hidden shell keeps it hidden until Unhide.
+    await page.locator('.sw-row.sw-hidden').click();
+    await page.waitForURL('**/terminal/term-abcd');
+    await page.locator('.term-bar .shell-hidden-pill').waitFor();
+    await page.locator('.term-bar').getByRole('button', { name: 'Unhide', exact: true }).click();
+    await page.locator('.term-bar').getByRole('button', { name: 'Hide', exact: true }).waitFor();
+    assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, false);
+    assert.ok(page.url().endsWith('/terminal/term-abcd'));
+    // Hide, then Undo from the toast returns to the shell.
+    await page.locator('.term-bar').getByRole('button', { name: 'Hide', exact: true }).click();
+    await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
+    await page.getByRole('button', { name: 'Undo', exact: true }).last().click();
+    await page.waitForURL('**/terminal/term-abcd');
+    assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, false);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('Agents page folds hidden shells into a tray and names tiles by their shell name', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await setup(browser);
+    state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, hidden: true }
+      : s.id === 'term-busy' ? { ...s, name: 'bench runner', named: true } : s);
+    await page.goto(`${ORIGIN}/`);
+    const terminals = page.getByRole('region', { name: 'Terminals', exact: true });
+    await terminals.getByText('1 open · 1 hidden', { exact: true }).waitFor();
+    assert.deepEqual(await terminals.locator('.terminal-tile strong').allTextContents(), ['bench runner']);
+    await terminals.getByRole('button', { name: /Hidden · 1/ }).click();
+    await terminals.locator('.terminal-tile.is-hidden').waitFor();
+    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-tray-agents.png`, fullPage: true }); }
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

@@ -372,11 +372,8 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
         } else {
             format!("last input {}", facts_age(last, now))
         };
-        let basename = std::path::Path::new(&t.cwd)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        out.push(json!({"id":t.id,"kind":"shell","provider":"shell","name":t.name.clone().unwrap_or_else(|| format!("zsh · {basename}")),"mark":"▹",
+        out.push(json!({"id":t.id,"kind":"shell","provider":"shell","name":plain_terminals::display_name(&t),"mark":"▹",
+            "named":t.name.is_some(),"hidden":t.hidden_at.is_some(),
             "state":if stopped {"stopped"} else if busy {"working"} else {"idle"},
             "working_dir":t.cwd,"repo":t.cwd,"node":state.config.nodes.default_node,"depth":0,"group":t.id,
             "last_activity":last,"activity_since":t.busy_since.as_deref().unwrap_or(last),

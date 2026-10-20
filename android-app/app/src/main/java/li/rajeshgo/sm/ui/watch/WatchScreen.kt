@@ -175,9 +175,13 @@ fun WatchScreen(
 
     // By attention (the server's sections) unless the owner picked By repo in the menu (spec 1782 J2).
     var byRepo by rememberSaveable { mutableStateOf(false) }
-    val attention = remember(state.sessions, filter, query) { attentionGroups(state.sessions, filter, query) }
-    val sections = remember(state.sessions, filter, query) {
-        filterSections(buildSections(state.sessions), filter, query)
+    // Hidden shells leave the sections for a folded tray at the end (sm#2460).
+    val listed = remember(state.sessions) { state.sessions.filterNot(::isHiddenShell) }
+    val hiddenShells = remember(state.sessions, filter, query) { hiddenShells(state.sessions, filter, query) }
+    var trayOpen by rememberSaveable { mutableStateOf(false) }
+    val attention = remember(listed, filter, query) { attentionGroups(listed, filter, query) }
+    val sections = remember(listed, filter, query) {
+        filterSections(buildSections(listed), filter, query)
     }
     val activeSections = remember(sections) { sliceSections(sections, TreeSlice.Active) }
     val idleSections = remember(sections) { sliceSections(sections, TreeSlice.Idle) }
@@ -431,6 +435,17 @@ fun WatchScreen(
                         toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                     }
                 },
+                onUpdateShell = { session, name, hidden ->
+                    viewModel.updateShell(session.id, name, hidden) { result ->
+                        toast = result.exceptionOrNull()?.message?.let { if (it.contains("name_too_long")) "Shell names are at most 40 characters." else it }
+                            ?: when {
+                                hidden == true -> "Hid ${session.name}. It keeps running."
+                                hidden == false -> "${session.name} is back in the list"
+                                name.isNullOrBlank() -> "Name reset"
+                                else -> "Renamed to ${name.trim()}"
+                            }
+                    }
+                },
                 onAnswered = { session ->
                     viewModel.answerNeedsYou(session) { result -> toast = result.exceptionOrNull()?.message ?: result.getOrNull() }
                 },
@@ -438,7 +453,7 @@ fun WatchScreen(
                 follow = follow,
             )
             val rowState = WatchRowState(sessionsById, state.expandedSessionIds, state.detailsBySessionId, state.whatBySessionId, showTitles)
-            if (if (byRepo) sections.isEmpty() else attention.isEmpty()) {
+            if (if (byRepo) sections.isEmpty() && hiddenShells.isEmpty() else attention.isEmpty() && hiddenShells.isEmpty()) {
                 item {
                     EmptyState(query = query, filter = filter)
                 }
@@ -467,6 +482,18 @@ fun WatchScreen(
                     items(section.roots, key = { "idle-${it.session.id}" }) { root ->
                         WatchTree(root, depth = 0, slice = TreeSlice.Idle, rowState, rowActions)
                     }
+                }
+            }
+            if (hiddenShells.isNotEmpty()) {
+                item(key = "hidden-shells") {
+                    Text(
+                        "Hidden · ${hiddenShells.size} ${if (trayOpen) "⌄" else "›"}",
+                        style = MaterialTheme.typography.labelLarge, color = TextMuted,
+                        modifier = Modifier.fillMaxWidth().clickable { trayOpen = !trayOpen }.padding(horizontal = 4.dp, vertical = 12.dp),
+                    )
+                }
+                if (trayOpen) items(hiddenShells, key = { "hidden-${it.id}" }) { session ->
+                    SessionRow(session, depth = 0, rowState, rowActions)
                 }
             }
 
@@ -1254,6 +1281,7 @@ private class WatchRowActions(
     val onUpdateWhat: (ClientSession) -> Unit,
     val onRegenerateWhat: (ClientSession) -> Unit,
     val onKill: (ClientSession) -> Unit,
+    val onUpdateShell: (ClientSession, String?, Boolean?) -> Unit,
     val onAnswered: (ClientSession) -> Unit,
     val onOpenPage: (ReaderPage) -> Unit,
     val follow: FollowUi,
@@ -1336,9 +1364,9 @@ private fun SessionRow(
     }
     if (confirmRetire) androidx.compose.material3.AlertDialog(
         onDismissRequest = { confirmRetire = false },
-        title = { Text("Retire ${session.name}?") },
-        text = { Text(if (session.kind == "shell") "Its shell and running commands will end." else "Its current turn will end.") },
-        confirmButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false; onKill() }) { Text("Retire") } },
+        title = { Text(if (session.kind == "shell") "Close ${session.name}?" else "Retire ${session.name}?") },
+        text = { Text(if (session.kind == "shell") "Any processes running in it will stop." else "Its current turn will end.") },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false; onKill() }) { Text(if (session.kind == "shell") "Close shell" else "Retire") } },
         dismissButton = { androidx.compose.material3.TextButton(onClick = { confirmRetire = false }) { Text("Cancel") } },
     )
     val onOpenPage = actions.onOpenPage
@@ -1349,7 +1377,7 @@ private fun SessionRow(
     if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, onDismiss = { showHandoff = false })
     if (showHandoffNow) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session, { showHandoffNow = false }, showNow = true)
     if (session.kind == "shell") {
-        ShellWatchCard(session, expanded, onToggleExpanded, onOpenAttach, retire, depth)
+        ShellWatchCard(session, expanded, onToggleExpanded, onOpenAttach, retire, depth) { name, hidden -> actions.onUpdateShell(session, name, hidden) }
         return
     }
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true

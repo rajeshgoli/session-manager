@@ -37,5 +37,5 @@ fun WatchStateSession.toShellSession(): ClientSession = ClientSession(
     id = id, name = name, workingDir = workingDir,
     status = if (state == "stopped") "stopped" else "running",
     createdAt = lastActivity, lastActivity = lastActivity, tmuxSession = id,
-    provider = "shell", kind = "shell", activityState = state, facts = facts, attention = attention,
+    provider = "shell", kind = "shell", activityState = state, facts = facts, attention = attention, hidden = hidden,
 )
