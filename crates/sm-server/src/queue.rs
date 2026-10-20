@@ -6867,6 +6867,66 @@ fn process_arguments(pid: i64) -> Option<Vec<u8>> {
     fs::read(format!("/proc/{pid}/cmdline")).ok()
 }
 
+/// A process's argument vector with its boundaries intact, which `ps`
+/// flattens into one display string (sm#2412).
+pub(crate) fn process_argv(pid: i64) -> Option<Vec<String>> {
+    let raw = process_arguments(pid)?;
+    #[cfg(target_os = "macos")]
+    {
+        // process_arguments drops KERN_PROCARGS2's leading argc, which leaves
+        // the executable path, NUL padding, then argc arguments and the
+        // environment. Read argc again to stop before the environment.
+        let argc = process_argument_count(pid)?;
+        let mut fields = raw
+            .split(|byte| *byte == 0)
+            .skip(1)
+            .skip_while(|field| field.is_empty());
+        let argv: Vec<String> = fields
+            .by_ref()
+            .take(argc)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .collect();
+        (argv.len() == argc && argc > 0).then_some(argv)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .collect();
+        while argv.last().is_some_and(String::is_empty) {
+            argv.pop();
+        }
+        (!argv.is_empty()).then_some(argv)
+    }
+}
+
+/// KERN_PROCARGS2's argc for `pid`.
+#[cfg(target_os = "macos")]
+fn process_argument_count(pid: i64) -> Option<usize> {
+    let pid = libc::c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut size = buffer.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: buffer is writable for size bytes; the kernel writes at most that.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let width = std::mem::size_of::<libc::c_int>();
+    if status != 0 || size < width {
+        return None;
+    }
+    let argc = libc::c_int::from_ne_bytes(buffer[..width].try_into().ok()?);
+    usize::try_from(argc).ok()
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn process_arguments(_pid: i64) -> Option<Vec<u8>> {
     None

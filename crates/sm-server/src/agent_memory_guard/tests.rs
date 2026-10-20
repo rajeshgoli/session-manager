@@ -207,6 +207,7 @@ fn facts(started_at: Option<OffsetDateTime>, args: &str) -> ProcessFacts {
         identity: None,
         started_at,
         args: Some(args.to_owned()),
+        command: None,
     }
 }
 

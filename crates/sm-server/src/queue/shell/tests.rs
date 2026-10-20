@@ -324,3 +324,48 @@ fn recovery_keeps_a_job_only_while_its_root_is_the_adopted_process() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn command_from_argv_keeps_argument_boundaries() {
+    let argv = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| (*item).to_owned())
+            .collect::<Vec<_>>()
+    };
+    // Codex runs a program directly; its -c source is one argument.
+    assert_eq!(
+        command_from_argv(&argv(&["python3", "-c", "import time; time.sleep(9)"])),
+        "python3 -c 'import time; time.sleep(9)'"
+    );
+    assert_eq!(command_from_argv(&argv(&["sleep", "180"])), "sleep 180");
+    assert_eq!(command_from_argv(&argv(&["echo", ""])), "echo ''");
+    assert_eq!(
+        command_from_argv(&argv(&["/bin/zsh", "-lc", "npm run dev | tee x"])),
+        "npm run dev | tee x"
+    );
+    let claude = r#"source /x/snapshot.sh 2>/dev/null || true && eval 'cargo test -- it'\''s' < /dev/null && pwd -P >| /tmp/c"#;
+    assert_eq!(
+        command_from_argv(&argv(&["/bin/zsh", "-c", claude])),
+        "cargo test -- it's"
+    );
+    // The resubmit line passes the quoted command through zsh -lc intact.
+    let line = resubmit_text(
+        &command_from_argv(&argv(&["python3", "-c", "print(1)"])),
+        GIB,
+        None,
+    );
+    assert!(
+        line.lines()
+            .next()
+            .unwrap()
+            .ends_with(r#"-- zsh -lc 'python3 -c '\''print(1)'\'''"#),
+        "{line}"
+    );
+}
+
+#[test]
+fn process_argv_reads_this_process_with_its_boundaries() {
+    let argv = crate::queue::process_argv(i64::from(std::process::id())).unwrap();
+    assert_eq!(argv, std::env::args().collect::<Vec<_>>());
+}

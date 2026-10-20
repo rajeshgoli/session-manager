@@ -289,6 +289,40 @@ pub fn command_text(args: &str) -> String {
     args.to_owned()
 }
 
+/// The command an agent ran, from its root process's argument vector, which
+/// keeps argument boundaries that [`command_text`] cannot recover from `ps`.
+/// A shell wrapper yields its script (Claude's `eval '…'` unwrapped); a
+/// program run directly yields its arguments, each quoted as the shell needs.
+pub fn command_from_argv(argv: &[String]) -> String {
+    if let [shell, flag, script, ..] = argv {
+        let name = shell.rsplit('/').next().unwrap_or(shell);
+        if matches!(name, "sh" | "bash" | "zsh" | "dash" | "fish")
+            && matches!(flag.as_str(), "-c" | "-lc" | "-ic")
+        {
+            if let Some(start) = script.find("eval '") {
+                if let Some(command) = single_quoted(&script[start + "eval '".len()..]) {
+                    return command;
+                }
+            }
+            return script.clone();
+        }
+    }
+    argv.iter()
+        .map(|arg| {
+            let plain = !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+            if plain {
+                arg.clone()
+            } else {
+                super::shell_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The text of a single-quoted shell word, `'\''` read as a quote; `text`
 /// starts just after the opening quote.
 fn single_quoted(text: &str) -> Option<String> {

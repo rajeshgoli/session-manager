@@ -207,7 +207,10 @@ pub fn spawn_agent_memory_guard(config: AgentMemoryGuardConfig) {
 struct ProcessFacts {
     identity: Option<String>,
     started_at: Option<OffsetDateTime>,
+    /// The `ps` display string, for helper markers.
     args: Option<String>,
+    /// The command the agent ran, from the argument vector when readable.
+    command: Option<String>,
 }
 
 struct Guard {
@@ -244,9 +247,14 @@ impl Guard {
                 return known.clone();
             }
         }
+        let args = process_arguments_text(pid, MAX_ARGUMENT_CHARS);
+        let command = crate::queue::process_argv(i64::from(pid))
+            .map(|argv| shell::command_from_argv(&argv))
+            .or_else(|| args.as_deref().map(shell::command_text));
         let facts = ProcessFacts {
             started_at: process_started_at(pid),
-            args: process_arguments_text(pid, MAX_ARGUMENT_CHARS),
+            args,
+            command,
             identity,
         };
         self.facts.insert(pid, facts.clone());
@@ -352,12 +360,10 @@ impl Guard {
                 && (root.detached || root.pgid == root.pid)
                 && Some(root.pgid) != harness_pgid;
             let facts = self.facts(root.pid);
-            let command = shell::command_text(
-                facts
-                    .args
-                    .as_deref()
-                    .unwrap_or_else(|| executable_name(&by_pid[&root.pid].command)),
-            );
+            let command = facts
+                .command
+                .clone()
+                .unwrap_or_else(|| executable_name(&by_pid[&root.pid].command).to_owned());
             let cause = if trackable {
                 let headroom = host_headroom(config.memory_min_free_bytes, &reserved);
                 match headroom.and_then(shell::reservation_for_headroom) {
@@ -400,7 +406,13 @@ impl Guard {
             } else {
                 StopCause::Untrackable
             };
-            self.stop(config, root, &command, trigger_bytes, cause);
+            let command_bytes = root
+                .pids
+                .iter()
+                .map(|pid| memory_of(*pid))
+                .fold(0i64, i64::saturating_add)
+                .max(trigger_bytes);
+            self.stop(config, root, &command, command_bytes, cause);
         }
 
         let mut snapshot: HashMap<String, Vec<BackgroundJob>> = HashMap::new();
@@ -429,12 +441,12 @@ impl Guard {
                 .or_default()
                 .push(BackgroundJob {
                     pid: i64::from(root.pid),
-                    command: shell::label_text(&shell::command_text(
+                    command: shell::label_text(
                         facts
-                            .args
+                            .command
                             .as_deref()
                             .unwrap_or_else(|| executable_name(&row.command)),
-                    )),
+                    ),
                     started_at: facts.started_at.and_then(|at| at.format(&Rfc3339).ok()),
                     memory_bytes: bytes,
                     shell_job_id: adopted.get(&root.pgid).cloned(),
@@ -877,8 +889,26 @@ fn process_started_at(pid: i32) -> Option<OffsetDateTime> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = pid;
-        None
+        // Field 22 of /proc/<pid>/stat: start time in clock ticks after boot.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let ticks: i64 = stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()?;
+        let boot: i64 = std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        // SAFETY: sysconf reads a constant; it returns -1 when unknown.
+        let hz = i128::from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1));
+        let nanos = i128::from(boot) * 1_000_000_000 + i128::from(ticks) * 1_000_000_000 / hz;
+        OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()
     }
 }
 
