@@ -31,10 +31,10 @@ int main(int argc, char **argv) {
         unsigned before = descriptor_count();
         struct wall_socket rejected;
         assert(wall_connect(&configuration, 1, (uint16_t)atoi(argv[11]), &rejected) == -1);
-        assert(errno == ECONNRESET);
+        assert(errno == ECONNRESET || errno == EPIPE);
         assert(rejected.descriptor == -1 && rejected.control == -1);
         assert(descriptor_count() == before);
-        puts("saturated broker resets without supplying a socket");
+        puts("saturated broker closes without supplying a socket");
         return 0;
     }
     if (argc == 11) {

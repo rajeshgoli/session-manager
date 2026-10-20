@@ -939,7 +939,7 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         // Hold all workers on complete, idle leases. The next request is
-        // closed before dispatch; the native client must report RESET and
+        // closed before dispatch; the native client must report a closed broker and
         // must never connect to the requested host listener.
         let lease = fixture
             .service

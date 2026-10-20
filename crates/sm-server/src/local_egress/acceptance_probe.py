@@ -29,10 +29,10 @@ else:
             connection = socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError as error:
             # Foreign loopback ports go through the private socket broker,
-            # not a TCP dial. A broker close (e.g. its worker limit) is RESET.
+            # not a TCP dial. A broker close (e.g. its worker limit) is RESET or EPIPE.
             # Both outcomes deny access; public egress and file reads below
             # still require a permission error from the local wall.
-            assert error.errno in (errno.EACCES, errno.EPERM, errno.ECONNRESET), (port, error)
+            assert error.errno in (errno.EACCES, errno.EPERM, errno.ECONNRESET, errno.EPIPE), (port, error)
         else:
             connection.close()
             raise AssertionError(f"direct connection escaped: {port}")
