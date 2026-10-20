@@ -310,17 +310,21 @@ impl SessionStore {
         };
         let mut attempted = 0;
         let mut failures = Vec::new();
-        for record in self
-            .list_sessions(false)?
-            .into_iter()
-            .filter(|record| record.provider == "opencode")
-        {
-            if !queue.pending_messages_for_target(&record.id, 1)?.is_empty() {
-                if let Err(error) = self.drain_opencode_outbox(&record.id, runtime) {
-                    failures.push(format!("{}: {error:#}", record.id));
-                }
-                attempted += 1;
+        let parsed = self.load_parsed_state()?;
+        for id in queue.pending_target_session_ids()? {
+            let Some(session) = raw_session_object(&parsed.raw, &id) else {
+                continue;
+            };
+            if session.get("provider").and_then(Value::as_str) != Some("opencode")
+                || raw_session_is_stopped(session)
+                || handoff_fences_delivery_raw(session)
+            {
+                continue;
             }
+            if let Err(error) = self.drain_opencode_outbox(&id, runtime) {
+                failures.push(format!("{id}: {error:#}"));
+            }
+            attempted += 1;
         }
         if failures.is_empty() {
             Ok(attempted)
