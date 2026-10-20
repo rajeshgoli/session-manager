@@ -710,7 +710,10 @@ impl OwnerDocStore {
         validate_repo_slug(&request.repo)?;
         validate_repo_path(&request.path)?;
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
+        // Reserve the writer before reading: a deferred transaction can acquire
+        // a stale WAL snapshot and fail its write upgrade immediately, bypassing
+        // busy_timeout when another connection commits in between (sm#2467).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_rfc3339();
         let mut existing = tx
             .query_row(
@@ -2495,6 +2498,35 @@ mod tests {
         let memo = summaries.iter().find(|s| s.doc.id == first.doc.id).unwrap();
         assert_eq!(memo.publish_count, 2);
         assert_eq!(memo.latest_commit_sha, "b".repeat(40));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_publishes_preserve_one_doc_and_every_revision() {
+        let (store, dir) = store();
+        store.ensure_schema().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        (0..20)
+                            .map(|_| store.publish(publish(Some(7), "a", "1"), |_| true))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|p| p.created).count(), 1);
+        let id = &results[0].doc.id;
+        assert!(results.iter().all(|p| &p.doc.id == id));
+        assert_eq!(store.publishes(id).unwrap().len(), 160);
+        assert_eq!(store.summaries(None, false).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
