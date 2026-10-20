@@ -144,6 +144,21 @@ fn cold_store_reserves_a_thaw_only_when_the_mac_cannot_take_it() {
     assert!(!thaw_fits_on_root(&f.conn(), &f.manager, &f.root, 700).unwrap());
 }
 #[test]
+fn cold_store_reserve_is_the_largest_frozen_set_not_its_largest_member() {
+    let f = Fixture::new();
+    f.frozen("a", 50, 400);
+    f.frozen("b", 50, 400);
+    f.conn()
+        .execute(
+            "UPDATE artifacts SET set_id='pair' WHERE name IN ('a','b')",
+            [],
+        )
+        .unwrap();
+    // The Mac fits one member (400) but not the set (800): the cold store keeps it.
+    f.disks(600, 100);
+    assert_eq!(enough(&f.conn(), &f.manager, 2, 100).unwrap(), 800);
+}
+#[test]
 fn hand_moved_folder_is_measured_where_it_now_lives() {
     let f = Fixture::new();
     f.disks(1_000_000, 1_000_000);

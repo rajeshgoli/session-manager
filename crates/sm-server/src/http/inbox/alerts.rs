@@ -187,8 +187,9 @@ pub(crate) async fn post_assign(
     ))
 }
 
-/// Whether an alert under `prefix` is with an agent that is still working,
-/// so sm does not send the same alert again meanwhile.
+/// Whether an alert under `prefix` is with an agent that is still working
+/// it (its condition has not cleared), so sm does not send the same alert
+/// again meanwhile.
 pub(crate) fn with_live_agent(state: &AppState, prefix: &str) -> anyhow::Result<bool> {
     let store = owner_message_store(state);
     let assignments = store.assignments()?;
@@ -196,14 +197,19 @@ pub(crate) fn with_live_agent(state: &AppState, prefix: &str) -> anyhow::Result<
         if !key.starts_with(prefix) {
             continue;
         }
-        if let Some(session_id) = assignments.get(&message_id) {
-            if state
+        let Some(session_id) = assignments.get(&message_id) else {
+            continue;
+        };
+        let open = store
+            .get(&message_id)?
+            .is_some_and(|message| message.handled_via.as_deref() == Some("agent"));
+        if open
+            && state
                 .session_store
                 .get_session(session_id)?
                 .is_some_and(|session| !session_ended(&session))
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
         }
     }
     Ok(false)

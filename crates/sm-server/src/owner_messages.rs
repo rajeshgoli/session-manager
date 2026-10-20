@@ -685,8 +685,9 @@ impl OwnerMessageStore {
     /// Records that `sender_session_id`'s notices keyed under `prefix` no
     /// longer stand (sm#2414): `resolved` when the condition cleared,
     /// `superseded` when a newer notice (`keep`) replaced them. Overrides an
-    /// owner's Done, so a cleared alert stops offering work; one handed to
-    /// an agent keeps that record.
+    /// owner's Done, so a cleared alert stops offering work. A resolved alert
+    /// that was assigned keeps its assignment as history; superseding never
+    /// takes an alert from its agent.
     pub fn clear_keyed(
         &self,
         sender_session_id: &str,
@@ -699,7 +700,8 @@ impl OwnerMessageStore {
         conn.execute(
             "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?3), \
                first_viewed_at = IFNULL(first_viewed_at, ?3), handled_via = ?4 \
-             WHERE sender_session_id = ?1 AND IFNULL(handled_via, '') NOT IN ('agent', ?4) \
+             WHERE sender_session_id = ?1 AND IFNULL(handled_via, '') != ?4 \
+               AND (?4 = 'resolved' OR IFNULL(handled_via, '') != 'agent') \
                AND id IN (SELECT message_id FROM owner_message_delivery_keys \
                           WHERE substr(key, 1, length(?2)) = ?2 AND key IS NOT ?5)",
             params![sender_session_id, prefix, now, via, keep],

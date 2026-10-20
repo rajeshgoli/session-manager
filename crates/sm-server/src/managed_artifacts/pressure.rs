@@ -9,7 +9,7 @@ use std::{
 
 /// Free space sm restores on `device`: room for the largest recent job
 /// output there, and on a cold store room to thaw the largest frozen
-/// artifact unless that thaw fits on the Mac instead (sm#2414).
+/// set unless that thaw fits on the Mac instead (sm#2414).
 pub fn enough(
     conn: &Connection,
     manager: &ManagedArtifacts,
@@ -21,7 +21,8 @@ pub fn enough(
         if moves::cold_mounted(root)
             && queue::fs_stats(&root.cold_store, manager.config.floor_percent)?.2 == device
         {
-            let bytes:u64=conn.query_row("SELECT COALESCE(MAX(data_bytes),0) FROM artifacts WHERE root=?1 AND state='frozen'",[&root.path],|r|r.get(0))?;
+            // A set thaws together, so the reserve is the largest frozen set.
+            let bytes:u64=conn.query_row("SELECT COALESCE(MAX(bytes),0) FROM (SELECT SUM(data_bytes) bytes FROM artifacts WHERE root=?1 AND state='frozen' GROUP BY set_id)",[&root.path],|r|r.get(0))?;
             if !thaw_fits_on_root(conn, manager, root, bytes)? {
                 result = result.max(bytes);
             }

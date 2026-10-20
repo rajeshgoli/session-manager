@@ -518,7 +518,9 @@ fn alert_assignment_marks_handled_refuses_a_second_and_follows_a_handoff() {
     store
         .clear_keyed("sm-artifacts", "pressure_pending:7:", "resolved", None)
         .unwrap();
-    assert_eq!(via(&alert.id).as_deref(), Some("agent"));
+    // Resolution reaches the assigned alert too; the assignment stays as history.
+    assert_eq!(via(&alert.id).as_deref(), Some("resolved"));
+    assert!(store.assignments().unwrap().contains_key(&alert.id));
     assert_eq!(via(&second.id).as_deref(), Some("resolved"));
     assert_eq!(via(&third.id).as_deref(), Some("resolved"));
     let _ = fs::remove_dir_all(dir);
