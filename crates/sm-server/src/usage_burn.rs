@@ -368,8 +368,14 @@ fn insert_windows(
                 .query_row(
                     "SELECT percent, resets_at, observed_at FROM burn_samples \
                  WHERE account_key = ?1 AND window_kind = ?2 AND window_scope IS ?3 \
+                   AND observed_at <= ?4 \
                  ORDER BY observed_at DESC, id DESC LIMIT 1",
-                    params![account_key, window.window_kind, window.window_scope],
+                    params![
+                        account_key,
+                        window.window_kind,
+                        window.window_scope,
+                        observed_at
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, f64>(0)?,

@@ -40,6 +40,8 @@ const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = ti
 
 #[cfg(test)]
 thread_local! {
+    static BURN_SCAN_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static WRITE_BATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1528,6 +1530,34 @@ impl UsageLedgerStore {
     fn pending_burn_scan(&self) -> Result<(Vec<BurnWindow>, i64)> {
         let mut connection = self.open()?;
         let tx = connection.transaction()?;
+        let (windows, max_id, persisted_high_water) = Self::read_pending_burn_scan(&tx)?;
+        #[cfg(test)]
+        BURN_SCAN_PREFLIGHT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        tx.commit()?;
+        if persisted_high_water.is_some()
+            && (!windows.is_empty() || persisted_high_water == Some(max_id))
+        {
+            return Ok((windows, max_id));
+        }
+
+        // Acquire the writer slot before taking a fresh snapshot. Ingestion may have
+        // committed since preflight; upgrading its old read snapshot can fail in WAL mode.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (windows, max_id, persisted_high_water) = Self::read_pending_burn_scan(&tx)?;
+        if windows.is_empty() && persisted_high_water.unwrap_or(0) != max_id {
+            advance_burn_scan(&tx, max_id)?;
+        } else if persisted_high_water.is_none() {
+            tx.execute("INSERT INTO burn_window_scan_state SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM burn_window_scan_state)", [])?;
+        }
+        tx.commit()?;
+        Ok((windows, max_id))
+    }
+
+    fn read_pending_burn_scan(tx: &Transaction<'_>) -> Result<(Vec<BurnWindow>, i64, Option<i64>)> {
         let max_id = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM burn_samples", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -1569,15 +1599,7 @@ impl UsageLedgerStore {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(anyhow::Error::from)?;
         drop(statement);
-        // No pending windows means every row in this snapshot is already complete.
-        // Do not take a writer slot on subsequent no-change scans.
-        if windows.is_empty() && high_water != max_id {
-            advance_burn_scan(&tx, max_id)?;
-        } else if persisted_high_water.is_none() {
-            tx.execute("INSERT INTO burn_window_scan_state SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM burn_window_scan_state)", [])?;
-        }
-        tx.commit()?;
-        Ok((windows, max_id))
+        Ok((windows, max_id, persisted_high_water))
     }
 
     fn pending_message_ids_for_window(&self, window: &BurnWindow) -> Result<Vec<i64>> {
@@ -4217,6 +4239,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tokens, 25);
+    }
+
+    #[test]
+    fn delayed_statusline_samples_preserve_historical_credit_classification() {
+        let dir = TestDir::new("delayed-statusline-credit");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let burn = UsageBurnStore::new(&db_path).unwrap();
+        let mut window = BurnWindowSample {
+            window_kind: "session_5h".into(),
+            window_scope: None,
+            duration_minutes: 300,
+            percent: 100.0,
+            resets_at: at("2026-08-10T21:00:00Z"),
+            severity: None,
+            is_active: None,
+        };
+        for (timestamp, percent) in [
+            ("2026-08-10T16:01:00Z", 100.0),
+            ("2026-08-10T16:03:00Z", 50.0),
+            ("2026-08-10T16:02:00Z", 50.0),
+            ("2026-08-10T16:00:30Z", 50.0),
+        ] {
+            window.percent = percent;
+            assert_eq!(
+                burn.record_for_account(
+                    "claude:account-one",
+                    &[window.clone()],
+                    "statusline",
+                    at(timestamp)
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = store.open().unwrap();
+        let tx = connection.transaction().unwrap();
+        for (timestamp, expected) in [
+            ("2026-08-10T16:00:45Z", false),
+            ("2026-08-10T16:01:30Z", true),
+            ("2026-08-10T16:02:30Z", false),
+            ("2026-08-10T16:03:30Z", false),
+        ] {
+            assert_eq!(
+                credit_metered(
+                    &tx,
+                    &mut BurnWindows::default(),
+                    "claude:account-one",
+                    "claude-sonnet-5",
+                    at(timestamp)
+                )
+                .unwrap(),
+                expected,
+                "{timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn burn_scan_rechecks_after_concurrent_ingestion_before_checkpoint_write() {
+        for initialize in [false, true] {
+            for new_window in [false, true] {
+                let dir = TestDir::new("burn-scan-concurrent");
+                let db_path = dir.0.join("usage.db");
+                seed_provider(
+                    &db_path,
+                    Provider::Claude,
+                    "account-one",
+                    "max",
+                    "session_5h",
+                    300,
+                );
+                let store = UsageLedgerStore::new(&db_path).unwrap();
+                store.materialize_pending_windows().unwrap();
+                let writer = store.open().unwrap();
+                if initialize {
+                    writer
+                        .execute("DELETE FROM burn_window_scan_state", [])
+                        .unwrap();
+                } else {
+                    // A new sample for a completed window requires checkpoint advancement.
+                    writer.execute_batch("INSERT INTO burn_samples (account_key, window_kind, window_start, percent, resets_at, source, observed_at) SELECT account_key, window_kind, window_start, percent, resets_at, 'preflight', observed_at FROM burn_samples LIMIT 1").unwrap();
+                }
+                BURN_SCAN_PREFLIGHT_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        // Commit on another connection while the preflight snapshot is open.
+                        // The old deferred transaction cannot upgrade after this WAL write.
+                        writer.execute_batch(if new_window {
+                            "INSERT INTO burn_samples (account_key, window_kind, window_start, percent, resets_at, source, observed_at) SELECT account_key, 'weekly_all', window_start, percent, '2026-08-17T21:00:00.000000000Z', 'concurrent', observed_at FROM burn_samples LIMIT 1"
+                        } else {
+                            "INSERT INTO burn_samples (account_key, window_kind, window_start, percent, resets_at, source, observed_at) SELECT account_key, window_kind, window_start, percent, resets_at, 'concurrent', observed_at FROM burn_samples LIMIT 1"
+                        }).unwrap();
+                    }));
+                });
+                let (windows, max_id) = store.pending_burn_scan().unwrap();
+                assert_eq!(windows.len(), usize::from(new_window));
+                let connection = store.open().unwrap();
+                let actual_max: i64 = connection
+                    .query_row("SELECT MAX(id) FROM burn_samples", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(max_id, actual_max);
+                let checkpoint: i64 = connection
+                    .query_row("SELECT max_id FROM burn_window_scan_state", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                if new_window {
+                    assert!(checkpoint < max_id);
+                    assert_eq!(windows[0].kind, "weekly_all");
+                    assert_eq!(
+                        store
+                            .materialize_pending_windows()
+                            .unwrap()
+                            .windows_examined,
+                        1
+                    );
+                } else {
+                    assert_eq!(checkpoint, max_id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_change_burn_scan_succeeds_while_another_writer_holds_the_slot() {
+        let dir = TestDir::new("burn-scan-read-only");
+        let store = UsageLedgerStore::new(dir.0.join("usage.db")).unwrap();
+        assert!(store.pending_burn_scan().unwrap().0.is_empty());
+        let mut connection = store.open().unwrap();
+        let _writer = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(store.pending_burn_scan().unwrap().0.is_empty());
     }
 
     #[test]
