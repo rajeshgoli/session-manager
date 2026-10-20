@@ -4558,6 +4558,116 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
 }
 
 #[tokio::test]
+async fn queue_delivery_obligation_lasts_until_delivery_and_ignores_stopped_targets() {
+    use sm_server::queue::QueueMessageMetadata;
+    use sm_server::watch_view::display_state;
+
+    let state_file = write_session_fixture();
+    let mut raw: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    let mut live = raw["sessions"][0].clone();
+    live["status"] = json!("idle");
+    let mut stopped = live.clone();
+    stopped["id"] = json!("stopped1");
+    stopped["status"] = json!("stopped");
+    let mut retired = live.clone();
+    retired["id"] = json!("retired1");
+    retired["completion_status"] = json!("retired");
+    raw["sessions"] = json!([live, stopped, retired]);
+    fs::write(&state_file, raw.to_string()).unwrap();
+    let queue_dir = state_file.with_extension("delivery-jobs");
+    create_queue_jobs_fixture_db(&queue_dir);
+    let conn = Connection::open(queue_dir.join("queue_runner.db")).unwrap();
+    conn.execute("DELETE FROM queue_jobs WHERE id != 'job-succeeded'", [])
+        .unwrap();
+    let message_path = state_file.with_extension("delivery-messages.db");
+    let queue = RetainedQueueStore::new(message_path.clone());
+    // The message's recipient wins over the job's original notify target,
+    // including after handoff. Revived jobs use a suffixed completion id.
+    for (id, target, category) in [
+        (
+            "queue-completion-job-succeeded-revived-2026-06-01",
+            "run12345",
+            "queue-completion",
+        ),
+        (
+            "queue-completion-job-succeeded",
+            "stopped1",
+            "queue-completion",
+        ),
+        (
+            "queue-completion-job-succeeded-revived-retired",
+            "retired1",
+            "queue-completion",
+        ),
+        ("unrelated", "run12345", "other"),
+    ] {
+        queue
+            .enqueue_message_once_with_metadata(
+                id,
+                target,
+                "result",
+                "sequential",
+                QueueMessageMetadata {
+                    message_category: Some(category.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+            ..Default::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_path.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_dir.display().to_string(),
+            configured: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let (status, feed) = get_json(app.clone(), "/session-obligations").await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = feed["sessions"].as_array().unwrap();
+    assert!(!entries
+        .iter()
+        .any(|entry| matches!(entry["session_id"].as_str(), Some("stopped1" | "retired1"))));
+    let entry = entries
+        .iter()
+        .find(|entry| entry["session_id"] == "run12345")
+        .unwrap();
+    assert_eq!(
+        entry["waiting_on"],
+        json!([{
+            "kind": "queue_delivery", "id": "job-succeeded",
+            "label": "Waiting on queue delivery · done tests", "since": "2026-06-01T00:02:20"
+        }])
+    );
+    assert_eq!(entry["waiting_since"], "2026-06-01T00:02:20");
+    assert_eq!(
+        display_state(&json!({"activity_state":"idle"}), Some(entry)),
+        "waiting"
+    );
+
+    queue
+        .mark_delivered("queue-completion-job-succeeded-revived-2026-06-01")
+        .unwrap();
+    let (_, feed) = get_json(app, "/session-obligations").await;
+    let entry = feed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["session_id"] == "run12345");
+    assert_eq!(
+        display_state(&json!({"activity_state":"idle"}), entry),
+        "idle"
+    );
+}
+
+#[tokio::test]
 async fn queue_job_log_reads_a_bounded_derived_tail() {
     let state_file = unique_temp_path();
     let queue_state_dir = state_file.with_extension("queue-runner-log");

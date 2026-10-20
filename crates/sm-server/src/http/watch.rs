@@ -561,6 +561,13 @@ fn agent_facts(
     let review_since = review
         .map(|item| s(item, "since"))
         .filter(|since| !since.is_empty());
+    let delivery = waiting_on
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| s(item, "kind") == "queue_delivery")
+        .min_by_key(|item| s(item, "since"));
+    let delivery_since = delivery.map(|item| s(item, "since"));
     let mut tone = Value::Null;
     let mut job_text = if running.is_empty() && pending.is_empty() {
         "No jobs".to_owned()
@@ -650,13 +657,22 @@ fn agent_facts(
             job_text.push_str(&format!(" · review {}", facts_age(since, now)));
         }
     }
+    if let Some(delivery) = delivery {
+        if running.is_empty() && pending.is_empty() && review.is_none() {
+            job_text = s(delivery, "label").to_owned();
+            tone = json!("amber");
+        } else {
+            job_text.push_str(&format!(" · {}", s(delivery, "label")));
+        }
+    }
     let background: Vec<&Value> = session["background_jobs"]
         .as_array()
         .into_iter()
         .flatten()
         .collect();
     if !background.is_empty() {
-        if running.is_empty() && pending.is_empty() && review_since.is_none() {
+        if running.is_empty() && pending.is_empty() && review_since.is_none() && delivery.is_none()
+        {
             tone = json!("background");
             job_text = match background.as_slice() {
                 [only] => format!("◷ Watching: {}", facts_cut(s(only, "command"), 40)),
@@ -737,6 +753,7 @@ fn agent_facts(
         && running.is_empty()
         && pending.is_empty()
         && review.is_none()
+        && delivery.is_none()
         && has_claim
         && activity_since
             .is_some_and(|at| old_enough(at, now, i64::from(config.board.stall_minutes)));
@@ -778,13 +795,14 @@ fn agent_facts(
         ("moving", Value::Null, inverse_time(latest))
     } else if let Some(note) = note {
         ("waiting", json!("note"), note.at.clone())
-    } else if !pending.is_empty() || review.is_some() {
+    } else if !pending.is_empty() || review.is_some() || delivery.is_some() {
         (
             "waiting",
             Value::Null,
             oldest_wait
                 .into_iter()
                 .chain(review_since)
+                .chain(delivery_since)
                 .min()
                 .unwrap_or("")
                 .to_owned(),
@@ -1238,6 +1256,35 @@ fn attach_html(v: &Value) -> String {
 #[cfg(test)]
 mod facts_tests {
     use super::*;
+
+    #[test]
+    fn queue_delivery_labels_the_web_summary_and_prevents_a_false_stall() {
+        let config = AppConfig::default();
+        let context = FactContext {
+            messages: &BTreeMap::new(),
+            finished: &BTreeMap::new(),
+            notes: &BTreeMap::new(),
+            config: &config,
+            now: OffsetDateTime::parse("2026-09-30T19:47:00Z", &Rfc3339).unwrap(),
+        };
+        let session = json!({"status":"idle", "activity_state":"idle", "last_activity":"2026-09-30T10:00:00Z"});
+        let wait = json!([{"kind":"queue_delivery", "label":"Waiting on queue delivery · tests", "since":"2026-09-30T19:46:00Z"}]);
+        let claims = json!([{"kind":"ticket"}]);
+        let (facts, group) = agent_facts(
+            &session,
+            &wait,
+            &claims,
+            &[],
+            Some("2026-09-30T10:00:00Z"),
+            &context,
+        );
+        assert_eq!(facts["jobs"]["text"], "Waiting on queue delivery · tests");
+        assert_eq!(facts["jobs"]["tone"], "amber");
+        assert_eq!(group["section"], "waiting");
+        let (facts, group) = agent_facts(&session, &json!([]), &json!([]), &[], None, &context);
+        assert_eq!(facts["jobs"]["text"], "No jobs");
+        assert_eq!(group["section"], "idle");
+    }
 
     #[test]
     fn attention_examples_keep_agent_jobs_and_owner_question_separate() {

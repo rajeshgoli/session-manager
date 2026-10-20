@@ -729,6 +729,15 @@ fn full_screen_tail_uses_height_and_scroll_follow_survives_resize() {
 }
 
 #[test]
+fn queue_delivery_label_is_visible_even_when_the_job_is_in_history() {
+    let obligation = json!({"waiting_on":[{"kind":"queue_delivery", "id":"j", "label":"Waiting on queue delivery · unit tests", "since":"2026-09-10T10:00:00Z"}]});
+    let jobs = vec![job("j", "a", "succeeded")];
+    let lines = obligation_context(&obligation, &jobs, "a", false, 0);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("Waiting on queue delivery · unit tests"));
+}
+
+#[test]
 fn obligations_do_not_repeat_visible_jobs_but_preserve_other_results() {
     let jobs = vec![job("j", "a", "running")];
     let single = json!({"waiting_on":[{"kind":"queue_job", "id":"j", "label":"unit tests", "since":"2026-09-10T10:00:00Z"}]});
