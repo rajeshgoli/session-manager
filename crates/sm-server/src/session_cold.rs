@@ -671,14 +671,30 @@ mod tests {
 
     #[test]
     fn cold_reserved_hot_filename_is_rejected_before_any_mutation() {
+        for filename in [
+            "sessions.cold.json",
+            "Sessions.Cold.Json",
+            "SESSIONS.COLD.JSON",
+        ] {
+            for exists in [false, true] {
+                assert_reserved_hot_filename_rejected(filename, exists);
+            }
+        }
+    }
+
+    fn assert_reserved_hot_filename_rejected(filename: &str, exists: bool) {
         let (store, raw) = fixture("path-collision");
         let dir = store.state_file.parent().unwrap();
-        let reserved = dir.join("sessions.cold.json");
+        let reserved = dir.join(filename);
         let original = raw.to_string();
-        fs::write(&reserved, &original).unwrap();
+        if exists {
+            fs::write(&reserved, &original).unwrap();
+        }
         let alias = dir.join("alias.json");
-        std::os::unix::fs::symlink(&reserved, &alias).unwrap();
-        for path in [&reserved, &alias] {
+        std::os::unix::fs::symlink(filename, &alias).unwrap();
+        let chained_alias = dir.join("chained-alias.json");
+        std::os::unix::fs::symlink(&alias, &chained_alias).unwrap();
+        for path in [&reserved, &alias, &chained_alias] {
             let bad = SessionStore::new(path.clone());
             assert!(bad
                 .list_sessions(true)
@@ -695,7 +711,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("reserved"));
-            assert_eq!(fs::read_to_string(&reserved).unwrap(), original);
+            if exists {
+                assert_eq!(fs::read_to_string(&reserved).unwrap(), original);
+            } else {
+                assert!(!reserved.exists());
+                assert!(!dir.join("sessions.cold.json").exists());
+            }
+            assert_eq!(fs::read_link(&alias).unwrap(), PathBuf::from(filename));
+            assert_eq!(fs::read_link(&chained_alias).unwrap(), alias);
+            assert_eq!(
+                fs::read_to_string(&store.state_file).unwrap(),
+                serde_json::to_string_pretty(&raw).unwrap()
+            );
             let config = dir.join("invalid.yaml");
             fs::write(
                 &config,

@@ -149,12 +149,24 @@ fn canonical_state_path(path: &Path) -> PathBuf {
 
 /// The sidecar filename is reserved even when the hot path is a symlink.
 pub(crate) fn validate_session_state_path(path: &Path) -> Result<()> {
-    let resolved = canonical_state_path(path);
-    anyhow::ensure!(
-        resolved.file_name() != Some(std::ffi::OsStr::new("sessions.cold.json")),
-        "paths.state_file must not resolve to sessions.cold.json; that filename is reserved for the cold segment"
-    );
-    Ok(())
+    let mut resolved = canonical_state_path(path);
+    for _ in 0..40 {
+        // Reserve ASCII case variants on every filesystem, including before the
+        // file exists, so hot and cold formats cannot alias on insensitive volumes.
+        anyhow::ensure!(
+            !resolved.file_name().is_some_and(|name| name
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(b"sessions.cold.json")),
+            "paths.state_file must not resolve to sessions.cold.json (case-insensitive); that filename is reserved for the cold segment"
+        );
+        // canonicalize cannot follow a dangling symlink. Inspect its target too
+        // before a write can replace the link or create either state file.
+        let Ok(target) = fs::read_link(&resolved) else {
+            return Ok(());
+        };
+        resolved = canonical_state_path(&resolved.parent().unwrap_or(Path::new("/")).join(target));
+    }
+    anyhow::bail!("paths.state_file has too many symbolic links")
 }
 
 fn shared_session_state(path: &Path) -> Arc<SharedSessionState> {
