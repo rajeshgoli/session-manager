@@ -399,17 +399,16 @@ impl SessionStore {
         };
         let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf())
             .claims_for_session(id, true)?;
-        if let Some(worktree) = claims
+        // Plain `sm ticket` in a main checkout records that checkout as the claim's path.
+        let work_dir = claims
             .into_iter()
             .rev()
             .filter_map(|view| view.claim.worktree_path)
             .map(|path| expand_home(&path))
             .find(|path| path.is_absolute() && path.is_dir())
-        {
-            return Ok((worktree.clone(), worktree));
-        }
-        if !is_main_checkout(&spawn_dir) {
-            return Ok((spawn_dir.clone(), spawn_dir));
+            .unwrap_or(spawn_dir);
+        if !is_main_checkout(&work_dir) {
+            return Ok((work_dir.clone(), work_dir));
         }
         let state_dir = queue
             .db_path()
@@ -417,7 +416,7 @@ impl SessionStore {
             .unwrap_or(Path::new("/"))
             .join("handoffs")
             .join(id);
-        Ok((spawn_dir, state_dir))
+        Ok((work_dir, state_dir))
     }
     pub fn handoff_draft(&self, id: &str) -> Result<Value> {
         let _guard = self.write_guard()?;
@@ -1512,12 +1511,25 @@ mod tests {
         // The agent's PR merged, so its claim ended and sm deleted the worktree.
         let draft = store.handoff_draft("agent001").unwrap();
         let path = root.join("handoffs/agent001/.sm/handoff.md");
-        assert_eq!(draft["path"], json!(path));
+        assert_eq!(draft["path"], json!(&path));
         assert!(draft["text"]
             .as_str()
             .unwrap()
             .contains(&format!("Working directory: {}", root.display())));
         assert!(!root.join(".sm").exists());
+        // A plain `sm ticket` claim records the main checkout itself; still not there.
+        store.remove_handoff_draft_record("agent001").unwrap();
+        Connection::open(root.join("messages.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO work_claims(id,repo,number,kind,session_id,source,worktree_path,claimed_at) VALUES('c1','o/r',7,'ticket','agent001','explicit',?1,'2026-10-19T01:00:00Z')",
+                params![root.display().to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.handoff_draft("agent001").unwrap()["path"],
+            json!(path)
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
