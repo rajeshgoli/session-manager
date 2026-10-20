@@ -5570,6 +5570,16 @@ impl SessionStore {
         let Some(queue) = &self.queue_store else {
             return Ok(false);
         };
+        // Reparent notices have a dedicated reconciler that releases the
+        // registry guard before tmux I/O. Leave its head row (and everything
+        // behind it) alone, including avoiding a readiness probe under this lock.
+        if queue
+            .pending_messages_for_target(session_id, 1)?
+            .first()
+            .is_some_and(|message| message.message_category.as_deref() == Some("reparent"))
+        {
+            return Ok(false);
+        }
         if !runtime_session_accepts_background_delivery_raw(&mut state, session_id, runtime)? {
             return Ok(false);
         }
@@ -12312,6 +12322,13 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
+            if require_ready_fence && message.message_category.as_deref() == Some("reparent") {
+                // A preceding ordinary message may have drained in this pass.
+                // Stop here so only the unlocked reparent reconciler sends this
+                // row, and later ordinary messages cannot overtake it.
+                should_continue = false;
+                break;
+            }
             let control_predecessor = require_ready_fence
                 && (message.message_category.as_deref() == Some("native_rename")
                     || normalized_delivery_mode(&message.delivery_mode) == "urgent");
@@ -21574,6 +21591,70 @@ sleep 30
                 .unwrap()
                 .is_empty());
             assert_eq!(ready.wait_for_input_lines(1), vec!["[sm review] landed"]);
+            let _ = fs::remove_file(state_file);
+            let _ = fs::remove_file(queue_db);
+        }
+    }
+
+    #[test]
+    fn background_retry_leaves_reparent_for_its_unlocked_reconciler() {
+        for with_preceding_message in [false, true] {
+            let pane = queue_completion_test_pane(true);
+            let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
+            let messages = if with_preceding_message {
+                vec![
+                    ("before", None),
+                    ("reparent", Some("reparent")),
+                    ("after", None),
+                ]
+            } else {
+                vec![("reparent", Some("reparent")), ("after", None)]
+            };
+            for (text, category) in messages {
+                queue
+                    .enqueue_message_once_with_metadata(
+                        text,
+                        "queue-target",
+                        text,
+                        "sequential",
+                        QueueMessageMetadata {
+                            message_category: category.map(str::to_owned),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            store.drain_runtime_background_retry_messages().unwrap();
+            assert_eq!(
+                queue
+                    .pending_messages_for_target("queue-target", 10)
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["reparent", "after"]
+            );
+            if with_preceding_message {
+                assert_eq!(pane.wait_for_input_lines(1), vec!["before"]);
+            } else {
+                assert!(pane.input_lines().is_empty());
+            }
+            // The existing specialized reconciler owns reparent delivery. The
+            // generic sweep resumes behind it without requiring another enqueue.
+            store.reconcile_reparent_notifications().unwrap();
+            store.drain_runtime_background_retry_messages().unwrap();
+            assert!(queue
+                .pending_messages_for_target("queue-target", 10)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                pane.wait_for_input_lines(if with_preceding_message { 3 } else { 2 }),
+                if with_preceding_message {
+                    vec!["before", "reparent", "after"]
+                } else {
+                    vec!["reparent", "after"]
+                }
+            );
             let _ = fs::remove_file(state_file);
             let _ = fs::remove_file(queue_db);
         }
