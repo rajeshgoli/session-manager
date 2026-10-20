@@ -518,6 +518,9 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS owner_doc_reviews_doc ON owner_doc_reviews(doc_id, submitted_at)"
+    )?;
     // Columns added after the table first shipped (sm#1580).
     for column in ["checkout_root", "review_dismissed_at"] {
         let present = conn
@@ -939,6 +942,31 @@ impl OwnerDocStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Read all requested docs in one query, preserving each doc's row order.
+    pub fn publishes_for(
+        &self,
+        doc_ids: &[String],
+    ) -> Result<BTreeMap<String, Vec<OwnerDocPublish>>> {
+        let mut result = BTreeMap::<String, Vec<OwnerDocPublish>>::new();
+        if doc_ids.is_empty() {
+            return Ok(result);
+        }
+        let Some(conn) = self.open_read()? else {
+            return Ok(result);
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {PUBLISH_COLUMNS} FROM owner_doc_publishes
+             WHERE doc_id IN (SELECT value FROM json_each(?1)) ORDER BY doc_id, id"
+        ))?;
+        for row in
+            statement.query_map(params![serde_json::to_string(doc_ids)?], publish_from_row)?
+        {
+            let row = row?;
+            result.entry(row.doc_id.clone()).or_default().push(row);
+        }
+        Ok(result)
     }
 
     pub fn publishes(&self, doc_id: &str) -> Result<Vec<OwnerDocPublish>> {
@@ -1392,6 +1420,26 @@ impl OwnerDocStore {
     }
 
     /// The doc's review submissions, oldest first.
+    /// Read all requested docs in one query, preserving each doc's row order.
+    pub fn reviews_for(&self, doc_ids: &[String]) -> Result<BTreeMap<String, Vec<OwnerDocReview>>> {
+        let mut result = BTreeMap::<String, Vec<OwnerDocReview>>::new();
+        if doc_ids.is_empty() {
+            return Ok(result);
+        }
+        let Some(conn) = self.open_read()? else {
+            return Ok(result);
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
+             WHERE doc_id IN (SELECT value FROM json_each(?1)) ORDER BY doc_id, submitted_at, rowid"
+        ))?;
+        for row in statement.query_map(params![serde_json::to_string(doc_ids)?], review_from_row)? {
+            let row = row?;
+            result.entry(row.doc_id.clone()).or_default().push(row);
+        }
+        Ok(result)
+    }
+
     pub fn reviews(&self, doc_id: &str) -> Result<Vec<OwnerDocReview>> {
         let Some(conn) = self.open_read()? else {
             return Ok(Vec::new());

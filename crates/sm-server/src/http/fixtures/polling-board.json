@@ -1,0 +1,1388 @@
+{
+  "auto_start_paused": false,
+  "generated_at": "<request time>",
+  "lanes": [
+    {
+      "added_at": "2100-01-01T00:00:00Z",
+      "added_by_name": "Fixture",
+      "changes": [],
+      "counts": {
+        "blocked": 0,
+        "close_ready": 0,
+        "done": 0,
+        "in_progress": 0,
+        "needs_you": 1,
+        "ready": 0
+      },
+      "cycles": [],
+      "goal": {
+        "number": 1,
+        "repo": "acme/widgets",
+        "state": "needs_you",
+        "sub_issues": {
+          "done": 0,
+          "total": 0
+        },
+        "title": "Polling",
+        "url": "https://example.test/1"
+      },
+      "handoff": null,
+      "id": 1,
+      "launch_default": {
+        "config": null,
+        "lane_id": 1,
+        "revision": 0
+      },
+      "longest_chain": [
+        {
+          "number": 1,
+          "repo": "acme/widgets"
+        }
+      ],
+      "rank": 1,
+      "review_policy": null,
+      "stale": false,
+      "tickets": [
+        {
+          "also_in": [],
+          "auto_start": null,
+          "chain": 1,
+          "clock": {
+            "ball": "you",
+            "segments": [],
+            "since": "2100-01-01T00:00:00Z",
+            "text": "Waiting on you 0m: Choose a direction"
+          },
+          "closed_at": null,
+          "docs": [
+            {
+              "reader_path": "/docs/widgets/docs/memo-000.html?version=bbbbbbbbbbbb",
+              "state": "review_requested",
+              "title": "Memo 000"
+            },
+            {
+              "reader_path": "/docs/widgets/docs/memo-001.html?version=bbbbbbbbbbbb",
+              "state": "review_requested",
+              "title": "Memo 001"
+            },
+            {
+              "reader_path": "/docs/widgets/docs/memo-002.html?version=bbbbbbbbbbbb",
+              "state": "review_requested",
+              "title": "Memo 002"
+            }
+          ],
+          "done_reason": null,
+          "holder": {
+            "name": "poll-author",
+            "provider": "claude",
+            "session_id": "poll-author",
+            "since": "2100-01-01T00:00:00Z",
+            "state": "idle"
+          },
+          "jobs": [
+            {
+              "id": "job-poll-waiting",
+              "label": "job-poll-waiting",
+              "quiet_since": null,
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting",
+              "type": "tests"
+            },
+            {
+              "id": "job-poll-running",
+              "label": "job-poll-running",
+              "quiet_since": null,
+              "since": "2100-01-01T00:00:00Z",
+              "state": "running",
+              "type": "tests"
+            }
+          ],
+          "launch_preference": null,
+          "needs_you": {
+            "kind": "message",
+            "text": "Choose a direction",
+            "url": "/messages/message-poll"
+          },
+          "new": false,
+          "not_before": null,
+          "number": 1,
+          "on_longest_chain": true,
+          "prs": [
+            {
+              "number": 7,
+              "repo": "acme/widgets",
+              "review": {
+                "by": "codex",
+                "round": 1,
+                "verdict": null,
+                "verdict_at": null,
+                "waiting_since": "2100-01-01T00:00:00Z"
+              },
+              "state": "OPEN",
+              "url": "https://example.test/pr/7"
+            }
+          ],
+          "repo": "acme/widgets",
+          "review": {
+            "reviewer_label": null,
+            "since": "2100-01-01T00:00:00Z",
+            "state": "waiting"
+          },
+          "review_policy": null,
+          "reviews": [
+            {
+              "by": "agent",
+              "id": "active-review",
+              "number": 7,
+              "reviewer_label": null,
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-000",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-001",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-002",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-003",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-004",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-005",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-006",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-007",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-008",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-009",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-010",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-011",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-012",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-013",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-014",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-015",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-016",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-017",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-018",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-019",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-020",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-021",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-022",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-023",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-024",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-025",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-026",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-027",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-028",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-029",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-030",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-031",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-032",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-033",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-034",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-035",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-036",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-037",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-038",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-039",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-040",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-041",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-042",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-043",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-044",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-045",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-046",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-047",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-048",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-049",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-050",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-051",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-052",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-053",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-054",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-055",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-056",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-057",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-058",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-059",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-060",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-061",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-062",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-063",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-064",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-065",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-066",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-067",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-068",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-069",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-070",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-071",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-072",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-073",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-074",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-075",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-076",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-077",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-078",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-079",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-080",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-081",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-082",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-083",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-084",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-085",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-086",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-087",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-088",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-089",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-090",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-091",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-092",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-093",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-094",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-095",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-096",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-097",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-098",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-099",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-100",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-101",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-102",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-103",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-104",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-105",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-106",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-107",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-108",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-109",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-110",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-111",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-112",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-113",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-114",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-115",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-116",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-117",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-118",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-119",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-120",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-121",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-122",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-123",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-124",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-125",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-126",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-127",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-128",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-129",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-130",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-131",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-132",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-133",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-134",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-135",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-136",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-137",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-138",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-139",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-140",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-141",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-142",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-143",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-144",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-145",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-146",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-147",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-148",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            },
+            {
+              "by": "you",
+              "id": "owner:doc-poll-149",
+              "number": 7,
+              "reviewer_label": "Your review",
+              "since": "2100-01-01T00:00:00Z",
+              "state": "waiting"
+            }
+          ],
+          "started_early": false,
+          "state": "needs_you",
+          "sub_issues": {
+            "done": 0,
+            "total": 0
+          },
+          "sub_issues_done": false,
+          "thread": {
+            "at": "message-poll",
+            "count": 1,
+            "key": "agent:poll-author",
+            "needs_you": true
+          },
+          "tier": null,
+          "title": "Polling",
+          "url": "https://example.test/1",
+          "waiting_until": null,
+          "waits_on": [],
+          "warnings": []
+        }
+      ],
+      "unseen": false
+    }
+  ],
+  "other": [
+    {
+      "repo": "acme/widgets",
+      "tickets": []
+    }
+  ],
+  "repos": [
+    {
+      "error": null,
+      "last_ok_at": null,
+      "repo": "acme/widgets",
+      "stale": false
+    }
+  ],
+  "start_defaults": {
+    "model": null,
+    "provider": "claude"
+  },
+  "unseen": {
+    "count": 0,
+    "lane_ids": []
+  }
+}

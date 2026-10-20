@@ -782,8 +782,17 @@ pub(super) fn start_sweeper(state: Arc<AppState>) {
 /// keyed by session id.
 pub(super) fn session_fields(state: &AppState) -> Result<BTreeMap<String, Value>> {
     let db = expand_home(&state.config.sm_send.db_path);
-    let mut fields: BTreeMap<String, Value> = BTreeMap::new();
     let active = RetainedQueueStore::list_active_codex_review_requests_from_path(&db)?;
+    session_fields_with_requests(state, &active)
+}
+
+pub(super) fn session_fields_with_requests(
+    state: &AppState,
+    requests: &[CodexReviewRequestRegistration],
+) -> Result<BTreeMap<String, Value>> {
+    let db = expand_home(&state.config.sm_send.db_path);
+    let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+    let active: Vec<_> = requests.iter().filter(|r| r.is_active).collect();
     for r in &active {
         let author = r
             .requester_session_id

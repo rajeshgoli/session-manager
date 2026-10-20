@@ -2831,119 +2831,135 @@ async fn tmux_client_hook(
     Ok(Json(response))
 }
 
+async fn blocking_http<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let caller = crate::local_identity::current();
+    tokio::task::spawn_blocking(move || crate::local_identity::sync_scope(caller, work))
+        .await
+        .map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!("HTTP blocking task failed: {error}"))
+        })?
+}
+
 async fn claude_hook(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
-    let Some(session_id) = hook_session_id(&payload) else {
-        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
-    };
-    let is_local_hook = is_local_bypass_request(&headers, Some(peer_addr), &state.config);
-    verify_hook_auth_or_secret(
-        &state,
-        &headers,
-        Some(peer_addr),
-        &session_id,
-        "/hooks/claude",
-    )?;
-
-    let hook_event = payload
-        .get("hook_event_name")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    // Stamped by the hook script before it detached its curl, so it describes when
-    // the event happened rather than when it reached us.
-    let emitted_at = hook_emitted_at(&payload);
-    if hook_event == "UserPromptSubmit" {
-        state
-            .session_store
-            .apply_claude_user_prompt_submit_hook(&session_id, emitted_at)?;
-        if let Some(prompt) = payload
-            .get("prompt")
-            .and_then(Value::as_str)
-            .filter(|prompt| crate::owner_messages::is_owner_typed_prompt(prompt, false))
-        {
-            let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
-            if queue
-                .recently_delivered_prompt(&session_id, prompt)
-                .is_ok_and(|delivered| {
-                    crate::owner_messages::is_owner_typed_prompt(prompt, delivered)
-                })
-            {
-                crate::owner_events::record_agent_prompt(
-                    &expand_home(&state.config.sm_send.db_path),
-                    &session_id,
-                );
-                let _ = messages::owner_answered(&state, &session_id, "claude_prompt");
-            }
-        }
-    }
-    if hook_event == "Stop" {
-        // Stamped before the transcript retry sleep below, so a turn-start that
-        // lands during that wait is recognised as the newer signal.
-        let received_at = now_rfc3339();
-        // Claude's own `last_assistant_message` is the turn's final text from
-        // memory. The transcript can still hold the previous turn's message
-        // when a short turn ends before Claude flushes it (sm#1863).
-        let mut last_message = ["last_assistant_message", "sm_last_message"]
-            .into_iter()
-            .filter_map(|key| payload.get(key).and_then(Value::as_str))
-            .map(str::trim)
-            .find(|value| !value.is_empty());
-        let mut native_title = payload
-            .get("sm_native_title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let mut native_title_mtime_ns = payload_i64(payload.get("sm_transcript_mtime_ns"));
-        let transcript_path = payload
-            .get("transcript_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let transcript_metadata = if is_local_hook
-            && transcript_path.is_some()
-            && (last_message.is_none() || native_title.is_none() || native_title_mtime_ns.is_none())
-        {
-            let first_read = transcript_path.and_then(read_claude_transcript_metadata);
-            if should_retry_local_stop_transcript_read(first_read.as_ref()) {
-                sleep(Duration::from_millis(500)).await;
-                let second_read = transcript_path.and_then(read_claude_transcript_metadata);
-                choose_newer_transcript_metadata(first_read, second_read)
-            } else {
-                first_read
-            }
-        } else {
-            None
+    blocking_http(move || {
+        let Some(session_id) = hook_session_id(&payload) else {
+            return Ok(Json(json!({ "status": "unknown_session" })).into_response());
         };
-        if let Some(metadata) = transcript_metadata.as_ref() {
-            if last_message.is_none() {
-                last_message = metadata.last_message.as_deref();
-            }
-            if native_title.is_none() {
-                native_title = metadata.native_title.as_deref();
-            }
-            if native_title_mtime_ns.is_none() {
-                native_title_mtime_ns = metadata.mtime_ns;
-            }
-        }
-        let stop_applied = state.session_store.apply_claude_stop_hook(
+        let is_local_hook = is_local_bypass_request(&headers, Some(peer_addr), &state.config);
+        verify_hook_auth_or_secret(
+            &state,
+            &headers,
+            Some(peer_addr),
             &session_id,
-            last_message,
-            native_title,
-            native_title_mtime_ns,
-            transcript_path,
-            Some(&received_at),
-            emitted_at,
+            "/hooks/claude",
         )?;
-        if stop_applied {
-            handoff::kick_handoff(state.clone(), session_id.clone());
-        }
-    }
 
-    Ok(Json(json!({ "status": "ok" })).into_response())
+        let hook_event = payload
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        // Stamped by the hook script before it detached its curl, so it describes when
+        // the event happened rather than when it reached us.
+        let emitted_at = hook_emitted_at(&payload);
+        if hook_event == "UserPromptSubmit" {
+            state
+                .session_store
+                .apply_claude_user_prompt_submit_hook(&session_id, emitted_at)?;
+            if let Some(prompt) = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|prompt| crate::owner_messages::is_owner_typed_prompt(prompt, false))
+            {
+                let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+                if queue
+                    .recently_delivered_prompt(&session_id, prompt)
+                    .is_ok_and(|delivered| {
+                        crate::owner_messages::is_owner_typed_prompt(prompt, delivered)
+                    })
+                {
+                    crate::owner_events::record_agent_prompt(
+                        &expand_home(&state.config.sm_send.db_path),
+                        &session_id,
+                    );
+                    let _ = messages::owner_answered(&state, &session_id, "claude_prompt");
+                }
+            }
+        }
+        if hook_event == "Stop" {
+            // Stamped before the transcript retry sleep below, so a turn-start that
+            // lands during that wait is recognised as the newer signal.
+            let received_at = now_rfc3339();
+            // Claude's own `last_assistant_message` is the turn's final text from
+            // memory. The transcript can still hold the previous turn's message
+            // when a short turn ends before Claude flushes it (sm#1863).
+            let mut last_message = ["last_assistant_message", "sm_last_message"]
+                .into_iter()
+                .filter_map(|key| payload.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .find(|value| !value.is_empty());
+            let mut native_title = payload
+                .get("sm_native_title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let mut native_title_mtime_ns = payload_i64(payload.get("sm_transcript_mtime_ns"));
+            let transcript_path = payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let transcript_metadata = if is_local_hook
+                && transcript_path.is_some()
+                && (last_message.is_none()
+                    || native_title.is_none()
+                    || native_title_mtime_ns.is_none())
+            {
+                let first_read = transcript_path.and_then(read_claude_transcript_metadata);
+                if should_retry_local_stop_transcript_read(first_read.as_ref()) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let second_read = transcript_path.and_then(read_claude_transcript_metadata);
+                    choose_newer_transcript_metadata(first_read, second_read)
+                } else {
+                    first_read
+                }
+            } else {
+                None
+            };
+            if let Some(metadata) = transcript_metadata.as_ref() {
+                if last_message.is_none() {
+                    last_message = metadata.last_message.as_deref();
+                }
+                if native_title.is_none() {
+                    native_title = metadata.native_title.as_deref();
+                }
+                if native_title_mtime_ns.is_none() {
+                    native_title_mtime_ns = metadata.mtime_ns;
+                }
+            }
+            let stop_applied = state.session_store.apply_claude_stop_hook(
+                &session_id,
+                last_message,
+                native_title,
+                native_title_mtime_ns,
+                transcript_path,
+                Some(&received_at),
+                emitted_at,
+            )?;
+            if stop_applied {
+                handoff::kick_handoff(state.clone(), session_id.clone());
+            }
+        }
+
+        Ok(Json(json!({ "status": "ok" })).into_response())
+    })
+    .await
 }
 
 /// Emission stamp taken by `hooks/notify_server.sh` before it detached the curl
@@ -2999,110 +3015,113 @@ async fn context_usage_hook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    // The migration contract for this route is "decodes JSON or returns 204"
-    // (specs/762_stage2_artifacts/route_auth_matrix.md:144). Taking the raw body
-    // rather than `Json<Value>` keeps that promise: the extractor would reject an
-    // empty or truncated body with a client error before the handler ran.
-    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
-        return Ok(StatusCode::NO_CONTENT.into_response());
-    };
-    let Some(session_id) = context_usage_session_id(&payload) else {
-        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
-    };
-    verify_hook_auth_or_secret(
-        &state,
-        &headers,
-        Some(peer_addr),
-        &session_id,
-        "/hooks/context-usage",
-    )?;
+    blocking_http(move || {
+        // The migration contract for this route is "decodes JSON or returns 204"
+        // (specs/762_stage2_artifacts/route_auth_matrix.md:144). Taking the raw body
+        // rather than `Json<Value>` keeps that promise: the extractor would reject an
+        // empty or truncated body with a client error before the handler ran.
+        let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        };
+        let Some(session_id) = context_usage_session_id(&payload) else {
+            return Ok(Json(json!({ "status": "unknown_session" })).into_response());
+        };
+        verify_hook_auth_or_secret(
+            &state,
+            &headers,
+            Some(peer_addr),
+            &session_id,
+            "/hooks/context-usage",
+        )?;
 
-    let rate_limits = payload.get("rate_limits").and_then(Value::as_object);
-    let five_hour = rate_limits
-        .and_then(|limits| limits.get("five_hour"))
-        .and_then(Value::as_object);
-    let seven_day = rate_limits
-        .and_then(|limits| limits.get("seven_day"))
-        .and_then(Value::as_object);
-    let (five_hour_resets_at, five_hour_reset_invalid) =
-        rate_limit_reset_at(&payload, five_hour, "five_hour_resets_at");
-    let (seven_day_resets_at, seven_day_reset_invalid) =
-        rate_limit_reset_at(&payload, seven_day, "seven_day_resets_at");
-    let event = ContextUsageEvent {
-        session_id,
-        event: payload
-            .get("event")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned),
-        used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
-        total_input_tokens: payload_i64(payload.get("total_input_tokens")),
-        context_window_tokens: payload_i64(payload.get("context_window_tokens")),
-        model_id: payload
-            .get("model_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        five_hour_percent: five_hour
-            .and_then(|window| window.get("used_percentage"))
-            .and_then(Value::as_f64)
-            .or_else(|| payload.get("five_hour_percent").and_then(Value::as_f64)),
-        five_hour_resets_at,
-        seven_day_percent: seven_day
-            .and_then(|window| window.get("used_percentage"))
-            .and_then(Value::as_f64)
-            .or_else(|| payload.get("seven_day_percent").and_then(Value::as_f64)),
-        seven_day_resets_at,
-        emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
-    };
+        let rate_limits = payload.get("rate_limits").and_then(Value::as_object);
+        let five_hour = rate_limits
+            .and_then(|limits| limits.get("five_hour"))
+            .and_then(Value::as_object);
+        let seven_day = rate_limits
+            .and_then(|limits| limits.get("seven_day"))
+            .and_then(Value::as_object);
+        let (five_hour_resets_at, five_hour_reset_invalid) =
+            rate_limit_reset_at(&payload, five_hour, "five_hour_resets_at");
+        let (seven_day_resets_at, seven_day_reset_invalid) =
+            rate_limit_reset_at(&payload, seven_day, "seven_day_resets_at");
+        let event = ContextUsageEvent {
+            session_id,
+            event: payload
+                .get("event")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
+            total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+            context_window_tokens: payload_i64(payload.get("context_window_tokens")),
+            model_id: payload
+                .get("model_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            five_hour_percent: five_hour
+                .and_then(|window| window.get("used_percentage"))
+                .and_then(Value::as_f64)
+                .or_else(|| payload.get("five_hour_percent").and_then(Value::as_f64)),
+            five_hour_resets_at,
+            seven_day_percent: seven_day
+                .and_then(|window| window.get("used_percentage"))
+                .and_then(Value::as_f64)
+                .or_else(|| payload.get("seven_day_percent").and_then(Value::as_f64)),
+            seven_day_resets_at,
+            emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
+        };
 
-    let runtime = state
-        .config
-        .rust_core
-        .runtime_enabled
-        .then(|| TmuxRuntime::from_app_config(&state.config));
-    let outcome = state
-        .session_store
-        .apply_context_usage_event(&event, runtime.as_ref())?;
-    if !matches!(outcome, ContextUsageOutcome::UnknownSession) {
-        if let Err(error) = state.session_store.record_claude_statusline_burn(&event) {
-            eprintln!("Claude status-line burn ingest failed: {error:#}");
+        let runtime = state
+            .config
+            .rust_core
+            .runtime_enabled
+            .then(|| TmuxRuntime::from_app_config(&state.config));
+        let outcome = state
+            .session_store
+            .apply_context_usage_event(&event, runtime.as_ref())?;
+        if !matches!(outcome, ContextUsageOutcome::UnknownSession) {
+            if let Err(error) = state.session_store.record_claude_statusline_burn(&event) {
+                eprintln!("Claude status-line burn ingest failed: {error:#}");
+            }
         }
-    }
 
-    let mut body = json!({ "status": outcome.status() });
-    let mut warnings = Vec::new();
-    if five_hour_reset_invalid {
-        warnings.push("five_hour.resets_at is not a valid RFC3339 string or Unix epoch second");
-    }
-    if seven_day_reset_invalid {
-        warnings.push("seven_day.resets_at is not a valid RFC3339 string or Unix epoch second");
-    }
-    if !warnings.is_empty() {
-        eprintln!(
-            "Claude status-line quota window rejected for {}: {}",
-            event.session_id,
-            warnings.join("; ")
-        );
-        body["warnings"] = json!(warnings);
-    }
-    match &outcome {
-        ContextUsageOutcome::Recorded { used_percentage } => {
-            body["used_percentage"] = json!(used_percentage);
+        let mut body = json!({ "status": outcome.status() });
+        let mut warnings = Vec::new();
+        if five_hour_reset_invalid {
+            warnings.push("five_hour.resets_at is not a valid RFC3339 string or Unix epoch second");
         }
-        ContextUsageOutcome::NoUsage => {
-            body["used_percentage"] = Value::Null;
+        if seven_day_reset_invalid {
+            warnings.push("seven_day.resets_at is not a valid RFC3339 string or Unix epoch second");
         }
-        // Answered here so the recovery hook does not need a second read that a
-        // remote node could not authenticate.
-        ContextUsageOutcome::CompactionCompleteLogged { last_handoff_path } => {
-            body["last_handoff_path"] = last_handoff_path
-                .as_deref()
-                .map_or(Value::Null, |path| Value::String(path.to_owned()));
+        if !warnings.is_empty() {
+            eprintln!(
+                "Claude status-line quota window rejected for {}: {}",
+                event.session_id,
+                warnings.join("; ")
+            );
+            body["warnings"] = json!(warnings);
         }
-        _ => {}
-    }
-    Ok(Json(body).into_response())
+        match &outcome {
+            ContextUsageOutcome::Recorded { used_percentage } => {
+                body["used_percentage"] = json!(used_percentage);
+            }
+            ContextUsageOutcome::NoUsage => {
+                body["used_percentage"] = Value::Null;
+            }
+            // Answered here so the recovery hook does not need a second read that a
+            // remote node could not authenticate.
+            ContextUsageOutcome::CompactionCompleteLogged { last_handoff_path } => {
+                body["last_handoff_path"] = last_handoff_path
+                    .as_deref()
+                    .map_or(Value::Null, |path| Value::String(path.to_owned()));
+            }
+            _ => {}
+        }
+        Ok(Json(body).into_response())
+    })
+    .await
 }
 
 /// The producer hooks post the sm session id as `session_id`, unlike the Claude
@@ -3125,74 +3144,77 @@ async fn tool_use_hook(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Response, ApiError> {
-    let Some(session_id) = hook_session_id(&payload) else {
-        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
-    };
-    verify_hook_auth_or_secret(
-        &state,
-        &headers,
-        Some(peer_addr),
-        &session_id,
-        "/hooks/tool-use",
-    )?;
+    blocking_http(move || {
+        let Some(session_id) = hook_session_id(&payload) else {
+            return Ok(Json(json!({ "status": "unknown_session" })).into_response());
+        };
+        verify_hook_auth_or_secret(
+            &state,
+            &headers,
+            Some(peer_addr),
+            &session_id,
+            "/hooks/tool-use",
+        )?;
 
-    let hook_type = payload
-        .get("hook_event_name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
-    let tool_name = payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(hook_type);
-    let session = state.session_store.get_session(&session_id)?;
-    if hook_type == "PreToolUse" {
-        state
-            .session_store
-            .apply_claude_pre_tool_use_hook(&session_id, Some(tool_name))?;
-    }
+        let hook_type = payload
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let tool_name = payload
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(hook_type);
+        let session = state.session_store.get_session(&session_id)?;
+        if hook_type == "PreToolUse" {
+            state
+                .session_store
+                .apply_claude_pre_tool_use_hook(&session_id, Some(tool_name))?;
+        }
 
-    let db_path = expand_home(&state.config.tool_logging.db_path);
-    log_tool_usage_to_path(
-        &db_path,
-        ToolUsageEvent {
-            session_id: Some(&session_id),
-            claude_session_id: payload
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            session_name: session.as_ref().map(|session| session.name.as_str()),
-            parent_session_id: session
-                .as_ref()
-                .and_then(|session| session.parent_session_id.as_deref()),
-            hook_type,
-            tool_name,
-            tool_input: payload.get("tool_input"),
-            tool_response: payload.get("tool_response"),
-            tool_use_id: payload
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            cwd: payload
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            agent_id: payload
-                .get("agent_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-        },
-    )
-    .map_err(ApiError::Internal)?;
+        let db_path = expand_home(&state.config.tool_logging.db_path);
+        log_tool_usage_to_path(
+            &db_path,
+            ToolUsageEvent {
+                session_id: Some(&session_id),
+                claude_session_id: payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                session_name: session.as_ref().map(|session| session.name.as_str()),
+                parent_session_id: session
+                    .as_ref()
+                    .and_then(|session| session.parent_session_id.as_deref()),
+                hook_type,
+                tool_name,
+                tool_input: payload.get("tool_input"),
+                tool_response: payload.get("tool_response"),
+                tool_use_id: payload
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                cwd: payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                agent_id: payload
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            },
+        )
+        .map_err(ApiError::Internal)?;
 
-    Ok(Json(json!({ "status": "logged" })).into_response())
+        Ok(Json(json!({ "status": "logged" })).into_response())
+    })
+    .await
 }
 
 fn hook_session_id(payload: &Value) -> Option<String> {
@@ -4262,14 +4284,17 @@ async fn list_sessions(
     Query(query): Query<ListSessionsQuery>,
     request: Request,
 ) -> Result<Json<SessionsEnvelope<SessionResponse>>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
-    let sessions = state
-        .session_store
-        .list_sessions(query.include_stopped)?
-        .into_iter()
-        .map(|session| session_response_with_live_activity(&state, session))
-        .collect::<Vec<_>>();
-    Ok(Json(SessionsEnvelope::from(sessions)))
+    blocking_http(move || {
+        ensure_session_read_allowed(&state, &request)?;
+        let sessions = state
+            .session_store
+            .list_sessions(query.include_stopped)?
+            .into_iter()
+            .map(|session| session_response_with_live_activity(&state, session))
+            .collect::<Vec<_>>();
+        Ok(Json(SessionsEnvelope::from(sessions)))
+    })
+    .await
 }
 
 async fn list_reparent_requests(
@@ -5295,29 +5320,32 @@ async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let actor_email = ensure_client_read(&state, &request)?;
-    let reviews = review_paired::session_fields(&state).unwrap_or_else(|error| {
-        eprintln!("review fields for sessions failed: {error:#}");
-        BTreeMap::new()
-    });
-    let sessions = state
-        .session_store
-        .list_sessions(false)?
-        .into_iter()
-        .map(|session| {
-            let fields = reviews.get(&session.id).cloned();
-            let mut value = client_session_value(&state, session, actor_email.as_deref(), None);
-            value["waiting_on_review"] = json!(null);
-            value["paired_reviewer"] = json!(null);
-            if let Some(Value::Object(fields)) = fields {
-                for (key, field) in fields {
-                    value[key] = field;
+    blocking_http(move || {
+        let actor_email = ensure_client_read(&state, &request)?;
+        let reviews = review_paired::session_fields(&state).unwrap_or_else(|error| {
+            eprintln!("review fields for sessions failed: {error:#}");
+            BTreeMap::new()
+        });
+        let sessions = state
+            .session_store
+            .list_sessions(false)?
+            .into_iter()
+            .map(|session| {
+                let fields = reviews.get(&session.id).cloned();
+                let mut value = client_session_value(&state, session, actor_email.as_deref(), None);
+                value["waiting_on_review"] = json!(null);
+                value["paired_reviewer"] = json!(null);
+                if let Some(Value::Object(fields)) = fields {
+                    for (key, field) in fields {
+                        value[key] = field;
+                    }
                 }
-            }
-            value
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(json!({ "sessions": sessions })))
+                value
+            })
+            .collect::<Vec<_>>();
+        Ok(Json(json!({ "sessions": sessions })))
+    })
+    .await
 }
 
 async fn list_nodes(
@@ -7728,30 +7756,65 @@ async fn list_session_obligations(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
-    Ok(Json(session_obligations(&state)?))
+    blocking_http(move || {
+        ensure_session_read_allowed(&state, &request)?;
+        Ok(Json(session_obligations(&state)?))
+    })
+    .await
 }
 
 /// The session feed's projection, shared by `/session-obligations` and the
 /// open-work idle check (sm#1452).
 fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
+    let inputs = ObligationInputs::load(state)?;
+    session_obligations_with_inputs(state, &inputs)
+}
+
+struct ObligationInputs {
+    records: Vec<SessionRecord>,
+    jobs: Vec<QueueJobRecord>,
+    reviews: Vec<CodexReviewRequestRegistration>,
+    messages: Vec<messages::ObligationMessage>,
+}
+
+impl ObligationInputs {
+    fn load(state: &AppState) -> Result<Self, ApiError> {
+        let records = state.session_store.list_sessions(true)?;
+        let messages = messages::obligation_messages_with_sessions(state, &records)?;
+        let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+            .join("queue_runner.db");
+        let jobs =
+            RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?;
+        let reviews = RetainedQueueStore::list_codex_review_requests_from_path(
+            &expand_home(&state.config.sm_send.db_path),
+            CodexReviewRequestFilters {
+                include_inactive: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(Self {
+            records,
+            jobs,
+            reviews,
+            messages,
+        })
+    }
+}
+
+fn session_obligations_with_inputs(
+    state: &AppState,
+    inputs: &ObligationInputs,
+) -> Result<Value, ApiError> {
     let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
         .join("queue_runner.db");
-    let jobs =
-        RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?;
-    let reviews = RetainedQueueStore::list_codex_review_requests_from_path(
-        &expand_home(&state.config.sm_send.db_path),
-        CodexReviewRequestFilters {
-            include_inactive: true,
-            ..Default::default()
-        },
-    )?;
+    let jobs = &inputs.jobs;
+    let reviews = &inputs.reviews;
+    let messages = &inputs.messages;
     let docs = docs::obligation_doc_summaries(state)?;
     let claims = claims::work_claim_store(state).active_claims()?;
-    let messages = messages::obligation_messages(state)?;
     let completions = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
         .pending_queue_completion_recipients()?;
-    let session_records = state.session_store.list_sessions(true)?;
+    let session_records = &inputs.records;
     let live_sessions: BTreeSet<_> = session_records
         .iter()
         .filter(|session| session.status != "stopped" && !messages::session_ended(session))
@@ -7771,8 +7834,8 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
         BTreeSet::new()
     };
     let mut projected = project_session_obligations(
-        &jobs,
-        &reviews,
+        jobs,
+        reviews,
         &docs,
         &claims,
         docs::doc_browser_base_url(&state.config).as_deref(),
@@ -7834,7 +7897,7 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
                 .push(serde_json::to_value(doc)?);
         }
     }
-    messages::project_messages(&mut sessions, &messages, &state.config.owner_name);
+    messages::project_messages(&mut sessions, messages, &state.config.owner_name);
     for entry in sessions.values_mut() {
         set_waiting_since(entry);
     }
@@ -8000,98 +8063,103 @@ async fn list_queue_jobs(
     Query(query): Query<ListQueueJobsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
-    let notify_session_id = if let Some(notify_target) = query
-        .notify_target
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let Some(session) = resolve_session_or_registry_role(&state, notify_target)? else {
-            return Err(ApiError::NotFound("Notify target not found"));
+    blocking_http(move || {
+        ensure_session_read_allowed(&state, &request)?;
+        let notify_session_id = if let Some(notify_target) = query
+            .notify_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let Some(session) = resolve_session_or_registry_role(&state, notify_target)? else {
+                return Err(ApiError::NotFound("Notify target not found"));
+            };
+            Some(session.id)
+        } else {
+            None
         };
-        Some(session.id)
-    } else {
-        None
-    };
 
-    let mut context = QueueResponseContext::new(&state)?;
-    let filters = QueueJobFilters {
-        notify_session_id: notify_session_id.clone(),
-        job_type: query
-            .job_type
-            .as_ref()
-            .and_then(|value| trimmed(&Some(value.clone()))),
-        state: query
-            .state
-            .as_ref()
-            .and_then(|value| trimmed(&Some(value.clone()))),
-        include_terminal: query.include_terminal,
-        limit: query.limit,
-        ..Default::default()
-    };
-    let total = if query.limit.is_some_and(|limit| limit > 0) {
-        context
+        let mut context = QueueResponseContext::new(&state)?;
+        let filters = QueueJobFilters {
+            notify_session_id: notify_session_id.clone(),
+            job_type: query
+                .job_type
+                .as_ref()
+                .and_then(|value| trimmed(&Some(value.clone()))),
+            state: query
+                .state
+                .as_ref()
+                .and_then(|value| trimmed(&Some(value.clone()))),
+            include_terminal: query.include_terminal,
+            limit: query.limit,
+            ..Default::default()
+        };
+        let total = if query.limit.is_some_and(|limit| limit > 0) {
+            context
+                .queue
+                .as_ref()
+                .map(|conn| crate::queue::count_queue_jobs_conn(conn, &filters))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut jobs = context.jobs(filters)?;
+        // Per-recipient retention expects oldest-first input and returns newest
+        // first. A bounded SQL list is already newest first.
+        if query.limit.is_some_and(|limit| limit > 0) && query.terminal_limit_per_session.is_some()
+        {
+            jobs.reverse();
+        }
+        // Include all active jobs even for a filtered listing: another agent's
+        // test/performance job may be holding this agent's queue.
+        let active = context.jobs(QueueJobFilters::default())?;
+        let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
+        let (names, current_session_ids) =
+            queue_session_names(&state, !query.current_sessions_only)?;
+        let mut response_jobs = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if query.current_sessions_only {
+                let recipient = job
+                    .notify_session_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .or(job.requester_session_id.as_deref());
+                if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) {
+                    continue;
+                }
+            }
+            response_jobs.push(queue_job_response_named(
+                &state,
+                job,
+                &active,
+                &names,
+                &mut context,
+            )?);
+        }
+        // Processes sm killed in agents' own shells for exceeding the per-process
+        // memory limit (#2137); a read failure must not hide the job listing.
+        let kills = context
             .queue
             .as_ref()
-            .map(|conn| crate::queue::count_queue_jobs_conn(conn, &filters))
-            .transpose()?
-    } else {
-        None
-    };
-    let mut jobs = context.jobs(filters)?;
-    // Per-recipient retention expects oldest-first input and returns newest
-    // first. A bounded SQL list is already newest first.
-    if query.limit.is_some_and(|limit| limit > 0) && query.terminal_limit_per_session.is_some() {
-        jobs.reverse();
-    }
-    // Include all active jobs even for a filtered listing: another agent's
-    // test/performance job may be holding this agent's queue.
-    let active = context.jobs(QueueJobFilters::default())?;
-    let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
-    let (names, current_session_ids) = queue_session_names(&state, !query.current_sessions_only)?;
-    let mut response_jobs = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        if query.current_sessions_only {
-            let recipient = job
-                .notify_session_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-                .or(job.requester_session_id.as_deref());
-            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) {
-                continue;
-            }
+            .map(|conn| {
+                crate::agent_memory_guard::recent_agent_process_kills_conn(
+                    conn,
+                    notify_session_id.as_deref(),
+                )
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .unwrap_or_else(|error| {
+                eprintln!("queue listing could not read agent process kills: {error:#}");
+                Vec::new()
+            });
+        let mut response = json!({ "jobs": response_jobs, "agent_process_kills": kills });
+        if let Some(total) = total {
+            response["total"] = json!(total);
         }
-        response_jobs.push(queue_job_response_named(
-            &state,
-            job,
-            &active,
-            &names,
-            &mut context,
-        )?);
-    }
-    // Processes sm killed in agents' own shells for exceeding the per-process
-    // memory limit (#2137); a read failure must not hide the job listing.
-    let kills = context
-        .queue
-        .as_ref()
-        .map(|conn| {
-            crate::agent_memory_guard::recent_agent_process_kills_conn(
-                conn,
-                notify_session_id.as_deref(),
-            )
-        })
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .unwrap_or_else(|error| {
-            eprintln!("queue listing could not read agent process kills: {error:#}");
-            Vec::new()
-        });
-    let mut response = json!({ "jobs": response_jobs, "agent_process_kills": kills });
-    if let Some(total) = total {
-        response["total"] = json!(total);
-    }
-    Ok(Json(response))
+        Ok(Json(response))
+    })
+    .await
 }
 
 struct QueueResponseContext {
@@ -8221,6 +8289,7 @@ async fn client_queue(
         });
     }
     let host = crate::host_status::snapshot().await;
+    blocking_http(move || {
     let now = time::OffsetDateTime::now_utc();
     let since = now - time::Duration::hours(ended_hours);
     // Lexically comparable with both stored timestamp styles.
@@ -8347,6 +8416,7 @@ async fn client_queue(
         "queued": queued_json,
         "ended": ended_json,
     })))
+    }).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -18171,6 +18241,9 @@ struct SessionOpenDefaults {
 
 #[cfg(test)]
 mod tests {
+    mod perf_tests {
+        include!("http/perf_tests.rs");
+    }
     use super::*;
     use crate::google_auth::test_support::{
         test_google_id_token, test_google_jwks, test_private_key_pem,

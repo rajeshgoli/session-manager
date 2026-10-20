@@ -741,23 +741,24 @@ pub(super) struct ObligationMessage {
 
 /// Messages for the obligations projection: stored data and the session
 /// registry only.
-pub(super) fn obligation_messages(state: &AppState) -> Result<Vec<ObligationMessage>, ApiError> {
+pub(super) fn obligation_messages_with_sessions(
+    state: &AppState,
+    records: &[SessionRecord],
+) -> Result<Vec<ObligationMessage>, ApiError> {
     let since = crate::owner_push::format_ts(OffsetDateTime::now_utc() - CARD_MESSAGE_WINDOW);
     let rows = owner_message_store(state).for_obligations(&since)?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let live: BTreeSet<String> = state
-        .session_store
-        .list_sessions(true)?
-        .into_iter()
+    let live: BTreeSet<&str> = records
+        .iter()
         .filter(|session| !session_ended(session))
-        .map(|session| session.id)
+        .map(|session| session.id.as_str())
         .collect();
     Ok(rows
         .into_iter()
         .map(|(message, replied)| {
-            let sender_ended = !live.contains(&message.sender_session_id);
+            let sender_ended = !live.contains(message.sender_session_id.as_str());
             ObligationMessage {
                 state: derive_message_state(&message, replied, sender_ended),
                 message,
