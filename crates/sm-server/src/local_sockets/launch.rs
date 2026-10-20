@@ -79,7 +79,7 @@ impl LaunchBinding {
         environment: &[(OsString, OsString)],
         checkout: &Path,
     ) -> io::Result<RegisteredChild> {
-        self.spawn_inner(executable, arguments, environment, checkout, None)
+        self.spawn_inner(executable, arguments, environment, checkout, None, false)
     }
 
     pub(crate) fn queue_identity(&self) -> io::Result<(&str, &Path)> {
@@ -98,9 +98,17 @@ impl LaunchBinding {
         environment: &[(OsString, OsString)],
         checkout: &Path,
         output: (std::fs::File, std::fs::File, Option<u64>),
+        lower_priority: bool,
     ) -> io::Result<RegisteredChild> {
         self.queue_identity()?;
-        self.spawn_inner(executable, arguments, environment, checkout, Some(output))
+        self.spawn_inner(
+            executable,
+            arguments,
+            environment,
+            checkout,
+            Some(output),
+            lower_priority,
+        )
     }
 
     fn spawn_inner(
@@ -110,6 +118,7 @@ impl LaunchBinding {
         environment: &[(OsString, OsString)],
         checkout: &Path,
         output: Option<(std::fs::File, std::fs::File, Option<u64>)>,
+        lower_priority: bool,
     ) -> io::Result<RegisteredChild> {
         let (gate, reader) = UnixStream::pair()?;
         // Reserve separate copies above the target descriptors. This avoids
@@ -160,6 +169,9 @@ impl LaunchBinding {
         // session is created before exec and before applying the guest wall.
         unsafe {
             command.pre_exec(move || {
+                if lower_priority {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
                 if libc::setsid() == -1
                     || control_fd.is_some_and(|fd| libc::dup2(fd, CONTROL_FD) == -1)
                     || libc::dup2(reader_fd, GATE_FD) == -1

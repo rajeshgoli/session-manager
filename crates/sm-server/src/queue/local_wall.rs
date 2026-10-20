@@ -228,9 +228,12 @@ pub(crate) fn cancel_pending_jobs_for_restaging(state_dir: &Path, agent: &str) -
     let connection = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
     init_queue_jobs_schema(&connection)?;
     let transaction = connection.unchecked_transaction()?;
-    for job in list_queue_job_runtime_records_conn(&transaction)?
-        .into_iter()
-        .filter(|job| job.local_agent_id.as_deref() == Some(agent) && job.state == "pending")
+    for job in list_queue_job_runtime_records_recent_conn(
+        &transaction,
+        &runtime_finished_since(QueueAdmissionPolicy::default()),
+    )?
+    .into_iter()
+    .filter(|job| job.local_agent_id.as_deref() == Some(agent) && job.state == "pending")
     {
         transaction.execute(
             "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1 AND state = 'pending'",
@@ -372,7 +375,18 @@ pub(super) fn prepare(
     fs::create_dir_all(&directory)?;
     physical_directory(&directory)?;
     let command = directory.join(format!("{id}.zsh"));
-    let mut source = format!("cd {} || exit 127\n", shell_quote(&cwd.to_string_lossy()));
+    // Durable owners can survive this server upgrade with their old launcher.
+    // Set priority again in the host-authenticated command, before user work,
+    // so those owners' future jobs and all descendants also inherit nice 10.
+    let mut source = if request.job_type == "perf" {
+        String::new()
+    } else {
+        "/usr/bin/renice 10 $$ >/dev/null 2>&1 || true\n".to_owned()
+    };
+    source.push_str(&format!(
+        "cd {} || exit 127\n",
+        shell_quote(&cwd.to_string_lossy())
+    ));
     match (&request.argv, &request.script) {
         (Some(argv), None) if !argv.is_empty() => {
             source.push_str("exec -- ");
@@ -460,6 +474,18 @@ pub(super) fn admission_ready(state_dir: &Path, agent: &str, binding: &str) -> R
     }
 }
 
+#[cfg(target_os = "macos")]
+fn lower_queue_priority(state_dir: &Path, binding: &JobBinding) -> Result<bool> {
+    let id = binding
+        .command
+        .file_stem()
+        .and_then(|id| id.to_str())
+        .context("missing queue job id")?;
+    let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    let job = get_queue_job_runtime_conn(&conn, id)?.context("missing local queue job")?;
+    Ok(job.job_type != "perf")
+}
+
 pub(super) fn spawn(
     state_dir: &Path,
     agent: &str,
@@ -495,12 +521,14 @@ pub(super) fn spawn(
             .iter()
             .map(|(k, v)| (k.into(), v.into()))
             .collect::<Vec<_>>();
+        let lower_priority = lower_queue_priority(state_dir, &binding)?;
         let child = launcher.spawn_queue(
             &wall.spec.shell,
             &["-df".into(), binding.command.into_os_string()],
             &environment,
             &binding.cwd,
             output,
+            lower_priority,
         )?;
         Ok(QueueChild::Local(child))
     }
@@ -537,12 +565,14 @@ pub(crate) fn spawn_owned(
         .iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect::<Vec<_>>();
+    let lower_priority = lower_queue_priority(state_dir, &binding)?;
     Ok(launcher.spawn_queue(
         &wall.spec.shell,
         &["-df".into(), binding.command.into_os_string()],
         &environment,
         &binding.cwd,
         output,
+        lower_priority,
     )?)
 }
 
@@ -637,6 +667,61 @@ mod tests {
             "confined\n"
         );
         assert!(!outside.exists());
+        for (kind, expected) in [
+            ("tests", 10),
+            ("perf", unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }),
+        ] {
+            let mut nice_request = request.clone();
+            nice_request.job_type = kind.into();
+            nice_request.label = format!("nice-{kind}");
+            nice_request.script = Some(format!("{} -c 'import os; print(os.getpriority(os.PRIO_PROCESS, 0), flush=True); pid=os.fork(); os.waitpid(pid, 0) if pid else print(os.getpriority(os.PRIO_PROCESS, 0), flush=True)'", shell_quote(&fixture.path("python").to_string_lossy())));
+            let nice_job =
+                RetainedQueueStore::create_queue_job_in_state_dir(&state_dir, nice_request)
+                    .unwrap();
+            let runtime = get_queue_job_runtime_conn(&conn, &nice_job.id)
+                .unwrap()
+                .unwrap();
+            assert!(spawn_queue_job_process(&runtime, None, &state_dir)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success());
+            let log = fs::read_to_string(nice_job.log_path.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                log.split_whitespace().collect::<Vec<_>>(),
+                [expected.to_string(), expected.to_string()],
+                "{kind}: {log}"
+            );
+            // Emulate a surviving pre-upgrade owner: the old queue launcher
+            // starts at inherited priority, with no new pre_exec adjustment.
+            let binding: JobBinding =
+                serde_json::from_str(runtime.local_binding_json.as_ref().unwrap()).unwrap();
+            let environment = spec
+                .environment
+                .iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect::<Vec<_>>();
+            let legacy_log = state_dir.join(format!("legacy-{kind}.log"));
+            let output = fs::File::create(&legacy_log).unwrap();
+            let mut child = fixture
+                .queue_binding()
+                .spawn_queue(
+                    &spec.shell,
+                    &["-df".into(), binding.command.into_os_string()],
+                    &environment,
+                    &binding.cwd,
+                    (output.try_clone().unwrap(), output, None),
+                    false,
+                )
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            let log = fs::read_to_string(legacy_log).unwrap();
+            assert_eq!(
+                log.split_whitespace().collect::<Vec<_>>(),
+                [expected.to_string(), expected.to_string()],
+                "legacy {kind}: {log}"
+            );
+        }
         let mut argv_request = request;
         argv_request.script = None;
         argv_request.argv = Some(vec![

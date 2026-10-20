@@ -99,6 +99,35 @@ fn ready(host: &ModelHost) -> ModelRecord {
     m
 }
 #[test]
+fn queue_reload_retry_skips_queue_reads_unless_yielded() {
+    let (host, _, root) = fixture();
+    let mut model = ready(&host);
+    let host = Arc::new(host);
+    let key = fs::canonicalize(&root).unwrap();
+    hosts().lock().unwrap().insert(key.clone(), host.clone());
+    // Queue reads fail, but ready-state retries still resume parked sessions.
+    fs::write(root.join("queue_runner.db"), "invalid SQLite").unwrap();
+    local_session(&host, "idle");
+    host.session_store()
+        .park_local_sessions("model reload")
+        .unwrap();
+    let parked = fs::read(&host.state_file).unwrap();
+    // Simulate a transient durable-resume failure after the model is ready.
+    fs::write(&host.state_file, "invalid JSON").unwrap();
+    assert!(retry_reload(&root).is_err());
+    assert_eq!(host.record().unwrap().unwrap().state, "ready");
+    fs::write(&host.state_file, parked).unwrap();
+    assert!(retry_reload(&root).is_ok());
+    let resumed: Value = serde_json::from_slice(&fs::read(&host.state_file).unwrap()).unwrap();
+    assert!(resumed["sessions"][0]["local_parked_reason"].is_null());
+    model.state = "yielded".into();
+    host.save(&model).unwrap();
+    assert!(retry_reload(&root).is_err());
+    hosts().lock().unwrap().remove(&key);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn measured_flash_reservation_and_identifier_match_spec() {
     let (host, _, root) = fixture();
     let m = host.prepare(request(FLASH_KEY, None, None, None)).unwrap();

@@ -187,6 +187,9 @@ pub struct QueueJobFilters {
     /// Active jobs plus jobs that finished at or after this time (RFC 3339);
     /// overrides `include_terminal`. The Queue page's refresh (sm#1609).
     pub finished_since: Option<String>,
+    /// Newest jobs; None or zero preserves the unlimited historical API.
+    pub limit: Option<usize>,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1552,16 +1555,14 @@ impl RetainedQueueStore {
         if let Some(job) = Self::get_queue_job_strict_from_path(db_path, identifier)? {
             return Ok(Some(job));
         }
-        let matches: Vec<_> = Self::list_queue_jobs_from_path(
+        let matches = Self::list_queue_jobs_from_path(
             db_path,
             QueueJobFilters {
                 include_terminal: true,
+                label: Some(identifier.to_owned()),
                 ..Default::default()
             },
-        )?
-        .into_iter()
-        .filter(|j| j.label == identifier)
-        .collect();
+        )?;
         match matches.len() {
             0 => Ok(None),
             1 => Ok(matches.into_iter().next()),
@@ -4030,6 +4031,9 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             ON queue_jobs(state, type, queued_at);
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_notify_state
             ON queue_jobs(notify_session_id, state);
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_state_queued ON queue_jobs(state, queued_at, id);
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_label ON queue_jobs(label);
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_queued ON queue_jobs(queued_at, id);
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_finished
             ON queue_jobs(finished_at);
         CREATE TABLE IF NOT EXISTS queue_resource_samples (
@@ -4131,6 +4135,12 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
             round INTEGER DEFAULT 1,
             findings_json TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_codex_review_active
+            ON codex_review_request_registrations(is_active, requested_at);
+        CREATE INDEX IF NOT EXISTS idx_codex_review_pr
+            ON codex_review_request_registrations(repo, pr_number, is_active);
+        CREATE INDEX IF NOT EXISTS idx_codex_review_notify_active
+            ON codex_review_request_registrations(notify_session_id, is_active);
         CREATE TABLE IF NOT EXISTS review_channels (
             name TEXT PRIMARY KEY,
             state TEXT NOT NULL,
@@ -4526,8 +4536,59 @@ fn get_queue_job_runtime_conn(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJobRuntimeRecord>> {
-    let mut statement = conn.prepare(
+    list_queue_job_runtime_records_where_conn(conn, None)
+}
+
+fn list_queue_job_runtime_records_recent_conn(
+    conn: &Connection,
+    finished_since: &str,
+) -> Result<Vec<QueueJobRuntimeRecord>> {
+    list_queue_job_runtime_records_where_conn(conn, Some(finished_since))
+}
+
+fn runtime_finished_since(policy: QueueAdmissionPolicy) -> String {
+    (OffsetDateTime::now_utc()
+        - time::Duration::seconds(policy.perf_cooldown_seconds.max(0).saturating_add(60)))
+    .format(time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second]"
+    ))
+    .expect("UTC timestamp")
+}
+
+// Admission also needs the last tests/perf finish, however old: it ensures
+// waiting tests run between consecutive perf jobs. Fetch one indexed row.
+fn admission_runtime_records_conn(
+    conn: &Connection,
+    policy: QueueAdmissionPolicy,
+) -> Result<Vec<QueueJobRuntimeRecord>> {
+    let mut jobs =
+        list_queue_job_runtime_records_recent_conn(conn, &runtime_finished_since(policy))?;
+    let latest: Option<String> = conn.query_row(
+        "SELECT id FROM queue_jobs WHERE type IN ('tests','perf') AND finished_at IS NOT NULL AND finished_at <= ?1 ORDER BY finished_at DESC, queued_at, id LIMIT 1",
+        [now_rfc3339()], |row| row.get(0)).optional()?;
+    if let Some(id) = latest {
+        if !jobs.iter().any(|job| job.id == id) {
+            if let Some(job) = get_queue_job_runtime_conn(conn, &id)? {
+                jobs.push(job);
+                jobs.sort_by(|a, b| (&a.queued_at, &a.id).cmp(&(&b.queued_at, &b.id)));
+            }
+        }
+    }
+    Ok(jobs)
+}
+
+fn list_queue_job_runtime_records_where_conn(
+    conn: &Connection,
+    finished_since: Option<&str>,
+) -> Result<Vec<QueueJobRuntimeRecord>> {
+    let predicate = if finished_since.is_some() {
+        "WHERE state IN ('pending','running') OR finished_at >= ?1"
+    } else {
+        ""
+    };
+    let mut statement = conn.prepare(&format!(
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
@@ -4539,11 +4600,12 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids,
                argv_json
         FROM queue_jobs
+        {predicate}
         ORDER BY queued_at, id
         "#,
-    )?;
+    ))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(finished_since), |row| {
             Ok(QueueJobRuntimeRecord {
                 local_agent_id: row.get(28)?,
                 local_binding_json: row.get(29)?,
@@ -4611,7 +4673,10 @@ pub(crate) fn with_model_load_admission<T>(
     if path.exists() {
         let conn = open_queue_jobs_connection(&path)?;
         init_queue_jobs_schema(&conn)?;
-        let jobs = list_queue_job_runtime_records_conn(&conn)?;
+        let jobs = list_queue_job_runtime_records_recent_conn(
+            &conn,
+            &runtime_finished_since(live_admission_policy(state_dir, captured)),
+        )?;
         if running_queue_job_count(&jobs, Some("perf")) > 0
             || perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured))
         {
@@ -4635,7 +4700,10 @@ fn admit_pending_queue_jobs_conn(
     let admission_policy = live_admission_policy(state_dir, admission_policy);
     // Deadlines first: a job gives up on time, and its requester hears why,
     // whatever a later step of this pass fails on (sm#2378).
-    let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
+    let pending_jobs = list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(admission_policy),
+    )?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
     // Artifact repair guards only jobs that declare artifacts. While the
     // artifact store is unavailable those jobs wait under their own reason;
@@ -4649,7 +4717,10 @@ fn admit_pending_queue_jobs_conn(
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
     // reserve for non-service work.
-    let running_jobs = list_queue_job_runtime_records_conn(conn)?;
+    let running_jobs = list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(admission_policy),
+    )?;
     if let Err(error) =
         ensure_service_capacity_reserve_before_admission(&running_jobs, admission_policy)
     {
@@ -4689,7 +4760,8 @@ fn admit_pending_queue_jobs_conn(
     // Read once per pass: reordering lanes applies at the next pass.
     let ticket_ranks = queue_ticket_ranks(message_queue_db_path);
     loop {
-        let mut jobs = ranked_queue_job_runtime_records_conn(conn, &ticket_ranks)?;
+        let mut jobs =
+            ranked_queue_job_runtime_records_conn(conn, &ticket_ranks, admission_policy)?;
         if expire_pending_queue_jobs_conn(conn, &jobs, message_queue_db_path, admission_policy)? > 0
         {
             continue;
@@ -4823,15 +4895,18 @@ fn admit_pending_queue_jobs_conn(
             }
         }
     }
-    let deadline_retry = list_queue_job_runtime_records_conn(conn)?
-        .iter()
-        .filter(|job| job.state == "pending")
-        .map(|job| artifact_aware_wait_remaining(conn, job))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|seconds| seconds.max(1) as u64);
+    let deadline_retry = list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(admission_policy),
+    )?
+    .iter()
+    .filter(|job| job.state == "pending")
+    .map(|job| artifact_aware_wait_remaining(conn, job))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|seconds| seconds.max(1) as u64);
     if let Some(seconds) = deadline_retry {
         summary.retry_after_seconds = Some(
             summary
@@ -4858,15 +4933,18 @@ fn schedule_pending_queue_deadline_retry(
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) -> Result<()> {
-    let retry_after_seconds = list_queue_job_runtime_records_conn(conn)?
-        .iter()
-        .filter(|job| job.state == "pending")
-        .map(|job| artifact_aware_wait_remaining(conn, job))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|seconds| seconds.max(1) as u64);
+    let retry_after_seconds = list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(admission_policy),
+    )?
+    .iter()
+    .filter(|job| job.state == "pending")
+    .map(|job| artifact_aware_wait_remaining(conn, job))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|seconds| seconds.max(1) as u64);
     if let Some(seconds) = retry_after_seconds {
         schedule_queue_admission_retry(
             state_dir.to_path_buf(),
@@ -5150,7 +5228,7 @@ pub fn queue_admission_policy_refusal(
         return Ok(None);
     }
     let conn = open_queue_jobs_connection(&db_path)?;
-    let jobs = list_queue_job_runtime_records_conn(&conn)?;
+    let jobs = list_queue_job_runtime_records_recent_conn(&conn, &runtime_finished_since(policy))?;
     let running_services = running_queue_job_count(&jobs, Some("service"));
     Ok((running_services > service_cap).then(|| {
         format!(
@@ -5777,8 +5855,9 @@ pub fn queue_job_lane_rank(
 fn ranked_queue_job_runtime_records_conn(
     conn: &Connection,
     ticket_ranks: &BTreeMap<(String, i64), i64>,
+    admission_policy: QueueAdmissionPolicy,
 ) -> Result<Vec<QueueJobRuntimeRecord>> {
-    let mut jobs = list_queue_job_runtime_records_conn(conn)?;
+    let mut jobs = admission_runtime_records_conn(conn, admission_policy)?;
     for job in &mut jobs {
         job.lane_rank = queue_job_lane_rank(job.rank_tickets.as_deref(), ticket_ranks);
     }
@@ -6097,6 +6176,16 @@ fn spawn_queue_job_process(
         let already_confined = false;
         if !already_confined {
             command.process_group(0);
+        }
+        if job.job_type != "perf" {
+            // SAFETY: setpriority touches only this child before exec. Failure
+            // leaves the inherited priority and must not prevent the job.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    Ok(())
+                });
+            }
         }
         if let Some(ceiling) = process_ceiling {
             // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
@@ -6602,11 +6691,14 @@ fn host_pressure_victim<'a>(
 }
 
 fn running_job_process_groups(conn: &Connection) -> Result<Vec<i64>> {
-    Ok(list_queue_job_runtime_records_conn(conn)?
-        .iter()
-        .filter(|job| job.state == "running")
-        .filter_map(|job| job.process_group_id.or(job.pid))
-        .collect())
+    Ok(list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(QueueAdmissionPolicy::default()),
+    )?
+    .iter()
+    .filter(|job| job.state == "running")
+    .filter_map(|job| job.process_group_id.or(job.pid))
+    .collect())
 }
 
 /// One host memory guard check. When available memory is below the reserve,
@@ -6631,7 +6723,10 @@ pub(crate) fn host_memory_guard_pass(
     else {
         return Ok(None);
     };
-    let jobs = list_queue_job_runtime_records_conn(conn)?;
+    let jobs = list_queue_job_runtime_records_recent_conn(
+        conn,
+        &runtime_finished_since(QueueAdmissionPolicy::default()),
+    )?;
     let Some((job, pgid, rss)) = host_pressure_victim(&jobs, rss_by_pgid) else {
         return Ok(None);
     };
@@ -8121,7 +8216,7 @@ impl RetainedQueueStore {
         let Some(job) = get_queue_job_runtime_conn(&conn, job_id)? else {
             return Ok(None);
         };
-        let jobs = list_queue_job_runtime_records_conn(&conn)?;
+        let jobs = admission_runtime_records_conn(&conn, policy)?;
         let earlier: Vec<String> = {
             let mut statement = conn.prepare(
                 r#"
@@ -9316,7 +9411,7 @@ fn create_codex_review_request_conn(
     Ok(registration)
 }
 
-fn get_codex_review_request_conn(
+pub(crate) fn get_codex_review_request_conn(
     conn: &Connection,
     request_id: &str,
 ) -> Result<Option<CodexReviewRequestRegistration>> {
@@ -9401,21 +9496,22 @@ fn codex_review_request_registration_from_row(
     })
 }
 
-fn list_queue_jobs_conn(
-    conn: &Connection,
-    filters: QueueJobFilters,
-) -> Result<Vec<QueueJobRecord>> {
+fn queue_jobs_predicate(filters: &QueueJobFilters) -> (Vec<&'static str>, Vec<SqlValue>) {
     let mut where_clauses = Vec::new();
     let mut values = Vec::<SqlValue>::new();
-    if let Some(value) = filters.notify_session_id {
+    if let Some(label) = filters.label.clone() {
+        where_clauses.push("label = ?");
+        values.push(label.into());
+    }
+    if let Some(value) = filters.notify_session_id.clone() {
         where_clauses.push("notify_session_id = ?");
         values.push(value.into());
     }
-    if let Some(value) = filters.job_type {
+    if let Some(value) = filters.job_type.clone() {
         where_clauses.push("type = ?");
         values.push(value.into());
     }
-    if let Some(value) = filters.state {
+    if let Some(value) = filters.state.clone() {
         if value == "done" {
             where_clauses
                 .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart', 'ended')");
@@ -9425,13 +9521,31 @@ fn list_queue_jobs_conn(
             where_clauses.push("state = ?");
             values.push(value.into());
         }
-    } else if let Some(since) = filters.finished_since {
+    } else if let Some(since) = filters.finished_since.clone() {
         where_clauses.push("(state IN ('pending', 'running') OR finished_at >= ?)");
         values.push(since.into());
     } else if !filters.include_terminal {
         where_clauses.push("state IN ('pending', 'running')");
     }
 
+    (where_clauses, values)
+}
+
+pub(crate) fn count_queue_jobs_conn(conn: &Connection, filters: &QueueJobFilters) -> Result<u64> {
+    let (clauses, values) = queue_jobs_predicate(filters);
+    let mut sql = "SELECT count(*) FROM queue_jobs".to_owned();
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    Ok(conn.query_row(&sql, rusqlite::params_from_iter(values), |row| row.get(0))?)
+}
+
+pub(crate) fn list_queue_jobs_conn(
+    conn: &Connection,
+    filters: QueueJobFilters,
+) -> Result<Vec<QueueJobRecord>> {
+    let (where_clauses, mut values) = queue_jobs_predicate(&filters);
     let resource_columns = queue_job_resource_projection(conn)?;
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
@@ -9460,7 +9574,12 @@ fn list_queue_jobs_conn(
         query.push_str(" WHERE ");
         query.push_str(&where_clauses.join(" AND "));
     }
-    query.push_str(" ORDER BY queued_at");
+    if let Some(limit) = filters.limit.filter(|limit| *limit > 0) {
+        query.push_str(" ORDER BY queued_at DESC, id DESC LIMIT ?");
+        values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
+    } else {
+        query.push_str(" ORDER BY queued_at");
+    }
 
     let mut statement = match conn.prepare(&query) {
         Ok(statement) => statement,
@@ -9928,6 +10047,24 @@ fn u64_to_i64(value: u64) -> Result<i64> {
 
 fn i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn seed_terminal_job_history(conn: &Connection, template_id: &str, count: usize) {
+    let columns = queue_job_columns(conn).unwrap();
+    let names = columns.iter().cloned().collect::<Vec<_>>().join(",");
+    let projection = columns
+        .iter()
+        .map(|name| match name.as_str() {
+            "id" => "printf('history_%05d', n)".to_owned(),
+            "state" => "'succeeded'".to_owned(),
+            "queued_at" | "finished_at" => "'2020-01-01T00:00:00Z'".to_owned(),
+            "label" => "'old-history'".to_owned(),
+            _ => format!("q.{name}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(&format!("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ?1) INSERT INTO queue_jobs ({names}) SELECT {projection} FROM seq CROSS JOIN queue_jobs q WHERE q.id=?2"), params![count, template_id]).unwrap();
 }
 
 #[cfg(test)]
@@ -12761,6 +12898,217 @@ mod tests {
     }
 
     #[test]
+    fn queue_jobs_start_at_expected_nice_and_children_inherit() {
+        let dir = unique_temp_path("queue-nice");
+        for (kind, expected) in [
+            ("tests", "10"),
+            ("background", "10"),
+            ("service", "10"),
+            ("review", "10"),
+            (
+                "perf",
+                &unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }.to_string(),
+            ),
+        ] {
+            let record = create_test_job(&dir, kind, kind);
+            let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+            let job = get_queue_job_runtime_conn(&conn, &record.id)
+                .unwrap()
+                .unwrap();
+            write_queue_job_wrapper(
+                Path::new(job.wrapper_path.as_ref().unwrap()),
+                "/tmp",
+                Some(&[
+                    "/bin/zsh".into(),
+                    "-c".into(),
+                    "/bin/ps -o nice= -p $$; /bin/zsh -c '/bin/ps -o nice= -p $$'".into(),
+                ]),
+                None,
+                &BTreeMap::new(),
+                Path::new(job.exit_code_path.as_ref().unwrap()),
+            )
+            .unwrap();
+            assert!(spawn_queue_job_process(&job, None, &dir)
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success());
+            let log = fs::read_to_string(job.log_path.unwrap()).unwrap();
+            assert_eq!(
+                log.split_whitespace().collect::<Vec<_>>(),
+                [expected, expected],
+                "{kind}: {log}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queue_runtime_decisions_ignore_large_terminal_history() {
+        let dir = unique_temp_path("queue-recent-history");
+        let pending = create_test_job(&dir, "tests", "pending");
+        let running = create_test_job(&dir, "service", "running");
+        let finished = create_test_job(&dir, "perf", "recent perf");
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state='running', pid=4242, process_group_id=4242 WHERE id=?1",
+            [&running.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state='succeeded', finished_at=?2 WHERE id=?1",
+            params![finished.id, now_rfc3339()],
+        )
+        .unwrap();
+        let policy = QueueAdmissionPolicy {
+            service_max_concurrent: 1,
+            max_running_jobs: 3,
+            tests_max_concurrent: 0,
+            ..QueueAdmissionPolicy::default()
+        };
+        let before =
+            list_queue_job_runtime_records_recent_conn(&conn, &runtime_finished_since(policy))
+                .unwrap();
+        seed_terminal_job_history(&conn, &pending.id, 5000);
+        let after =
+            list_queue_job_runtime_records_recent_conn(&conn, &runtime_finished_since(policy))
+                .unwrap();
+        assert_eq!(
+            before.iter().map(|j| &j.id).collect::<Vec<_>>(),
+            after.iter().map(|j| &j.id).collect::<Vec<_>>()
+        );
+        assert_eq!(after.len(), 3);
+        // Load guard and model-card/retry decisions retain the recent cooldown.
+        assert!(with_model_load_admission(&dir, policy, || Ok(())).is_err());
+        assert_eq!(
+            model_reload_block(&dir, policy).unwrap(),
+            ModelReloadBlock::Cooldown
+        );
+        // Admission ranks and capacity checks retain the same live jobs.
+        let ranked =
+            ranked_queue_job_runtime_records_conn(&conn, &BTreeMap::new(), policy).unwrap();
+        assert_eq!(running_queue_job_count(&ranked, Some("service")), 1);
+        let refusal = QueueAdmissionPolicy {
+            service_max_concurrent: 0,
+            ..policy
+        };
+        assert!(queue_admission_policy_refusal(&dir, refusal)
+            .unwrap()
+            .is_some());
+        assert_eq!(running_job_process_groups(&conn).unwrap(), [4242]);
+        let rss = HashMap::from([(4242, HOST_MEMORY_GUARD_MIN_VICTIM_RSS * 2)]);
+        let victim = host_memory_guard_pass(
+            &conn,
+            Some((32 * 1024 * 1024 * 1024, 0)),
+            1024 * 1024 * 1024,
+            &rss,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(victim, (running.id.clone(), 4242));
+        // Deadline and Start now inputs contain the original pending job only.
+        let deadlines = after
+            .iter()
+            .filter(|j| j.state == "pending")
+            .map(|j| artifact_aware_wait_remaining(&conn, j).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(deadlines.len(), 1);
+        let messages = dir.join("messages.db");
+        let summary =
+            admit_pending_queue_jobs_conn(&conn, &dir, &messages, 0, policy, true).unwrap();
+        assert_eq!(summary.started, 0);
+        assert!(summary.retry_after_seconds.is_some());
+        schedule_pending_queue_deadline_retry(&conn, &dir, &messages, 0, policy).unwrap();
+        release_queue_admission_retry(&dir);
+        assert!(
+            RetainedQueueStore::start_check_in_state_dir(&dir, &pending.id, policy, |_| None)
+                .unwrap()
+                .is_some()
+        );
+        // An ancient last perf still yields to waiting tests between perf runs.
+        conn.execute(
+            "UPDATE queue_jobs SET finished_at='2021-01-01T00:00:00Z' WHERE id=?1",
+            [&finished.id],
+        )
+        .unwrap();
+        let ranked =
+            ranked_queue_job_runtime_records_conn(&conn, &BTreeMap::new(), policy).unwrap();
+        assert_eq!(ranked.len(), 3);
+        assert!(perf_blocked_by_tests_after_perf(&ranked));
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn review_registration_indexes_are_installed_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_codex_review_requests_schema(&conn).unwrap();
+        init_codex_review_requests_schema(&conn).unwrap();
+        for index in [
+            "idx_codex_review_active",
+            "idx_codex_review_pr",
+            "idx_codex_review_notify_active",
+        ] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn queue_history_limit_is_newest_and_label_lookup_is_indexed() {
+        let dir = unique_temp_path("queue-history-limit");
+        let job = create_test_job(&dir, "tests", "newest");
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        seed_terminal_job_history(&conn, &job.id, 16000);
+        let filters = QueueJobFilters {
+            include_terminal: true,
+            limit: Some(200),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let jobs = list_queue_jobs_conn(&conn, filters.clone()).unwrap();
+        assert_eq!(jobs.len(), 200);
+        assert_eq!(jobs[0].id, job.id);
+        assert_eq!(count_queue_jobs_conn(&conn, &filters).unwrap(), 16001);
+        assert!(start.elapsed() < StdDuration::from_secs(2));
+        assert_eq!(
+            list_queue_jobs_conn(
+                &conn,
+                QueueJobFilters {
+                    include_terminal: true,
+                    limit: Some(0),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            16001
+        );
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM queue_jobs WHERE label=?1",
+                ["newest"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_queue_jobs_label"), "{plan}");
+        assert_eq!(
+            RetainedQueueStore::resolve_queue_job_from_path(&dir.join("queue_runner.db"), "newest")
+                .unwrap()
+                .unwrap()
+                .id,
+            job.id
+        );
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn queue_job_starts_under_the_process_ceiling() {
         let job_dir = unique_temp_path("process-ceiling-spawn");
         fs::create_dir_all(&job_dir).unwrap();
@@ -14912,7 +15260,9 @@ mod tests {
     fn next_job(state_dir: &Path, claims_db: &Path) -> Option<String> {
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
         let ranks = queue_ticket_ranks(claims_db);
-        let jobs = ranked_queue_job_runtime_records_conn(&conn, &ranks).unwrap();
+        let jobs =
+            ranked_queue_job_runtime_records_conn(&conn, &ranks, QueueAdmissionPolicy::default())
+                .unwrap();
         let mut summary = QueueAdmissionSummary::default();
         next_admissible_queue_job_id_conn(
             &conn,
@@ -15168,15 +15518,21 @@ pub(crate) fn model_reload_block(
         return Ok(ModelReloadBlock::None);
     }
     let conn = open_queue_jobs_connection(&path)?;
-    init_queue_jobs_schema(&conn)?;
-    let jobs = list_queue_job_runtime_records_conn(&conn)?;
+    model_reload_block_conn(&conn, live_admission_policy(state_dir, captured))
+}
+
+pub(crate) fn model_reload_block_conn(
+    conn: &Connection,
+    policy: QueueAdmissionPolicy,
+) -> Result<ModelReloadBlock> {
+    let jobs = list_queue_job_runtime_records_recent_conn(conn, &runtime_finished_since(policy))?;
     let perf_waiting = jobs
         .iter()
         .any(|job| job.job_type == "perf" && job.state == "pending");
     Ok(
         if running_queue_job_count(&jobs, Some("perf")) > 0 || perf_waiting {
             ModelReloadBlock::PerfJob
-        } else if perf_cooldown_active(&jobs, live_admission_policy(state_dir, captured)) {
+        } else if perf_cooldown_active(&jobs, policy) {
             ModelReloadBlock::Cooldown
         } else {
             ModelReloadBlock::None

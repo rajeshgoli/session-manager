@@ -154,9 +154,10 @@ impl ModelHost {
         Ok(conn)
     }
     pub fn record(&self) -> Result<Option<ModelRecord>> {
-        Ok(self
-            .connect()?
-            .query_row(
+        Self::record_conn(&self.connect()?)
+    }
+    fn record_conn(conn: &Connection) -> Result<Option<ModelRecord>> {
+        Ok(conn.query_row(
                 "SELECT key,server,identifier,seats,context,
             reservation_bytes,measured_peak_bytes,state,desired,state_since,
             last_yield_reason,last_yield_at,last_error,pid,endpoint FROM local_model WHERE singleton=1",
@@ -1177,7 +1178,13 @@ pub fn retry_reload(state_dir: &Path) -> Result<()> {
     if host.yield_worker.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let blocked = crate::queue::model_reload_block(state_dir, host.queue_policy)?;
+    let blocked = match host.record()?.as_ref().map(|model| model.state.as_str()) {
+        Some("yielded") => crate::queue::model_reload_block(state_dir, host.queue_policy)?,
+        // A previous load may have become ready before durable resume failed.
+        // Keep retrying that effect, without reading queue history.
+        Some("ready") => ModelReloadBlock::None,
+        _ => return Ok(()),
+    };
     host.reload_pass(
         crate::queue::host_memory_capacity().map(|(_, a)| a),
         blocked,
@@ -1192,8 +1199,15 @@ impl ModelHost {
         )
     }
     fn card_snapshot(&self, available: Option<i64>, block: ModelReloadBlock) -> Result<Value> {
+        self.card_snapshot_with_model(available, block, self.record()?)
+    }
+    fn card_snapshot_with_model(
+        &self,
+        available: Option<i64>,
+        block: ModelReloadBlock,
+        model: Option<ModelRecord>,
+    ) -> Result<Value> {
         let perf_blocked = block != ModelReloadBlock::None;
-        let model = self.record()?;
         let agents = self.local_sessions()?;
         let seats = model.as_ref().map_or(0, |m| m.seats);
         let names = agents
@@ -1242,6 +1256,29 @@ impl ModelHost {
             "reload_held_seconds":held,"perf_blocked":perf_blocked,"reload_text":reload_text}))
     }
 }
+pub(crate) fn queue_card_with_queue_conn(
+    state_dir: &Path,
+    conn: Option<&rusqlite::Connection>,
+    messages: Option<&rusqlite::Connection>,
+) -> Result<Value> {
+    if let Some(host) = live(state_dir) {
+        let block = conn
+            .map(|conn| crate::queue::model_reload_block_conn(conn, host.queue_policy))
+            .transpose()?
+            .unwrap_or(ModelReloadBlock::None);
+        let model = match messages {
+            Some(conn) => ModelHost::record_conn(conn)?,
+            None => host.record()?,
+        };
+        return host.card_snapshot_with_model(
+            crate::queue::host_memory_capacity().map(|(_, a)| a),
+            block,
+            model,
+        );
+    }
+    queue_card(state_dir)
+}
+
 pub fn queue_card(state_dir: &Path) -> Result<Value> {
     live(state_dir).map_or(Ok(serde_json::json!({"state":"unloaded","model_text":"unloaded",
         "seats_text":"0 of 0","memory_text":"Local model controller unavailable","reload_text":null})), |host| host.queue_card())

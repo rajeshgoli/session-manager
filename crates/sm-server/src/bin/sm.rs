@@ -744,6 +744,9 @@ struct QueueRunArgs {
 
 #[derive(Args)]
 struct QueueListArgs {
+    /// Maximum newest jobs; --all defaults to 200. Zero shows all.
+    #[arg(long)]
+    limit: Option<usize>,
     #[arg(long)]
     notify: Option<String>,
     #[arg(
@@ -2120,6 +2123,10 @@ const QUEUE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
     let mut query = Vec::new();
+    let limit = args.limit.or(args.all.then_some(200));
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
     let explicit_notify = args
         .notify
         .as_deref()
@@ -2171,6 +2178,13 @@ fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
              jobs only) or --notify <target>",
         )?;
     let jobs = payload["jobs"].as_array().cloned().unwrap_or_default();
+    if let (Some(limit), Some(total)) =
+        (limit.filter(|limit| *limit > 0), payload["total"].as_u64())
+    {
+        if total > jobs.len() as u64 {
+            eprintln!("Showing newest {limit} of {total} jobs; use --limit 0 for all.");
+        }
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
@@ -7693,6 +7707,34 @@ mod tests {
         assert_eq!(run_args.cpu.as_deref(), Some("100"));
         assert_eq!(run_args.gpu.as_deref(), Some("100%"));
         assert_eq!(run_args.memory.as_deref(), Some("32G"));
+    }
+
+    #[test]
+    fn queue_list_all_sends_default_and_explicit_limits() {
+        for (limit, path) in [
+            (None, "/queue-jobs?limit=200&include_terminal=true"),
+            (Some(7), "/queue-jobs?limit=7&include_terminal=true"),
+            (Some(0), "/queue-jobs?limit=0&include_terminal=true"),
+        ] {
+            let (client, server) = start_lookup_server([(
+                path,
+                200,
+                r#"{"jobs":[],"total":16000,"agent_process_kills":[]}"#,
+            )]);
+            run_queue_list(
+                &client,
+                QueueListArgs {
+                    limit,
+                    all: true,
+                    notify: None,
+                    job_type: None,
+                    state: None,
+                    json: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(server.join().unwrap(), [path]);
+        }
     }
 
     #[test]
