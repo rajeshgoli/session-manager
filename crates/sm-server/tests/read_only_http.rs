@@ -11128,10 +11128,23 @@ async fn custom_usage_database_contains_identity_and_session_chain_tables() {
 }
 
 #[tokio::test]
-async fn claude_stop_hook_survives_an_unwritable_usage_database() {
+async fn claude_stop_hook_survives_a_usage_database_write_failure() {
     let state_file = write_session_fixture();
-    fs::create_dir_all(state_file.with_extension("usage.db")).unwrap();
-    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let usage_db_path = state_file.with_extension("usage.db");
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+
+    // Terminal stores require this database at startup. Fail ledger writes only
+    // after initialization, without replacing a file held by pooled connections.
+    let connection = Connection::open(&usage_db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_seat_session_insert BEFORE INSERT ON seat_sessions
+             BEGIN SELECT RAISE(ABORT, 'injected usage ledger write failure'); END;",
+        )
+        .unwrap();
 
     let (status, payload) = post_json(
         app,
@@ -11167,6 +11180,14 @@ async fn claude_stop_hook_survives_an_unwritable_usage_database() {
         session["provider_resume_id"],
         "provider-session-after-failure"
     );
+    let recorded_sessions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'run12345' AND provider_session_id = 'provider-session-after-failure'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded_sessions, 0);
 }
 
 #[tokio::test]
