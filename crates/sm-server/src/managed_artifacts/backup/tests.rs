@@ -856,19 +856,29 @@ fn destination_open_waits_out_a_briefly_held_lock() {
     use std::os::unix::io::AsRawFd;
     let f = Fixture::new();
     let root = f.dir.join("remote");
-    drop(Destination::open(&root).unwrap());
-    // A forked child that has not yet exec'd holds the lock on its own descriptor.
-    let held = fs::File::open(root.join(".sm-backup.lock")).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    // Acquire the fixture's lock first. Opening and dropping a Destination here
+    // races unrelated forks that can briefly inherit that first descriptor.
+    let held = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(root.join(".sm-backup.lock"))
+        .unwrap();
     assert_eq!(
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
+    let started = std::time::Instant::now();
     let release = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(200));
         drop(held);
     });
-    Destination::open(&root).unwrap();
+    let opened = Destination::open(&root);
+    let elapsed = started.elapsed();
     release.join().unwrap();
+    opened.unwrap();
+    assert!(elapsed >= std::time::Duration::from_millis(200));
 }
 
 #[test]

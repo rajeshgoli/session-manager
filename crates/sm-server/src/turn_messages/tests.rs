@@ -215,7 +215,8 @@ fn now_plus(minutes: i64) -> OffsetDateTime {
 
 #[test]
 fn the_first_turn_started_after_a_send_answers_it_once() {
-    let store = store_with_notes(&[now_plus(1)]);
+    let sent = now_plus(1);
+    let store = store_with_notes(&[sent]);
     // A turn that began before the send and ended after it is not the answer.
     store
         .record_turn(
@@ -248,7 +249,7 @@ fn the_first_turn_started_after_a_send_answers_it_once() {
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].text, "Here is my answer");
-    assert_eq!(replies[0].input_at, stamp(now_plus(1)));
+    assert_eq!(replies[0].input_at, stamp(sent));
 }
 
 #[test]
@@ -279,7 +280,8 @@ fn the_earlier_turn_answers_even_when_its_stop_arrives_later() {
 
 #[test]
 fn two_sends_before_one_turn_get_one_answer() {
-    let store = store_with_notes(&[now_plus(1), now_plus(2)]);
+    let latest_sent = now_plus(2);
+    let store = store_with_notes(&[now_plus(1), latest_sent]);
     store
         .record_turn(
             "s1",
@@ -291,7 +293,7 @@ fn two_sends_before_one_turn_get_one_answer() {
         .unwrap();
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].input_at, stamp(now_plus(2)));
+    assert_eq!(replies[0].input_at, stamp(latest_sent));
 }
 
 #[test]

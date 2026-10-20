@@ -2,6 +2,107 @@ use super::*;
 
 const REPO: &str = "acme/widgets";
 
+#[test]
+fn concurrent_initializers_finish_fresh_and_legacy_schemas() {
+    use std::sync::{Arc, Barrier};
+    for legacy in [false, true] {
+        for _ in 0..8 {
+            let (store, db) = new_store();
+            if legacy {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "DELETE FROM work_claims_meta WHERE key = 'work_claims_schema_version';
+                     ALTER TABLE work_items DROP COLUMN is_draft;
+                     ALTER TABLE handoff_ticket_overrides DROP COLUMN ask_on_codex_review;
+                     ALTER TABLE handoff_ticket_overrides DROP COLUMN ask_on_doc_review;",
+                )
+                .unwrap();
+            } else {
+                fs::remove_file(&db).unwrap();
+            }
+            let barrier = Arc::new(Barrier::new(8));
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let db = db.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let conn = Connection::open(db).unwrap();
+                        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                        barrier.wait();
+                        init_work_claims_schema(&conn)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            for result in results {
+                result.unwrap();
+            }
+            let conn = store.open_read().unwrap().unwrap();
+            conn.prepare("SELECT is_draft FROM work_items").unwrap();
+            conn.prepare(
+                "SELECT ask_on_codex_review, ask_on_doc_review FROM handoff_ticket_overrides",
+            )
+            .unwrap();
+            drop(conn);
+            fs::remove_dir_all(db.parent().unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn initialized_schema_remains_readable_while_another_writer_is_active() {
+    let (store, db) = new_store();
+    let mut writer = Connection::open(&db).unwrap();
+    let reader = Connection::open(&db).unwrap();
+    reader.busy_timeout(Duration::ZERO).unwrap();
+    let tx = writer
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    init_work_claims_schema(&reader).unwrap();
+    let read_only = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    read_only.busy_timeout(Duration::ZERO).unwrap();
+    init_work_claims_schema(&read_only).unwrap();
+    assert!(store.open_read().unwrap().is_some());
+    drop(read_only);
+    tx.rollback().unwrap();
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn schema_publication_follows_the_callers_commit_or_rollback() {
+    let (store, db) = new_store();
+    fs::remove_file(&db).unwrap();
+    let mut conn = Connection::open(&db).unwrap();
+    for commit in [false, true] {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        init_work_claims_schema(&tx).unwrap();
+        assert!(table_exists(&tx, "work_claims_meta").unwrap());
+        // A read-only client uses this marker to decide whether it can query
+        // handoff columns. It must not see the marker before the migration.
+        assert!(store.open_read().unwrap().is_none());
+        if commit {
+            tx.commit().unwrap();
+        } else {
+            tx.rollback().unwrap();
+            assert!(store.open_read().unwrap().is_none());
+        }
+    }
+    let reader = store.open_read().unwrap().unwrap();
+    reader
+        .prepare("SELECT ask_on_codex_review, ask_on_doc_review FROM handoff_ticket_overrides")
+        .unwrap();
+    drop(reader);
+    drop(conn);
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
 fn new_store() -> (WorkClaimStore, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "sm-work-claims-{}-{}",

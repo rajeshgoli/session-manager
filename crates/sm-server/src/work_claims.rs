@@ -35,7 +35,47 @@ pub const RESERVATION_RECOVERY_AGE: Duration = Duration::from_secs(5 * 60);
 /// Queue category for every message this module enqueues.
 pub const MESSAGE_CATEGORY: &str = "work_claim";
 
+// Bump when this initializer or its merge-hold, loose-worktree, or board
+// schema dependencies change. The marker is published with the whole schema.
+const WORK_CLAIMS_SCHEMA_VERSION: &str = "1";
+
+fn work_claims_schema_is_current(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "work_claims_meta")? {
+        return Ok(false);
+    }
+    let version = conn
+        .query_row(
+            "SELECT value FROM work_claims_meta WHERE key = 'work_claims_schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(version.as_deref() == Some(WORK_CLAIMS_SCHEMA_VERSION))
+}
+
 pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
+    // Read-only callers must not contend with an unrelated message DB writer
+    // once initialization has committed.
+    if work_claims_schema_is_current(conn)? {
+        return Ok(());
+    }
+    // Reserve the writer before inspecting columns. Readers must see either
+    // no schema or the complete schema, and concurrent initializers must not
+    // both decide to add the same column. Queue callers may already own a
+    // transaction; in that case its commit also publishes these migrations.
+    if !conn.is_autocommit() {
+        return init_work_claims_schema_in_transaction(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Another initializer may have completed while we waited for the writer.
+    if !work_claims_schema_is_current(&tx)? {
+        init_work_claims_schema_in_transaction(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn init_work_claims_schema_in_transaction(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
     worktrees::loose::init_schema(conn)?;
     crate::board::init_board_schema(conn)?;
@@ -166,6 +206,11 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    conn.execute(
+        "INSERT INTO work_claims_meta (key, value) VALUES ('work_claims_schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![WORK_CLAIMS_SCHEMA_VERSION],
+    )?;
     Ok(())
 }
 
