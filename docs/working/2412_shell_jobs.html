@@ -119,7 +119,7 @@
 <dl class="vocab">
 <dt>Queue job</dt><dd>Work submitted with <code>sm queue run</code>. sm starts it when its type has a free slot and the Mac has the memory, and wakes the agent when it ends.</dd>
 <dt>Shell job (new)</dt><dd>A command an agent started from its own shell that sm took over as a queue job after it passed 1 GB. It is already running, so it never waits and takes no slot. It shows in the Queue screen and in <code>sm queue list</code> with type <code>shell</code>.</dd>
-<dt>Reservation</dt><dd>The memory sm sets aside for a shell job when it adopts it: 10 GB or 5 GB (decision 2). It decides which job stops first when memory runs short. It is not a tripwire.</dd>
+<dt>Reservation</dt><dd>The memory sm sets aside for a shell job when it adopts it: 16 GB or 8 GB (decision 2). It decides which job stops first when memory runs short. It is not a tripwire.</dd>
 <dt>Memory reserve</dt><dd>Existing rule: sm keeps at least 8 GB free, rising to a quarter of the Mac's memory (64 GB) while macOS reports memory pressure. The <i>host memory guard</i> stops queue jobs one at a time, largest first, while free memory is below the reserve.</dd>
 <dt>Headroom</dt><dd>Free memory, minus the memory reserve, minus what running queue jobs have reserved but not yet used.</dd>
 <dt>Background job (new)</dt><dd>A command an agent left running after its turn ended, such as a watcher (<code>until grep -q Ready dev.log</code>) or a dev server. sm reads it from the agent's process tree.</dd>
@@ -135,7 +135,7 @@
   <rect x="10" y="30" width="160" height="60" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
   <text x="90" y="55" text-anchor="middle" font-weight="600">Agent's command</text><text x="90" y="72" text-anchor="middle" font-size="11" fill="#52514e">passes 1 GB</text>
   <rect x="222" y="30" width="180" height="60" rx="8" fill="#fcfcfb" stroke="#2a78d6"/>
-  <text x="312" y="52" text-anchor="middle" font-weight="600">Headroom?</text><text x="312" y="68" text-anchor="middle" font-size="11" fill="#52514e">≥100 GB → reserve 10 GB</text><text x="312" y="82" text-anchor="middle" font-size="11" fill="#52514e">≥20 GB → reserve 5 GB</text>
+  <text x="312" y="52" text-anchor="middle" font-weight="600">Headroom?</text><text x="312" y="68" text-anchor="middle" font-size="11" fill="#52514e">≥100 GB → reserve 16 GB</text><text x="312" y="82" text-anchor="middle" font-size="11" fill="#52514e">≥20 GB → reserve 8 GB</text>
   <rect x="452" y="30" width="180" height="60" rx="8" fill="#fcfcfb" stroke="#008300"/>
   <text x="542" y="55" text-anchor="middle" font-weight="600" fill="#008300">Shell job, running</text><text x="542" y="72" text-anchor="middle" font-size="11" fill="#52514e">agent hears nothing</text>
   <rect x="690" y="30" width="160" height="60" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
@@ -165,14 +165,25 @@
 </thead>
 <tbody>
 <tr><td>1. Kill or adopt at 1 GB?</td><td><b>Adopt.</b> The whole command the agent ran, such as <code>cargo test --workspace</code> with every <code>rustc</code> under it, becomes one shell job. The 1 GB trigger stays the same.</td><td>The Mac nearly always has room, and the agent's work goes on unharmed.</td></tr>
-<tr><td>2. How much to reserve?</td><td><b>10 GB when headroom is at least 100 GB, 5 GB when it is at least 20 GB.</b> Under 20 GB, sm stops the command as it does today. Headroom subtracts what running queue jobs have reserved but not used, so ten adoptions in a burst cannot each count the same free memory.</td><td>Your proposed numbers. Counting unused reservations is the "projection from other queue items".</td></tr>
-<tr><td>3. What does the reservation do?</td><td><b>It sets the stop order. It is not a limit.</b> sm stops a shell job only when the host memory guard needs memory back. Shell jobs over their reservation go first, so a job that declared its memory honestly through <code>sm queue run</code> outlives one that did not.</td><td>A hard stop at 5 GB would just move today's cliff from 1 GB to 5 GB.</td></tr>
+<tr><td>2. How much to reserve?</td><td><b>16 GB when headroom is at least 100 GB, 8 GB when it is at least 20 GB.</b> Under 20 GB, sm stops the command as it does today. Headroom subtracts what running queue jobs have reserved but not used, so ten adoptions in a burst cannot each count the same free memory.</td><td>Sized from last week's queue jobs that passed 1 GB (table below). Counting unused reservations is the "projection from other queue items".</td></tr>
+<tr><td>3. What does the reservation do?</td><td><b>It sets the stop order. It is not a limit.</b> sm stops a shell job only when the host memory guard needs memory back. Shell jobs over their reservation go first, so a job that declared its memory honestly through <code>sm queue run</code> outlives one that did not.</td><td>A hard stop at 8 GB would just move today's cliff from 1 GB to 8 GB.</td></tr>
 <tr><td>4. What does the agent see?</td><td><b>Nothing when sm adopts.</b> One message if sm stops the command, with a ready-to-paste <code>sm queue run</code> line sized from the command's peak (Figure 4). <code>sm queue list</code> shows the agent's shell jobs.</td><td>No wake and no tokens spent on the 99.9% case. The rare stop gives the agent everything it needs to resubmit.</td></tr>
 <tr><td>5. Do shell jobs use queue slots?</td><td><b>No. There is no limit on how many, they never wait, and sm sends no completion wake.</b> They end as <i>ended</i>, not <i>succeeded</i> or <i>failed</i>, because the exit code goes to the agent's own shell.</td><td>They are found after they start. The agent already sees the command finish.</td></tr>
 <tr><td>6. Can you stop one?</td><td><b>Yes, with the Stop button the job sheet already has.</b> The agent gets the stop message, which says you stopped it.</td><td>Same control as every other job, so nothing new to learn.</td></tr>
 <tr><td>7. Background jobs</td><td><b>sm reads them from the process tree for Claude, Codex and opencode alike, and shows them on idle agents (Figure 3).</b> No Stop button in this ticket. A background job that passes 1 GB becomes a shell job and appears in the Queue.</td><td>It works for every provider and shows <i>what</i> is running. Today only Claude's footer is read, and it gives a count.</td></tr>
 </tbody>
 </table>
+
+<h3>Sizing the reservation from last week</h3>
+<p>The reservation should cover the typical heavy command, so that only the unusual one is "over its reservation" and goes first in a squeeze. The utilization recorder samples every queue job's memory every 5 seconds. Below is every tests and background job from the last 7 days that passed 1 GB, the population that would have been adopted had the agent run it from its shell.</p>
+<table>
+<thead><tr><th>Type</th><th>Jobs over 1 GB</th><th>Median peak</th><th>90th percentile</th><th>Fit in 8 GB</th><th>Fit in 16 GB</th></tr></thead>
+<tbody>
+<tr><td>tests</td><td>753</td><td>3.6 GB</td><td>7.1 GB</td><td>93%</td><td>100%</td></tr>
+<tr><td>background</td><td>486</td><td>6.9 GB</td><td>44.5 GB</td><td>52%</td><td>78%</td></tr>
+</tbody>
+</table>
+<p>16 GB covers every test run and four in five long jobs. The rest (training replays, peaking at 239 GB) are exactly the jobs that should go through <code>sm queue run --memory</code>, and the stop message (Figure 4) tells the agent so. 8 GB is the tighter tier for when the Mac has between 20 and 100 GB of headroom, which happened 4.9% of last week; it still covers 93% of test runs. The guard's own kill log agrees with the tests row: its 121 kills were mostly <code>rustc</code> and <code>pytest</code>, killed at 1.1–2.3 GB on their way up.</p>
 
 <h3>Works the same for Claude, Codex and local agents</h3>
 <p>I started a Codex agent and a local agent, had each run <code>sleep 180</code>, and read their process trees. All three providers run a command as a child process of the agent program, so one rule covers them: <b>the command is the child of the agent program, together with everything under it.</b> They differ in what wraps the command and in what else the agent program keeps running. The table shows those differences.</p>
@@ -185,6 +196,12 @@
 </tbody>
 </table>
 <p>The table forces two fixes. First, sm must watch <i>every</i> window of a session. Today it maps each session to one pane, so it sees a local agent's commands only by accident of listing order. Second, the agent's own helpers must never be shown as background jobs. sm ignores children that started within 10 seconds of the agent program, which covers MCP servers and startup helpers, plus a built-in list of known helpers: the Codex three above and <code>caffeinate</code>. The 1 GB adoption still applies to helpers. A helper that large should be visible.</p>
+
+<h3>Commands an agent detaches</h3>
+<p>You asked whether sm can see a command that an agent starts with <code>nohup … &amp;</code>, after the shell that started it has exited. <b>Yes, through the process group.</b> When the shell exits, macOS hands the command to the system's root process (PID 1) and forgets its parent. macOS also hides another process's environment from sm, so the agent's id there cannot be read. What survives is the process group, a number every process carries and inherits. Each command an agent starts gets a group named after the shell that ran it, and a detached command keeps that group.</p>
+<p>I checked this on my own session: <code>( nohup sleep 306 &amp; )</code> left <code>sleep</code> with parent 1 and group 34017, the PID of the shell Claude had started for the command, which had already exited.</p>
+<p>So sm records the group of every command it sees under an agent, with the agent's id. A process whose parent is 1 and whose group is on that record belongs to the agent: sm adopts it at 1 GB and shows it as a background job, like any other. The shell behind a detached command lives only milliseconds, too short for a 2-second sample. sm therefore also asks macOS to notify it each time an agent program starts a process (a kernel fork event) and records the group at that instant. In the test above the notice arrived while shell 34017 was still alive.</p>
+<p>What stays out of reach: a command that deliberately leaves its group (<code>setsid</code>, or a daemonizer that forks twice and starts a new group). That is rare in agent work, and sm does not attempt it.</p>
 
 <h3>What you see on the phone</h3>
 <figure>
@@ -202,11 +219,11 @@
     <rect x="22" y="194" width="276" height="3" fill="#1e1e28"/><rect x="22" y="194" width="74" height="3" fill="#5ee7ff"/>
     <line x1="18" y1="206" x2="300" y2="206" stroke="#2b2b37"/>
     <text x="22" y="226" font-weight="600" fill="#f5f7fa">cargo build -p sm-server</text><text x="186" y="226" fill="#adb2c2"> · far-2236</text>
-    <text x="22" y="242" font-size="10.5" fill="#adb2c2">shell · 3m · 3G of 10G reserved</text>
+    <text x="22" y="242" font-size="10.5" fill="#adb2c2">shell · 3m · 3G of 16G reserved</text>
     <rect x="22" y="248" width="276" height="3" fill="#1e1e28"/><rect x="22" y="248" width="83" height="3" fill="#4ade80"/>
     <line x1="18" y1="260" x2="300" y2="260" stroke="#2b2b37"/>
     <text x="22" y="280" font-weight="600" fill="#f5f7fa">python markets.py --replay</text><text x="196" y="280" fill="#adb2c2"> · far-1955</text>
-    <text x="22" y="296" font-size="10.5" fill="#adb2c2">shell · 22m · <tspan fill="#fbbf24">7G of 5G reserved</tspan></text>
+    <text x="22" y="296" font-size="10.5" fill="#adb2c2">shell · 22m · <tspan fill="#fbbf24">11G of 8G reserved</tspan></text>
     <text x="22" y="311" font-size="10.5" fill="#fbbf24">Over its reservation · stops first if memory runs short</text>
     <rect x="22" y="317" width="276" height="3" fill="#1e1e28"/><rect x="22" y="317" width="276" height="3" fill="#fbbf24"/>
     <line x1="18" y1="328" x2="300" y2="328" stroke="#2b2b37"/>
@@ -224,10 +241,10 @@
     <text x="22" y="236" font-size="10" fill="#777c8b" letter-spacing=".08em">HOW IT GOT HERE</text>
     <text x="22" y="254" font-size="11" fill="#f5f7fa">far-1955 started this from its own shell. At</text>
     <text x="22" y="269" font-size="11" fill="#f5f7fa">14:02 it passed 1 GB and sm took it into the</text>
-    <text x="22" y="284" font-size="11" fill="#f5f7fa">queue with 5 GB set aside.</text>
+    <text x="22" y="284" font-size="11" fill="#f5f7fa">queue with 8 GB set aside.</text>
     <text x="22" y="310" font-size="10" fill="#777c8b" letter-spacing=".08em">MEMORY</text>
-    <text x="22" y="328" font-size="11" fill="#f5f7fa">7.1 G now · peak 7.4 G · 5 G reserved</text>
-    <text x="22" y="343" font-size="11" fill="#adb2c2">Mac: 138 G free · 8 G kept in reserve</text>
+    <text x="22" y="328" font-size="11" fill="#f5f7fa">11.2 G now · peak 11.6 G · 8 G reserved</text>
+    <text x="22" y="343" font-size="11" fill="#adb2c2">Mac: 41 G free · 8 G kept in reserve</text>
     <text x="22" y="369" font-size="10" fill="#777c8b" letter-spacing=".08em">COMMAND</text>
     <text x="22" y="386" font-size="10.5" font-family="SF Mono,Menlo,monospace" fill="#adb2c2">cd ~/projects/fractal-algo-rust/training</text>
     <rect x="216" y="372" width="82" height="28" rx="14" fill="none" stroke="#fb7185"/><text x="257" y="390" text-anchor="middle" fill="#fb7185">Stop</text>
@@ -280,17 +297,21 @@
 <figure>
 <pre>[sm queue] At 14:31:07 UTC sm stopped `python markets.py --replay` (PID 41822 and 3 child
 processes), which you started from your shell at 14:02. The Mac ran short of memory (6.1 GB
-free; it keeps 8 GB in reserve), and this command was using 7.4 GB, above the 5 GB sm had
+free; it keeps 8 GB in reserve), and this command was using 11.6 GB, above the 8 GB sm had
 set aside for it. Rerun it through the queue so it waits for memory instead of being stopped:
 
-  sm queue run --type background --label markets-replay --memory 12G -- python markets.py --replay</pre>
-<figcaption>Figure 4. The stop message. <code>--memory</code> is 1.5 times the peak, rounded up to a whole GB. <code>--type</code> is <code>tests</code> when the command runs a test runner and <code>background</code> otherwise. If you pressed Stop, the second sentence reads "Rajesh stopped it from the Queue screen." If the Mac had under 20 GB of headroom when the command passed 1 GB, the message says so in place of the second sentence.</figcaption>
+  sm queue run --type <type> --label markets-replay --memory 18G -- python markets.py --replay
+
+Pick the type: tests for a test suite or build check; background for other long work (a
+performance run may stop it to get the machine quiet); perf only for a timing measurement,
+which needs --timeout and --cpu as well.</pre>
+<figcaption>Figure 4. The stop message. <code>--memory</code> is 1.5 times the peak, rounded up to a whole GB. sm cannot know what a command is for, so it fills in <code>--type tests</code> only for a known test runner (<code>cargo test</code>, <code>cargo nextest</code>, <code>pytest</code>, <code>python -m pytest</code>, <code>jest</code>, <code>scripts/test-*</code>). For anything else it leaves <code>&lt;type&gt;</code> and the three-line guide, because a wrong guess has a cost: a performance run displaces background jobs. If you pressed Stop, the second sentence reads "Rajesh stopped it from the Queue screen." If the Mac had under 20 GB of headroom when the command passed 1 GB, the message says so in place of the second sentence.</figcaption>
 </figure>
 
 <h3>Risks</h3>
 <ul>
 <li><b>A runaway shell job grows faster than the guard can act.</b> The 2026-10-08 incident climbed 260 GB in six minutes. The host memory guard checks every second and stops the job that is over its reservation first, so a runaway goes before anything well-behaved. That is the same protection queued jobs have today.</li>
-<li><b>A command that backgrounds itself and exits its shell</b> (<code>nohup … &amp;</code>, then the shell returns) leaves the agent's process tree. sm cannot see it, either today or after this change. This ticket leaves that unchanged.</li>
+<li><b>A command that calls <code>setsid</code> or a daemonizer</b> moves to a new process group and cannot be traced back to its agent (see "Commands an agent detaches"). That is rare in agent work. A plain <code>nohup … &amp;</code> is traced.</li>
 <li><b>A server restart while shell jobs run.</b> sm records each job's process identity. After a restart it keeps jobs whose process is still the same one and ends the rest.</li>
 </ul>
 
@@ -298,7 +319,9 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 <p>One ticket and one PR: server, <code>sm</code> CLI, web, and Android. After it merges I restart the server and rebuild the app. I will check it live on all three providers. A Claude agent, a Codex agent and a local agent each run a 2 GB allocation, which should appear as a shell job and finish untouched. Each agent also leaves a watcher running, which should show on its row. You can repeat both from any agent.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>First revision.</p>
+<p><b>Reservation sizes.</b> They are now 16 GB and 8 GB, sized from last week's queue readings, where the first revision used 10 GB and 5 GB. You asked for numbers from data.</p>
+<p><b>Detached commands.</b> A command an agent detaches with <code>nohup … &amp;</code> is now traced to its agent, adopted at 1 GB and shown as a background job. The first revision called this out of reach. You asked whether the process tree could show it. It can, through the process group (see "Commands an agent detaches").</p>
+<p><b>Job type in the stop message.</b> The resubmit line now names <code>tests</code> only for known test runners and otherwise asks the agent to choose. The first revision defaulted to <code>background</code>, a guess you questioned.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -324,10 +347,17 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
   <li>Local agent: <code>… supervisor → opencode serve → pytest</code> gives <i>R</i> = <code>pytest</code>. <code>opencode attach</code> in the other window is also a harness, but no commands run under it.</li>
   </ul>
   The job covers <i>R</i> and every descendant. The harness's own children that are helpers (E) are still roots for adoption, so a 1 GiB helper becomes a visible shell job and is not killed silently.</li>
+<li><b>Detached commands.</b> The guard keeps a group record: process group → (session id, root PID, root identity). It is filled from three sources:
+  <ul>
+  <li>every command root whose process group equals its own PID, seen in a pass;</li>
+  <li>on macOS, a kqueue <code>EVFILT_PROC</code> watch with <code>NOTE_FORK | NOTE_EXIT</code> on every harness process found in a pane walk. On each <code>NOTE_FORK</code> the guard lists that harness's children (<code>proc_listchildpids</code>) and records each new child's group. On <code>NOTE_EXIT</code> it drops the watch. Watches run on one dedicated thread, which adds watches for harnesses the pass reports.</li>
+  <li>on Linux, which has no fork notice, the 2-second pass only, plus <code>CLAUDE_SESSION_MANAGER_ID</code> read from <code>/proc/&lt;pid&gt;/environ</code> of any process whose parent is 1.</li>
+  </ul>
+  An entry is dropped when no listed process carries its group. In each pass, a process whose parent is PID 1 and whose group is on the record is a command root for that session: the walk treats it like a harness child for adoption (steps 4–7) and for background jobs (E), its descendants included. Example, observed 2026-10-19: <code>( nohup sleep 306 &amp; )</code> gave <code>sleep</code> PID 34026, parent 1, group 34017, and the fork notice on <code>claude</code> listed 34017 before it exited. Not covered: a process that calls <code>setsid</code> or <code>setpgid</code> into a new group.</li>
 <li><b>Already adopted.</b> If <i>R</i>'s PID and process identity match a running shell job, nothing happens. The guard never adopts or kills inside an adopted tree.</li>
 <li><b>Headroom.</b> <code>available − effective_memory_reserve_bytes(memory_min_free_bytes) − Σ max(0, memory_bytes − current_bytes)</code>, summed over running queue jobs that have <code>memory_bytes</code>. <code>available</code> comes from <code>host_memory_capacity()</code>, and <code>current_bytes</code> is the job's latest sampled memory (0 if unknown). If host memory cannot be read, the guard does not adopt and stops the command as today.</li>
-<li><b>Reservation.</b> Headroom ≥ 100 GiB gives 10 GiB. Headroom ≥ 20 GiB gives 5 GiB. Anything lower gives no adoption: the guard stops <i>R</i>'s tree, records the kill in <code>agent_process_kills</code> as today, and sends the no-headroom form of the stop message. The constants are <code>SHELL_JOB_RESERVATION_TIERS = [(100 GiB, 10 GiB), (20 GiB, 5 GiB)]</code>.
-  <br>Worked example: 256 GiB Mac, 140 GiB available, reserve 8 GiB, one perf job reserving 40 GiB and using 15 GiB. Headroom = 140 − 8 − 25 = 107 GiB, so the reservation is 10 GiB. A second adoption a moment later counts this job's 10 GiB as unused (it uses about 1 GiB), so it sees 98 GiB and reserves 5 GiB.</li>
+<li><b>Reservation.</b> Headroom ≥ 100 GiB gives 16 GiB. Headroom ≥ 20 GiB gives 8 GiB. Anything lower gives no adoption: the guard stops <i>R</i>'s tree, records the kill in <code>agent_process_kills</code> as today, and sends the no-headroom form of the stop message. The constants are <code>SHELL_JOB_RESERVATION_TIERS = [(100 GiB, 16 GiB), (20 GiB, 8 GiB)]</code>.
+  <br>Worked example: 256 GiB Mac, 140 GiB available, reserve 8 GiB, one perf job reserving 40 GiB and using 15 GiB. Headroom = 140 − 8 − 25 = 107 GiB, so the reservation is 16 GiB. A second adoption a moment later counts this job's 16 GiB as unused (it uses about 1 GiB), so it sees 92 GiB and reserves 8 GiB.</li>
 <li><b>Label.</b> The label comes from <i>R</i>'s arguments. For <code>zsh|bash|sh -c &lt;script&gt;</code> where the script contains <code>eval '&lt;cmd&gt;'</code> (Claude's wrapper), the label is <i>cmd</i> with <code>'\''</code> unescaped. For <code>-c</code> or <code>-lc &lt;cmd&gt;</code> (Codex, opencode), it is <i>cmd</i>. Otherwise it is <i>R</i>'s full arguments. Trailing <code>&lt; /dev/null</code> and <code>&amp;&amp; pwd -P &gt;| …</code> are dropped. Whitespace is collapsed and the label is cut to 120 characters with "…". The full text goes in <code>argv</code> as a single element.</li>
 </ol>
 
@@ -338,7 +368,7 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 <tbody>
 <tr><td><code>type</code></td><td><code>shell</code></td></tr>
 <tr><td><code>state</code> / <code>holding_reason</code></td><td><code>running</code> / NULL, then terminal (C)</td></tr>
-<tr><td><code>label</code>, <code>argv</code></td><td>Appendix A step 6</td></tr>
+<tr><td><code>label</code>, <code>argv</code></td><td>Appendix A step 7</td></tr>
 <tr><td><code>requester_session_id</code>, <code>notify_session_id</code></td><td>The pane's session id</td></tr>
 <tr><td><code>cwd</code></td><td><i>R</i>'s working directory (<code>proc_pidinfo</code> vnode path on macOS, <code>/proc/&lt;pid&gt;/cwd</code> on Linux), else empty</td></tr>
 <tr><td><code>queued_at</code>, <code>started_at</code></td><td>Adoption time. The shell job's age counts from <i>R</i>'s process start time, which <code>termination_detail_json.process_started_at</code> carries.</td></tr>
@@ -359,7 +389,7 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 <li><b>Tracking.</b> On each 2-second pass, the guard checks every running shell job. If <i>R</i> is gone, or its identity no longer matches, the job finishes as state <code>ended</code>, exit code NULL, with no message. The same check runs once at server start, before the first pass. That is the restart recovery: queue recovery (<code>recover_running_queue_job_conn</code>) skips <code>shell</code> rows.</li>
 <li><b>Usage.</b> The guard sums footprint over <i>R</i>'s subtree each pass and stores the latest value and the peak in memory, keyed by job id. The latest value is what <code>current_bytes</code> in A means. <code>/client/queue</code> reads this as the job's <code>usage.memory_bytes</code>, and the utilization recorder samples it like other running jobs.</li>
 <li><b>Stopping.</b> Any stop (host memory guard, owner Stop or <code>sm queue cancel</code>) signals <i>R</i>'s whole tree by PID, the way the guard's <code>stop_processes</code> does: SIGTERM, then SIGKILL after the job's stop grace, with identity checks against PID reuse. It never signals the process group, which may be shared. The terminal state is <code>memory_exceeded</code> for the host guard and <code>cancelled</code> for an owner or agent cancel. Each sends the stop message (Figure 4) through the message queue with category <code>queue-completion</code>, so it waits for the agent to be idle.</li>
-<li><b>Stop message.</b> It names the stop time in UTC, the command, its PID and descendant count, and the start time. Then one cause sentence (host pressure with free and reserve figures, owner Stop, agent's own cancel, or no headroom at adoption). Then the resubmit line: <code>sm queue run --type &lt;tests|background&gt; --label &lt;slug&gt; --memory &lt;ceil(1.5 × peak) GB&gt; -- &lt;label command&gt;</code>. It adds <code>--cwd &lt;cwd&gt;</code> when the cwd is known and differs from the session's working directory. <code>tests</code> is chosen when the command contains <code>test</code>, <code>pytest</code>, <code>nextest</code> or <code>jest</code> as a word. The slug is the first two words of the command, lowercased and joined with <code>-</code>.</li>
+<li><b>Stop message.</b> It names the stop time in UTC, the command, its PID and descendant count, and the start time. Then one cause sentence (host pressure with free and reserve figures, owner Stop, agent's own cancel, or no headroom at adoption). Then the resubmit line: <code>sm queue run --type &lt;type&gt; --label &lt;slug&gt; --memory &lt;ceil(1.5 × peak) GB&gt; -- &lt;label command&gt;</code>. It adds <code>--cwd &lt;cwd&gt;</code> when the cwd is known and differs from the session's working directory. <code>--type tests</code> is filled in only when the label command, after any leading <code>cd … &amp;&amp;</code> segments (the rule in <code>activity_ledger::shell_kind</code>), starts with <code>cargo test</code>, <code>cargo nextest</code>, <code>pytest</code>, <code>python -m pytest</code>, <code>python3 -m pytest</code>, <code>npx jest</code>, <code>jest</code>, or <code>scripts/test-</code> / <code>./scripts/test-</code>. Otherwise the line keeps the literal <code>&lt;type&gt;</code>, followed by the three-line guide in Figure 4. The slug is the first two words of the command, lowercased and joined with <code>-</code>.</li>
 </ul>
 
 <h3 id="D">D. Host memory guard order</h3>
@@ -367,7 +397,7 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 
 <h3 id="E">E. Background jobs</h3>
 <ul>
-<li><b>Definition.</b> A command root (A step 2) that is not a helper, found while the session's activity state is not <code>working</code> or <code>thinking</code>. A root is a helper when any of these holds:
+<li><b>Definition.</b> A command root (A steps 2 and 3) that is not a helper, found while the session's activity state is not <code>working</code> or <code>thinking</code>. A root is a helper when any of these holds:
   <ul>
   <li>It started no more than 10 seconds after its harness process started. This covers MCP servers and the Codex REPL helpers, which start with the agent.</li>
   <li>Its basename is in the built-in list <code>caffeinate</code>, <code>codex-code-mode-host</code>, <code>node_repl</code>.</li>
@@ -375,7 +405,7 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
   <li>Its basename is in the new config list <code>queue_runner.memory.background_ignore_commands</code> (default empty).</li>
   </ul>
   The rule is the same for every provider. Example: an idle Codex agent with <code>cua-repl</code>, <code>node_repl</code> and <code>npm run dev</code> under <code>codex-fork</code> shows one background job, <code>npm run dev</code>.</li>
-<li><b>Snapshot.</b> The guard pass publishes <code>{session_id → [{pid, command, started_at, memory_bytes, shell_job_id?}]}</code> to an in-memory map. It is not persisted. <code>command</code> is the label rule from A step 6. <code>shell_job_id</code> is set when the root is also a shell job. Arguments are read once per (pid, identity) and cached.</li>
+<li><b>Snapshot.</b> The guard pass publishes <code>{session_id → [{pid, command, started_at, memory_bytes, shell_job_id?}]}</code> to an in-memory map. It is not persisted. <code>command</code> is the label rule from A step 7. <code>shell_job_id</code> is set when the root is also a shell job. Arguments are read once per (pid, identity) and cached.</li>
 <li><b>Activity.</b> An agent whose turn has stopped and whose snapshot is non-empty reports <code>activity_state = "waiting"</code>, as Claude does today from its footer. The process tree is now the source for every provider, and the Claude footer reading stays as a fallback when no snapshot exists.</li>
 <li><b>Facts.</b> <code>facts.jobs</code> in <code>http/watch.rs</code>: when there are no queue jobs and the snapshot has one entry, the text is <code>"◷ Watching: &lt;command, cut to 40&gt;"</code>. With two or more, it is <code>"◷ N in background"</code>. Both use the new tone <code>"background"</code>, which the app and web render in cyan. Queue jobs, including shell jobs, keep their existing text, with the background count appended as <code>" · N in background"</code>.</li>
 <li><b>API.</b> <code>GET /client/sessions</code> and <code>/client/sessions/{id}</code> carry <code>background_jobs</code>: the snapshot list, or an empty list.</li>
@@ -389,7 +419,7 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 <tr><td>Android Queue (<code>QueueScreen.kt</code>, <code>QueueModels.kt</code>)</td><td><code>runningLine</code> for shell: <code>shell · &lt;age&gt; · &lt;use&gt;G of &lt;reserved&gt;G reserved</code>. The progress bar shows use over reservation, Emerald when at or under it and Amber over it (capped at full). The amber reason line comes from <code>holding.summary</code>. <code>slotsLine</code> appends <code>shell N</code> when N &gt; 0 and adds the missing <code>review</code>. The sheet shows "How it got here", "Memory" (now, peak, reserved, Mac free and reserve) and "Command" sections, plus the existing Stop button.</td></tr>
 <tr><td>Android Watch (<code>WatchModels.kt</code>, <code>WatchScreen.kt</code>)</td><td><code>jobsToneColor("background")</code> = Cyan. <code>activityLabel("waiting")</code> = "background". <code>AgentWorkSections</code> gains a "Running in the background" list above Jobs: command in monospace, then "started &lt;age&gt; ago · &lt;memory&gt;".</td></tr>
 <tr><td>Web (<code>web/queue.js</code>, <code>queue.css</code>, <code>web/agents.js</code>)</td><td>Sixth tile "Shell" (count, no maximum). The CSS grid becomes 6 columns, wrapping to 3 under 720 px. In the job row, the memory bar replaces the time bar for shell jobs, and the panel matches the Android sheet with no log tab (shell jobs have no log). The Agents page gets the cyan tone and the background list in the agent panel.</td></tr>
-<tr><td><code>sm queue list</code> (<code>bin/sm.rs</code>)</td><td>Shell rows appear in the normal table with type <code>shell</code>, state <code>running</code> or <code>ended</code>, and Holding "5G reserved, using 7G". <code>--type shell</code> becomes a valid filter. The kills table remains for no-headroom stops.</td></tr>
+<tr><td><code>sm queue list</code> (<code>bin/sm.rs</code>)</td><td>Shell rows appear in the normal table with type <code>shell</code>, state <code>running</code> or <code>ended</code>, and Holding "8G reserved, using 11G". <code>--type shell</code> becomes a valid filter. The kills table remains for no-headroom stops.</td></tr>
 <tr><td>Utilization (<code>utilization.rs</code>)</td><td><code>job_samples</code> records shell jobs (job_type <code>shell</code>). The host per-type columns are unchanged.</td></tr>
 <tr><td>web-demo</td><td>Fixtures need no change. The demo shows no shell jobs until it is next regenerated.</td></tr>
 </tbody>
@@ -401,9 +431,10 @@ set aside for it. Rerun it through the queue so it waits for memory instead of b
 <li>Headroom tiers at 100, 99.9, 20 and 19.9 GiB, unused-reservation subtraction (the worked example in A), and unreadable host memory leading to a stop.</li>
 <li>Label extraction from the Claude wrapper (including <code>'\''</code>), from <code>bash -lc</code>, and from plain arguments.</li>
 <li>No re-adoption of an adopted root, and no kill inside an adopted tree.</li>
+<li>Group record: an orphan (parent 1) in a recorded group becomes a root for its session; an orphan in an unknown group is ignored; an entry drops when its group is empty. A macOS integration test runs <code>( nohup sleep 30 &amp; )</code> under a watched parent and asserts the sleep is attributed.</li>
 <li>Ending on root exit and on identity mismatch, plus restart recovery keeping a live identity and ending a stale one.</li>
 <li><code>host_pressure_victim</code> order: over-reservation shell before owner-forced before larger normal.</li>
-<li>Stop message for each of the four causes, including the computed <code>--memory</code> and <code>--type</code>.</li>
+<li>Stop message for each of the four causes, including the computed <code>--memory</code>, <code>--type tests</code> for each listed runner, and <code>&lt;type&gt;</code> with the guide for <code>python markets.py</code> and <code>cargo build</code>.</li>
 <li>Admission: shell jobs do not count toward <code>max_running_jobs</code>, and submitting <code>--type shell</code> is rejected.</li>
 <li>Facts text for zero, one and two background jobs, with and without queue jobs.</li>
 <li>Android unit tests for <code>runningLine</code>, <code>slotsLine</code> and the progress colour for shell jobs.</li>
