@@ -11,7 +11,8 @@ fn concurrent_initializers_finish_fresh_and_legacy_schemas() {
             if legacy {
                 let conn = Connection::open(&db).unwrap();
                 conn.execute_batch(
-                    "ALTER TABLE work_items DROP COLUMN is_draft;
+                    "DELETE FROM work_claims_meta WHERE key = 'work_claims_schema_version';
+                     ALTER TABLE work_items DROP COLUMN is_draft;
                      ALTER TABLE handoff_ticket_overrides DROP COLUMN ask_on_codex_review;
                      ALTER TABLE handoff_ticket_overrides DROP COLUMN ask_on_doc_review;",
                 )
@@ -49,6 +50,27 @@ fn concurrent_initializers_finish_fresh_and_legacy_schemas() {
             fs::remove_dir_all(db.parent().unwrap()).unwrap();
         }
     }
+}
+
+#[test]
+fn initialized_schema_remains_readable_while_another_writer_is_active() {
+    let (store, db) = new_store();
+    let mut writer = Connection::open(&db).unwrap();
+    let reader = Connection::open(&db).unwrap();
+    reader.busy_timeout(Duration::ZERO).unwrap();
+    let tx = writer
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    init_work_claims_schema(&reader).unwrap();
+    let read_only = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    read_only.busy_timeout(Duration::ZERO).unwrap();
+    init_work_claims_schema(&read_only).unwrap();
+    assert!(store.open_read().unwrap().is_some());
+    drop(read_only);
+    tx.rollback().unwrap();
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(db.parent().unwrap()).unwrap();
 }
 
 #[test]
