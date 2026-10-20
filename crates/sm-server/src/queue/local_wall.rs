@@ -375,7 +375,18 @@ pub(super) fn prepare(
     fs::create_dir_all(&directory)?;
     physical_directory(&directory)?;
     let command = directory.join(format!("{id}.zsh"));
-    let mut source = format!("cd {} || exit 127\n", shell_quote(&cwd.to_string_lossy()));
+    // Durable owners can survive this server upgrade with their old launcher.
+    // Set priority again in the host-authenticated command, before user work,
+    // so those owners' future jobs and all descendants also inherit nice 10.
+    let mut source = if request.job_type == "perf" {
+        String::new()
+    } else {
+        "/usr/bin/renice 10 $$ >/dev/null 2>&1 || true\n".to_owned()
+    };
+    source.push_str(&format!(
+        "cd {} || exit 127\n",
+        shell_quote(&cwd.to_string_lossy())
+    ));
     match (&request.argv, &request.script) {
         (Some(argv), None) if !argv.is_empty() => {
             source.push_str("exec -- ");
@@ -680,6 +691,35 @@ mod tests {
                 log.split_whitespace().collect::<Vec<_>>(),
                 [expected.to_string(), expected.to_string()],
                 "{kind}: {log}"
+            );
+            // Emulate a surviving pre-upgrade owner: the old queue launcher
+            // starts at inherited priority, with no new pre_exec adjustment.
+            let binding: JobBinding =
+                serde_json::from_str(runtime.local_binding_json.as_ref().unwrap()).unwrap();
+            let environment = spec
+                .environment
+                .iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect::<Vec<_>>();
+            let legacy_log = state_dir.join(format!("legacy-{kind}.log"));
+            let output = fs::File::create(&legacy_log).unwrap();
+            let mut child = fixture
+                .queue_binding()
+                .spawn_queue(
+                    &spec.shell,
+                    &["-df".into(), binding.command.into_os_string()],
+                    &environment,
+                    &binding.cwd,
+                    (output.try_clone().unwrap(), output, None),
+                    false,
+                )
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            let log = fs::read_to_string(legacy_log).unwrap();
+            assert_eq!(
+                log.split_whitespace().collect::<Vec<_>>(),
+                [expected.to_string(), expected.to_string()],
+                "legacy {kind}: {log}"
             );
         }
         let mut argv_request = request;

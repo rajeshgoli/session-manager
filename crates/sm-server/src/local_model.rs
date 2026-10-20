@@ -1178,10 +1178,13 @@ pub fn retry_reload(state_dir: &Path) -> Result<()> {
     if host.yield_worker.load(Ordering::SeqCst) {
         return Ok(());
     }
-    if host.record()?.is_none_or(|model| model.state != "yielded") {
-        return Ok(());
-    }
-    let blocked = crate::queue::model_reload_block(state_dir, host.queue_policy)?;
+    let blocked = match host.record()?.as_ref().map(|model| model.state.as_str()) {
+        Some("yielded") => crate::queue::model_reload_block(state_dir, host.queue_policy)?,
+        // A previous load may have become ready before durable resume failed.
+        // Keep retrying that effect, without reading queue history.
+        Some("ready") => ModelReloadBlock::None,
+        _ => return Ok(()),
+    };
     host.reload_pass(
         crate::queue::host_memory_capacity().map(|(_, a)| a),
         blocked,
