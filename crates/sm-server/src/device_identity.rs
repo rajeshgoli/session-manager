@@ -45,6 +45,19 @@ pub struct Identity {
     pub name: String,
     _lock: File,
 }
+impl Drop for Identity {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        // Closing our descriptor alone would leave its flock held by that child.
+        loop {
+            if unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) } == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+    }
+}
 fn regular(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     ensure!(
@@ -102,10 +115,9 @@ impl Identity {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(".lock"))?;
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "device identity is already in use"
-        );
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("lock device identity");
+        }
         let identity = Self {
             root: root.into(),
             name: name.into(),
@@ -226,4 +238,67 @@ pub(crate) fn certificate_expiry(pem: &str) -> Result<time::OffsetDateTime> {
         "[month repr:short] [day padding:none] [hour]:[minute]:[second] [year] GMT",
     )?;
     Ok(time::PrimitiveDateTime::parse(&normalized, &format)?.assume_utc())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::{OsRng, RngCore};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn dropping_identity_releases_lock_while_fork_child_keeps_descriptor() {
+        let root = std::env::temp_dir().join(format!("sm-identity-lock-{}", OsRng.next_u64()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        // Loading only checks the key's file type and permissions, not its contents.
+        atomic(&root, "private-key.pem", "unused fixture key").unwrap();
+        atomic(
+            &root,
+            "identity.json",
+            r#"{"name":"backup-mini","expires_at":"2099-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let identity = Identity::load(&root)
+            .unwrap_or_else(|error| panic!("initial identity load: {error:#}"));
+        assert!(
+            Identity::load(&root).is_err(),
+            "live owner must exclude another owner"
+        );
+        let (parent, child) = UnixStream::pair().unwrap();
+        let child_fd = child.as_raw_fd();
+        // Model a concurrent Command fork before exec closes CLOEXEC descriptors.
+        // The child calls only async-signal-safe libc functions and never unwinds.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let mut byte = 0u8;
+            unsafe {
+                while libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) < 0 {}
+                libc::_exit(0);
+            }
+        }
+        drop(child);
+        drop(identity);
+        let reloaded = Identity::load(&root);
+        let still_exclusive = Identity::load(&root).is_err();
+        // Reap the child before asserting, including when the regression occurs.
+        let released = unsafe { libc::write(parent.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        let mut status = 0;
+        let waited = loop {
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result != -1
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break result;
+            }
+        };
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(released, 1);
+        assert_eq!(waited, pid);
+        assert_eq!(status, 0);
+        reloaded.unwrap_or_else(|error| {
+            panic!("reload while child holds inherited descriptor: {error:#}")
+        });
+        assert!(still_exclusive, "reloaded owner must retain exclusivity");
+    }
 }
