@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use sm_server::{
     activity_ledger::ActivityRecorder,
     config::AppConfig,
@@ -53,6 +53,8 @@ const OPEN_FILE_SOFT_LIMIT_TARGET: u64 = 8192;
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8421)]
@@ -92,12 +94,39 @@ struct Args {
     take_over: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Restore all cold sessions before rolling back to a pre-cold binary.
+    ThawCold {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+    },
+}
+
+fn thaw_cold(config_path: &std::path::Path) -> Result<(usize, PathBuf)> {
+    let config = AppConfig::load_from_path_with_local_env(config_path, None::<&std::path::Path>)?;
+    let state_file = expand_home(&config.paths.state_file);
+    let dir = state_file.parent().context("state file has no parent")?;
+    let _exclusive = handover::bind_socket(dir).context("stop the server before thaw-cold")?;
+    let count = SessionStore::new(state_file.clone()).thaw_all_cold_sessions()?;
+    std::fs::remove_file(handover::socket_path(dir))?;
+    Ok((count, state_file))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // The LAN listener and ACME client both use rustls. Their dependency graph
     // enables more than one crypto backend, so choose one before either runs.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
+    if let Some(Command::ThawCold { config }) = args.command {
+        let (count, state_file) = thaw_cold(&config)?;
+        println!(
+            "Moved {count} cold sessions back into {}",
+            state_file.display()
+        );
+        return Ok(());
+    }
     if let Some(id) = args.backup_prepare {
         return sm_server::managed_artifacts::backup::lifecycle::run_worker(
             args.backup_db.unwrap(),
@@ -736,6 +765,8 @@ async fn main() -> Result<()> {
             }
         });
 
+        // SessionStore instances for this canonical path share the startup gate.
+        let cold_sweep_store = SessionStore::new(state_file.clone());
         let serving_listener = listener.try_clone()?;
         serving_listener.set_nonblocking(true)?;
         let serving_listener = TcpListener::from_std(serving_listener)?;
@@ -795,11 +826,27 @@ async fn main() -> Result<()> {
             ready.context("slot did not become healthy in four seconds")??;
             write_active_slot(handover_dir)?;
         }
+        let serving_since = std::time::Instant::now();
+        if takeover_stream.is_none() {
+            cold_sweep_store.enable_cold_sweeps(serving_since);
+        }
         let mut decision_rx = takeover_stream.take().map(|mut stream| {
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             tokio::task::spawn_blocking(move || {
+                let peer = handover::peer_pid(&stream);
                 let decision =
                     handover::read_decision(&mut stream).unwrap_or(handover::Decision::Rollback);
+                if matches!(
+                    decision,
+                    handover::Decision::Commit | handover::Decision::PeerExited
+                ) {
+                    match peer.and_then(handover::wait_peer_exit) {
+                        Ok(()) => cold_sweep_store.enable_cold_sweeps(serving_since),
+                        Err(error) => eprintln!(
+                            "cold sweep disabled: previous server exit not confirmed: {error:#}"
+                        ),
+                    }
+                }
                 let _ = sender.blocking_send((decision, stream));
             });
             receiver
@@ -1134,6 +1181,57 @@ fn raised_open_file_soft_limit(soft: u64, hard: u64, target: u64) -> Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_rollback_command_refuses_live_socket_and_thaws_offline() {
+        let dir = std::env::temp_dir().join(format!(
+            "cold-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.yaml");
+        let state_file = dir.join("sessions.json");
+        std::fs::write(
+            &config,
+            format!("paths:\n  state_file: {}\n", state_file.display()),
+        )
+        .unwrap();
+        let hot = serde_json::json!({"sessions":[{"id":"A"}]});
+        std::fs::write(&state_file, hot.to_string()).unwrap();
+        let cold = serde_json::json!({"version":1,"sessions":[{"anchor":"A","record":{"id":"X"}}],"session_runtime_launches":[]});
+        std::fs::write(dir.join("sessions.cold.json"), cold.to_string()).unwrap();
+        let live = handover::bind_socket(&dir).unwrap();
+        assert!(thaw_cold(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("stop the server"));
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap(),
+            hot.to_string()
+        );
+        drop(live);
+        assert_eq!(thaw_cold(&config).unwrap().0, 1);
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"sessions":[{"id":"A"},{"id":"X"}]})
+        );
+        assert!(!dir.join("sessions.cold.json").exists());
+        let args = Args::try_parse_from([
+            "sm-server",
+            "thaw-cold",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(args.command, Some(Command::ThawCold { .. })));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn rollback_initialization_failure_stops_at_five_minutes() {

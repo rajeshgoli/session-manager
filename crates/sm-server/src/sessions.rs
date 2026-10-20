@@ -51,6 +51,8 @@ mod handoff_store;
 mod handoff_transfer;
 #[path = "owner_settings/store.rs"]
 mod owner_settings_store;
+#[path = "session_cold.rs"]
+mod session_cold;
 #[path = "terminal_images.rs"]
 mod terminal_images;
 use crate::handoff::policy::HandoffDefaults;
@@ -58,6 +60,7 @@ use handoff_store::{handoff_session_ref, handoff_view_for_record};
 pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};
 use handoff_transfer::handoff_fences_delivery_raw;
 pub use handoff_transfer::{HandoffAcceptOutcome, HandoffFacts, HandoffWork, SuccessorPlan};
+use session_cold::{ColdSegment, MergedRaw};
 
 /// The provider is live, but acceptance of its submitted initial turn is unknown.
 #[derive(Debug)]
@@ -106,6 +109,8 @@ static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct SharedSessionState {
     write_lock: Arc<Mutex<()>>,
     parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
+    cold_state: Mutex<Option<session_cold::CachedColdState>>,
+    cold_sweep_not_before: Mutex<Option<Instant>>,
     #[cfg(test)]
     parses: AtomicU64,
 }
@@ -140,6 +145,16 @@ fn canonical_state_path(path: &Path) -> PathBuf {
         }
     }
     resolved
+}
+
+/// The sidecar filename is reserved even when the hot path is a symlink.
+pub(crate) fn validate_session_state_path(path: &Path) -> Result<()> {
+    let resolved = canonical_state_path(path);
+    anyhow::ensure!(
+        resolved.file_name() != Some(std::ffi::OsStr::new("sessions.cold.json")),
+        "paths.state_file must not resolve to sessions.cold.json; that filename is reserved for the cold segment"
+    );
+    Ok(())
 }
 
 fn shared_session_state(path: &Path) -> Arc<SharedSessionState> {
@@ -1673,6 +1688,7 @@ impl SessionStore {
         let _launch = crate::handover::runtime_launch_gate().begin()?;
         let (rotation, session, recovering_launch_id) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
             let rotations = session_credential_rotation_records(state)?;
@@ -1829,7 +1845,7 @@ impl SessionStore {
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         let mut launches = session_runtime_launch_records(&state)?;
-        let launch_id = generate_unique_runtime_launch_id(&launches)?;
+        let launch_id = self.allocate_runtime_launch_id(&launches)?;
         let now = now_rfc3339();
         launches.push(SessionRuntimeLaunchRecord {
             id: launch_id.clone(),
@@ -1956,6 +1972,7 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
         self.write_raw_json_value(&state)
@@ -1967,6 +1984,7 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         mark_session_runtime_missing_terminal(&mut state, session_id)?;
         self.write_raw_json_value(&state)
@@ -2609,8 +2627,16 @@ impl SessionStore {
         }
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                subject_session_id,
+                target_parent_session_id,
+                requester_session_id,
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let sessions = self.load_parsed_state()?.snapshot()?.into_sessions();
         if !session_credential_matches(&sessions, requester_session_id, session_credential) {
             return Ok(ReparentMutationOutcome::Forbidden(
                 "session credential is missing, stale, or does not match the claimed actor"
@@ -2793,8 +2819,12 @@ impl SessionStore {
             ));
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[source_session_id, target_session_id, requester_session_id],
+        )?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let sessions = self.load_parsed_state()?.snapshot()?.into_sessions();
         if !session_credential_matches(&sessions, requester_session_id, session_credential) {
             return Ok(ReparentMutationOutcome::Forbidden(
                 "session credential is missing, stale, or does not match the claimed actor"
@@ -3112,7 +3142,7 @@ impl SessionStore {
 
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let sessions = self.load_parsed_state()?.snapshot()?.into_sessions();
         if !session_credential_matches(&sessions, requester_session_id, session_credential) {
             return Ok(ReparentMutationOutcome::Forbidden(
                 "session credential is missing, stale, or does not match the claimed actor"
@@ -3221,7 +3251,7 @@ impl SessionStore {
         }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let sessions = self.load_parsed_state()?.snapshot()?.into_sessions();
         let mut records = reparent_request_records(&state)?;
         let now = OffsetDateTime::now_utc();
         let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
@@ -3361,6 +3391,7 @@ impl SessionStore {
         runtime: Option<&TmuxRuntime>,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[child_session_id])?;
         let mut state = self.load_raw_json_value()?;
         if let Some(request_id) =
             active_reparent_route_request_for_session(&state, child_session_id)?
@@ -3458,7 +3489,7 @@ impl SessionStore {
             let mut changed = refreshed;
             changed |= reconcile_reparent_notification_intents(&mut records);
             if changed {
-                let mut state = state.clone();
+                let mut state = self.load_raw_json_value()?;
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
@@ -3770,7 +3801,7 @@ impl SessionStore {
             // The lifecycle worker may inspect an idle registry frequently.
             // An idle pass must not rewrite the complete sessions file.
             if refreshed || state.get("reparent_requests").is_none() {
-                let mut state = state.clone();
+                let mut state = self.load_raw_json_value()?;
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
@@ -3781,7 +3812,7 @@ impl SessionStore {
             records[index].ready_to_apply = false;
             records[index].failure_reason = Some(reason);
             records[index].decided_at = Some(now_rfc3339());
-            let mut state = state.clone();
+            let mut state = self.load_raw_json_value()?;
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
             return Ok(None);
@@ -3793,7 +3824,7 @@ impl SessionStore {
         records[index].apply_stage = Some("applying".to_owned());
         records[index].apply_plan = Some(plan);
         records[index].failure_reason = None;
-        let mut state = state.clone();
+        let mut state = self.load_raw_json_value()?;
         store_reparent_request_records(&mut state, &records)?;
         store_reparent_apply_lease(
             &mut state,
@@ -4603,6 +4634,7 @@ impl SessionStore {
 
         let record = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             if let Some(request_id) = active_reparent_request_for_session(&state, session_id)? {
                 return Ok(CredentialRotationOutcome::Conflict(format!(
@@ -4844,6 +4876,7 @@ impl SessionStore {
             return Ok(false);
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         if state["handoff_deferred_sessions"][id] != true {
             return Ok(false);
@@ -4874,11 +4907,18 @@ impl SessionStore {
         handoff: Option<(&str, Option<&str>)>,
     ) -> Result<SessionRecord> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                request.parent_session_id.as_deref().unwrap_or_default(),
+                handoff.map(|(id, _)| id).unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         if let Some(parent_id) = request.parent_session_id.as_deref() {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
-        let naming_sessions = sessions_with_registered_aliases(&state);
+        let naming_sessions = sessions_with_registered_aliases(&self.load_parsed_state()?.raw);
         let record = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let record = self.build_core_session_record(
@@ -4974,6 +5014,13 @@ impl SessionStore {
     ) -> Result<SessionRecord> {
         let (provider, working_dir) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(
+                &_guard,
+                &[
+                    existing_id.unwrap_or_default(),
+                    request.parent_session_id.as_deref().unwrap_or_default(),
+                ],
+            )?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
             let sessions = state
@@ -5003,11 +5050,18 @@ impl SessionStore {
             .map(|working_dir| self.lock_codex_cli_binding_working_dir(working_dir))
             .transpose()?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                existing_id.unwrap_or_default(),
+                request.parent_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         if let Some(parent_id) = request.parent_session_id.as_deref() {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
-        let naming_sessions = sessions_with_registered_aliases(&state);
+        let naming_sessions = sessions_with_registered_aliases(&self.load_parsed_state()?.raw);
         let mut record = if let Some(id) = existing_id {
             anyhow::ensure!(
                 state["handoff_deferred_sessions"][id] == true,
@@ -5098,7 +5152,7 @@ impl SessionStore {
             )
         });
         let mut launch_records = session_runtime_launch_records(&state)?;
-        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_id = self.allocate_runtime_launch_id(&launch_records)?;
         let launch_time = now_rfc3339();
         launch_records.push(SessionRuntimeLaunchRecord {
             id: launch_id.clone(),
@@ -5178,6 +5232,13 @@ impl SessionStore {
             });
             if !acceptance_unknown {
                 let _guard = self.write_guard()?;
+                self.thaw_ids_locked(
+                    &_guard,
+                    &[
+                        existing_id.unwrap_or_default(),
+                        request.parent_session_id.as_deref().unwrap_or_default(),
+                    ],
+                )?;
                 let mut state = self.load_raw_json_value()?;
                 let error_message = format!("{error:#}");
                 let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
@@ -5247,6 +5308,13 @@ impl SessionStore {
                 Err(error) => {
                     let teardown_error = runtime.kill_session(&record.tmux_session).err();
                     let _guard = self.write_guard()?;
+                    self.thaw_ids_locked(
+                        &_guard,
+                        &[
+                            existing_id.unwrap_or_default(),
+                            request.parent_session_id.as_deref().unwrap_or_default(),
+                        ],
+                    )?;
                     let mut state = self.load_raw_json_value()?;
                     let remove_provisional_session = existing_id.is_none()
                         && teardown_error.is_none()
@@ -5279,6 +5347,13 @@ impl SessionStore {
             }
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                existing_id.unwrap_or_default(),
+                request.parent_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = sessions
@@ -5401,6 +5476,13 @@ impl SessionStore {
         request: SendCoreInputRequest,
     ) -> Result<Option<CoreInputResult>> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                session_id,
+                request.sender_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -5442,6 +5524,13 @@ impl SessionStore {
             return self.send_opencode_input(session_id, request, runtime);
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                session_id,
+                request.sender_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
 
         let Some(initial_status) = runtime_session_status_raw(&mut state, session_id)? else {
@@ -5583,6 +5672,7 @@ impl SessionStore {
             return self.drain_reparent_runtime_messages(session_id, runtime);
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         if let Some(queue) = &self.queue_store {
             let before = self.load_parsed_state()?;
@@ -5597,7 +5687,7 @@ impl SessionStore {
                 None,
                 false,
             )?;
-            if !result.delivered_message_ids.is_empty() || state != before.raw {
+            if !result.delivered_message_ids.is_empty() || state != before.raw.hot {
                 self.write_raw_json_value(&state)?;
             }
         }
@@ -5625,6 +5715,7 @@ impl SessionStore {
             };
             let (target, text) = {
                 let _guard = self.write_guard()?;
+                self.thaw_ids_locked(&_guard, &[session_id])?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
                 let text = raw_session_object(state, session_id)
@@ -5674,6 +5765,7 @@ impl SessionStore {
             };
 
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             if !reparent_runtime_delivery_target(&state, session_id, runtime)?
                 .is_some_and(|current| current == target)
@@ -5721,6 +5813,7 @@ impl SessionStore {
         }
         drop(parsed);
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let Some(queue) = &self.queue_store else {
             return Ok(false);
@@ -5742,7 +5835,7 @@ impl SessionStore {
         let result = drain_pending_runtime_messages_raw(
             self, &mut state, session_id, runtime, queue, None, None, None, true,
         )?;
-        if !result.delivered_message_ids.is_empty() || state != before.raw {
+        if !result.delivered_message_ids.is_empty() || state != before.raw.hot {
             self.write_raw_json_value(&state)?;
         }
         Ok(true)
@@ -5836,6 +5929,7 @@ impl SessionStore {
         runtime: Option<&TmuxRuntime>,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         if let Some(queue) = &self.queue_store {
             enqueue_stop_notification_raw(self, &mut state, runtime, queue, session_id, text)?;
@@ -5858,6 +5952,7 @@ impl SessionStore {
         request: ClearSessionRequest,
     ) -> Result<CoreClearOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -5919,6 +6014,7 @@ impl SessionStore {
             previous_provider_resume_id,
         ) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let claimed_provider_resume_ids = sessions
@@ -6062,6 +6158,7 @@ impl SessionStore {
 
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
@@ -6158,6 +6255,7 @@ impl SessionStore {
         };
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
@@ -6197,6 +6295,7 @@ impl SessionStore {
     )> {
         let clear_guard = self.lock_clear_operation(session_id)?;
         let state_guard = self.write_guard()?;
+        self.thaw_ids_locked(&state_guard, &[session_id])?;
         let input_guard = runtime.lock_session_input(tmux_session)?;
         Ok((clear_guard, state_guard, input_guard))
     }
@@ -6251,12 +6350,13 @@ impl SessionStore {
 
     pub fn restore_core_session(&self, session_id: &str) -> Result<Option<CoreRestoreOutcome>> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
         if deferred_handoff_restore_is_fenced(&state, session_id)? {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
-        let naming_sessions = sessions_with_registered_aliases(&state);
+        let naming_sessions = sessions_with_registered_aliases(&self.load_parsed_state()?.raw);
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let new_name = sessions
             .iter()
@@ -6304,6 +6404,7 @@ impl SessionStore {
     ) -> Result<Option<CoreRestoreOutcome>> {
         let _launch = crate::handover::runtime_launch_gate().begin()?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
         // Decide under the same write guard that persists create intent. A
@@ -6312,7 +6413,7 @@ impl SessionStore {
         if deferred_handoff_restore_is_fenced(&state, session_id)? {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
-        let snapshot = snapshot_from_raw_value(&state)?;
+        let snapshot = self.load_parsed_state()?.snapshot()?;
         let Some(mut record) = snapshot
             .sessions
             .iter()
@@ -6418,7 +6519,7 @@ impl SessionStore {
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         let mut launch_records = session_runtime_launch_records(&state)?;
-        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_id = self.allocate_runtime_launch_id(&launch_records)?;
         let launch_time = now_rfc3339();
         launch_records.push(SessionRuntimeLaunchRecord {
             id: launch_id.clone(),
@@ -6614,7 +6715,7 @@ impl SessionStore {
             }
         }
 
-        let naming_sessions = sessions_with_registered_aliases(&state);
+        let naming_sessions = sessions_with_registered_aliases(&self.load_parsed_state()?.raw);
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let new_name = record
             .friendly_name
@@ -6781,6 +6882,13 @@ impl SessionStore {
         request: ContextMonitorRequest,
     ) -> Result<ContextMonitorOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                session_id,
+                request.notify_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -6995,6 +7103,7 @@ impl SessionStore {
             }
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         if raw_session_object(&state, session_id).is_none() {
             return Ok(ContextUsageOutcome::UnknownSession);
@@ -7525,6 +7634,7 @@ impl SessionStore {
         );
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -7672,6 +7782,7 @@ impl SessionStore {
         reserved_human_names: &BTreeSet<String>,
     ) -> Result<SessionMetadataOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         recover_missing_maintainer_registration_raw(&mut state)?;
         prune_agent_registrations_raw(&mut state)?;
@@ -7690,7 +7801,7 @@ impl SessionStore {
             .and_then(|aliases| aliases.iter().next().cloned());
         if let Some(friendly_name) = request.friendly_name.as_deref() {
             if let Some(error) = validate_friendly_name_update_raw(
-                &state,
+                &self.load_parsed_state()?.raw,
                 session_id,
                 friendly_name,
                 &primary_alias,
@@ -7796,6 +7907,7 @@ impl SessionStore {
     /// Call before delivering its brief; no HTTP route exposes this operation.
     pub fn authorize_autopm_seat(&self, session_id: &str) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let session = session_object_mut(sessions, session_id)
@@ -7913,6 +8025,7 @@ impl SessionStore {
         }
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         recover_missing_maintainer_registration_raw(&mut state)?;
         prune_agent_registrations_raw(&mut state)?;
@@ -7974,6 +8087,7 @@ impl SessionStore {
         }
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         recover_missing_maintainer_registration_raw(&mut state)?;
         prune_agent_registrations_raw(&mut state)?;
@@ -8036,6 +8150,7 @@ impl SessionStore {
     ) -> Result<CoreRetireOutcome> {
         let _submission_guard = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
         let sessions_snapshot = snapshot_from_raw_value(&state)?.into_sessions();
@@ -8140,6 +8255,7 @@ impl SessionStore {
         }
         let _submission_guard = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
         let sessions_snapshot = snapshot_from_raw_value(&state)?.into_sessions();
@@ -8280,6 +8396,7 @@ impl SessionStore {
         request: AgentStatusRequest,
     ) -> Result<Option<AgentStatusResult>> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -8326,6 +8443,7 @@ impl SessionStore {
         }
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
@@ -8488,6 +8606,7 @@ impl SessionStore {
         }
 
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         if !sessions.iter().any(|session| session.id == session_id) {
@@ -8513,6 +8632,14 @@ impl SessionStore {
         request: ArmStopNotifyRequest,
     ) -> Result<ArmStopNotifyOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                session_id,
+                &request.requester_session_id,
+                &request.sender_session_id,
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let Some(target) = sessions.iter().find(|session| session.id == session_id) else {
@@ -8585,6 +8712,7 @@ impl SessionStore {
         request: SubagentStartRequest,
     ) -> Result<SubagentStartOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let now = now_python_naive_iso();
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -8614,6 +8742,7 @@ impl SessionStore {
         request: SubagentStopRequest,
     ) -> Result<SubagentStopOutcome> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let now = now_python_naive_iso();
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -8752,7 +8881,7 @@ impl SessionStore {
     }
 
     fn load_raw_json_value(&self) -> Result<Value> {
-        Ok(self.load_parsed_state()?.raw.clone())
+        Ok(self.load_parsed_state()?.raw.hot.clone())
     }
 
     /// The current state file, parsed once per version and shared read-only.
@@ -8761,7 +8890,11 @@ impl SessionStore {
     fn load_parsed_state(&self) -> Result<Arc<ParsedState>> {
         let state_file = self.readable_state_file();
         if !state_file.exists() {
-            return Ok(Arc::new(ParsedState::new(json!({ "sessions": [] }))));
+            let (_, cold) = self.load_cold_segment()?;
+            return Ok(Arc::new(ParsedState::with_cold(
+                json!({ "sessions": [] }),
+                cold,
+            )));
         }
         self.parsed_state_at(&state_file)
     }
@@ -8783,11 +8916,16 @@ impl SessionStore {
             StateFileStamp::of(&file.metadata().with_context(|| {
                 format!("failed to read session state {}", state_file.display())
             })?);
+        let (cold_stamp, cold) = self.load_cold_segment()?;
         // Parse while holding the lock: after a write, every poller misses at
         // once, and waiting for the first parse is cheaper than repeating it.
         if let Some(parsed) = cached
             .as_ref()
-            .filter(|cached| cached.path == state_file && cached.stamp == stamp)
+            .filter(|cached| {
+                cached.path == state_file
+                    && cached.stamp == stamp
+                    && cached.cold_stamp == cold_stamp
+            })
             .map(|cached| Arc::clone(&cached.parsed))
         {
             return Ok(parsed);
@@ -8799,10 +8937,11 @@ impl SessionStore {
             .with_context(|| format!("failed to parse session state {}", state_file.display()))?;
         #[cfg(test)]
         self.shared.parses.fetch_add(1, Ordering::Relaxed);
-        let parsed = Arc::new(ParsedState::new(raw));
+        let parsed = Arc::new(ParsedState::with_cold(raw, cold));
         *cached = Some(CachedParsedState {
             path: state_file.to_path_buf(),
             stamp,
+            cold_stamp,
             parsed: Arc::clone(&parsed),
         });
         Ok(parsed)
@@ -8817,6 +8956,7 @@ impl SessionStore {
         value: &Value,
         after_rename: impl FnOnce(),
     ) -> Result<()> {
+        validate_session_state_path(&self.state_file)?;
         #[cfg(test)]
         self.state_writes.fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = self.state_file.parent() {
@@ -8834,7 +8974,6 @@ impl SessionStore {
         file.write_all(&serde_json::to_vec_pretty(value)?)?;
         file.flush()?;
         let written = StateFileStamp::of(&file.metadata()?);
-        let parsed = Arc::new(ParsedState::new(value.clone()));
         let mut cached = self
             .shared
             .parsed_state
@@ -8850,6 +8989,8 @@ impl SessionStore {
         // A rename can change ctime. Compare the other handle-derived fields,
         // then retain ctime from the reopened handle for future cache checks.
         let previous = cached.take();
+        let (cold_stamp, cold) = self.load_cold_segment()?;
+        let parsed = Arc::new(ParsedState::with_cold(value.clone(), cold));
         let installed = fs::File::open(&self.state_file)
             .and_then(|file| file.metadata())
             .map(|metadata| StateFileStamp::of(&metadata))?;
@@ -8861,6 +9002,7 @@ impl SessionStore {
             *cached = Some(CachedParsedState {
                 path: self.state_file.clone(),
                 stamp: installed,
+                cold_stamp,
                 parsed,
             });
         }
@@ -8878,6 +9020,11 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn test_write_lock_attempts(&self) -> u64 {
         self.write_lock_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_merged_json(&self) -> Value {
+        (*self.load_parsed_state().unwrap().raw).clone()
     }
 
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
@@ -11242,26 +11389,32 @@ impl StateFileStamp {
 struct CachedParsedState {
     path: PathBuf,
     stamp: StateFileStamp,
+    cold_stamp: Option<StateFileStamp>,
     parsed: Arc<ParsedState>,
 }
 
 /// One parse of the state file. The typed snapshot is derived on first use.
 #[derive(Debug)]
 struct ParsedState {
-    raw: Value,
+    raw: MergedRaw,
     snapshot: std::sync::OnceLock<StateSnapshot>,
     view: OnceLock<Arc<SessionsView>>,
 }
 
 impl ParsedState {
-    fn new(mut raw: Value) -> Self {
+    #[cfg(test)]
+    fn new(raw: Value) -> Self {
+        Self::with_cold(raw, Arc::new(ColdSegment::default()))
+    }
+
+    fn with_cold(mut raw: Value, cold: Arc<ColdSegment>) -> Self {
         if let Some(sessions) = raw.get_mut("sessions").and_then(Value::as_array_mut) {
             for session in sessions {
                 normalize_opencode_runtime_record(session);
             }
         }
         Self {
-            raw,
+            raw: MergedRaw::new(raw, cold),
             snapshot: std::sync::OnceLock::new(),
             view: OnceLock::new(),
         }
@@ -12826,11 +12979,14 @@ fn complete_runtime_message_delivery_with_sender_drain_raw(
     drain_sender: bool,
 ) -> Result<()> {
     let sanitized_message;
-    let message = if message
-        .sender_session_id
-        .as_deref()
-        .is_some_and(|sender_id| raw_session_object(state, sender_id).is_none())
-    {
+    let sender_missing = match message.sender_session_id.as_deref() {
+        Some(sender) => {
+            raw_session_object(state, sender).is_none()
+                && raw_session_object(&store.load_parsed_state()?.raw, sender).is_none()
+        }
+        None => false,
+    };
+    let message = if sender_missing {
         sanitized_message = PendingMessage {
             sender_session_id: None,
             sender_name: None,
@@ -13020,7 +13176,13 @@ fn complete_stop_notify_after_stop_raw(
     }
     clear_stop_notify_raw(state, session_id)?;
 
-    if raw_session_object(state, &stop_notify.sender_session_id).is_none() {
+    if raw_session_object(state, &stop_notify.sender_session_id).is_none()
+        && raw_session_object(
+            &store.load_parsed_state()?.raw,
+            &stop_notify.sender_session_id,
+        )
+        .is_none()
+    {
         return Ok(());
     }
 
@@ -13065,7 +13227,9 @@ fn enqueue_stop_notification_raw(
     sender_session_id: &str,
     text: &str,
 ) -> Result<()> {
-    if raw_session_object(state, sender_session_id).is_none() {
+    if raw_session_object(state, sender_session_id).is_none()
+        && raw_session_object(&store.load_parsed_state()?.raw, sender_session_id).is_none()
+    {
         return Ok(());
     }
     queue.enqueue_message(sender_session_id, text, "important", Some("stop_notify"))?;

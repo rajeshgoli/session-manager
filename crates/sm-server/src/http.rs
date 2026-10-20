@@ -18241,6 +18241,9 @@ struct SessionOpenDefaults {
 
 #[cfg(test)]
 mod tests {
+    mod cold_tests {
+        include!("http/cold_tests.rs");
+    }
     mod perf_tests {
         include!("http/perf_tests.rs");
     }

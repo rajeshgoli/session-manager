@@ -1,10 +1,91 @@
 import json
+import pytest
+
+from scripts.rust_migration import state_backup
 
 from scripts.rust_migration.state_backup import (
     build_backup_plan,
     main as state_backup_main,
     render_text_report,
 )
+
+
+def _replace_json(path, value):
+    temporary = path.with_name(path.name + ".next")
+    temporary.write_text(json.dumps(value))
+    temporary.replace(path)
+
+
+@pytest.mark.parametrize("movement", ["thaw", "sweep", "first-sweep", "thaw-remove"])
+def test_session_pair_retries_a_move_between_file_copies(tmp_path, monkeypatch, movement):
+    config, state_dir = _seed_state_tree(tmp_path)
+    hot = state_dir / "sessions.json"
+    cold = state_dir / "sessions.cold.json"
+    record = {"id": "old"}
+    empty = {"version": 1, "sessions": [], "session_runtime_launches": []}
+    populated = {**empty, "sessions": [{"anchor": None, "record": record}]}
+    thaw = movement.startswith("thaw")
+    _replace_json(hot, {"sessions": [] if thaw else [record]})
+    if movement != "first-sweep":
+        _replace_json(cold, populated if thaw else empty)
+    original = state_backup._file_hash
+    copies = 0
+
+    def move_after_hot_copy(path):
+        nonlocal copies
+        digest = original(path)
+        if path.name == "sessions_state":
+            copies += 1
+            if copies == 1:
+                if thaw:
+                    _replace_json(hot, {"sessions": [record]})
+                    if movement == "thaw-remove":
+                        cold.unlink()
+                    else:
+                        _replace_json(cold, empty)
+                else:
+                    _replace_json(cold, populated)
+                    _replace_json(hot, {"sessions": []})
+        return digest
+
+    monkeypatch.setattr(state_backup, "_file_hash", move_after_hot_copy)
+    backup = tmp_path / "backup"
+    report = build_backup_plan(config_path=config, output_dir=backup, execute=True)
+    assert report["status"] == "copied"
+    assert copies == 2
+    assert json.loads((backup / "stores/sessions_state").read_text()) == json.loads(hot.read_text())
+    entries = {entry["store_id"]: entry for entry in report["entries"]}
+    if cold.exists():
+        assert json.loads((backup / "stores/sessions_cold").read_text()) == json.loads(cold.read_text())
+        assert entries["sessions_cold"]["action"] == "copy"
+        assert entries["sessions_cold"]["sha256"] == original(backup / "stores/sessions_cold")
+    else:
+        assert entries["sessions_cold"]["action"] == "skip"
+        assert not (backup / "stores/sessions_cold").exists()
+    assert report["summary"]["copied"] == report["summary"]["planned"]
+
+
+def test_session_pair_blocks_when_every_copy_races_a_write(tmp_path, monkeypatch):
+    config, state_dir = _seed_state_tree(tmp_path)
+    original = state_backup._file_hash
+    copies = 0
+
+    def change_after_hot_copy(path):
+        nonlocal copies
+        digest = original(path)
+        if path.name == "sessions_state":
+            copies += 1
+            _replace_json(state_dir / "sessions.json", {"sessions": [], "revision": copies})
+        return digest
+
+    monkeypatch.setattr(state_backup, "_file_hash", change_after_hot_copy)
+    backup = tmp_path / "backup"
+    report = build_backup_plan(config_path=config, output_dir=backup, execute=True)
+    assert report["status"] == "blocked"
+    assert copies == 5
+    assert any(issue["kind"] == "session_pair_unstable" for issue in report["blockers"])
+    from scripts.rust_migration.state_restore import build_restore_report
+    assert build_restore_report(manifest_path=backup / "state-backup-manifest.json")["status"] == "blocked"
 
 
 def _write_config(path, state_dir):

@@ -27,6 +27,7 @@ impl SessionStore {
         let _submission = self.lock_opencode_submission(id)?;
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             ensure_session_not_reparent_fenced(&state, id)?;
             let sessions = snapshot_from_raw_value(&state)?.sessions;
@@ -113,6 +114,7 @@ impl SessionStore {
         };
         if let Err(error) = self.opencode_driver()?.stop(&pending.record, runtime) {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
                 .context("session disappeared")?;
@@ -125,6 +127,7 @@ impl SessionStore {
         }
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             let raw = raw_session_object(&state, id).context("session disappeared")?;
             let current: SessionRecord = serde_json::from_value(Value::Object(raw.clone()))?;

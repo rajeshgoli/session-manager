@@ -57,6 +57,7 @@ impl SessionStore {
         let _submission = self.lock_opencode_submission(id)?;
         let message_id = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             let Some(session) = raw_session_object(&state, id) else {
                 return Ok(None);
@@ -225,6 +226,13 @@ impl SessionStore {
             .as_ref()
             .context("opencode queue missing")?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(
+            &_guard,
+            &[
+                &record.id,
+                message.sender_session_id.as_deref().unwrap_or_default(),
+            ],
+        )?;
         let mut state = self.load_raw_json_value()?;
         let current = snapshot_from_raw_value(&state)?
             .sessions

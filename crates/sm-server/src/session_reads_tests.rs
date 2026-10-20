@@ -249,7 +249,7 @@ async fn watch_handoff_inheritance_stays_fresh_without_session_writes() {
     let queue = dir.join("messages.db");
     fs::write(
         &path,
-        json!({"sessions":[{
+        json!({"handoff_notes_imported_at":"2026-10-01T00:00:00Z","handoff_note_sources_pending":[],"sessions":[{
             "id":"fresh001", "name":"fresh", "status":"stopped", "completion_status":"retired",
             "working_dir":"/repo", "tmux_session":"fresh001", "provider":"claude",
             "created_at":"2026-10-01T00:00:00Z", "last_activity":"2026-10-01T00:00:00Z"

@@ -133,6 +133,7 @@ impl SessionStore {
             needed: false,
         };
         let guard = self.write_guard()?;
+        self.thaw_ids_locked(&guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let mut stop_applied =
             self.drain_opencode_effects(&mut state, session_id, &mut owner_wake.needed)?;
@@ -292,6 +293,7 @@ impl SessionStore {
             needed: false,
         };
         let guard = self.write_guard()?;
+        self.thaw_ids_locked(&guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let stop = self.drain_opencode_effects(&mut state, session_id, &mut owner_wake.needed)?;
         drop(guard);
@@ -315,6 +317,7 @@ impl SessionStore {
         expected: &OpencodeStopSignal,
     ) -> Result<bool> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let Some(session) = session_object_mut(ensure_sessions_array_mut(&mut state)?, session_id)
         else {

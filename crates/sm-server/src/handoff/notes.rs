@@ -420,6 +420,7 @@ impl SessionStore {
     }
     pub fn handoff_draft(&self, id: &str) -> Result<Value> {
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         let draft = self.handoff_draft_raw(&mut state, id)?;
         self.write_raw_json_value(&state)?;
@@ -692,6 +693,7 @@ impl SessionStore {
     /// The accepted note is durable, and no successor can yet create a draft.
     pub fn cleanup_handoff_before_spawn(&self, id: &str) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[id])?;
         let parsed = self.load_parsed_state()?;
         let state = &parsed.raw;
         self.cleanup_handoff_draft(state, id, false);
@@ -1188,6 +1190,7 @@ impl SessionStore {
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        let before = state.clone();
         let importing = state.get("handoff_notes_imported_at").is_none();
         let mut pending = state["handoff_note_sources_pending"]
             .as_array()
@@ -1300,20 +1303,21 @@ impl SessionStore {
             }
         }
         let mut remaining = vec![];
+        let merged = self.load_parsed_state()?;
         for source in pending {
             let Some(id) = source["session_id"].as_str() else {
                 continue;
             };
-            let ids = self.line_ids(&state, id);
+            let ids = self.line_ids(&merged.raw, id);
             let ended = ids
                 .last()
-                .and_then(|id| raw_session_object(&state, id))
+                .and_then(|id| raw_session_object(&merged.raw, id))
                 .is_some_and(raw_session_is_stopped);
             if !ended {
                 remaining.push(source);
                 continue;
             }
-            let (removed, reason) = self.remove_handoff_original(&state, &source)?;
+            let (removed, reason) = self.remove_handoff_original(&merged.raw, &source)?;
             self.report_handoff_source(id, removed, reason.as_deref())?;
             checkpoint("remove")?;
         }
@@ -1321,7 +1325,9 @@ impl SessionStore {
         if importing {
             state["handoff_notes_imported_at"] = json!(now_rfc3339());
         }
-        self.write_raw_json_value(&state)?;
+        if state != before {
+            self.write_raw_json_value(&state)?;
+        }
         checkpoint("marker")?;
         let legacy = self
             .state_file

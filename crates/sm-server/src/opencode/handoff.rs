@@ -47,6 +47,7 @@ impl SessionStore {
             }
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id, successor_id])?;
         let mut state = self.load_raw_json_value()?;
         let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
             .context("handoff predecessor disappeared")?;
@@ -69,6 +70,7 @@ impl SessionStore {
         let now = OffsetDateTime::now_utc();
         let blocked_at = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let parsed = self.load_parsed_state()?;
             let state = &parsed.raw;
             let raw = raw_session_object(state, id).context("session disappeared")?;
@@ -104,6 +106,7 @@ impl SessionStore {
         };
         let resolution = self.resolve_opencode_pending_bindings_while_locked(&record, runtime);
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
             .context("session disappeared")?;

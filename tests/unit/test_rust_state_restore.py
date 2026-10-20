@@ -8,6 +8,29 @@ from scripts.rust_migration.state_restore import (
 )
 
 
+def test_cold_segment_survives_backup_and_restore_and_is_optional_for_old_backups(tmp_path):
+    config, state_dir = _seed_state_tree(tmp_path)
+    cold = '{"version":1,"sessions":[{"anchor":null,"record":{"id":"old"}}],"session_runtime_launches":[]}\n'
+    (state_dir / "sessions.cold.json").write_text(cold)
+    backup = tmp_path / "with-cold"
+    report = build_backup_plan(config_path=config, output_dir=backup, execute=True)
+    assert report["status"] == "copied"
+    assert (backup / "stores/sessions_cold").read_text() == cold
+    restore = build_restore_report(manifest_path=backup / "state-backup-manifest.json",
+                                   restore_dir=tmp_path / "restored", execute_restore=True)
+    assert restore["status"] == "restored"
+    entry = next(entry for entry in restore["entries"] if entry["store_id"] == "sessions_cold")
+    from pathlib import Path
+    assert Path(entry["restore_path"]).read_text() == cold
+
+    (state_dir / "sessions.cold.json").unlink()
+    backup = tmp_path / "without-cold"
+    report = build_backup_plan(config_path=config, output_dir=backup, execute=True)
+    assert report["status"] == "copied"
+    assert next(entry for entry in report["entries"] if entry["store_id"] == "sessions_cold")["action"] == "skip"
+    assert build_restore_report(manifest_path=backup / "state-backup-manifest.json")["status"] == "verified"
+
+
 def _write_config(path, state_dir):
     path.write_text(
         f"""
