@@ -549,9 +549,25 @@ async fn start_now_check_lists_warnings_and_refuses_unauthenticated_local_starts
     );
     assert!(check["memory_reserve_bytes"].as_i64().unwrap() > 0);
 
-    let (status, body) =
-        request(&f.app, "POST", "/client/queue/jobs/job-waiting/start", None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    for payload in [
+        None,
+        Some(json!({})),
+        Some(json!({"ask_if_risky": true})),
+        Some(json!({"ask_if_risky": "invalid"})),
+    ] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            "/client/queue/jobs/job-waiting/start",
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["detail"],
+            "Start now is for the owner, signed in to the sm app"
+        );
+    }
     let state: String = conn
         .query_row(
             "SELECT state FROM queue_jobs WHERE id = 'job-waiting'",
