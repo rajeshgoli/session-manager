@@ -565,12 +565,6 @@ fn deliver_alerts(state: &AppState, manager: &ManagedArtifacts) -> anyhow::Resul
         &[],
     )? {
         let key = r["key"].as_str().context("backup alert key")?;
-        // The same condition already with a working agent is not sent again (sm#2414).
-        let prefix = format!("{}:", key.rsplit_once(':').map_or(key, |(p, _)| p));
-        if super::inbox::alerts::with_live_agent(state, &prefix)? {
-            conn.execute("UPDATE backup_alerts SET delivered=1 WHERE key=?1", [key])?;
-            continue;
-        }
         let result = messages::owner_message_store(state).create_once(
             crate::owner_messages::NewOwnerMessage {
                 human: state.config.owner_name.clone(),
