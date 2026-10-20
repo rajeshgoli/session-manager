@@ -1064,6 +1064,7 @@ fn move_work(
     let queue_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     RetainedQueueStore::hand_off_queue_jobs(&queue_dir, predecessor_id, successor_id)?;
     docs::owner_doc_store(state).hand_off(predecessor_id, successor_id, &successor_name)?;
+    messages::owner_message_store(state).hand_off_assignments(predecessor_id, successor_id)?;
     crate::owner_push::OwnerPushStore::new(crate::owner_push::push_db_path(&state.config))
         .hand_off_follows(predecessor_id, successor_id, &successor_name)?;
 

@@ -637,6 +637,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/inbox/unarchive", "inbox.unarchive", None),
     ("GET", "/inbox/thread/{key}", "inbox.thread", Some("thread")),
     ("POST", "/inbox/thread/{key}/send", "inbox.reply", Some("thread")),
+    ("POST", "/inbox/alerts/{message_id}/assign", "inbox.assign", Some("message")),
     ("GET", "/inbox/agent/{session_id}", "inbox.agent", Some("session")),
     ("POST", "/inbox/agent/{session_id}/send", "inbox.reply", Some("session")),
     ("GET", "/messages/{message_id}", "message.open", Some("message")),

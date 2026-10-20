@@ -13,6 +13,17 @@ use std::{
 struct Member {
     name: String,
     location: String,
+    /// Where a thaw extracts to, decided when it starts copying (sm#2414):
+    /// the cold store when it fits there, else the Mac when the Mac keeps
+    /// its own headroom. Absent before then and on journals written earlier,
+    /// which thaw onto the cold store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thaw_to: Option<String>,
+}
+impl Member {
+    fn thaws_to_root(&self, kind: &str) -> bool {
+        kind == "thawing" && self.thaw_to.as_deref() == Some("root")
+    }
 }
 #[derive(Debug)]
 struct Operation {
@@ -25,6 +36,12 @@ struct Operation {
 }
 
 fn paths(root: &ArtifactRoot, member: &Member, kind: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let path = Path::new(&root.path).join(&member.name);
+    if member.thaws_to_root(kind) {
+        // The extracted folder itself is published at the artifact path.
+        let stage = Path::new(&root.path).join(format!(".{}.thawing", member.name));
+        return (path.clone(), stage, path);
+    }
     let cold = Path::new(&root.cold_store);
     let stage = if kind == "freezing" {
         cold.join(".frozen")
@@ -37,7 +54,7 @@ fn paths(root: &ArtifactRoot, member: &Member, kind: &str) -> (PathBuf, PathBuf,
     } else {
         cold.join(&member.name)
     };
-    (Path::new(&root.path).join(&member.name), stage, finished)
+    (path, stage, finished)
 }
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
@@ -227,6 +244,7 @@ pub fn request(
         let m = Member {
             name: n.into(),
             location: a["location"].as_str().context("location")?.into(),
+            thaw_to: None,
         };
         let (_, stage, finished) = paths(root, &m, kind);
         for path in [
@@ -234,6 +252,7 @@ pub fn request(
             finished,
             Path::new(&root.path).join(format!(".{n}.old")),
             Path::new(&root.path).join(format!(".{n}.placeholder")),
+            Path::new(&root.path).join(format!(".{n}.thawing")),
         ] {
             ensure!(
                 path.symlink_metadata()
@@ -270,7 +289,9 @@ pub fn request(
     Ok(result)
 }
 
-fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
+/// The disk the operation writes to, or `None` while neither has room. Only a
+/// thaw may fall back to the Mac (sm#2414).
+fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<Option<&'static str>> {
     let conn = manager.store.open()?;
     let mut required = 0u64;
     for m in &op.members {
@@ -304,26 +325,37 @@ fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
         .unwrap_or(0)
         .saturating_sub(cold["floor"].as_u64().unwrap_or(0))
         .saturating_sub(cold["outstanding"].as_u64().unwrap_or(0));
-    Ok(available >= required)
-}
-fn set_phase(manager: &ManagedArtifacts, id: i64, phase: &str) -> Result<()> {
-    manager.store.open()?.execute(
-        "UPDATE artifact_operations SET phase=?2,error=NULL WHERE id=?1",
-        params![id, phase],
-    )?;
-    Ok(())
-}
-fn stage(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
-    if !space(manager, op)? {
-        manager.store.open()?.execute("UPDATE artifact_operations SET error='Waiting for cold-store capacity above the floor and reservations' WHERE id=?1",[op.id])?;
-        return Ok(false);
+    if available >= required {
+        Ok(Some("cold"))
+    } else if op.kind == "thawing"
+        && super::pressure::thaw_fits_on_root(&conn, manager, &op.root, required)?
+    {
+        Ok(Some("root"))
+    } else {
+        Ok(None)
     }
+}
+fn stage(manager: &ManagedArtifacts, op: &mut Operation) -> Result<bool> {
+    let Some(disk) = space(manager, op)? else {
+        manager.store.open()?.execute("UPDATE artifact_operations SET error='Waiting for disk space above the floor and reservations' WHERE id=?1",[op.id])?;
+        return Ok(false);
+    };
     store::set_meta(
         &manager.store.open()?,
         &format!("operation_started:{}", op.id),
         &OffsetDateTime::now_utc().unix_timestamp_nanos().to_string(),
     )?;
-    set_phase(manager, op.id, "copying")?;
+    if op.kind == "thawing" {
+        for m in &mut op.members {
+            m.thaw_to = Some(disk.into());
+        }
+    }
+    // The destination is journaled with the phase, so recovery discards the
+    // right staging folder and publishes where the copy went.
+    manager.store.open()?.execute(
+        "UPDATE artifact_operations SET phase='copying',members_json=?2,error=NULL WHERE id=?1",
+        params![op.id, serde_json::to_string(&op.members)?],
+    )?;
     for m in &op.members {
         mounted(&op.root)?;
         let (_, staging, _) = paths(&op.root, m, &op.kind);
@@ -429,6 +461,11 @@ fn valid_published(path: &Path, target: Option<&Path>) -> bool {
         path.symlink_metadata().is_ok_and(|m| m.is_dir()) && path.join("FROZEN.md").is_file()
     }
 }
+/// A thaw onto the Mac is published once its staging folder has become the
+/// artifact's own directory.
+fn valid_root_thaw(path: &Path, staging: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|m| m.is_dir()) && staging.symlink_metadata().is_err()
+}
 fn swap(op: &Operation, m: &Member, target: Option<&Path>) -> Result<()> {
     let root = Path::new(&op.root.path);
     let path = root.join(&m.name);
@@ -470,7 +507,22 @@ fn swap(op: &Operation, m: &Member, target: Option<&Path>) -> Result<()> {
 fn publish(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
     for m in &op.members {
         mounted(&op.root)?;
-        let (_, staging, finished) = paths(&op.root, m, &op.kind);
+        let (path, staging, finished) = paths(&op.root, m, &op.kind);
+        if m.thaws_to_root(&op.kind) {
+            // The extracted folder replaces FROZEN.md's folder at the path itself.
+            if staging.symlink_metadata().is_ok() {
+                let old = Path::new(&op.root.path).join(format!(".{}.old", m.name));
+                if path.symlink_metadata().is_ok() {
+                    rename(&path, &old)?;
+                }
+                rename(&staging, &path)?;
+            }
+            ensure!(
+                valid_root_thaw(&path, &staging),
+                "published destination is not a directory"
+            );
+            continue;
+        }
         if staging.symlink_metadata().is_ok() {
             rename(&staging, &finished)?;
         }
@@ -488,7 +540,12 @@ fn publish(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for m in &op.members {
         if op.kind == "thawing" {
-            tx.execute("UPDATE artifacts SET state='live',location='cold',thawed_at=?3,last_used_at=?3 WHERE root=?1 AND name=?2",params![op.root.path,m.name,now()])?;
+            let location = if m.thaws_to_root(&op.kind) {
+                "root"
+            } else {
+                "cold"
+            };
+            tx.execute("UPDATE artifacts SET state='live',location=?4,thawed_at=?3,last_used_at=?3 WHERE root=?1 AND name=?2",params![op.root.path,m.name,now(),location])?;
         } else if op.kind == "moving" {
             tx.execute(
                 "UPDATE artifacts SET location='cold' WHERE root=?1 AND name=?2",
@@ -506,16 +563,20 @@ fn publish(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
 fn cleanup(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
     mounted(&op.root)?;
     for m in &op.members {
-        let (path, _, finished) = paths(&op.root, m, &op.kind);
+        let (path, staging, finished) = paths(&op.root, m, &op.kind);
         ensure!(
-            valid_published(
-                &path,
-                if op.kind == "freezing" {
-                    None
-                } else {
-                    Some(&finished)
-                }
-            ),
+            if m.thaws_to_root(&op.kind) {
+                valid_root_thaw(&path, &staging)
+            } else {
+                valid_published(
+                    &path,
+                    if op.kind == "freezing" {
+                        None
+                    } else {
+                        Some(&finished)
+                    },
+                )
+            },
             "artifact publication changed before cleanup"
         );
         delete::remove_entry(&Path::new(&op.root.path).join(format!(".{}.old", m.name)))?;
@@ -592,14 +653,14 @@ fn discard_staging(op: &Operation) -> Result<()> {
     }
     Ok(())
 }
-fn run(manager: &ManagedArtifacts, op: &Operation) -> Result<()> {
+fn run(manager: &ManagedArtifacts, op: &mut Operation) -> Result<()> {
     mounted(&op.root)?;
     match op.phase.as_str() {
         "queued" | "copying" => {
             if op.phase == "copying" {
                 discard_staging(op)?;
             }
-            if stage(manager, op)? {
+            if stage(manager, &mut *op)? {
                 publish(manager, op)
             } else {
                 Ok(())
@@ -662,7 +723,7 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
             if !moves::cold_mounted(&root) {
                 continue;
             }
-            let op = Operation {
+            let mut op = Operation {
                 id: row["id"].as_i64().context("operation id")?,
                 root,
                 kind: row["kind"].as_str().context("kind")?.into(),
@@ -670,7 +731,7 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
                 members: serde_json::from_str(row["members_json"].as_str().context("members")?)?,
                 actor: row["actor"].as_str().unwrap_or("sm").into(),
             };
-            if let Err(error) = run(manager, &op) {
+            if let Err(error) = run(manager, &mut op) {
                 let mut db = manager.store.open()?;
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let phase: String = tx.query_row(

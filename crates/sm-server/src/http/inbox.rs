@@ -12,6 +12,7 @@ use super::messages::{
     valid_submission_id, NO_RECIPIENT,
 };
 use super::*;
+pub(super) mod alerts;
 pub(super) mod board_pings;
 pub(super) mod work_threads;
 use crate::owner_doc_render::{inline_json, render_markdown_with_lines};
@@ -144,6 +145,10 @@ struct World {
     /// Agents' answers to the owner's sends (sm#1844), oldest first.
     agent_replies: Vec<ThreadReply>,
     marks: BTreeMap<String, ThreadMarks>,
+    /// Message id to its delivery key, which names an sm alert's kind.
+    delivery_keys: BTreeMap<String, String>,
+    /// Message id to the agent an sm alert was assigned to (sm#2414).
+    assignments: BTreeMap<String, String>,
 }
 
 impl World {
@@ -175,7 +180,17 @@ impl World {
                 .transpose()?
                 .unwrap_or_default(),
             marks,
+            delivery_keys: store.delivery_keys()?,
+            assignments: store.assignments()?,
         })
+    }
+
+    fn alert_action(&self, message: &OwnerMessage) -> alerts::AlertAction<'_> {
+        alerts::alert_action(
+            message,
+            self.delivery_keys.get(&message.id).map(String::as_str),
+            self.assignments.get(&message.id).map(String::as_str),
+        )
     }
 
     fn live(&self, session_id: &str) -> bool {
@@ -645,6 +660,13 @@ impl Item<'_> {
                 "title": message.title, "markdown": message.body_markdown,
                 "state": message_state_label(*state),
                 "needs_you": *state == OwnerMessageState::NeedsYou, "html": html(),
+                "alert": match world.alert_action(message) {
+                    alerts::AlertAction::Assign => json!({"action": "assign"}),
+                    alerts::AlertAction::Assigned(agent) => json!({"action": "assigned",
+                        "agent": {"id": agent, "name": world.agent_name(agent),
+                            "live": world.live(agent), "thread_path": agent_thread_path(agent)}}),
+                    alerts::AlertAction::None => Value::Null,
+                },
             }),
             Item::Answered(message) => json!({
                 "kind": "event", "at": self.at(), "text": answered_label(message), "link": null,
@@ -728,7 +750,45 @@ const THREAD_STYLE: &str = r#"
 .btns .msg { flex: 1; font-size: 12.5px; color: var(--kt3); }
 .btns .msg.err { color: var(--kr); }
 .hint { font: 11.5px var(--mono); color: var(--kt3); }
+.b .foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.b .foot .m { flex: 1; min-width: 7em; margin: 0; }
+.assign { display: inline-flex; align-items: center; gap: 6px; font: 600 13px var(--sans); color: var(--kc);
+  background: #0f2530; border: 1px solid #1d4b5c; border-radius: 999px; padding: 6px 14px 6px 11px;
+  cursor: pointer; transition: background .15s, border-color .15s, transform .1s; -webkit-tap-highlight-color: transparent; }
+.assign:hover { background: #133240; border-color: #2b6a80; }
+.assign:active { transform: scale(.97); }
+.assign svg { width: 15px; height: 15px; flex: none; }
+.assign[hidden] { display: none; }
+.owner { display: inline-flex; align-items: center; gap: 8px; font: 13px var(--sans); color: var(--kt);
+  background: var(--k3); border-radius: 999px; padding: 6px 10px 6px 11px; }
+.owner:hover { background: #262632; }
+.owner .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--kg); box-shadow: 0 0 0 3px #12301f; }
+.owner.ended { color: var(--kt2); }
+.owner.ended .dot { background: var(--kt3); box-shadow: none; }
+.owner .chev { color: var(--kt3); font-size: 16px; line-height: 1; margin-left: 2px; }
+.sheet { margin-top: 10px; padding: 12px; border-radius: 10px; background: var(--k1); border: 1px solid var(--kl);
+  display: flex; flex-direction: column; gap: 10px; animation: sheet-in .16s ease-out; }
+@keyframes sheet-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.sheet .q { font-weight: 600; font-size: 14px; }
+.sheet .types { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5em, 1fr)); gap: 6px; }
+.sheet .types label { display: inline-flex; flex-direction: column; gap: 1px; cursor: pointer; border-radius: 10px;
+  padding: 6px 11px; border: 1px solid var(--kl); background: var(--k2); transition: border-color .15s, background .15s; }
+.sheet .types label b { font-size: 13px; font-weight: 600; color: var(--kt); }
+.sheet .types label span { font: 11px var(--mono); color: var(--kt3); }
+.sheet .types input { position: absolute; opacity: 0; pointer-events: none; }
+.sheet .types label:has(input:checked) { border-color: var(--kc); background: #0f2530; }
+.sheet .types label:has(input:focus-visible) { box-shadow: 0 0 0 2px var(--kc); }
+.sheet .what { font-size: 13px; color: var(--kt2); line-height: 1.45; }
+.sheet .go { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+.sheet .go .msg { flex: 1; font-size: 12.5px; color: var(--kr); }
+.sheet .go button { font: 13px var(--sans); border-radius: 999px; padding: 7px 16px; cursor: pointer;
+  border: 1px solid var(--kl); background: none; color: var(--kt2); }
+.sheet .go button.start { background: var(--kc); color: #09090D; border-color: var(--kc); font-weight: 700; }
+.sheet .go button:disabled { opacity: .55; cursor: default; }
 "#;
+
+/// A small spark: an agent takes this.
+const ASSIGN_ICON: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8v2.4M8 11.8v2.4M1.8 8h2.4M11.8 8h2.4M3.6 3.6l1.6 1.6M10.8 10.8l1.6 1.6M12.4 3.6l-1.6 1.6M5.2 10.8l-1.6 1.6"/><circle cx="8" cy="8" r="1.6" fill="currentColor" stroke="none"/></svg>"#;
 
 fn message_state_label(state: OwnerMessageState) -> &'static str {
     match state {
@@ -746,6 +806,8 @@ fn answered_label(message: &OwnerMessage) -> &'static str {
         Some("claude_prompt") => "You answered in Claude",
         Some("codex_prompt") => "You answered in Codex",
         Some("inbox") => "Answered in the Inbox",
+        Some("resolved") => "sm resolved this",
+        Some("superseded") => "A newer alert replaced this",
         _ => "Marked answered",
     }
 }
@@ -769,8 +831,35 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
         }
         Item::Message(message, state) => {
             let ask = *state == OwnerMessageState::NeedsYou;
+            let action = world.alert_action(message);
+            let meta = if matches!(action, alerts::AlertAction::Assigned(_)) {
+                format!(r#"<span class="m">{}</span>"#, when(&message.created_at))
+            } else {
+                format!(
+                    r#"<span class="m">{} · {}</span>"#,
+                    when(&message.created_at),
+                    message_state_label(*state)
+                )
+            };
+            let action = match action {
+                alerts::AlertAction::Assign => format!(
+                    r#"<button type="button" class="assign" data-assign="{}">{ASSIGN_ICON}Assign to agent</button>"#,
+                    escape_html(&message.id)
+                ),
+                alerts::AlertAction::Assigned(agent) => {
+                    let live = world.live(agent);
+                    format!(
+                        r#"<a class="owner{ended}" href="{href}"><span class="dot"></span>{name} {doing}<span class="chev">›</span></a>"#,
+                        ended = if live { "" } else { " ended" },
+                        href = escape_html(&agent_thread_path(agent)),
+                        name = escape_html(&world.agent_name(agent)),
+                        doing = if live { "is on it" } else { "worked on it" },
+                    )
+                }
+                alerts::AlertAction::None => String::new(),
+            };
             format!(
-                r#"<div class="b{ask_class}" id="{id}">{chip}<h3>{title}</h3><div class="md" data-msg="{id}">{body}</div><div class="m">{when} · {state}</div></div>"#,
+                r#"<div class="b{ask_class}" id="{id}">{chip}<h3>{title}</h3><div class="md" data-msg="{id}">{body}</div><div class="foot">{meta}{action}</div></div>"#,
                 ask_class = if ask { " ask" } else { "" },
                 id = escape_html(&message.id),
                 chip = if ask {
@@ -780,8 +869,6 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 },
                 title = escape_html(&message.title),
                 body = render_markdown_with_lines(&message.body_markdown),
-                when = when(&message.created_at),
-                state = message_state_label(*state),
             )
         }
         Item::Reply(reply) => {

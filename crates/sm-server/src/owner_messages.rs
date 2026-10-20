@@ -5,7 +5,11 @@
 //! for the agent in one transaction. Spec:
 //! `specs/1580_app_messages_replace_email.html`, appendices A, C1 and D.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 use anyhow::{bail, Context, Result};
 use rand_core::{OsRng, RngCore};
@@ -385,6 +389,15 @@ pub fn init_owner_messages_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS owner_message_replies_message
             ON owner_message_replies(message_id, created_at);
+        CREATE TABLE IF NOT EXISTS owner_message_delivery_keys (
+            key TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS owner_message_assignments (
+            message_id TEXT PRIMARY KEY REFERENCES owner_messages(id),
+            session_id TEXT NOT NULL,
+            assigned_at TEXT NOT NULL
+        );
         "#,
     )?;
     let has_via = conn
@@ -667,6 +680,95 @@ impl OwnerMessageStore {
             params![key, now],
         )?;
         Ok(())
+    }
+
+    /// Records that `sender_session_id`'s notices keyed under `prefix` no
+    /// longer stand (sm#2414): `resolved` when the condition cleared,
+    /// `superseded` when a newer notice (`keep`) replaced them. Overrides an
+    /// owner's Done, so a cleared alert stops offering work. A resolved alert
+    /// that was assigned keeps its assignment as history; superseding never
+    /// takes an alert from its agent.
+    pub fn clear_keyed(
+        &self,
+        sender_session_id: &str,
+        prefix: &str,
+        via: &str,
+        keep: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        conn.execute(
+            "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?3), \
+               first_viewed_at = IFNULL(first_viewed_at, ?3), handled_via = ?4 \
+             WHERE sender_session_id = ?1 AND IFNULL(handled_via, '') != ?4 \
+               AND (?4 = 'resolved' OR IFNULL(handled_via, '') != 'agent') \
+               AND id IN (SELECT message_id FROM owner_message_delivery_keys \
+                          WHERE substr(key, 1, length(?2)) = ?2 AND key IS NOT ?5)",
+            params![sender_session_id, prefix, now, via, keep],
+        )?;
+        Ok(())
+    }
+
+    /// Hands a message to the agent started for it (sm#2414). The record and
+    /// the message turning handled commit together; a second assignment of
+    /// the same message is refused.
+    pub fn assign(&self, id: &str, session_id: &str) -> Result<Option<OwnerMessage>> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_rfc3339();
+        tx.execute(
+            "INSERT INTO owner_message_assignments (message_id, session_id, assigned_at) \
+             VALUES (?1, ?2, ?3)",
+            params![id, session_id, now],
+        )?;
+        tx.execute(
+            "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?2), \
+               first_viewed_at = IFNULL(first_viewed_at, ?2), handled_via = 'agent' WHERE id = ?1",
+            params![id, now],
+        )?;
+        let message = get_message_conn(&tx, id)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
+    /// Context handoff: an alert the predecessor was working stays with its successor.
+    pub fn hand_off_assignments(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {
+        if !self.db_path.exists() {
+            return Ok(());
+        }
+        self.open_write()?.execute(
+            "UPDATE owner_message_assignments SET session_id = ?2 WHERE session_id = ?1",
+            params![predecessor_id, successor_id],
+        )?;
+        Ok(())
+    }
+
+    /// Message id to the agent it was handed to.
+    pub fn assignments(&self) -> Result<BTreeMap<String, String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        if !has_table(&conn, "owner_message_assignments")? {
+            return Ok(BTreeMap::new());
+        }
+        let mut statement =
+            conn.prepare("SELECT message_id, session_id FROM owner_message_assignments")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Message id to the delivery key it was created under.
+    pub fn delivery_keys(&self) -> Result<BTreeMap<String, String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        if !has_table(&conn, "owner_message_delivery_keys")? {
+            return Ok(BTreeMap::new());
+        }
+        let mut statement =
+            conn.prepare("SELECT message_id, key FROM owner_message_delivery_keys")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Unhandled messages from `sender_session_id` created under a delivery
@@ -953,6 +1055,17 @@ fn replied_ids(conn: &Connection) -> Result<BTreeSet<String>> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
     Ok(ids)
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerMessage> {

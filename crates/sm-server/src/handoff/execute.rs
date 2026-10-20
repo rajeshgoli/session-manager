@@ -264,6 +264,8 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
     ("owner_docs", "author_session_id"),
     ("owner_doc_readers", "session_id"),
     ("owner_doc_reviews", "assigned_session_id"),
+    // An sm alert stays with the agent working it (sm#2414).
+    ("owner_message_assignments", "session_id"),
     ("owner_follows", "session_id"),
 ];
 

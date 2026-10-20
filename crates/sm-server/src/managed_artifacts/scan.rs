@@ -107,7 +107,7 @@ impl ManagedArtifacts {
                             }
                         }
                     }
-                    if resolved == Path::new(&root.cold_store).join(&name) {
+                    if on_cold_store(root, &name, &resolved) {
                         location = "cold";
                     }
                 }
@@ -124,6 +124,7 @@ impl ManagedArtifacts {
                 json!({"initial":initial}),
             )?;
         }
+        let mut relocated = Vec::new();
         for a in store::query(
             &tx,
             "SELECT * FROM artifacts WHERE root=?1 AND state IN ('live','building','frozen')",
@@ -146,11 +147,47 @@ impl ManagedArtifacts {
                     event(&tx, &root.path, name, "vanished", "sm", json!({}))?;
                 }
                 Err(e) => return Err(e.into()),
+                // A folder moved between disks by hand, behind or out of a
+                // link, is measured where it now lives (sm#2414).
+                Ok(m) if a["state"] == "live" => {
+                    let path = Path::new(&root.path).join(name);
+                    let location = if m.file_type().is_symlink() {
+                        fs::canonicalize(&path)
+                            .is_ok_and(|resolved| on_cold_store(root, name, &resolved))
+                            .then_some("cold")
+                    } else {
+                        m.is_dir().then_some("root")
+                    };
+                    if let Some(location) = location.filter(|l| a["location"] != *l) {
+                        tx.execute(
+                            "UPDATE artifacts SET location=?3 WHERE root=?1 AND name=?2",
+                            params![root.path, name, location],
+                        )?;
+                        event(
+                            &tx,
+                            &root.path,
+                            name,
+                            "relocated",
+                            "sm",
+                            json!({"location":location}),
+                        )?;
+                        relocated.push(name.to_owned());
+                    }
+                }
                 Ok(_) => {}
             }
         }
         store::set_meta(&tx, &key, &now())?;
         tx.commit()?;
+        // The old size measured the link, not the folder; do not wait for the night walk.
+        for name in relocated {
+            if let Err(error) = self.measure_one(root, &name) {
+                eprintln!(
+                    "artifact size unavailable for {}/{name} after it moved: {error:#}",
+                    root.path
+                );
+            }
+        }
         Ok(())
     }
     /// Measure unknown folders too: an absent record is agent work, not zero bytes.
@@ -197,6 +234,10 @@ impl ManagedArtifacts {
         }
         Ok(())
     }
+}
+/// A root entry whose link resolves to `<cold_store>/<name>` lives on the cold store.
+fn on_cold_store(root: &ArtifactRoot, name: &str, resolved: &Path) -> bool {
+    resolved == Path::new(&root.cold_store).join(name)
 }
 pub fn ticket_prefix(name: &str) -> Option<i64> {
     let end = name.find(['_', '-'])?;

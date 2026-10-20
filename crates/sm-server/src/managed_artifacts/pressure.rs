@@ -7,7 +7,31 @@ use std::{
     os::{fd::AsRawFd, unix::fs::MetadataExt},
 };
 
+/// Free space sm restores on `device`: room for the largest recent job
+/// output there, and on a cold store room to thaw the largest frozen
+/// set unless that thaw fits on the Mac instead (sm#2414).
 pub fn enough(
+    conn: &Connection,
+    manager: &ManagedArtifacts,
+    device: u64,
+    floor: u64,
+) -> Result<u64> {
+    let mut result = job_enough(conn, manager, device, floor)?;
+    for root in &manager.config.roots {
+        if moves::cold_mounted(root)
+            && queue::fs_stats(&root.cold_store, manager.config.floor_percent)?.2 == device
+        {
+            // A set thaws together, so the reserve is the largest frozen set.
+            let bytes:u64=conn.query_row("SELECT COALESCE(MAX(bytes),0) FROM (SELECT SUM(data_bytes) bytes FROM artifacts WHERE root=?1 AND state='frozen' GROUP BY set_id)",[&root.path],|r|r.get(0))?;
+            if !thaw_fits_on_root(conn, manager, root, bytes)? {
+                result = result.max(bytes);
+            }
+        }
+    }
+    Ok(result)
+}
+/// Room for the largest output one queue job wrote on `device` lately.
+fn job_enough(
     conn: &Connection,
     manager: &ManagedArtifacts,
     device: u64,
@@ -22,14 +46,24 @@ pub fn enough(
             let bytes: u64 = conn.query_row("SELECT COALESCE(MAX(bytes_written),0) FROM artifact_completions WHERE root=?1 AND placement='root' AND state='succeeded' AND finished_at>=?2",params![root.path,since],|r|r.get(0))?;
             result = result.max(bytes);
         }
-        if moves::cold_mounted(root)
-            && queue::fs_stats(&root.cold_store, manager.config.floor_percent)?.2 == device
-        {
-            let bytes:u64=conn.query_row("SELECT COALESCE(MAX(data_bytes),0) FROM artifacts WHERE root=?1 AND state='frozen'",[&root.path],|r|r.get(0))?;
-            result = result.max(bytes);
-        }
     }
     Ok(result)
+}
+/// A thaw of `bytes` may land on the Mac only when the Mac keeps its own
+/// job headroom and reservations afterwards, so a thaw never fills it.
+pub fn thaw_fits_on_root(
+    conn: &Connection,
+    manager: &ManagedArtifacts,
+    root: &ArtifactRoot,
+    bytes: u64,
+) -> Result<bool> {
+    let (free, floor, device) = queue::fs_stats(&root.path, manager.config.floor_percent)?;
+    if queue::fs_stats(&root.cold_store, manager.config.floor_percent)?.2 == device {
+        return Ok(false);
+    }
+    let keep = job_enough(conn, manager, device, floor)?
+        .saturating_add(queue::outstanding(conn, manager, device)?);
+    Ok(free.saturating_sub(keep) >= bytes)
 }
 pub fn target(enough: u64, floor: u64, waiting: u64) -> u64 {
     enough.max(floor.saturating_add(waiting))

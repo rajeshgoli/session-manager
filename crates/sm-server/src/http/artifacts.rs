@@ -726,7 +726,8 @@ impl AppState {
                         sender_session_name: "sm artifacts".into(),
                         title: "Artifact cold store is disconnected".into(),
                         body_markdown: body.into(),
-                        blocking: false,
+                        // Only the owner can plug the drive back in (sm#2414).
+                        blocking: true,
                     },
                     Some(key),
                 )?;
@@ -898,20 +899,21 @@ impl AppState {
         }
         ma::pressure::periodic(svc)?;
         ma::pressure::resolve_notices(svc, |prefix| {
-            let inbox = messages::owner_message_store(self);
-            for (suffix, _) in inbox.open_keyed("sm-artifacts", prefix)? {
-                inbox.mark_handled_by_delivery_key(&format!("{prefix}{suffix}"))?;
-            }
-            Ok(())
+            messages::owner_message_store(self).clear_keyed(
+                "sm-artifacts",
+                prefix,
+                "resolved",
+                None,
+            )
         })?;
         ma::pressure::notify(svc, time::OffsetDateTime::now_utc(), |key, body| {
             let inbox = messages::owner_message_store(self);
             let prefix = format!("{}:", key.rsplit_once(':').map(|(p, _)| p).unwrap_or(key));
-            for (suffix, _) in inbox.open_keyed("sm-artifacts", &prefix)? {
-                if format!("{prefix}{suffix}") != key {
-                    inbox.mark_handled_by_delivery_key(&format!("{prefix}{suffix}"))?;
-                }
+            // An agent assigned the last one is still working it: no repeat.
+            if super::inbox::alerts::with_live_agent(self, &prefix)? {
+                return Ok(());
             }
+            inbox.clear_keyed("sm-artifacts", &prefix, "superseded", Some(key))?;
             let result = inbox.create_once(
                 crate::owner_messages::NewOwnerMessage {
                     human: self.config.owner_name.clone(),
@@ -919,7 +921,8 @@ impl AppState {
                     sender_session_name: "sm artifacts".into(),
                     title: "Artifacts need disk space".into(),
                     body_markdown: body.into(),
-                    blocking: true,
+                    // Agent work: the message carries Assign to agent (sm#2414).
+                    blocking: false,
                 },
                 Some(key),
             )?;

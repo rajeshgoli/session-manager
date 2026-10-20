@@ -131,6 +131,55 @@ fn enough_is_per_filesystem_and_ignores_old_or_failed_jobs() {
     assert!(satisfied(200, 50, 160, 10));
 }
 #[test]
+fn cold_store_reserves_a_thaw_only_when_the_mac_cannot_take_it() {
+    let f = Fixture::new();
+    f.frozen("frozen", 50, 700);
+    // The Mac keeps its own floor (10) and still has room: no cold reserve.
+    f.disks(5_000, 100);
+    assert_eq!(enough(&f.conn(), &f.manager, 2, 100).unwrap(), 100);
+    assert!(thaw_fits_on_root(&f.conn(), &f.manager, &f.root, 700).unwrap());
+    // A recent 4.5 KB job output is headroom the thaw may not take.
+    f.history("recent", 4_500, 1, "succeeded");
+    assert_eq!(enough(&f.conn(), &f.manager, 2, 100).unwrap(), 700);
+    assert!(!thaw_fits_on_root(&f.conn(), &f.manager, &f.root, 700).unwrap());
+}
+#[test]
+fn cold_store_reserve_is_the_largest_frozen_set_not_its_largest_member() {
+    let f = Fixture::new();
+    f.frozen("a", 50, 400);
+    f.frozen("b", 50, 400);
+    f.conn()
+        .execute(
+            "UPDATE artifacts SET set_id='pair' WHERE name IN ('a','b')",
+            [],
+        )
+        .unwrap();
+    // The Mac fits one member (400) but not the set (800): the cold store keeps it.
+    f.disks(600, 100);
+    assert_eq!(enough(&f.conn(), &f.manager, 2, 100).unwrap(), 800);
+}
+#[test]
+fn hand_moved_folder_is_measured_where_it_now_lives() {
+    let f = Fixture::new();
+    f.disks(1_000_000, 1_000_000);
+    f.live("moved", 4096);
+    let path = Path::new(&f.root.path).join("moved");
+    let cold = Path::new(&f.root.cold_store).join("moved");
+    fs::rename(&path, &cold).unwrap();
+    std::os::unix::fs::symlink(&cold, &path).unwrap();
+    f.manager.scan(&f.root).unwrap();
+    let a = f.manager.store.detail(&f.root.path, "moved").unwrap();
+    assert_eq!(a["location"], "cold");
+    assert!(a["data_bytes"].as_u64().unwrap() >= 4096);
+    // Moved back by hand: the record follows it home.
+    fs::remove_file(&path).unwrap();
+    fs::rename(&cold, &path).unwrap();
+    f.manager.scan(&f.root).unwrap();
+    let a = f.manager.store.detail(&f.root.path, "moved").unwrap();
+    assert_eq!(a["location"], "root");
+    assert!(a["data_bytes"].as_u64().unwrap() >= 4096);
+}
+#[test]
 fn ranking_moves_infinity_wait_floor_and_ties() {
     let f = Fixture::new();
     let make = |name: &str, action, freed, wait_minutes| score::Candidate {
@@ -364,8 +413,9 @@ fn report_only_and_enforcing_choose_same_frozen_deletions() {
         let db = f.manager.store.clone();
         queue::TEST_DISKS.with(|h| {
             *h.borrow_mut() = Some(Box::new(move |path| {
+                // Too little on the Mac to take a thaw, so the cold store keeps the reserve.
                 if path == root {
-                    return Ok((1_000_000, 10, 1));
+                    return Ok((100, 10, 1));
                 }
                 let removed = db
                     .list(&root)?
@@ -498,8 +548,9 @@ fn report_only_still_freezes_real_hot_cold_store_folders() {
     let db = f.manager.store.clone();
     queue::TEST_DISKS.with(|h| {
         *h.borrow_mut() = Some(Box::new(move |path| {
+            // Too little on the Mac to take a thaw, so the cold store keeps the reserve.
             if path == root {
-                return Ok((1_000_000, 10, 1));
+                return Ok((100, 10, 1));
             }
             let a = artifact(&db.open()?, &root, "live")?;
             Ok((if a["state"] == "frozen" { 75000 } else { 9000 }, 10, 2))

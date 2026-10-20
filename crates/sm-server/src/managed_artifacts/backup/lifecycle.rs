@@ -461,7 +461,8 @@ pub fn acknowledge(manager: &ManagedArtifacts, device: &str, id: &str, ack: &Ack
                 "The remote disk reported files that failed its integrity check: {}",
                 ack.check.as_ref().unwrap().bad.join(", ")
             ),
-            true,
+            // An agent can find out why; nothing here needs the owner's hands (sm#2414).
+            false,
         )?;
     }
     if ack.held_deletions > 0 {

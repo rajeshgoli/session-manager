@@ -167,8 +167,8 @@ fn managed_artifacts_ops_freeze_thaw_round_trip_and_placeholder() {
 fn managed_artifacts_ops_recovers_prepared_freeze_and_partial_swap() {
     let f = Fixture::new();
     f.create("sample");
-    let op = f.op("sample", "freezing");
-    stage(&f.manager, &op).unwrap();
+    let mut op = f.op("sample", "freezing");
+    stage(&f.manager, &mut op).unwrap();
     let (path, staging, finished) = paths(&f.root, &op.members[0], "freezing");
     rename(&staging, &finished).unwrap();
     rename(&path, &Path::new(&f.root.path).join(".sample.old")).unwrap();
@@ -191,8 +191,8 @@ fn managed_artifacts_ops_recovers_thaw_after_destination_rename() {
     f.create("sample");
     f.op("sample", "freezing");
     resume(&f.manager).unwrap();
-    let op = f.op("sample", "thawing");
-    stage(&f.manager, &op).unwrap();
+    let mut op = f.op("sample", "thawing");
+    stage(&f.manager, &mut op).unwrap();
     let (_, staging, finished) = paths(&f.root, &op.members[0], "thawing");
     rename(&staging, &finished).unwrap();
     resume(&f.manager).unwrap();
@@ -203,12 +203,83 @@ fn managed_artifacts_ops_recovers_thaw_after_destination_rename() {
         .exists());
 }
 
+/// The cold store too full for a thaw, the Mac with room to spare (sm#2414).
+fn cold_full(f: &Fixture) {
+    let root = f.root.path.clone();
+    queue::TEST_DISKS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            Ok(if path == root {
+                (u64::MAX / 4, 10, 1)
+            } else {
+                (0, 10, 2)
+            })
+        }))
+    });
+}
+
+#[test]
+fn managed_artifacts_ops_thaws_onto_the_mac_when_the_cold_store_is_full() {
+    let f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    cold_full(&f);
+    let mut op = f.op("sample", "thawing");
+    // Staged, then the server stops before publication: recovery finishes it.
+    stage(&f.manager, &mut op).unwrap();
+    assert_eq!(op.members[0].thaw_to.as_deref(), Some("root"));
+    let staging = Path::new(&f.root.path).join(".sample.thawing");
+    assert!(staging.is_dir());
+    resume(&f.manager).unwrap();
+    queue::TEST_DISKS.with(|hook| *hook.borrow_mut() = None);
+    let path = Path::new(&f.root.path).join("sample");
+    assert!(fs::symlink_metadata(&path).unwrap().is_dir());
+    f.assert_bytes("sample");
+    assert!(!staging.exists());
+    assert!(!Path::new(&f.root.path).join(".sample.old").exists());
+    assert!(!Path::new(&f.root.cold_store)
+        .join(".frozen/sample")
+        .exists());
+    assert!(!Path::new(&f.root.cold_store).join("sample").exists());
+    let a = f.detail("sample");
+    assert_eq!(a["state"], "live");
+    assert_eq!(a["location"], "root");
+    assert!(a["op"].is_null());
+}
+
+#[test]
+fn managed_artifacts_ops_thaw_waits_when_no_disk_has_room() {
+    let f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    let root = f.root.path.clone();
+    queue::TEST_DISKS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            Ok(if path == root { (0, 10, 1) } else { (0, 10, 2) })
+        }))
+    });
+    let mut op = f.op("sample", "thawing");
+    assert!(!stage(&f.manager, &mut op).unwrap());
+    queue::TEST_DISKS.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!(f.detail("sample")["state"], "frozen");
+    assert!(!Path::new(&f.root.path).join(".sample.thawing").exists());
+}
+
 #[test]
 fn managed_artifacts_ops_recovers_move_and_disposable_partial_copy() {
     let f = Fixture::new();
     f.create("sample");
     let op = f.op("sample", "moving");
-    set_phase(&f.manager, op.id, "copying").unwrap();
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE artifact_operations SET phase='copying' WHERE id=?1",
+            [op.id],
+        )
+        .unwrap();
     let (_, staging, _) = paths(&f.root, &op.members[0], "moving");
     fs::create_dir(&staging).unwrap();
     fs::write(staging.join("partial"), "incomplete").unwrap();
@@ -219,8 +290,8 @@ fn managed_artifacts_ops_recovers_move_and_disposable_partial_copy() {
         .join("sample/partial")
         .exists());
     f.create("second");
-    let op = f.op("second", "moving");
-    stage(&f.manager, &op).unwrap();
+    let mut op = f.op("second", "moving");
+    stage(&f.manager, &mut op).unwrap();
     let (_, staging, finished) = paths(&f.root, &op.members[0], "moving");
     rename(&staging, &finished).unwrap();
     swap(&op, &op.members[0], Some(&finished)).unwrap();

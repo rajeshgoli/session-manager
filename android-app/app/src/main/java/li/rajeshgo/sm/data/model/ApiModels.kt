@@ -885,6 +885,40 @@ data class InboxThread(
     @SerialName("reply_to") val replyTo: InboxReplyTarget? = null,
     @SerialName("reply_options") val replyOptions: List<InboxReplyOption> = emptyList(),
     val items: List<InboxThreadItem> = emptyList(),
+    /** What Assign to agent offers, when an sm alert here can take it (sm#2414). */
+    val assign: AssignChoices? = null,
+)
+
+@Serializable
+data class AssignChoices(
+    val types: List<AssignType> = emptyList(),
+    val default: String? = null,
+    val repo: String? = null,
+)
+
+@Serializable
+data class AssignType(val name: String = "", val detail: String = "")
+
+/** An sm alert's action: `assign`, or `assigned` with the agent it went to. */
+@Serializable
+data class InboxAlert(val action: String = "", val agent: AlertAgent? = null)
+
+@Serializable
+data class AlertAgent(
+    val id: String = "",
+    val name: String = "",
+    val live: Boolean = false,
+    @SerialName("thread_path") val threadPath: String = "",
+)
+
+@Serializable
+data class AssignAlertRequest(@SerialName("agent_type") val agentType: String? = null)
+
+@Serializable
+data class AssignAlertResponse(
+    @SerialName("session_id") val sessionId: String = "",
+    val name: String = "",
+    @SerialName("thread_path") val threadPath: String = "",
 )
 
 @Serializable
@@ -932,6 +966,7 @@ data class InboxThreadItem(
     val pr: Long? = null,
     val sha: String? = null,
     @SerialName("review_state") val reviewState: String? = null,
+    val alert: InboxAlert? = null,
 )
 
 @Serializable
