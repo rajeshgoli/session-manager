@@ -355,8 +355,22 @@ fn single_quoted(text: &str) -> Option<String> {
 }
 
 /// The queue label: the command on one line, at most 120 characters.
+/// A program named by absolute path shows as its file name: a re-launched
+/// interpreter (Homebrew's `python3` becomes `…/Python.app/…/Python`) would
+/// otherwise fill the label with its install path.
 pub fn label_text(command: &str) -> String {
-    let line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut words = command.split_whitespace().collect::<Vec<_>>();
+    if let Some(first) = words.first_mut() {
+        let path = *first;
+        if path.starts_with('/') {
+            *first = path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path);
+        }
+    }
+    let line = words.join(" ");
     match line.char_indices().nth(MAX_LABEL_CHARS) {
         Some((end, _)) => format!("{}…", &line[..end]),
         None => line,
