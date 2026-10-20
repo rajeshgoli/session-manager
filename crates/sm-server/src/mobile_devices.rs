@@ -2210,7 +2210,8 @@ mod tests {
         revoke_device(&mobile_device_db_path(&config), "owner", "backup-mini").unwrap();
         assert!(renew_backup_with_sync(&config, "backup-mini", &csr, &short, |_| Ok(())).is_err());
         drop(identity);
-        assert!(Identity::load(&root).is_ok());
+        Identity::load(&root)
+            .unwrap_or_else(|error| panic!("reload backup identity after revocation: {error:#}"));
         drop(other);
         fs::remove_dir_all(dir).unwrap();
     }
