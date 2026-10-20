@@ -1060,7 +1060,13 @@ pub(super) async fn publish_owner_doc(
     let summary = store
         .summary(&published.doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
-    if published.publish.review_requested {
+    // Read before the board recompute starts writing (sm#2466).
+    let round = if published.publish.review_requested {
+        store.review_round(published.publish.id)?
+    } else {
+        None
+    };
+    if published.publish.review_requested && !round.is_some_and(|round| round.repeats) {
         super::follows::notice_review_publish(&state, &published.doc, &published.publish);
     }
     super::board::request_recompute(&state);
@@ -1068,6 +1074,10 @@ pub(super) async fn publish_owner_doc(
     response["created"] = json!(published.created);
     response["publish"] = serde_json::to_value(&published.publish)?;
     response["owner_name"] = json!(state.config.owner_name);
+    if let Some(round) = round {
+        // How the CLI words the request (sm#2466).
+        response["review_round"] = json!({ "repeats": round.repeats });
+    }
     if let Some(pr_number) = published.doc.pr_number {
         // The publishing session's implicit PR claim (sm#1452).
         if let Some(warning) = super::claims::record_implicit_pr_claim(

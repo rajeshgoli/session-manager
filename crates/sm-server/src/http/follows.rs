@@ -573,7 +573,9 @@ pub(super) fn notice_new_message(state: &AppState, message: &OwnerMessage) {
 }
 
 /// The notice for a `--review` publish; as for messages, failures wait for
-/// the repair pass.
+/// the repair pass. The caller skips a request the owner was already
+/// notified of in the round (since their last review, on this PR): the
+/// round's first notice stands for it (sm#2466).
 pub(super) fn notice_review_publish(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) {
     let notice = review_notice(state, doc, publish);
     if let Err(error) = push_store(state).create_notice(&notice, OffsetDateTime::now_utc()) {
@@ -582,6 +584,16 @@ pub(super) fn notice_review_publish(state: &AppState, doc: &OwnerDoc, publish: &
             doc.id
         );
     }
+}
+
+/// Whether a `--review` publish repeats a request already notified. An
+/// unreadable store notifies, as before sm#2466.
+fn review_repeats(state: &AppState, publish_id: i64) -> bool {
+    OwnerDocStore::new(expand_home(&state.config.sm_send.db_path))
+        .review_round(publish_id)
+        .ok()
+        .flatten()
+        .is_some_and(|round| round.repeats)
 }
 
 /// The server as notice delivery sees it.
@@ -621,8 +633,12 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                 let Some((doc, _)) = store.publish_by_id(publish_id)? else {
                     return Ok(false);
                 };
-                let latest = store.publishes(&doc.id)?.last().map(|publish| publish.id);
-                Ok(latest == Some(publish_id)
+                // Later requests in the round send no notice of their own, so
+                // its notice stands for them (sm#2466).
+                let current = store
+                    .review_round(publish_id)?
+                    .is_some_and(|round| round.current);
+                Ok(current
                     && store
                         .summary(&doc.id)?
                         .is_some_and(|summary| summary.state == OwnerDocState::ReviewRequested))
@@ -658,12 +674,27 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                 let Some((doc, publish)) = store.publish_by_id(publish_id)? else {
                     return Ok(false);
                 };
-                Ok(store
-                    .last_viewed_at(&doc.id, &publish.blob_sha)?
-                    .as_deref()
-                    .and_then(owner_push::parse_ts)
-                    .zip(owner_push::parse_ts(&notice.created_at))
-                    .is_some_and(|(viewed_at, created_at)| viewed_at >= created_at))
+                // The requested revision, or the newest one that replaced it.
+                let mut blobs = vec![publish.blob_sha];
+                blobs.extend(
+                    store
+                        .publishes(&doc.id)?
+                        .pop()
+                        .map(|latest| latest.blob_sha),
+                );
+                let created_at = owner_push::parse_ts(&notice.created_at);
+                for blob in blobs {
+                    let viewed_at = store.last_viewed_at(&doc.id, &blob)?;
+                    if viewed_at
+                        .as_deref()
+                        .and_then(owner_push::parse_ts)
+                        .zip(created_at)
+                        .is_some_and(|(viewed_at, created_at)| viewed_at >= created_at)
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
             crate::board::NOTICE_BOARD_READY
             | crate::board::NOTICE_BOARD_LANE_DONE
@@ -698,6 +729,7 @@ impl NoticeWorld for AppNoticeWorld<'_> {
             OwnerDocStore::new(expand_home(&self.state.config.sm_send.db_path))
                 .review_publishes_since(&since)?
                 .iter()
+                .filter(|(_, publish)| !review_repeats(self.state, publish.id))
                 .map(|(doc, publish)| review_notice(self.state, doc, publish)),
         );
         Ok(candidates)

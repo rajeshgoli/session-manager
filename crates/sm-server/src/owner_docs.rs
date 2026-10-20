@@ -205,6 +205,17 @@ pub struct PostedOwnerDocReview {
     pub wake: Option<(String, String)>,
 }
 
+/// A `--review` publish within its doc's review round: the requests on one
+/// PR since the owner's last posted review (sm#2466).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewRound {
+    /// The owner was notified of an earlier request in the round: this one
+    /// sends no new notification.
+    pub repeats: bool,
+    /// The publish is in the round the doc's latest publish belongs to.
+    pub current: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishOwnerDoc {
     pub repo: String,
@@ -236,6 +247,39 @@ pub struct OwnerDocStateInputs<'a> {
     pub viewed_blobs: BTreeSet<&'a str>,
     /// `(blob_sha, submitted_at)` of reviews with status `posted`.
     pub posted_reviews: Vec<(&'a str, &'a str)>,
+}
+
+/// Whether `publish` is a review request in `later`'s round: on the same
+/// PR, with no posted review of the doc between them (sm#2466).
+fn in_same_round(
+    publish: &OwnerDocPublish,
+    later: &OwnerDocPublish,
+    posted_reviews: &[(&str, &str)],
+) -> bool {
+    publish.review_requested
+        && publish.pr_number == later.pr_number
+        && !posted_reviews.iter().any(|(_, submitted_at)| {
+            timestamp_after(submitted_at, &publish.published_at)
+                && !timestamp_after(submitted_at, &later.published_at)
+        })
+}
+
+/// Whether the publish at `index` asks for a review the owner was already
+/// notified of in this round, dismissed or not. Such a publish is requested
+/// like any other but sends no new notification: the owner hears once per
+/// doc per PR, again only after posting a review (sm#2466).
+pub fn repeats_review_request(
+    publishes: &[&OwnerDocPublish],
+    index: usize,
+    posted_reviews: &[(&str, &str)],
+) -> bool {
+    let Some(publish) = publishes.get(index) else {
+        return false;
+    };
+    publish.review_requested
+        && publishes[..index]
+            .iter()
+            .any(|earlier| in_same_round(earlier, publish, posted_reviews))
 }
 
 /// Derived doc state; first match wins (spec "Storage"). A review request
@@ -967,6 +1011,44 @@ impl OwnerDocStore {
             result.entry(row.doc_id.clone()).or_default().push(row);
         }
         Ok(result)
+    }
+
+    /// Where a `--review` publish stands in its doc's review round
+    /// (sm#2466); `None` when the publish is unknown.
+    pub fn review_round(&self, publish_id: i64) -> Result<Option<ReviewRound>> {
+        let Some((doc, publish)) = self.publish_by_id(publish_id)? else {
+            return Ok(None);
+        };
+        let publishes = self.publishes(&doc.id)?;
+        let Some(index) = publishes.iter().position(|p| p.id == publish_id) else {
+            return Ok(None);
+        };
+        let reviews = self.posted_review_times(&doc.id)?;
+        let posted: Vec<(&str, &str)> = reviews
+            .iter()
+            .map(|(blob, at)| (blob.as_str(), at.as_str()))
+            .collect();
+        let all: Vec<&OwnerDocPublish> = publishes.iter().collect();
+        let latest = all.last().expect("publish found above");
+        Ok(Some(ReviewRound {
+            repeats: repeats_review_request(&all, index, &posted),
+            current: in_same_round(&publish, latest, &posted),
+        }))
+    }
+
+    /// `(blob_sha, submitted_at)` of the doc's posted reviews.
+    fn posted_review_times(&self, doc_id: &str) -> Result<Vec<(String, String)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(
+            "SELECT blob_sha, submitted_at FROM owner_doc_reviews
+             WHERE doc_id = ?1 AND status = 'posted' ORDER BY submitted_at, rowid",
+        )?;
+        let rows = statement
+            .query_map(params![doc_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn publishes(&self, doc_id: &str) -> Result<Vec<OwnerDocPublish>> {
@@ -2581,18 +2663,60 @@ mod tests {
         );
         let latest = store.publishes(&id).unwrap().pop().unwrap();
         assert!(latest.review_dismissed_at.is_some());
-        // A new --review publish asks again.
+        // A new --review publish asks again, without a second notification
+        // (sm#2466).
         let mut again = publish(Some(7), "b", "2");
         again.review_requested = true;
-        store.publish(again, |_| true).unwrap();
+        let again = store.publish(again, |_| true).unwrap().publish;
         assert_eq!(
             store.summary(&id).unwrap().unwrap().state,
             OwnerDocState::ReviewRequested
         );
+        let round = store.review_round(again.id).unwrap().unwrap();
+        assert!(round.repeats && round.current);
+        // A request on another PR notifies.
+        let mut next_pr = publish(Some(8), "c", "3");
+        next_pr.review_requested = true;
+        let next_pr = store.publish(next_pr, |_| true).unwrap().publish;
+        let round = store.review_round(next_pr.id).unwrap().unwrap();
+        assert!(!round.repeats && round.current);
         // A plain publish has nothing to dismiss.
-        store.publish(publish(Some(7), "c", "3"), |_| true).unwrap();
+        store.publish(publish(Some(7), "d", "4"), |_| true).unwrap();
         assert!(!store.dismiss_review(&id).unwrap());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owner_hears_once_per_round() {
+        let publish = |id, at: &str, pr, review_requested| OwnerDocPublish {
+            id,
+            doc_id: "d".into(),
+            commit_sha: "c".into(),
+            blob_sha: format!("b{id}"),
+            session_id: "s".into(),
+            review_requested,
+            published_at: at.into(),
+            checkout_root: None,
+            review_dismissed_at: None,
+            pr_number: pr,
+        };
+        let plain = publish(1, "2026-10-20T20:00:00Z", Some(7), false);
+        let first = publish(2, "2026-10-20T20:05:00Z", Some(7), true);
+        let mut second = publish(3, "2026-10-20T20:10:00Z", Some(7), true);
+        second.review_dismissed_at = Some("2026-10-20T20:12:00Z".into());
+        let third = publish(4, "2026-10-20T20:15:00Z", Some(7), true);
+        let after_review = publish(5, "2026-10-20T21:00:00Z", Some(7), true);
+        let other_pr = publish(6, "2026-10-20T21:05:00Z", Some(8), true);
+        let all = [&plain, &first, &second, &third, &after_review, &other_pr];
+        let posted = [("b4", "2026-10-20T20:30:00Z")];
+        assert!(!repeats_review_request(&all, 0, &posted), "plain publish");
+        assert!(!repeats_review_request(&all, 1, &posted), "first notifies");
+        assert!(repeats_review_request(&all, 2, &posted));
+        // No review needed is not a review: the round goes on.
+        assert!(repeats_review_request(&all, 3, &posted));
+        // A posted review starts the next round.
+        assert!(!repeats_review_request(&all, 4, &posted));
+        assert!(!repeats_review_request(&all, 5, &posted), "a new PR");
     }
 
     #[test]
