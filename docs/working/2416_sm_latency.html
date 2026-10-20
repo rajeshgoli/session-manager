@@ -267,7 +267,7 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>Revision 2</b> closes eight gaps an adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
+<p><b>Revisions 2 and 3</b> close ten gaps that two rounds of adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
 <ul>
 <li><b>Rollback stays safe.</b> The first move of old sessions into the cold segment happens only after a restart's handover is final, and after an hour of serving. If a deploy of T3 rolls back during the restart, the old binary finds every session where it expects them.</li>
 <li><b>Manual rollback past T3 needs one command.</b> Rolling back by hand to a build without T3, after the first move, would hide old sessions from that build until someone runs <code>sm-server thaw-cold</code>. T3 adds that command and documents it.</li>
@@ -429,14 +429,18 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 <ul>
 <li><b>Required.</b> <code>write_raw_json_value</code> takes the <code>Value</code> by value (or clones once, if a caller keeps using it). It no longer clears the cache unconditionally. Instead it installs <code>Arc::new(ParsedState::new(value))</code>, but only under a stamp that provably names the bytes it wrote:
   <ol>
-  <li>Write the temp file and keep its handle open.</li>
+  <li>Write the temp file, flush it, and <code>fstat</code> the temp handle. Record <code>(dev, inode, len, mtime)</code>.</li>
   <li>Rename it over the state file.</li>
   <li>Open the state file path again and <code>fstat</code> that new handle.</li>
-  <li>If the new handle's <code>(dev, inode)</code> equals the temp handle's, install the value with the stamp from that <code>fstat</code>. That is the same handle-based stamp <code>parsed_state_at</code> already computes.</li>
-  <li>Otherwise another writer replaced the file in between, so clear the cache, as today.</li>
+  <li>If the new handle's <code>(dev, inode, len, mtime)</code> all equal the values from step 1, install the value. Use the stamp from the step 3 <code>fstat</code>, which is the same handle-based stamp <code>parsed_state_at</code> already computes, including <code>ctime</code>.</li>
+  <li>Otherwise another writer replaced or rewrote the file in between, so clear the cache, as today.</li>
   </ol>
-  The stamp must come from a handle opened after the rename, because a rename can change <code>ctime</code>.</li>
-<li><b>Test, interleaving.</b> Inject a hook between steps 2 and 3 that replaces the file with different content. The next <code>load_parsed_state</code> must return the other writer's content.</li>
+  <ul>
+  <li><b>Why <code>ctime</code> is not compared.</b> A rename can change it, so it is not part of the comparison. It is still part of the installed stamp, taken from the reopened handle.</li>
+  <li><b>Why <code>len</code> and <code>mtime</code> are compared.</b> An in-place rewrite keeps the inode but changes <code>mtime</code> (nanosecond resolution on APFS) and usually <code>len</code>. Comparing them rejects it.</li>
+  <li><b>Residual case.</b> The only case left is a same-length rewrite within the same nanosecond. Nothing in sm writes the file in place, so this is accepted.</li>
+  </ul></li>
+<li><b>Test, interleaving.</b> Inject a hook between steps 2 and 3, and run it twice. Once it replaces the file through a rename; once it truncates and rewrites the file in place with different bytes and a later <code>mtime</code>. In both cases the next <code>load_parsed_state</code> must return the other writer's content.</li>
 <li><b>Normalization.</b> <code>ParsedState::new</code> runs <code>normalize_opencode_runtime_record</code> as on parse. The installed value must therefore equal what a fresh parse of the written file yields.</li>
 <li><b>Test.</b> Write, then <code>load_parsed_state</code>. The result equals <code>serde_json::from_slice(fs::read(file))</code> after normalization, and no parse ran (count parses with a test-only counter).</li>
 <li><b>External writers.</b> A write from outside the process changes the stamp, and the next reader parses, as today.</li>
@@ -597,7 +601,12 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 <li><b>Whole-store writers.</b> These need cold handling:
   <ul>
   <li><code>update_session_metadata</code>'s <code>is_em</code> flip needs nothing, because cold records never have <code>is_em</code>.</li>
-  <li><code>transfer_handoff_json</code> repoints <code>parent_session_id</code>. It is a class-2 writer: under its guard it thaws cold records whose <code>parent_session_id</code> is the predecessor, using the view's index of cold children by parent id.</li>
+  <li><code>transfer_handoff_json</code> repoints, on every session, each field that names the predecessor. Today those fields are <code>parent_session_id</code> and <code>context_monitor_notify</code> (handoff/transfer.rs ~502–513). It is a class-2 writer.
+  <ul>
+  <li>Factor the loop's "does this record name the predecessor in a field I repoint" test into one predicate.</li>
+  <li>Under its guard, thaw every cold record that predicate matches, then run the loop. A field added to the loop later is then covered automatically.</li>
+  <li>The view indexes cold records by each repointed field's value.</li>
+  </ul></li>
   <li><code>strip_legacy_handoff_fields</code> and <code>maintain_handoff_notes</code> do not modify cold records; legacy fields on cold records are stripped by the sweep before they go cold.</li>
   <li><code>scan_usage_ledger</code> account stamping skips stopped records (T1), so it never touches cold ones.</li>
   </ul></li>
@@ -613,7 +622,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li>every route in the stopped-session inventory: <code>/sessions?include_stopped=true</code>, <code>/history/agents</code>, <code>/watch/state</code>, children with <code>include_terminated</code>, <code>/nodes/{node}/restore-candidates</code>, by-id GETs;</li>
   <li><code>get_session</code> by id, alias and name;</li>
   <li>restore, retire, kill and PATCH of a cold session;</li>
-  <li>a successor handoff whose predecessor has cold children;</li>
+  <li>a successor handoff whose predecessor has cold children, plus a cold record that is not a child but has <code>context_monitor_notify</code> set to the predecessor;</li>
   <li>a tmux client attach naming a stopped, non-retired codex-fork session older than 14 days, which stays hot by D.2 and is revived as before;</li>
   <li>a sweep concurrent with a by-id write to an eligible record. The write must succeed on the thawed record;</li>
   <li>work-claims <code>session_directory</code>;</li>
