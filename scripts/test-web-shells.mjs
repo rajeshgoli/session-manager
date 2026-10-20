@@ -406,23 +406,24 @@ for (const width of [390, 1440]) test(`Hide sends a shell to the tray and Undo b
     await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
     assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: true });
     assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, true);
-    // In the switcher it waits folded under Hidden; the other shell stays.
+    // The shell leaves the switcher; an eye with a count appears in the top bar.
     if (width < 900) await page.getByRole('button', { name: 'Unfold session list', exact: true }).click();
-    const tray = page.getByRole('button', { name: /Hidden · 1/ });
-    await tray.waitFor();
-    assert.equal(await page.locator('.sw-row').filter({ hasText: 'cargo bench' }).count(), 1);
-    assert.equal(await page.locator('.sw-row.sw-hidden').count(), 0);
-    await tray.click();
-    await page.locator('.sw-row.sw-hidden').waitFor();
-    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-tray-${width}.png` }); }
+    await page.locator('.sw-row').filter({ hasText: 'cargo bench' }).waitFor();
+    assert.equal(await page.locator('.sw-row').filter({ hasText: 'last input' }).count(), 0);
+    const eye = page.locator('.term-bar').getByRole('button', { name: '1 hidden terminal', exact: true });
+    await eye.click();
+    const hiddenRow = page.locator('.hidden-shell');
+    assert.equal(await hiddenRow.count(), 1);
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-eye-${width}.png` }); }
     // Opening a hidden shell keeps it hidden until Unhide.
-    await page.locator('.sw-row.sw-hidden').click();
+    await hiddenRow.locator('.hidden-shell-open').click();
     await page.waitForURL('**/terminal/term-abcd');
     await page.locator('.term-bar .shell-hidden-pill').waitFor();
     await page.locator('.term-bar').getByRole('button', { name: 'Unhide', exact: true }).click();
     await page.locator('.term-bar').getByRole('button', { name: 'Hide', exact: true }).waitFor();
     assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, false);
     assert.ok(page.url().endsWith('/terminal/term-abcd'));
+    await page.locator('.hidden-shells-btn').waitFor({ state: 'detached' });
     // Hide, then Undo from the toast returns to the shell.
     await page.locator('.term-bar').getByRole('button', { name: 'Hide', exact: true }).click();
     await page.waitForURL(url => url.pathname !== '/terminal/term-abcd');
@@ -433,20 +434,26 @@ for (const width of [390, 1440]) test(`Hide sends a shell to the tray and Undo b
   } finally { await browser.close(); }
 });
 
-test('Agents page folds hidden shells into a tray and names tiles by their shell name', async () => {
+test('Agents page shows the eye only while a shell is hidden; its menu opens and unhides', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
-    const { page, state, errors } = await setup(browser);
-    state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, hidden: true }
-      : s.id === 'term-busy' ? { ...s, name: 'bench runner', named: true } : s);
+    const { page, state, requests, errors } = await setup(browser);
     await page.goto(`${ORIGIN}/`);
     const terminals = page.getByRole('region', { name: 'Terminals', exact: true });
-    await terminals.getByText('1 open · 1 hidden', { exact: true }).waitFor();
+    await terminals.getByText('2 open', { exact: true }).waitFor();
+    assert.equal(await page.locator('.hidden-shells-btn').count(), 0);
+    state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, hidden: true }
+      : s.id === 'term-busy' ? { ...s, name: 'bench runner', named: true } : s);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await terminals.getByText('1 open', { exact: true }).waitFor();
     assert.deepEqual(await terminals.locator('.terminal-tile strong').allTextContents(), ['bench runner']);
-    await terminals.getByRole('button', { name: /Hidden · 1/ }).click();
-    await terminals.locator('.terminal-tile.is-hidden').waitFor();
-    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
-    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-tray-agents.png`, fullPage: true }); }
+    await page.locator('header.bar').getByRole('button', { name: '1 hidden terminal', exact: true }).click();
+    await page.locator('.hidden-shell').getByText('last input 12m').waitFor();
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/agents-eye.png` }); }
+    await page.locator('.hidden-shell').getByRole('button', { name: 'Unhide', exact: true }).click();
+    await terminals.getByText('2 open', { exact: true }).waitFor();
+    await page.locator('.hidden-shells-btn').waitFor({ state: 'detached' });
+    assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: false });
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

@@ -847,14 +847,18 @@ button.sw-sec { cursor: pointer; }
 .shell-name-input { min-width: 0; max-width: min(22rem, 40vw); margin: 0 -6px; padding: 3px 6px; border: 1px solid var(--accent); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; font-weight: 650; outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .shell-name-input::placeholder { color: var(--ink-3); font-weight: 500; }
 .shell-hidden-pill { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink-3); font-size: .8rem; font-weight: 500; }
-.sw-tray { display: block; width: 100%; padding: 6px 12px 4px 30px; border: 0; background: none; color: var(--ink-3); font: 500 .867rem var(--ui); text-align: left; cursor: pointer; }
-.sw-tray:hover { color: var(--ink); }
 .sw-row.sw-hidden .sw-nm, .sw-row.sw-hidden .sw-shell { color: var(--ink-3); }
-.terminal-tray { display: inline-flex; align-items: center; gap: 6px; margin-top: 14px; padding: 4px 2px; border: 0; background: none; color: var(--ink-3); font: 500 .867rem var(--ui); cursor: pointer; }
-.terminal-tray:hover { color: var(--ink); }
-.terminal-tray + .terminal-tiles { margin-top: 10px; }
-.terminal-tile.is-hidden { border-style: dashed; background: transparent; }
-.terminal-tile.is-hidden strong { color: var(--ink-2); }
+/* The eye shows only while shells are hidden; its menu opens or unhides them. */
+.icon-btn.hidden-shells-btn { width: auto; display: inline-flex; align-items: center; gap: 4px; padding: 0 7px; }
+.hidden-shells-count { font: 600 .8rem var(--ui); font-variant-numeric: tabular-nums; }
+.pop.hidden-shells-pop { width: min(20rem, calc(100vw - 24px)); padding: 6px; gap: 2px; }
+.hidden-shells-head { padding: 6px 8px 8px; color: var(--ink-3); font: 600 .8rem var(--ui); letter-spacing: .06em; text-transform: uppercase; }
+.hidden-shell { display: flex; align-items: center; gap: 8px; padding: 2px 4px 2px 0; border-radius: 6px; }
+.hidden-shell:hover, .hidden-shell.cur { background: var(--panel-2); }
+.hidden-shell-open { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; padding: 7px 8px; border: 0; background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.hidden-shell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.hidden-shell-fact { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: .8rem; }
+.hidden-shell .btn { flex: none; }
 .term-bar .shell-close-confirm { top: 44px; display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 8px; padding: 16px; width: min(21rem, calc(100vw - 24px)); max-width: min(21rem, calc(100vw - 24px)); box-shadow: var(--shadow); }
 .shell-close-confirm > span { font-size: .9rem; color: var(--ink-2); }
 .shell-close-confirm .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
