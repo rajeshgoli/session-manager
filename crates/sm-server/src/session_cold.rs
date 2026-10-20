@@ -74,7 +74,20 @@ impl ColdSegment {
     }
 
     fn merge(&self, hot: &Value) -> Value {
-        let mut merged = hot.clone();
+        // Split arrays are rebuilt below. Copying them here as well duplicates
+        // the hot history on the first reader after every write.
+        let mut merged = match hot.as_object() {
+            Some(object) => Value::Object(
+                object
+                    .iter()
+                    .filter(|(field, _)| {
+                        !FIELDS.contains(&field.as_str()) || self.entries(field).is_empty()
+                    })
+                    .map(|(field, value)| (field.clone(), value.clone()))
+                    .collect(),
+            ),
+            None => hot.clone(),
+        };
         for field in FIELDS {
             let cold = self.entries(field);
             if cold.is_empty() {
@@ -739,6 +752,65 @@ mod tests {
             "cold-copy-perf {}",
             json!({"sessions":before["sessions"].as_array().unwrap().len(),"sweeps":moved,"before_bytes":before_bytes,"after_bytes":after_bytes,"before_write_ms":before_ms,"after_write_ms":after_ms})
         );
+        fs::remove_dir_all(store.state_file.parent().unwrap()).unwrap();
+    }
+
+    /// Compare identical records with no cold file, one sweep, and all sweeps.
+    /// Each iteration writes and then measures the first and cached read.
+    #[test]
+    #[ignore = "requires explicit isolated performance input"]
+    fn cold_copy_read_after_write_benchmark() {
+        let input = PathBuf::from(env::var("SM_COLD_PERF_INPUT").expect("SM_COLD_PERF_INPUT"));
+        let (store, _) = fixture("read-perf");
+        fs::copy(&input, &store.state_file).unwrap();
+        let cold_input = input.with_file_name("sessions.cold.json");
+        if cold_input.exists() {
+            fs::copy(cold_input, store.cold_path()).unwrap();
+        }
+        store.thaw_all_cold_sessions().unwrap();
+        store.strip_legacy_handoff_fields().unwrap();
+        let expected = (*store.load_parsed_state().unwrap().raw).clone();
+        let id = expected["sessions"][0]["id"].as_str().unwrap();
+        let iterations = 30;
+        for phase in ["all-hot", "first-sweep", "all-sweeps"] {
+            if phase != "all-hot" {
+                store.sweep_cold_sessions().unwrap();
+            }
+            if phase == "all-sweeps" {
+                while store.sweep_cold_sessions().unwrap() != 0 {}
+            }
+            assert_eq!(*store.load_parsed_state().unwrap().raw, expected);
+            let mut times = [Duration::ZERO; 4];
+            for _ in 0..iterations {
+                let started = Instant::now();
+                {
+                    let _guard = store.write_guard().unwrap();
+                    let hot = store.load_raw_json_value().unwrap();
+                    store.write_raw_json_value(&hot).unwrap();
+                }
+                times[0] += started.elapsed();
+                let started = Instant::now();
+                let parsed = store.load_parsed_state().unwrap();
+                std::hint::black_box(&*parsed.raw);
+                times[1] += started.elapsed();
+                let started = Instant::now();
+                assert!(store.get_session(id).unwrap().is_some());
+                times[2] += started.elapsed();
+                let started = Instant::now();
+                assert!(store.get_session(id).unwrap().is_some());
+                times[3] += started.elapsed();
+            }
+            println!(
+                "cold-read-perf {}",
+                json!({
+                    "phase":phase,"iterations":iterations,
+                    "write_ms":times[0].as_secs_f64()*1000.0/f64::from(iterations),
+                    "merge_ms":times[1].as_secs_f64()*1000.0/f64::from(iterations),
+                    "first_lookup_ms":times[2].as_secs_f64()*1000.0/f64::from(iterations),
+                    "cached_lookup_ms":times[3].as_secs_f64()*1000.0/f64::from(iterations)
+                })
+            );
+        }
         fs::remove_dir_all(store.state_file.parent().unwrap()).unwrap();
     }
 
