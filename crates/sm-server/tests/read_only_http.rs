@@ -18702,7 +18702,6 @@ for arg in "$@"; do
   previous="$arg"
 done
 printf '{"event_type":"thread/started","payload":{"thread":{"id":"recovered-provider-thread"}}}\n' >> "$event_stream"
-printf '{"event_type":"turn_complete","payload":{}}\n' >> "$event_stream"
 while true; do sleep 1; done
 "#,
     )
@@ -18819,17 +18818,45 @@ while true; do sleep 1; done
         )
         .unwrap();
     assert_eq!(attributed_provider_session, "recovered-provider-thread");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let (_, session) = get_json(app.clone(), "/sessions/recoverfork").await;
-        if session["status"] == "idle" {
-            break;
+    // Startup recovery resumes monitoring at the existing stream's end. Emit
+    // fresh root-thread events only after AppState has installed that monitor.
+    let (event_path, _) = codex_fork_artifact_paths(&log_dir, session_id);
+    let mut event_stream = fs::OpenOptions::new()
+        .append(true)
+        .open(event_path)
+        .unwrap();
+    let (status, session) = get_json(app.clone(), "/sessions/recoverfork").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(session["status"], "running");
+    for (event_type, expected_status) in [
+        ("turn_complete", "idle"),
+        ("turn_started", "running"),
+        ("turn_complete", "idle"),
+    ] {
+        writeln!(
+            event_stream,
+            "{}",
+            json!({
+                "schema_version": 2,
+                "session_id": "recovered-provider-thread",
+                "event_type": event_type,
+                "payload": {}
+            })
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (status, session) = get_json(app.clone(), "/sessions/recoverfork").await;
+            assert_eq!(status, StatusCode::OK);
+            if session["status"] == expected_status {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recovered event monitor did not apply {event_type}: {session}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "recovered event monitor stayed stale"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
