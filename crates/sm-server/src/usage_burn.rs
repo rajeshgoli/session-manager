@@ -136,7 +136,7 @@ impl UsageBurnStore {
         }
         let observed_at = format_timestamp(observed_at)?;
         let mut connection = self.open()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = insert_windows(&transaction, account_key, windows, source, &observed_at)?;
         transaction.commit()?;
         Ok(inserted)
@@ -660,6 +660,56 @@ mod tests {
     use crate::usage_identity::AccountIdentity;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn statusline_dedupe_waits_for_concurrent_writer_before_reading() {
+        let db_path = temp_db("statusline-concurrent");
+        seed_account(&db_path, Provider::Claude, "one", "2026-08-10T12:00:00Z");
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        let start = at("2026-08-10T12:00:00Z");
+        let window = BurnWindowSample {
+            window_kind: "session_5h".into(),
+            window_scope: None,
+            duration_minutes: 300,
+            percent: 10.0,
+            resets_at: start + time::Duration::hours(5),
+            severity: None,
+            is_active: None,
+        };
+        let mut connection = store.open().unwrap();
+        let blocker = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        insert_windows(
+            &blocker,
+            "claude:one",
+            std::slice::from_ref(&window),
+            "statusline",
+            &format_timestamp(start).unwrap(),
+        )
+        .unwrap();
+        let concurrent = store.clone();
+        let (sent, received) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            sent.send(concurrent.record_for_account(
+                "claude:one",
+                &[window],
+                "statusline",
+                start + time::Duration::seconds(5),
+            ))
+            .unwrap();
+        });
+        assert!(received.recv_timeout(StdDuration::from_millis(50)).is_err());
+        blocker.commit().unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(StdDuration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        writer.join().unwrap();
+    }
 
     #[test]
     fn statusline_samples_keep_changes_and_five_minute_heartbeat() {

@@ -150,6 +150,12 @@ impl UsageIdentityStore {
             );
             CREATE INDEX IF NOT EXISTS idx_account_metadata_lookup
               ON account_metadata_history(account_key, observed_at);
+            CREATE TABLE IF NOT EXISTS account_metadata_observation_hours (
+              account_key TEXT NOT NULL REFERENCES accounts(account_key),
+              hour TEXT NOT NULL,
+              observed_times TEXT NOT NULL,
+              PRIMARY KEY (account_key, hour)
+            );
             "#,
         )
         .context("failed to initialize usage identity schema")?;
@@ -487,28 +493,104 @@ fn record_account_metadata(
     account_key: &str,
     observed_ts: &str,
 ) -> Result<()> {
+    // Retain observation times in bounded hourly arrays, rather than one metadata
+    // row per poll. A delayed change needs the *first* later observation, including
+    // an unchanged poll, to restore the value that was observed at that time.
+    let hour = &observed_ts[..13];
+    let encoded: Option<String> = tx.query_row(
+        "SELECT observed_times FROM account_metadata_observation_hours WHERE account_key = ?1 AND hour = ?2",
+        params![account_key, hour], |row| row.get(0),
+    ).optional()?;
+    let mut times: Vec<String> = encoded
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()?
+        .unwrap_or_default();
+    let next_index = times.partition_point(|timestamp| timestamp.as_str() <= observed_ts);
+    let next_observation = if let Some(timestamp) = times.get(next_index) {
+        Some(timestamp.clone())
+    } else {
+        let next_hour: Option<String> = tx.query_row(
+            "SELECT observed_times FROM account_metadata_observation_hours WHERE account_key = ?1 AND hour > ?2 ORDER BY hour LIMIT 1",
+            params![account_key, hour], |row| row.get(0),
+        ).optional()?;
+        next_hour
+            .map(|encoded| serde_json::from_str::<Vec<String>>(&encoded))
+            .transpose()?
+            .and_then(|times| times.into_iter().next())
+    };
+    let next_history: Option<String> = tx.query_row(
+        "SELECT observed_at FROM account_metadata_history WHERE account_key = ?1 AND observed_at > ?2 ORDER BY observed_at LIMIT 1",
+        params![account_key, observed_ts], |row| row.get(0),
+    ).optional()?;
+    let restoration = if let Some(next) =
+        next_observation.filter(|next| next_history.as_ref().is_none_or(|history| next < history))
+    {
+        metadata_at_or_before(tx, account_key, &next)?.map(|metadata| (next, metadata))
+    } else {
+        None
+    };
+    let metadata = tx.query_row(
+        "SELECT plan_tier, extra_usage_enabled FROM accounts WHERE account_key = ?1",
+        [account_key],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<bool>>(1)?,
+            ))
+        },
+    )?;
+    if metadata_at_or_before(tx, account_key, observed_ts)?.as_ref() != Some(&metadata) {
+        write_account_metadata(tx, account_key, observed_ts, &metadata)?;
+        if let Some((next, previous)) = restoration.filter(|(_, previous)| previous != &metadata) {
+            write_account_metadata(tx, account_key, &next, &previous)?;
+        }
+    }
+    if let Err(index) = times.binary_search_by(|timestamp| timestamp.as_str().cmp(observed_ts)) {
+        times.insert(index, observed_ts.to_owned());
+        tx.execute(
+            "INSERT INTO account_metadata_observation_hours (account_key, hour, observed_times) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(account_key, hour) DO UPDATE SET observed_times = excluded.observed_times",
+            params![account_key, hour, serde_json::to_string(&times)?],
+        )?;
+    }
+    Ok(())
+}
+
+type AccountMetadata = (Option<String>, Option<bool>);
+
+fn metadata_at_or_before(
+    tx: &Transaction<'_>,
+    account_key: &str,
+    timestamp: &str,
+) -> Result<Option<AccountMetadata>> {
+    tx.query_row(
+        "SELECT plan_tier, extra_usage_enabled FROM account_metadata_history \
+         WHERE account_key = ?1 AND observed_at <= ?2 ORDER BY observed_at DESC LIMIT 1",
+        params![account_key, timestamp],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn write_account_metadata(
+    tx: &Transaction<'_>,
+    account_key: &str,
+    timestamp: &str,
+    metadata: &AccountMetadata,
+) -> Result<()> {
     tx.execute(
         r#"
         INSERT INTO account_metadata_history (
           account_key, observed_at, plan_tier, extra_usage_enabled
         )
-        SELECT account_key, ?2, plan_tier, extra_usage_enabled
-        FROM accounts WHERE account_key = ?1
-          AND NOT EXISTS (
-            SELECT 1 FROM account_metadata_history AS history
-            WHERE history.account_key = ?1
-              AND history.observed_at = (
-                SELECT MAX(observed_at) FROM account_metadata_history
-                WHERE account_key = ?1 AND observed_at <= ?2
-              )
-              AND history.plan_tier IS accounts.plan_tier
-              AND history.extra_usage_enabled IS accounts.extra_usage_enabled
-          )
+        VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(account_key, observed_at) DO UPDATE SET
           plan_tier = excluded.plan_tier,
           extra_usage_enabled = excluded.extra_usage_enabled
         "#,
-        params![account_key, observed_ts],
+        params![account_key, timestamp, metadata.0, metadata.1],
     )?;
     Ok(())
 }
@@ -855,6 +937,58 @@ mod tests {
     }
 
     #[test]
+    fn delayed_metadata_restores_the_first_later_observation_across_restarts() {
+        let dir = TestDir::new("metadata-delayed");
+        let path = dir.0.join("usage.db");
+        UsageIdentityStore::new(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE expected_metadata (observed_at TEXT PRIMARY KEY, plan_tier TEXT, extra_usage_enabled INTEGER)").unwrap();
+        let start = at("2026-08-10T12:00:00Z");
+        // Include repeated polls within an hour, across hours, overwrites at an
+        // existing timestamp, and a backfill before the earliest observation.
+        for (seconds, tier, enabled) in [
+            (0, "max", false),
+            (60, "max", false),
+            (120, "max", false),
+            (3600, "max", false),
+            (7200, "max", false),
+            (30, "max", true),
+            (1800, "pro", true),
+            (5400, "pro", true),
+            (60, "pro", false),
+            (-30, "pro", true),
+            (7200, "max", true),
+            (3600, "max", true),
+        ] {
+            let store = UsageIdentityStore::new(&path).unwrap();
+            let mut account = identity(Provider::Claude, "one");
+            account.plan_tier = Some(tier.into());
+            account.extra_usage_enabled = Some(enabled);
+            let timestamp = format_timestamp(start + time::Duration::seconds(seconds)).unwrap();
+            store
+                .ensure_account(&account, start + time::Duration::seconds(seconds))
+                .unwrap();
+            conn.execute("INSERT INTO expected_metadata VALUES (?1, ?2, ?3) ON CONFLICT(observed_at) DO UPDATE SET plan_tier = excluded.plan_tier, extra_usage_enabled = excluded.extra_usage_enabled", params![timestamp, tier, enabled]).unwrap();
+            for probe in [
+                -60, -30, 0, 29, 30, 59, 60, 61, 119, 120, 121, 1799, 1800, 3599, 3600, 5400, 7199,
+                7200, 8000,
+            ] {
+                let timestamp = format_timestamp(start + time::Duration::seconds(probe)).unwrap();
+                let read = |table: &str| {
+                    conn.query_row(&format!(
+                    "SELECT plan_tier, extra_usage_enabled FROM {table} WHERE observed_at = COALESCE((SELECT MAX(observed_at) FROM {table} WHERE observed_at <= ?1), (SELECT MIN(observed_at) FROM {table}))"
+                ), [&timestamp], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))).unwrap()
+                };
+                assert_eq!(
+                    read("account_metadata_history"),
+                    read("expected_metadata"),
+                    "after observation at {seconds}, reading at {probe}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn identical_polls_and_ensures_keep_one_metadata_row() {
         let dir = TestDir::new("metadata-dedupe");
         let store = UsageIdentityStore::new(dir.0.join("usage.db")).unwrap();
@@ -915,7 +1049,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            vec!["account_metadata_history", "account_timeline", "accounts"]
+            vec![
+                "account_metadata_history",
+                "account_metadata_observation_hours",
+                "account_timeline",
+                "accounts"
+            ]
         );
     }
 
