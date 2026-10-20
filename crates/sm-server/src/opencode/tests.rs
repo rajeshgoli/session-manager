@@ -95,11 +95,18 @@ impl Stub {
         let stopped = Arc::new(AtomicBool::new(false));
         let (worker_state, worker_stopped) = (state.clone(), stopped.clone());
         let worker = thread::spawn(move || {
+            let mut handlers = Vec::new();
             for stream in listener.incoming() {
                 if worker_stopped.load(Ordering::Acquire) {
                     break;
                 }
-                handle(stream.unwrap(), &worker_state);
+                // A readiness request can retain its health response while
+                // asking for status on a second connection.
+                let state = worker_state.clone();
+                handlers.push(thread::spawn(move || handle(stream.unwrap(), &state)));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
             }
         });
         Self {
@@ -298,6 +305,48 @@ fn handle(mut stream: TcpStream, state: &Mutex<StubState>) {
     };
     let output = format!("HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
     let _ = stream.write_all(output.as_bytes());
+    drop(state);
+    // Let the HTTP client close first. An active server close can leave this
+    // port in TIME_WAIT, making the launch fixture's immediate restore fail
+    // the production bind probe even though the stub listener is gone.
+    // The read timeout above still bounds cleanup for a misbehaving client.
+    let _ = std::io::copy(&mut stream, &mut std::io::sink());
+}
+
+#[test]
+fn stub_leaves_connection_close_to_client_and_port_is_rebindable() {
+    let stub = Stub::new();
+    let port = stub.port;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    stream
+        .write_all(b"GET /global/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n\r\n")
+        .unwrap();
+    // Read the complete response without waiting for EOF: the stub must keep
+    // the connection open until the client closes it, even after replying.
+    let body = b"{\"healthy\":true}";
+    let mut response = Vec::new();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    while !response.ends_with(body) {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = stream.read(&mut [0]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    drop(stream);
+    drop(stub);
+    let _rebound = TcpListener::bind(("127.0.0.1", port)).unwrap();
 }
 
 #[test]
