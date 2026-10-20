@@ -102,6 +102,10 @@ const POEM_NAMES: &str = "ozymandias kubla-khan dover-beach the-raven invictus j
 const STAR_NAMES: &str = "vega rigel sirius altair deneb polaris capella arcturus aldebaran antares betelgeuse procyon spica regulus castor pollux canopus achernar fomalhaut bellatrix mira algol alcor mizar dubhe merak alioth alkaid shaula sadr albireo alnilam alnitak mintaka saiph hadar acrux mimosa markab scheat alpheratz hamal menkar nunki kochab thuban denebola algieba elnath alhena wezen adhara avior suhail orion lyra cygnus carina perseus draco auriga pleiades hyades andromeda";
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[path = "session_reads_tests.rs"]
+mod session_reads_tests;
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     state_file: PathBuf,
