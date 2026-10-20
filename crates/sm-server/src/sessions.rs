@@ -83,14 +83,6 @@ const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
-/// Wake categories the background delivery loop retries until an idle target
-/// accepts them: sm queue completion wakes, sm remind reminders, and a
-/// handoff successor's brief that found its composer not yet ready.
-const BACKGROUND_RETRY_MESSAGE_CATEGORIES: [&str; 3] = [
-    "queue-completion",
-    "scheduled_reminder",
-    crate::handoff::execute::NOTICE_CATEGORY,
-];
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
@@ -5592,12 +5584,12 @@ impl SessionStore {
         &self,
         message_category: &str,
     ) -> Result<usize> {
-        self.drain_runtime_pending_targets_by_category(message_category, false)
+        self.drain_runtime_pending_targets(Some(message_category), false)
     }
 
-    fn drain_runtime_pending_targets_by_category(
+    fn drain_runtime_pending_targets(
         &self,
-        message_category: &str,
+        message_category: Option<&str>,
         skip_opencode: bool,
     ) -> Result<usize> {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
@@ -5606,7 +5598,10 @@ impl SessionStore {
         let Some(queue) = self.queue_store.as_ref() else {
             return Ok(0);
         };
-        let targets = queue.pending_target_session_ids_by_category(message_category)?;
+        let targets = match message_category {
+            Some(category) => queue.pending_target_session_ids_by_category(category)?,
+            None => queue.pending_target_session_ids()?,
+        };
         let mut failures = Vec::new();
         let mut attempted = 0;
         for target_session_id in &targets {
@@ -5626,7 +5621,8 @@ impl SessionStore {
             Ok(attempted)
         } else {
             Err(anyhow::anyhow!(
-                "failed to drain {message_category} messages for {}",
+                "failed to drain {} messages for {}",
+                message_category.unwrap_or("pending"),
                 failures.join("; ")
             ))
         }
@@ -5643,11 +5639,12 @@ impl SessionStore {
             Ok(targets) => drained += targets,
             Err(error) => failures.push(format!("{error:#}")),
         }
-        for message_category in BACKGROUND_RETRY_MESSAGE_CATEGORIES {
-            match self.drain_runtime_pending_targets_by_category(message_category, true) {
-                Ok(targets) => drained += targets,
-                Err(error) => failures.push(format!("{error:#}")),
-            }
+        // Every pending target needs a retry, including ordinary sequential
+        // sends and review wakes queued while a handoff successor was busy.
+        // Drain each target in queue order under a fresh provider-ready fence.
+        match self.drain_runtime_pending_targets(None, true) {
+            Ok(targets) => drained += targets,
+            Err(error) => failures.push(format!("{error:#}")),
         }
         if failures.is_empty() {
             Ok(drained)
@@ -11589,11 +11586,14 @@ fn runtime_session_accepts_background_delivery_raw(
     session_id: &str,
     runtime: &TmuxRuntime,
 ) -> Result<bool> {
-    let Some(_status) = runtime_session_status_raw(state, session_id)? else {
+    let Some(session) = raw_session_object(state, session_id) else {
         return Ok(false);
     };
-    let session = raw_session_object(state, session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+    // Remote targets have their own delivery transport; this loop probes only
+    // locally hosted provider composers.
+    if !is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node)) {
+        return Ok(false);
+    }
     // A Claude Stop hook is the durable lifecycle signal, but it is dispatched
     // through a detached curl and can be stale or lost.  Delivery must not wait
     // for that projection once the provider itself proves that its live composer
@@ -21513,6 +21513,70 @@ sleep 30
         );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn background_retry_delivers_a_successors_only_wake_after_busy_to_idle() {
+        // Neither a review wake nor an ordinary send may need a second message
+        // to unstick it, even after a handoff reported failure.
+        for category in [None, Some("codex_review")] {
+            let busy = queue_completion_test_pane(false);
+            let (store, queue, state_file, queue_db) =
+                queue_completion_test_store(&busy, "running");
+            let mut state = store.load_raw_json_value().unwrap();
+            state["sessions"][0]["predecessor_session_id"] = json!("failed-predecessor");
+            state["sessions"].as_array_mut().unwrap().push(json!({
+                "id": "failed-predecessor", "name": "predecessor", "status": "stopped",
+                "working_dir": "/repo", "tmux_session": "old-runtime",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:00:00Z",
+                "handoff": {"state": "failed", "successor_session_id": "queue-target"}
+            }));
+            store.write_raw_json_value(&state).unwrap();
+            queue
+                .enqueue_message_once_with_metadata(
+                    "only-wake",
+                    "queue-target",
+                    "[sm review] landed",
+                    "sequential",
+                    QueueMessageMetadata {
+                        message_category: category.map(str::to_owned),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store.drain_runtime_background_retry_messages().unwrap();
+            assert_eq!(
+                queue
+                    .pending_messages_for_target("queue-target", 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(busy.input_lines().is_empty());
+            drop(store);
+
+            // Reopening also proves the retry needs no in-memory registration
+            // from the original enqueue. No further message is queued.
+            let ready = queue_completion_test_pane(true);
+            let mut state: Value =
+                serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+            state["sessions"][0]["tmux_socket_name"] = json!(ready.socket_name);
+            fs::write(&state_file, state.to_string()).unwrap();
+            let restarted = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+                .with_delivery_runtime(Some(ready.runtime.clone()));
+            assert!(restarted
+                .apply_claude_stop_hook("queue-target", None, None, None, None, None, None)
+                .unwrap());
+            restarted.drain_runtime_background_retry_messages().unwrap();
+            restarted.drain_runtime_background_retry_messages().unwrap();
+            assert!(queue
+                .pending_messages_for_target("queue-target", 10)
+                .unwrap()
+                .is_empty());
+            assert_eq!(ready.wait_for_input_lines(1), vec!["[sm review] landed"]);
+            let _ = fs::remove_file(state_file);
+            let _ = fs::remove_file(queue_db);
+        }
     }
 
     /// Claim a due one-shot reminder without its immediate delivery attempt,

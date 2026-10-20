@@ -2545,7 +2545,20 @@ fn claude_brief_text_matches(content: &str, prompt: &str) -> bool {
     }
     body_and_end
         .strip_suffix(format!("\n</pasted_content id=\"{id}\">").as_str())
-        .is_some_and(matches)
+        .is_some_and(|body| {
+            matches(body)
+                // Claude escapes nested opening and closing paste tags when
+                // wrapping a long paste. Compare against that exact provider
+                // transformation; never unescape arbitrary transcript text.
+                || matches_claude_escaped_paste(body, prompt)
+        })
+}
+
+fn matches_claude_escaped_paste(body: &str, prompt: &str) -> bool {
+    let escaped = prompt
+        .replace("<pasted_content", "<\\pasted_content")
+        .replace("</pasted_content", "<\\/pasted_content");
+    body == escaped || (!escaped.trim().is_empty() && body == escaped.trim())
 }
 
 /// Claude renders a status/footer block below its live composer. Looking only
@@ -3996,6 +4009,36 @@ esac
         // A brief that itself contains markup is still matched literally.
         assert!(claude_brief_text_matches(&wrapped, &wrapped));
         assert!(!claude_brief_text_matches(&wrapped, "Preserve indentation"));
+    }
+
+    #[test]
+    fn claude_brief_acceptance_matches_escaped_nested_pastes_only_inside_an_envelope() {
+        let prompt =
+            "Handoff\n<pasted_content id=\"f5d5\">\nPrior brief\n</pasted_content id=\"f5d5\">\n";
+        let escaped = prompt
+            .replace("<pasted_content", "<\\pasted_content")
+            .replace("</pasted_content", "<\\/pasted_content");
+        let wrapped =
+            format!("\n\n<pasted_content id=\"96a2\">\n{escaped}\n</pasted_content id=\"96a2\">");
+        assert!(claude_brief_text_matches(&wrapped, prompt));
+        assert!(claude_brief_text_matches(
+            &wrapped.replace(&escaped, escaped.trim()),
+            prompt
+        ));
+        for wrong in [
+            escaped.clone(),
+            wrapped.replace("Prior brief", "Changed brief"),
+            wrapped.replace("f5d5", "f5d6"),
+            wrapped.replace("<\\/pasted_content", "</pasted_content"),
+            wrapped.replace(
+                "</pasted_content id=\"96a2\">",
+                "</pasted_content id=\"96a3\">",
+            ),
+            format!("extra instructions{wrapped}"),
+            format!("{wrapped}extra instructions"),
+        ] {
+            assert!(!claude_brief_text_matches(&wrong, prompt), "{wrong:?}");
+        }
     }
 
     #[test]

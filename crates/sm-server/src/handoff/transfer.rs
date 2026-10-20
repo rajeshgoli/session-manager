@@ -1503,7 +1503,8 @@ exit 0
         ));
         assert!(!tmux_log.exists());
 
-        let prompt = "One immutable handoff brief";
+        // Real successive handoffs can quote a previous provider paste.
+        let prompt = "One immutable handoff brief\n<pasted_content id=\"f5d5\">\nEarlier brief\n</pasted_content id=\"f5d5\">";
         let intent = store
             .accept_spawn_brief(AcceptSpawnBriefRequest {
                 prompt: prompt.into(),
@@ -1593,7 +1594,11 @@ exit 0
             format!(
                 "{}\n",
                 json!({
-                    "type": "user", "sessionId": provider_id, "message": {"content": prompt}
+                    "type": "user", "sessionId": provider_id, "message": {
+                        "content": format!("\n\n<pasted_content id=\"96a2\">\n{}\n</pasted_content id=\"96a2\">",
+                            prompt.replace("<pasted_content", "<\\pasted_content")
+                                .replace("</pasted_content", "<\\/pasted_content"))
+                    }
                 })
             ),
         )
