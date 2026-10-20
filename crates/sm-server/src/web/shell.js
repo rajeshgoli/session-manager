@@ -56,7 +56,7 @@ export function HiddenShells({ shells, currentId, onChanged, now }) {
         <button type="button" class="hidden-shell-open" onClick=${() => go(shell)}>
           <span class="hidden-shell-name">${shell.name}</span>
           <span class="hidden-shell-fact">${shellFact(shell, now).text}</span></button>
-        <button type="button" class="btn sm" onClick=${() => setShellHidden(shell, false, () => onChanged?.())}>Unhide</button>
+        <button type="button" class="btn sm" onClick=${() => setShellHidden(shell, false, () => { setOpen(false); onChanged?.(); })}>Unhide</button>
       </div>`)}
     <//>` : null}
   </span>`;

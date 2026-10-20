@@ -454,6 +454,11 @@ test('Agents page shows the eye only while a shell is hidden; its menu opens and
     await terminals.getByText('2 open', { exact: true }).waitFor();
     await page.locator('.hidden-shells-btn').waitFor({ state: 'detached' });
     assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: false });
+    // Hiding another shell later shows the eye closed.
+    state.sessions = state.sessions.map(s => s.id === 'term-busy' ? { ...s, hidden: true } : s);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await page.locator('.hidden-shells-btn').waitFor();
+    assert.equal(await page.locator('.hidden-shells-pop').count(), 0);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
