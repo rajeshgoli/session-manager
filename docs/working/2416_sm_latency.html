@@ -267,7 +267,7 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>Revisions 2 and 3</b> close ten gaps that two rounds of adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
+<p><b>Revisions 2 to 4</b> close eleven gaps that three rounds of adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
 <ul>
 <li><b>Rollback stays safe.</b> The first move of old sessions into the cold segment happens only after a restart's handover is final, and after an hour of serving. If a deploy of T3 rolls back during the restart, the old binary finds every session where it expects them.</li>
 <li><b>Manual rollback past T3 needs one command.</b> Rolling back by hand to a build without T3, after the first move, would hide old sessions from that build until someone runs <code>sm-server thaw-cold</code>. T3 adds that command and documents it.</li>
@@ -547,9 +547,20 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li>a thaw writes hot, then cold.</li>
   </ul>
   At every crash point a record is therefore in at least one file. The hot state file keeps its existing write (no fsync) for ordinary changes; only writes that move records use the durable sequence.</li>
-<li><b>Test, crash points.</b> Inject a failure after each of the four steps of each of the two writes, for both a sweep and a thaw. After a restart, assert two things: every record is visible exactly once in the merged view, and the merged order equals the pre-operation order.</li>
+<li><b>Test, crash points.</b> Inject a failure after each of the four steps of each of the two writes, for both a sweep and a thaw. The thaw case uses the <code>A, X, Y</code> layout above, and the sweep case moves two adjacent records with one hot record between them and a third. After a restart, assert two things: every record is visible exactly once in the merged view, and the merged order equals the pre-operation order.</li>
 <li><b>Reads.</b> The cold file is read at startup and whenever its stamp changes.</li>
-<li><b>Duplicates.</b> A session id present in both files is the hot copy; the cold copy is ignored and removed at the next cold rewrite. The same rule applies to launch ids.</li>
+<li><b>Duplicates take the hot content at the cold position.</b> A session id present in both files is merged as follows:
+  <ul>
+  <li>Its content is the hot copy.</li>
+  <li>Its position is the cold entry's position.</li>
+  <li>Its occurrence in the hot file is skipped during the merge.</li>
+  </ul>
+  The next cold rewrite removes the duplicate. The same rule applies to launch ids.</li>
+<li><b>Why the position comes from the cold entry.</b> A duplicate exists only between the two writes of a move, and a crash there must not change the order.
+  <ul>
+  <li><b>Thaw.</b> Take hot <code>A</code>, and cold <code>X</code> and <code>Y</code>, both anchored to <code>A</code>. Thawing <code>X</code> first writes hot <code>A, X</code>. If it crashes before the cold rewrite, the merge emits <code>A</code>, then cold <code>X</code> (with the hot content), then cold <code>Y</code>, and skips the hot <code>X</code>. The order is <code>A, X, Y</code>, unchanged.</li>
+  <li><b>Sweep.</b> A sweep writes cold entries anchored to the post-sweep hot set before the hot file drops them. A crash between the two writes therefore merges each duplicate at its cold position, which equals its old hot position.</li>
+  </ul></li>
 </ul>
 
 <h4>D.2 Eligibility to go cold</h4>
