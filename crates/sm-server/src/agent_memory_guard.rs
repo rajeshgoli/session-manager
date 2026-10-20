@@ -216,6 +216,10 @@ struct Guard {
     facts: HashMap<i32, ProcessFacts>,
     #[cfg(target_os = "macos")]
     forks: fork_watch::ForkWatcher,
+    /// Linux has no fork notice; a reparented process's own environment
+    /// names its session instead. Read once per process.
+    #[cfg(not(target_os = "macos"))]
+    environ_sessions: HashMap<i32, Option<String>>,
 }
 
 impl Guard {
@@ -227,12 +231,14 @@ impl Guard {
             forks: fork_watch::ForkWatcher::spawn(groups.clone()),
             groups,
             facts: HashMap::new(),
+            #[cfg(not(target_os = "macos"))]
+            environ_sessions: HashMap::new(),
         }
     }
 
     /// Arguments and start time of `pid`, read once per process.
     fn facts(&mut self, pid: i32) -> ProcessFacts {
-        let identity = process_identity(pid).map(|identity| format!("{identity:?}"));
+        let identity = process_identity_text(pid);
         if let Some(known) = self.facts.get(&pid) {
             if known.identity == identity {
                 return known.clone();
@@ -255,6 +261,8 @@ impl Guard {
         let rows = parse_process_listing(&listing);
         let live: HashSet<i32> = rows.iter().map(|row| row.pid).collect();
         self.facts.retain(|pid, _| live.contains(pid));
+        #[cfg(not(target_os = "macos"))]
+        self.attribute_by_environment(&rows, &panes, &live);
         let groups = {
             let mut groups = self.groups.lock().unwrap_or_else(|p| p.into_inner());
             let listed: HashSet<i32> = rows.iter().map(|row| row.pgid).collect();
@@ -437,6 +445,42 @@ impl Guard {
         }
         publish_background_jobs(snapshot);
         Ok(())
+    }
+
+    /// Records the group of each reparented process whose environment names
+    /// a live session, so it is traced like a fork notice would trace it.
+    #[cfg(not(target_os = "macos"))]
+    fn attribute_by_environment(
+        &mut self,
+        rows: &[ProcessRow],
+        panes: &[AgentPane],
+        live: &HashSet<i32>,
+    ) {
+        self.environ_sessions.retain(|pid, _| live.contains(pid));
+        let owners: HashMap<&str, &AgentPane> = panes
+            .iter()
+            .map(|pane| (pane.session_id.as_str(), pane))
+            .collect();
+        let mut groups = self.groups.lock().unwrap_or_else(|p| p.into_inner());
+        for row in rows.iter().filter(|row| row.ppid == 1) {
+            if groups.contains_key(&row.pgid) {
+                continue;
+            }
+            let session = self
+                .environ_sessions
+                .entry(row.pid)
+                .or_insert_with(|| environ_session_id(row.pid))
+                .clone();
+            if let Some(pane) = session.as_deref().and_then(|id| owners.get(id)) {
+                groups.insert(
+                    row.pgid,
+                    GroupOwner {
+                        session_id: pane.session_id.clone(),
+                        session_name: pane.session_name.clone(),
+                    },
+                );
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // one adoption's measurements
@@ -798,6 +842,29 @@ fn process_identity(pid: i32) -> Option<ProcessIdentity> {
         let after_command = stat.rsplit_once(')')?.1;
         after_command.split_whitespace().nth(19).map(str::to_owned)
     }
+}
+
+/// A process's kernel identity as shell jobs record it, to tell the process
+/// sm adopted from a later one that reused its PID.
+pub(crate) fn process_identity_text(pid: i32) -> Option<String> {
+    process_identity(pid).map(|identity| format!("{identity:?}"))
+}
+
+/// `CLAUDE_SESSION_MANAGER_ID` from a process's environment, which sm sets
+/// in every agent's shell and every child inherits.
+#[cfg(not(target_os = "macos"))]
+fn environ_session_id(pid: i32) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environ_value(&environ, "CLAUDE_SESSION_MANAGER_ID")
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))] // Linux only, tested everywhere
+fn environ_value(environ: &[u8], key: &str) -> Option<String> {
+    environ.split(|byte| *byte == 0).find_map(|entry| {
+        let entry = std::str::from_utf8(entry).ok()?;
+        let (name, value) = entry.split_once('=')?;
+        (name == key && !value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 fn process_started_at(pid: i32) -> Option<OffsetDateTime> {

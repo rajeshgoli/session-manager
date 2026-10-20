@@ -255,3 +255,72 @@ fn an_owner_stop_names_the_owner() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn the_stop_message_resubmits_the_full_command_not_the_cut_label() {
+    let dir = state_dir("long");
+    let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+    let command = format!("python train.py {}", "--flag ".repeat(30).trim_end());
+    let mut long = adoption(999_996);
+    long.label = label_text(&command);
+    long.command = command.clone();
+    let id = adopt_conn(&conn, &long).unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET holding_reason = 'cancelling', termination_detail_json = '{\"kind\":\"cancel\"}' WHERE id = ?1",
+        params![id],
+    )
+    .unwrap();
+    let messages = dir.join("messages.db");
+    finish_gone_conn(&conn, &id, &messages).unwrap();
+    let sent = RetainedQueueStore::new(messages)
+        .pending_messages_for_target_by_category("agent1", "queue-completion", 10)
+        .unwrap();
+    assert!(
+        sent[0].text.contains(&format!("-- {command}")),
+        "{}",
+        sent[0].text
+    );
+    assert!(
+        sent[0]
+            .text
+            .contains("It was cancelled with sm queue cancel."),
+        "{}",
+        sent[0].text
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recovery_keeps_a_job_only_while_its_root_is_the_adopted_process() {
+    let dir = state_dir("recover");
+    let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+    let messages = dir.join("messages.db");
+    // This test process stands in for a live command root leading a live group.
+    let pid = std::process::id() as i64;
+    // SAFETY: getpgrp has no failure mode.
+    let pgid = i64::from(unsafe { libc::getpgrp() });
+    let mut live = adoption(pgid);
+    live.root_pid = pid;
+    live.record.root_identity = crate::agent_memory_guard::process_identity_text(pid as i32);
+    let kept = adopt_conn(&conn, &live).unwrap();
+    let job = get_queue_job_runtime_conn(&conn, &kept).unwrap().unwrap();
+    assert!(recover_conn(&conn, &job, &messages, false).unwrap());
+    // Same live group number, but the recorded root was another process.
+    let mut reused = live.clone();
+    reused.record.root_identity = Some("an earlier process".to_owned());
+    let stale = adopt_conn(&conn, &reused).unwrap();
+    let job = get_queue_job_runtime_conn(&conn, &stale).unwrap().unwrap();
+    assert!(!recover_conn(&conn, &job, &messages, false).unwrap());
+    assert_eq!(
+        get_queue_job_conn(&conn, &stale).unwrap().unwrap().state,
+        "ended"
+    );
+    // Adopted before the Mac last booted: it died with the host.
+    let job = get_queue_job_runtime_conn(&conn, &kept).unwrap().unwrap();
+    assert!(!recover_conn(&conn, &job, &messages, true).unwrap());
+    assert_eq!(
+        get_queue_job_conn(&conn, &kept).unwrap().unwrap().state,
+        "host_restart"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

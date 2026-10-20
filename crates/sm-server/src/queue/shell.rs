@@ -250,7 +250,17 @@ pub(super) fn recover_conn(
         forget_usage(&job.id);
         return Ok(false);
     }
-    if job.process_group_id.is_some_and(process_group_exists) {
+    // The group id alone may have been reused since the command ended: keep
+    // the job only while its root is the very process sm adopted.
+    let root_matches = || {
+        let recorded = adoption_record_conn(conn, &job.id)
+            .ok()
+            .flatten()?
+            .root_identity?;
+        let pid = i32::try_from(job.pid?).ok()?;
+        Some(crate::agent_memory_guard::process_identity_text(pid)? == recorded)
+    };
+    if job.process_group_id.is_some_and(process_group_exists) && root_matches() == Some(true) {
         return Ok(true);
     }
     finish_gone_conn(conn, &job.id, message_queue_db_path)?;
@@ -502,11 +512,18 @@ pub(super) fn completion_text(
         })
         .unwrap_or_default();
     let cause = format!("{cause}{note}");
-    let command = job.label.clone();
+    // The exact command as adopted; the label is cut and collapsed for display.
+    let command = job
+        .argv_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .and_then(|argv| argv.into_iter().next())
+        .unwrap_or_else(|| job.label.clone());
     Some(format!(
-        "[sm queue] At {at} sm stopped `{command}` (PID {pid}), which you started from your shell at {started}. \
+        "[sm queue] At {at} sm stopped `{label}` (PID {pid}), which you started from your shell at {started}. \
 {cause} Rerun it through the queue so it waits for memory instead of being stopped:\n\n{resubmit}",
         at = clock_text(finished_at),
+        label = job.label,
         pid = job.pid.unwrap_or_default(),
         started = clock_text(&job.queued_at),
         resubmit = resubmit_text(&command, peak, None),

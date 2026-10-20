@@ -331,6 +331,8 @@ struct QueueJobRuntimeRecord {
     stop_escaped_pids: Vec<i64>,
     /// The job's lane rank for this admission pass; `i64::MAX` without one.
     lane_rank: i64,
+    /// The submitted argv as stored; a shell job's exact command (sm#2412).
+    argv_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4428,7 +4430,8 @@ fn get_queue_job_runtime_conn(
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
                rank_tickets, owner, local_agent_id, local_binding_json,
-               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids,
+               argv_json
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -4483,6 +4486,7 @@ fn get_queue_job_runtime_conn(
                     .and_then(|raw| serde_json::from_str(&raw).ok())
                     .unwrap_or_default(),
                 lane_rank: i64::MAX,
+                argv_json: row.get(34)?,
             })
         })
         .optional()
@@ -4499,7 +4503,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                exit_code, completion_notified_at, label, termination_detail_json,
                revived_at, process_limit, peak_process_count, owner_forced_at,
                rank_tickets, owner, local_agent_id, local_binding_json,
-               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids
+               stop_grace_seconds, stop_requested_at, stop_signal, stop_escaped_pids,
+               argv_json
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -4545,6 +4550,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                     .and_then(|raw| serde_json::from_str(&raw).ok())
                     .unwrap_or_default(),
                 lane_rank: i64::MAX,
+                argv_json: row.get(34)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12647,6 +12653,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
         // The limit counts every process the user runs, so it must sit above
@@ -12984,6 +12991,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
 
@@ -13048,6 +13056,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
 
@@ -13118,6 +13127,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
 
@@ -13195,6 +13205,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
 
@@ -13248,6 +13259,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
@@ -14436,6 +14448,7 @@ mod tests {
             peak_process_count: None,
             owner_forced_at: None,
             lane_rank: i64::MAX,
+            argv_json: None,
             rank_tickets: None,
         };
 

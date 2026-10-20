@@ -346,6 +346,23 @@ fn records_kills_and_lists_recent_ones_per_session() {
 }
 
 #[test]
+fn reads_the_session_id_from_a_linux_environment_block() {
+    let environ = b"PATH=/bin\0CLAUDE_SESSION_MANAGER_ID=cbf8008e\0HOME=/x\0";
+    assert_eq!(
+        environ_value(environ, "CLAUDE_SESSION_MANAGER_ID").as_deref(),
+        Some("cbf8008e")
+    );
+    assert_eq!(
+        environ_value(b"CLAUDE_SESSION_MANAGER_ID=\0", "CLAUDE_SESSION_MANAGER_ID"),
+        None
+    );
+    assert_eq!(
+        environ_value(b"OTHER=1\0", "CLAUDE_SESSION_MANAGER_ID"),
+        None
+    );
+}
+
+#[test]
 fn truncates_long_commands() {
     assert_eq!(truncate_chars("abcdef", 3), "abc…");
     assert_eq!(truncate_chars("abc", 3), "abc");
