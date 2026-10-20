@@ -73,7 +73,10 @@ def prepare(args):
     ])
     profile = state / "wall.sb"
     profile_args.command_groups = opencode if args.opencode_binary else None
-    profile.write_text(wall.generate(profile_args, wall.listening_ports(), len(wall.user_temp())))
+    # This credential-free fixture admits only its explicit service ports and
+    # denies all other outbound connections. Production listener discovery is
+    # unnecessary here and makes parallel launch tests depend on host-wide lsof.
+    profile.write_text(wall.generate(profile_args, set(), len(wall.user_temp())))
     text_command = Path(tmp) / "text-command"
     text_command.write_text("exit 37\n")
     text_command.chmod(0o700)

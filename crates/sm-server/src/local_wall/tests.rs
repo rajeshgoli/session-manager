@@ -202,23 +202,31 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
         "#[test]\nfn staged_test() {\n    assert_eq!(2 + 2, 4);\n}\n",
     )
     .unwrap();
-    let mut validation = a.spawn_queue("validation-shell", &["-c".into(), "set -e; python3 -c 'import pathlib; pathlib.Path(\"python-ran\").write_text(\"ok\")'; rustc -vV; cargo test --offline --lib; cargo fmt --check; cargo clippy --offline --all-targets -- -D warnings".into()]).unwrap();
+    let mut validation = a.spawn_queue("validation-shell", &["-c".into(), "set -e; python3 -c 'import pathlib, sys; sys.stdout.write(\"o\" * 131072); sys.stdout.flush(); sys.stderr.write(\"e\" * 131072); sys.stderr.flush(); pathlib.Path(\"python-ran\").write_text(\"ok\")'; rustc -vV; cargo test --offline --lib; cargo fmt --check; cargo clippy --offline --all-targets -- -D warnings".into()]).unwrap();
     let mut validation_stdout = validation.take_stdout().unwrap();
     let mut validation_stderr = validation.take_stderr().unwrap();
+    // Drain both pipes while the staged tools run: compiler diagnostics can
+    // fill either pipe and prevent the child from ever reporting its exit.
+    let output = thread::spawn(move || {
+        let mut text = String::new();
+        validation_stdout.read_to_string(&mut text).unwrap();
+        text
+    });
+    let errors = thread::spawn(move || {
+        let mut text = String::new();
+        validation_stderr.read_to_string(&mut text).unwrap();
+        text
+    });
     let validation_status = validation.wait().unwrap();
-    let mut validation_output = String::new();
-    let mut validation_errors = String::new();
-    validation_stdout
-        .read_to_string(&mut validation_output)
-        .unwrap();
-    validation_stderr
-        .read_to_string(&mut validation_errors)
-        .unwrap();
+    let validation_output = output.join().unwrap();
+    let validation_errors = errors.join().unwrap();
     drop(validation);
     assert!(
         validation_status.success(),
         "staged validation: {validation_output}\n{validation_errors}"
     );
+    assert!(validation_output.starts_with(&"o".repeat(131072)));
+    assert!(validation_errors.starts_with(&"e".repeat(131072)));
     assert!(validation_output.contains("1 passed"));
     assert_eq!(
         fs::read_to_string(a_request.checkout.join("python-ran")).unwrap(),

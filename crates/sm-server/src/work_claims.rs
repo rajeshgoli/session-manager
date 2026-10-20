@@ -36,6 +36,20 @@ pub const RESERVATION_RECOVERY_AGE: Duration = Duration::from_secs(5 * 60);
 pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
+    // Reserve the writer before inspecting columns. Readers must see either
+    // no schema or the complete schema, and concurrent initializers must not
+    // both decide to add the same column. Queue callers may already own a
+    // transaction; in that case its commit also publishes these migrations.
+    if !conn.is_autocommit() {
+        return init_work_claims_schema_in_transaction(conn);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    init_work_claims_schema_in_transaction(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn init_work_claims_schema_in_transaction(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
     worktrees::loose::init_schema(conn)?;
     crate::board::init_board_schema(conn)?;
