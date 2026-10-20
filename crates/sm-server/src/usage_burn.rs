@@ -53,6 +53,7 @@ impl UsageBurnStore {
         self.open()?
             .execute_batch(
                 r#"
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS burn_samples (
                   id           INTEGER PRIMARY KEY AUTOINCREMENT,
                   account_key  TEXT NOT NULL REFERENCES accounts(account_key),
@@ -74,6 +75,29 @@ impl UsageBurnStore {
                   );
                 CREATE INDEX IF NOT EXISTS idx_burn_active_at
                   ON burn_samples(account_key, observed_at, window_start, resets_at);
+                -- Keep count(*) and mutation detection constant-time for per-message reads.
+                CREATE TABLE IF NOT EXISTS burn_sample_scan_state (
+                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                  sample_count INTEGER NOT NULL,
+                  rewrite_version INTEGER NOT NULL
+                );
+                INSERT INTO burn_sample_scan_state
+                  SELECT 1, (SELECT COUNT(*) FROM burn_samples), 0
+                  WHERE NOT EXISTS (SELECT 1 FROM burn_sample_scan_state);
+                CREATE TRIGGER IF NOT EXISTS burn_sample_insert AFTER INSERT ON burn_samples
+                BEGIN
+                  UPDATE burn_sample_scan_state SET sample_count = sample_count + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS burn_sample_delete AFTER DELETE ON burn_samples
+                BEGIN
+                  UPDATE burn_sample_scan_state SET sample_count = sample_count - 1,
+                    rewrite_version = rewrite_version + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS burn_sample_update AFTER UPDATE ON burn_samples
+                BEGIN
+                  UPDATE burn_sample_scan_state SET rewrite_version = rewrite_version + 1;
+                END;
+                COMMIT;
                 "#,
             )
             .context("failed to initialize usage burn schema")?;
@@ -339,6 +363,33 @@ fn insert_windows(
     let mut inserted = 0;
     for window in windows {
         let resets_at = format_timestamp(window.resets_at)?;
+        if source == "statusline" {
+            let latest = transaction
+                .query_row(
+                    "SELECT percent, resets_at, observed_at FROM burn_samples \
+                 WHERE account_key = ?1 AND window_kind = ?2 AND window_scope IS ?3 \
+                 ORDER BY observed_at DESC, id DESC LIMIT 1",
+                    params![account_key, window.window_kind, window.window_scope],
+                    |row| {
+                        Ok((
+                            row.get::<_, f64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((percent, reset, observed)) = latest {
+                let age = OffsetDateTime::parse(observed_at, &Rfc3339)?
+                    - OffsetDateTime::parse(&observed, &Rfc3339)?;
+                if percent == window.percent
+                    && reset == resets_at
+                    && age < time::Duration::seconds(300)
+                {
+                    continue;
+                }
+            }
+        }
         let window_start =
             format_timestamp(window.resets_at - time::Duration::minutes(window.duration_minutes))?;
         inserted += transaction.execute(
@@ -609,6 +660,78 @@ mod tests {
     use crate::usage_identity::AccountIdentity;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn statusline_samples_keep_changes_and_five_minute_heartbeat() {
+        let db_path = temp_db("statusline-dedupe");
+        seed_account(&db_path, Provider::Claude, "one", "2026-08-10T12:00:00Z");
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        let start = at("2026-08-10T12:00:00Z");
+        let mut window = BurnWindowSample {
+            window_kind: "session_5h".into(),
+            window_scope: None,
+            duration_minutes: 300,
+            percent: 10.0,
+            resets_at: start + time::Duration::hours(5),
+            severity: None,
+            is_active: None,
+        };
+        assert_eq!(
+            store
+                .record_for_account("claude:one", &[window.clone()], "statusline", start)
+                .unwrap(),
+            1
+        );
+        let mut inserted = 1;
+        // Sixty unchanged polls over the next five minutes add only the heartbeat.
+        for i in 1..=60 {
+            inserted += store
+                .record_for_account(
+                    "claude:one",
+                    &[window.clone()],
+                    "statusline",
+                    start + time::Duration::seconds(i * 5),
+                )
+                .unwrap();
+        }
+        assert_eq!(inserted, 2);
+        window.percent = 11.0;
+        assert_eq!(
+            store
+                .record_for_account(
+                    "claude:one",
+                    &[window.clone()],
+                    "statusline",
+                    start + time::Duration::seconds(301)
+                )
+                .unwrap(),
+            1
+        );
+        window.resets_at += time::Duration::seconds(1);
+        assert_eq!(
+            store
+                .record_for_account(
+                    "claude:one",
+                    &[window.clone()],
+                    "statusline",
+                    start + time::Duration::seconds(302)
+                )
+                .unwrap(),
+            1
+        );
+        window.window_scope = Some("opus".into());
+        assert_eq!(
+            store
+                .record_for_account(
+                    "claude:one",
+                    &[window],
+                    "statusline",
+                    start + time::Duration::seconds(303)
+                )
+                .unwrap(),
+            1
+        );
+    }
 
     fn temp_db(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

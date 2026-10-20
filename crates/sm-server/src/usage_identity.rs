@@ -494,6 +494,16 @@ fn record_account_metadata(
         )
         SELECT account_key, ?2, plan_tier, extra_usage_enabled
         FROM accounts WHERE account_key = ?1
+          AND NOT EXISTS (
+            SELECT 1 FROM account_metadata_history AS history
+            WHERE history.account_key = ?1
+              AND history.observed_at = (
+                SELECT MAX(observed_at) FROM account_metadata_history
+                WHERE account_key = ?1 AND observed_at <= ?2
+              )
+              AND history.plan_tier IS accounts.plan_tier
+              AND history.extra_usage_enabled IS accounts.extra_usage_enabled
+          )
         ON CONFLICT(account_key, observed_at) DO UPDATE SET
           plan_tier = excluded.plan_tier,
           extra_usage_enabled = excluded.extra_usage_enabled
@@ -842,6 +852,48 @@ mod tests {
             plan_tier: None,
             extra_usage_enabled: None,
         }
+    }
+
+    #[test]
+    fn identical_polls_and_ensures_keep_one_metadata_row() {
+        let dir = TestDir::new("metadata-dedupe");
+        let store = UsageIdentityStore::new(dir.0.join("usage.db")).unwrap();
+        let mut account = identity(Provider::Claude, "one");
+        account.plan_tier = Some("max".into());
+        account.extra_usage_enabled = Some(false);
+        let start = at("2026-08-10T12:00:00Z");
+        for i in 0..100 {
+            let observed = start + time::Duration::seconds(i);
+            store
+                .record_observation(Provider::Claude, Some(&account), observed, None, None)
+                .unwrap();
+            store.ensure_account(&account, observed).unwrap();
+            store.ensure_local_account(observed).unwrap();
+        }
+        let conn = store.open().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_metadata_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2); // One Claude row and one local row.
+        account.extra_usage_enabled = Some(true);
+        store
+            .ensure_account(&account, start + time::Duration::seconds(100))
+            .unwrap();
+        let rows = conn.prepare("SELECT observed_at, extra_usage_enabled FROM account_metadata_history WHERE account_key = 'claude:one' ORDER BY observed_at").unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (format_timestamp(start).unwrap(), false),
+                (
+                    format_timestamp(start + time::Duration::seconds(100)).unwrap(),
+                    true
+                )
+            ]
+        );
     }
 
     #[test]
