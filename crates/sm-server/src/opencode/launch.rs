@@ -113,12 +113,28 @@ pub fn loaded_config(
 
 pub fn lowest_port(config: &OpencodeConfig, occupied: &BTreeSet<u16>) -> Result<u16> {
     config.validate()?;
+    let mut last_failure = None;
     for port in config.port_range[0]..=config.port_range[1] {
-        if !occupied.contains(&port) && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return Ok(port);
+        if occupied.contains(&port) {
+            continue;
+        }
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(_) => return Ok(port),
+            Err(error) => {
+                #[cfg(test)]
+                crate::opencode::tests::report_bind_failure(port, &error);
+                last_failure = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("binding OpenCode port 127.0.0.1:{port}")),
+                );
+            }
         }
     }
-    Err(AdmissionError("no local port free".into()).into())
+    let refusal = AdmissionError("no local port free".into());
+    match last_failure {
+        Some(error) => Err(error.context(refusal)),
+        None => Err(refusal.into()),
+    }
 }
 
 pub fn verify_version(config: &OpencodeConfig) -> Result<()> {

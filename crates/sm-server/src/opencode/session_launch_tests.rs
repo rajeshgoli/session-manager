@@ -232,6 +232,7 @@ struct Fixture {
     store: SessionStore,
     driver: Arc<Driver>,
     runtime: TmuxRuntime,
+    _ports: crate::opencode::tests::PortRun,
 }
 impl Fixture {
     fn new() -> Self {
@@ -240,7 +241,8 @@ impl Fixture {
     fn with_ports(ports: u16) -> Self {
         let scratch = ScratchDir::new();
         let path = scratch.path().join("sessions.json");
-        let port = free_port_run(ports);
+        let port_run = free_port_run(ports);
+        let port = port_run.first;
         let driver = Arc::new(Driver {
             config: OpencodeConfig {
                 port_range: [port, port + ports - 1],
@@ -289,6 +291,7 @@ impl Fixture {
             store,
             driver,
             runtime,
+            _ports: port_run,
         }
     }
     fn request(id: &str, brief: Option<&str>) -> CreateCoreSessionRequest {

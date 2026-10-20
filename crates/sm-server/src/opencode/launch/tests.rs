@@ -123,7 +123,8 @@ fn ordinary_second_launch_is_refused_and_authorized_handoff_keeps_the_seat() {
 
 #[test]
 fn port_selection_excludes_listeners_and_persisted_reservations() {
-    let port = crate::opencode::tests::free_port_run(1);
+    let ports = crate::opencode::tests::free_port_run(1);
+    let port = ports.first;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let config = OpencodeConfig {
         port_range: [port, port],
@@ -131,6 +132,7 @@ fn port_selection_excludes_listeners_and_persisted_reservations() {
     };
     assert!(lowest_port(&config, &BTreeSet::new()).is_err());
     drop(listener);
+    crate::opencode::tests::wait_until_port_free(port);
     assert!(lowest_port(&config, &BTreeSet::from([port])).is_err());
     assert_eq!(lowest_port(&config, &BTreeSet::new()).unwrap(), port);
 }
