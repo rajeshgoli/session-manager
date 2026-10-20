@@ -111,7 +111,7 @@
 
 <h2>Memo</h2>
 
-<p><b>sm is slow for two reasons that stack.</b> First, the machine was overloaded: eight queue jobs ran at once, four of them full Rust test suites, and each suite can use all 32 cores by itself. Queue jobs run at the same CPU priority as sm-server and the agents, so everything waited in line together. Second, and growing every day, sm-server does work in proportion to <i>every agent that has ever run</i>, not to the handful that are live. It keeps all 2,822 sessions in one 13 MB file, copies that file in memory on most reads, rewrites it whole on most writes, and runs background loops that walk the entire history every few seconds.</p>
+<p><b>sm is slow for two reasons that stack.</b> First, the machine was overloaded: eight queue jobs ran at once, four of them full Rust test suites, and each suite can use all 32 cores by itself. Queue jobs run at the same CPU priority as sm-server and the agents, so everything waited in line together. Second, and growing every day, sm-server does work in proportion to <i>every agent that has ever run</i>, not to the handful that are live. It keeps all 2,823 sessions in one 13 MB file, copies that file in memory on most reads, rewrites it whole on most writes, and runs background loops that walk the entire history every few seconds.</p>
 
 <p><b>I recommend six tickets in three parallel lanes.</b> The first ticket alone removes about 28% of sm-server's CPU and a write storm that follows every account switch. The full set should cut sm-server's CPU by roughly two thirds, make the board page about four times faster, and keep sm responsive when the queue fills the machine, without capping how much work the queue does. Nothing in the plan deletes data or changes what any page shows, except where the decision table below says so.</p>
 
@@ -121,7 +121,7 @@
 <dt>Hook</dt><dd>An HTTP call a Claude agent makes to sm-server on each lifecycle event: prompt submitted, tool about to run, turn stopped, status-line update. Agents wait on the reply, so hook latency is agent latency.</dd>
 <dt>Write lock</dt><dd>The single in-process lock every change to the session state file takes. While one change holds it, every other change waits.</dd>
 <dt>Parse cache</dt><dd>sm-server's in-memory copy of the parsed state file. Today every write throws it away, so the next reader parses the whole file again.</dd>
-<dt>Cold segment</dt><dd>The proposed second file for sessions stopped more than 14 days ago. It is read once at startup and rarely rewritten. Every read still sees its sessions; only writes get cheaper.</dd>
+<dt>Cold segment</dt><dd>The proposed second file for retired or killed sessions that stopped more than 14 days ago. It is read once at startup and rarely rewritten. Every read still sees its sessions; only writes get cheaper.</dd>
 <dt>Nice value</dt><dd>The operating system's CPU priority for a process. 0 is the default; higher numbers yield to lower ones when cores are contended and use any spare cores freely when they are not.</dd>
 </dl>
 </div>
@@ -197,7 +197,7 @@
 <tbody>
 <tr><td><b>T1</b></td><td><b>Stop needless session work.</b> The retry loop skips stopped sessions before taking any lock. Writes happen only when something changed. The usage scan stamps accounts only on live sessions, in one write per scan.</td><td>sm-server CPU drops about a quarter. No more lock storm after an account switch.</td></tr>
 <tr><td><b>T2</b></td><td><b>Make reads free.</b> All readers share one parsed copy instead of copying it; looking up one session reads one record. A write hands its result to the cache instead of clearing it. Read-only lookups stop taking the write lock. Every part of the server uses one shared store.</td><td>Hooks and pages stop waiting on each other. Agents' tool calls return faster under load.</td></tr>
-<tr><td><b>T3</b></td><td><b>Cold segment.</b> Sessions stopped more than 14 days ago, with their finished launch records, move to a second file that sm loads once. Reads see both files, so every page and command behaves as before. Changing a cold session first moves it back.</td><td>The rewritten file shrinks from 13 MB to about 3 MB and stays there. Writes get about four times cheaper.</td></tr>
+<tr><td><b>T3</b></td><td><b>Cold segment.</b> Retired or killed sessions that stopped more than 14 days ago, with their finished launch records, move to a second file that sm loads once. Reads see both files, so every page and command behaves as before. Changing a cold session first moves it back.</td><td>The rewritten file shrinks from 13 MB to about 3 MB and stays there. Writes get about four times cheaper.</td></tr>
 <tr><td><b>T4</b></td><td><b>Queue.</b> Queue jobs start at nice 10, except perf jobs. Queue reads look only at live jobs and recent finishes. The queue page opens each database once per request. <code>sm queue list --all</code> shows the newest 200 jobs unless given <code>--limit</code>.</td><td>sm stays responsive when the queue fills the machine. The queue page halves. <code>--all</code> works again.</td></tr>
 <tr><td><b>T5</b></td><td><b>Polling pages and hooks.</b> The board reads all docs' publishes and reviews in two queries, not 290. Watch and obligations compute each input once per request. Review registrations get an index. Hooks run off the server's async worker threads.</td><td>Board page about four times faster. The phone's 5-second watch refresh costs a fraction of today.</td></tr>
 <tr><td><b>T6</b></td><td><b>Usage ledger.</b> Scans read only burn samples added since the last scan. Account history rows are written only when something changed. A status-line sample is stored when it changes, plus one every 5 minutes.</td><td>The once-a-minute usage scan stops showing up. usage.db stops growing by 18,000 rows a day.</td></tr>
@@ -229,7 +229,13 @@
 <tbody>
 <tr><td>1. Fix waste first, or shrink the file first?</td><td><b>Waste first (T1, T2), then the cold segment (T3).</b></td><td>T1 and T2 remove most of the cost with no change to stored data; T3 then keeps it from growing back.</td></tr>
 <tr><td>2. What happens to old stopped sessions?</td><td><b>Move them to a cold segment that every read still sees.</b> Do not delete them, and do not hide them from history, restore or work claims.</td><td>History, restore, handoff lineage and work claims all read old sessions. Work claims treat a missing session as "purged" and end its claims, so deleting would change behaviour.</td></tr>
-<tr><td>3. Cut-off for "old"?</td><td><b>14 days after the session stopped.</b> Sessions with an active role, a pending launch, a handoff hold or an <code>is_em</code> flag never go cold.</td><td>It keeps about 300 sessions hot. The name-reuse window is 7 days, so name reservations are unaffected.</td></tr>
+<tr><td>3. Cut-off for "old"?</td><td><b>14 days after a retired or killed session stopped.</b> These never go cold:
+<ul>
+<li>sessions that stopped without being retired or killed, which a terminal attach can still revive;</li>
+<li>sessions with an active role or any unfinished launch;</li>
+<li>sessions with a handoff hold;</li>
+<li>sessions with an <code>is_em</code> flag.</li>
+</ul></td><td>It keeps about 300 sessions hot. The name-reuse window is 7 days, so name reservations are unaffected.</td></tr>
 <tr><td>4. Should the usage scan keep stamping the current account onto stopped sessions?</td><td><b>No. Stamp live sessions only.</b> A stopped session keeps the account it ran on.</td><td>Today an account switch relabels every past session with the new account and rewrites the file about 2,800 times.</td></tr>
 <tr><td>5. CPU priority of queue jobs?</td><td><b>Nice 10 for all job types except perf, which stays at 0.</b></td><td>Jobs still use every spare core; sm and agents go first when cores are contended. Perf jobs already hold the machine alone, so lowering them would only add noise.</td></tr>
 <tr><td>6. <code>sm queue list --all</code>?</td><td><b>Show the newest 200 jobs by default; <code>--limit N</code> changes it, <code>--limit 0</code> shows all.</b></td><td>With 16,021 jobs, "all" times out today, so the default is already broken.</td></tr>
@@ -261,7 +267,13 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision.</p>
+<p><b>Revision 2</b> closes eight gaps an adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
+<ul>
+<li><b>Rollback stays safe.</b> The first move of old sessions into the cold segment happens only after a restart's handover is final, and after an hour of serving. If a deploy of T3 rolls back during the restart, the old binary finds every session where it expects them.</li>
+<li><b>Manual rollback past T3 needs one command.</b> Rolling back by hand to a build without T3, after the first move, would hide old sessions from that build until someone runs <code>sm-server thaw-cold</code>. T3 adds that command and documents it.</li>
+<li><b>Order is preserved exactly.</b> Lists of sessions come back in the same order as today, including ties between old sessions with the same name.</li>
+<li><b>Moves survive a host crash.</b> Each move is written to disk in a fixed, synced order, so a power loss cannot lose a session.</li>
+</ul>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -415,7 +427,16 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 
 <h4>C.2 Writes install their result in the cache</h4>
 <ul>
-<li><b>Required.</b> <code>write_raw_json_value</code> takes the <code>Value</code> by value (or clones once, if a caller keeps using it). After the rename it stats the new file and installs <code>Arc::new(ParsedState::new(value))</code> with that stamp. It no longer clears the cache.</li>
+<li><b>Required.</b> <code>write_raw_json_value</code> takes the <code>Value</code> by value (or clones once, if a caller keeps using it). It no longer clears the cache unconditionally. Instead it installs <code>Arc::new(ParsedState::new(value))</code>, but only under a stamp that provably names the bytes it wrote:
+  <ol>
+  <li>Write the temp file and keep its handle open.</li>
+  <li>Rename it over the state file.</li>
+  <li>Open the state file path again and <code>fstat</code> that new handle.</li>
+  <li>If the new handle's <code>(dev, inode)</code> equals the temp handle's, install the value with the stamp from that <code>fstat</code>. That is the same handle-based stamp <code>parsed_state_at</code> already computes.</li>
+  <li>Otherwise another writer replaced the file in between, so clear the cache, as today.</li>
+  </ol>
+  The stamp must come from a handle opened after the rename, because a rename can change <code>ctime</code>.</li>
+<li><b>Test, interleaving.</b> Inject a hook between steps 2 and 3 that replaces the file with different content. The next <code>load_parsed_state</code> must return the other writer's content.</li>
 <li><b>Normalization.</b> <code>ParsedState::new</code> runs <code>normalize_opencode_runtime_record</code> as on parse. The installed value must therefore equal what a fresh parse of the written file yields.</li>
 <li><b>Test.</b> Write, then <code>load_parsed_state</code>. The result equals <code>serde_json::from_slice(fs::read(file))</code> after normalization, and no parse ran (count parses with a test-only counter).</li>
 <li><b>External writers.</b> A write from outside the process changes the stamp, and the next reader parses, as today.</li>
@@ -432,9 +453,18 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   </ul>
   It does not hold <code>handoff_view</code>, because that depends on the work-claims database (see below).</li>
 <li><b>Freshness of <code>handoff_view</code>.</b> Each public read call still runs <code>WorkClaimStore::handoff_inherited_by_session</code> once, as <code>load_snapshot</code> does today. It then computes <code>handoff_view</code> only for the records it returns, so freshness is unchanged.</li>
+<li><b>Read set.</b> Readers never receive a bare <code>SessionsView</code>. They receive a per-call <code>SessionReadSet</code>, which holds <code>view: Arc&lt;SessionsView&gt;</code> plus <code>inherited: BTreeMap&lt;String, Inherited&gt;</code>, queried once when the read set is made. It offers three methods:
+  <ul>
+  <li><code>iter()</code> yields <code>&amp;SessionRecord</code> whose <code>handoff_view</code> is <code>None</code>. It is for callers that only filter or look up fields.</li>
+  <li><code>handoff_view(idx) -&gt; Value</code> computes <code>handoff_view_for_record(record, defaults, session_refs, inherited.get(id))</code>.</li>
+  <li><code>record(idx) -&gt; SessionRecord</code> returns a clone with <code>handoff_view</code> filled in. It is the only way to obtain a record for serialization.</li>
+  </ul>
+  The shared view is never mutated after it is built.</li>
+<li><b>Serialization rule.</b> Any code that builds a <code>SessionResponse</code> (or any JSON that includes <code>handoff_view</code>) from a read set must go through <code>record(idx)</code>. Today that is <code>watch_state</code>, <code>list_sessions</code>, <code>list_client_sessions</code>, by-id GETs, and <code>session_response_with_live_activity</code>. Enforce it with types: <code>SessionResponse::from</code> accepts an owned <code>SessionRecord</code> only, so a borrowed record from <code>iter()</code> cannot reach it.</li>
+<li><b>Test, freshness.</b> Read <code>/watch/state</code>, change a work claim so <code>handoff_inherited_by_session</code> changes for one session, without touching <code>sessions.json</code>, then read again. The second response's <code>handoff_view</code> reflects the change, and is byte-identical to what main returns for the same sequence.</li>
 <li><b><code>get_session(id)</code>.</b> Keep the four resolution steps in today's order: id, alias, a live record's display name, any record's display name. Steps 1–2 use the indexes. Steps 3–4 scan the view without copying. Only the single result is cloned.</li>
 <li><b><code>list_sessions(include_stopped)</code>.</b> Clone only the records it returns.</li>
-<li><b>Borrowing API.</b> Add <code>pub(crate) fn sessions_view(&amp;self) -&gt; Result&lt;Arc&lt;SessionsView&gt;&gt;</code>. Move these hot callers to borrow instead of clone:
+<li><b>Borrowing API.</b> Add <code>pub(crate) fn sessions_read_set(&amp;self) -&gt; Result&lt;SessionReadSet&gt;</code>. Move these hot callers to borrow instead of clone:
   <ul>
   <li><code>watch_state</code></li>
   <li><code>session_obligations</code></li>
@@ -462,9 +492,8 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li><code>apply_claude_stop_hook</code></li>
   <li><code>apply_context_usage_event</code> (unknown-session and stale-sample checks)</li>
   <li><code>apply_codex_fork_event_line_with_artifact</code></li>
-  <li><code>revive_stopped_tmux_client_session</code></li>
   </ul>
-  The locked path re-checks.</li>
+  <code>revive_stopped_tmux_client_session</code> gets the same treatment with its own condition: it returns without the lock when no record matches its selector (a stopped, non-retired codex-fork record with that <code>tmux_session</code>). The locked path re-checks in every case.</li>
 <li><b><code>handoff_doc_rows</code> (handoff/notes.rs 696).</b> Borrow via <code>load_parsed_state</code> instead of <code>load_raw_json_value</code>. Build one id-to-record map instead of calling <code>raw_session_object</code> per row. The output order and content are unchanged (existing tests at notes.rs ~1356 pin them).</li>
 <li><b>Other read-only callers of <code>load_raw_json_value</code>.</b> These switch to <code>load_parsed_state</code>:
   <ul>
@@ -487,34 +516,61 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 <p>The equivalence test passes. The perf scripts show <code>ParsedState::snapshot</code>, <code>load_snapshot</code> and <code>get_session</code> together under 2% of busy samples. Lock waits in <code>parsed_state_at</code> fall under 1%.</p>
 
 <h3 id="d">D. T3 — Cold segment</h3>
-<p>Files: <code>sessions.rs</code>, <code>handoff/transfer.rs</code>, <code>handoff/notes.rs</code>, <code>opencode/*.rs</code>, <code>scripts/rust_migration/{state_preflight,state_backup,state_restore,final_backup}.py</code>. Starts after T2 merges.</p>
+<p>Files: <code>sessions.rs</code>, <code>handoff/transfer.rs</code>, <code>handoff/notes.rs</code>, <code>opencode/*.rs</code>, <code>main.rs</code> (the <code>thaw-cold</code> subcommand and first-sweep gate), <code>scripts/rust_migration/{state_preflight,state_backup,state_restore,final_backup}.py</code>, <code>docs/product/lessons.md</code>. Starts after T2 merges.</p>
 
 <h4>D.1 Files and shape</h4>
 <ul>
-<li><b>Location and format.</b> The cold segment is <code>sessions.cold.json</code> beside the state file: <code>{"version":1,"sessions":[...],"session_runtime_launches":[...]}</code>. Each element is the raw JSON exactly as it stood in <code>sessions.json</code>.</li>
-<li><b>Writes.</b> It is written with the same temp-file-and-rename as the state file, plus an <code>fsync</code> of the file before the rename, because it is rewritten rarely and holds most of the history.</li>
-<li><b>Reads.</b> It is read at startup and whenever its stamp changes.</li>
-<li><b>Merged view.</b> The merged view orders sessions as cold records in stored order, then hot records in stored order. Launch records follow the same rule.</li>
+<li><b>Location and format.</b> The cold segment is <code>sessions.cold.json</code> beside the state file: <code>{"version":1,"sessions":[{"anchor":&lt;id or null&gt;,"record":{...}}],"session_runtime_launches":[{"anchor":&lt;launch id or null&gt;,"record":{...}}]}</code>. Each <code>record</code> is the raw JSON exactly as it stood in <code>sessions.json</code>. The hot file's shape does not change.</li>
+<li><b>Anchors preserve today's global order.</b> A cold entry's <code>anchor</code> is the id of the nearest record before it, in today's merged order, that is hot. It is <code>null</code> if no hot record precedes it. Cold entries keep their relative order within the file.</li>
+<li><b>Merged view.</b> The merged order is defined as:
+  <ol>
+  <li>cold entries anchored to <code>null</code>, in cold-file order;</li>
+  <li>then, for each hot record in hot-file order, that record followed by the cold entries anchored to it, in cold-file order.</li>
+  </ol>
+  This reproduces exactly the order the single file had. Launch records use the same rule over launch ids.</li>
+<li><b>Anchors at sweep and thaw.</b> When a sweep moves a record cold, it recomputes the anchors of every cold entry from the full merged order before writing. When a thaw moves X (anchored to A) back to hot, X is inserted into the hot file immediately after A, or at the front if A is <code>null</code>. The cold entries that followed X under the same anchor are re-anchored to X, and the entries before X keep A. The merged order is unchanged by either operation.</li>
+<li><b>Missing anchor.</b> An anchor whose id is in neither file can only arise from a manual edit. The merge then places that entry among the <code>null</code>-anchored ones and logs a warning naming the id. The next sweep recomputes the anchor.</li>
+<li><b>Durable writes.</b> Each file write is:
+  <ol>
+  <li>write the temp file;</li>
+  <li><code>fsync</code> the temp file;</li>
+  <li>rename it over the target;</li>
+  <li><code>fsync</code> the parent directory.</li>
+  </ol>
+  Moving records between the files is two such writes in a fixed order, and the second starts only after the first has completed step 4:
+  <ul>
+  <li>a sweep writes cold, then hot;</li>
+  <li>a thaw writes hot, then cold.</li>
+  </ul>
+  At every crash point a record is therefore in at least one file. The hot state file keeps its existing write (no fsync) for ordinary changes; only writes that move records use the durable sequence.</li>
+<li><b>Test, crash points.</b> Inject a failure after each of the four steps of each of the two writes, for both a sweep and a thaw. After a restart, assert two things: every record is visible exactly once in the merged view, and the merged order equals the pre-operation order.</li>
+<li><b>Reads.</b> The cold file is read at startup and whenever its stamp changes.</li>
 <li><b>Duplicates.</b> A session id present in both files is the hot copy; the cold copy is ignored and removed at the next cold rewrite. The same rule applies to launch ids.</li>
 </ul>
 
 <h4>D.2 Eligibility to go cold</h4>
 <p>A session goes cold when all of these hold at sweep time:</p>
 <ol>
-<li><code>raw_session_is_stopped</code> is true.</li>
+<li><code>raw_session_is_stopped</code> is true <i>and</i> <code>completion_status</code> is <code>retired</code> or <code>killed</code>. A session stopped without either can still be revived by a tmux client attach (<code>revive_stopped_tmux_client_session</code>) and stays hot.</li>
 <li>Its stop time is more than 14 days ago. The stop time is the first parseable of <code>stopped_at</code>, <code>completed_at</code>, <code>last_activity</code>; a record with none of them stays hot.</li>
 <li><code>is_em</code> is not true.</li>
 <li>It is not the holder of any <code>agent_registrations</code> entry, and not <code>maintainer_session_id</code>.</li>
-<li>It has no runtime launch whose status is <code>prepared</code> or <code>launching</code>.</li>
+<li>Every runtime launch for it has status <code>applied</code> or <code>failed</code>. Any other status keeps it hot, including <code>prepared</code>, <code>launching</code>, Opencode's <code>teardown_pending</code> (the <code>opencode_launch_pending</code> predicate, opencode/session_launch.rs ~901) and any status added later.</li>
 <li>It is not a key in <code>handoff_deferred_sessions</code>.</li>
 <li>It is not the subject, parent or target of any <code>reparent_requests</code> entry that is not terminal.</li>
 <li>No hot session names it in <code>parent_session_id</code>, <code>predecessor_session_id</code> or <code>successor_session_id</code> while that hot session is live.</li>
 </ol>
-<p>A launch record goes cold with its session when its status is <code>applied</code> or <code>failed</code>. Launch records whose session id is in neither file stay hot.</p>
+<p>A session's launch records go cold with it; by rule 5 they are all <code>applied</code> or <code>failed</code>. Launch records whose session id is in neither file stay hot. The fixture for D.5 includes a stopped, retired Opencode session with a <code>teardown_pending</code> launch, which must stay hot.</p>
 
 <h4>D.3 Sweep</h4>
 <ul>
-<li><b>When.</b> Once at startup, after boot recovery, and then every 24 h from the existing daily handoff-notes pass.</li>
+<li><b>When.</b> Every 24 h from the existing daily handoff-notes pass. The first sweep in a process runs only once both of these hold:
+  <ul>
+  <li>Its handover is final: <code>handover::wait_peer_exit</code> has returned for the previous server, or the process started with no peer.</li>
+  <li>It has been serving for at least 1 hour.</li>
+  </ul>
+  A replacement that rolls back during the restart script's health window has therefore never swept, so the old binary resumes with every session in the one file it understands.</li>
+<li><b>Manual rollback to a binary without T3.</b> Add <code>sm-server thaw-cold --config &lt;path&gt;</code>. It refuses to run while a server holds the handover socket. Otherwise it moves every cold record back into the hot file in merged order, by the thaw write order, and deletes the cold file. Document it in <code>docs/product/lessons.md</code> under rollback.</li>
 <li><b>Order of steps.</b> Under <code>write_guard</code>:
   <ol>
   <li>Compute the eligible set.</li>
@@ -522,19 +578,26 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li>Write the hot file without them.</li>
   </ol>
   A crash between the two writes leaves duplicates, which D.1 resolves.</li>
-<li><b>Limits.</b> At most 1,000 sessions per sweep, oldest first, so the first sweep on today's data takes three passes over three days, or three at startup if the implementer loops at boot.</li>
+<li><b>Limits.</b> At most 1,000 sessions per sweep, oldest first, so today's data takes three daily sweeps to settle.</li>
 </ul>
 
 <h4>D.4 Thaw</h4>
 <p>A thaw moves a session, and its cold launch records, back into the hot file.</p>
 <ul>
 <li><b>Order of writes.</b> Write the hot file with the record, then the cold file without it.</li>
-<li><b>Position.</b> The record is inserted before the first hot record whose <code>created_at</code> is later, or appended if none is.</li>
-<li><b>Every write path that targets a session id thaws first.</b> Implement this as one helper <code>thaw_if_cold(&amp;self, ids: &amp;[&amp;str])</code>, called at the top of each such public function before its own <code>write_guard</code>. The rule: every public <code>SessionStore</code> function in sessions.rs, handoff/*.rs and opencode/*.rs that takes a session id and takes <code>write_guard</code>. The implementer lists them in the PR description; a missing call is caught by the equivalence test below.</li>
+<li><b>Position.</b> Defined by the anchor rule in D.1.</li>
+<li><b>Thaw and mutation share one critical section.</b> The helper is <code>thaw_locked(&amp;self, guard: &amp;WriteGuard, select: impl Fn(&amp;Value) -&gt; bool) -&gt; Result&lt;usize&gt;</code>. It requires the caller's held write guard, so it cannot run without one. A writer calls it after taking its guard and before <code>load_raw_json_value</code>. The sweep takes the same guard, so a record cannot go cold between the thaw and the mutation.</li>
+<li><b>Which writers thaw.</b> Every function that takes <code>write_guard</code> in sessions.rs, handoff/*.rs, opencode/*.rs and owner_settings/store.rs falls into exactly one of four classes. The implementer lists every site with its class in the PR description:
+  <ol>
+  <li><b>By id.</b> It thaws the ids it targets, including ids it reaches by following a parent, predecessor or successor link inside its own mutation.</li>
+  <li><b>By selector.</b> It finds records by a field other than id: tmux name, parent id, provider resume id or name. It thaws every cold record the selector matches. The exception is a selector that, by D.2, can only match hot records; the PR cites the D.2 rule that guarantees it. <code>revive_stopped_tmux_client_session</code> is the known instance: it matches stopped, non-retired codex-fork records, which rule 1 keeps hot.</li>
+  <li><b>Top-level only.</b> It writes no session record, for example registries and settings.</li>
+  <li><b>Skips stopped records.</b> It provably never mutates a stopped record, for example account stamping after T1.</li>
+  </ol></li>
 <li><b>Whole-store writers.</b> These need cold handling:
   <ul>
   <li><code>update_session_metadata</code>'s <code>is_em</code> flip needs nothing, because cold records never have <code>is_em</code>.</li>
-  <li><code>transfer_handoff_json</code> repoints <code>parent_session_id</code>. It first thaws cold records whose <code>parent_session_id</code> is the predecessor; the view indexes cold children by parent id.</li>
+  <li><code>transfer_handoff_json</code> repoints <code>parent_session_id</code>. It is a class-2 writer: under its guard it thaws cold records whose <code>parent_session_id</code> is the predecessor, using the view's index of cold children by parent id.</li>
   <li><code>strip_legacy_handoff_fields</code> and <code>maintain_handoff_notes</code> do not modify cold records; legacy fields on cold records are stripped by the sweep before they go cold.</li>
   <li><code>scan_usage_ledger</code> account stamping skips stopped records (T1), so it never touches cold ones.</li>
   </ul></li>
@@ -551,6 +614,8 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li><code>get_session</code> by id, alias and name;</li>
   <li>restore, retire, kill and PATCH of a cold session;</li>
   <li>a successor handoff whose predecessor has cold children;</li>
+  <li>a tmux client attach naming a stopped, non-retired codex-fork session older than 14 days, which stays hot by D.2 and is revived as before;</li>
+  <li>a sweep concurrent with a by-id write to an eligible record. The write must succeed on the thawed record;</li>
   <li>work-claims <code>session_directory</code>;</li>
   <li>worktree cleanup candidates.</li>
   </ul></li>
@@ -639,7 +704,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 
 <h4>F.2 Watch and obligations compute each input once</h4>
 <ul>
-<li><b>Required.</b> One <code>/watch/state</code> request runs <code>list_sessions</code> (or <code>sessions_view</code>), <code>obligation_messages</code>, <code>handoff_doc_rows</code>, active queue jobs and the review-registration read once each. Today it is up to three, two, one, two and two. Pass a per-request context into <code>session_obligations</code>.</li>
+<li><b>Required.</b> One <code>/watch/state</code> request runs <code>list_sessions</code> (or <code>sessions_read_set</code>), <code>obligation_messages</code>, <code>handoff_doc_rows</code>, active queue jobs and the review-registration read once each. Today it is up to three, two, one, two and two. Pass a per-request context into <code>session_obligations</code>.</li>
 <li><b>Same for <code>/session-obligations</code>.</b></li>
 <li><b>Callers that only need active registrations</b> use the active-only query with the index from E.5. Callers that need history keep the full read.</li>
 <li><b>Test.</b> Golden equivalence on both routes.</li>
@@ -663,7 +728,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 </ul>
 
 <h4>F.4 Borrowing callers</h4>
-<p>Convert the http callers listed in C.3 to <code>sessions_view</code>.</p>
+<p>Convert the http callers listed in C.3 to <code>sessions_read_set</code>.</p>
 
 <h3 id="g">G. T6 — Usage ledger</h3>
 <p>Files: <code>usage_ledger.rs</code>, <code>usage_burn.rs</code>, <code>usage_identity.rs</code>, <code>usage_db.rs</code>.</p>
@@ -714,7 +779,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 <tbody>
 <tr><td>T1</td><td>sessions.rs, opencode/outbox.rs, scripts/perf/</td><td>—</td><td>mid (opus high)</td></tr>
 <tr><td>T2</td><td>sessions.rs, handoff/notes.rs, handoff/store.rs, opencode/*.rs</td><td>T1</td><td>top (fable xhigh): shared-state design</td></tr>
-<tr><td>T3</td><td>sessions.rs, handoff/transfer.rs, handoff/notes.rs, opencode/*.rs, scripts/rust_migration/*.py</td><td>T2</td><td>top (fable xhigh): data movement and crash safety</td></tr>
+<tr><td>T3</td><td>sessions.rs, handoff/transfer.rs, handoff/notes.rs, opencode/*.rs, main.rs, scripts/rust_migration/*.py, docs/product/lessons.md</td><td>T2</td><td>top (fable xhigh): data movement and crash safety</td></tr>
 <tr><td>T4</td><td>queue.rs, queue/local_wall.rs, local_sockets/launch.rs, local_model.rs, bin/sm.rs, http.rs (queue functions)</td><td>—</td><td>mid</td></tr>
 <tr><td>T5</td><td>http.rs (hooks, obligations, session lists), http/watch.rs, http/messages.rs, http/board_*.rs, owner_docs.rs, http/local_agent.rs, http/handoff.rs</td><td>T4; its F.4 also needs T2</td><td>mid</td></tr>
 <tr><td>T6</td><td>usage_ledger.rs, usage_burn.rs, usage_identity.rs, usage_db.rs</td><td>—</td><td>mid</td></tr>
