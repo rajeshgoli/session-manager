@@ -51,6 +51,11 @@ fn labels_are_one_line_and_cut() {
         "cargo test --workspace"
     );
     let long = "x".repeat(130);
+    assert_eq!(
+        label_text("/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -c 'x=1'"),
+        "Python -c 'x=1'"
+    );
+    assert_eq!(label_text("./run.sh --fast"), "./run.sh --fast");
     assert_eq!(label_text(&long).chars().count(), 121);
     assert!(label_text(&long).ends_with('…'));
 }

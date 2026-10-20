@@ -8278,9 +8278,10 @@ pub fn queue_hold_explanation(
         return None;
     }
     let reason = job.holding_reason.as_deref().unwrap_or("");
+    // Shell jobs take no slot, so they never hold another job back.
     let running: Vec<_> = jobs
         .iter()
-        .filter(|j| j.state == "running" && j.id != job.id)
+        .filter(|j| j.state == "running" && j.id != job.id && j.job_type != shell::SHELL_JOB_TYPE)
         .collect();
     let perf = jobs
         .iter()
@@ -12974,6 +12975,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("No queued tests jobs are ahead of this one."));
+        // A running shell job takes no slot: it neither fills the global
+        // limit nor shows as a blocker.
+        let shell_job = record("shell", shell::SHELL_JOB_TYPE, "running", None);
+        let tight = QueueAdmissionPolicy {
+            max_running_jobs: 2,
+            ..policy
+        };
+        let with_shell = [jobs.clone(), vec![shell_job]].concat();
+        let detail = queue_hold_explanation(&limited, &with_shell, tight).unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(detail.contains("tests limit"), "{detail}");
+        assert!(!detail.contains("friendly-shell"), "{detail}");
         let earlier = record("earlier-tests", "tests", "pending", Some("concurrency_cap"));
         let in_line = queue_hold_explanation(
             &limited,
