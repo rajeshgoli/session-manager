@@ -109,6 +109,10 @@ pub struct SessionStore {
     codex_sessions_root: PathBuf,
     claude_projects_roots: Vec<PathBuf>,
     write_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    write_lock_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    state_writes: Arc<AtomicU64>,
     /// Applies span the JSON registry and the retained queue, so their durable
     /// lease must have exactly one in-process driver. The persisted lease still
     /// provides restart recovery; this lock prevents a second HTTP request from
@@ -263,6 +267,10 @@ impl SessionStore {
                 .map(|root| vec![root.join("claude-projects")])
                 .unwrap_or_else(|| claude_projects_roots(None)),
             write_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            write_lock_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            state_writes: Arc::new(AtomicU64::new(0)),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             handoff_config: None,
@@ -514,15 +522,17 @@ impl SessionStore {
         };
         let records = self.load_snapshot()?.into_sessions();
         let observed_at = OffsetDateTime::now_utc();
-        for record in &records {
+        let mut account_updates = Vec::new();
+        for record in records.iter().filter(|record| !record.is_stopped()) {
             let provider = match record.provider.as_str() {
                 "claude" => UsageProvider::Claude,
                 "codex" | "codex-fork" => UsageProvider::Codex,
                 "opencode" => UsageProvider::Local,
                 _ => continue,
             };
-            self.record_session_account_key(&record.id, provider, observed_at)?;
+            account_updates.push((record.id.as_str(), provider));
         }
+        self.record_session_account_keys(&account_updates, observed_at)?;
         self.repair_current_codex_usage_artifacts(&records)?;
         let by_id = records
             .iter()
@@ -634,38 +644,62 @@ impl SessionStore {
         provider: UsageProvider,
         observed_at: OffsetDateTime,
     ) -> Result<()> {
+        self.record_session_account_keys(&[(session_id, provider)], observed_at)
+    }
+
+    fn record_session_account_keys(
+        &self,
+        targets: &[(&str, UsageProvider)],
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
         let Some(identity_store) = self.usage_identity_store.as_ref() else {
-            return Ok(());
-        };
-        let Some(attribution) = identity_store.account_at(provider, observed_at)? else {
             return Ok(());
         };
         // Runs for every statusline event and almost never changes anything;
         // check the shared parse before copying state under the write lock.
         let parsed_state = self.load_parsed_state()?;
-        if raw_session_object(&parsed_state.raw, session_id).is_none_or(|session| {
-            json_text(session.get("account_key")).as_deref()
-                == Some(attribution.account_key.as_str())
-        }) {
+        let mut changes = Vec::new();
+        for &(session_id, provider) in targets {
+            let Some(session) = raw_session_object(&parsed_state.raw, session_id) else {
+                continue;
+            };
+            if raw_session_is_stopped(session) {
+                continue;
+            }
+            let Some(attribution) = identity_store.account_at(provider, observed_at)? else {
+                continue;
+            };
+            if json_text(session.get("account_key")).as_deref()
+                != Some(attribution.account_key.as_str())
+            {
+                changes.push((session_id, attribution.account_key));
+            }
+        }
+        if changes.is_empty() {
             return Ok(());
         }
         drop(parsed_state);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(());
-        };
-        if json_text(session.get("account_key")).as_deref()
-            == Some(attribution.account_key.as_str())
-        {
-            return Ok(());
+        let mut changed = false;
+        for (session_id, account_key) in changes {
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                continue;
+            };
+            // A session can stop while this scan waits for the writer.
+            if raw_session_is_stopped(session)
+                || json_text(session.get("account_key")).as_deref() == Some(account_key.as_str())
+            {
+                continue;
+            }
+            session.insert("account_key".to_owned(), Value::String(account_key));
+            changed = true;
         }
-        session.insert(
-            "account_key".to_owned(),
-            Value::String(attribution.account_key),
-        );
-        self.write_raw_json_value(&state)
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
     }
 
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
@@ -1920,6 +1954,10 @@ impl SessionStore {
                 .map(|root| vec![root.join("claude-projects")])
                 .unwrap_or_else(|| claude_projects_roots(None)),
             write_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            write_lock_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            state_writes: Arc::new(AtomicU64::new(0)),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             handoff_config: None,
@@ -5435,7 +5473,8 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         if let Some(queue) = &self.queue_store {
-            drain_pending_runtime_messages_raw(
+            let before = self.load_parsed_state()?;
+            let result = drain_pending_runtime_messages_raw(
                 self,
                 &mut state,
                 session_id,
@@ -5446,7 +5485,9 @@ impl SessionStore {
                 None,
                 false,
             )?;
-            self.write_raw_json_value(&state)?;
+            if !result.delivered_message_ids.is_empty() || state != before.raw {
+                self.write_raw_json_value(&state)?;
+            }
         }
         Ok(())
     }
@@ -5561,10 +5602,12 @@ impl SessionStore {
         session_id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<bool> {
-        if self.is_opencode_session(session_id)? {
+        let parsed = self.load_parsed_state()?;
+        if raw_session_provider(&parsed.raw, session_id).as_deref() == Some("opencode") {
             self.drain_opencode_outbox(session_id, runtime)?;
             return Ok(true);
         }
+        drop(parsed);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let Some(queue) = &self.queue_store else {
@@ -5583,10 +5626,13 @@ impl SessionStore {
         if !runtime_session_accepts_background_delivery_raw(&mut state, session_id, runtime)? {
             return Ok(false);
         }
-        drain_pending_runtime_messages_raw(
+        let before = self.load_parsed_state()?;
+        let result = drain_pending_runtime_messages_raw(
             self, &mut state, session_id, runtime, queue, None, None, None, true,
         )?;
-        self.write_raw_json_value(&state)?;
+        if !result.delivered_message_ids.is_empty() || state != before.raw {
+            self.write_raw_json_value(&state)?;
+        }
         Ok(true)
     }
 
@@ -5614,10 +5660,18 @@ impl SessionStore {
         };
         let mut failures = Vec::new();
         let mut attempted = 0;
+        let parsed = self.load_parsed_state()?;
         for target_session_id in &targets {
+            let Some(session) = raw_session_object(&parsed.raw, target_session_id) else {
+                continue;
+            };
+            if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
+                continue;
+            }
             // The same retry sweep already gives each Opencode target one
             // ordered pass across every category, including ordinary sends.
-            if skip_opencode && self.is_opencode_session(target_session_id)? {
+            if skip_opencode && session.get("provider").and_then(Value::as_str) == Some("opencode")
+            {
                 continue;
             }
             attempted += 1;
@@ -8555,6 +8609,8 @@ impl SessionStore {
     }
 
     fn write_raw_json_value(&self, value: &Value) -> Result<()> {
+        #[cfg(test)]
+        self.state_writes.fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = self.state_file.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create state directory {}", parent.display())
@@ -8583,6 +8639,8 @@ impl SessionStore {
     }
 
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        #[cfg(test)]
+        self.write_lock_attempts.fetch_add(1, Ordering::Relaxed);
         self.write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
@@ -21184,7 +21242,7 @@ sleep 30
             store
                 .drain_runtime_pending_message_targets_by_category("queue-completion")
                 .unwrap(),
-            1
+            0
         );
         assert_eq!(
             queue
@@ -21528,6 +21586,135 @@ sleep 30
             pane.wait_for_input_lines(1),
             vec!["[sm queue] test job completed"]
         );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn background_retry_skips_stopped_unknown_and_fenced_targets_without_writing() {
+        use std::os::unix::fs::MetadataExt;
+
+        for ready in [false, true] {
+            let pane = queue_completion_test_pane(ready);
+            let (store, queue, state_file, queue_db) =
+                queue_completion_test_store(&pane, "running");
+            let mut state = store.load_raw_json_value().unwrap();
+            for i in 0..30 {
+                let id = format!("stopped-{i}");
+                state["sessions"].as_array_mut().unwrap().push(json!({
+                    "id": id, "status": "stopped", "provider": if i % 2 == 0 { "opencode" } else { "claude" }
+                }));
+                queue
+                    .enqueue_message_once_with_metadata(
+                        &id,
+                        &id,
+                        "completion",
+                        "sequential",
+                        QueueMessageMetadata {
+                            message_category: Some("queue-completion".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            // Neither unknown records nor reserved handoff sources may take a writer.
+            state["sessions"].as_array_mut().unwrap().push(json!({
+                "id": "fenced", "status": "running", "handoff": {"state": "accepted", "trigger": "owner"}
+            }));
+            for id in ["unknown", "fenced"] {
+                queue
+                    .enqueue_message_once_with_metadata(
+                        id,
+                        id,
+                        "completion",
+                        "sequential",
+                        QueueMessageMetadata::default(),
+                    )
+                    .unwrap();
+            }
+            store.write_raw_json_value(&state).unwrap();
+            enqueue_queue_completion(&queue, "live-completion");
+            let inode = fs::metadata(&state_file).unwrap().ino();
+            store.write_lock_attempts.store(0, Ordering::Relaxed);
+            store.state_writes.store(0, Ordering::Relaxed);
+
+            assert_eq!(store.drain_runtime_background_retry_messages().unwrap(), 1);
+            assert_eq!(store.write_lock_attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(store.state_writes.load(Ordering::Relaxed), u64::from(ready));
+            if ready {
+                assert_eq!(
+                    pane.wait_for_input_lines(1),
+                    vec!["[sm queue] test job completed"]
+                );
+            } else {
+                assert_eq!(fs::metadata(&state_file).unwrap().ino(), inode);
+                assert!(pane.input_lines().is_empty());
+            }
+            for i in 0..30 {
+                assert_eq!(
+                    queue
+                        .pending_messages_for_target(&format!("stopped-{i}"), 10)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            for id in ["unknown", "fenced"] {
+                assert_eq!(queue.pending_messages_for_target(id, 10).unwrap().len(), 1);
+            }
+            let _ = fs::remove_file(state_file);
+            let _ = fs::remove_file(queue_db);
+        }
+    }
+
+    #[test]
+    fn background_retry_rechecks_stopped_target_after_waiting_for_writer() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        enqueue_queue_completion(&queue, "race-completion");
+        let guard = store.write_guard().unwrap();
+        let attempts = store.write_lock_attempts.load(Ordering::Relaxed);
+        let retry_store = store.clone();
+        let worker = thread::spawn(move || retry_store.drain_runtime_background_retry_messages());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while store.write_lock_attempts.load(Ordering::Relaxed) == attempts {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry did not reach writer"
+            );
+            thread::yield_now();
+        }
+        // The retry has passed its borrowed check and is blocked on our guard.
+        let mut state = store.load_raw_json_value().unwrap();
+        state["sessions"][0]["status"] = json!("stopped");
+        store.write_raw_json_value(&state).unwrap();
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        assert!(pane.input_lines().is_empty());
+        assert_eq!(
+            queue
+                .pending_messages_for_target("queue-target", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn category_drain_without_messages_preserves_state_file() {
+        let pane = queue_completion_test_pane(true);
+        let (store, _, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
+        store.state_writes.store(0, Ordering::Relaxed);
+        store
+            .drain_runtime_pending_messages_for_session_category(
+                "queue-target",
+                &pane.runtime,
+                Some("queue-completion"),
+            )
+            .unwrap();
+        assert_eq!(store.state_writes.load(Ordering::Relaxed), 0);
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
@@ -25676,6 +25863,73 @@ sleep 30
                 "codex_event".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn usage_scan_account_switch_updates_only_live_sessions_in_one_write() {
+        let state_file = unique_temp_path("batchaccounts");
+        let sessions = (0..53)
+            .map(|i| {
+                json!({
+                    "id": format!("seat-{i}"), "name": format!("seat-{i}"), "provider": "claude",
+                    "working_dir": "/repo", "tmux_session": format!("seat-{i}"),
+                    "status": if i < 50 { "stopped" } else { "running" },
+                    "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:00:00Z",
+                    "account_key": "claude:old-account"
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(&state_file, json!({"sessions": sessions}).to_string()).unwrap();
+        let usage_db = state_file.with_extension("usage.db");
+        let identity = UsageIdentityStore::new(&usage_db).unwrap();
+        let now = OffsetDateTime::now_utc();
+        identity
+            .record_observation(
+                Provider::Claude,
+                Some(&AccountIdentity {
+                    provider: Provider::Claude,
+                    external_id: "new-account".into(),
+                    label: None,
+                    plan_tier: None,
+                    extra_usage_enabled: None,
+                }),
+                now - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let store = SessionStore::new(state_file.clone())
+            .with_usage_identity_store(identity)
+            .with_usage_ledger_store(UsageLedgerStore::new(&usage_db).unwrap());
+        store.state_writes.store(0, Ordering::Relaxed);
+        store.scan_usage_ledger().unwrap();
+        assert_eq!(store.state_writes.load(Ordering::Relaxed), 1);
+        for record in store.list_sessions(true).unwrap() {
+            assert_eq!(
+                record.account_key.as_deref(),
+                Some(if record.is_stopped() {
+                    "claude:old-account"
+                } else {
+                    "claude:new-account"
+                })
+            );
+        }
+        store.scan_usage_ledger().unwrap();
+        assert_eq!(store.state_writes.load(Ordering::Relaxed), 1);
+        // The same attribution helper is called by statusline and Codex events.
+        store
+            .record_session_account_key("seat-0", UsageProvider::Claude, now)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_session("seat-0")
+                .unwrap()
+                .unwrap()
+                .account_key
+                .as_deref(),
+            Some("claude:old-account")
+        );
+        assert_eq!(store.state_writes.load(Ordering::Relaxed), 1);
     }
 
     #[test]
