@@ -107,6 +107,27 @@ pub fn remove_draft(path: &Path, expected: Option<&str>) -> Result<bool> {
     Ok(true)
 }
 
+/// True when `dir` is inside a repository's main checkout rather than a linked worktree.
+fn is_main_checkout(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .is_some_and(|out| {
+            let mut lines = out.lines();
+            matches!((lines.next(), lines.next()), (Some(a), Some(b)) if a == b)
+        })
+}
+
 /// The CLI captures these before submission; cleanup cannot remove a changed file.
 pub fn remove_source(path: &Path, before: &fs::Metadata) -> (bool, Option<String>) {
     let parent = path.parent().unwrap_or(Path::new("/"));
@@ -278,12 +299,15 @@ impl SessionStore {
         let name = raw_session_display_name(session, id);
         let previous = self.handoff_draft_record(id)?;
         // An asked agent edits the file at the recorded path, so a later claim never moves it.
-        let dir = match &previous {
-            Some((path, _)) => Path::new(path)
-                .parent()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_default(),
+        let (dir, draft_dir) = match &previous {
+            Some((path, _)) => {
+                let dir = Path::new(path)
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                (dir.clone(), dir)
+            }
             None => self.handoff_work_dir(state, id)?,
         };
         anyhow::ensure!(
@@ -349,35 +373,50 @@ impl SessionStore {
         let sha = previous
             .map(|(_, sha)| sha)
             .unwrap_or_else(|| digest(&text));
-        let path = dir.join(".sm/handoff.md");
+        let path = draft_dir.join(".sm/handoff.md");
         self.notes_db()?.execute("INSERT INTO handoff_drafts(session_id,path,sha256,written_at) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path",params![id,path.display().to_string(),sha,now_rfc3339()])?;
         session_object_mut(ensure_sessions_array_mut(state)?, id)
             .unwrap()
             .insert("handoff_draft_text".into(), json!(text));
         Ok(json!({"path":path, "text":text, "sha256":sha}))
     }
-    /// The agent's newest claimed worktree that exists, else its spawn directory.
-    /// An agent spawned in a main checkout that then ran `sm ticket --setup-worktree`
-    /// works in the worktree, so its draft belongs there, not in the main checkout.
-    fn handoff_work_dir(&self, state: &Value, id: &str) -> Result<PathBuf> {
+    /// The directory the agent works in and the directory its draft goes in.
+    /// The work directory is the agent's newest claimed worktree that exists, else its
+    /// spawn directory: an agent spawned in a main checkout that then ran
+    /// `sm ticket --setup-worktree` works in the worktree. The draft goes there too,
+    /// except that sm never writes into a main checkout; when no claimed worktree is
+    /// left (its PR merged and sm deleted the worktree), the draft goes under sm's
+    /// state directory instead.
+    fn handoff_work_dir(&self, state: &Value, id: &str) -> Result<(PathBuf, PathBuf)> {
         let session =
             raw_session_object(state, id).ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let spawn_dir = expand_home(&json_text(session.get("working_dir")).unwrap_or_default());
         if Self::handoff_node(state, id) != "primary" {
-            return Ok(spawn_dir);
+            return Ok((spawn_dir.clone(), spawn_dir));
         }
         let Some(queue) = &self.queue_store else {
-            return Ok(spawn_dir);
+            return Ok((spawn_dir.clone(), spawn_dir));
         };
         let claims = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf())
             .claims_for_session(id, true)?;
-        Ok(claims
+        // Plain `sm ticket` in a main checkout records that checkout as the claim's path.
+        let work_dir = claims
             .into_iter()
             .rev()
             .filter_map(|view| view.claim.worktree_path)
             .map(|path| expand_home(&path))
             .find(|path| path.is_absolute() && path.is_dir())
-            .unwrap_or(spawn_dir))
+            .unwrap_or(spawn_dir);
+        if !is_main_checkout(&work_dir) {
+            return Ok((work_dir.clone(), work_dir));
+        }
+        let state_dir = queue
+            .db_path()
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join("handoffs")
+            .join(id);
+        Ok((work_dir, state_dir))
     }
     pub fn handoff_draft(&self, id: &str) -> Result<Value> {
         let _guard = self.write_guard()?;
@@ -1398,8 +1437,9 @@ mod tests {
             .status
             .success());
         let draft = store.handoff_draft("agent001").unwrap();
-        let path = Path::new(draft["path"].as_str().unwrap());
-        assert_eq!(path, root.join(".sm/handoff.md"));
+        // The draft itself goes outside a main checkout; write_draft still excludes `.sm/`
+        // in whatever checkout it writes to.
+        let path = &root.join(".sm/handoff.md");
         assert!(draft["text"]
             .as_str()
             .unwrap()
@@ -1452,6 +1492,44 @@ mod tests {
         store.remove_handoff_draft_record("agent001").unwrap();
         let fallback = store.handoff_draft("agent001").unwrap();
         assert_eq!(fallback["path"], json!(root.join("wt-7/.sm/handoff.md")));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn handoff_draft_never_lands_in_a_main_checkout() {
+        let (store, root) = fixture();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        // The agent's PR merged, so its claim ended and sm deleted the worktree.
+        let draft = store.handoff_draft("agent001").unwrap();
+        let path = root.join("handoffs/agent001/.sm/handoff.md");
+        assert_eq!(draft["path"], json!(&path));
+        assert!(draft["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("Working directory: {}", root.display())));
+        assert!(!root.join(".sm").exists());
+        // A plain `sm ticket` claim records the main checkout itself; still not there.
+        store.remove_handoff_draft_record("agent001").unwrap();
+        Connection::open(root.join("messages.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO work_claims(id,repo,number,kind,session_id,source,worktree_path,claimed_at) VALUES('c1','o/r',7,'ticket','agent001','explicit',?1,'2026-10-19T01:00:00Z')",
+                params![root.display().to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.handoff_draft("agent001").unwrap()["path"],
+            json!(path)
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
