@@ -217,6 +217,8 @@ data class ClientSession(
     @SerialName("is_em")
     val isEm: Boolean = false,
     val role: String? = null,
+    /** Shells only: kept out of the sections, in the Hidden tray (sm#2460). */
+    val hidden: Boolean = false,
     @SerialName("activity_state")
     val activityState: String? = null,
     @SerialName("last_tool_call")
@@ -270,6 +272,8 @@ data class WatchStateSession(
     val facts: AgentFacts? = null,
     val attention: AgentAttention? = null,
     @SerialName("background_jobs") val backgroundJobs: List<BackgroundJob> = emptyList(),
+    /** A shell the owner hid; it stays live in a folded Hidden tray (sm#2460). */
+    val hidden: Boolean = false,
 )
 
 /** A command an idle agent left running outside the queue (sm#2412). */

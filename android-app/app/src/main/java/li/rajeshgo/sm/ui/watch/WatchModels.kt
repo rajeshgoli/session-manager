@@ -591,6 +591,12 @@ fun attentionSection(session: ClientSession): String = when {
     else -> session.attention?.section?.takeIf { section -> ATTENTION_SECTIONS.any { it.first == section } } ?: "idle"
 }
 
+fun isHiddenShell(session: ClientSession): Boolean = session.kind == "shell" && session.hidden && session.status != "stopped"
+
+/** Live hidden shells matching the list's filter and search, by name (sm#2460). */
+fun hiddenShells(sessions: List<ClientSession>, statusFilter: String, query: String): List<ClientSession> =
+    sessions.filter { isHiddenShell(it) && sessionMatches(it, statusFilter, query) }.sortedBy { sessionDisplayName(it).lowercase() }
+
 /** Watch by attention: sections in order, each sorted by the server's order key, then name. */
 fun attentionGroups(sessions: List<ClientSession>, statusFilter: String, query: String): List<AttentionGroup> {
     val bySection = sessions.filter { sessionMatches(it, statusFilter, query) }.groupBy(::attentionSection)

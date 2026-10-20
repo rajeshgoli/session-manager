@@ -24,6 +24,7 @@ import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.HTTP
 import retrofit2.http.Header
+import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Path
@@ -38,6 +39,10 @@ interface ApiService {
 
     @DELETE("terminals/{id}")
     suspend fun retirePlainTerminal(@Path("id") id: String): retrofit2.Response<Unit>
+
+    /** `name` (null restores the default) and/or `hidden` (sm#2460). */
+    @PATCH("terminals/{id}")
+    suspend fun updatePlainTerminal(@Path("id") id: String, @Body body: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 
     @POST("terminals/{id}/route")
     suspend fun plainTerminalRoute(@Path("id") id: String, @Body request: li.rajeshgo.sm.data.model.PlainTerminalRouteRequest): li.rajeshgo.sm.data.model.PlainTerminalRoute

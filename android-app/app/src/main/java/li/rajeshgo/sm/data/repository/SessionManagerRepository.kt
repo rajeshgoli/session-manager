@@ -394,6 +394,19 @@ class SessionManagerRepository(
         }
     }
 
+    /** Renames (blank restores `zsh · folder`) or hides a shell; the server rejects names over 40 characters. */
+    suspend fun updatePlainTerminal(baseUrl: String, token: String, id: String, name: String? = null, hidden: Boolean? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { updatePlainTerminalWith(api(baseUrl, token), id, name, hidden) }.mapFailure(::classifyWriteFailure)
+    }
+
+    internal suspend fun updatePlainTerminalWith(service: ApiService, id: String, name: String?, hidden: Boolean?) {
+        val body = kotlinx.serialization.json.buildJsonObject {
+            if (name != null) put("name", name.trim().takeIf { it.isNotEmpty() }?.let { kotlinx.serialization.json.JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull)
+            if (hidden != null) put("hidden", kotlinx.serialization.json.JsonPrimitive(hidden))
+        }
+        service.updatePlainTerminal(id, body)
+    }
+
     suspend fun createSession(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.CreateSessionRequest): Result<li.rajeshgo.sm.data.model.CreatedSession> = withContext(Dispatchers.IO) {
         runCatching {
             val service = api(baseUrl, token, readTimeoutSeconds = 180)
