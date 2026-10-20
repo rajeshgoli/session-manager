@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -148,6 +149,7 @@ pub struct UsageLedgerStore {
     identity_store: UsageIdentityStore,
     burn_store: UsageBurnStore,
     model_defaults: UsageModelDefaults,
+    burn_windows: Arc<Mutex<BurnWindows>>,
 }
 
 impl UsageLedgerStore {
@@ -165,6 +167,7 @@ impl UsageLedgerStore {
             burn_store: UsageBurnStore::new(&db_path)?,
             db: UsageDbPool::new(db_path, USAGE_DB_BUSY_TIMEOUT),
             model_defaults,
+            burn_windows: Arc::new(Mutex::new(BurnWindows::default())),
         };
         store.initialize()?;
         Ok(store)
@@ -315,6 +318,9 @@ impl UsageLedgerStore {
                   )
                 );
                 DROP INDEX IF EXISTS idx_burn_window_materialization_source;
+                CREATE TABLE IF NOT EXISTS burn_window_scan_state (
+                  max_id INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_burn_window_observed
                   ON burn_samples(
                     account_key, window_kind, window_scope, window_start, resets_at,
@@ -626,7 +632,7 @@ impl UsageLedgerStore {
             .iter()
             .map(|seat| (seat.seat_id.clone(), seat.clone()))
             .collect::<BTreeMap<_, _>>();
-        let mut windows = BurnWindows::default();
+        let mut windows = self.burn_windows.lock().unwrap_or_else(|p| p.into_inner());
         self.rebind_provisional_messages(&bindings, &seat_meta, &mut windows)?;
         self.reconcile_unknown_models(&seat_meta, &mut windows)?;
         let mut artifacts = expand_artifacts(&bindings);
@@ -953,6 +959,7 @@ impl UsageLedgerStore {
         tx.execute("DELETE FROM seat_tokens", [])?;
         tx.execute("DELETE FROM message_window", [])?;
         tx.execute("DELETE FROM burn_window_materialization", [])?;
+        tx.execute("DELETE FROM burn_window_scan_state", [])?;
         let ids = tx
             .prepare("SELECT msg_id FROM message_ledger ORDER BY msg_id")?
             .query_map([], |row| row.get::<_, i64>(0))?
@@ -973,6 +980,7 @@ impl UsageLedgerStore {
         tx.execute("DELETE FROM message_alias", [])?;
         tx.execute("DELETE FROM message_window", [])?;
         tx.execute("DELETE FROM burn_window_materialization", [])?;
+        tx.execute("DELETE FROM burn_window_scan_state", [])?;
         tx.execute("DELETE FROM message_ledger", [])?;
         tx.execute("DELETE FROM scan_offsets", [])?;
         tx.execute("DELETE FROM codex_thread_cursor", [])?;
@@ -1491,7 +1499,7 @@ impl UsageLedgerStore {
     }
 
     fn materialize_pending_windows(&self) -> Result<MaterializationSummary> {
-        let windows = self.pending_burn_windows()?;
+        let (windows, max_id) = self.pending_burn_scan()?;
         let mut summary = MaterializationSummary {
             windows_examined: windows.len(),
             ..MaterializationSummary::default()
@@ -1501,7 +1509,10 @@ impl UsageLedgerStore {
             let ids = self.pending_message_ids_for_window(&window)?;
             summary.messages_selected += ids.len();
             self.materialize_window_messages(&window, &ids)?;
-            self.mark_burn_window_materialized(&window)?;
+            self.mark_burn_window_materialized(
+                &window,
+                (index + 1 == window_count).then_some(max_id),
+            )?;
             if index + 1 < window_count {
                 thread::sleep(MATERIALIZATION_BATCH_PAUSE);
             }
@@ -1509,14 +1520,29 @@ impl UsageLedgerStore {
         Ok(summary)
     }
 
+    #[cfg(test)]
     fn pending_burn_windows(&self) -> Result<Vec<BurnWindow>> {
-        let connection = self.open()?;
-        let mut statement = connection.prepare(
+        self.pending_burn_scan().map(|(windows, _)| windows)
+    }
+
+    fn pending_burn_scan(&self) -> Result<(Vec<BurnWindow>, i64)> {
+        let mut connection = self.open()?;
+        let tx = connection.transaction()?;
+        let max_id = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM burn_samples", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let persisted_high_water = tx
+            .query_row("SELECT max_id FROM burn_window_scan_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?;
+        let high_water = persisted_high_water.unwrap_or(0);
+        let mut statement = tx.prepare(
             r#"
                 SELECT b.account_key, b.window_kind, COALESCE(b.window_scope, ''),
                        b.window_start, b.resets_at
                 FROM burn_samples AS b
-                WHERE NOT EXISTS (
+                WHERE b.id > ?1 AND b.id <= ?2 AND NOT EXISTS (
                     SELECT 1
                     FROM burn_window_materialization AS completed
                     WHERE completed.account_key = b.account_key
@@ -1531,7 +1557,7 @@ impl UsageLedgerStore {
                 "#,
         )?;
         let windows = statement
-            .query_map([], |row| {
+            .query_map(params![high_water, max_id], |row| {
                 Ok(BurnWindow {
                     account_key: row.get(0)?,
                     kind: row.get(1)?,
@@ -1542,7 +1568,16 @@ impl UsageLedgerStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(anyhow::Error::from)?;
-        Ok(windows)
+        drop(statement);
+        // No pending windows means every row in this snapshot is already complete.
+        // Do not take a writer slot on subsequent no-change scans.
+        if windows.is_empty() && high_water != max_id {
+            advance_burn_scan(&tx, max_id)?;
+        } else if persisted_high_water.is_none() {
+            tx.execute("INSERT INTO burn_window_scan_state SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM burn_window_scan_state)", [])?;
+        }
+        tx.commit()?;
+        Ok((windows, max_id))
     }
 
     fn pending_message_ids_for_window(&self, window: &BurnWindow) -> Result<Vec<i64>> {
@@ -1614,7 +1649,11 @@ impl UsageLedgerStore {
         Ok(())
     }
 
-    fn mark_burn_window_materialized(&self, window: &BurnWindow) -> Result<()> {
+    fn mark_burn_window_materialized(
+        &self,
+        window: &BurnWindow,
+        max_id: Option<i64>,
+    ) -> Result<()> {
         let mut connection = self.open()?;
         let tx = connection.transaction()?;
         tx.execute(
@@ -1632,9 +1671,21 @@ impl UsageLedgerStore {
                 format_timestamp(OffsetDateTime::now_utc())?,
             ],
         )?;
+        if let Some(max_id) = max_id {
+            advance_burn_scan(&tx, max_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
+}
+
+fn advance_burn_scan(tx: &Transaction<'_>, max_id: i64) -> Result<()> {
+    tx.execute("INSERT INTO burn_window_scan_state SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM burn_window_scan_state)", [max_id])?;
+    tx.execute(
+        "UPDATE burn_window_scan_state SET max_id = MAX(max_id, ?1) WHERE max_id < ?1",
+        [max_id],
+    )?;
+    Ok(())
 }
 
 fn save_scan_offset(
@@ -2728,11 +2779,13 @@ fn windows_for(
 /// A message belongs to the window of every sample with `window_start <= ts < resets_at`.
 /// Asking SQLite per message walks every sample of the account: hundreds of thousands of rows,
 /// against a few thousand distinct windows. `burn_samples` is append-only, so the cache catches
-/// up by id and reloads from scratch only if the table ever shrinks. Every read happens inside
+/// up by id and reloads from scratch if samples are deleted or rewritten. Every read happens inside
 /// the caller's transaction, so it sees the same rows a direct query would.
 #[derive(Debug, Default)]
 struct BurnWindows {
     max_id: i64,
+    sample_count: i64,
+    rewrite_version: i64,
     by_account: BTreeMap<String, BTreeSet<SampleWindow>>,
 }
 
@@ -2768,10 +2821,21 @@ impl BurnWindows {
         let max_id = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM burn_samples", [], |row| {
             row.get::<_, i64>(0)
         })?;
-        if max_id == self.max_id {
+        let (sample_count, rewrite_version) = tx.query_row(
+            "SELECT sample_count, rewrite_version FROM burn_sample_scan_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if max_id == self.max_id
+            && sample_count == self.sample_count
+            && rewrite_version == self.rewrite_version
+        {
             return Ok(());
         }
-        if max_id < self.max_id {
+        if max_id < self.max_id
+            || sample_count < self.sample_count
+            || rewrite_version != self.rewrite_version
+        {
             *self = Self::default();
         }
         let mut statement = tx.prepare_cached(
@@ -2800,6 +2864,8 @@ impl BurnWindows {
                 .insert(window);
         }
         self.max_id = max_id;
+        self.sample_count = sample_count;
+        self.rewrite_version = rewrite_version;
         Ok(())
     }
 }
@@ -3920,7 +3986,10 @@ mod tests {
             tx.commit().unwrap();
             starts
         };
-        let mut windows = BurnWindows::default();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let cloned = store.clone();
+        assert!(Arc::ptr_eq(&store.burn_windows, &cloned.burn_windows));
+        let mut windows = store.burn_windows.lock().unwrap();
         assert!(starts(&mut connection, &mut windows).is_empty());
 
         let observed_at = at("2026-08-10T16:00:00Z");
@@ -3958,6 +4027,28 @@ mod tests {
             ]
         );
 
+        // Removing an older row leaves max(id) unchanged but must remove its window.
+        writer
+            .execute(
+                "DELETE FROM burn_samples WHERE id = (SELECT MIN(id) FROM burn_samples)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            starts(&mut connection, &mut windows),
+            ["2026-08-10T16:00:01.000000000Z"]
+        );
+        // Rewriting a row leaves both max(id) and count(*) unchanged.
+        writer
+            .execute(
+                "UPDATE burn_samples SET window_start = '2026-08-10T16:00:02.000000000Z'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            starts(&mut connection, &mut windows),
+            ["2026-08-10T16:00:02.000000000Z"]
+        );
         writer.execute("DELETE FROM burn_samples", []).unwrap();
         assert!(starts(&mut connection, &mut windows).is_empty());
     }
@@ -4126,6 +4217,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tokens, 25);
+    }
+
+    #[test]
+    fn incremental_pending_windows_match_full_query_on_large_history() {
+        let dir = TestDir::new("incremental-pending");
+        let store = UsageLedgerStore::new(dir.0.join("usage.db")).unwrap();
+        let connection = store.open().unwrap();
+        connection.execute_batch(r#"
+            INSERT INTO accounts (account_key, provider, external_id, first_seen, last_seen)
+              VALUES ('claude:one', 'claude', 'one', '2026-08-01', '2026-08-01');
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 100000)
+            INSERT INTO burn_samples (account_key, window_kind, window_start, percent, resets_at, source, observed_at)
+              SELECT 'claude:one', 'session_5h',
+                strftime('%Y-%m-%dT%H:%M:%fZ', '2026-08-01', '+' || (i / 1000) || ' hours'), 10,
+                strftime('%Y-%m-%dT%H:%M:%fZ', '2026-08-01', '+' || (i / 1000 + 5) || ' hours'), 'test', '2026-08-01' FROM n;
+            INSERT INTO burn_window_materialization
+              SELECT DISTINCT account_key, window_kind, '', window_start, resets_at, '2026-08-01'
+              FROM burn_samples WHERE id <= 50000;
+        "#).unwrap();
+        let full = || {
+            connection.prepare(r#"
+            SELECT b.account_key, b.window_kind, COALESCE(b.window_scope, ''), b.window_start, b.resets_at
+            FROM burn_samples b WHERE NOT EXISTS (
+              SELECT 1 FROM burn_window_materialization c WHERE c.account_key = b.account_key
+                AND c.window_kind = b.window_kind AND c.window_scope = COALESCE(b.window_scope, '')
+                AND c.window_start = b.window_start AND c.resets_at = b.resets_at)
+            GROUP BY b.account_key, b.window_kind, COALESCE(b.window_scope, ''), b.window_start, b.resets_at
+            ORDER BY b.account_key, b.window_start, b.window_kind, b.window_scope
+        "#).unwrap().query_map([], |row| Ok(BurnWindow {
+            account_key: row.get(0)?, kind: row.get(1)?, scope: row.get(2)?, start: row.get(3)?, resets_at: row.get(4)?,
+        })).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(store.pending_burn_windows().unwrap(), full());
+        assert!(!full().is_empty());
+        store.materialize_pending_windows().unwrap();
+        let high_water: i64 = connection
+            .query_row("SELECT max_id FROM burn_window_scan_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(high_water, 100000);
+        let restarted = UsageLedgerStore::new(dir.0.join("usage.db")).unwrap();
+        assert!(restarted.pending_burn_windows().unwrap().is_empty());
+        connection.execute_batch("INSERT INTO burn_samples (account_key, window_kind, window_start, percent, resets_at, source, observed_at) VALUES ('claude:one', 'weekly_all', '2026-08-01', 10, '2026-08-08', 'test', '2026-08-01')").unwrap();
+        assert_eq!(restarted.pending_burn_windows().unwrap(), full());
+        assert_eq!(
+            connection
+                .query_row("SELECT max_id FROM burn_window_scan_state", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            high_water
+        );
     }
 
     #[test]
