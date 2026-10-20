@@ -7749,17 +7749,23 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
     let docs = docs::obligation_doc_summaries(state)?;
     let claims = claims::work_claim_store(state).active_claims()?;
     let messages = messages::obligation_messages(state)?;
+    let completions = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
+        .pending_queue_completion_recipients()?;
+    let session_records = state.session_store.list_sessions(true)?;
+    let live_sessions: BTreeSet<_> = session_records
+        .iter()
+        .filter(|session| session.status != "stopped" && !messages::session_ended(session))
+        .map(|session| session.id.as_str())
+        .collect();
     // A review request from an agent that has ended waits on nobody.
     let ended_sessions = if docs
         .iter()
         .any(|doc| doc.state == crate::owner_docs::OwnerDocState::ReviewRequested)
     {
-        state
-            .session_store
-            .list_sessions(true)?
-            .into_iter()
-            .filter(messages::session_ended)
-            .map(|session| session.id)
+        session_records
+            .iter()
+            .filter(|session| messages::session_ended(session))
+            .map(|session| session.id.clone())
             .collect()
     } else {
         BTreeSet::new()
@@ -7780,6 +7786,32 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
         .filter_map(|entry| Some((entry["session_id"].as_str()?.to_owned(), entry)))
         .collect();
     let hold_store = claims::work_claim_store(state);
+    for (message_id, target) in completions {
+        if !live_sessions.contains(target.as_str()) {
+            continue;
+        }
+        // Completion ids are stable, including a separate notification when
+        // a job revived after a false completion finally exits.
+        let Some(job_id) = message_id.strip_prefix("queue-completion-") else {
+            continue;
+        };
+        let job_id = job_id.split_once("-revived-").map_or(job_id, |(id, _)| id);
+        // Read only the referenced finished jobs, rather than loading the
+        // entire terminal job history on every watch refresh.
+        let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_path, job_id)?
+            .filter(|job| job.finished_at.is_some())
+        else {
+            continue;
+        };
+        let entry = sessions
+            .entry(target.clone())
+            .or_insert_with(|| new_obligation_entry(&target));
+        entry["waiting_on"].as_array_mut().unwrap().push(json!({
+            "kind": "queue_delivery", "id": job.id,
+            "label": format!("Waiting on queue delivery · {}", job.label),
+            "since": job.finished_at,
+        }));
+    }
     for entry in sessions.values_mut() {
         for claim in entry["claims"].as_array_mut().into_iter().flatten() {
             claim["merge_hold"] = match (claim["repo"].as_str(), claim["number"].as_i64()) {

@@ -2763,6 +2763,22 @@ impl RetainedQueueStore {
         self.pending_target_session_ids_filtered(None)
     }
 
+    /// Completion message identities and their current recipients, without
+    /// loading message bodies or changing delivery state on a read surface.
+    pub fn pending_queue_completion_recipients(&self) -> Result<Vec<(String, String)>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, target_session_id FROM message_queue
+                 WHERE delivered_at IS NULL AND message_category = 'queue-completion'
+                 ORDER BY queued_at, id",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn pending_target_session_ids_by_category(
         &self,
         message_category: &str,
