@@ -2199,7 +2199,13 @@ impl RetainedQueueStore {
                 let started_before_boot = boot_time
                     .zip(job.started_at.as_deref().and_then(parse_queue_datetime))
                     .is_some_and(|(boot, started)| started < boot);
-                shell::recover_conn(&conn, &job, message_queue_db_path, started_before_boot)?;
+                shell::recover_conn(
+                    &conn,
+                    &job,
+                    message_queue_db_path,
+                    started_before_boot,
+                    cancel_grace_seconds,
+                )?;
                 continue;
             }
             if job.state.as_str() == "running" {
@@ -5320,6 +5326,21 @@ pub fn queue_job_ended_reason(job: &QueueJobRecord) -> Option<(&'static str, Str
                 "Stopped: ran past its {} limit",
                 queue_short_duration(job.timeout_seconds)
             ),
+        ),
+        // A shell job ends only by stopping or finishing; a cancel is a stop
+        // the owner or agent asked for, so it belongs in the ended feed.
+        "cancelled" if job.job_type == shell::SHELL_JOB_TYPE => (
+            "stopped",
+            match job
+                .termination_detail
+                .as_ref()
+                .and_then(|detail| detail.get("cancelled_by"))
+                .and_then(JsonValue::as_str)
+                .filter(|by| !by.trim().is_empty())
+            {
+                Some(by) => format!("Stopped by {by}"),
+                None => "Stopped: cancelled".to_owned(),
+            },
         ),
         _ => return None,
     })
@@ -10739,6 +10760,14 @@ mod tests {
         for state in ["succeeded", "failed", "cancelled", "pending", "running"] {
             assert_eq!(queue_job_ended_reason(&with(state)), None, "{state}");
         }
+        let mut stopped_shell = with("cancelled");
+        stopped_shell.job_type = shell::SHELL_JOB_TYPE.to_owned();
+        stopped_shell.termination_detail =
+            Some(serde_json::json!({"cancelled_by": "Rajesh from the sm app"}));
+        assert_eq!(
+            queue_job_ended_reason(&stopped_shell),
+            Some(("stopped", "Stopped by Rajesh from the sm app".into()))
+        );
         assert_eq!(queue_short_duration(40), "40s");
         assert_eq!(queue_short_duration(300), "5m");
         assert_eq!(queue_short_duration(3600), "1h");

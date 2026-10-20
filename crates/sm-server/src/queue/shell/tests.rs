@@ -291,6 +291,42 @@ fn the_stop_message_resubmits_the_full_command_not_the_cut_label() {
 }
 
 #[test]
+fn recovery_resumes_a_stop_the_restart_interrupted() {
+    use std::os::unix::process::CommandExt;
+    let dir = state_dir("resume-stop");
+    let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+    let messages = dir.join("messages.db");
+    // A command that ignores SIGTERM, leading its own group.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "trap '' TERM; sleep 60"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = i64::from(child.id());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut live = adoption(pid);
+    live.root_pid = pid;
+    live.record.root_identity = crate::agent_memory_guard::process_identity_text(pid as i32);
+    let id = adopt_conn(&conn, &live).unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET holding_reason = 'cancelling' WHERE id = ?1",
+        params![id],
+    )
+    .unwrap();
+    let job = get_queue_job_runtime_conn(&conn, &id).unwrap().unwrap();
+    assert!(recover_conn(&conn, &job, &messages, false, 1).unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the interrupted stop was not resumed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn recovery_keeps_a_job_only_while_its_root_is_the_adopted_process() {
     let dir = state_dir("recover");
     let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
@@ -304,20 +340,20 @@ fn recovery_keeps_a_job_only_while_its_root_is_the_adopted_process() {
     live.record.root_identity = crate::agent_memory_guard::process_identity_text(pid as i32);
     let kept = adopt_conn(&conn, &live).unwrap();
     let job = get_queue_job_runtime_conn(&conn, &kept).unwrap().unwrap();
-    assert!(recover_conn(&conn, &job, &messages, false).unwrap());
+    assert!(recover_conn(&conn, &job, &messages, false, 10).unwrap());
     // Same live group number, but the recorded root was another process.
     let mut reused = live.clone();
     reused.record.root_identity = Some("an earlier process".to_owned());
     let stale = adopt_conn(&conn, &reused).unwrap();
     let job = get_queue_job_runtime_conn(&conn, &stale).unwrap().unwrap();
-    assert!(!recover_conn(&conn, &job, &messages, false).unwrap());
+    assert!(!recover_conn(&conn, &job, &messages, false, 10).unwrap());
     assert_eq!(
         get_queue_job_conn(&conn, &stale).unwrap().unwrap().state,
         "ended"
     );
     // Adopted before the Mac last booted: it died with the host.
     let job = get_queue_job_runtime_conn(&conn, &kept).unwrap().unwrap();
-    assert!(!recover_conn(&conn, &job, &messages, true).unwrap());
+    assert!(!recover_conn(&conn, &job, &messages, true, 10).unwrap());
     assert_eq!(
         get_queue_job_conn(&conn, &kept).unwrap().unwrap().state,
         "host_restart"
@@ -339,6 +375,10 @@ fn command_from_argv_keeps_argument_boundaries() {
         "python3 -c 'import time; time.sleep(9)'"
     );
     assert_eq!(command_from_argv(&argv(&["sleep", "180"])), "sleep 180");
+    assert_eq!(
+        command_from_argv(&argv(&["bash", "-c", r#"printf "%s" "$1""#, "_", "value"])),
+        r#"bash -c 'printf "%s" "$1"' _ value"#
+    );
     assert_eq!(command_from_argv(&argv(&["echo", ""])), "echo ''");
     assert_eq!(
         command_from_argv(&argv(&["/bin/zsh", "-lc", "npm run dev | tee x"])),

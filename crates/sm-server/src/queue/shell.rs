@@ -238,12 +238,16 @@ pub fn finish_gone_conn(
 
 /// Startup check for a running shell job: keep it while its process group
 /// lives, otherwise finish it. A job adopted before the Mac last booted died
-/// with it, whatever now holds its group id. Returns whether it still runs.
+/// with it, whatever now holds its group id. A stop sm began before the
+/// restart (`cancelling` or `memory_terminating`) is signalled again with a
+/// fresh grace, since nothing else resumes it; the guard's next pass after
+/// the group exits finishes the job. Returns whether it still runs.
 pub(super) fn recover_conn(
     conn: &Connection,
     job: &QueueJobRuntimeRecord,
     message_queue_db_path: &Path,
     started_before_boot: bool,
+    cancel_grace_seconds: u64,
 ) -> Result<bool> {
     if started_before_boot {
         finish_queue_job_conn(conn, job, "host_restart", None, Some(message_queue_db_path))?;
@@ -261,6 +265,13 @@ pub(super) fn recover_conn(
         Some(crate::agent_memory_guard::process_identity_text(pid)? == recorded)
     };
     if job.process_group_id.is_some_and(process_group_exists) && root_matches() == Some(true) {
+        if let (Some(pgid), Some("cancelling" | "memory_terminating")) =
+            (job.process_group_id, job.holding_reason.as_deref())
+        {
+            std::thread::spawn(move || {
+                super::terminate_process_group_with_grace(pgid, cancel_grace_seconds)
+            });
+        }
         return Ok(true);
     }
     finish_gone_conn(conn, &job.id, message_queue_db_path)?;
@@ -294,7 +305,8 @@ pub fn command_text(args: &str) -> String {
 /// A shell wrapper yields its script (Claude's `eval '…'` unwrapped); a
 /// program run directly yields its arguments, each quoted as the shell needs.
 pub fn command_from_argv(argv: &[String]) -> String {
-    if let [shell, flag, script, ..] = argv {
+    // Arguments after the script become its $0, $1…: keep the whole argv.
+    if let [shell, flag, script] = argv {
         let name = shell.rsplit('/').next().unwrap_or(shell);
         if matches!(name, "sh" | "bash" | "zsh" | "dash" | "fish")
             && matches!(flag.as_str(), "-c" | "-lc" | "-ic")
