@@ -176,7 +176,7 @@ fn owner_answer_wakes_after_unlock_even_when_a_later_tool_write_fails() {
     fixture.question("question", fixture.started - 1);
     let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = wakes.clone();
-    let write_lock = fixture.store.write_lock.clone();
+    let write_lock = fixture.store.shared.write_lock.clone();
     fixture.store = fixture.store.with_owner_answered_wake(Arc::new(move || {
         assert!(
             write_lock.try_lock().is_ok(),
@@ -281,7 +281,7 @@ fn stopped_session_recovery_scan_skips_completed_history_without_taking_writer_l
     }
     fixture.save(&state);
     {
-        let _writer = fixture.store.write_lock.lock().unwrap();
+        let _writer = fixture.store.shared.write_lock.lock().unwrap();
         assert_eq!(
             fixture.store.opencode_pending_effect_session_ids().unwrap(),
             BTreeSet::from(["agent".into()])

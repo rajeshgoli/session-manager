@@ -8,7 +8,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -102,13 +102,72 @@ const POEM_NAMES: &str = "ozymandias kubla-khan dover-beach the-raven invictus j
 const STAR_NAMES: &str = "vega rigel sirius altair deneb polaris capella arcturus aldebaran antares betelgeuse procyon spica regulus castor pollux canopus achernar fomalhaut bellatrix mira algol alcor mizar dubhe merak alioth alkaid shaula sadr albireo alnilam alnitak mintaka saiph hadar acrux mimosa markab scheat alpheratz hamal menkar nunki kochab thuban denebola algieba elnath alhena wezen adhara avior suhail orion lyra cygnus carina perseus draco auriga pleiades hyades andromeda";
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Default)]
+struct SharedSessionState {
+    write_lock: Arc<Mutex<()>>,
+    parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
+    #[cfg(test)]
+    parses: AtomicU64,
+}
+
+// Resolve existing ancestors too: a store is often constructed before its
+// directory or file exists. Keep the resolved path for writes so replacing a
+// symlink does not split one logical store into two files.
+fn canonical_state_path(path: &Path) -> PathBuf {
+    if let Ok(path) = fs::canonicalize(path) {
+        return path;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .expect("current directory unavailable")
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            component => {
+                resolved.push(component.as_os_str());
+                if let Ok(canonical) = fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+        }
+    }
+    resolved
+}
+
+fn shared_session_state(path: &Path) -> Arc<SharedSessionState> {
+    static REGISTRY: OnceLock<Mutex<BTreeMap<PathBuf, Weak<SharedSessionState>>>> = OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("session registry poisoned");
+    registry.retain(|_, entry| entry.strong_count() > 0);
+    if let Some(shared) = registry.get(path).and_then(Weak::upgrade) {
+        return shared;
+    }
+    let shared = Arc::new(SharedSessionState::default());
+    registry.insert(path.to_path_buf(), Arc::downgrade(&shared));
+    shared
+}
+
+#[cfg(test)]
+#[path = "session_reads_tests.rs"]
+mod session_reads_tests;
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
+    shared: Arc<SharedSessionState>,
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
     codex_sessions_root: PathBuf,
     claude_projects_roots: Vec<PathBuf>,
-    write_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     write_lock_attempts: Arc<AtomicU64>,
     #[cfg(test)]
@@ -148,8 +207,6 @@ pub struct SessionStore {
     usage_ledger_store: Option<UsageLedgerStore>,
     usage_report_store: Option<UsageReportStore>,
     usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
-    /// The last parse of the state file, reused until the file changes (#1530).
-    parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
     /// Owner follows fired by `sm task-complete` (sm#1569).
     owner_push_db_path: Option<PathBuf>,
 }
@@ -254,6 +311,8 @@ impl SessionStore {
         } else {
             None
         };
+        let state_file = canonical_state_path(&state_file);
+        let shared = shared_session_state(&state_file);
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
@@ -266,7 +325,6 @@ impl SessionStore {
                 .as_ref()
                 .map(|root| vec![root.join("claude-projects")])
                 .unwrap_or_else(|| claude_projects_roots(None)),
-            write_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             write_lock_attempts: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -291,7 +349,7 @@ impl SessionStore {
             usage_ledger_store: None,
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
-            parsed_state: Arc::new(Mutex::new(None)),
+            shared,
             owner_push_db_path: None,
         }
     }
@@ -520,7 +578,8 @@ impl SessionStore {
         let Some(store) = self.usage_ledger_store.as_ref() else {
             return Ok(ScanSummary::default());
         };
-        let records = self.load_snapshot()?.into_sessions();
+        let reads = self.sessions_read_set()?;
+        let records = &reads.view.sessions;
         let observed_at = OffsetDateTime::now_utc();
         let mut account_updates = Vec::new();
         for record in records.iter().filter(|record| !record.is_stopped()) {
@@ -533,7 +592,7 @@ impl SessionStore {
             account_updates.push((record.id.as_str(), provider));
         }
         self.record_session_account_keys(&account_updates, observed_at)?;
-        self.repair_current_codex_usage_artifacts(&records)?;
+        self.repair_current_codex_usage_artifacts(records)?;
         let by_id = records
             .iter()
             .map(|record| (record.id.as_str(), record))
@@ -860,7 +919,7 @@ impl SessionStore {
         artifact_cutoff_ns: i128,
     ) -> Result<SeatSessionReconciliationSnapshot> {
         Ok(SeatSessionReconciliationSnapshot {
-            records: self.load_snapshot()?.into_sessions(),
+            records: self.list_sessions(true)?,
             artifact_cutoff_ns,
         })
     }
@@ -1019,10 +1078,9 @@ impl SessionStore {
     }
 
     fn cancel_unsupported_context_alerts(&self) -> Result<()> {
-        for session in self
-            .load_snapshot()?
-            .into_sessions()
-            .into_iter()
+        let reads = self.sessions_read_set()?;
+        for session in reads
+            .iter()
             .filter(|session| !provider_has_measured_context_gauge(&session.provider))
         {
             self.cancel_context_monitor_alerts(&session.id)?;
@@ -1941,6 +1999,8 @@ impl SessionStore {
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         let test_isolation_root =
             test_isolation_root_from_environment().expect("invalid Rust test isolation root");
+        let state_file = canonical_state_path(&state_file);
+        let shared = shared_session_state(&state_file);
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
@@ -1953,7 +2013,6 @@ impl SessionStore {
                 .as_ref()
                 .map(|root| vec![root.join("claude-projects")])
                 .unwrap_or_else(|| claude_projects_roots(None)),
-            write_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             write_lock_attempts: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -1978,7 +2037,7 @@ impl SessionStore {
             usage_ledger_store: None,
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
-            parsed_state: Arc::new(Mutex::new(None)),
+            shared,
             owner_push_db_path: None,
         }
     }
@@ -1990,11 +2049,12 @@ impl SessionStore {
     }
 
     pub fn list_sessions(&self, include_stopped: bool) -> Result<Vec<SessionRecord>> {
-        let snapshot = self.load_snapshot()?;
-        Ok(snapshot
-            .into_sessions()
-            .into_iter()
-            .filter(|session| include_stopped || !session.is_stopped())
+        let reads = self.sessions_read_set()?;
+        Ok(reads
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| include_stopped || !session.is_stopped())
+            .map(|(idx, _)| reads.record(idx))
             .collect())
     }
 
@@ -2024,55 +2084,77 @@ impl SessionStore {
         status_filter: Option<&str>,
         include_terminated: bool,
     ) -> Result<Vec<SessionRecord>> {
-        let all_sessions = self.load_snapshot()?.into_sessions();
-        let mut children = if recursive {
-            let mut descendants = Vec::new();
-            let mut visited = BTreeSet::new();
-            collect_descendants_preorder(
-                &all_sessions,
-                parent_session_id,
-                &mut visited,
-                &mut descendants,
-            );
-            descendants
-        } else {
-            direct_children(&all_sessions, parent_session_id)
-        };
+        let reads = self.sessions_read_set()?;
+        fn collect(
+            reads: &SessionReadSet,
+            parent: &str,
+            recursive: bool,
+            visited: &mut BTreeSet<String>,
+            children: &mut Vec<usize>,
+        ) {
+            for (idx, child) in reads
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| child.parent_session_id.as_deref() == Some(parent))
+            {
+                if recursive && !visited.insert(child.id.clone()) {
+                    continue;
+                }
+                children.push(idx);
+                if recursive {
+                    collect(reads, &child.id, true, visited, children);
+                }
+            }
+        }
+        let mut children = Vec::new();
+        collect(
+            &reads,
+            parent_session_id,
+            recursive,
+            &mut BTreeSet::new(),
+            &mut children,
+        );
 
         let status_filter = status_filter
             .map(str::trim)
             .filter(|value| !value.is_empty() && *value != "all");
         if let Some(status_filter) = status_filter {
-            children.retain(|session| match status_filter {
-                "running" => {
-                    !session.is_stopped() && normalized_status(&session.status) == "running"
+            children.retain(|idx| {
+                let session = &reads.view.sessions[*idx];
+                match status_filter {
+                    "running" => {
+                        !session.is_stopped() && normalized_status(&session.status) == "running"
+                    }
+                    "completed" => session.completion_status.as_deref() == Some("completed"),
+                    "error" => session.completion_status.as_deref() == Some("error"),
+                    _ => true,
                 }
-                "completed" => session.completion_status.as_deref() == Some("completed"),
-                "error" => session.completion_status.as_deref() == Some("error"),
-                _ => true,
             });
         }
         if !include_terminated {
-            children.retain(|session| {
+            children.retain(|idx| {
+                let session = &reads.view.sessions[*idx];
                 !completion_status_is_retired(session.completion_status.as_deref())
             });
         }
 
-        Ok(children)
+        Ok(children.into_iter().map(|idx| reads.record(idx)).collect())
     }
 
     /// Resolves the `/root` send target: the topmost record of `session_id`'s
     /// persisted parent chain. The caller is matched by exact ID only.
     pub fn resolve_hierarchy_root(&self, session_id: &str) -> Result<HierarchyRootResolution> {
-        let sessions = self.load_snapshot()?.into_sessions();
-        Ok(resolve_hierarchy_root(&sessions, session_id))
+        let reads = self.sessions_read_set()?;
+        Ok(resolve_hierarchy_root(&reads.view.sessions, session_id))
     }
 
     /// Authenticate an agent's current session against its launch credential.
     pub fn session_credential_matches(&self, session_id: &str, credential: &str) -> Result<bool> {
-        let sessions = self.load_snapshot()?.into_sessions();
+        let reads = self.sessions_read_set()?;
         Ok(session_credential_matches(
-            &sessions, session_id, credential,
+            &reads.view.sessions,
+            session_id,
+            credential,
         ))
     }
 
@@ -2081,35 +2163,8 @@ impl SessionStore {
         if session_id.is_empty() {
             return Ok(None);
         }
-        let sessions = self.load_snapshot()?.into_sessions();
-        if let Some(session) = sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-        {
-            return Ok(Some(session));
-        }
-        if let Some(session) = sessions
-            .iter()
-            .find(|session| session.aliases.iter().any(|alias| alias == session_id))
-            .cloned()
-        {
-            return Ok(Some(session));
-        }
-        let matches_name = |session: &SessionRecord| {
-            session.cached_display_name().as_deref() == Some(session_id)
-                || session.friendly_name.as_deref() == Some(session_id)
-                || session.native_title.as_deref() == Some(session_id)
-                || session.name == session_id
-        };
-        if let Some(session) = sessions
-            .iter()
-            .find(|session| !session.is_stopped() && matches_name(session))
-            .cloned()
-        {
-            return Ok(Some(session));
-        }
-        Ok(sessions.into_iter().find(matches_name))
+        let reads = self.sessions_read_set()?;
+        Ok(reads.resolve(session_id).map(|idx| reads.record(idx)))
     }
 
     pub fn get_context_snapshot(
@@ -2151,6 +2206,39 @@ impl SessionStore {
         let session_id = session_id.trim();
         if session_id.is_empty() {
             return Ok(false);
+        }
+        {
+            let parsed = self.load_parsed_state()?;
+            let Some(session) = raw_session_object(&parsed.raw, session_id) else {
+                return Ok(false);
+            };
+            if raw_session_is_stopped(session) {
+                // Stopped hooks still register their Claude transcript, as before.
+                let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+                if provider == "claude" {
+                    let previous_path = json_text(session.get("transcript_path"));
+                    if let Some(resume) = previous_path
+                        .as_deref()
+                        .and_then(provider_resume_id_from_transcript_path)
+                        .or_else(|| json_text(session.get("provider_resume_id")))
+                    {
+                        self.append_seat_session(
+                            session_id,
+                            &provider,
+                            &resume,
+                            previous_path.as_deref(),
+                        );
+                    }
+                    if let Some(resume) =
+                        transcript_path.and_then(provider_resume_id_from_transcript_path)
+                    {
+                        self.append_seat_session(session_id, &provider, &resume, transcript_path);
+                    }
+                }
+                return Ok(false);
+            }
+            // Superseded Stop still carries transcript, title and turn-message
+            // effects. It must continue through the existing locked path.
         }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -2322,6 +2410,12 @@ impl SessionStore {
         if session_id.is_empty() {
             return Ok(false);
         }
+        {
+            let parsed = self.load_parsed_state()?;
+            if raw_session_object(&parsed.raw, session_id).is_none_or(raw_session_is_stopped) {
+                return Ok(false);
+            }
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -2366,6 +2460,20 @@ impl SessionStore {
         let session_id = session_id.trim();
         if session_id.is_empty() {
             return Ok(false);
+        }
+        {
+            let parsed = self.load_parsed_state()?;
+            let Some(session) = raw_session_object(&parsed.raw, session_id) else {
+                return Ok(false);
+            };
+            if raw_session_is_stopped(session)
+                || emitted_at.is_some_and(|emitted| {
+                    json_text(session.get("activity_hook_emitted_at"))
+                        .is_some_and(|stored| timestamp_is_after(&stored, emitted))
+                })
+            {
+                return Ok(false);
+            }
         }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -3340,18 +3448,17 @@ impl SessionStore {
         let _cross_process_guard = self.reparent_apply_file_lock()?;
         let pending = {
             let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-            let mut records = reparent_request_records(&state)?;
-            let refreshed = refresh_reparent_requests(
-                &mut records,
-                &sessions,
-                &state,
-                OffsetDateTime::now_utc(),
-            );
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let view = parsed.view()?;
+            let sessions = &view.sessions;
+            let mut records = reparent_request_records(state)?;
+            let refreshed =
+                refresh_reparent_requests(&mut records, sessions, state, OffsetDateTime::now_utc());
             let mut changed = refreshed;
             changed |= reconcile_reparent_notification_intents(&mut records);
             if changed {
+                let mut state = state.clone();
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
@@ -3637,14 +3744,16 @@ impl SessionStore {
 
     fn acquire_reparent_apply_lease(&self) -> Result<Option<String>> {
         let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        if let Some(lease) = reparent_apply_lease(&state)? {
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
+        if let Some(lease) = reparent_apply_lease(state)? {
             return Ok(Some(lease.request_id));
         }
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-        let mut records = reparent_request_records(&state)?;
+        let view = parsed.view()?;
+        let sessions = &view.sessions;
+        let mut records = reparent_request_records(state)?;
         let refreshed =
-            refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
+            refresh_reparent_requests(&mut records, sessions, state, OffsetDateTime::now_utc());
         let Some(index) = records
             .iter()
             .enumerate()
@@ -3661,27 +3770,30 @@ impl SessionStore {
             // The lifecycle worker may inspect an idle registry frequently.
             // An idle pass must not rewrite the complete sessions file.
             if refreshed || state.get("reparent_requests").is_none() {
+                let mut state = state.clone();
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
             return Ok(None);
         };
-        if let Some(reason) = reparent_stale_reason(&records[index], &sessions, &state) {
+        if let Some(reason) = reparent_stale_reason(&records[index], sessions, state) {
             records[index].status = "stale".to_owned();
             records[index].ready_to_apply = false;
             records[index].failure_reason = Some(reason);
             records[index].decided_at = Some(now_rfc3339());
+            let mut state = state.clone();
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
             return Ok(None);
         }
-        let plan = self.build_reparent_apply_plan(&state, &records[index])?;
+        let plan = self.build_reparent_apply_plan(state, &records[index])?;
         let request_id = records[index].id.clone();
         let acquired_at = now_rfc3339();
         records[index].status = "applying".to_owned();
         records[index].apply_stage = Some("applying".to_owned());
         records[index].apply_plan = Some(plan);
         records[index].failure_reason = None;
+        let mut state = state.clone();
         store_reparent_request_records(&mut state, &records)?;
         store_reparent_apply_lease(
             &mut state,
@@ -4629,8 +4741,8 @@ impl SessionStore {
     /// Retire and kill end the session's work claims (sm#1452). A failure is
     /// logged; the next claims sync ends them.
     fn end_work_claims_after_retire(&self, session_id: &str) {
-        if let Ok(state) = self.load_raw_json_value() {
-            self.cleanup_handoff_draft(&state, session_id, false);
+        if let Ok(parsed) = self.load_parsed_state() {
+            self.cleanup_handoff_draft(&parsed.raw, session_id, false);
         }
         if let Err(error) = self.cleanup_terminal_images(session_id) {
             eprintln!("removing terminal images of retired session {session_id} failed: {error:#}");
@@ -4665,14 +4777,14 @@ impl SessionStore {
     }
 
     pub(crate) fn handoff_uses_launch_prompt(&self, id: &str) -> Result<bool> {
-        Ok(self.load_raw_json_value()?["handoff_deferred_sessions"][id] == true)
+        Ok(self.load_parsed_state()?.raw["handoff_deferred_sessions"][id] == true)
     }
 
     /// None means no launch was attempted; otherwise the launch ledger owns
     /// recovery and prompt replay is forbidden here.
     pub(crate) fn handoff_runtime_launch_status(&self, id: &str) -> Result<Option<String>> {
         Ok(
-            session_runtime_launch_records(&self.load_raw_json_value()?)?
+            session_runtime_launch_records(&self.load_parsed_state()?.raw)?
                 .into_iter()
                 .find(|launch| is_current_create_launch(launch, id))
                 .map(|launch| launch.status),
@@ -4705,7 +4817,7 @@ impl SessionStore {
                         )
                     })
         };
-        let launches = session_runtime_launch_records(&self.load_raw_json_value()?)?;
+        let launches = session_runtime_launch_records(&self.load_parsed_state()?.raw)?;
         // One relaunch only: a cause that repeats (a missing worktree, say)
         // would otherwise relaunch on every sweep.
         if launches
@@ -6582,10 +6694,7 @@ impl SessionStore {
             return Ok(None);
         }
 
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session_index) = sessions.iter().position(|value| {
+        let matches = |value: &Value| {
             let Some(session) = value.as_object() else {
                 return false;
             };
@@ -6600,7 +6709,24 @@ impl SessionStore {
                 && !completion_status_is_retired(
                     json_text(session.get("completion_status")).as_deref(),
                 )
-        }) else {
+        };
+        {
+            let parsed = self.load_parsed_state()?;
+            if !parsed
+                .raw
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(&matches)
+            {
+                return Ok(None);
+            }
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session_index) = sessions.iter().position(&matches) else {
             return Ok(None);
         };
 
@@ -6846,6 +6972,28 @@ impl SessionStore {
             return Ok(ContextUsageOutcome::UnknownSession);
         }
 
+        {
+            let parsed = self.load_parsed_state()?;
+            let Some(session) = raw_session_object(&parsed.raw, session_id) else {
+                return Ok(ContextUsageOutcome::UnknownSession);
+            };
+            if !matches!(
+                event.event.as_deref().map(str::trim).unwrap_or(""),
+                "compaction" | "compaction_complete" | "context_reset"
+            ) {
+                if let Some(emitted) = event.emitted_at.as_deref() {
+                    if ["context_cycle_reset_emitted_at", "context_sampled_at"]
+                        .iter()
+                        .any(|key| {
+                            json_text(session.get(*key))
+                                .is_some_and(|stored| !timestamp_is_after(emitted, &stored))
+                        })
+                    {
+                        return Ok(ContextUsageOutcome::StaleSample);
+                    }
+                }
+            }
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         if raw_session_object(&state, session_id).is_none() {
@@ -7323,18 +7471,17 @@ impl SessionStore {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(0);
         };
-        let monitors = self
-            .load_snapshot()?
-            .into_sessions()
-            .into_iter()
+        let reads = self.sessions_read_set()?;
+        let monitors = reads
+            .iter()
             .filter(|session| {
                 session.provider == "codex-fork"
                     && is_primary_node(&session.node)
                     && !session.is_stopped()
             })
             .filter_map(|session| {
-                codex_fork_event_stream_path(&session, runtime)
-                    .map(|event_stream_path| (session.id, event_stream_path))
+                codex_fork_event_stream_path(session, runtime)
+                    .map(|event_stream_path| (session.id.clone(), event_stream_path))
             })
             .collect::<Vec<_>>();
 
@@ -7472,6 +7619,11 @@ impl SessionStore {
     }
 
     pub fn list_agent_registrations(&self) -> Result<Vec<AgentRegistrationResponse>> {
+        let parsed = self.load_parsed_state()?;
+        let view = parsed.view()?;
+        if !agent_registrations_need_repair(&parsed.raw, &view.sessions)? {
+            return agent_registration_responses_with_sessions(&parsed.raw, &view.sessions);
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let mut changed = recover_missing_maintainer_registration_raw(&mut state)?;
@@ -7490,6 +7642,15 @@ impl SessionStore {
         let normalized_role = normalize_role(role);
         if normalized_role.is_empty() {
             return Ok(None);
+        }
+        let parsed = self.load_parsed_state()?;
+        let view = parsed.view()?;
+        if !agent_registrations_need_repair(&parsed.raw, &view.sessions)? {
+            return Ok(
+                agent_registration_responses_with_sessions(&parsed.raw, &view.sessions)?
+                    .into_iter()
+                    .find(|registration| registration.role == normalized_role),
+            );
         }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -7647,9 +7808,10 @@ impl SessionStore {
     }
 
     pub fn is_authorized_autopm_seat(&self, session_id: &str) -> Result<bool> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         Ok(
-            raw_session_object(&state, session_id).is_some_and(|session| {
+            raw_session_object(state, session_id).is_some_and(|session| {
                 session.get("autopm_authorized").and_then(Value::as_bool) == Some(true)
                     && !raw_session_is_stopped(session)
             }),
@@ -8545,6 +8707,39 @@ impl SessionStore {
         Ok(snapshot)
     }
 
+    pub(crate) fn sessions_read_set(&self) -> Result<SessionReadSet> {
+        let path = self.readable_state_file();
+        let view = match self.load_parsed_state().and_then(|parsed| parsed.view()) {
+            Ok(view) => view,
+            Err(primary_error) => {
+                if path != self.state_file {
+                    return Err(primary_error);
+                }
+                let Some(legacy) = self.legacy_state_file.as_ref().filter(|path| path.exists())
+                else {
+                    return Err(primary_error);
+                };
+                // The legacy fallback historically bypasses work-claim inheritance.
+                return Ok(SessionReadSet {
+                    view: Arc::new(SessionsView::new(read_snapshot(legacy)?)),
+                    inherited: BTreeMap::new(),
+                });
+            }
+        };
+        let inherited = if path.exists() {
+            match &self.queue_store {
+                Some(queue) => {
+                    crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf())
+                        .handoff_inherited_by_session()?
+                }
+                None => BTreeMap::new(),
+            }
+        } else {
+            BTreeMap::new()
+        };
+        Ok(SessionReadSet { view, inherited })
+    }
+
     fn readable_state_file(&self) -> PathBuf {
         if !self.state_file.exists() {
             if let Some(legacy_state_file) = &self.legacy_state_file {
@@ -8572,6 +8767,13 @@ impl SessionStore {
     }
 
     fn parsed_state_at(&self, state_file: &Path) -> Result<Arc<ParsedState>> {
+        // Lock before opening: an old open handle must not overwrite a newer
+        // cache installation after waiting for a writer to finish.
+        let mut cached = self
+            .shared
+            .parsed_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?;
         // Stamp the open handle, not the path: the file is replaced by rename,
         // so the handle's inode is exactly the content read below. A replace
         // after the stamp only makes the cached entry miss on the next read.
@@ -8583,10 +8785,6 @@ impl SessionStore {
             })?);
         // Parse while holding the lock: after a write, every poller misses at
         // once, and waiting for the first parse is cheaper than repeating it.
-        let mut cached = self
-            .parsed_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?;
         if let Some(parsed) = cached
             .as_ref()
             .filter(|cached| cached.path == state_file && cached.stamp == stamp)
@@ -8599,6 +8797,8 @@ impl SessionStore {
             .with_context(|| format!("failed to read session state {}", state_file.display()))?;
         let raw = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse session state {}", state_file.display()))?;
+        #[cfg(test)]
+        self.shared.parses.fetch_add(1, Ordering::Relaxed);
         let parsed = Arc::new(ParsedState::new(raw));
         *cached = Some(CachedParsedState {
             path: state_file.to_path_buf(),
@@ -8609,6 +8809,14 @@ impl SessionStore {
     }
 
     fn write_raw_json_value(&self, value: &Value) -> Result<()> {
+        self.write_raw_json_value_after_rename(value, || {})
+    }
+
+    fn write_raw_json_value_after_rename(
+        &self,
+        value: &Value,
+        after_rename: impl FnOnce(),
+    ) -> Result<()> {
         #[cfg(test)]
         self.state_writes.fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = self.state_file.parent() {
@@ -8621,20 +8829,43 @@ impl SessionStore {
             std::process::id(),
             STATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-            .with_context(|| format!("failed to write temp state {}", tmp.display()))?;
-        let renamed = fs::rename(&tmp, &self.state_file).with_context(|| {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("failed to create temp state {}", tmp.display()))?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.flush()?;
+        let written = StateFileStamp::of(&file.metadata()?);
+        let parsed = Arc::new(ParsedState::new(value.clone()));
+        let mut cached = self
+            .shared
+            .parsed_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?;
+        fs::rename(&tmp, &self.state_file).with_context(|| {
             format!(
                 "failed to atomically replace session state {}",
                 self.state_file.display()
             )
-        });
-        // The stamp already misses after a rename; clearing also covers a
-        // filesystem whose timestamps are too coarse to tell two writes apart.
-        if let Ok(mut cached) = self.parsed_state.lock() {
-            *cached = None;
+        })?;
+        after_rename();
+        // A rename can change ctime. Compare the other handle-derived fields,
+        // then retain ctime from the reopened handle for future cache checks.
+        let previous = cached.take();
+        let installed = fs::File::open(&self.state_file)
+            .and_then(|file| file.metadata())
+            .map(|metadata| StateFileStamp::of(&metadata))?;
+        if written.device == installed.device
+            && written.inode == installed.inode
+            && written.len == installed.len
+            && written.modified == installed.modified
+        {
+            *cached = Some(CachedParsedState {
+                path: self.state_file.clone(),
+                stamp: installed,
+                parsed,
+            });
         }
-        renamed?;
+        drop(cached);
+        drop(previous);
         Ok(())
     }
 
@@ -8652,7 +8883,8 @@ impl SessionStore {
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         #[cfg(test)]
         self.write_lock_attempts.fetch_add(1, Ordering::Relaxed);
-        self.write_lock
+        self.shared
+            .write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
     }
@@ -8804,6 +9036,17 @@ impl SessionStore {
             return Ok(());
         };
 
+        {
+            let parsed = self.load_parsed_state()?;
+            let Some(session) = raw_session_object(&parsed.raw, session_id) else {
+                return Ok(());
+            };
+            if json_text(session.get("provider")).unwrap_or_else(default_provider) != "codex-fork"
+                || raw_session_is_stopped(session)
+            {
+                return Ok(());
+            }
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -11007,6 +11250,7 @@ struct CachedParsedState {
 struct ParsedState {
     raw: Value,
     snapshot: std::sync::OnceLock<StateSnapshot>,
+    view: OnceLock<Arc<SessionsView>>,
 }
 
 impl ParsedState {
@@ -11019,6 +11263,7 @@ impl ParsedState {
         Self {
             raw,
             snapshot: std::sync::OnceLock::new(),
+            view: OnceLock::new(),
         }
     }
 
@@ -11028,6 +11273,97 @@ impl ParsedState {
         }
         let snapshot = snapshot_from_raw_value(&self.raw)?;
         Ok(self.snapshot.get_or_init(|| snapshot).clone())
+    }
+
+    fn view(&self) -> Result<Arc<SessionsView>> {
+        if let Some(view) = self.view.get() {
+            return Ok(Arc::clone(view));
+        }
+        let view = Arc::new(SessionsView::new(self.snapshot()?));
+        Ok(Arc::clone(self.view.get_or_init(|| view)))
+    }
+}
+
+#[derive(Debug)]
+struct SessionsView {
+    sessions: Vec<SessionRecord>,
+    by_id: BTreeMap<String, usize>,
+    by_alias: BTreeMap<String, usize>,
+    defaults: HandoffDefaults,
+    session_refs: BTreeMap<String, crate::handoff::policy::SessionRef>,
+}
+
+impl SessionsView {
+    fn new(snapshot: StateSnapshot) -> Self {
+        let defaults = HandoffDefaults::from_stored(snapshot.handoff_defaults.as_ref());
+        let mut sessions = snapshot.into_sessions();
+        let mut by_id = BTreeMap::new();
+        let mut by_alias = BTreeMap::new();
+        let mut session_refs = BTreeMap::new();
+        for (idx, session) in sessions.iter_mut().enumerate() {
+            session.handoff_view = None;
+            // First match wins, as in the original ordered scans.
+            by_id.entry(session.id.clone()).or_insert(idx);
+            for alias in &session.aliases {
+                by_alias.entry(alias.clone()).or_insert(idx);
+            }
+            session_refs.insert(session.id.clone(), handoff_session_ref(session));
+        }
+        Self {
+            sessions,
+            by_id,
+            by_alias,
+            defaults,
+            session_refs,
+        }
+    }
+}
+
+pub(crate) struct SessionReadSet {
+    view: Arc<SessionsView>,
+    inherited: BTreeMap<String, crate::handoff::policy::Inherited>,
+}
+
+impl SessionReadSet {
+    fn resolve(&self, session_id: &str) -> Option<usize> {
+        if let Some(idx) = self
+            .view
+            .by_id
+            .get(session_id)
+            .or_else(|| self.view.by_alias.get(session_id))
+        {
+            return Some(*idx);
+        }
+        let matches_name = |session: &SessionRecord| {
+            session.cached_display_name().as_deref() == Some(session_id)
+                || session.friendly_name.as_deref() == Some(session_id)
+                || session.native_title.as_deref() == Some(session_id)
+                || session.name == session_id
+        };
+        self.iter()
+            .position(|session| !session.is_stopped() && matches_name(session))
+            .or_else(|| self.iter().position(matches_name))
+    }
+
+    /// Borrowed records have no handoff view; serialize through `record`.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SessionRecord> {
+        self.view.sessions.iter()
+    }
+
+    pub(crate) fn handoff_view(&self, idx: usize) -> Value {
+        let record = &self.view.sessions[idx];
+        handoff_view_for_record(
+            record,
+            &self.view.defaults,
+            &self.view.session_refs,
+            self.inherited.get(&record.id),
+        )
+    }
+
+    pub(crate) fn record(&self, idx: usize) -> SessionRecord {
+        let mut record = self.view.sessions[idx].clone();
+        record.handoff_view = Some(self.handoff_view(idx));
+        record
     }
 }
 
@@ -13096,19 +13432,74 @@ fn agent_registration_responses_from_state(
     state: &Value,
 ) -> Result<Vec<AgentRegistrationResponse>> {
     let sessions = snapshot_from_raw_value(state)?.into_sessions();
-    let sessions_by_id = sessions
+    agent_registration_responses_with_sessions(state, &sessions)
+}
+
+fn agent_registrations_need_repair(state: &Value, sessions: &[SessionRecord]) -> Result<bool> {
+    if find_raw_registration(state, "maintainer")?.is_none() {
+        if json_text(state.get("maintainer_session_id")).is_some() {
+            return Ok(true);
+        }
+        if let Some(id) = state
+            .get("agent_role_last_session_ids")
+            .and_then(|last| last.get("maintainer"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if sessions
+                .iter()
+                .find(|session| session.id == id)
+                .is_some_and(|session| {
+                    session.is_live_for_registry() && session_has_maintainer_identity(session)
+                })
+            {
+                return Ok(true);
+            }
+        }
+    }
+    let by_id = sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect::<BTreeMap<_, _>>();
+    if state
+        .get("agent_registrations")
+        .is_some_and(|v| !v.is_array())
+    {
+        anyhow::bail!("session state field 'agent_registrations' is not an array");
+    }
+    Ok(state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
         .into_iter()
-        .map(|session| (session.id.clone(), session))
+        .flatten()
+        .filter_map(raw_registration_record)
+        .any(|registration| {
+            !by_id
+                .get(registration.session_id.as_str())
+                .is_some_and(|session| {
+                    session.is_live_for_registry()
+                        || (registration.role == crate::autopm::ROLE && session.auto_retired())
+                })
+        }))
+}
+
+fn agent_registration_responses_with_sessions(
+    state: &Value,
+    sessions: &[SessionRecord],
+) -> Result<Vec<AgentRegistrationResponse>> {
+    let sessions_by_id = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
         .collect::<BTreeMap<_, _>>();
     let mut responses = state
         .get("agent_registrations")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(raw_registration_record)
         .filter_map(|registration| {
-            let session = sessions_by_id.get(&registration.session_id)?;
+            let session = sessions_by_id.get(registration.session_id.as_str())?;
             Some(agent_registration_response(
                 &registration.role,
                 session,

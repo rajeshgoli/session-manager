@@ -28,9 +28,14 @@ impl SessionStore {
         Ok(())
     }
     pub(super) fn is_opencode_session(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .get_session(id)?
-            .is_some_and(|session| session.provider == "opencode"))
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        let reads = self.sessions_read_set()?;
+        Ok(reads
+            .resolve(id)
+            .is_some_and(|idx| reads.view.sessions[idx].provider == "opencode"))
     }
 
     pub(super) fn send_opencode_input(
@@ -144,8 +149,9 @@ impl SessionStore {
             };
             let target = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
-                opencode_delivery_target(&state, id, true)?
+                let parsed = self.load_parsed_state()?;
+                let state = &parsed.raw;
+                opencode_delivery_target(state, id, true)?
             };
             let Some(record) = target else { break };
             let driver = self.opencode_driver()?;
@@ -179,8 +185,9 @@ impl SessionStore {
                 )?;
                 let text = {
                     let _guard = self.write_guard()?;
-                    let state = self.load_raw_json_value()?;
-                    let session = raw_session_object(&state, id).context("session disappeared")?;
+                    let parsed = self.load_parsed_state()?;
+                    let state = &parsed.raw;
+                    let session = raw_session_object(state, id).context("session disappeared")?;
                     text_with_task_reopen_notice(
                         session,
                         &message.delivery_text(OffsetDateTime::now_utc()),
