@@ -11001,6 +11001,11 @@ mod tests {
             Some(stop_grace_seconds),
         )
         .unwrap();
+        // Initialize before the monitor and completion reader can open this
+        // database concurrently; this test exercises stopping, not migrations.
+        RetainedQueueStore::new(state_dir.join("messages.db"))
+            .ensure_schema()
+            .unwrap();
         let started = RetainedQueueStore::start_queue_job_in_state_dir(
             state_dir,
             &state_dir.join("messages.db"),
@@ -11019,21 +11024,56 @@ mod tests {
     }
 
     fn completion_text(state_dir: &Path) -> String {
-        // The monitor thread may be creating the message schema right now.
-        let mut attempts = 0;
+        // Terminal job state and the completion message are separate writes.
+        // Wait for publication too, including a successfully read empty queue.
+        let deadline = Instant::now() + StdDuration::from_secs(10);
         loop {
             match RetainedQueueStore::new(state_dir.join("messages.db"))
                 .pending_messages_for_target_by_category("notify", "queue-completion", 10)
             {
-                Ok(mut messages) => return messages.pop().expect("completion notice").text,
-                Err(error) if attempts < 20 => {
-                    attempts += 1;
-                    eprintln!("completion notice not readable yet: {error:#}");
-                    thread::sleep(StdDuration::from_millis(100));
+                Ok(mut messages) => {
+                    if let Some(message) = messages.pop() {
+                        return message.text;
+                    }
+                    assert!(Instant::now() < deadline, "completion notice not published");
                 }
-                Err(error) => panic!("completion notice unreadable: {error:#}"),
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "completion notice unreadable: {error:#}"
+                    );
+                }
             }
+            thread::sleep(StdDuration::from_millis(100));
         }
+    }
+
+    #[test]
+    fn completion_reader_waits_when_the_message_database_is_ready_but_empty() {
+        let state_dir = unique_temp_path("queue-delayed-completion");
+        let store = RetainedQueueStore::new(state_dir.join("messages.db"));
+        store.ensure_schema().unwrap();
+        assert!(store
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap()
+            .is_empty());
+        let publisher = thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(200));
+            store
+                .enqueue_message_with_metadata(
+                    "notify",
+                    "delayed completion",
+                    "sequential",
+                    QueueMessageMetadata {
+                        message_category: Some("queue-completion".into()),
+                        ..QueueMessageMetadata::default()
+                    },
+                )
+                .unwrap();
+        });
+        assert_eq!(completion_text(&state_dir), "delayed completion");
+        publisher.join().unwrap();
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
