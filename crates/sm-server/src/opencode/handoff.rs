@@ -16,8 +16,9 @@ impl SessionStore {
     ) -> Result<()> {
         let _clear = self.lock_clear_operation(id)?;
         let _submission = self.lock_opencode_submission(id)?;
-        let state = self.load_raw_json_value()?;
-        let Some(raw) = raw_session_object(&state, id) else {
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
+        let Some(raw) = raw_session_object(state, id) else {
             return Ok(());
         };
         let Some(mut handoff) = HandoffRecord::from_session(raw).and_then(Result::ok) else {
@@ -68,8 +69,9 @@ impl SessionStore {
         let now = OffsetDateTime::now_utc();
         let blocked_at = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
-            let raw = raw_session_object(&state, id).context("session disappeared")?;
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let raw = raw_session_object(state, id).context("session disappeared")?;
             let Some(handoff) = HandoffRecord::from_session(raw).and_then(Result::ok) else {
                 return Ok(false);
             };

@@ -27,8 +27,9 @@ impl SessionStore {
         let _submission = self.lock_opencode_submission(id)?;
         let record = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
-            let Some(raw) = raw_session_object(&state, id) else {
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let Some(raw) = raw_session_object(state, id) else {
                 return Ok(CoreClearOutcome::NotFound);
             };
             if let Some(detail) =
@@ -42,7 +43,7 @@ impl SessionStore {
             ensure_runtime_local_node(&json_text(raw.get("node")).unwrap_or_else(default_node))?;
             if handoff_fences_delivery_raw(raw)
                 || raw.get("retirement_intent").is_some_and(|v| !v.is_null())
-                || session_runtime_launch_records(&state)?.iter().any(|l| {
+                || session_runtime_launch_records(state)?.iter().any(|l| {
                     l.session_id == id
                         && matches!(
                             l.status.as_str(),
@@ -185,15 +186,16 @@ impl SessionStore {
     fn finish_opencode_clear_while_locked(&self, id: &str, runtime: &TmuxRuntime) -> Result<()> {
         let (record, pending) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
-            let raw = raw_session_object(&state, id).context("session disappeared")?;
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let raw = raw_session_object(state, id).context("session disappeared")?;
             let Some(value) = raw.get("opencode_pending_clear").filter(|v| !v.is_null()) else {
                 return Ok(());
             };
             if raw_session_is_stopped(raw)
                 || handoff_fences_delivery_raw(raw)
                 || raw.get("retirement_intent").is_some_and(|v| !v.is_null())
-                || session_runtime_launch_records(&state)?.iter().any(|l| {
+                || session_runtime_launch_records(state)?.iter().any(|l| {
                     l.session_id == id
                         && matches!(
                             l.status.as_str(),
@@ -275,19 +277,21 @@ impl SessionStore {
 
     pub(crate) fn recover_opencode_clears(&self, runtime: &TmuxRuntime) -> Result<()> {
         let ids: Vec<String> = {
-            let state = self.load_raw_json_value()?;
-            snapshot_from_raw_value(&state)?
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            parsed
+                .view()?
                 .sessions
-                .into_iter()
+                .iter()
                 .filter(|s| s.provider == "opencode" && !s.is_stopped())
                 .filter(|s| {
-                    raw_session_object(&state, &s.id).is_some_and(|raw| {
+                    raw_session_object(state, &s.id).is_some_and(|raw| {
                         raw.get("opencode_pending_clear")
                             .is_some_and(|v| !v.is_null())
                             || raw.get("opencode_clear_view_paused") == Some(&Value::Bool(true))
                     })
                 })
-                .map(|s| s.id)
+                .map(|s| s.id.clone())
                 .collect()
         };
         for id in ids {
@@ -298,8 +302,9 @@ impl SessionStore {
             let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
             let _input = session_runtime.lock_session_input(&record.tmux_session)?;
             let _submission = self.lock_opencode_submission(&id)?;
-            let state = self.load_raw_json_value()?;
-            let Some(raw) = raw_session_object(&state, &id) else {
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let Some(raw) = raw_session_object(state, &id) else {
                 continue;
             };
             if raw

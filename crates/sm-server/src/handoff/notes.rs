@@ -692,8 +692,9 @@ impl SessionStore {
     /// The accepted note is durable, and no successor can yet create a draft.
     pub fn cleanup_handoff_before_spawn(&self, id: &str) -> Result<()> {
         let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
-        self.cleanup_handoff_draft(&state, id, false);
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
+        self.cleanup_handoff_draft(state, id, false);
         Ok(())
     }
     pub(super) fn save_handoff_note(
@@ -723,7 +724,8 @@ impl SessionStore {
         Ok(())
     }
     pub fn pending_handoff_source_paths(&self) -> Result<Vec<std::path::PathBuf>> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         Ok(state["handoff_note_sources_pending"]
             .as_array()
             .into_iter()
@@ -733,7 +735,14 @@ impl SessionStore {
             .collect())
     }
     pub fn handoff_doc_rows(&self) -> Result<BTreeMap<String, Vec<crate::work_history::RowDoc>>> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
+        let mut by_id = BTreeMap::new();
+        for record in state["sessions"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(record)) = (record["id"].as_str(), record.as_object()) {
+                by_id.entry(id).or_insert(record);
+            }
+        }
         let mut rows = BTreeMap::<String, Vec<crate::work_history::RowDoc>>::new();
         for s in state["sessions"].as_array().into_iter().flatten() {
             let Some(id) = s["id"].as_str() else { continue };
@@ -744,20 +753,22 @@ impl SessionStore {
             let name = raw_session_display_name(s.as_object().unwrap(), id);
             let next = s["successor_session_id"].as_str();
             let next_name = next.map(|n| {
-                raw_session_object(&state, n)
+                by_id
+                    .get(n)
                     .map(|s| raw_session_display_name(s, n))
                     .unwrap_or_else(|| n.to_owned())
             });
             let superseded = note["superseded_by"].as_str();
             let target = superseded.unwrap_or(id);
             let title = if let Some(latest) = superseded {
-                let latest = raw_session_object(&state, latest)
+                let latest = by_id
+                    .get(latest)
                     .map(|s| raw_session_display_name(s, latest))
                     .unwrap_or_else(|| latest.to_owned());
                 format!("Handoff note (overwritten by {latest}'s)")
             } else if note["kind"] == "path"
                 && !Self::handoff_artifact_path(
-                    &state,
+                    state,
                     id,
                     note["value"].as_str().unwrap_or_default(),
                 )
@@ -810,7 +821,8 @@ impl SessionStore {
         own: bool,
         messages: bool,
     ) -> Result<Value> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         let sessions = state["sessions"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
@@ -825,12 +837,12 @@ impl SessionStore {
         } else {
             session["id"].as_str().unwrap_or(target)
         };
-        let ids = self.line_ids(&state, target);
+        let ids = self.line_ids(state, target);
         let conn = self.notes_db()?;
         let mut notes = vec![];
         let mut count = 0;
         for id in &ids {
-            let Some(s) = raw_session_object(&state, id) else {
+            let Some(s) = raw_session_object(state, id) else {
                 continue;
             };
             let note = s.get("handoff").and_then(|h| h.get("note"));
@@ -843,7 +855,7 @@ impl SessionStore {
             }
             let mut entry = json!({"session":{"id":id,"name":raw_session_display_name(s,id)},"successor":null,"sequence":count,"kind":note["kind"],"source":null,"source_path":null,"created_at":s.get("handoff").and_then(|h|h.get("accepted_at"))});
             if let Some(next) = json_text(s.get("successor_session_id")) {
-                entry["successor"] = json!({"id":next,"name":raw_session_object(&state,&next).map(|s|raw_session_display_name(s,&next)).unwrap_or(next)});
+                entry["successor"] = json!({"id":next,"name":raw_session_object(state,&next).map(|s|raw_session_display_name(s,&next)).unwrap_or(next)});
             }
             match note["kind"].as_str() {
                 Some("stored") => {
@@ -867,12 +879,12 @@ impl SessionStore {
                         continue;
                     }
                     let path = Self::handoff_artifact_path(
-                        &state,
+                        state,
                         id,
                         note["value"].as_str().unwrap_or_default(),
                     );
                     entry["source_path"] = json!(path);
-                    if let Ok(Some((text, _))) = self.read_handoff_artifact(&state, id, &path) {
+                    if let Ok(Some((text, _))) = self.read_handoff_artifact(state, id, &path) {
                         entry["text"] = json!(text);
                     }
                 }
@@ -881,7 +893,7 @@ impl SessionStore {
             notes.push(entry);
         }
         let messages = if messages {
-            self.handoff_owner_messages(&state, &ids)?
+            self.handoff_owner_messages(state, &ids)?
         } else {
             vec![]
         };
@@ -1336,14 +1348,15 @@ impl SessionStore {
         Ok(())
     }
     pub fn handoff_line_id(&self, target: &str) -> Result<Option<String>> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         let id = state["sessions"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|s| s["id"] == target || s["friendly_name"] == target || s["name"] == target)
             .and_then(|s| s["id"].as_str());
-        Ok(id.and_then(|id| self.line_ids(&state, id).first().cloned()))
+        Ok(id.and_then(|id| self.line_ids(state, id).first().cloned()))
     }
 }
 fn source_snapshot(id: &str, path: &Path, before: &fs::Metadata) -> Value {

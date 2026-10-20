@@ -248,7 +248,8 @@ impl SessionStore {
                 }));
             }
         }
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         for session in state
             .get("sessions")
             .and_then(Value::as_array)
@@ -299,7 +300,8 @@ impl SessionStore {
 
     /// The default policy, starting values filled in (`GET /handoff-defaults`).
     pub fn handoff_defaults(&self) -> Result<HandoffDefaults> {
-        let state = self.load_raw_json_value()?;
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
         let mut defaults = HandoffDefaults::from_stored(state.get(policy::DEFAULTS_KEY));
         let mut latest = BTreeMap::<String, String>::new();
         if let Some(sessions) = state.get("sessions").and_then(Value::as_array) {

@@ -103,8 +103,9 @@ impl SessionStore {
 
     fn finish_opencode_retire_while_locked(&self, id: &str, runtime: &TmuxRuntime) -> Result<()> {
         let pending: PendingRetire = {
-            let state = self.load_raw_json_value()?;
-            let raw = raw_session_object(&state, id).context("session disappeared")?;
+            let parsed = self.load_parsed_state()?;
+            let state = &parsed.raw;
+            let raw = raw_session_object(state, id).context("session disappeared")?;
             let Some(value) = raw.get("opencode_pending_retire").filter(|v| !v.is_null()) else {
                 return Ok(());
             };
@@ -196,18 +197,20 @@ impl SessionStore {
     }
 
     pub(crate) fn recover_opencode_retirements(&self, runtime: &TmuxRuntime) -> Result<()> {
-        let state = self.load_raw_json_value()?;
-        let ids: Vec<_> = snapshot_from_raw_value(&state)?
+        let parsed = self.load_parsed_state()?;
+        let state = &parsed.raw;
+        let ids: Vec<_> = parsed
+            .view()?
             .sessions
-            .into_iter()
+            .iter()
             .filter(|s| s.provider == "opencode" && is_primary_node(&s.node))
             .filter(|s| {
-                raw_session_object(&state, &s.id).is_some_and(|r| {
+                raw_session_object(state, &s.id).is_some_and(|r| {
                     r.get("opencode_pending_retire")
                         .is_some_and(|v| !v.is_null())
                 })
             })
-            .map(|s| s.id)
+            .map(|s| s.id.clone())
             .collect();
         for id in ids {
             let _clear = self.lock_clear_operation(&id)?;
