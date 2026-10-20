@@ -21,6 +21,7 @@ import { TerminalPage } from './terminal.js';
 import { NotesView } from './notes.js';
 import { NewAgentPopover } from './start.js';
 import { BugButton } from './bug.js';
+import { HiddenShells } from './shell.js';
 
 // ---- pages ------------------------------------------------------------------
 
@@ -404,6 +405,7 @@ function Dash() {
 
 function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
   const queue = useShared('queue');
+  const hidden = useShared('hidden_shells');
   const current = PAGES.find((p) => p.key === page);
   const running = queue ? (queue.running || []).length : null;
   const waiting = queue ? (queue.queued || []).length : null;
@@ -420,6 +422,7 @@ function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
             Queue ${running} running · ${waiting} waiting</a>`
         : null}
     </span>
+    ${hidden ? html`<${HiddenShells} shells=${hidden.shells} onChanged=${hidden.reload} />` : null}
     <${BugButton} page=${current ? current.label : ''} />
     <span class="anchor">
       <button type="button" class="btn pri" data-pop-anchor onClick=${() => setCreating(creating ? null : {})}>New agent</button>

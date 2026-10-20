@@ -4,10 +4,10 @@ import { safeThreadHtml, Thread } from './inbox.js';
 import {
   html, api, inboxWrite, usePoll, useNow, config, age, clock,
   basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
-  openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn,
+  openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn, setShared,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
-import { isShell, shellFact, ShellMenu, ShellTiles, createShell, shellError } from './shell.js';
+import { isShell, shellFact, ShellMenu, ShellTiles, createShell, shellError, hiddenShells } from './shell.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -419,6 +419,9 @@ export function AgentsPage({ openRef }) {
     [filter],
   );
   const now = useNow(15000);
+  // The top bar's eye lists hidden shells while this page is open.
+  useEffect(() => { setShared('hidden_shells', { shells: hiddenShells(doc?.sessions), reload }); }, [doc]);
+  useEffect(() => () => setShared('hidden_shells', null), []);
   const selected = openRef && openRef.startsWith('agent:') ? openRef.slice(6) : null;
   const keys = useRef({ order: [], cursor: null });
   const choose = (value) => {

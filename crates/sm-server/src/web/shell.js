@@ -1,6 +1,6 @@
 // Plain shell presentation and owner actions (plain_terminal_memo, appendix C).
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, age, basename, homeRelative, navigate, Popover, Icon, toast, stored, store } from './ui.js';
+import { html, api, age, basename, homeRelative, navigate, Popover, Icon, toast } from './ui.js';
 
 export const isShell = row => row?.kind === 'shell';
 // The server allows this many characters in a shell name.
@@ -17,7 +17,7 @@ function ShellTile({ shell, now }) {
   const fact = shellFact(shell, now).text;
   const detail = fact.startsWith('running') ? fact.replace(/^running/, 'Running') : fact.replace(/^last input/, 'Last used');
   const href = `/terminal/${encodeURIComponent(shell.id)}`;
-  return html`<a class=${`terminal-tile${shell.hidden ? ' is-hidden' : ''}`} href=${href}
+  return html`<a class="terminal-tile" href=${href}
     onClick=${event => { if (!event.metaKey && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); navigate(href); } }}>
     <span class="terminal-tile-icon"><${Icon} name="terminal" size="22" /></span>
     <span class="terminal-tile-content"><strong>${shellTitle(shell)}</strong>
@@ -26,22 +26,40 @@ function ShellTile({ shell, now }) {
     <${Icon} name="unfold" size="16" />
   </a>`;
 }
-const TRAY_KEY = 'sm-terminals-hidden-open';
-/** Open shells as tiles. Hidden ones wait folded under "Hidden" until opened. */
+/** Open shells as tiles. Hidden ones live behind the top bar's eye (HiddenShells). */
 export function ShellTiles({ shells, now }) {
-  const [trayOpen, setTrayOpen] = useState(() => stored(TRAY_KEY, false));
-  if (!shells.length) return null;
   const shown = shells.filter(shell => !shell.hidden);
-  const hidden = shells.filter(shell => shell.hidden);
-  const toggle = () => { store(TRAY_KEY, !trayOpen); setTrayOpen(!trayOpen); };
+  if (!shown.length) return null;
   return html`<section class="terminal-section" aria-label="Terminals">
-    <div class="terminal-section-heading"><h2>Terminals</h2>
-      <span>${shown.length} open${hidden.length ? ` · ${hidden.length} hidden` : ''}</span></div>
-    ${shown.length ? html`<div class="terminal-tiles">${shown.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>` : null}
-    ${hidden.length ? html`<button type="button" class="terminal-tray" aria-expanded=${trayOpen} onClick=${toggle}>
-        Hidden · ${hidden.length} ${trayOpen ? '⌄' : '›'}</button>
-      ${trayOpen ? html`<div class="terminal-tiles">${hidden.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>` : null}` : null}
+    <div class="terminal-section-heading"><h2>Terminals</h2><span>${shown.length} open</span></div>
+    <div class="terminal-tiles">${shown.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>
   </section>`;
+}
+/** Live hidden shells, by name. */
+export const hiddenShells = sessions => (sessions || [])
+  .filter(row => isShell(row) && row.hidden && row.state !== 'stopped' && row.attention?.section !== 'stopped')
+  .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+/** The top bar's eye: only while a shell is hidden. Lists them to open or unhide. */
+export function HiddenShells({ shells, currentId, onChanged, now }) {
+  const [open, setOpen] = useState(false);
+  if (!shells?.length) return null;
+  const label = `${shells.length} hidden terminal${shells.length === 1 ? '' : 's'}`;
+  const go = shell => { setOpen(false); navigate(`/terminal/${encodeURIComponent(shell.id)}`); };
+  return html`<span class="anchor hidden-shells">
+    <button type="button" class=${`icon-btn hidden-shells-btn${open ? ' on' : ''}`} data-pop-anchor title=${label} aria-label=${label}
+      aria-expanded=${open} onClick=${() => setOpen(!open)}><${Icon} name="eye-off" />
+      <span class="hidden-shells-count" aria-hidden="true">${shells.length}</span></button>
+    ${open ? html`<${Popover} align="right" onClose=${() => setOpen(false)} className="hidden-shells-pop">
+      <div class="hidden-shells-head">Hidden terminals</div>
+      ${shells.map(shell => html`<div key=${shell.id} class=${`hidden-shell${shell.id === currentId ? ' cur' : ''}`}>
+        <button type="button" class="hidden-shell-open" onClick=${() => go(shell)}>
+          <span class="hidden-shell-name">${shell.name}</span>
+          <span class="hidden-shell-fact">${shellFact(shell, now).text}</span></button>
+        <button type="button" class="btn sm" onClick=${() => setShellHidden(shell, false, () => { setOpen(false); onChanged?.(); })}>Unhide</button>
+      </div>`)}
+    <//>` : null}
+  </span>`;
 }
 export function shellError(error) {
   if (error.message === 'plain_disabled') return 'Plain shells are disabled in Settings → Terminals.';
@@ -73,7 +91,7 @@ export const updateShell = (id, body) => api(`/terminals/${encodeURIComponent(id
 export async function setShellHidden(shell, hidden, then) {
   try { await updateShell(shell.id, { hidden }); }
   catch (error) { toast(shellError(error)); return false; }
-  if (!hidden) { toast(`${shell.name} is back in the list`); then?.(false, false); return true; }
+  if (!hidden) { toast(`${shell.name} is back in the lists`); then?.(false, false); return true; }
   let undone = false;
   toast(`Hid ${shell.name}. It keeps running.`, null, { ms: 8000, action: { label: 'Undo', run: async () => {
     if (undone) return;
