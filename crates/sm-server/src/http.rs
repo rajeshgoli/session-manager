@@ -8152,7 +8152,11 @@ async fn client_queue(
     let mut running_json = Vec::with_capacity(running.len());
     for job in &running {
         let mut value = queue_job_response_named(&state, (*job).clone(), &active, &names)?;
-        if let (Some(usage), Some(object)) = (job_usage.get(&job.id), value.as_object_mut()) {
+        // A shell job's use is the agent memory guard's own measurement.
+        let shell = job.job_type == crate::queue::shell::SHELL_JOB_TYPE;
+        if let (false, Some(usage), Some(object)) =
+            (shell, job_usage.get(&job.id), value.as_object_mut())
+        {
             object.insert("usage".into(), json!(usage));
         }
         running_json.push(value);
@@ -8219,7 +8223,8 @@ async fn client_queue(
         "host": host,
         "local_model": crate::local_model::queue_card(&expand_home(&state.config.queue_runner_state_dir().to_string_lossy()))?,
         "slots": {
-            "running": running.len(),
+            // Shell jobs were found already running and take no slot.
+            "running": running.len() - count(crate::queue::shell::SHELL_JOB_TYPE),
             "max": policy.max_running_jobs,
             "by_type": {
                 "tests": {"running": count("tests"), "max": policy.tests_max_concurrent},
@@ -8227,6 +8232,8 @@ async fn client_queue(
                 "background": {"running": count("background"), "max": policy.background_max_concurrent},
                 "service": {"running": count("service"), "max": policy.service_max_concurrent},
                 "review": {"running": count("review"), "max": policy.review_max_concurrent},
+                // No "max": shell jobs have no limit, and older apps read max as a number.
+                "shell": {"running": count(crate::queue::shell::SHELL_JOB_TYPE)},
             },
         },
         "running": running_json,
@@ -13553,7 +13560,30 @@ fn child_session_response_with_live_activity(
     response
 }
 
+/// The provider's live activity, downgraded from idle to `waiting` while
+/// the agent has commands running outside the queue (sm#2412). Claude also
+/// reports `waiting` from its footer; the process tree covers every provider.
 fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'static str> {
+    let live = provider_live_activity_state(state, session);
+    let idle = match live {
+        Some(live) => live == "idle",
+        None => {
+            session.status.trim() != "stopped"
+                && session.completion_status.is_none()
+                && session.local_parked_reason.is_none()
+                && crate::sessions::projected_activity_state(session, &session.status) == "idle"
+        }
+    };
+    let background = || {
+        crate::agent_memory_guard::background_jobs(&session.id).is_some_and(|jobs| !jobs.is_empty())
+    };
+    if idle && background() {
+        return Some("waiting");
+    }
+    live
+}
+
+fn provider_live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'static str> {
     if session.status.trim() == "stopped" || session.completion_status.is_some() {
         return None;
     }
@@ -17739,6 +17769,7 @@ fn queue_job_response_with_names(
             | "memory_exceeded"
             | "process_limit_exceeded"
             | "host_restart"
+            | "ended"
     ) {
         "missing_partial_output"
     } else {
@@ -17838,7 +17869,48 @@ fn queue_job_response_with_names(
                 .expect("quiet status is an object")
                 .clone(),
         );
+    if job.job_type == crate::queue::shell::SHELL_JOB_TYPE {
+        shell_job_fields(state, &job, notify_name_for_shell(&response), &mut response);
+    }
     Ok(response)
+}
+
+fn notify_name_for_shell(response: &Value) -> String {
+    response["notify_name"]
+        .as_str()
+        .or_else(|| response["notify_session_id"].as_str())
+        .unwrap_or("The agent")
+        .to_owned()
+}
+
+/// A shell job's reservation, measured use and how it came to be in the
+/// queue (sm#2412). Its `holding` explains the job instead of a wait.
+fn shell_job_fields(state: &AppState, job: &QueueJobRecord, agent: String, response: &mut Value) {
+    use crate::queue::shell;
+    let usage = shell::usage(&job.id);
+    let adoption = shell::adoption_record(
+        &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+            .join("queue_runner.db"),
+        &job.id,
+    );
+    response["shell"] = json!({
+        "reserved_bytes": job.memory_bytes,
+        "current_bytes": usage.map(|usage| usage.current_bytes),
+        "peak_bytes": usage.map(|usage| usage.peak_bytes),
+        "over_reservation": job.state == "running" && shell::over_reservation(&job.id, job.memory_bytes),
+        "adopted_at": adoption.as_ref().map(|record| record.adopted_at.clone()),
+        "detached": adoption.as_ref().is_some_and(|record| record.detached),
+    });
+    if let Some(usage) = usage.filter(|_| job.state == "running") {
+        response["usage"] = json!({"memory_bytes": usage.current_bytes});
+    }
+    let (summary, detail) = shell::holding_text(
+        &job.id,
+        &agent,
+        job.memory_bytes,
+        adoption.as_ref().map(|record| record.adopted_at.as_str()),
+    );
+    response["holding"] = json!({"summary": summary, "detail": detail});
 }
 
 fn session_display_name(session: SessionRecord) -> String {

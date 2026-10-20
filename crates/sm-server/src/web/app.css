@@ -887,3 +887,9 @@ button.sw-sec { cursor: pointer; }
   .shell-connect-card { margin: 0 auto; padding: 24px 20px; border-radius: 12px; }
   .shell-command { gap: 8px; padding: 12px; }
 }
+/* An idle agent's background jobs (sm#2412). */
+.bg-jobs { margin: 8px 14px; padding: 10px 12px; border-radius: 8px; background: color-mix(in srgb, var(--cyan) 7%, transparent); }
+.bg-jobs h4 { margin: 0 0 6px; font-size: .933rem; color: var(--cyan); }
+.bg-job { display: grid; gap: 2px; padding: 4px 0; min-width: 0; }
+.bg-job code { font: .867rem/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bg-job small { color: var(--ink-3); font-size: .8rem; }

@@ -751,7 +751,7 @@ struct QueueListArgs {
         help = "Include terminal history; without --notify, show every notify target"
     )]
     all: bool,
-    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service", "review"])]
+    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service", "review", "shell"])]
     job_type: Option<String>,
     #[arg(
         long,
@@ -2873,7 +2873,7 @@ fn print_queue_jobs(jobs: &[Value]) {
                     .unwrap_or("")
                     .to_owned(),
                 json_string(job, "id"),
-                job["holding_reason"].as_str().unwrap_or("-").to_owned(),
+                queue_holding_text(job),
                 job["readable_log_path"]
                     .as_str()
                     .or_else(|| job["log_path"].as_str())
@@ -2883,6 +2883,23 @@ fn print_queue_jobs(jobs: &[Value]) {
         })
         .collect::<Vec<_>>();
     print_table(&headers, &rows);
+}
+
+/// The hold reason; for a shell job (sm#2412), its reservation and use.
+fn queue_holding_text(job: &Value) -> String {
+    let gib = |bytes: i64| format!("{}G", (bytes as f64 / 1_073_741_824.0).round() as i64);
+    if job["type"].as_str() == Some("shell") && job["state"].as_str() == Some("running") {
+        let reserved = job["shell"]["reserved_bytes"].as_i64();
+        let current = job["shell"]["current_bytes"].as_i64();
+        return match (reserved, current) {
+            (Some(reserved), Some(current)) => {
+                format!("{} reserved, using {}", gib(reserved), gib(current))
+            }
+            (Some(reserved), None) => format!("{} reserved", gib(reserved)),
+            _ => "-".to_owned(),
+        };
+    }
+    job["holding_reason"].as_str().unwrap_or("-").to_owned()
 }
 
 fn queue_quiet_age(job: &Value) -> Option<String> {

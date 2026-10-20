@@ -22,7 +22,7 @@ export function QueuePage() {
       const slot = queue.slots?.by_type?.[type];
       const waiting = queue.queued.filter((job) => job.type === type).length;
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
-    })}</div>
+    })}<div class="q-card"><span class="q-label">shell</span><strong>${queue.slots?.by_type?.shell?.running ?? 0} <small>running</small></strong><span class="muted">no limit</span></div></div>
     <${MacChart} />
     <${LocalModelCard} card=${queue.local_model} />
     ${!insightDismissed ? html`<${HeldBack} stats=${stats} insightOnly=${true} onDismiss=${() => { store('queue-limits-insight-dismissed', true); setInsightDismissed(true); }} />` : null}
@@ -158,7 +158,21 @@ function JobRow({ job, now }) {
   return html`<div class="q-job-line" data-open-ref=${`job:${job.id}`}><${JobRowButton} job=${job} now=${now} /><${StartNow} job=${job} /></div>`;
 }
 
+// A shell job (sm#2412): memory against its reservation where other jobs show time.
+function ShellJobRowButton({ job, now, anchor }) {
+  const reserved = job.shell?.reserved_bytes ?? job.memory_bytes;
+  const used = job.shell?.current_bytes ?? job.usage?.memory_bytes;
+  const over = !!job.shell?.over_reservation;
+  const share = reserved && used != null ? Math.min(100, (used / reserved) * 100) : 0;
+  return html`<button class="q-job" type="button" data-open-ref=${anchor ? `job:${job.id}` : null} onClick=${() => openPanel(`job:${job.id}`)}>
+    <span class="q-job-title">${title(job)}<small>shell · ${jobAgentLabel(job)}</small>${over ? html`<small class="amber">${job.holding?.summary}</small>` : null}</span>
+    <span class=${`q-membar${over ? ' over' : ''}`} role="img" aria-label=${`${gb(used)} of ${gb(reserved)} reserved`}><i style=${`width:${share}%`}></i></span>
+    <span>${age(job.queued_at || job.started_at, now)} · <span class=${over ? 'amber' : ''}>${used != null ? `${gb(used)} of ` : ''}${gb(reserved)} reserved</span></span>
+  </button>`;
+}
+
 function JobRowButton({ job, now, anchor = false }) {
+  if (job.type === 'shell') return html`<${ShellJobRowButton} job=${job} now=${now} anchor=${anchor} />`;
   const deadline = Date.parse(job.wait_deadline_at) - now;
   const review = reviewJobText(job);
   return html`<button class="q-job" type="button" data-open-ref=${anchor ? `job:${job.id}` : null} onClick=${() => openPanel(`job:${job.id}`)}>
@@ -219,6 +233,7 @@ function JobPanel({ id, controls }) {
   };
   if (!job) return html`<div class="phd"><span class="t">Job</span>${controls}<span class="s">${error?.message || 'Loading…'}</span></div>`;
   const active = ['running', 'pending'].includes(job.state);
+  const shell = job.type === 'shell';
   const following = follows?.follows?.some((f) => f.job_id === job.id && f.state !== 'done');
   const send = () => perform(async () => {
     const created = await askJobQuestion(api, queue?.owner_name || 'The owner', job, question);
@@ -231,10 +246,10 @@ function JobPanel({ id, controls }) {
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
         ${job.state === 'pending' ? html`<${StartNow} job=${job} primary=${true} />` : null}
-        ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>Cancel</button><button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>` : null}
+        ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>${shell ? 'Stop' : 'Cancel'}</button>${shell ? null : html`<button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>`}` : null}
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
-      ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>Cancel job</button></section>` : null}
+      ${cancel && active ? html`<section class="q-card"><label>${shell ? `Note to ${jobAgentLabel(job)} (optional)` : 'Cancellation note (optional)'}<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>${shell ? 'Stop it' : 'Cancel job'}</button>${shell ? html`<p class="sub">sm stops the command and tells ${jobAgentLabel(job)} how to rerun it through the queue.</p>` : null}</section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}
         ${request?.status === 'completed' ? html`<div class="summary">${request.result}</div>` : null}
@@ -244,11 +259,11 @@ function JobPanel({ id, controls }) {
         <dt>Reviewer</dt><dd>${job.review.reviewer_label || '—'}</dd><dt>For</dt><dd>${job.review.author_name}</dd>
         <dt>Why</dt><dd>${job.review.policy_source || 'default'} policy${job.review.why !== 'default' ? html` · <span class="amber">${job.review.why}</span>` : ''}</dd>
         <dt>Checkout</dt><dd>${job.cwd}</dd></dl>` : null}
-      <dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>
+      ${shell ? html`<dl class="q-details"><dt>How it got here</dt><dd>${job.holding?.detail || '—'}</dd><dt>Memory</dt><dd>${job.shell?.current_bytes != null ? `${gb(job.shell.current_bytes)} now · ` : ''}${job.shell?.peak_bytes != null ? `peak ${gb(job.shell.peak_bytes)} · ` : ''}${gb(job.shell?.reserved_bytes ?? job.memory_bytes)} reserved${job.shell?.over_reservation ? html`<br /><span class="amber">Over its reservation: if the Mac runs short of memory, sm stops this first.</span>` : ''}</dd><dt>Command</dt><dd><code>${job.argv?.join(' ') || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd || '—'}</dd><dt>Started</dt><dd>${clock(job.queued_at)}</dd><dt>In the queue</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Ended</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>` : html`<dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>`}
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
       <div class="q-actions">${usage?.next_before_ms ? html`<button class="btn sm" onClick=${() => setBefore(usage.next_before_ms)}>Earlier samples</button>` : null}${before ? html`<button class="btn sm" onClick=${() => setBefore(null)}>Latest samples</button>` : null}</div>
-      <h3>Last 40 log lines</h3><pre class="q-log">${logError?.message || (log ? log.text || 'No log yet' : 'Loading log…')}</pre>
+      ${shell ? null : html`<h3>Last 40 log lines</h3><pre class="q-log">${logError?.message || (log ? log.text || 'No log yet' : 'Loading log…')}</pre>`}
     </div>`;
 }
 registerPanel('job', JobPanel);

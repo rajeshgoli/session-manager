@@ -3,6 +3,7 @@ package li.rajeshgo.sm.ui.watch
 import java.time.Duration
 import java.time.OffsetDateTime
 import java.time.format.DateTimeParseException
+import li.rajeshgo.sm.data.model.BackgroundJob
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.PersistedWhatSummary
 import li.rajeshgo.sm.data.model.PersistedWhatSummaryEntry
@@ -186,7 +187,7 @@ fun isOperationallyActive(session: ClientSession): Boolean {
     val rawActivity = session.activityState?.trim()
     val activity = activityLabel(rawActivity)
     return when {
-        activity == "working" || activity == "thinking" || activity == "waiting" || activity == "bg-wait" ||
+        activity == "working" || activity == "thinking" || activity == "waiting" || activity == "background" ||
             activity == "approve" -> true
         !rawActivity.isNullOrEmpty() -> false
         else -> session.status == "running"
@@ -387,6 +388,15 @@ fun ageFromIso(value: String?): String {
     return elapsedLabel(seconds)
 }
 
+/** "started 2h 10m ago · 410 M": a background job's second line (sm#2412). */
+fun backgroundJobLine(job: BackgroundJob, now: OffsetDateTime = OffsetDateTime.now()): String {
+    val memory = job.memoryBytes?.let { bytes ->
+        val mib = bytes / (1024.0 * 1024.0)
+        if (mib >= 1024) "%.1f G".format(mib / 1024) else "${mib.toLong()} M"
+    }
+    return listOfNotNull(factAge(job.startedAt, now)?.let { "started $it ago" }, memory).joinToString(" · ")
+}
+
 fun formatAge(lastActivity: String?, activityState: String?): String {
     val parsed = parseIso(lastActivity) ?: return "-"
     val seconds = Duration.between(parsed, OffsetDateTime.now(parsed.offset)).seconds.coerceAtLeast(0)
@@ -401,9 +411,9 @@ fun formatDateTime(value: String?): String {
 
 fun activityLabel(state: String?): String {
     return when (state) {
-        // The agent's turn stopped but background shells/monitors are still
-        // running — distinct from waiting on a human.
-        "waiting" -> "bg-wait"
+        // The agent's turn stopped but commands it started are still
+        // running — distinct from waiting on a human (sm#2412).
+        "waiting" -> "background"
         // Blocked on an Allow prompt only the owner can answer (sm#1743).
         "waiting_permission" -> "approve"
         "waiting_input" -> "waiting"

@@ -109,6 +109,16 @@ export function agentFact(agent, now = Date.now()) {
   return { text: `○ ${fact.state === 'stopped' ? 'Stopped' : 'Idle'} ${since}`.trim(), tone: 'muted' };
 }
 
+/** Commands an idle agent left running outside the queue (sm#2412). */
+function BackgroundJobs({ jobs, now }) {
+  if (!jobs || !jobs.length) return null;
+  const memory = (bytes) => bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(1)} G` : `${Math.round(bytes / 1048576)} M`;
+  return html`<section class="bg-jobs"><h4>Running in the background</h4>${jobs.map((job) => html`<div class="bg-job" key=${job.pid}>
+    <code title=${job.command}>${job.command}</code>
+    <small>${[job.started_at ? `started ${age(job.started_at, now)} ago` : null, job.memory_bytes != null ? memory(job.memory_bytes) : null].filter(Boolean).join(' · ')}</small>
+  </div>`)}</section>`;
+}
+
 /** "▶ 2 running · 2h 56m", "⏸ Waiting 8m · 1st in line", or "No jobs". */
 export function jobsFact(agent) {
   // A paired reviewer leads with its round and keeps its own jobs' status.
@@ -120,6 +130,8 @@ export function jobsFact(agent) {
   }
   const jobs = agent.facts && agent.facts.jobs;
   if (!jobs || !jobs.tone) return { text: (jobs && jobs.text) || 'No jobs', tone: 'muted' };
+  // Something the agent left running (sm#2412); the text carries its own ◷.
+  if (jobs.tone === 'background') return { text: jobs.text, tone: 'cyan' };
   return { text: `${jobs.running > 0 ? '▶' : '⏸'} ${jobs.text}`, tone: jobs.tone };
 }
 
@@ -647,6 +659,7 @@ export function AgentPanel({ id, controls, beside }) {
       onRetired=${(done) => { if (done) closePanel(); reload(); }} />`}
     <${Links} prs=${claims.filter(item => item.kind === 'pr')}
       jobs=${agent.jobs || []} docs=${agent.docs || []} />
+    <${BackgroundJobs} jobs=${agent.background_jobs} now=${now} />
     <${AgentStatus} agent=${agent} claims=${claims} now=${now} onAnswered=${reload} />
     <${Thread} key=${agent.id} id=${agent.id} embedded
       empty=${html`<div class="pbody"><${LastTurn} id=${agent.id} /></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />

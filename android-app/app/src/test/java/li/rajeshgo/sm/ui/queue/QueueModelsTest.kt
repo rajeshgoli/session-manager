@@ -10,10 +10,12 @@ import li.rajeshgo.sm.data.model.QueueStats
 import li.rajeshgo.sm.data.model.QueueTypeStats
 import li.rajeshgo.sm.data.model.QueueWaitingGroup
 import li.rajeshgo.sm.data.model.SessionJob
+import li.rajeshgo.sm.data.model.ShellJobInfo
 import li.rajeshgo.sm.data.model.SlotCount
 import li.rajeshgo.sm.data.model.UtilizationBucket
 import li.rajeshgo.sm.data.model.UtilizationSummary
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -218,5 +220,27 @@ class QueueModelsTest {
         assertEquals(null, stoppedLinkText(0))
         assertEquals("3 stopped in the last 24h ›", stoppedLinkText(3))
         assertEquals("50+ stopped in the last 24h ›", stoppedLinkText(50))
+    }
+    @Test
+    fun shellJobsShowMemoryAgainstTheirReservation() {
+        val gib = 1024L * 1024 * 1024
+        val now = OffsetDateTime.of(2026, 10, 19, 14, 25, 0, 0, ZoneOffset.UTC)
+        val under = SessionJob(
+            id = "job_a", label = "cargo build -p sm-server", state = "running", type = "shell",
+            queuedAt = "2026-10-19T14:22:00Z", startedAt = "2026-10-19T14:24:00Z", memoryBytes = 16 * gib,
+            shell = ShellJobInfo(reservedBytes = 16 * gib, currentBytes = 3 * gib, peakBytes = 3 * gib),
+        )
+        // Age counts from when the agent started it, not when sm adopted it.
+        assertEquals("shell · 3m · 3G of 16G reserved", runningLine(under, now))
+        assertEquals(3f / 16f, runningProgress(under, now), 0.001f)
+        assertFalse(shellOverReservation(under))
+        val over = under.copy(shell = ShellJobInfo(reservedBytes = 8 * gib, currentBytes = 11 * gib, peakBytes = 12 * gib, overReservation = true))
+        assertEquals("shell · 3m · 11G of 8G reserved", runningLine(over, now))
+        assertEquals(1f, runningProgress(over, now), 0.001f)
+        assertTrue(shellOverReservation(over))
+        assertEquals("11.0 G now · peak 12.0 G · 8 G reserved", shellMemoryDetail(over))
+        val slots = QueueSlots(running = 1, max = 8, byType = mapOf("tests" to SlotCount(1, 2), "review" to SlotCount(0, 4), "shell" to SlotCount(2)))
+        assertEquals("1 of 8 slots in use · tests 1/2 · review 0/4 · shell 2", slotsLine(slots))
+        assertEquals("1 of 8 slots in use · tests 1/2", slotsLine(QueueSlots(running = 1, max = 8, byType = mapOf("tests" to SlotCount(1, 2), "shell" to SlotCount(0)))))
     }
 }

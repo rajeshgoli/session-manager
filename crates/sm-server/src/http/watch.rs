@@ -264,8 +264,20 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
                 .then(|| optional("last_activity"))
                 .flatten()
         });
+        // Commands the agent left running outside the queue (sm#2412);
+        // a shell job is already among its jobs.
+        let background: Vec<Value> = (state != "working" && state != "stopped")
+            .then(|| crate::agent_memory_guard::background_jobs(id))
+            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|job| job.shell_job_id.is_none())
+            .filter_map(|job| serde_json::to_value(job).ok())
+            .collect();
+        let mut with_background = v.clone();
+        with_background["background_jobs"] = json!(background);
         let (facts, attention) = agent_facts(
-            v,
+            &with_background,
             &waiting_on,
             &field("claims"),
             &own_jobs,
@@ -311,6 +323,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "paired_reviewer": reviews.get(id).map_or(Value::Null, |r| r["paired_reviewer"].clone()),
             "review_history": field("review_history"),
             "jobs": own_jobs,
+            "background_jobs": background,
             "collision": colliding.contains(id),
             "attach": format!("sm attach {}", name(v)),
         }));
@@ -480,6 +493,14 @@ struct FactContext<'a> {
     now: OffsetDateTime,
 }
 
+/// `text` cut to `max` characters with "…".
+fn facts_cut(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
 fn agent_facts(
     session: &Value,
     waiting_on: &Value,
@@ -629,6 +650,22 @@ fn agent_facts(
             job_text.push_str(&format!(" · review {}", facts_age(since, now)));
         }
     }
+    let background: Vec<&Value> = session["background_jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    if !background.is_empty() {
+        if running.is_empty() && pending.is_empty() && review_since.is_none() {
+            tone = json!("background");
+            job_text = match background.as_slice() {
+                [only] => format!("◷ Watching: {}", facts_cut(s(only, "command"), 40)),
+                many => format!("◷ {} in background", many.len()),
+            };
+        } else {
+            job_text.push_str(&format!(" · {} in background", background.len()));
+        }
+    }
     let review_fact =
         review.map(|item| json!({"pr_number": item["pr_number"], "since": item["since"]}));
     let job_facts = json!({"running": running.len(), "waiting": pending.len(),
@@ -685,7 +722,7 @@ fn agent_facts(
         );
     let note = notes.get(s(session, "id"));
     let facts = json!({"agent": {"state": agent_state, "since": activity_since, "text": parked.then(|| s(session, "activity_state"))},
-        "jobs": job_facts, "you": you, "finished": finished,
+        "jobs": job_facts, "background": background.len(), "you": you, "finished": finished,
         "note": note.map_or(Value::Null, |note| json!({"text": note.text, "at": note.at}))});
     let last = s(session, "last_activity");
     let has_claim = claims
@@ -1290,6 +1327,62 @@ mod facts_tests {
             assert_eq!(attention["section"], section);
             assert_eq!(facts["jobs"]["text"], job_text);
         }
+    }
+
+    /// sm#2412: an idle agent says what it left running outside the queue.
+    #[test]
+    fn background_jobs_name_what_an_idle_agent_left_running() {
+        let now = OffsetDateTime::parse("2026-10-19T16:20:00Z", &Rfc3339).unwrap();
+        let config = AppConfig::default();
+        let (messages, finished, notes) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let context = FactContext {
+            messages: &messages,
+            finished: &finished,
+            notes: &notes,
+            config: &config,
+            now,
+        };
+        let watcher =
+            json!({"pid": 7, "command": "until grep -q Ready /tmp/dev.log; do sleep 2; done"});
+        let server = json!({"pid": 8, "command": "npm run dev"});
+        let text = |background: Value, jobs: Value| {
+            let session = json!({"status": "active", "activity_state": "idle", "background_jobs": background});
+            let (facts, _) = agent_facts(
+                &session,
+                &json!([]),
+                &json!([]),
+                jobs.as_array().unwrap(),
+                None,
+                &context,
+            );
+            (
+                facts["jobs"]["text"].clone(),
+                facts["jobs"]["tone"].clone(),
+                facts["background"].clone(),
+            )
+        };
+        assert_eq!(
+            text(json!([watcher]), json!([])),
+            (
+                json!("◷ Watching: until grep -q Ready /tmp/dev.log; do sle…"),
+                json!("background"),
+                json!(1)
+            )
+        );
+        assert_eq!(
+            text(json!([watcher, server]), json!([])),
+            (json!("◷ 2 in background"), json!("background"), json!(2))
+        );
+        let running = json!([{"type": "shell", "state": "running", "started_at": "2026-10-19T16:16:00Z", "timeout_seconds": 0}]);
+        assert_eq!(
+            text(json!([server]), running),
+            (
+                json!("Shell running 4m · 1 in background"),
+                json!("green"),
+                json!(1)
+            )
+        );
+        assert_eq!(text(json!([]), json!([])).0, json!("No jobs"));
     }
 
     #[test]

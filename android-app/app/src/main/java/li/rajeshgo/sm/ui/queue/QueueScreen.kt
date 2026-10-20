@@ -197,13 +197,21 @@ fun QueueScreen(
                     if (overview.running.isNotEmpty()) {
                         item { SectionHeader("RUNNING") }
                         items(overview.running, key = { "r-${it.id}" }) { job ->
+                            val over = shellOverReservation(job)
                             JobRow(
                                 title = jobTitle(job),
                                 agent = jobAgentLabel(job),
                                 line = runningLine(job, now),
-                                reason = reviewJobLine(job),
+                                reason = reviewJobLine(job) ?: job.holding?.summary?.takeIf { over },
+                                reasonColor = if (over) Amber else Color.Unspecified,
                                 progress = runningProgress(job, now),
-                                onClick = { sheetJob = job; viewModel.loadLog(job) },
+                                progressColor = when {
+                                    over -> Amber
+                                    isShellJob(job) -> Emerald
+                                    else -> Cyan
+                                },
+                                // A shell job has no log; its output is in the agent's shell.
+                                onClick = { sheetJob = job; if (!isShellJob(job)) viewModel.loadLog(job) },
                             )
                         }
                     }
@@ -374,7 +382,9 @@ internal fun JobRow(
     line: String,
     onClick: () -> Unit,
     reason: String? = null,
+    reasonColor: Color = Color.Unspecified,
     progress: Float? = null,
+    progressColor: Color = Cyan,
     prefix: String? = null,
     prefixColor: Color = Cyan,
     trailing: (@Composable () -> Unit)? = null,
@@ -398,12 +408,12 @@ internal fun JobRow(
                 Text(" · $agent", color = TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Text(line, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-            reason?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            reason?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = reasonColor) }
             progress?.let {
                 LinearProgressIndicator(
                     progress = { it },
                     modifier = Modifier.fillMaxWidth().height(3.dp).padding(top = 2.dp),
-                    color = Cyan,
+                    color = progressColor,
                     trackColor = PanelMuted,
                 )
             }
@@ -493,9 +503,30 @@ private fun JobSheet(
                 review.authorName?.let { Detail("For", it) }
                 Detail("Why", review.why?.takeIf { it.isNotBlank() } ?: review.policySource ?: "default")
             }
+            val shell = isShellJob(job)
+            if (shell) {
+                job.holding?.detail?.let { Detail("How it got here", it) }
+                shellMemoryDetail(job)?.let { memory ->
+                    Detail("Memory", memory)
+                    if (shellOverReservation(job)) {
+                        Text(
+                            "Over its reservation. If the Mac runs short of memory, sm stops this first and tells ${jobAgentLabel(job)} how to rerun it through the queue.",
+                            color = Amber,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
             jobCommand(job)?.let { Detail("Command", it, mono = true) }
-            job.cwd?.let { Detail("Folder", it, mono = true) }
-            Detail(
+            job.cwd?.takeIf { it.isNotBlank() }?.let { Detail("Folder", it, mono = true) }
+            if (shell) Detail(
+                "Times",
+                listOfNotNull(
+                    job.queuedAt?.let { "started ${secondsBetween(it, now)?.let(::shortDuration) ?: "-"} ago" },
+                    job.startedAt?.let { "in the queue ${secondsBetween(it, now)?.let(::shortDuration) ?: "-"}" },
+                    job.finishedAt?.let { "ended ${secondsBetween(it, now)?.let(::shortDuration) ?: "-"} ago" },
+                ).joinToString(" · "),
+            ) else Detail(
                 "Times",
                 listOfNotNull(
                     job.queuedAt?.let { "queued ${secondsBetween(it, now)?.let(::shortDuration) ?: "-"} ago" },
@@ -503,7 +534,7 @@ private fun JobSheet(
                     job.finishedAt?.let { "finished ${secondsBetween(it, now)?.let(::shortDuration) ?: "-"} ago" },
                 ).joinToString(" · "),
             )
-            jobLimits(job).takeIf { it.isNotBlank() }?.let { Detail("Limits", it) }
+            if (!shell) jobLimits(job).takeIf { it.isNotBlank() }?.let { Detail("Limits", it) }
             if (job.state == "pending") job.holding?.detail?.let { Detail("Why it is waiting", it) }
             if (job.state == "running" && job.ownerForcedAt != null) {
                 Detail("Started", "Early, by you. If the Mac runs low on memory, sm stops this run first and puts the job back in line.")
@@ -539,21 +570,23 @@ private fun JobSheet(
                 }
             }
 
-            HorizontalDivider(color = Border)
-            Text("Log (last 40 lines)", style = MaterialTheme.typography.titleSmall)
-            Text(
-                log ?: "Loading…",
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall,
-                color = TextSecondary,
-            )
+            if (!shell) {
+                HorizontalDivider(color = Border)
+                Text("Log (last 40 lines)", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    log ?: "Loading…",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+            }
             cancelError?.let { Text(it, color = Rose) }
             followMessage?.let { Text(it, color = TextSecondary) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 24.dp)) {
                 if (active) {
-                    OutlinedButton(onClick = { confirming = true }) { Text("Cancel", color = Rose) }
+                    OutlinedButton(onClick = { confirming = true }) { Text(if (shell) "Stop" else "Cancel", color = Rose) }
                     // The server follows only jobs that have not finished.
-                    OutlinedButton(onClick = onFollow) { Text("Follow") }
+                    if (!shell) OutlinedButton(onClick = onFollow) { Text("Follow") }
                 }
                 onOpenAgent?.let { OutlinedButton(onClick = it) { Text("Open agent") } }
             }
@@ -651,7 +684,7 @@ private fun CancelDialog(job: SessionJob, onConfirm: (String?) -> Unit, onDismis
     var note by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Cancel ${jobTitle(job)}?") },
+        title = { Text(if (isShellJob(job)) "Stop ${jobTitle(job)}?" else "Cancel ${jobTitle(job)}?") },
         text = {
             OutlinedTextField(
                 value = note,
@@ -661,7 +694,9 @@ private fun CancelDialog(job: SessionJob, onConfirm: (String?) -> Unit, onDismis
             )
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(note.trim().ifEmpty { null }) }) { Text("Cancel job", color = Rose) }
+            TextButton(onClick = { onConfirm(note.trim().ifEmpty { null }) }) {
+                Text(if (isShellJob(job)) "Stop it" else "Cancel job", color = Rose)
+            }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text(if (job.state == "running") "Keep running" else "Keep waiting") }

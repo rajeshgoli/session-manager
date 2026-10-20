@@ -440,6 +440,12 @@ async fn main() -> Result<()> {
                         .memory
                         .agent_process_exempt_commands
                         .clone(),
+                    background_ignore_commands: config
+                        .queue_runner
+                        .memory
+                        .background_ignore_commands
+                        .clone(),
+                    memory_min_free_bytes: admission_policy.memory_min_free_bytes,
                 },
             );
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_after_boot(
