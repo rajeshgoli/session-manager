@@ -11,7 +11,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import stat
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -89,6 +92,12 @@ def build_backup_plan(
     }
     if execute and not blockers:
         copied = _execute_plan(report)
+        # The cold file may appear or disappear during the pair snapshot.
+        report["summary"]["planned"] = sum(entry["action"] == "copy" for entry in entries)
+        report["summary"]["skipped"] = sum(entry["action"] == "skip" for entry in entries)
+        report["summary"]["planned_bytes"] = sum(
+            int(entry.get("size_bytes") or 0) for entry in entries if entry["action"] == "copy"
+        )
         report["summary"]["copied"] = copied
         report["summary"]["blockers"] = len(report["blockers"])
         report["summary"]["warnings"] = len(report["warnings"])
@@ -237,8 +246,14 @@ def _is_same_or_descendant(path: Path, parent: Path) -> bool:
 def _execute_plan(report: dict[str, Any]) -> int:
     backup_root = Path(report["backup_root"])
     backup_root.mkdir(parents=True, exist_ok=False)
-    copied = 0
+    session_pair = {
+        entry["store_id"]: entry for entry in report["entries"]
+        if entry["store_id"] in {"sessions_state", "sessions_cold"}
+    }
+    copied = _copy_session_pair(session_pair, report) if len(session_pair) == 2 else 0
     for entry in report["entries"]:
+        if len(session_pair) == 2 and entry["store_id"] in session_pair:
+            continue
         if entry["action"] != "copy":
             continue
         source = Path(entry["source"])
@@ -273,6 +288,95 @@ def _execute_plan(report: dict[str, Any]) -> int:
     if report["blockers"]:
         report["status"] = "blocked"
     return copied
+
+
+def _session_stamp(metadata: os.stat_result) -> tuple[int, ...]:
+    # Open handles keep old inodes alive, preventing rename/reuse from making
+    # a replaced file appear unchanged. Nanosecond mtime/ctime catch rewrites.
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _copy_session_pair(pair: dict[str, dict[str, Any]], report: dict[str, Any]) -> int:
+    """Copy an overlapping stable hot/cold interval, including cold absence.
+
+    Hold both original handles through validation. All source handle and path
+    stamps must still match *after both copies*. A move between opening/copying
+    either file therefore invalidates the attempt, regardless of move direction.
+    A legitimate crash-intermediate duplicate pair is safe to restore as-is.
+    """
+    entries = [pair["sessions_state"], pair["sessions_cold"]]
+    last_error = "session files changed while copying"
+    for _attempt in range(5):
+        try:
+            with ExitStack() as stack:
+                sources = []
+                for entry in entries:
+                    try:
+                        fd = os.open(entry["source"], os.O_RDONLY | os.O_NOFOLLOW)
+                    except FileNotFoundError:
+                        if entry["required"]:
+                            raise
+                        sources.append((entry, None, None))
+                        continue
+                    handle = stack.enter_context(os.fdopen(fd, "rb"))
+                    metadata = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise OSError(f"session source is not a regular file: {entry['source']}")
+                    sources.append((entry, handle, metadata))
+                evidence = {}
+                for entry, handle, metadata in sources:
+                    destination = Path(entry["destination"])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if handle is None:
+                        destination.unlink(missing_ok=True)
+                        continue
+                    with destination.open("wb") as target:
+                        shutil.copyfileobj(handle, target)
+                        os.fchmod(target.fileno(), stat.S_IMODE(metadata.st_mode))
+                    os.utime(destination, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    digest = _file_hash(destination)
+                    if digest is None:
+                        raise OSError(f"cannot hash copied session file: {destination}")
+                    evidence[entry["store_id"]] = (destination.stat().st_size, digest)
+                stable = True
+                for entry, handle, metadata in sources:
+                    try:
+                        current = os.stat(entry["source"], follow_symlinks=False)
+                    except FileNotFoundError:
+                        current = None
+                    if handle is None:
+                        stable &= current is None
+                    else:
+                        stable &= current is not None and (
+                            _session_stamp(metadata) == _session_stamp(current)
+                            == _session_stamp(os.fstat(handle.fileno()))
+                        )
+                if not stable:
+                    continue
+                for entry, handle, metadata in sources:
+                    present = handle is not None
+                    entry.update(exists=present, action="copy" if present else "skip",
+                                 skip_reason=None if present else "missing", copied=present)
+                    if present:
+                        size, digest = evidence[entry["store_id"]]
+                        entry.update(size_bytes=size, sha256=digest,
+                                     backup_size_bytes=size, backup_sha256=digest)
+                        # An optional file missing at preflight may now exist.
+                        report["warnings"] = [warning for warning in report["warnings"]
+                            if not (warning["store_id"] == entry["store_id"] and warning["kind"] == "missing")]
+                    else:
+                        entry.update(size_bytes=None, sha256=None)
+                return len(evidence)
+        except OSError as error:
+            last_error = str(error)
+    # A blocked manifest cannot be restored. Never certify a mixed pair merely
+    # because both individually copied files have valid content hashes.
+    pair["sessions_state"]["blockers"].append(_issue(
+        "sessions_state", "session_pair_unstable",
+        f"could not snapshot hot/cold session files consistently after 5 attempts: {last_error}",
+    ))
+    return 0
 
 
 def _copy_directory(source: Path, destination: Path, entry: dict[str, Any]) -> None:
