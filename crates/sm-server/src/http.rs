@@ -22652,6 +22652,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_start_now_accepts_empty_body_and_validates_nonempty_json() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for (payload, expected) in [
+            ("", StatusCode::CONFLICT),
+            ("{}", StatusCode::CONFLICT),
+            (r#"{"ask_if_risky":true}"#, StatusCode::CONFLICT),
+            (r#"{"ask_if_risky":false}"#, StatusCode::CONFLICT),
+            ("{", StatusCode::BAD_REQUEST),
+            (r#"{"ask_if_risky":"invalid"}"#, StatusCode::BAD_REQUEST),
+        ] {
+            let mut request = owner_web_request(
+                Method::POST,
+                "/client/queue/jobs/job-missing/start",
+                "sm.example.com",
+                Some(&owner),
+                &[("origin", "https://sm.example.com")],
+                &json!({}),
+            );
+            *request.body_mut() = Body::from(payload);
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, expected, "payload {payload:?}: {body}");
+            if expected == StatusCode::CONFLICT {
+                assert_eq!(body["detail"], "the queue runtime is off on this server");
+            } else {
+                assert!(body["detail"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("invalid JSON body:"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn owner_web_guard_passes_browser_writes_from_the_page() {
         let app = owner_web_app();
         let owner =

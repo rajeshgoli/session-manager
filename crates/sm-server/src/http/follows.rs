@@ -1061,9 +1061,8 @@ pub(super) async fn force_start_queue_job(
     uri: Uri,
     headers: HeaderMap,
     Path(identifier): Path<String>,
-    body: Option<Json<StartNowBody>>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let body = body.map(|Json(body)| body).unwrap_or_default();
     if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
         owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
         if authenticated_user(&headers, &state.config).is_none() {
@@ -1073,6 +1072,8 @@ pub(super) async fn force_start_queue_job(
             });
         }
     }
+    // Authorize before parsing, and accept an empty body from older app builds.
+    let body: StartNowBody = docs::parse_json_body(&body)?;
     if !state.config.rust_core.runtime_enabled {
         return Err(conflict("the queue runtime is off on this server"));
     }
