@@ -243,6 +243,7 @@ impl SessionStore {
     }
 
     pub(super) fn load_cold_segment(&self) -> Result<(Option<StateFileStamp>, Arc<ColdSegment>)> {
+        validate_session_state_path(&self.state_file)?;
         let path = self.cold_path();
         let mut file = match fs::File::open(&path) {
             Ok(file) => Some(file),
@@ -653,6 +654,47 @@ mod tests {
         let store = SessionStore::new(dir.join("sessions.json"));
         store.write_raw_json_value(&raw).unwrap();
         (store, raw)
+    }
+
+    #[test]
+    fn cold_reserved_hot_filename_is_rejected_before_any_mutation() {
+        let (store, raw) = fixture("path-collision");
+        let dir = store.state_file.parent().unwrap();
+        let reserved = dir.join("sessions.cold.json");
+        let original = raw.to_string();
+        fs::write(&reserved, &original).unwrap();
+        let alias = dir.join("alias.json");
+        std::os::unix::fs::symlink(&reserved, &alias).unwrap();
+        for path in [&reserved, &alias] {
+            let bad = SessionStore::new(path.clone());
+            assert!(bad
+                .list_sessions(true)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved"));
+            assert!(bad
+                .write_raw_json_value(&json!({"sessions":[]}))
+                .unwrap_err()
+                .to_string()
+                .contains("reserved"));
+            assert!(bad
+                .sweep_cold_sessions()
+                .unwrap_err()
+                .to_string()
+                .contains("reserved"));
+            assert_eq!(fs::read_to_string(&reserved).unwrap(), original);
+            let config = dir.join("invalid.yaml");
+            fs::write(
+                &config,
+                format!("paths:\n  state_file: {}\n", path.display()),
+            )
+            .unwrap();
+            assert!(crate::config::AppConfig::load_from_path(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved"));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Read-only live input, copied into test isolation before any movement.

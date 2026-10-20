@@ -147,6 +147,16 @@ fn canonical_state_path(path: &Path) -> PathBuf {
     resolved
 }
 
+/// The sidecar filename is reserved even when the hot path is a symlink.
+pub(crate) fn validate_session_state_path(path: &Path) -> Result<()> {
+    let resolved = canonical_state_path(path);
+    anyhow::ensure!(
+        resolved.file_name() != Some(std::ffi::OsStr::new("sessions.cold.json")),
+        "paths.state_file must not resolve to sessions.cold.json; that filename is reserved for the cold segment"
+    );
+    Ok(())
+}
+
 fn shared_session_state(path: &Path) -> Arc<SharedSessionState> {
     static REGISTRY: OnceLock<Mutex<BTreeMap<PathBuf, Weak<SharedSessionState>>>> = OnceLock::new();
     let mut registry = REGISTRY
@@ -8946,6 +8956,7 @@ impl SessionStore {
         value: &Value,
         after_rename: impl FnOnce(),
     ) -> Result<()> {
+        validate_session_state_path(&self.state_file)?;
         #[cfg(test)]
         self.state_writes.fetch_add(1, Ordering::Relaxed);
         if let Some(parent) = self.state_file.parent() {

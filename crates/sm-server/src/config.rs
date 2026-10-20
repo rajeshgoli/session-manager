@@ -217,6 +217,9 @@ impl AppConfig {
         config.utilization.validate()?;
         config.managed_artifacts.validate()?;
         config.opencode.validate()?;
+        crate::sessions::validate_session_state_path(&crate::sessions::expand_home(
+            &config.paths.state_file,
+        ))?;
 
         Ok(config)
     }
