@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2416 — Why sm is slow</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2416 — Why sm is slow, and six changes that fix it</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>297bfff8</code> · Ticket #2416 · Measured 2026-10-19, 18:30–19:20 PDT on studio.local</small></p>
+
+<h2>Memo</h2>
+
+<p><b>sm is slow for two reasons that stack.</b> First, the machine was overloaded: eight queue jobs ran at once, four of them full Rust test suites, and each suite can use all 32 cores by itself. Queue jobs run at the same CPU priority as sm-server and the agents, so everything waited in line together. Second, and growing every day, sm-server does work in proportion to <i>every agent that has ever run</i>, not to the handful that are live. It keeps all 2,822 sessions in one 13 MB file, copies that file in memory on most reads, rewrites it whole on most writes, and runs background loops that walk the entire history every few seconds.</p>
+
+<p><b>I recommend six tickets in three parallel lanes.</b> The first ticket alone removes about 28% of sm-server's CPU and a write storm that follows every account switch. The full set should cut sm-server's CPU by roughly two thirds, make the board page about four times faster, and keep sm responsive when the queue fills the machine, without capping how much work the queue does. Nothing in the plan deletes data or changes what any page shows, except where the decision table below says so.</p>
+
+<div class="vocab">
+<dl>
+<dt>Session state file</dt><dd><code>~/.local/share/claude-sessions/sessions.json</code>. One JSON document holding every session record sm has ever created, plus registries (roles, launches, pending reparents). sm-server is its only reader and writer.</dd>
+<dt>Hook</dt><dd>An HTTP call a Claude agent makes to sm-server on each lifecycle event: prompt submitted, tool about to run, turn stopped, status-line update. Agents wait on the reply, so hook latency is agent latency.</dd>
+<dt>Write lock</dt><dd>The single in-process lock every change to the session state file takes. While one change holds it, every other change waits.</dd>
+<dt>Parse cache</dt><dd>sm-server's in-memory copy of the parsed state file. Today every write throws it away, so the next reader parses the whole file again.</dd>
+<dt>Cold segment</dt><dd>The proposed second file for sessions stopped more than 14 days ago. It is read once at startup and rarely rewritten. Every read still sees its sessions; only writes get cheaper.</dd>
+<dt>Nice value</dt><dd>The operating system's CPU priority for a process. 0 is the default; higher numbers yield to lower ones when cores are contended and use any spare cores freely when they are not.</dd>
+</dl>
+</div>
+
+<h3>What I measured</h3>
+
+<table>
+<thead><tr><th>Measure</th><th>Peak (18:32, load 66–88)</th><th>Normal (19:04–19:15, load 8–24)</th></tr></thead>
+<tbody>
+<tr><td>Load average on 32 cores</td><td>66, rising to 88</td><td>8 to 24 (today's usual is 4–18)</td></tr>
+<tr><td>Queue page (<code>/client/queue</code>), typical</td><td>1.1–2.2 s, one request 11 s</td><td>0.09–0.14 s (0.9 s in one burst)</td></tr>
+<tr><td>Board page (<code>/client/board</code>), typical</td><td>not measured</td><td>0.37–1.2 s</td></tr>
+<tr><td><code>sm queue list --all</code></td><td>gives up after 30 s</td><td>not retried</td></tr>
+<tr><td>sm-server CPU</td><td>3.8 cores busy</td><td>1.1 cores busy (average of six 10 s profiles)</td></tr>
+<tr><td>Hook calls waiting on locks</td><td>up to 1.9 s of every 5 s</td><td>about 0.6 s of every 10 s</td></tr>
+<tr><td>Session state file</td><td colspan="2">13.2 MB; 2,823 sessions, of which 7 are live and 2,523 stopped more than 14 days ago. It grows by 400–1,200 sessions a month.</td></tr>
+</tbody>
+</table>
+
+<figure>
+<svg viewBox="0 0 720 300" role="img" aria-label="Share of sm-server CPU by cause">
+<style>.l{font:12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}.v{font:12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}</style>
+<g transform="translate(0,10)">
+<text class="l" x="0" y="16">Retry loop visiting stopped sessions (T1)</text><rect x="330" y="4" width="278" height="16" fill="var(--red)"/><text class="v" x="614" y="16">28%</text>
+<text class="l" x="0" y="46">Watch, obligations, board polling (T5)</text><rect x="330" y="34" width="126" height="16" fill="var(--orange)"/><text class="v" x="462" y="46">13%</text>
+<text class="l" x="0" y="76">Copies of the state file on reads (T2)</text><rect x="330" y="64" width="102" height="16" fill="var(--orange)"/><text class="v" x="438" y="76">10%</text>
+<text class="l" x="0" y="106">Queue database reads (T4)</text><rect x="330" y="94" width="57" height="16" fill="var(--blue)"/><text class="v" x="393" y="106">6%</text>
+<text class="l" x="0" y="136">Agents inbox catalogue (not in this plan)</text><rect x="330" y="124" width="32" height="16" fill="var(--ink-3)"/><text class="v" x="368" y="136">3%</text>
+<text class="l" x="0" y="166">Usage ledger scan (T6)</text><rect x="330" y="154" width="30" height="16" fill="var(--blue)"/><text class="v" x="366" y="166">3%</text>
+<text class="l" x="0" y="196">Server runtime, tmux, sockets (not sm code)</text><rect x="330" y="184" width="264" height="16" fill="var(--ink-3)"/><text class="v" x="600" y="196">26%</text>
+<text class="l" x="0" y="226">Everything else, each under 1%</text><rect x="330" y="214" width="110" height="16" fill="var(--ink-3)"/><text class="v" x="446" y="226">11%</text>
+<line x1="330" y1="0" x2="330" y2="236" stroke="var(--ink-3)"/>
+</g>
+</svg>
+<figcaption>Share of sm-server's busy CPU at normal load, from six 10-second profiles taken two minutes apart (19:04–19:15). At peak load, copies of the state file rose to about 30% and the usage scan to about 9%; the profile at 18:33 is in Appendix A.</figcaption>
+</figure>
+
+<h3>Why it is slow</h3>
+
+<p><b>1. Queue jobs compete with sm on equal terms.</b> The queue admits test jobs by memory, not CPU, and allows six at once. That is the right policy for throughput, but because queue jobs run at the same priority as everything else, a full machine slows sm-server, the <code>sm</code> CLI, tmux and the agents in proportion. At load 66, the queue page went from 0.1 s to 1–2 s with no change in sm's own work.</p>
+
+<p><b>2. The session state file is one document, copied and rewritten whole.</b> On an idle machine, parsing the file takes 26 ms, copying it in memory 12 ms, and serializing it 10 ms. The diagram shows where those costs land.</p>
+
+<figure>
+<svg viewBox="0 0 720 210" role="img" aria-label="Read and write path of the session state file">
+<style>.b{font:12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}.s{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}</style>
+<rect x="10" y="20" width="150" height="50" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text class="b" x="22" y="42">Readers: hooks, pages,</text><text class="b" x="22" y="58">loops (many per second)</text>
+<rect x="285" y="20" width="150" height="50" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text class="b" x="300" y="42">Parse cache</text><text class="s" x="300" y="58">one copy, behind a lock</text>
+<rect x="560" y="20" width="150" height="50" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text class="b" x="575" y="42">sessions.json</text><text class="s" x="575" y="58">13 MB, 2,823 sessions</text>
+<line x1="160" y1="45" x2="285" y2="45" stroke="var(--orange)" stroke-width="2"/><text class="s" x="168" y="38">copy all 2,823 records</text><text class="s" x="168" y="64">per lookup</text>
+<line x1="435" y1="45" x2="560" y2="45" stroke="var(--red)" stroke-width="2"/><text class="s" x="440" y="38">re-parse 26 ms after</text><text class="s" x="440" y="64">every write, lock held</text>
+<rect x="10" y="130" width="150" height="50" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text class="b" x="22" y="152">Writers: every tool call,</text><text class="b" x="22" y="168">prompt, stop, retry pass</text>
+<rect x="285" y="130" width="150" height="50" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/><text class="b" x="300" y="152">Write lock</text><text class="s" x="300" y="168">one for the whole server</text>
+<line x1="160" y1="155" x2="285" y2="155" stroke="var(--red)" stroke-width="2"/><text class="s" x="168" y="148">copy 13 MB (12 ms)</text>
+<line x1="435" y1="155" x2="560" y2="70" stroke="var(--red)" stroke-width="2"/><text class="s" x="470" y="140">rewrite whole file (12 ms),</text><text class="s" x="470" y="155">clear the cache</text>
+</svg>
+<figcaption>Today's path. Each write costs about 50 ms of locked work on an idle machine, and three to five times that under load. Each read of one session copies all of them.</figcaption>
+</figure>
+
+<p><b>3. Background loops walk the whole history.</b> These are the costs that grow without bound:</p>
+<ul>
+<li>Every 5 s, the message-retry loop visits 23 stopped sessions that each hold a queue-completion notice they can never receive. For each one it takes the write lock and copies all 13 MB, only to find the session stopped. This is the single largest cost: 28% of sm-server's CPU.</li>
+<li>Every usage scan, once a minute, stamps the <i>current</i> account onto every session, stopped ones included, with one full-file rewrite per changed session. After an account switch that is about 2,800 rewrites, roughly two minutes of holding the write lock. It also overwrites the account that old sessions actually ran on.</li>
+<li>The local-model card on the queue page, and its 5-second retry loop, read all 16,021 queue jobs ever run. <code>sm queue list --all</code> builds a reply for every one of them and opens the board database about 4,500 times, so it times out.</li>
+<li>The board page opens the docs database twice for each of 145 docs: 80% of its 0.4 s.</li>
+<li>Each usage scan reads all 693,000 burn samples (the stored usage-meter readings) twice.</li>
+</ul>
+
+<h3>The plan</h3>
+
+<table>
+<thead><tr><th style="width:7%">Ticket</th><th>What changes</th><th style="width:30%">What you notice</th></tr></thead>
+<tbody>
+<tr><td><b>T1</b></td><td><b>Stop needless session work.</b> The retry loop skips stopped sessions before taking any lock. Writes happen only when something changed. The usage scan stamps accounts only on live sessions, in one write per scan.</td><td>sm-server CPU drops about a quarter. No more lock storm after an account switch.</td></tr>
+<tr><td><b>T2</b></td><td><b>Make reads free.</b> All readers share one parsed copy instead of copying it; looking up one session reads one record. A write hands its result to the cache instead of clearing it. Read-only lookups stop taking the write lock. Every part of the server uses one shared store.</td><td>Hooks and pages stop waiting on each other. Agents' tool calls return faster under load.</td></tr>
+<tr><td><b>T3</b></td><td><b>Cold segment.</b> Sessions stopped more than 14 days ago, with their finished launch records, move to a second file that sm loads once. Reads see both files, so every page and command behaves as before. Changing a cold session first moves it back.</td><td>The rewritten file shrinks from 13 MB to about 3 MB and stays there. Writes get about four times cheaper.</td></tr>
+<tr><td><b>T4</b></td><td><b>Queue.</b> Queue jobs start at nice 10, except perf jobs. Queue reads look only at live jobs and recent finishes. The queue page opens each database once per request. <code>sm queue list --all</code> shows the newest 200 jobs unless given <code>--limit</code>.</td><td>sm stays responsive when the queue fills the machine. The queue page halves. <code>--all</code> works again.</td></tr>
+<tr><td><b>T5</b></td><td><b>Polling pages and hooks.</b> The board reads all docs' publishes and reviews in two queries, not 290. Watch and obligations compute each input once per request. Review registrations get an index. Hooks run off the server's async worker threads.</td><td>Board page about four times faster. The phone's 5-second watch refresh costs a fraction of today.</td></tr>
+<tr><td><b>T6</b></td><td><b>Usage ledger.</b> Scans read only burn samples added since the last scan. Account history rows are written only when something changed. A status-line sample is stored when it changes, plus one every 5 minutes.</td><td>The once-a-minute usage scan stops showing up. usage.db stops growing by 18,000 rows a day.</td></tr>
+</tbody>
+</table>
+
+<figure>
+<svg viewBox="0 0 720 120" role="img" aria-label="Ticket order in three lanes">
+<style>.t{font:12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}.k{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}</style>
+<text class="k" x="0" y="26">Session store</text><text class="k" x="0" y="66">Queue and pages</text><text class="k" x="0" y="106">Usage ledger</text>
+<rect x="120" y="10" width="130" height="26" rx="5" fill="var(--red)" opacity=".85"/><text class="t" x="132" y="28" fill="#fff" style="fill:#fff">T1 needless work</text>
+<rect x="290" y="10" width="130" height="26" rx="5" fill="var(--orange)" opacity=".85"/><text class="t" x="302" y="28" style="fill:#fff">T2 free reads</text>
+<rect x="460" y="10" width="130" height="26" rx="5" fill="var(--orange)" opacity=".85"/><text class="t" x="472" y="28" style="fill:#fff">T3 cold segment</text>
+<line x1="250" y1="23" x2="290" y2="23" stroke="var(--ink-3)"/><line x1="420" y1="23" x2="460" y2="23" stroke="var(--ink-3)"/>
+<rect x="120" y="50" width="130" height="26" rx="5" fill="var(--blue)" opacity=".85"/><text class="t" x="132" y="68" style="fill:#fff">T4 queue</text>
+<rect x="290" y="50" width="130" height="26" rx="5" fill="var(--blue)" opacity=".85"/><text class="t" x="302" y="68" style="fill:#fff">T5 pages, hooks</text>
+<line x1="250" y1="63" x2="290" y2="63" stroke="var(--ink-3)"/>
+<rect x="120" y="90" width="130" height="26" rx="5" fill="var(--green)" opacity=".85"/><text class="t" x="132" y="108" style="fill:#fff">T6 usage ledger</text>
+</svg>
+<figcaption>Three lanes run in parallel. Within a lane, tickets touch the same files, so each starts after the one before it merges.</figcaption>
+</figure>
+
+<h3>Decision surface</h3>
+
+<table>
+<thead>
+<tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Fix waste first, or shrink the file first?</td><td><b>Waste first (T1, T2), then the cold segment (T3).</b></td><td>T1 and T2 remove most of the cost with no change to stored data; T3 then keeps it from growing back.</td></tr>
+<tr><td>2. What happens to old stopped sessions?</td><td><b>Move them to a cold segment that every read still sees.</b> Do not delete them, and do not hide them from history, restore or work claims.</td><td>History, restore, handoff lineage and work claims all read old sessions. Work claims treat a missing session as "purged" and end its claims, so deleting would change behaviour.</td></tr>
+<tr><td>3. Cut-off for "old"?</td><td><b>14 days after the session stopped.</b> Sessions with an active role, a pending launch, a handoff hold or an <code>is_em</code> flag never go cold.</td><td>It keeps about 300 sessions hot. The name-reuse window is 7 days, so name reservations are unaffected.</td></tr>
+<tr><td>4. Should the usage scan keep stamping the current account onto stopped sessions?</td><td><b>No. Stamp live sessions only.</b> A stopped session keeps the account it ran on.</td><td>Today an account switch relabels every past session with the new account and rewrites the file about 2,800 times.</td></tr>
+<tr><td>5. CPU priority of queue jobs?</td><td><b>Nice 10 for all job types except perf, which stays at 0.</b></td><td>Jobs still use every spare core; sm and agents go first when cores are contended. Perf jobs already hold the machine alone, so lowering them would only add noise.</td></tr>
+<tr><td>6. <code>sm queue list --all</code>?</td><td><b>Show the newest 200 jobs by default; <code>--limit N</code> changes it, <code>--limit 0</code> shows all.</b></td><td>With 16,021 jobs, "all" times out today, so the default is already broken.</td></tr>
+<tr><td>7. Status-line usage samples?</td><td><b>Store one when the reading changes, plus at least one every 5 minutes.</b></td><td>Usage charts look the same at 5-minute resolution; today a flat reading is stored on every status-line refresh.</td></tr>
+<tr><td>8. Move session state into SQLite rows?</td><td><b>Not now.</b> Revisit if T1–T3 miss the targets below.</td><td>It would touch about 170 write sites. T2 and T3 give most of the gain at a fraction of the risk.</td></tr>
+</tbody>
+</table>
+
+<h3>What I am not doing</h3>
+<ul>
+<li><b>Capping test jobs.</b> You ruled this out: using the whole machine is the point. Nice 10 gives sm priority without lowering the queue's throughput.</li>
+<li><b>Agents running builds outside the queue.</b> Some agents run cargo directly in their own shell. Those processes are not niced. The memory guard already kills them past 1 GiB; this plan leaves them alone.</li>
+<li><b>The agents inbox catalogue (3%) and tool-call hook writes.</b> Neither is large enough to justify a ticket now. Tool-call hooks still write once per call, but T2 and T3 make each write about eight times cheaper.</li>
+</ul>
+
+<h3>How we will know it worked</h3>
+<p>After each ticket ships, its implementer re-runs the same benchmark and six spaced profiles (Appendix A) at comparable load and posts the numbers on the ticket. The targets below assume all six have shipped. An estimate that misses by more than half triggers a new decision, not more tickets.</p>
+<table>
+<thead><tr><th>Measure</th><th>Today, normal load</th><th>Target</th></tr></thead>
+<tbody>
+<tr><td>sm-server busy CPU</td><td>1.1 cores</td><td>at most 0.4 cores</td></tr>
+<tr><td>Board page, typical</td><td>0.37–1.2 s</td><td>at most 0.15 s</td></tr>
+<tr><td>Queue page, typical</td><td>0.09–0.14 s</td><td>at most 0.05 s</td></tr>
+<tr><td>Queue page at load above 60</td><td>1–2 s</td><td>at most 0.3 s</td></tr>
+<tr><td><code>sm queue list --all</code></td><td>times out at 30 s</td><td>under 2 s</td></tr>
+<tr><td>Hook time spent waiting on locks</td><td>~6% of profile samples</td><td>under 1%</td></tr>
+<tr><td>Bytes rewritten per state change</td><td>13 MB</td><td>about 3 MB</td></tr>
+</tbody>
+</table>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. Measurement method and data</a></div>
+<div><a href="#b">B. T1 — Stop needless session work</a></div>
+<div><a href="#c">C. T2 — Make reads free</a></div>
+<div><a href="#d">D. T3 — Cold segment</a></div>
+<div><a href="#e">E. T4 — Queue</a></div>
+<div><a href="#f">F. T5 — Polling pages and hooks</a></div>
+<div><a href="#g">G. T6 — Usage ledger</a></div>
+<div><a href="#h">H. Requirement traceability</a></div>
+<div><a href="#i">I. Ticket file sets and order</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Measurement method and data</h3>
+
+<h4>A.1 Endpoint benchmark</h4>
+<p>The benchmark below times read routes that the CLI, web app and phone poll. It reports p50, p90 and max over N runs. It must run against the live server on 127.0.0.1:8420, from a shell where <code>uptime</code> shows the load being compared. Before and after numbers are comparable only when the 1-minute load averages are within 30% of each other.</p>
+<pre><code>#!/bin/bash
+N=${1:-10}
+ID=${SM_BENCH_ID:-&lt;a live session id&gt;}
+for p in /health /sessions /client/bootstrap /client/queue /client/board /client/follows \
+         /client/notices /client/sessions/$ID /client/usage/meters "/queue-jobs?limit=20"; do
+  ts=$(for i in $(seq $N); do curl -s -m 60 -o /dev/null -w "%{time_total}\n" "localhost:8420$p"; done | sort -n)
+  echo "$ts" | awk -v p="$p" '{a[NR]=$1} END{printf "%-28s p50 %6.3f  p90 %6.3f  max %6.3f\n",
+      p, a[int(NR/2)+1], a[int(NR*0.9)], a[NR]}'
+done
+printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
+
+<h4>A.2 CPU profile</h4>
+<ul>
+<li>Capture: <code>sample &lt;sm-server pid&gt; 10 -file sN.txt</code>, six times, 110 s apart. The live process is <code>sm-server-blue</code> or <code>sm-server-green</code>.</li>
+<li>Attribution: each non-wait leaf sample is credited to the outermost <code>sm_server::</code> frame below the thread entry. The thread entry is <code>main</code>, a tokio worker or <code>run_background_pass</code>. Wait leaves (<code>__psynch_cvwait</code>, <code>__semwait_signal</code>, <code>poll</code>, <code>kevent</code>, <code>__ulock_wait</code>, <code>__workq_kernreturn</code>, <code>mach_msg2_trap</code>) are excluded from "busy".</li>
+<li>Lock waits: a <code>__psynch_mutexwait</code> leaf is credited to the deepest <code>sm_server::</code> frame above it.</li>
+<li>The scripts are <code>prof.py</code> and <code>agg.py</code>. The implementer of T1 commits them to <code>scripts/perf/</code> so later tickets use the same method.</li>
+</ul>
+
+<h4>A.3 Normal-load profile (19:04–19:15, six samples, 1.1 busy cores)</h4>
+<table>
+<thead><tr><th>Share</th><th>Outermost sm frame</th><th>Ticket</th></tr></thead>
+<tbody>
+<tr><td>27.8%</td><td><code>SessionStore::drain_runtime_background_retry_messages</code></td><td>T1</td></tr>
+<tr><td>26.4%</td><td>non-sm (tokio, hyper, tmux process spawns)</td><td>—</td></tr>
+<tr><td>4.9%</td><td><code>http::session_obligations</code></td><td>T5</td></tr>
+<tr><td>3.6%</td><td><code>SessionStore::get_session</code></td><td>T2</td></tr>
+<tr><td>3.0%</td><td><code>RetainedQueueStore::list_codex_review_requests_from_path</code></td><td>T4 index, T5 callers</td></tr>
+<tr><td>2.8%</td><td><code>http::inbox::work_threads::ThreadCatalog::load</code></td><td>not in plan</td></tr>
+<tr><td>2.5%</td><td><code>queue::open_queue_jobs_connection</code></td><td>T4</td></tr>
+<tr><td>2.2%</td><td><code>UsageLedgerStore::scan</code></td><td>T6</td></tr>
+<tr><td>2.1%</td><td><code>SessionStore::load_snapshot</code></td><td>T2</td></tr>
+<tr><td>1.8%</td><td><code>handoff_doc_rows</code></td><td>T2</td></tr>
+<tr><td>1.6%</td><td><code>local_model::queue_card</code></td><td>T4</td></tr>
+<tr><td>1.5% / 1.2%</td><td><code>http::live_activity_state</code> / <code>session_response_with_live_activity</code></td><td>T2</td></tr>
+<tr><td>1.2%</td><td><code>http::messages::obligation_messages</code></td><td>T5</td></tr>
+<tr><td>1.2%</td><td><code>AppState::reconcile_reparent_background</code></td><td>T2</td></tr>
+<tr><td>0.9%</td><td><code>local_model::retry_reload</code></td><td>T4</td></tr>
+<tr><td>0.8%</td><td><code>SessionStore::record_session_account_key</code></td><td>T1</td></tr>
+<tr><td>0.7% each</td><td><code>lookup_agent_registration</code>, <code>watch_state</code>, <code>load_raw_json_value</code>, <code>run_follow_pass</code>, <code>poll_recovered_queue_job</code></td><td>T2, T5, T2, T2, T4</td></tr>
+</tbody>
+</table>
+
+<h4>A.4 Peak-load profile (18:33, 5 s, 3.8 busy cores)</h4>
+<p>Deepest sm frames: <code>ParsedState::snapshot</code> 12.3%, <code>handoff_doc_rows</code> 9.8%, <code>BurnWindows::containing</code> 8.8%, <code>parsed_state_at</code> 4.1%, <code>list_codex_review_requests_conn</code> 3.8%, <code>TmuxRuntime::capture_pane_text</code> 3.3%, <code>load_raw_json_value</code> 3.2%. Lock waits, by deepest frame: <code>parsed_state_at</code> 3,703 samples, <code>apply_claude_user_prompt_submit_hook</code> 1,905, <code>apply_context_usage_event</code> 1,558, <code>apply_claude_stop_hook</code> 732. These four are hooks and the parse cache.</p>
+
+<h4>A.5 Serialization benchmark</h4>
+<p>Release build of <code>serde_json</code> 1.x on a copy of the live file, mean of 10 runs, idle core:</p>
+<table>
+<thead><tr><th>Operation</th><th>Live file (13.25 MB, 2,823 sessions)</th><th>14-day hot set (4.4 MB, 300 sessions)</th></tr></thead>
+<tbody>
+<tr><td>Parse to <code>Value</code></td><td>25.7 ms</td><td>6.5 ms</td></tr>
+<tr><td>Clone <code>Value</code></td><td>11.5 ms</td><td>3.1 ms</td></tr>
+<tr><td><code>to_vec_pretty</code></td><td>9.7 ms</td><td>3.0 ms</td></tr>
+<tr><td>Write and rename</td><td>11.7 ms</td><td>3.9 ms</td></tr>
+</tbody>
+</table>
+<p>The 4.4 MB hot set still holds every <code>session_runtime_launches</code> entry (1.9 MB). T3 also moves the 1,037 finished launch records of cold sessions out, so the hot file lands near 3 MB.</p>
+
+<h4>A.6 Data shape</h4>
+<ul>
+<li><b>Sessions.</b> 2,823 total: 1,740 retired, 1,065 killed, 11 stopped with no completion status, 7 live.</li>
+<li><b>Age.</b> Median stopped age is 57 days.</li>
+<li><b>Growth.</b> Sessions created per month: Jun 236, Jul 326, Aug 1,198, Sep 625, Oct (to the 19th) 435.</li>
+<li><b>Largest raw fields.</b> <code>last_action_summary</code> 1.27 MB, <code>opencode_event_projection</code> 0.78 MB, <code>subagents</code> 0.39 MB.</li>
+<li><b>Other databases.</b>
+  <ul>
+  <li>queue_runner.db: 16,021 jobs.</li>
+  <li>usage.db: 693,144 burn samples, 454,691 account-metadata rows.</li>
+  <li>message_queue.db: 4,070 review registrations (2 active), 669 doc publishes, 160 doc reviews, 145 docs.</li>
+  </ul>
+</li>
+</ul>
+
+<h3 id="b">B. T1 — Stop needless session work</h3>
+<p>Files: <code>crates/sm-server/src/sessions.rs</code>, <code>crates/sm-server/src/opencode/outbox.rs</code>, <code>scripts/perf/</code> (new).</p>
+
+<h4>B.1 Retry loop skips stopped and unknown targets without locking</h4>
+<p><code>drain_runtime_pending_targets_by_category</code> (sessions.rs ~5598) runs every 5 s from <code>drain_runtime_background_retry_messages</code>, driven by the main.rs background pass "background wake delivery retry".</p>
+<ul>
+<li><b>Required.</b> Before calling <code>is_opencode_session</code> or <code>drain_runtime_pending_messages_for_writable_session</code> for a target, read the target's raw record from <code>load_parsed_state()</code> (an <code>Arc</code>, no copy). Skip the target, without taking <code>write_guard</code>, when:
+  <ul>
+  <li>the record is absent, or</li>
+  <li><code>raw_session_is_stopped</code> is true, or</li>
+  <li><code>handoff_fences_delivery_raw</code> is true.</li>
+  </ul>
+  These are exactly the conditions under which <code>runtime_session_accepts_background_delivery_raw</code> returns <code>false</code> today before touching tmux.</li>
+<li><b>Opencode check.</b> Read the provider from the same borrowed record. Do not call <code>get_session</code>.</li>
+<li><b>Re-check under the lock.</b> <code>drain_runtime_pending_messages_for_writable_session</code> still checks under <code>write_guard</code>, because a session can stop between the two checks.</li>
+<li><b>Conditional write.</b> It writes the state file only if <code>drain_pending_runtime_messages_raw</code> delivered at least one message or changed the state. That requires an equality check against the pre-drain value, or a <code>changed</code> flag threaded through the drain (implementer's choice). <code>drain_runtime_pending_messages_for_session_category</code> (~5431) gets the same conditional write.</li>
+<li><b>Undeliverable messages stay queued.</b> They remain undelivered rows in message_queue.db, exactly as today. A restore or successor handoff delivers them through the existing paths. T1 does not mark, expire or delete them.</li>
+<li><b>Test, retry.</b> With 30 stopped targets holding undelivered <code>queue-completion</code> rows and one live target, one retry pass:
+  <ul>
+  <li>takes <code>write_guard</code> at most once;</li>
+  <li>leaves <code>sessions.json</code>'s inode unchanged if the live target had nothing deliverable;</li>
+  <li>delivers to the live target when it is ready.</li>
+  </ul></li>
+<li><b>Test, race.</b> A target that stops between the borrowed check and the locked check is not delivered to.</li>
+</ul>
+
+<h4>B.2 Account stamping only on live sessions, one write per scan</h4>
+<ul>
+<li><b>Required.</b> In <code>scan_usage_ledger</code> (sessions.rs 519), <code>record_session_account_key</code> runs only for records where <code>is_stopped</code> is false.</li>
+<li><b>Batch.</b> Collect all the changes, then apply them in one <code>write_guard</code>, load, mutate, write cycle. Records whose key already matches are skipped, as today.</li>
+<li><b>Status-line path.</b> The status-line path (<code>record_claude_statusline_burn</code>) keeps calling <code>record_session_account_key</code> for its own session, but skips it if that session is stopped.</li>
+<li><b>Unchanged.</b> <code>usage_report_for_session</code> and the ledger keep reading <code>account_key</code> as stored.</li>
+<li><b>Test, switch.</b> After a simulated account switch, one scan over 50 stopped and 3 live sessions writes the file once and changes only the 3 live records' <code>account_key</code>.</li>
+<li><b>Test, history.</b> A stopped session's <code>account_key</code> never changes after it stops.</li>
+</ul>
+
+<h4>B.3 Perf scripts</h4>
+<p>Commit the benchmark (A.1), <code>prof.py</code> and <code>agg.py</code> (A.2) under <code>scripts/perf/</code>, with a five-line README naming the comparison rule in A.1. Post before and after numbers on the ticket.</p>
+
+<h3 id="c">C. T2 — Make reads free</h3>
+<p>Files: <code>sessions.rs</code>, <code>handoff/notes.rs</code>, <code>handoff/store.rs</code>. Starts after T1 merges.</p>
+
+<h4>C.1 One shared store per state file</h4>
+<ul>
+<li><b>Required.</b> All <code>SessionStore</code> values in one process whose canonicalized <code>state_file</code> paths are equal share one parse cache (<code>parsed_state</code>) and one <code>write_lock</code>. Use a process-wide registry keyed by canonical path (for example a <code>static OnceLock&lt;Mutex&lt;HashMap&lt;PathBuf, Weak&lt;Shared&gt;&gt;&gt;&gt;</code>).</li>
+<li><b>Instances fixed with no change at their call sites:</b>
+  <ul>
+  <li><code>agent_memory_guard.rs:306</code>: today a fresh store every 2 s, so a full parse every 2 s.</li>
+  <li><code>runtime.rs:1480</code>: a fresh store per opencode readiness check.</li>
+  <li><code>local_model.rs:1017</code>.</li>
+  <li><code>main.rs:419</code>.</li>
+  </ul></li>
+<li><b>Behaviour change, deliberate.</b> Two instances in one process can no longer interleave read-modify-write cycles and lose an update.</li>
+<li><b>Test.</b> Two instances built from different spellings of one path (a symlink, or a trailing <code>./</code>) observe each other's writes without a re-parse, and their writes serialize.</li>
+</ul>
+
+<h4>C.2 Writes install their result in the cache</h4>
+<ul>
+<li><b>Required.</b> <code>write_raw_json_value</code> takes the <code>Value</code> by value (or clones once, if a caller keeps using it). After the rename it stats the new file and installs <code>Arc::new(ParsedState::new(value))</code> with that stamp. It no longer clears the cache.</li>
+<li><b>Normalization.</b> <code>ParsedState::new</code> runs <code>normalize_opencode_runtime_record</code> as on parse. The installed value must therefore equal what a fresh parse of the written file yields.</li>
+<li><b>Test.</b> Write, then <code>load_parsed_state</code>. The result equals <code>serde_json::from_slice(fs::read(file))</code> after normalization, and no parse ran (count parses with a test-only counter).</li>
+<li><b>External writers.</b> A write from outside the process changes the stamp, and the next reader parses, as today.</li>
+</ul>
+
+<h4>C.3 A shared session view replaces per-call copies</h4>
+<ul>
+<li><b>New cache.</b> <code>ParsedState</code> gains <code>view: OnceLock&lt;Arc&lt;SessionsView&gt;&gt;</code>, built on first use per file version. <code>SessionsView</code> holds:
+  <ul>
+  <li>the <code>StateSnapshot</code> sessions after <code>into_sessions</code>'s alias map and pending adoption proposals;</li>
+  <li>an index from id to position;</li>
+  <li>an index from alias to position;</li>
+  <li>the <code>HandoffDefaults</code> and <code>session_refs</code> map that <code>handoff_view_for_record</code> needs.</li>
+  </ul>
+  It does not hold <code>handoff_view</code>, because that depends on the work-claims database (see below).</li>
+<li><b>Freshness of <code>handoff_view</code>.</b> Each public read call still runs <code>WorkClaimStore::handoff_inherited_by_session</code> once, as <code>load_snapshot</code> does today. It then computes <code>handoff_view</code> only for the records it returns, so freshness is unchanged.</li>
+<li><b><code>get_session(id)</code>.</b> Keep the four resolution steps in today's order: id, alias, a live record's display name, any record's display name. Steps 1–2 use the indexes. Steps 3–4 scan the view without copying. Only the single result is cloned.</li>
+<li><b><code>list_sessions(include_stopped)</code>.</b> Clone only the records it returns.</li>
+<li><b>Borrowing API.</b> Add <code>pub(crate) fn sessions_view(&amp;self) -&gt; Result&lt;Arc&lt;SessionsView&gt;&gt;</code>. Move these hot callers to borrow instead of clone:
+  <ul>
+  <li><code>watch_state</code></li>
+  <li><code>session_obligations</code></li>
+  <li><code>queue_session_names</code></li>
+  <li><code>run_follow_pass</code></li>
+  <li><code>live_activity_state</code></li>
+  <li><code>opencode_readers</code> supervisor</li>
+  <li><code>retry_opencode_outboxes</code></li>
+  <li><code>is_opencode_session</code></li>
+  <li><code>verify_hook_auth_or_secret</code></li>
+  <li><code>tool_use_hook</code></li>
+  <li><code>local_agent::authenticate_request</code></li>
+  </ul>
+  These sit in http.rs files that belong to T5's lane. T2 adds the API and converts only the <code>sessions.rs</code> and <code>opencode/</code> callers; T5 converts the http callers.</li>
+<li><b>Test, equivalence.</b> For a fixture of 200 sessions with aliases, adoption proposals, handoff records and duplicate names, every one of <code>get_session</code> (by id, alias, name and stale name), <code>list_sessions(true|false)</code>, <code>list_child_records</code> and <code>resolve_hierarchy_root</code> returns byte-identical JSON before and after T2. Capture the golden output from main in the first commit.</li>
+</ul>
+
+<h4>C.4 Read-only paths stop copying under the write lock</h4>
+<ul>
+<li><b><code>list_agent_registrations</code> and <code>lookup_agent_registration</code> (sessions.rs 7413, 7425).</b> Evaluate <code>recover_missing_maintainer_registration_raw</code> and <code>prune_agent_registrations_raw</code> on the borrowed state, in check-only mode. Only if a repair is needed, take <code>write_guard</code>, reload, repair and write. The result must equal today's.</li>
+<li><b>Early returns before the copy.</b> These hooks and events check the borrowed record before cloning, and return without taking <code>write_guard</code> when the session is unknown or stopped, or the emission is superseded:
+  <ul>
+  <li><code>apply_claude_user_prompt_submit_hook</code></li>
+  <li><code>apply_claude_pre_tool_use_hook</code></li>
+  <li><code>apply_claude_stop_hook</code></li>
+  <li><code>apply_context_usage_event</code> (unknown-session and stale-sample checks)</li>
+  <li><code>apply_codex_fork_event_line_with_artifact</code></li>
+  <li><code>revive_stopped_tmux_client_session</code></li>
+  </ul>
+  The locked path re-checks.</li>
+<li><b><code>handoff_doc_rows</code> (handoff/notes.rs 696).</b> Borrow via <code>load_parsed_state</code> instead of <code>load_raw_json_value</code>. Build one id-to-record map instead of calling <code>raw_session_object</code> per row. The output order and content are unchanged (existing tests at notes.rs ~1356 pin them).</li>
+<li><b>Other read-only callers of <code>load_raw_json_value</code>.</b> These switch to <code>load_parsed_state</code>:
+  <ul>
+  <li><code>end_work_claims_after_retire</code></li>
+  <li><code>handoff_uses_launch_prompt</code></li>
+  <li><code>handoff_runtime_launch_status</code></li>
+  <li><code>is_authorized_autopm_seat</code></li>
+  <li><code>opencode/retire.rs:106,199</code></li>
+  <li><code>opencode/clear.rs:30,188,278,301</code></li>
+  <li><code>opencode/handoff.rs:19</code></li>
+  <li><code>opencode/outbox.rs:147,182</code></li>
+  <li><code>handoff/notes.rs:687,774,1300</code></li>
+  <li><code>handoff/store.rs:251,302</code></li>
+  </ul>
+  Each must remain read-only.</li>
+<li><b><code>snapshot_from_raw_value</code> callers.</b> Use the cached view when they run on unmodified state: <code>reconcile_reparent_notifications</code>, <code>acquire_reparent_apply_lease</code>, <code>recover_opencode_retirements</code>, <code>recover_opencode_clears</code>. <code>prune_agent_registrations_raw</code> runs on modified state and keeps re-deriving.</li>
+</ul>
+
+<h4>C.5 Done when</h4>
+<p>The equivalence test passes. The perf scripts show <code>ParsedState::snapshot</code>, <code>load_snapshot</code> and <code>get_session</code> together under 2% of busy samples. Lock waits in <code>parsed_state_at</code> fall under 1%.</p>
+
+<h3 id="d">D. T3 — Cold segment</h3>
+<p>Files: <code>sessions.rs</code>, <code>handoff/transfer.rs</code>, <code>handoff/notes.rs</code>, <code>opencode/*.rs</code>, <code>scripts/rust_migration/{state_preflight,state_backup,state_restore,final_backup}.py</code>. Starts after T2 merges.</p>
+
+<h4>D.1 Files and shape</h4>
+<ul>
+<li><b>Location and format.</b> The cold segment is <code>sessions.cold.json</code> beside the state file: <code>{"version":1,"sessions":[...],"session_runtime_launches":[...]}</code>. Each element is the raw JSON exactly as it stood in <code>sessions.json</code>.</li>
+<li><b>Writes.</b> It is written with the same temp-file-and-rename as the state file, plus an <code>fsync</code> of the file before the rename, because it is rewritten rarely and holds most of the history.</li>
+<li><b>Reads.</b> It is read at startup and whenever its stamp changes.</li>
+<li><b>Merged view.</b> The merged view orders sessions as cold records in stored order, then hot records in stored order. Launch records follow the same rule.</li>
+<li><b>Duplicates.</b> A session id present in both files is the hot copy; the cold copy is ignored and removed at the next cold rewrite. The same rule applies to launch ids.</li>
+</ul>
+
+<h4>D.2 Eligibility to go cold</h4>
+<p>A session goes cold when all of these hold at sweep time:</p>
+<ol>
+<li><code>raw_session_is_stopped</code> is true.</li>
+<li>Its stop time is more than 14 days ago. The stop time is the first parseable of <code>stopped_at</code>, <code>completed_at</code>, <code>last_activity</code>; a record with none of them stays hot.</li>
+<li><code>is_em</code> is not true.</li>
+<li>It is not the holder of any <code>agent_registrations</code> entry, and not <code>maintainer_session_id</code>.</li>
+<li>It has no runtime launch whose status is <code>prepared</code> or <code>launching</code>.</li>
+<li>It is not a key in <code>handoff_deferred_sessions</code>.</li>
+<li>It is not the subject, parent or target of any <code>reparent_requests</code> entry that is not terminal.</li>
+<li>No hot session names it in <code>parent_session_id</code>, <code>predecessor_session_id</code> or <code>successor_session_id</code> while that hot session is live.</li>
+</ol>
+<p>A launch record goes cold with its session when its status is <code>applied</code> or <code>failed</code>. Launch records whose session id is in neither file stay hot.</p>
+
+<h4>D.3 Sweep</h4>
+<ul>
+<li><b>When.</b> Once at startup, after boot recovery, and then every 24 h from the existing daily handoff-notes pass.</li>
+<li><b>Order of steps.</b> Under <code>write_guard</code>:
+  <ol>
+  <li>Compute the eligible set.</li>
+  <li>Write the cold file with those records appended.</li>
+  <li>Write the hot file without them.</li>
+  </ol>
+  A crash between the two writes leaves duplicates, which D.1 resolves.</li>
+<li><b>Limits.</b> At most 1,000 sessions per sweep, oldest first, so the first sweep on today's data takes three passes over three days, or three at startup if the implementer loops at boot.</li>
+</ul>
+
+<h4>D.4 Thaw</h4>
+<p>A thaw moves a session, and its cold launch records, back into the hot file.</p>
+<ul>
+<li><b>Order of writes.</b> Write the hot file with the record, then the cold file without it.</li>
+<li><b>Position.</b> The record is inserted before the first hot record whose <code>created_at</code> is later, or appended if none is.</li>
+<li><b>Every write path that targets a session id thaws first.</b> Implement this as one helper <code>thaw_if_cold(&amp;self, ids: &amp;[&amp;str])</code>, called at the top of each such public function before its own <code>write_guard</code>. The rule: every public <code>SessionStore</code> function in sessions.rs, handoff/*.rs and opencode/*.rs that takes a session id and takes <code>write_guard</code>. The implementer lists them in the PR description; a missing call is caught by the equivalence test below.</li>
+<li><b>Whole-store writers.</b> These need cold handling:
+  <ul>
+  <li><code>update_session_metadata</code>'s <code>is_em</code> flip needs nothing, because cold records never have <code>is_em</code>.</li>
+  <li><code>transfer_handoff_json</code> repoints <code>parent_session_id</code>. It first thaws cold records whose <code>parent_session_id</code> is the predecessor; the view indexes cold children by parent id.</li>
+  <li><code>strip_legacy_handoff_fields</code> and <code>maintain_handoff_notes</code> do not modify cold records; legacy fields on cold records are stripped by the sweep before they go cold.</li>
+  <li><code>scan_usage_ledger</code> account stamping skips stopped records (T1), so it never touches cold ones.</li>
+  </ul></li>
+<li><b>Uniqueness checks see both files.</b> <code>allocate_session_id</code>, <code>generate_unique_runtime_launch_id</code> and <code>generate_unique_spawn_launch_intent_id</code> check both files' ids.</li>
+<li><b>Restore.</b> <code>restore_core_session*</code>'s claimed-resume-id and transcript exclusion sets are built from the merged view.</li>
+</ul>
+
+<h4>D.5 Equivalence test (the convergence criterion)</h4>
+<ul>
+<li><b>Setup.</b> Build two stores from one fixture: A with every eligible record hot, B with the same records cold.</li>
+<li><b>Operations.</b> For each operation below, run it on both stores and assert three things: equal responses, equal merged views (compared as JSON), and equal queue-database effects.
+  <ul>
+  <li>every route in the stopped-session inventory: <code>/sessions?include_stopped=true</code>, <code>/history/agents</code>, <code>/watch/state</code>, children with <code>include_terminated</code>, <code>/nodes/{node}/restore-candidates</code>, by-id GETs;</li>
+  <li><code>get_session</code> by id, alias and name;</li>
+  <li>restore, retire, kill and PATCH of a cold session;</li>
+  <li>a successor handoff whose predecessor has cold children;</li>
+  <li>work-claims <code>session_directory</code>;</li>
+  <li>worktree cleanup candidates.</li>
+  </ul></li>
+<li><b>Known difference.</b> The cold file's bytes differ; that is the point.</li>
+</ul>
+
+<h4>D.6 Backups and preflight</h4>
+<p>Add <code>sessions.cold.json</code> to the state-store manifests in <code>scripts/rust_migration/state_preflight.py</code> (next to <code>StoreSpec "sessions_state"</code>), <code>state_backup.py</code>, <code>state_restore.py</code> and <code>final_backup.py</code>. A restore that brings back only <code>sessions.json</code> from before T3 is valid: the cold file is then absent and every session is hot.</p>
+
+<h4>D.7 Reader table</h4>
+<table>
+<thead><tr><th>Reader</th><th>Reads</th><th>Cold behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>get_session</code>, <code>list_sessions</code>, <code>list_child_records</code>, history, restore candidates, watch, inbox, board, claims, worktree cleanup, analytics</td><td>merged view</td><td>unchanged</td></tr>
+<tr><td>Name reservation (7 days)</td><td>merged view</td><td>unchanged; cold records are past 14 days</td></tr>
+<tr><td>Usage ledger seat metadata, seat reconciliation at startup</td><td>merged view</td><td>unchanged</td></tr>
+<tr><td>Writers by id</td><td>hot after thaw</td><td>thaw then unchanged</td></tr>
+<tr><td><code>retained_pending_messages</code>, <code>spawn_launch_intents</code></td><td>hot file</td><td>stay hot; not moved (148 and 98 entries)</td></tr>
+<tr><td><code>agent_role_last_session_ids</code></td><td>hot file</td><td>a pointer to a cold id is inert today (the candidate must be live)</td></tr>
+</tbody>
+</table>
+
+<h3 id="e">E. T4 — Queue</h3>
+<p>Files: <code>queue.rs</code>, <code>queue/local_wall.rs</code>, <code>local_sockets/launch.rs</code>, <code>local_model.rs</code>, <code>bin/sm.rs</code>, <code>http.rs</code> (only <code>client_queue</code>, <code>list_queue_jobs</code>, <code>queue_job_response*</code>, <code>queue_job_lane</code>).</p>
+
+<h4>E.1 Nice 10 for queue jobs</h4>
+<ul>
+<li><b>Required.</b> Every queue job process except type <code>perf</code> starts at nice 10, and its children inherit it.</li>
+<li><b>Hosted path.</b> In the existing <code>pre_exec</code> at queue.rs ~6029, call <code>libc::setpriority(PRIO_PROCESS, 0, 10)</code> before exec. That is async-signal-safe.</li>
+<li><b>Local-wall path.</b> Apply the same in the owner-process spawn (<code>local_sockets/launch.rs:94,106,125</code>), in its <code>pre_exec</code> or by prefixing the supervisor with <code>/usr/bin/nice -n 10</code>.</li>
+<li><b>Failure handling.</b> A failed <code>setpriority</code> is ignored, and the job runs at nice 0.</li>
+<li><b>No new job field.</b> No config, API or app field is added.</li>
+<li><b>Test, hosted.</b> A <code>tests</code> job running <code>ps -o nice= -p $$</code> logs 10. A <code>perf</code> job logs 0.</li>
+<li><b>Test, local-wall.</b> The same, through the local-wall launcher.</li>
+</ul>
+
+<h4>E.2 Runtime reads skip old jobs</h4>
+<ul>
+<li><b>Required.</b> Add <code>list_queue_job_runtime_records_recent_conn(conn, finished_since)</code>. It returns jobs whose state is <code>pending</code> or <code>running</code>, plus jobs with <code>finished_at &gt;= finished_since</code>, ordered by <code>queued_at, id</code>.</li>
+<li><b>Index.</b> Add <code>CREATE INDEX IF NOT EXISTS idx_queue_jobs_state_queued ON queue_jobs(state, queued_at, id)</code>.</li>
+<li><b>Which callers switch.</b> Each caller of <code>list_queue_job_runtime_records_conn</code> switches when its decision depends only on non-terminal jobs and jobs finished within a window. That window becomes <code>finished_since = now − max(perf_cooldown_seconds, any other lookback the caller uses) − 60 s</code>. The callers are:
+  <ul>
+  <li><code>model_reload_block</code> (14924)</li>
+  <li>load guard 4564</li>
+  <li>admission 4588, 4602, 4642 and <code>ranked_queue_job_runtime_records_conn</code></li>
+  <li>deadline retry 4776, 4811</li>
+  <li>5098</li>
+  <li><code>running_job_process_groups</code> 6523</li>
+  <li><code>host_memory_guard_pass</code> 6552</li>
+  <li>7975</li>
+  </ul>
+  The implementer classifies each in the PR description, with a test for each switched caller that pins its decision on a fixture holding 5,000 terminal jobs.</li>
+<li><b>Callers that stay.</b> A caller that needs older history keeps the full read.</li>
+<li><b><code>model_reload_block</code> and the 5 s retry.</b> <code>model_reload_block</code> stops calling <code>init_queue_jobs_schema</code> on its read path (the schema is initialized at startup). <code>local_model::retry_reload</code> computes the block only when a model is yielded.</li>
+</ul>
+
+<h4>E.3 Queue page and job lists open each database once</h4>
+<ul>
+<li><b>Ticket ranks.</b> <code>client_queue</code> and <code>list_queue_jobs</code> compute <code>ticket_ranks</code> once per request and pass them to <code>queue_job_lane</code> (today: one board-database open per job with <code>rank_tickets</code>).</li>
+<li><b>Connections.</b> <code>queue_job_response_with_names</code> takes a per-request context holding one read connection each to queue_runner.db and message_queue.db.</li>
+<li><b>Review jobs.</b> <code>review_runs::job_fields</code> reads the job owner through the shared connection, without <code>init_queue_jobs_schema</code>. It reads each distinct requester session once per request through <code>get_session</code>, not once per job.</li>
+<li><b>Output.</b> Response JSON is byte-identical; an existing-route golden test pins it.</li>
+</ul>
+
+<h4>E.4 <code>sm queue list --all</code></h4>
+<ul>
+<li><b>Server.</b> <code>/queue-jobs</code> accepts <code>limit</code> (newest by <code>queued_at</code>, default unlimited for compatibility).</li>
+<li><b>CLI.</b> The CLI sends <code>limit=200</code> for <code>--all</code> unless <code>--limit N</code> is given; <code>--limit 0</code> means unlimited. When it truncates, the CLI prints <code>Showing newest 200 of N jobs; use --limit 0 for all.</code></li>
+<li><b>Label lookups.</b> <code>resolve_queue_job_from_path</code> label lookups use an indexed <code>WHERE label = ?</code> (add <code>idx_queue_jobs_label</code>) instead of listing all jobs.</li>
+<li><b>Test.</b> With 16,000 terminal jobs, <code>sm queue list --all</code> returns in under 2 s on a fixture database.</li>
+</ul>
+
+<h4>E.5 Review registrations index</h4>
+<p>In <code>init_codex_review_requests_schema</code> (queue.rs ~4045), add <code>CREATE INDEX IF NOT EXISTS idx_codex_review_active ON codex_review_request_registrations(is_active, requested_at)</code> and <code>idx_codex_review_pr ON ...(repo, pr_number, is_active)</code>. The live database already has an unrecorded <code>idx_codex_review_notify_active</code>; keep it and add it to the schema code.</p>
+
+<h3 id="f">F. T5 — Polling pages and hooks</h3>
+<p>Files: <code>http.rs</code> (hooks, <code>session_obligations</code>, <code>list_sessions</code> handlers), <code>http/watch.rs</code>, <code>http/messages.rs</code>, <code>http/board_links.rs</code>, <code>http/board_clock.rs</code>, <code>http/board_launch.rs</code>, <code>owner_docs.rs</code>, <code>http/local_agent.rs</code>. Starts after T4 merges (both touch http.rs).</p>
+
+<h4>F.1 Board docs in two queries</h4>
+<ul>
+<li><b>Required.</b> Add <code>OwnerDocStore::publishes_for(doc_ids)</code> and <code>reviews_for(doc_ids)</code>. Each runs one query over one connection, returning a map keyed by doc id in the same per-doc order as today (<code>ORDER BY doc_id, id</code> and <code>ORDER BY doc_id, submitted_at, rowid</code>).</li>
+<li><b>Callers.</b> <code>BoardLinks::load</code> (board_links.rs 104, 120) uses them.</li>
+<li><b>Index.</b> Add <code>CREATE INDEX IF NOT EXISTS owner_doc_reviews_doc ON owner_doc_reviews(doc_id, submitted_at)</code>.</li>
+<li><b>Test.</b> <code>/client/board</code> JSON is byte-identical on a fixture with 150 docs.</li>
+</ul>
+
+<h4>F.2 Watch and obligations compute each input once</h4>
+<ul>
+<li><b>Required.</b> One <code>/watch/state</code> request runs <code>list_sessions</code> (or <code>sessions_view</code>), <code>obligation_messages</code>, <code>handoff_doc_rows</code>, active queue jobs and the review-registration read once each. Today it is up to three, two, one, two and two. Pass a per-request context into <code>session_obligations</code>.</li>
+<li><b>Same for <code>/session-obligations</code>.</b></li>
+<li><b>Callers that only need active registrations</b> use the active-only query with the index from E.5. Callers that need history keep the full read.</li>
+<li><b>Test.</b> Golden equivalence on both routes.</li>
+</ul>
+
+<h4>F.3 Hooks off the async threads</h4>
+<ul>
+<li><b>Required.</b> These handlers run their <code>SessionStore</code> and SQLite work inside <code>tokio::task::spawn_blocking</code>, so a hook waiting on the write lock does not block a tokio worker serving other routes:
+  <ul>
+  <li><code>claude_hook</code> (http.rs ~2830)</li>
+  <li><code>tool_use_hook</code> (~3118)</li>
+  <li><code>context_usage_hook</code> (~2992)</li>
+  <li>the <code>list_sessions</code> and <code>list_client_sessions</code> handlers</li>
+  <li><code>watch_state</code></li>
+  <li><code>client_queue</code></li>
+  <li><code>list_queue_jobs</code></li>
+  </ul></li>
+<li><b>Handoff sweeper.</b> The handoff sweeper task (http/handoff.rs 508–575) wraps its store calls the same way.</li>
+<li><b>No change to responses or order.</b> Each hook's effects stay sequential within that hook.</li>
+<li><b>Test.</b> With the write lock held by a test thread, <code>/health</code> and <code>/client/bootstrap</code> answer within 50 ms while 32 hook requests wait.</li>
+</ul>
+
+<h4>F.4 Borrowing callers</h4>
+<p>Convert the http callers listed in C.3 to <code>sessions_view</code>.</p>
+
+<h3 id="g">G. T6 — Usage ledger</h3>
+<p>Files: <code>usage_ledger.rs</code>, <code>usage_burn.rs</code>, <code>usage_identity.rs</code>, <code>usage_db.rs</code>.</p>
+<ul>
+<li><b>G.1 Pending windows.</b> <code>pending_burn_windows</code> (usage_ledger.rs 1512) considers only <code>burn_samples</code> with <code>id &gt; materialized_high_water</code>. The high water is persisted in a new one-row table, <code>burn_window_scan_state(max_id)</code>, and advanced in the same transaction that materializes. On first run it is the current <code>max(id)</code> if the full query returns no rows, otherwise 0. Result: identical windows. Test: a fixture of 100,000 samples, half materialized, produces the same pending set as the old query.</li>
+<li><b>G.2 Burn windows across scans.</b> <code>BurnWindows</code> lives in <code>UsageLedgerStore</code> instead of being rebuilt per scan, and <code>refresh</code> reads only <code>id &gt; last_max</code>. A deleted or rewritten sample (none exist today) forces a full refresh: compare <code>count(*)</code> as well as <code>max(id)</code>.</li>
+<li><b>G.3 Account history.</b> <code>ensure_account</code>, <code>ensure_local_account</code> and the identity poll insert an <code>account_metadata_history</code> row only when its metadata differs from the account's latest row. Readers through <code>(account_key, observed_at)</code> see the same values at every timestamp. Test: 100 identical polls add one row.</li>
+<li><b>G.4 Status-line samples.</b>
+  <ul>
+  <li><b>When to insert.</b> <code>insert_windows</code> for source <code>statusline</code> inserts a sample only when one of these holds:
+    <ul>
+    <li>its percentage or <code>resets_at</code> differs from the latest stored sample for the same account, window kind and scope;</li>
+    <li>the latest is more than 300 s older;</li>
+    <li>there is no latest.</li>
+    </ul>
+  The Codex path keeps its own dedupe.</li>
+  <li><b>Test.</b> 60 identical readings at 5 s spacing store 2 rows. A changed reading stores immediately.</li>
+  <li><b>Existing rows.</b> Existing rows are kept.</li>
+  </ul></li>
+<li><b>G.5 Unchanged.</b> Message ingestion, scan offsets and the trailing-newline re-entry (an artifact whose tail lacks a newline re-enters the full path every scan) are out of scope. File a separate ticket if the profile after G.1–G.4 still shows <code>ensure_bootstrap_for_artifact</code>.</li>
+</ul>
+
+<h3 id="h">H. Requirement traceability</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Verified by</th></tr></thead>
+<tbody>
+<tr><td>Retry loop skips stopped sessions</td><td>B.1</td><td>retry pass test; profile share of <code>drain_runtime_background_retry_messages</code> under 2%</td></tr>
+<tr><td>Writes only on change</td><td>B.1, C.4</td><td>inode-unchanged assertions</td></tr>
+<tr><td>Account stamped on live sessions only (decision 4)</td><td>B.2</td><td>account switch test</td></tr>
+<tr><td>Shared parsed copy, one-record lookups</td><td>C.1–C.3</td><td>equivalence golden test; parse counter</td></tr>
+<tr><td>Read-only lookups do not take the write lock</td><td>C.4</td><td>registration equivalence test; lock-wait profile</td></tr>
+<tr><td>Cold segment, invisible to reads (decisions 2, 3)</td><td>D.1–D.7</td><td>hot/cold equivalence test</td></tr>
+<tr><td>Nice 10 except perf (decision 5)</td><td>E.1</td><td>nice-value job tests</td></tr>
+<tr><td>Queue reads skip old jobs; page opens once</td><td>E.2, E.3</td><td>per-caller decision tests; queue golden test</td></tr>
+<tr><td><code>--all</code> shows newest 200 (decision 6)</td><td>E.4</td><td>CLI test; timing test</td></tr>
+<tr><td>Board in two queries; watch computes once</td><td>F.1, F.2</td><td>board and watch golden tests</td></tr>
+<tr><td>Hooks off async threads</td><td>F.3</td><td>held-lock responsiveness test</td></tr>
+<tr><td>Usage scan reads only new samples</td><td>G.1, G.2</td><td>pending-set equivalence test</td></tr>
+<tr><td>Status-line samples on change or 5 min (decision 7)</td><td>G.4</td><td>dedupe test</td></tr>
+<tr><td>Targets table</td><td>A.1–A.2</td><td>numbers posted on each ticket</td></tr>
+<tr><td>Not doing SQLite rows (decision 8)</td><td>—</td><td>dropped: revisit only if targets are missed</td></tr>
+</tbody>
+</table>
+
+<h3 id="i">I. Ticket file sets and order</h3>
+<table>
+<thead><tr><th>Ticket</th><th>Files</th><th>Starts after</th><th>Tier</th></tr></thead>
+<tbody>
+<tr><td>T1</td><td>sessions.rs, opencode/outbox.rs, scripts/perf/</td><td>—</td><td>mid (opus high)</td></tr>
+<tr><td>T2</td><td>sessions.rs, handoff/notes.rs, handoff/store.rs, opencode/*.rs</td><td>T1</td><td>top (fable xhigh): shared-state design</td></tr>
+<tr><td>T3</td><td>sessions.rs, handoff/transfer.rs, handoff/notes.rs, opencode/*.rs, scripts/rust_migration/*.py</td><td>T2</td><td>top (fable xhigh): data movement and crash safety</td></tr>
+<tr><td>T4</td><td>queue.rs, queue/local_wall.rs, local_sockets/launch.rs, local_model.rs, bin/sm.rs, http.rs (queue functions)</td><td>—</td><td>mid</td></tr>
+<tr><td>T5</td><td>http.rs (hooks, obligations, session lists), http/watch.rs, http/messages.rs, http/board_*.rs, owner_docs.rs, http/local_agent.rs, http/handoff.rs</td><td>T4; its F.4 also needs T2</td><td>mid</td></tr>
+<tr><td>T6</td><td>usage_ledger.rs, usage_burn.rs, usage_identity.rs, usage_db.rs</td><td>—</td><td>mid</td></tr>
+</tbody>
+</table>
+<p>The stopped-session inventory behind D (every function, route and script that reads stopped sessions, with line numbers at main 424fdf9b) is attached to the T3 ticket. Re-derive it at the T3 start commit; line numbers drift.</p>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not just delete old sessions?</b> Work claims treat a session missing from the store as retired and purged. They end its claims, delete its stale reservations, and stop collecting its worktrees. History, restore candidates, handoff lineage walks and reply routing all read old records. A cold segment keeps every one of those readers unchanged.</p>
+<p><b>Why not SQLite for sessions now?</b> About 170 write sites follow the "lock, copy whole state, mutate, write" pattern, and several mutate many sessions in one step (handoff repointing, reparent). Converting them is a multi-ticket migration with its own crash-safety design. T2 removes the read-side cost entirely, and T3 cuts the write-side cost about four times. If the targets are met, the migration buys little.</p>
+<p><b>Is skipping stopped targets in the retry loop safe?</b> Yes. Today the same targets reach <code>runtime_session_accepts_background_delivery_raw</code>, which returns false for stopped sessions before doing anything. T1 only moves that check before the lock and the copy.</p>
+<p><b>Why does the board page take 0.4 s when the machine is idle?</b> <code>BoardLinks::load</code> calls <code>publishes(doc_id)</code> and <code>reviews(doc_id)</code> for each of 145 docs. Each call opens message_queue.db and prepares a statement. That is 290 opens per page load, and the web board polls every 30 s per open tab.</p>
+<p><b>Why does every tool call rewrite the state file?</b> <code>apply_claude_pre_tool_use_hook</code> records the tool name and activity time, and the time always changes. Coalescing these writes would change what the activity views show between flushes, so the plan leaves them and makes each write cheaper instead.</p>
+<p><b>Do the separate <code>SessionStore</code> instances cause lost updates today?</b> They can. Each has its own write lock, so two instances in one process can interleave read-modify-write cycles. The instances found mostly read, so I have not seen a lost update. C.1 removes the possibility.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
