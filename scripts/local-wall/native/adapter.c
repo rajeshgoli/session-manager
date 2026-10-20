@@ -1,5 +1,4 @@
 #include "wire_client.h"
-#include <stdio.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -212,7 +211,7 @@ __attribute__((constructor)) static void initialize(void) {
             fcntl(wall_control_fd, F_SETFD, flags | FD_CLOEXEC) < 0)) _exit(126);
         if (flags >= 0) control_source = wall_control_fd;
     }
-    if (recover_inherited() < 0) { fprintf(stderr, "child recovery failed errno=%d\n", errno); _exit(126); }
+    if (recover_inherited() < 0) _exit(126);
     if (pthread_atfork(fork_prepare, fork_parent, fork_child)) _exit(126);
     atomic_store_explicit(&initialized, 1, memory_order_release);
     acknowledge_recovery();

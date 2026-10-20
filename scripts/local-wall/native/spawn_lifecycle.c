@@ -176,7 +176,6 @@ static int spawn_process(pid_t *pid, const char *path,
         int ready;
         do { ready = poll(&item, 1, 2000); } while (ready < 0 && errno == EINTR);
         if (ready <= 0 || recv(notification[0], &reply, 1, MSG_DONTWAIT) != 1 || reply != 'R') {
-            fprintf(stderr, "recovery handshake failed: image=%s ready=%d events=%d reply=%d errno=%d\n", resolved, ready, item.revents, reply, errno);
             // Do not return success for a process that ignored the adapter.
             (void)kill(child, SIGKILL);
             while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
