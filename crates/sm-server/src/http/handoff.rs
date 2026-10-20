@@ -508,16 +508,33 @@ pub(super) fn kick_handoff(state: Arc<AppState>, session_id: String) {
 pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
     let maintenance_state = state.clone();
     tokio::spawn(async move {
-        let mut daily = tokio::time::interval(Duration::from_secs(86400));
+        let mut daily = tokio::time::interval_at(
+            // Leave the startup health/handover window outside the one-hour
+            // serving requirement; a slow handover remains gated below.
+            tokio::time::Instant::now() + Duration::from_secs(3660),
+            Duration::from_secs(86400),
+        );
+        // Import legacy notes immediately; the first cold sweep waits an hour.
+        let store = maintenance_state.session_store.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || store.maintain_handoff_notes())
+            .await
+            .unwrap_or_else(|e| Err(e.into()))
+        {
+            eprintln!("handoff note maintenance: {error:#}");
+        }
         loop {
             daily.tick().await;
             if maintenance_state.shutdown().is_stopped() {
                 return;
             }
             let store = maintenance_state.session_store.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || store.maintain_handoff_notes())
-                .await
-                .unwrap_or_else(|e| Err(e.into()))
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                store.maintain_handoff_notes()?;
+                store.sweep_cold_sessions_if_ready()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.into()))
             {
                 eprintln!("handoff note maintenance: {error:#}");
             }

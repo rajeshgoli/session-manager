@@ -381,6 +381,7 @@ impl SessionStore {
     ) -> Result<HandoffPolicyOutcome> {
         {
             let _guard = self.write_guard()?;
+            self.thaw_lineage_locked(&_guard, &[session_id])?;
             let mut state = self.load_raw_json_value()?;
             let Some(context) = raw_handoff_context(
                 &state,
@@ -470,6 +471,7 @@ impl SessionStore {
         ask: ReviewAsk<'_>,
     ) -> Result<Option<String>> {
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let Some(context) = raw_handoff_context(
             &state,

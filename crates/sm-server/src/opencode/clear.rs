@@ -27,6 +27,7 @@ impl SessionStore {
         let _submission = self.lock_opencode_submission(id)?;
         let record = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let parsed = self.load_parsed_state()?;
             let state = &parsed.raw;
             let Some(raw) = raw_session_object(state, id) else {
@@ -79,6 +80,7 @@ impl SessionStore {
             .context("missing conversation")?;
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
                 .context("session disappeared")?
@@ -151,6 +153,7 @@ impl SessionStore {
         };
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
                 .context("session disappeared")?;
@@ -186,6 +189,7 @@ impl SessionStore {
     fn finish_opencode_clear_while_locked(&self, id: &str, runtime: &TmuxRuntime) -> Result<()> {
         let (record, pending) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let parsed = self.load_parsed_state()?;
             let state = &parsed.raw;
             let raw = raw_session_object(state, id).context("session disappeared")?;
@@ -239,6 +243,7 @@ impl SessionStore {
         )?;
         self.opencode_driver()?.replace_attach(&record, runtime)?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
             .context("session disappeared")?;
@@ -268,6 +273,7 @@ impl SessionStore {
         }
         self.opencode_driver()?.replace_attach(&record, runtime)?;
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         let raw = session_object_mut(ensure_sessions_array_mut(&mut state)?, id)
             .context("session disappeared")?;

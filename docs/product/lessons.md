@@ -104,3 +104,6 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
   Session-auth-only routes pass on localhost and on scratch servers, then return 401 on the
   public host (#1858). Check a new web screen on `sm.rajeshgo.li` after deploy.
 - Never search the home directory recursively (`find ~`, `rg ~`, `du ~`). Every agent runs inside the tmux server sm-server started, so macOS charges the walk into `~/Library` to sm-server and pops "sm-server would like to access data from other apps" on Rajesh's screen (sm#2267). Search the specific directory you need.
+# Rolling back the cold session store
+
+Before rolling back to a server without cold-session support, stop both server slots and run the currently installed `sm-server thaw-cold --config ~/.config/session-manager/config.yaml`. It refuses to run while a server owns the handover socket. It restores `sessions.cold.json` into `sessions.json` in the original order, syncs both moves to disk, then removes the cold file. Only then start the older binary. Backups must include both files; a backup from before cold-session support remains valid with only `sessions.json`.

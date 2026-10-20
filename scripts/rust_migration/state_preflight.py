@@ -180,6 +180,7 @@ def _store_specs(
         ),
         StoreSpec("local_env_overlay", "Local auth env overlay", "file", local_env, False, "config", "default local env overlay"),
         StoreSpec("sessions_state", "Session state", "file", state_file, True, "session", "paths.state_file"),
+        StoreSpec("sessions_cold", "Cold session state", "file", state_file.with_name("sessions.cold.json"), False, "session", "beside paths.state_file"),
         StoreSpec(
             "message_queue_db",
             "Message queue DB",

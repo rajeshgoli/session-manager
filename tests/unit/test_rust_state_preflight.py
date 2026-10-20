@@ -45,7 +45,7 @@ def test_state_preflight_passes_with_required_state_and_warns_optional_missing(t
     report = build_state_preflight_report(config_path=config)
 
     assert report["status"] == "passed"
-    assert report["summary"]["stores"] == 17
+    assert report["summary"]["stores"] == 18
     assert report["summary"]["blockers"] == 0
     assert report["summary"]["warnings"] > 0
     stores = {row["id"]: row for row in report["stores"]}

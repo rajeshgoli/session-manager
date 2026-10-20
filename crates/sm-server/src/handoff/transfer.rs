@@ -94,6 +94,30 @@ fn replace_text_field(object: &mut Map<String, Value>, key: &str, from: &str, to
     }
 }
 
+pub(super) fn strip_legacy_handoff_record(record: &mut Value) -> bool {
+    let Some(record) = record.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in [
+        "pending_handoff_path",
+        "pending_handoff_recorded_at",
+        "claude_handoff_in_progress_at",
+        "pending_handoff_event_offset",
+    ] {
+        changed |= record.remove(key).is_some();
+    }
+    changed
+}
+
+const REPOINTED_SESSION_FIELDS: [&str; 2] = ["parent_session_id", "context_monitor_notify"];
+
+fn names_predecessor(record: &Value, predecessor: &str) -> bool {
+    REPOINTED_SESSION_FIELDS
+        .iter()
+        .any(|field| record[*field].as_str() == Some(predecessor))
+}
+
 /// Re-point `keys` of every entry of a top-level array.
 fn repoint_array_entries(state: &mut Value, array: &str, keys: &[&str], from: &str, to: &str) {
     let Some(entries) = state.get_mut(array).and_then(Value::as_array_mut) else {
@@ -114,6 +138,7 @@ impl SessionStore {
         }
         let _submission = self.lock_opencode_submission(id)?;
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         let Some(session) = session_object_mut(ensure_sessions_array_mut(&mut state)?, id) else {
             return Ok(HandoffAcceptOutcome::NotFound);
@@ -164,6 +189,7 @@ impl SessionStore {
         }
         let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         if raw_session_object(&state, session_id).is_some_and(|session| {
             json_text(session.get("provider")).as_deref() == Some("opencode")
@@ -272,6 +298,7 @@ impl SessionStore {
     pub fn claim_handoff_start(&self, session_id: &str) -> Result<Option<SuccessorPlan>> {
         let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -315,6 +342,7 @@ impl SessionStore {
     ) -> Result<Option<SuccessorPlan>> {
         let _submission = self.lock_opencode_submission(session_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let snapshot = snapshot_from_raw_value(&state)?;
         let Some(existing) = snapshot
@@ -374,6 +402,7 @@ impl SessionStore {
     ) -> Result<()> {
         let _submission = self.lock_opencode_submission(predecessor_id)?;
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[predecessor_id, successor_id])?;
         let mut state = self.load_raw_json_value()?;
         let successor =
             raw_session_object(&state, successor_id).context("handoff successor disappeared")?;
@@ -406,6 +435,7 @@ impl SessionStore {
     /// told and keeps its work.
     pub fn fail_handoff(&self, session_id: &str, error: &str) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[session_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -442,6 +472,15 @@ impl SessionStore {
     /// repeat: each change is `where <field> = predecessor`.
     pub fn transfer_handoff_json(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {
         let _guard = self.write_guard()?;
+        let affected = self.cold_reference_ids(&REPOINTED_SESSION_FIELDS, predecessor_id)?;
+        self.thaw_locked(&_guard, |record| {
+            (record["id"]
+                .as_str()
+                .is_some_and(|id| affected.contains(id))
+                && names_predecessor(record, predecessor_id))
+                || [predecessor_id, successor_id]
+                    .contains(&record["id"].as_str().unwrap_or_default())
+        })?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(predecessor) = session_object_mut(sessions, predecessor_id) else {
@@ -504,13 +543,9 @@ impl SessionStore {
             if json_text(session.get("id")).as_deref() == Some(successor_id) {
                 continue;
             }
-            replace_text_field(session, "parent_session_id", predecessor_id, successor_id);
-            replace_text_field(
-                session,
-                "context_monitor_notify",
-                predecessor_id,
-                successor_id,
-            );
+            for field in REPOINTED_SESSION_FIELDS {
+                replace_text_field(session, field, predecessor_id, successor_id);
+            }
         }
         // Registered roles.
         repoint_array_entries(
@@ -630,6 +665,7 @@ impl SessionStore {
             return Ok(());
         };
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[predecessor_id, target_session_id])?;
         let mut state = self.load_raw_json_value()?;
         if raw_session_object(&state, target_session_id).is_none() {
             return Ok(());
@@ -674,6 +710,7 @@ impl SessionStore {
         let moved = queue.hand_off_messages(predecessor_id, successor_id)?;
         if moved > 0 {
             let _guard = self.write_guard()?;
+            self.thaw_lineage_locked(&_guard, &[predecessor_id, successor_id])?;
             let mut state = self.load_raw_json_value()?;
             self.drain_after_handoff_raw(&mut state, successor_id, None)?;
             self.write_raw_json_value(&state)?;
@@ -751,6 +788,7 @@ impl SessionStore {
             )?;
         }
         let _guard = self.write_guard()?;
+        self.thaw_lineage_locked(&_guard, &[predecessor_id])?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         if let Some(session) = session_object_mut(sessions, predecessor_id) {

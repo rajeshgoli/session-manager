@@ -195,7 +195,7 @@ impl SessionStore {
                 ensure_session_not_reparent_fenced(&state, parent)?;
             }
             let mut record = self.build_core_session_record(
-                &sessions_with_registered_aliases(&state),
+                &sessions_with_registered_aliases(&self.load_parsed_state()?.raw),
                 &request,
                 log_dir.as_deref(),
                 true,
@@ -219,7 +219,7 @@ impl SessionStore {
             let launch = opencode_launch_record(
                 &record,
                 &request,
-                generate_unique_runtime_launch_id(&launches)?,
+                self.allocate_runtime_launch_id(&launches)?,
                 "create",
             );
             launches.push(launch.clone());
@@ -263,6 +263,7 @@ impl SessionStore {
         let driver = self.opencode_driver()?;
         let (original, expected_authority) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let Some(original) = self.get_session(id)? else {
                 return Ok(None);
             };
@@ -288,6 +289,7 @@ impl SessionStore {
         };
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let state = self.load_parsed_state()?;
             ensure_session_not_reparent_fenced(&state.raw, id)?;
             if raw_session_object(&state.raw, id).is_some_and(|r| {
@@ -318,6 +320,7 @@ impl SessionStore {
         let credential = generate_session_credential();
         let (record, launch) = {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[id])?;
             let mut state = self.load_raw_json_value()?;
             ensure_session_not_reparent_fenced(&state, id)?;
             // Retirement does not take the clear lock. Its terminal write
@@ -334,13 +337,12 @@ impl SessionStore {
             if record.provider_resume_id.as_deref() != Some(&conversation) {
                 anyhow::bail!("conversation changed during restore")
             }
+            let naming_sessions = sessions_with_registered_aliases(&self.load_parsed_state()?.raw);
             let new_name = record
                 .friendly_name
                 .as_deref()
                 .or(Some(record.name.as_str()))
-                .and_then(|name| {
-                    restored_name(&sessions_with_registered_aliases(&state), id, name)
-                });
+                .and_then(|name| restored_name(&naming_sessions, id, name));
             let mut renamed = serde_json::to_value(&record)?;
             apply_restored_name(
                 renamed.as_object_mut().context("invalid restore session")?,
@@ -367,7 +369,7 @@ impl SessionStore {
             let mut launch = opencode_launch_record(
                 &record,
                 &request,
-                generate_unique_runtime_launch_id(&launches)?,
+                self.allocate_runtime_launch_id(&launches)?,
                 "restore",
             );
             launch.opencode_restore_terminal_metadata =
@@ -473,6 +475,7 @@ impl SessionStore {
         let _submission_guard = self.lock_opencode_submission(&record.id)?;
         {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[&record.id])?;
             let state = self.load_parsed_state()?;
             let current = session_runtime_launch_records(&state.raw)?
                 .into_iter()
@@ -537,6 +540,7 @@ impl SessionStore {
             }
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[&record.id])?;
         let mut state = self.load_raw_json_value()?;
         let mut launches = session_runtime_launch_records(&state)?;
         let current = launches
@@ -603,6 +607,7 @@ impl SessionStore {
         reason: &str,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[&record.id])?;
         let mut state = self.load_raw_json_value()?;
         if let Err(error) = stopped {
             let mut launches = session_runtime_launch_records(&state)?;
@@ -759,6 +764,7 @@ impl SessionStore {
             return Ok(());
         }
         let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[id])?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, id)?;
         if session_runtime_launch_records(&state)?
@@ -822,6 +828,7 @@ impl SessionStore {
             .for_socket_name(launch.tmux_socket_name.as_deref());
         let Some(record) = self.get_session(&launch.session_id)? else {
             let _guard = self.write_guard()?;
+            self.thaw_ids_locked(&_guard, &[&launch.session_id])?;
             let mut state = self.load_raw_json_value()?;
             mark_runtime_launch_failed(
                 &mut state,
