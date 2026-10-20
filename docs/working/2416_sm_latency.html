@@ -267,7 +267,7 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>Revisions 2 to 4</b> close eleven gaps that three rounds of adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
+<p><b>Revisions 2 to 5</b> close twelve gaps that four rounds of adversarial review found in the specs for T2 and T3. None changes the plan, the order or the targets. These are the ones you would notice:</p>
 <ul>
 <li><b>Rollback stays safe.</b> The first move of old sessions into the cold segment happens only after a restart's handover is final, and after an hour of serving. If a deploy of T3 rolls back during the restart, the old binary finds every session where it expects them.</li>
 <li><b>Manual rollback past T3 needs one command.</b> Rolling back by hand to a build without T3, after the first move, would hide old sessions from that build until someone runs <code>sm-server thaw-cold</code>. T3 adds that command and documents it.</li>
@@ -547,7 +547,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
   <li>a thaw writes hot, then cold.</li>
   </ul>
   At every crash point a record is therefore in at least one file. The hot state file keeps its existing write (no fsync) for ordinary changes; only writes that move records use the durable sequence.</li>
-<li><b>Test, crash points.</b> Inject a failure after each of the four steps of each of the two writes, for both a sweep and a thaw. The thaw case uses the <code>A, X, Y</code> layout above, and the sweep case moves two adjacent records with one hot record between them and a third. After a restart, assert two things: every record is visible exactly once in the merged view, and the merged order equals the pre-operation order.</li>
+<li><b>Test, crash points.</b> Inject a failure after each of the four steps of each of the two writes, for both a sweep and a thaw. The thaw case uses the <code>A, X, Y</code> layout above and continues through a following sweep that re-colds <code>X</code>; the order stays <code>A, X, Y</code> with one <code>X</code>, and the sweep case moves two adjacent records with one hot record between them and a third. After a restart, assert two things: every record is visible exactly once in the merged view, and the merged order equals the pre-operation order.</li>
 <li><b>Reads.</b> The cold file is read at startup and whenever its stamp changes.</li>
 <li><b>Duplicates take the hot content at the cold position.</b> A session id present in both files is merged as follows:
   <ul>
@@ -589,7 +589,7 @@ printf "load: "; uptime | sed 's/.*averages: //'</code></pre>
 <li><b>Order of steps.</b> Under <code>write_guard</code>:
   <ol>
   <li>Compute the eligible set.</li>
-  <li>Write the cold file with those records appended.</li>
+  <li>Rebuild the cold file instead of appending to it. It holds every record that is cold after this sweep, which means the already-cold records plus the newly eligible ones. Each record appears exactly once, carries the content its merged-view copy has, follows the pre-sweep merged order, and has its anchor recomputed. A duplicate left by a crashed thaw therefore collapses back to one entry in its original position.</li>
   <li>Write the hot file without them.</li>
   </ol>
   A crash between the two writes leaves duplicates, which D.1 resolves.</li>
