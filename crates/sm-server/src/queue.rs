@@ -2741,9 +2741,20 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn pending_target_session_ids(&self) -> Result<Vec<String>> {
+        self.pending_target_session_ids_filtered(None)
+    }
+
     pub fn pending_target_session_ids_by_category(
         &self,
         message_category: &str,
+    ) -> Result<Vec<String>> {
+        self.pending_target_session_ids_filtered(Some(message_category))
+    }
+
+    fn pending_target_session_ids_filtered(
+        &self,
+        message_category: Option<&str>,
     ) -> Result<Vec<String>> {
         self.with_connection(|conn| {
             let mut statement = conn.prepare(
@@ -2751,7 +2762,7 @@ impl RetainedQueueStore {
                 SELECT target_session_id
                 FROM message_queue
                 WHERE delivered_at IS NULL
-                    AND message_category = ?1
+                    AND (?1 IS NULL OR message_category = ?1)
                     AND trim(target_session_id) != ''
                 GROUP BY target_session_id
                 ORDER BY MIN(queued_at), target_session_id
