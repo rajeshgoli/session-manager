@@ -927,7 +927,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        let result = std::process::Command::new(executable)
+        let result = std::process::Command::new(&executable)
             .arg(fixture.service.endpoint())
             .args(fixture.service.peer_token().0.map(|word| word.to_string()))
             .output()
@@ -937,6 +937,46 @@ mod tests {
             "stdout: {}\nstderr: {}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
+        );
+        // Hold all workers on complete, idle leases. The next request is
+        // closed before dispatch; the native client must report RESET and
+        // must never connect to the requested host listener.
+        let lease = fixture
+            .service
+            .state
+            .pool
+            .bind(IpVersion::V4, 0, false)
+            .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut stream = client(&fixture.service);
+            let (reply, _) = exchange(
+                &mut stream,
+                Request::Retain {
+                    ip: IpVersion::V4,
+                    port: lease.port(),
+                },
+            );
+            assert_eq!(reply.errno, 0);
+            clients.push(stream);
+        }
+        let sentinel = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sentinel.set_nonblocking(true).unwrap();
+        let result = std::process::Command::new(&executable)
+            .arg(fixture.service.endpoint())
+            .args(fixture.service.peer_token().0.map(|word| word.to_string()))
+            .arg("saturated")
+            .arg(sentinel.local_addr().unwrap().port().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            sentinel.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
     }
 

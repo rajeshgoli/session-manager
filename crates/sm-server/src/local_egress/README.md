@@ -96,8 +96,17 @@ restores the host launch bindings before normal admission of the pending jobs.
 
 All six jobs must finish successfully. Their connections must be logged under
 their submitting agents, with exactly one tunnel per job and correct byte counts.
-The sandbox must return a permission denial for direct public egress, the direct
-sm listener, the other agent's gateway/proxy ports, and gateway-secret reads.
+The sandbox must return a permission denial for direct public egress and
+gateway-secret reads. Connections to the direct sm listener and the other
+agent's gateway/proxy ports must fail with permission denied or connection
+reset. Those loopback requests use the private socket broker, which only dials
+listeners allocated to the requesting agent. A broker close before its reply
+(for example at its worker limit) surfaces as `ECONNRESET` in the native wire
+client, even though no TCP connection to the requested port is attempted.
+`local_sockets::service::tests::native_wire_client_uses_real_service_and_checks_kernel_identity`
+forces that limit and verifies the reset, absent socket transfer, descriptor
+cleanup, and absence of a connection at a live host listener. The same test
+requires `EACCES` for a normally dispatched forbidden connection.
 Gateway input carries forged identity, stamp, session, and credential headers.
 The stored requester and durable wall identity must still match the listener.
 

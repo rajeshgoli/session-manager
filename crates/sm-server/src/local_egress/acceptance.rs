@@ -42,6 +42,11 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
     let gateway = gateway::Gateway::open(&service_dir).unwrap();
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
+    // Keep the listener reserved across server replacement. Rebinding after
+    // abort races other tests allocating ephemeral ports in the same process.
+    let upstream = upstream.into_std().unwrap();
+    let restarted_upstream = upstream.try_clone().unwrap();
+    let upstream = TcpListener::from_std(upstream).unwrap();
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut proxy = Proxy::new(&service_dir).unwrap();
     proxy.resolver = Arc::new(PublicResolver);
@@ -230,7 +235,7 @@ async fn two_agents_gateway_queue_restart_and_egress_attribution() {
     // pending database rows. Gateway listeners and registrations remain stable.
     server.abort();
     let _ = server.await;
-    let upstream = TcpListener::bind(upstream_addr).await.unwrap();
+    let upstream = TcpListener::from_std(restarted_upstream).unwrap();
     server = tokio::spawn(
         axum::serve(
             upstream,

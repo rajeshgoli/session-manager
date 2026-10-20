@@ -18,13 +18,24 @@ static unsigned descriptor_count(void) {
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 10 || argc == 11);
+    assert(argc == 10 || argc == 11 || argc == 12);
     struct wall_configuration configuration = { .endpoint = argv[1] };
     for (int i = 0; i < 8; ++i) {
         char *end = NULL;
         unsigned long token = strtoul(argv[i + 2], &end, 10);
         assert(end && !*end && token <= UINT32_MAX);
         configuration.peer_token[i] = (uint32_t)token;
+    }
+    if (argc == 12) {
+        assert(!strcmp(argv[10], "saturated"));
+        unsigned before = descriptor_count();
+        struct wall_socket rejected;
+        assert(wall_connect(&configuration, 1, (uint16_t)atoi(argv[11]), &rejected) == -1);
+        assert(errno == ECONNRESET);
+        assert(rejected.descriptor == -1 && rejected.control == -1);
+        assert(descriptor_count() == before);
+        puts("saturated broker resets without supplying a socket");
+        return 0;
     }
     if (argc == 11) {
         assert(!strcmp(argv[10], "malformed"));
@@ -46,6 +57,7 @@ int main(int argc, char **argv) {
     assert(rejected.descriptor == -1 && rejected.control == -1);
     assert(wall_bind(&configuration, 3, 0, 0, &rejected) == -1 && errno == EINVAL);
     assert(wall_bind(&configuration, 1, 8420, 0, &rejected) == -1 && errno == EACCES);
+    assert(wall_connect(&configuration, 1, 8420, &rejected) == -1 && errno == EACCES);
     assert(rejected.descriptor == -1 && rejected.control == -1);
     for (uint8_t family = 1; family <= 2; ++family) {
         assert(wall_retain(&configuration, family, 24000, &rejected) == -1 && errno == EACCES);
