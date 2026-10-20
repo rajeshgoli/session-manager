@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True
 import wall_profile as wall
@@ -60,6 +61,15 @@ def prepare(args):
                         str(scripts / "native" / source), "-o", str(executables / name)], check=True)
     subprocess.run(["rustc", str(scripts / "native/test_exec.rs"),
                     "-o", str(executables / "rust-application")], check=True)
+    # Complete macOS first-launch loader work before the production adapter's
+    # two-second acknowledgement deadline. The probe has no inherited listener;
+    # actual inheritance still runs under the unchanged production wall.
+    startup = time.monotonic()
+    probe_environment = dict(os.environ)
+    probe_environment.pop("DYLD_INSERT_LIBRARIES", None)
+    subprocess.run([str(executables / "rust-application"), "--startup-probe"],
+                   env=probe_environment, check=True)
+    print(f"Rust fixture first launch: {time.monotonic() - startup:.3f}s", file=sys.stderr)
     profile_args = wall.parser().parse_args([
         "--home", str(home), "--checkout", str(checkout), "--state-root", str(home / "s"),
         "--state-dir", str(state), "--tmp-dir", tmp,

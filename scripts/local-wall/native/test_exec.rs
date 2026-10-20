@@ -3,6 +3,11 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::{FromRawFd, RawFd};
 
 fn main() {
+    // The host can finish first-launch loader work before the timed adapter
+    // handshake. This mode uses no descriptors and performs no socket calls.
+    if std::env::args().nth(1).as_deref() == Some("--startup-probe") {
+        return;
+    }
     let descriptor: RawFd = std::env::args().nth(1).unwrap().parse().unwrap();
     // SAFETY: the fixture passes ownership of its inherited listener.
     let original = unsafe { TcpListener::from_raw_fd(descriptor) };

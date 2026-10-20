@@ -1125,6 +1125,18 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&rust_compiled.stderr)
         );
+        // A newly linked Rust image can spend more than the production two-second
+        // recovery deadline in the macOS loader, before adapter initialization.
+        // Finish that first launch without socket authority; the real inherited
+        // listener test below still uses the unchanged sandbox and handshake.
+        let startup = std::time::Instant::now();
+        let probe = std::process::Command::new(&rust_application)
+            .arg("--startup-probe")
+            .env_remove("DYLD_INSERT_LIBRARIES")
+            .output()
+            .unwrap();
+        eprintln!("Rust fixture first launch: {:?}", startup.elapsed());
+        assert!(probe.status.success(), "{probe:?}");
         let control_result = std::process::Command::new(&executable)
             .arg("raw-control")
             .env_remove("DYLD_INSERT_LIBRARIES")
