@@ -280,7 +280,8 @@ fn the_earlier_turn_answers_even_when_its_stop_arrives_later() {
 
 #[test]
 fn two_sends_before_one_turn_get_one_answer() {
-    let store = store_with_notes(&[now_plus(1), now_plus(2)]);
+    let latest_sent = now_plus(2);
+    let store = store_with_notes(&[now_plus(1), latest_sent]);
     store
         .record_turn(
             "s1",
@@ -292,7 +293,7 @@ fn two_sends_before_one_turn_get_one_answer() {
         .unwrap();
     let replies = store.thread_replies().unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].input_at, stamp(now_plus(2)));
+    assert_eq!(replies[0].input_at, stamp(latest_sent));
 }
 
 #[test]
