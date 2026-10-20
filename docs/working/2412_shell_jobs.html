@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2412 — Adopt heavy agent commands into the queue</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+
+<h1>2412 — Adopt heavy agent commands into the queue instead of killing them</h1>
+<p class="sans"><small>Author: sm-2412 <code>cbf8008e</code> · Ticket #2412 · 2026-10-19</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend that sm stop killing an agent's command the moment it passes 1 GB.</b> Instead, sm adopts the command into the queue as a running <i>shell job</i>. sm sets memory aside for it and stops it only if the Mac actually runs short of memory. The process-tree watch that makes this possible also shows, for every provider, what an idle agent has left running in the background.</p>
+
+<p>Today's rule costs more than it saves. The guard killed 121 agent commands in the last 10 days, about 12 a day. Most were <code>rustc</code> or <code>pytest</code> at 1.1–2.3 GB, and the largest was 17 GB. Over the last 7 days the Mac had at least 100 GB free 95% of the time, and less than 20 GB free 0.04% of the time. Each kill costs an agent a wake, a re-read of the notice, and a resubmit. It protects against a risk that the host memory guard, which already stops queue jobs when memory runs short, handles better.</p>
+
+<dl class="vocab">
+<dt>Queue job</dt><dd>Work submitted with <code>sm queue run</code>. sm starts it when its type has a free slot and the Mac has the memory, and wakes the agent when it ends.</dd>
+<dt>Shell job (new)</dt><dd>A command an agent started from its own shell that sm took over as a queue job after it passed 1 GB. It is already running, so it never waits and takes no slot. It shows in the Queue screen and in <code>sm queue list</code> with type <code>shell</code>.</dd>
+<dt>Reservation</dt><dd>The memory sm sets aside for a shell job when it adopts it: 10 GB or 5 GB (decision 2). It decides which job stops first when memory runs short. It is not a tripwire.</dd>
+<dt>Memory reserve</dt><dd>Existing rule: sm keeps at least 8 GB free, rising to a quarter of the Mac's memory (64 GB) while macOS reports memory pressure. The <i>host memory guard</i> stops queue jobs one at a time, largest first, while free memory is below the reserve.</dd>
+<dt>Headroom</dt><dd>Free memory, minus the memory reserve, minus what running queue jobs have reserved but not yet used.</dd>
+<dt>Background job (new)</dt><dd>A command an agent left running after its turn ended, such as a watcher (<code>until grep -q Ready dev.log</code>) or a dev server. sm reads it from the agent's process tree.</dd>
+</dl>
+
+<figure>
+<svg viewBox="0 0 860 330" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#52514e"/></marker></defs>
+  <g stroke="#52514e" fill="none" marker-end="url(#a)">
+    <path d="M170,60 H222"/><path d="M402,60 H452"/><path d="M312,92 V160"/><path d="M632,60 H690"/>
+    <path d="M542,92 V160"/><path d="M542,212 V258"/><path d="M632,186 H690"/>
+  </g>
+  <rect x="10" y="30" width="160" height="60" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="90" y="55" text-anchor="middle" font-weight="600">Agent's command</text><text x="90" y="72" text-anchor="middle" font-size="11" fill="#52514e">passes 1 GB</text>
+  <rect x="222" y="30" width="180" height="60" rx="8" fill="#fcfcfb" stroke="#2a78d6"/>
+  <text x="312" y="52" text-anchor="middle" font-weight="600">Headroom?</text><text x="312" y="68" text-anchor="middle" font-size="11" fill="#52514e">≥100 GB → reserve 10 GB</text><text x="312" y="82" text-anchor="middle" font-size="11" fill="#52514e">≥20 GB → reserve 5 GB</text>
+  <rect x="452" y="30" width="180" height="60" rx="8" fill="#fcfcfb" stroke="#008300"/>
+  <text x="542" y="55" text-anchor="middle" font-weight="600" fill="#008300">Shell job, running</text><text x="542" y="72" text-anchor="middle" font-size="11" fill="#52514e">agent hears nothing</text>
+  <rect x="690" y="30" width="160" height="60" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="770" y="55" text-anchor="middle" font-weight="600">Command ends</text><text x="770" y="72" text-anchor="middle" font-size="11" fill="#52514e">row shows "ended"</text>
+  <rect x="222" y="160" width="180" height="52" rx="8" fill="#fcfcfb" stroke="#e34948"/>
+  <text x="312" y="182" text-anchor="middle" font-weight="600" fill="#e34948">Under 20 GB</text><text x="312" y="198" text-anchor="middle" font-size="11" fill="#52514e">stopped now, as today</text>
+  <rect x="452" y="160" width="180" height="52" rx="8" fill="#fcfcfb" stroke="#eb6834"/>
+  <text x="542" y="182" text-anchor="middle" font-weight="600" fill="#eb6834">Mac short of memory</text><text x="542" y="198" text-anchor="middle" font-size="11" fill="#52514e">host memory guard picks a job</text>
+  <rect x="690" y="160" width="160" height="52" rx="8" fill="#fcfcfb" stroke="#8a8880"/>
+  <text x="770" y="182" text-anchor="middle" font-weight="600">Owner taps Stop</text><text x="770" y="198" text-anchor="middle" font-size="11" fill="#52514e">in app or web</text>
+  <rect x="402" y="258" width="280" height="62" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="542" y="280" text-anchor="middle" font-weight="600">Stop order</text>
+  <text x="542" y="296" text-anchor="middle" font-size="11" fill="#52514e">1 shell jobs over their reservation, largest first</text>
+  <text x="542" y="311" text-anchor="middle" font-size="11" fill="#52514e">2 owner-forced runs  3 every other job, largest first</text>
+  <path d="M770,212 V289 H682" stroke="#52514e" fill="none" marker-end="url(#a)" stroke-dasharray="3 3"/>
+  <text x="776" y="250" font-size="11" fill="#52514e">agent gets one message</text>
+  <path d="M312,212 V289 H402" stroke="#52514e" fill="none" marker-end="url(#a)" stroke-dasharray="3 3"/>
+  <text x="196" y="250" font-size="11" fill="#52514e">agent gets one message</text>
+</svg>
+<figcaption>Figure 1. Life of a heavy command. An agent hears from sm only when its command is stopped, and that message contains the exact command to resubmit (Figure 4).</figcaption>
+</figure>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Kill or adopt at 1 GB?</td><td><b>Adopt.</b> The whole command the agent ran, such as <code>cargo test --workspace</code> with every <code>rustc</code> under it, becomes one shell job. The 1 GB trigger stays the same.</td><td>The Mac nearly always has room, and the agent's work goes on unharmed.</td></tr>
+<tr><td>2. How much to reserve?</td><td><b>10 GB when headroom is at least 100 GB, 5 GB when it is at least 20 GB.</b> Under 20 GB, sm stops the command as it does today. Headroom subtracts what running queue jobs have reserved but not used, so ten adoptions in a burst cannot each count the same free memory.</td><td>Your proposed numbers. Counting unused reservations is the "projection from other queue items".</td></tr>
+<tr><td>3. What does the reservation do?</td><td><b>It sets the stop order. It is not a limit.</b> sm stops a shell job only when the host memory guard needs memory back. Shell jobs over their reservation go first, so a job that declared its memory honestly through <code>sm queue run</code> outlives one that did not.</td><td>A hard stop at 5 GB would just move today's cliff from 1 GB to 5 GB.</td></tr>
+<tr><td>4. What does the agent see?</td><td><b>Nothing when sm adopts.</b> One message if sm stops the command, with a ready-to-paste <code>sm queue run</code> line sized from the command's peak (Figure 4). <code>sm queue list</code> shows the agent's shell jobs.</td><td>No wake and no tokens spent on the 99.9% case. The rare stop gives the agent everything it needs to resubmit.</td></tr>
+<tr><td>5. Do shell jobs use queue slots?</td><td><b>No. There is no limit on how many, they never wait, and sm sends no completion wake.</b> They end as <i>ended</i>, not <i>succeeded</i> or <i>failed</i>, because the exit code goes to the agent's own shell.</td><td>They are found after they start. The agent already sees the command finish.</td></tr>
+<tr><td>6. Can you stop one?</td><td><b>Yes, with the Stop button the job sheet already has.</b> The agent gets the stop message, which says you stopped it.</td><td>Same control as every other job, so nothing new to learn.</td></tr>
+<tr><td>7. Background jobs</td><td><b>sm reads them from the process tree for Claude, Codex and opencode alike, and shows them on idle agents (Figure 3).</b> No Stop button in this ticket. A background job that passes 1 GB becomes a shell job and appears in the Queue.</td><td>It works for every provider and shows <i>what</i> is running. Today only Claude's footer is read, and it gives a count.</td></tr>
+</tbody>
+</table>
+
+<h3>Works the same for Claude, Codex and local agents</h3>
+<p>I started a Codex agent and a local agent, had each run <code>sleep 180</code>, and read their process trees. All three providers run a command as a child process of the agent program, so one rule covers them: <b>the command is the child of the agent program, together with everything under it.</b> They differ in what wraps the command and in what else the agent program keeps running. The table shows those differences.</p>
+<table>
+<thead><tr><th style="width:16%">Agent</th><th>Where the command runs</th><th style="width:34%">Other children that are not commands</th></tr></thead>
+<tbody>
+<tr><td>Claude</td><td><code>claude → zsh -c …eval '&lt;command&gt;'</code>. sm reads the label from inside the wrapper.</td><td><code>caffeinate</code> while working; MCP servers started with the agent</td></tr>
+<tr><td>Codex</td><td><code>codex-fork → &lt;command&gt;</code> directly, or under <code>zsh -lc</code></td><td><code>cua-repl</code>, <code>node_repl</code>, <code>codex-code-mode-host</code></td></tr>
+<tr><td>Local agent</td><td><code>opencode serve → &lt;command&gt;</code>, inside the agent's sandbox, in the session's second tmux window ("serve")</td><td>None seen; the model judge and supervisor sit beside <code>opencode serve</code>, not under it</td></tr>
+</tbody>
+</table>
+<p>The table forces two fixes. First, sm must watch <i>every</i> window of a session. Today it maps each session to one pane, so it sees a local agent's commands only by accident of listing order. Second, the agent's own helpers must never be shown as background jobs. sm ignores children that started within 10 seconds of the agent program, which covers MCP servers and startup helpers, plus a built-in list of known helpers: the Codex three above and <code>caffeinate</code>. The 1 GB adoption still applies to helpers. A helper that large should be visible.</p>
+
+<h3>What you see on the phone</h3>
+<figure>
+<svg viewBox="0 0 660 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <g>
+    <rect x="4" y="4" width="310" height="420" rx="22" fill="#09090d" stroke="#3b3b49"/>
+    <text x="22" y="38" font-size="17" font-weight="600" fill="#f5f7fa">Queue</text><text x="22" y="54" font-size="10" fill="#777c8b">Updated 3s ago</text>
+    <rect x="18" y="66" width="282" height="40" rx="8" fill="#121219"/>
+    <text x="28" y="84" font-size="11" fill="#adb2c2">Memory 118 G used of 256 G · CPU 41%</text>
+    <rect x="28" y="92" width="262" height="4" rx="2" fill="#1e1e28"/><rect x="28" y="92" width="121" height="4" rx="2" fill="#5ee7ff"/>
+    <text x="22" y="124" font-size="10.5" fill="#adb2c2">Slots 2/4 · tests 1/2 · perf 0/1 · background 1/2 · shell 2</text>
+    <text x="22" y="150" font-size="10" fill="#777c8b" letter-spacing=".08em">RUNNING</text>
+    <text x="22" y="172" font-weight="600" fill="#f5f7fa">sm-tests</text><text x="82" y="172" fill="#adb2c2"> · sm-2398</text>
+    <text x="22" y="188" font-size="10.5" fill="#adb2c2">tests · 4m of 15m · 6G · cpu 22%</text>
+    <rect x="22" y="194" width="276" height="3" fill="#1e1e28"/><rect x="22" y="194" width="74" height="3" fill="#5ee7ff"/>
+    <line x1="18" y1="206" x2="300" y2="206" stroke="#2b2b37"/>
+    <text x="22" y="226" font-weight="600" fill="#f5f7fa">cargo build -p sm-server</text><text x="186" y="226" fill="#adb2c2"> · far-2236</text>
+    <text x="22" y="242" font-size="10.5" fill="#adb2c2">shell · 3m · 3G of 10G reserved</text>
+    <rect x="22" y="248" width="276" height="3" fill="#1e1e28"/><rect x="22" y="248" width="83" height="3" fill="#4ade80"/>
+    <line x1="18" y1="260" x2="300" y2="260" stroke="#2b2b37"/>
+    <text x="22" y="280" font-weight="600" fill="#f5f7fa">python markets.py --replay</text><text x="196" y="280" fill="#adb2c2"> · far-1955</text>
+    <text x="22" y="296" font-size="10.5" fill="#adb2c2">shell · 22m · <tspan fill="#fbbf24">7G of 5G reserved</tspan></text>
+    <text x="22" y="311" font-size="10.5" fill="#fbbf24">Over its reservation · stops first if memory runs short</text>
+    <rect x="22" y="317" width="276" height="3" fill="#1e1e28"/><rect x="22" y="317" width="276" height="3" fill="#fbbf24"/>
+    <line x1="18" y1="328" x2="300" y2="328" stroke="#2b2b37"/>
+    <text x="22" y="354" font-size="10" fill="#777c8b" letter-spacing=".08em">QUEUED · IN START ORDER</text>
+    <text x="22" y="376" fill="#5ee7ff" font-weight="700">1</text><text x="40" y="376" font-weight="600" fill="#f5f7fa">bench-fill</text><text x="108" y="376" fill="#adb2c2"> · far-2221</text>
+    <text x="40" y="392" font-size="10.5" fill="#adb2c2">perf · waiting 1m · Tests ahead</text>
+    <text x="159" y="416" text-anchor="middle" font-size="11" fill="#adb2c2">2 · Queue screen</text>
+  </g>
+  <g transform="translate(338,0)">
+    <rect x="4" y="4" width="310" height="420" rx="22" fill="#09090d" stroke="#3b3b49"/>
+    <rect x="4" y="150" width="310" height="274" rx="18" fill="#181820"/>
+    <rect x="139" y="160" width="40" height="4" rx="2" fill="#3b3b49"/>
+    <text x="22" y="190" font-size="15" font-weight="600" fill="#f5f7fa">python markets.py --replay</text>
+    <text x="22" y="208" font-size="10.5" fill="#adb2c2">shell · running · far-1955</text>
+    <text x="22" y="236" font-size="10" fill="#777c8b" letter-spacing=".08em">HOW IT GOT HERE</text>
+    <text x="22" y="254" font-size="11" fill="#f5f7fa">far-1955 started this from its own shell. At</text>
+    <text x="22" y="269" font-size="11" fill="#f5f7fa">14:02 it passed 1 GB and sm took it into the</text>
+    <text x="22" y="284" font-size="11" fill="#f5f7fa">queue with 5 GB set aside.</text>
+    <text x="22" y="310" font-size="10" fill="#777c8b" letter-spacing=".08em">MEMORY</text>
+    <text x="22" y="328" font-size="11" fill="#f5f7fa">7.1 G now · peak 7.4 G · 5 G reserved</text>
+    <text x="22" y="343" font-size="11" fill="#adb2c2">Mac: 138 G free · 8 G kept in reserve</text>
+    <text x="22" y="369" font-size="10" fill="#777c8b" letter-spacing=".08em">COMMAND</text>
+    <text x="22" y="386" font-size="10.5" font-family="SF Mono,Menlo,monospace" fill="#adb2c2">cd ~/projects/fractal-algo-rust/training</text>
+    <rect x="216" y="372" width="82" height="28" rx="14" fill="none" stroke="#fb7185"/><text x="257" y="390" text-anchor="middle" fill="#fb7185">Stop</text>
+    <text x="159" y="416" text-anchor="middle" font-size="11" fill="#adb2c2">2b · Shell job sheet</text>
+  </g>
+</svg>
+<figcaption>Figure 2. Shell jobs sit in Running beside queued work. Where a queued job shows elapsed time against its time limit, a shell job shows memory against its reservation: green under it, amber over it, and an amber note that it stops first. The slots line counts shell jobs without a maximum. The web Queue page gains a sixth tile, "Shell · 2 running", and the same row and sheet.</figcaption>
+</figure>
+
+<figure>
+<svg viewBox="0 0 660 330" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,sans-serif" font-size="12">
+  <g>
+    <rect x="4" y="4" width="310" height="320" rx="22" fill="#09090d" stroke="#3b3b49"/>
+    <text x="22" y="38" font-size="17" font-weight="600" fill="#f5f7fa">Watch</text>
+    <text x="22" y="66" font-size="10" fill="#777c8b" letter-spacing=".08em">IDLE</text>
+    <text x="22" y="88" font-weight="600" fill="#f5f7fa">far-1955</text>
+    <text x="22" y="104" font-size="10.5" fill="#adb2c2">Replay the October tape</text>
+    <text x="22" y="120" font-size="10.5" fill="#adb2c2">#1955 · ○ Idle 12m · <tspan fill="#5ee7ff">◷ Watching: until grep -q Ready…</tspan></text>
+    <line x1="18" y1="132" x2="300" y2="132" stroke="#2b2b37"/>
+    <text x="22" y="154" font-weight="600" fill="#f5f7fa">kubla-h3</text>
+    <text x="22" y="170" font-size="10.5" fill="#adb2c2">Fix the board clock</text>
+    <text x="22" y="186" font-size="10.5" fill="#adb2c2">#2398 · ○ Idle 40m · <tspan fill="#5ee7ff">◷ 2 in background</tspan></text>
+    <line x1="18" y1="198" x2="300" y2="198" stroke="#2b2b37"/>
+    <text x="22" y="220" font-weight="600" fill="#f5f7fa">far-2232-h6</text>
+    <text x="22" y="236" font-size="10.5" fill="#adb2c2">Iteration 11 base run</text>
+    <text x="22" y="252" font-size="10.5" fill="#adb2c2">#2232 · ○ Idle 1h 4m · No jobs</text>
+    <text x="159" y="314" text-anchor="middle" font-size="11" fill="#adb2c2">3 · Watch list</text>
+  </g>
+  <g transform="translate(338,0)">
+    <rect x="4" y="4" width="310" height="320" rx="22" fill="#09090d" stroke="#3b3b49"/>
+    <text x="22" y="38" font-size="15" font-weight="600" fill="#f5f7fa">kubla-h3</text>
+    <text x="22" y="56" font-size="10.5" fill="#adb2c2">#2398 · ○ Idle 40m</text>
+    <text x="22" y="86" font-size="10" fill="#777c8b" letter-spacing=".08em">RUNNING IN THE BACKGROUND</text>
+    <text x="22" y="108" font-size="11" font-family="SF Mono,Menlo,monospace" fill="#f5f7fa">npm run dev</text>
+    <text x="22" y="123" font-size="10.5" fill="#adb2c2">started 2h 10m ago · 410 M</text>
+    <line x1="18" y1="134" x2="300" y2="134" stroke="#2b2b37"/>
+    <text x="22" y="154" font-size="11" font-family="SF Mono,Menlo,monospace" fill="#f5f7fa">tail -f /tmp/replay.log | grep…</text>
+    <text x="22" y="169" font-size="10.5" fill="#adb2c2">started 41m ago · 3 M</text>
+    <line x1="18" y1="180" x2="300" y2="180" stroke="#2b2b37"/>
+    <text x="22" y="206" font-size="10" fill="#777c8b" letter-spacing=".08em">JOBS</text>
+    <text x="22" y="226" font-size="11" fill="#adb2c2">No queue jobs</text>
+    <text x="159" y="314" text-anchor="middle" font-size="11" fill="#adb2c2">3b · Agent card</text>
+  </g>
+</svg>
+<figcaption>Figure 3. An idle agent with something still running says what it is. One background job shows its command on the row. More than one shows a count, and the agent card lists each with its age and memory. The agent stays "Idle": the turn is over, and the cyan note says the agent left something running rather than waiting on you. The detail label "bg-wait" becomes "background". The web Agents page shows the same note and list.</figcaption>
+</figure>
+
+<h3>What the agent sees</h3>
+<p>Adoption is silent: the command keeps running and the agent's shell reports its result as usual. If sm stops the command, the agent gets one message, delivered once it is idle:</p>
+<figure>
+<pre>[sm queue] At 14:31:07 UTC sm stopped `python markets.py --replay` (PID 41822 and 3 child
+processes), which you started from your shell at 14:02. The Mac ran short of memory (6.1 GB
+free; it keeps 8 GB in reserve), and this command was using 7.4 GB, above the 5 GB sm had
+set aside for it. Rerun it through the queue so it waits for memory instead of being stopped:
+
+  sm queue run --type background --label markets-replay --memory 12G -- python markets.py --replay</pre>
+<figcaption>Figure 4. The stop message. <code>--memory</code> is 1.5 times the peak, rounded up to a whole GB. <code>--type</code> is <code>tests</code> when the command runs a test runner and <code>background</code> otherwise. If you pressed Stop, the second sentence reads "Rajesh stopped it from the Queue screen." If the Mac had under 20 GB of headroom when the command passed 1 GB, the message says so in place of the second sentence.</figcaption>
+</figure>
+
+<h3>Risks</h3>
+<ul>
+<li><b>A runaway shell job grows faster than the guard can act.</b> The 2026-10-08 incident climbed 260 GB in six minutes. The host memory guard checks every second and stops the job that is over its reservation first, so a runaway goes before anything well-behaved. That is the same protection queued jobs have today.</li>
+<li><b>A command that backgrounds itself and exits its shell</b> (<code>nohup … &amp;</code>, then the shell returns) leaves the agent's process tree. sm cannot see it, either today or after this change. This ticket leaves that unchanged.</li>
+<li><b>A server restart while shell jobs run.</b> sm records each job's process identity. After a restart it keeps jobs whose process is still the same one and ends the rest.</li>
+</ul>
+
+<h3>Scope and delivery</h3>
+<p>One ticket and one PR: server, <code>sm</code> CLI, web, and Android. After it merges I restart the server and rebuild the app. I will check it live on all three providers. A Claude agent, a Codex agent and a local agent each run a 2 GB allocation, which should appear as a shell job and finish untouched. Each agent also leaves a watcher running, which should show on its row. You can repeat both from any agent.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>First revision.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<div class="toc">
+<div><a href="#A">A. Adoption</a></div>
+<div><a href="#B">B. Persisted shape</a></div>
+<div><a href="#C">C. Running, ending, stopping</a></div>
+<div><a href="#D">D. Host memory guard order</a></div>
+<div><a href="#E">E. Background jobs</a></div>
+<div><a href="#F">F. Surfaces</a></div>
+<div><a href="#G">G. Tests</a></div>
+<div><a href="#Z">Z. FAQ</a></div>
+</div>
+
+<h3 id="A">A. Adoption</h3>
+<p>The agent memory guard (<code>crates/sm-server/src/agent_memory_guard.rs</code>) keeps its 2-second pass, its trigger (<code>queue_runner.memory.agent_process_max_bytes</code>, 1 GiB), its harness and exempt lists, and its tree walk from each live session's tmux pane. What changes is the response to a victim.</p>
+<ol>
+<li><b>Panes.</b> <code>live_agent_panes</code> returns every pane of each session's tmux session (<code>list-panes -a -F '#{session_name} #{pane_pid}'</code>, keeping all pids per name rather than the last). A local agent therefore contributes both its <code>agent</code> window (<code>launch-attach.sh → opencode attach</code>) and its <code>serve</code> window (<code>launch-serve.sh → owner → supervisor → opencode serve</code>).</li>
+<li><b>Command root.</b> For an over-limit process <i>P</i> in a pane's tree, the root <i>R</i> is the ancestor of <i>P</i> (or <i>P</i> itself) whose parent is a harness process (basename <code>claude</code>, <code>codex</code>, <code>codex-fork</code> or <code>opencode</code>, wherever it sits in the tree) or, if there is no harness above <i>P</i>, the pane process. Examples, all observed live on 2026-10-19:
+  <ul>
+  <li>Claude: <code>claude → zsh -c …eval 'cargo test' → cargo → rustc</code>, where <code>rustc</code> passes 1 GiB, gives <i>R</i> = the <code>zsh</code>.</li>
+  <li>Codex: <code>codex-fork → cargo → rustc</code> gives <i>R</i> = <code>cargo</code>. Codex runs single commands without a wrapper shell.</li>
+  <li>Local agent: <code>… supervisor → opencode serve → pytest</code> gives <i>R</i> = <code>pytest</code>. <code>opencode attach</code> in the other window is also a harness, but no commands run under it.</li>
+  </ul>
+  The job covers <i>R</i> and every descendant. The harness's own children that are helpers (E) are still roots for adoption, so a 1 GiB helper becomes a visible shell job and is not killed silently.</li>
+<li><b>Already adopted.</b> If <i>R</i>'s PID and process identity match a running shell job, nothing happens. The guard never adopts or kills inside an adopted tree.</li>
+<li><b>Headroom.</b> <code>available − effective_memory_reserve_bytes(memory_min_free_bytes) − Σ max(0, memory_bytes − current_bytes)</code>, summed over running queue jobs that have <code>memory_bytes</code>. <code>available</code> comes from <code>host_memory_capacity()</code>, and <code>current_bytes</code> is the job's latest sampled memory (0 if unknown). If host memory cannot be read, the guard does not adopt and stops the command as today.</li>
+<li><b>Reservation.</b> Headroom ≥ 100 GiB gives 10 GiB. Headroom ≥ 20 GiB gives 5 GiB. Anything lower gives no adoption: the guard stops <i>R</i>'s tree, records the kill in <code>agent_process_kills</code> as today, and sends the no-headroom form of the stop message. The constants are <code>SHELL_JOB_RESERVATION_TIERS = [(100 GiB, 10 GiB), (20 GiB, 5 GiB)]</code>.
+  <br>Worked example: 256 GiB Mac, 140 GiB available, reserve 8 GiB, one perf job reserving 40 GiB and using 15 GiB. Headroom = 140 − 8 − 25 = 107 GiB, so the reservation is 10 GiB. A second adoption a moment later counts this job's 10 GiB as unused (it uses about 1 GiB), so it sees 98 GiB and reserves 5 GiB.</li>
+<li><b>Label.</b> The label comes from <i>R</i>'s arguments. For <code>zsh|bash|sh -c &lt;script&gt;</code> where the script contains <code>eval '&lt;cmd&gt;'</code> (Claude's wrapper), the label is <i>cmd</i> with <code>'\''</code> unescaped. For <code>-c</code> or <code>-lc &lt;cmd&gt;</code> (Codex, opencode), it is <i>cmd</i>. Otherwise it is <i>R</i>'s full arguments. Trailing <code>&lt; /dev/null</code> and <code>&amp;&amp; pwd -P &gt;| …</code> are dropped. Whitespace is collapsed and the label is cut to 120 characters with "…". The full text goes in <code>argv</code> as a single element.</li>
+</ol>
+
+<h3 id="B">B. Persisted shape</h3>
+<p>A shell job is a row in <code>queue_jobs</code> (<code>queue_runner.db</code>). It is inserted directly, not through submit:</p>
+<table>
+<thead><tr><th>Column</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>type</code></td><td><code>shell</code></td></tr>
+<tr><td><code>state</code> / <code>holding_reason</code></td><td><code>running</code> / NULL, then terminal (C)</td></tr>
+<tr><td><code>label</code>, <code>argv</code></td><td>Appendix A step 6</td></tr>
+<tr><td><code>requester_session_id</code>, <code>notify_session_id</code></td><td>The pane's session id</td></tr>
+<tr><td><code>cwd</code></td><td><i>R</i>'s working directory (<code>proc_pidinfo</code> vnode path on macOS, <code>/proc/&lt;pid&gt;/cwd</code> on Linux), else empty</td></tr>
+<tr><td><code>queued_at</code>, <code>started_at</code></td><td>Adoption time. The shell job's age counts from <i>R</i>'s process start time, which <code>termination_detail_json.process_started_at</code> carries.</td></tr>
+<tr><td><code>pid</code></td><td><i>R</i></td></tr>
+<tr><td><code>process_group_id</code></td><td><i>R</i>'s process group when it equals <i>R</i> and differs from the harness's group (true for Claude), else NULL</td></tr>
+<tr><td><code>memory_bytes</code></td><td>The reservation</td></tr>
+<tr><td><code>timeout_seconds</code>, <code>max_wait_seconds</code></td><td>0, 0</td></tr>
+<tr><td><code>wrapper_path</code>, <code>log_path</code>, <code>exit_code_path</code>, <code>script_path</code></td><td>NULL</td></tr>
+<tr><td><code>completion_notified_at</code></td><td>Set at adoption, so completion retry never wakes anyone</td></tr>
+<tr><td>new column <code>process_identity TEXT</code></td><td>The kernel identity of <i>R</i> (<code>process_identity()</code>, serialized)</td></tr>
+<tr><td><code>termination_detail_json</code></td><td>At adoption: <code>{"adopted": {"trigger_pid", "trigger_bytes", "headroom_bytes", "process_started_at"}}</code>. At stop, it gains the memory guard trip fields (D).</td></tr>
+</tbody>
+</table>
+<p>The per-type admission code must never see <code>shell</code>: it is not in <code>QUEUE_JOB_TYPE_ORDER</code>, it is never <code>pending</code>, and <code>running_queue_job_count(jobs, None)</code> leaves it out, so shell jobs never fill <code>max_running_jobs</code>. Submit (<code>queue_job_default_timeout_seconds</code>) keeps rejecting <code>--type shell</code>, so agents cannot submit one.</p>
+
+<h3 id="C">C. Running, ending, stopping</h3>
+<ul>
+<li><b>Tracking.</b> On each 2-second pass, the guard checks every running shell job. If <i>R</i> is gone, or its identity no longer matches, the job finishes as state <code>ended</code>, exit code NULL, with no message. The same check runs once at server start, before the first pass. That is the restart recovery: queue recovery (<code>recover_running_queue_job_conn</code>) skips <code>shell</code> rows.</li>
+<li><b>Usage.</b> The guard sums footprint over <i>R</i>'s subtree each pass and stores the latest value and the peak in memory, keyed by job id. The latest value is what <code>current_bytes</code> in A means. <code>/client/queue</code> reads this as the job's <code>usage.memory_bytes</code>, and the utilization recorder samples it like other running jobs.</li>
+<li><b>Stopping.</b> Any stop (host memory guard, owner Stop or <code>sm queue cancel</code>) signals <i>R</i>'s whole tree by PID, the way the guard's <code>stop_processes</code> does: SIGTERM, then SIGKILL after the job's stop grace, with identity checks against PID reuse. It never signals the process group, which may be shared. The terminal state is <code>memory_exceeded</code> for the host guard and <code>cancelled</code> for an owner or agent cancel. Each sends the stop message (Figure 4) through the message queue with category <code>queue-completion</code>, so it waits for the agent to be idle.</li>
+<li><b>Stop message.</b> It names the stop time in UTC, the command, its PID and descendant count, and the start time. Then one cause sentence (host pressure with free and reserve figures, owner Stop, agent's own cancel, or no headroom at adoption). Then the resubmit line: <code>sm queue run --type &lt;tests|background&gt; --label &lt;slug&gt; --memory &lt;ceil(1.5 × peak) GB&gt; -- &lt;label command&gt;</code>. It adds <code>--cwd &lt;cwd&gt;</code> when the cwd is known and differs from the session's working directory. <code>tests</code> is chosen when the command contains <code>test</code>, <code>pytest</code>, <code>nextest</code> or <code>jest</code> as a word. The slug is the first two words of the command, lowercased and joined with <code>-</code>.</li>
+</ul>
+
+<h3 id="D">D. Host memory guard order</h3>
+<p><code>host_pressure_victim</code> orders candidates as follows. First, shell jobs whose current bytes exceed their reservation. Then owner-forced runs. Then everything else. Ties break by size, largest first. The 512 MiB floor stays. A shell job's resident size comes from C's usage map, not the process-group listing. The stop goes through C's PID-tree stop when <code>type = shell</code>.</p>
+
+<h3 id="E">E. Background jobs</h3>
+<ul>
+<li><b>Definition.</b> A command root (A step 2) that is not a helper, found while the session's activity state is not <code>working</code> or <code>thinking</code>. A root is a helper when any of these holds:
+  <ul>
+  <li>It started no more than 10 seconds after its harness process started. This covers MCP servers and the Codex REPL helpers, which start with the agent.</li>
+  <li>Its basename is in the built-in list <code>caffeinate</code>, <code>codex-code-mode-host</code>, <code>node_repl</code>.</li>
+  <li>Its arguments contain <code>cua-repl</code>.</li>
+  <li>Its basename is in the new config list <code>queue_runner.memory.background_ignore_commands</code> (default empty).</li>
+  </ul>
+  The rule is the same for every provider. Example: an idle Codex agent with <code>cua-repl</code>, <code>node_repl</code> and <code>npm run dev</code> under <code>codex-fork</code> shows one background job, <code>npm run dev</code>.</li>
+<li><b>Snapshot.</b> The guard pass publishes <code>{session_id → [{pid, command, started_at, memory_bytes, shell_job_id?}]}</code> to an in-memory map. It is not persisted. <code>command</code> is the label rule from A step 6. <code>shell_job_id</code> is set when the root is also a shell job. Arguments are read once per (pid, identity) and cached.</li>
+<li><b>Activity.</b> An agent whose turn has stopped and whose snapshot is non-empty reports <code>activity_state = "waiting"</code>, as Claude does today from its footer. The process tree is now the source for every provider, and the Claude footer reading stays as a fallback when no snapshot exists.</li>
+<li><b>Facts.</b> <code>facts.jobs</code> in <code>http/watch.rs</code>: when there are no queue jobs and the snapshot has one entry, the text is <code>"◷ Watching: &lt;command, cut to 40&gt;"</code>. With two or more, it is <code>"◷ N in background"</code>. Both use the new tone <code>"background"</code>, which the app and web render in cyan. Queue jobs, including shell jobs, keep their existing text, with the background count appended as <code>" · N in background"</code>.</li>
+<li><b>API.</b> <code>GET /client/sessions</code> and <code>/client/sessions/{id}</code> carry <code>background_jobs</code>: the snapshot list, or an empty list.</li>
+</ul>
+
+<h3 id="F">F. Surfaces</h3>
+<table>
+<thead><tr><th style="width:22%">Surface</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>/client/queue</code></td><td>Shell jobs are listed under <code>running</code> with <code>usage</code>, and under <code>ended</code> when stopped. <code>slots.by_type.shell = {running, max: null}</code>. The holding object for a shell job carries <code>summary</code> "Over its reservation · stops first if memory runs short" when over, and <code>detail</code> "far-1955 started this from its own shell. At 14:02 it passed 1 GB and sm took it into the queue with 5 GB set aside." The server computes this text and both clients render it.</td></tr>
+<tr><td>Android Queue (<code>QueueScreen.kt</code>, <code>QueueModels.kt</code>)</td><td><code>runningLine</code> for shell: <code>shell · &lt;age&gt; · &lt;use&gt;G of &lt;reserved&gt;G reserved</code>. The progress bar shows use over reservation, Emerald when at or under it and Amber over it (capped at full). The amber reason line comes from <code>holding.summary</code>. <code>slotsLine</code> appends <code>shell N</code> when N &gt; 0 and adds the missing <code>review</code>. The sheet shows "How it got here", "Memory" (now, peak, reserved, Mac free and reserve) and "Command" sections, plus the existing Stop button.</td></tr>
+<tr><td>Android Watch (<code>WatchModels.kt</code>, <code>WatchScreen.kt</code>)</td><td><code>jobsToneColor("background")</code> = Cyan. <code>activityLabel("waiting")</code> = "background". <code>AgentWorkSections</code> gains a "Running in the background" list above Jobs: command in monospace, then "started &lt;age&gt; ago · &lt;memory&gt;".</td></tr>
+<tr><td>Web (<code>web/queue.js</code>, <code>queue.css</code>, <code>web/agents.js</code>)</td><td>Sixth tile "Shell" (count, no maximum). The CSS grid becomes 6 columns, wrapping to 3 under 720 px. In the job row, the memory bar replaces the time bar for shell jobs, and the panel matches the Android sheet with no log tab (shell jobs have no log). The Agents page gets the cyan tone and the background list in the agent panel.</td></tr>
+<tr><td><code>sm queue list</code> (<code>bin/sm.rs</code>)</td><td>Shell rows appear in the normal table with type <code>shell</code>, state <code>running</code> or <code>ended</code>, and Holding "5G reserved, using 7G". <code>--type shell</code> becomes a valid filter. The kills table remains for no-headroom stops.</td></tr>
+<tr><td>Utilization (<code>utilization.rs</code>)</td><td><code>job_samples</code> records shell jobs (job_type <code>shell</code>). The host per-type columns are unchanged.</td></tr>
+<tr><td>web-demo</td><td>Fixtures need no change. The demo shows no shell jobs until it is next regenerated.</td></tr>
+</tbody>
+</table>
+
+<h3 id="G">G. Tests</h3>
+<ul>
+<li>Command-root resolution: rustc under cargo under zsh under claude gives the zsh. A process directly under the pane is its own root.</li>
+<li>Headroom tiers at 100, 99.9, 20 and 19.9 GiB, unused-reservation subtraction (the worked example in A), and unreadable host memory leading to a stop.</li>
+<li>Label extraction from the Claude wrapper (including <code>'\''</code>), from <code>bash -lc</code>, and from plain arguments.</li>
+<li>No re-adoption of an adopted root, and no kill inside an adopted tree.</li>
+<li>Ending on root exit and on identity mismatch, plus restart recovery keeping a live identity and ending a stale one.</li>
+<li><code>host_pressure_victim</code> order: over-reservation shell before owner-forced before larger normal.</li>
+<li>Stop message for each of the four causes, including the computed <code>--memory</code> and <code>--type</code>.</li>
+<li>Admission: shell jobs do not count toward <code>max_running_jobs</code>, and submitting <code>--type shell</code> is rejected.</li>
+<li>Facts text for zero, one and two background jobs, with and without queue jobs.</li>
+<li>Android unit tests for <code>runningLine</code>, <code>slotsLine</code> and the progress colour for shell jobs.</li>
+</ul>
+
+<h3 id="Z">Z. FAQ</h3>
+<p><b>Why not grow the reservation when a shell job exceeds it?</b> The reservation affects only the stop order and later headroom. Growing it would protect a misbehaving job against honest ones, which reverses decision 3.</p>
+<p><b>Why not count shell reservations in perf admission?</b> Perf admission already measures live free memory against the reserve. An unused shell reservation is memory a perf run may borrow, and if both grow, the host guard stops the shell job first when it is over its reservation.</p>
+<p><b>Why not a separate table?</b> As <code>queue_jobs</code> rows, shell jobs inherit the Queue screen, <code>sm queue list</code>, cancel, utilization sampling and the host guard with no new read path.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
