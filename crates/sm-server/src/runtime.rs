@@ -3188,10 +3188,22 @@ fn managed_session_command(
 }
 
 fn is_codex_directory_trust_prompt(pane: &str) -> bool {
-    pane.contains("Do you trust the contents of this directory?")
+    let legacy = pane.contains("Do you trust the contents of this directory?")
         && pane.contains("Yes, continue")
         && pane.contains("No, quit")
-        && pane.contains("Press enter to continue")
+        && pane.contains("Press enter to continue");
+    // Codex 0.160 uses a folder-access picker. Only submit when its trust
+    // option is highlighted: Enter must never choose restricted access or quit.
+    let folder_access = pane.contains("Trust this folder?")
+        && pane
+            .lines()
+            .any(|line| line.trim() == "› 1. Trust and continue")
+        && (pane.contains("Press Enter to continue")
+            || pane.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("enter continue") && line.contains("esc")
+            }));
+    legacy || folder_access
 }
 
 fn initial_stdin_prompt<'a>(spec: &'a TmuxSessionSpec, prompt_mode: &str) -> Option<&'a str> {
@@ -4201,46 +4213,72 @@ esac
 
     #[test]
     fn codex_directory_trust_prompt_is_accepted_without_matching_incidental_text() {
-        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
-        fs::write(
-            &tmux_binary,
-            format!(
-                r#"#!/bin/sh
+        let legacy = "> You are in /repo\nDo you trust the contents of this directory?\n1. Yes, continue\n2. No, quit\nPress enter to continue\n";
+        let folder_access = include_str!("../tests/fixtures/codex_0160_directory_trust.txt");
+        for pane in [legacy, folder_access] {
+            let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+            fs::write(
+                &tmux_binary,
+                format!(
+                    r#"#!/bin/sh
 printf '%s\n' "$*" >> "{}"
 case "$1" in
   has-session) exit 0 ;;
   capture-pane)
-    printf '%s\n' '> You are in /repo' \
-      'Do you trust the contents of this directory?' \
-      '1. Yes, continue' '2. No, quit' 'Press enter to continue'
+    cat <<'PANE'
+{pane}
+PANE
     exit 0
     ;;
   *) exit 0 ;;
 esac
 "#,
-                log_path.display(),
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&tmux_binary, permissions).unwrap();
-        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
-        runtime.tmux_binary = tmux_binary.display().to_string();
+                    log_path.display(),
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmux_binary, permissions).unwrap();
+            let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+            runtime.tmux_binary = tmux_binary.display().to_string();
 
-        assert!(runtime
-            .accept_codex_directory_trust_prompt("sm-test")
-            .unwrap());
-        assert!(fs::read_to_string(&log_path)
-            .unwrap()
-            .contains("send-keys -t sm-test Enter"));
+            assert!(runtime
+                .accept_codex_directory_trust_prompt("sm-test")
+                .unwrap());
+            assert!(fs::read_to_string(&log_path)
+                .unwrap()
+                .contains("send-keys -t sm-test Enter"));
+        }
     }
 
     #[test]
     fn incidental_trust_text_does_not_submit_input() {
-        assert!(!is_codex_directory_trust_prompt(
-            "The docs ask: Do you trust the contents of this directory?"
-        ));
+        for pane in [
+            "The docs ask: Do you trust the contents of this directory?",
+            "The docs ask: Trust this folder? Trust and continue / Open restricted",
+        ] {
+            assert!(!is_codex_directory_trust_prompt(pane));
+        }
+    }
+
+    #[test]
+    fn codex_folder_trust_requires_selected_trust_option_and_confirmation_hint() {
+        let pane = include_str!("../tests/fixtures/codex_0160_directory_trust.txt");
+        assert!(is_codex_directory_trust_prompt(pane));
+        assert!(is_codex_directory_trust_prompt(&pane.replace(
+            "enter continue · esc quit",
+            "Press Enter to continue."
+        )));
+        for changed in [
+            pane.replace("› 1. Trust and continue", "  1. Trust and continue")
+                .replace("  2. Quit", "› 2. Quit"),
+            pane.replace("Trust and continue", "Open restricted"),
+            pane.replace("enter continue · esc quit", ""),
+            pane.replace("Trust this folder?", ""),
+        ] {
+            assert!(!is_codex_directory_trust_prompt(&changed));
+        }
     }
 
     #[test]
