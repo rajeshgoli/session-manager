@@ -302,6 +302,7 @@ fun InboxScreen(
                     openRow = next?.takeIf { inboxThreadTarget(it) == null }
                 },
                 onMessage = { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() },
+                onOpenThread = { openThread = it },
             )
         }
 

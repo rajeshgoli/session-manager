@@ -451,3 +451,75 @@ fn artifact_service_blockers_need_owner_until_handled_without_a_session() {
         OwnerMessageState::Read
     );
 }
+
+#[test]
+fn alert_assignment_marks_handled_refuses_a_second_and_follows_a_handoff() {
+    let (store, dir) = store();
+    let alert = created(
+        store
+            .create_once(
+                new_message("sm-artifacts", false),
+                Some("pressure_pending:7:1"),
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        store
+            .delivery_keys()
+            .unwrap()
+            .get(&alert.id)
+            .map(String::as_str),
+        Some("pressure_pending:7:1")
+    );
+    let handled = store.assign(&alert.id, "agent001").unwrap().unwrap();
+    assert_eq!(handled.handled_via.as_deref(), Some("agent"));
+    assert!(handled.handled_at.is_some());
+    assert!(store.assign(&alert.id, "agent002").is_err());
+    store.hand_off_assignments("agent001", "succ0001").unwrap();
+    assert_eq!(
+        store
+            .assignments()
+            .unwrap()
+            .get(&alert.id)
+            .map(String::as_str),
+        Some("succ0001")
+    );
+    // A cleared condition is recorded as such, not as the owner's Done.
+    let second = created(
+        store
+            .create_once(
+                new_message("sm-artifacts", false),
+                Some("pressure_pending:7:2"),
+            )
+            .unwrap(),
+    );
+    // The owner's Done does not stop a cleared alert being recorded as cleared.
+    store.mark_handled_via(&second.id, "inbox").unwrap();
+    let third = created(
+        store
+            .create_once(
+                new_message("sm-artifacts", false),
+                Some("pressure_pending:7:3"),
+            )
+            .unwrap(),
+    );
+    store
+        .clear_keyed(
+            "sm-artifacts",
+            "pressure_pending:7:",
+            "superseded",
+            Some("pressure_pending:7:3"),
+        )
+        .unwrap();
+    let via = |id: &str| store.get(id).unwrap().unwrap().handled_via;
+    assert_eq!(via(&alert.id).as_deref(), Some("agent"));
+    assert_eq!(via(&second.id).as_deref(), Some("superseded"));
+    assert_eq!(via(&third.id), None);
+    store
+        .clear_keyed("sm-artifacts", "pressure_pending:7:", "resolved", None)
+        .unwrap();
+    assert_eq!(via(&alert.id).as_deref(), Some("agent"));
+    assert_eq!(via(&second.id).as_deref(), Some("resolved"));
+    assert_eq!(via(&third.id).as_deref(), Some("resolved"));
+    let _ = fs::remove_dir_all(dir);
+}

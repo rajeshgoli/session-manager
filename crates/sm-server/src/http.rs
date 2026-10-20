@@ -2286,6 +2286,10 @@ pub fn router(state: AppState) -> Router {
             "/inbox/thread/{key}/send",
             post(inbox::work_threads::post_thread_send),
         )
+        .route(
+            "/inbox/alerts/{message_id}/assign",
+            post(inbox::alerts::post_assign),
+        )
         .route("/inbox/agent/{session_id}", get(inbox::get_agent_thread))
         .route(
             "/inbox/agent/{session_id}/send",

@@ -6,6 +6,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -25,6 +29,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -71,6 +81,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.InboxSendRequest
+import li.rajeshgo.sm.data.model.AlertAgent
+import li.rajeshgo.sm.data.model.AssignChoices
 import li.rajeshgo.sm.data.model.DocAskRequest
 import li.rajeshgo.sm.data.model.DocAskTarget
 import li.rajeshgo.sm.data.model.InboxThread
@@ -86,6 +98,8 @@ import li.rajeshgo.sm.ui.queue.shortDuration
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
 import li.rajeshgo.sm.ui.theme.Cyan
+import li.rajeshgo.sm.ui.theme.Emerald
+import li.rajeshgo.sm.ui.theme.InkBlack
 import li.rajeshgo.sm.ui.theme.CyanDeep
 import li.rajeshgo.sm.ui.theme.Fuchsia
 import li.rajeshgo.sm.ui.theme.Panel
@@ -242,6 +256,11 @@ class ThreadViewModel(application: Application) : AndroidViewModel(application) 
         write(onResult) { url, token -> repository.markInboxDone(url, token, key) }
     }
 
+    /** Assign to agent (sm#2414): starts an agent for the alert; [onResult] gets the failure's text, or null. */
+    fun assign(messageId: String, agentType: String?, onResult: (String?) -> Unit) {
+        write(onResult) { url, token -> repository.assignAlert(url, token, messageId, agentType) }
+    }
+
     fun archive(unarchive: Boolean, onResult: (String?) -> Unit) {
         val thread = _uiState.value.thread ?: return
         write(onResult) { url, token -> repository.archiveInbox(url, token, thread.threadKey, unarchive) }
@@ -281,6 +300,7 @@ fun ThreadScreen(
     onOpenTerminal: (String) -> Unit,
     onDone: () -> Unit,
     onMessage: (String) -> Unit,
+    onOpenThread: ((ThreadTarget) -> Unit)? = null,
 ) {
     li.rajeshgo.sm.ui.navigation.ScreenName("inbox/thread")
     val viewModel: ThreadViewModel = viewModel(key = "thread:${target.key ?: target.sessionId}")
@@ -298,6 +318,8 @@ fun ThreadScreen(
     var attempted by rememberSaveable(target) { mutableStateOf<String?>(null) }
     var recipient by rememberSaveable(target) { mutableStateOf<String?>(null) }
     var quote by rememberSaveable(target) { mutableStateOf(target.quote) }
+    // The alert whose Assign to agent sheet is open.
+    var assigning by rememberSaveable(target) { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val thread = state.thread
     val now = remember(thread) { OffsetDateTime.now() }
@@ -374,7 +396,16 @@ fun ThreadScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         itemsIndexed(thread.items, key = { index, item -> item.id ?: "${item.kind}-$index-${item.at}" }) { _, item ->
-                            ThreadItem(item, now) { path -> reader = ReaderPage(title = item.text.orEmpty(), subtitle = thread.title, path = path) }
+                            ThreadItem(
+                                item,
+                                now,
+                                onAssign = { assigning = it },
+                                onOpenAgent = { agent ->
+                                    val open = onOpenThread
+                                    if (open != null) open(ThreadTarget(null, agent.id, agent.name))
+                                    else reader = ReaderPage(title = agent.name, subtitle = thread.title, path = agent.threadPath)
+                                },
+                            ) { path -> reader = ReaderPage(title = item.text.orEmpty(), subtitle = thread.title, path = path) }
                         }
                     }
                 }
@@ -414,6 +445,22 @@ fun ThreadScreen(
         }
     }
 
+    val choices = thread?.assign
+    val alert = assigning?.let { id -> thread?.items?.firstOrNull { it.id == id && it.alert?.action == "assign" } }
+    if (choices != null && alert != null) {
+        AssignSheet(
+            alertTitle = alert.title.orEmpty(),
+            choices = choices,
+            busy = state.busy,
+            onClose = { assigning = null },
+            onStart = { type ->
+                viewModel.assign(alert.id.orEmpty(), type) { error ->
+                    if (error == null) assigning = null else onMessage(error)
+                }
+            },
+        )
+    }
+
     reader?.let { page ->
         key(page) {
             DocReaderOverlay(
@@ -431,7 +478,13 @@ private fun itemAge(at: String, now: OffsetDateTime): String =
     secondsBetween(at, now)?.let { shortDuration(it) + " ago" }.orEmpty()
 
 @Composable
-private fun ThreadItem(item: InboxThreadItem, now: OffsetDateTime, onOpenLink: (String) -> Unit) {
+private fun ThreadItem(
+    item: InboxThreadItem,
+    now: OffsetDateTime,
+    onAssign: (String) -> Unit,
+    onOpenAgent: (AlertAgent) -> Unit,
+    onOpenLink: (String) -> Unit,
+) {
     if (item.type == "doc_revision") {
         Bubble(color = Panel, border = Border, edge = Fuchsia) {
             Text(item.text ?: "Document revision", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
@@ -496,7 +549,118 @@ private fun ThreadItem(item: InboxThreadItem, now: OffsetDateTime, onOpenLink: (
                 Text(item.title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             }
             if (markdown.isNotBlank()) MarkdownText(markdown)
-            Meta(listOfNotNull(item.sender?.name, itemAge(item.at, now), item.state).filter { it.isNotBlank() }.joinToString(" · "))
+            val alert = item.alert
+            val agent = alert?.agent?.takeIf { alert.action == "assigned" }
+            val meta = listOfNotNull(item.sender?.name, itemAge(item.at, now), item.state.takeIf { agent == null })
+                .filter { it.isNotBlank() }.joinToString(" · ")
+            when {
+                agent != null -> AlertFooter(meta) { OwnerPill(agent) { onOpenAgent(agent) } }
+                alert?.action == "assign" && item.id != null -> AlertFooter(meta) { AssignChip { onAssign(item.id) } }
+                else -> Meta(meta)
+            }
+        }
+    }
+}
+
+/** An sm alert's last line: when it came, and what you can do with it. */
+@Composable
+private fun AlertFooter(meta: String, action: @Composable () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(meta, color = TextMuted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f).padding(end = 8.dp))
+        action()
+    }
+}
+
+@Composable
+private fun AssignChip(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = CyanDeep.copy(alpha = 0.7f),
+        shape = RoundedCornerShape(50),
+        border = BorderStroke(1.dp, Cyan.copy(alpha = 0.35f)),
+    ) {
+        Row(
+            Modifier.defaultMinSize(minHeight = 36.dp).padding(start = 11.dp, end = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Rounded.AutoAwesome, contentDescription = null, tint = Cyan, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Assign to agent", color = Cyan, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+/** Who has the alert: a live dot while the agent works, grey once it ends. */
+@Composable
+private fun OwnerPill(agent: AlertAgent, onClick: () -> Unit) {
+    Surface(onClick = onClick, color = PanelMuted, shape = RoundedCornerShape(50)) {
+        Row(
+            Modifier.defaultMinSize(minHeight = 34.dp).padding(start = 11.dp, end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.size(14.dp).background(if (agent.live) Emerald.copy(alpha = 0.18f) else Color.Transparent, RoundedCornerShape(50)),
+                contentAlignment = Alignment.Center,
+            ) { Box(Modifier.size(8.dp).background(if (agent.live) Emerald else TextMuted, RoundedCornerShape(50))) }
+            Spacer(Modifier.width(7.dp))
+            Text(
+                "${agent.name} ${if (agent.live) "is on it" else "worked on it"}",
+                color = if (agent.live) MaterialTheme.colorScheme.onSurface else TextSecondary,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(" ›", color = TextMuted, style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
+
+/**
+ * Assign to agent (sm#2414): the agent types from Settings › New agents with the
+ * default chosen, where the agent will work, and one Start.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+private fun AssignSheet(alertTitle: String, choices: AssignChoices, busy: Boolean, onClose: () -> Unit, onStart: (String?) -> Unit) {
+    var chosen by rememberSaveable { mutableStateOf(choices.default ?: choices.types.firstOrNull()?.name) }
+    ModalBottomSheet(onDismissRequest = { if (!busy) onClose() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Hand this to a new agent", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                if (alertTitle.isNotBlank()) Text(alertTitle, color = TextSecondary, style = MaterialTheme.typography.bodyMedium)
+            }
+            if (choices.types.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                choices.types.forEach { type ->
+                    val on = type.name == chosen
+                    Surface(
+                        onClick = { chosen = type.name },
+                        enabled = !busy,
+                        color = if (on) CyanDeep else Panel,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, if (on) Cyan else Border),
+                    ) {
+                        Column(Modifier.defaultMinSize(minWidth = 104.dp).padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            Text(type.name, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                            Text(type.detail, color = TextMuted, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+                }
+            }
+            Text(
+                "It starts in ${choices.repo ?: "the artifacts repo"} with this alert as its brief, fixes what it can, and messages you what it found.",
+                color = TextSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Button(
+                onClick = { onStart(chosen) },
+                enabled = !busy,
+                colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = InkBlack),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+            ) {
+                if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = InkBlack)
+                else Text("Start agent", fontWeight = FontWeight.Bold)
+            }
         }
     }
 }
@@ -550,7 +714,11 @@ private fun ReplyBox(
             val chosen = recipient ?: (if (askTarget != null) askTarget.default else defaultReplyOptionId(thread))
             val target = choices.firstOrNull { it.first == chosen }?.second ?: thread.replyTo?.name
             if (choices.isEmpty() && (askTarget == null && !thread.canSend)) {
-                Text("No agent is left to reply to.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    if (thread.items.any { it.sender?.id == "sm-artifacts" }) "sm alerts take no replies." else "No agent is left to reply to.",
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 return@Column
             }
             var menuOpen by remember { mutableStateOf(false) }

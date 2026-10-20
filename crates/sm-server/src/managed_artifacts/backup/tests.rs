@@ -684,14 +684,24 @@ fn expired_request_retries_delta_and_alerts_recover_after_confirmation() {
     // The fixture's configured device is backup-mini; recovery is per device.
     crate::managed_artifacts::store::set_meta(&conn, "backup_missed:mini", "1").unwrap();
     l::acknowledge(&f.manager, "mini", &next.id, &ack).unwrap();
+    // Held deletions need the owner; a failed check is agent work (sm#2414).
     assert_eq!(
         conn.query_row(
-            "SELECT COUNT(*) FROM backup_alerts WHERE blocking=1",
+            "SELECT title FROM backup_alerts WHERE blocking=1",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "Backup deletions need confirmation"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM backup_alerts WHERE blocking=0 AND title='Backup integrity check failed'",
             [],
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        2
+        1
     );
     assert_eq!(
         conn.query_row(

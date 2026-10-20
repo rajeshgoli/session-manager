@@ -290,6 +290,13 @@ interface ApiService {
         @Body request: li.rajeshgo.sm.data.model.InboxSendRequest,
     ): kotlinx.serialization.json.JsonObject
 
+    /** Starts an agent for an sm alert (sm#2414). */
+    @POST("inbox/alerts/{message_id}/assign")
+    suspend fun assignAlert(
+        @Path("message_id") messageId: String,
+        @Body request: li.rajeshgo.sm.data.model.AssignAlertRequest,
+    ): li.rajeshgo.sm.data.model.AssignAlertResponse
+
     @POST("inbox/done")
     suspend fun markInboxDone(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
 

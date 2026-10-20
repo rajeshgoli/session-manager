@@ -122,6 +122,69 @@
     });
   }
 
+  // Assign to agent on an sm alert (sm#2414): one sheet at a time opens
+  // under its alert; Start hands the alert to a new agent and the button
+  // becomes the agent it went to.
+  var sheetTemplate = document.getElementById('assign-sheet');
+  var openSheet = null;
+  function closeSheet() {
+    if (!openSheet) return;
+    openSheet.button.hidden = false;
+    openSheet.el.remove();
+    openSheet = null;
+  }
+  function ownerPill(res) {
+    var a = document.createElement('a');
+    a.className = 'owner';
+    a.href = res.thread_path;
+    var dot = document.createElement('span');
+    dot.className = 'dot';
+    var chev = document.createElement('span');
+    chev.className = 'chev';
+    chev.textContent = '›';
+    a.appendChild(dot);
+    a.appendChild(document.createTextNode((res.name || 'An agent') + ' is on it'));
+    a.appendChild(chev);
+    return a;
+  }
+  if (sheetTemplate) Array.prototype.forEach.call(document.querySelectorAll('button.assign'), function (b) {
+    b.addEventListener('click', function () {
+      closeSheet();
+      var el = sheetTemplate.content.firstElementChild.cloneNode(true);
+      var start = el.querySelector('button.start');
+      var cancel = el.querySelector('button.cancel');
+      var note = el.querySelector('.msg');
+      openSheet = { el: el, button: b };
+      b.hidden = true;
+      b.closest('.b').appendChild(el);
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      start.focus();
+      cancel.addEventListener('click', closeSheet);
+      el.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeSheet(); });
+      start.addEventListener('click', function () {
+        var chosen = el.querySelector('input[name="agent-type"]:checked');
+        start.disabled = true;
+        cancel.disabled = true;
+        start.textContent = 'Starting…';
+        note.textContent = '';
+        api('/inbox/alerts/' + encodeURIComponent(b.getAttribute('data-assign')) + '/assign',
+          chosen ? { agent_type: chosen.value } : {}).then(function (res) {
+          openSheet = null;
+          el.remove();
+          // As the server paints it: the time alone, then who has it.
+          var meta = b.parentNode.querySelector('.m');
+          if (meta) meta.textContent = meta.textContent.split(' · ')[0];
+          b.replaceWith(ownerPill(res));
+        }, function (err) {
+          start.disabled = false;
+          cancel.disabled = false;
+          start.textContent = 'Start agent';
+          note.textContent = err.message;
+        });
+      });
+    });
+  });
+
   if (done) done.addEventListener('click', function () {
     done.disabled = true;
     api('/inbox/done', { thread_key: CONFIG.threadKey }).then(function () {

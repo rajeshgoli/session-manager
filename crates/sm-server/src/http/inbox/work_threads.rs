@@ -250,7 +250,7 @@ impl ThreadCatalog {
                 item: Item::Message(message, self.world.message_state(message, &replied)),
                 counted: true,
             });
-            if message.handled_at.is_some() {
+            if message.handled_at.is_some() && message.handled_via.as_deref() != Some("agent") {
                 entries.push(ThreadEntry {
                     key,
                     legacy_key: agent_thread_key(&message.sender_session_id),
@@ -878,11 +878,22 @@ pub(crate) fn thread_page(
                 .is_some_and(|id| message_ids.contains(id))
         }));
     }
+    let assignable = entries.iter().any(|entry| match &entry.item {
+        Item::Message(message, _) => {
+            catalog.world.alert_action(message) == super::alerts::AlertAction::Assign
+        }
+        _ => false,
+    });
+    let assign = if assignable {
+        Some(assign_choices(state)?)
+    } else {
+        None
+    };
     if json_format {
         return Ok(Json(
             json!({"thread_key": key, "title": row.title, "status": row.status,
             "doc_url": row.doc_url, "repo": row.repo, "can_send": reply_to.is_some(), "reply_to": reply_to,
-            "reply_options": options, "items": items, "review_asks": review_actions}),
+            "reply_options": options, "items": items, "review_asks": review_actions, "assign": assign}),
         )
         .into_response());
     }
@@ -938,9 +949,20 @@ pub(crate) fn thread_page(
         };
         body.push_str(&format!("<div class=\"qs\" id=\"qs\"></div><textarea id=\"box\" rows=\"2\" placeholder=\"Write to {}\"></textarea><div class=\"btns\"><button id=\"done\">Done</button><button id=\"archive\">Archive</button><span class=\"msg\" id=\"msg\">{hint}</span><button class=\"send\" id=\"send\">Send</button></div>", escape_html(target["name"].as_str().unwrap_or("agent"))));
     } else {
-        body.push_str("<div class=\"btns\"><button id=\"done\">Done</button><button id=\"archive\">Archive</button><span class=\"msg\" id=\"msg\">No agent is left to reply to.</span></div>");
+        let alerts = entries
+            .iter()
+            .any(|entry| entry.sender_id == Some(super::alerts::ALERT_SENDER));
+        let hint = if alerts {
+            "sm alerts take no replies."
+        } else {
+            "No agent is left to reply to."
+        };
+        body.push_str(&format!("<div class=\"btns\"><button id=\"done\">Done</button><button id=\"archive\">Archive</button><span class=\"msg\" id=\"msg\">{hint}</span></div>"));
     }
     body.push_str("</div>");
+    if let Some(choices) = &assign {
+        body.push_str(&assign_sheet(choices));
+    }
     let config = json!({"page": "thread", "token": docs::issue_doc_token(&state.config, TOKEN_SUBJECT),
         "threadKey": key, "sessionId": selected.as_ref().and_then(|v| v["id"].as_str()),
         "replyOptions": options, "canSend": reply_to.is_some(), "at": at});
@@ -950,6 +972,62 @@ pub(crate) fn thread_page(
     ));
     body.push_str(&web::reader_injection(browser));
     Ok(html(page_shell_with_status(&row.title, "inbox", "", &body)))
+}
+
+/// What Assign to agent offers (sm#2414): `{types: [{name, detail}], default, repo}`,
+/// the agent types from Settings › New agents with the New agent default, and
+/// the repo the agent starts in.
+fn assign_choices(state: &AppState) -> Result<Value, ApiError> {
+    let (types, preferred) = super::alerts::agent_choices(state)?;
+    let types: Vec<Value> = types
+        .iter()
+        .map(|t| {
+            let provider = match t.provider.as_str() {
+                "claude" => "Claude",
+                "opencode" => "Local",
+                _ => "Codex",
+            };
+            json!({"name": t.name, "detail": format!("{provider} · {}", t.effort)})
+        })
+        .collect();
+    let repo = state
+        .managed_artifacts
+        .as_ref()
+        .and_then(|svc| svc.config.roots.first())
+        .and_then(|root| {
+            std::path::Path::new(&root.repo_checkout)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+    Ok(json!({"types": types, "default": preferred, "repo": repo}))
+}
+
+/// The Assign to agent sheet, shown under the tapped alert.
+fn assign_sheet(choices: &Value) -> String {
+    let default = choices["default"].as_str();
+    let types: String = choices["types"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let name = t["name"].as_str().unwrap_or_default();
+            format!(
+                r#"<label><input type="radio" name="agent-type" value="{name}"{checked}><b>{name}</b><span>{detail}</span></label>"#,
+                name = escape_html(name),
+                checked = if default == Some(name) { " checked" } else { "" },
+                detail = escape_html(t["detail"].as_str().unwrap_or_default()),
+            )
+        })
+        .collect();
+    let types = if types.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="types" role="radiogroup" aria-label="Agent type">{types}</div>"#)
+    };
+    format!(
+        r#"<template id="assign-sheet"><div class="sheet" role="group" aria-label="Assign to agent"><div class="q">Hand this to a new agent</div>{types}<div class="what">It starts in <b>{repo}</b> with this alert as its brief, fixes what it can, and messages you what it found.</div><div class="go"><span class="msg" role="status"></span><button type="button" class="cancel">Cancel</button><button type="button" class="start">Start agent</button></div></div></template>"#,
+        repo = escape_html(choices["repo"].as_str().unwrap_or("the artifacts repo")),
+    )
 }
 
 fn thread_path(key: &str) -> String {
@@ -1125,6 +1203,8 @@ mod tests {
                 finished: Vec::new(),
                 agent_replies: Vec::new(),
                 marks: BTreeMap::new(),
+                delivery_keys: BTreeMap::new(),
+                assignments: BTreeMap::new(),
             },
             work: index(),
             docs: vec![DocData {

@@ -367,7 +367,7 @@
 <tr><td>building, unrecorded</td><td>live</td><td><code>sm artifact record</code> succeeds (D.2)</td><td>Sets description, consumers, marks, GPU fields, <code>recorded_at</code>; recipe validation and tags if <code>--recipe-complete</code> (E.6).</td></tr>
 <tr><td>unrecorded</td><td>frozen</td><td><code>grace_until</code> passes, artifact not in use, cold store mounted</td><td>Freeze (H). Listed under Needs you.</td></tr>
 <tr><td>live</td><td>frozen</td><td>Nightly pass finds it cold (F) and not <code>keep_live_until</code>-protected; or pressure pass (J); or <code>sm artifact freeze</code>; or owner Freeze is not offered (D.6)</td><td>H.2.</td></tr>
-<tr><td>frozen</td><td>live</td><td>A queue job needs it (E.2); <code>sm artifact thaw</code>; owner Thaw</td><td>H.4. Sets <code>thawed_at</code> = now; placement = cold.</td></tr>
+<tr><td>frozen</td><td>live</td><td>A queue job needs it (E.2); <code>sm artifact thaw</code>; owner Thaw</td><td>H.4. Sets <code>thawed_at</code> = now; placement = cold, or root when the thaw fell back to the Mac.</td></tr>
 <tr><td>live, frozen</td><td>deleted</td><td>Pressure pass step (J); <code>sm artifact delete</code>; owner Delete</td><td>K.1. <code>rebuildable</code> = recipe complete and no GPU spend.</td></tr>
 <tr><td>deleted (rebuildable)</td><td>building</td><td><code>sm artifact rebuild</code></td><td>K.2.</td></tr>
 <tr><td>building</td><td>deleted</td><td>Agent delete; or owner session ended, no job references it, and <code>orphan_building_days</code> passed</td><td>K.1, reason <code>orphan</code>.</td></tr>
@@ -593,6 +593,7 @@ fits(fs)        = free − outstanding − job.disk ≥ floor</code></pre>
 <tr><td>Directory containing only <code>FROZEN.md</code> (and <code>.DS_Store</code>) with a frozen record</td><td>Nothing; the frozen placeholder (H.3).</td></tr>
 <tr><td>Symlink resolving inside the root below a recorded artifact</td><td>Upsert <code>artifact_aliases</code>.</td></tr>
 <tr><td>Symlink to <code>&lt;cold_store&gt;/&lt;name&gt;</code> with no record</td><td>Unrecorded, location cold (covers folders moved by hand before this feature).</td></tr>
+<tr><td>A live record whose entry is now a symlink to <code>&lt;cold_store&gt;/&lt;name&gt;</code> while its location is root, or a real directory while its location is cold</td><td>Moved by hand: location follows the folder, event <code>relocated</code>, and the folder is measured at once (example: a 601 GB folder an agent moved to the cold store after discovery stops reading as 0 bytes on the Mac).</td></tr>
 <tr><td>Any other entry without a record</td><td>Unrecorded (A).</td></tr>
 <tr><td>A record whose path is missing while live, building or frozen</td><td>State deleted, reason <code>vanished</code>, <code>deleted_by = unknown</code>, listed under Needs you.</td></tr>
 <tr><td>Hidden entries (<code>.DS_Store</code>, <code>.localized</code>, names starting with <code>.</code>)</td><td>Ignored; sm's own in-progress names start with <code>.</code>.</td></tr>
@@ -641,10 +642,11 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <p>The swap is: rename the old entry to <code>&lt;root&gt;/.&lt;name&gt;.old</code>, create the placeholder at <code>&lt;root&gt;/.&lt;name&gt;.placeholder</code>, rename it to <code>&lt;root&gt;/&lt;name&gt;</code>, then delete <code>.&lt;name&gt;.old</code>.</p>
 <h4>H.4 Thaw</h4>
 <ol>
-<li>Preconditions: state frozen, cold store mounted, cold-store free − floor ≥ manifest <code>data_bytes</code>. Else the requester (or the Needs you list) is told why and the thaw waits for J on the cold store. Set <code>op = thawing</code>.</li>
-<li>Extract parts in parallel (<code>thaw_parallel_parts</code>) into <code>&lt;cold_store&gt;/.&lt;name&gt;.thawing/</code>, restoring mode and mtime; refuse any entry path that is absolute or contains <code>..</code>.</li>
+<li>Preconditions: state frozen, cold store mounted. Set <code>op = thawing</code>.</li>
+<li>Destination, chosen when copying starts and journaled with the phase (<code>members_json[].thaw_to</code>): the cold store when cold-store free − floor − outstanding ≥ manifest <code>data_bytes</code>; else the Mac when Mac free − <code>enough(root fs)</code> − outstanding ≥ <code>data_bytes</code>, so the Mac keeps its own job headroom and a thaw never fills it; else the thaw waits (error "Waiting for disk space above the floor and reservations") and J runs. Example: a 1.39 TB thaw with 732 GB free on the cold store and 2.9 TB free on the Mac (enough 200 GB) goes to the Mac.</li>
+<li>Extract parts in parallel (<code>thaw_parallel_parts</code>) into <code>.&lt;name&gt;.thawing/</code> on the destination (<code>&lt;cold_store&gt;/</code> or <code>&lt;root&gt;/</code>), restoring mode and mtime; refuse any entry path that is absolute or contains <code>..</code>.</li>
 <li>Verify the extracted tree against the manifest (paths, kinds, sizes, targets).</li>
-<li>Rename to <code>&lt;cold_store&gt;/&lt;name&gt;</code>; swap the placeholder for a symlink (same rename dance as H.3); delete <code>.frozen/&lt;name&gt;</code>; in one transaction: state live, location cold, <code>thawed_at</code> = <code>last_used_at</code> = now, <code>op = NULL</code>.</li>
+<li>Cold store: rename to <code>&lt;cold_store&gt;/&lt;name&gt;</code> and swap the placeholder for a symlink (same rename dance as H.3). Mac: rename the placeholder to <code>.&lt;name&gt;.old</code> and <code>.&lt;name&gt;.thawing</code> to <code>&lt;root&gt;/&lt;name&gt;</code>. Then delete <code>.frozen/&lt;name&gt;</code>; in one transaction: state live, location = destination, <code>thawed_at</code> = <code>last_used_at</code> = now, <code>op = NULL</code>.</li>
 <li>Re-run admission for jobs held on <code>thawing</code>.</li>
 </ol>
 <p>Thaw rate for estimates is the median of the last five thaws' <code>data_bytes / seconds</code>, default 100 GB/min until five exist.</p>
@@ -664,14 +666,14 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <h4>I.3 Output placement on the cold store</h4>
 <p>When E.3 places a job's output on the cold store, sm creates <code>&lt;cold_store&gt;/&lt;name&gt;</code> and the symlink <code>&lt;root&gt;/&lt;name&gt;</code> before the job starts, and records location cold. The job writes through the symlink. Reservation <code>placed = cold</code> makes its outstanding bytes count against the cold store.</p>
 <h4>I.4 Cold store missing</h4>
-<p>If the cold-store path does not exist or its <code>st_dev</code> equals the root's (not mounted), sm performs no freeze, thaw or move, holds jobs whose inputs are frozen with reason <code>thawing</code>, places no output there, and sends the owner one message per 6 hours: "The cold store is not connected; N frozen and M moved artifacts are unreadable."</p>
+<p>If the cold-store path does not exist or its <code>st_dev</code> equals the root's (not mounted), sm performs no freeze, thaw or move, holds jobs whose inputs are frozen with reason <code>thawing</code>, places no output there, and sends the owner one message per 6 hours: "The cold store is not connected; N frozen and M moved artifacts are unreadable." The message is blocking: only the owner can reconnect the drive.</p>
 
 <h3 id="J">J. The pressure pass and the score</h3>
 <h4>J.1 Triggers and target</h4>
 <p>Every <code>pressure_check_seconds</code> per filesystem (root fs and cold fs) when <code>free &lt; enough(fs)</code>; and from E.3 with its <code>needed</code>. One pass per filesystem at a time; a trigger during a pass waits and re-measures.</p>
 <ul>
 <li><code>enough(root fs)</code> = max(largest <code>bytes_written</code> of one succeeded queue job finishing in the last <code>enough_window_days</code>, <code>floor</code>).</li>
-<li><code>enough(cold fs)</code> = max(largest <code>data_bytes</code> among frozen artifacts, <code>floor</code>), so any one artifact can thaw.</li>
+<li><code>enough(cold fs)</code> = max(largest <code>data_bytes</code> among frozen artifacts, <code>floor</code>), so any one artifact can thaw; the frozen term drops out while that artifact could thaw onto the Mac instead (H.4 step 2).</li>
 <li>Stop rule: <code>free − outstanding ≥ max(enough, floor + needed_by_waiting_jobs)</code>, where <code>needed_by_waiting_jobs</code> is the largest <code>disk</code> among jobs held on <code>disk_space</code> for this fs.</li>
 </ul>
 <h4>J.2 Candidates and score</h4>
@@ -689,12 +691,13 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <ol>
 <li>Refresh F if older than one hour; measure free.</li>
 <li>Build candidates, sort by score descending, and execute in order (moves and freezes through the op worker, at most <code>max_concurrent_ops</code>), re-measuring after each completion and stopping at the stop rule. With <code>deletion_mode: report_only</code>, a delete candidate is logged as <code>would_delete</code>, listed under Needs you, and assumed freed when choosing what comes next.</li>
-<li>If candidates run out: one owner message, <code>blocking = true</code>, at most once per filesystem per 6 hours, replacing the pending one:</li>
+<li>If candidates run out: one owner message, <code>blocking = false</code> (an agent can work it; see "sm alerts" below), at most once per filesystem per 6 hours, replacing the pending one, and none while an agent assigned the previous one is still live:</li>
 </ol>
 <pre><code>Artifacts: the Mac needs 90 GB for job "4210-dataset" (150 GB). sm cannot free more by itself.
   4231_run           301 GB  GPU output (6.5 h, $14)            [Delete]
   4199_fixture        75 GB  no recipe (made by hand)            [Delete]
   4202_bundle         14 GB  in use by job 4205-train            —</code></pre>
+<p><b>sm alerts.</b> Every message sm sends as <code>sm artifacts</code> is an alert. An alert is blocking (shows "needs you") only when the owner alone can act: the cold store disconnected (plug it back in), the backup drive failing (replace it), backup deletions held (confirm them). Every other alert, and the held-deletions one, carries <b>Assign to agent</b> in its Inbox card on web and in the app (the app opens the same page). The cold-store, failing-drive and "confirming again" alerts carry none: no agent can act on them. Tapping it opens a sheet under the alert with the agent types from Settings › New agents, the New agent default preselected; Start calls <code>POST /inbox/alerts/{message_id}/assign</code> <code>{agent_type?}</code>, which starts a top-level agent in the artifact root's <code>repo_checkout</code> with the alert as its brief, records the agent in <code>owner_message_assignments</code>, and marks the message handled (<code>handled_via = agent</code>). The card then shows "&lt;agent&gt; is on it ›", linking to the agent's thread ("worked on it" once it ends). A second assignment of one alert is refused. An alert whose condition cleared is marked handled with <code>handled_via = resolved</code> ("sm resolved this"); one a newer alert replaced, <code>superseded</code>. Neither offers Assign; one marked Done in the Inbox still does.</p>
 
 <h3 id="K">K. Deletion and rebuild</h3>
 <h4>K.1 Deletion mechanics</h4>
@@ -741,7 +744,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <h4>L.4 Alerts</h4>
 <ul>
 <li>No acked request for <code>alert_after_missed_nights</code> × 24 h: one owner message (not blocking): "Backup: the remote disk has not confirmed since &lt;local time&gt; (&lt;n&gt; nights). Last state: &lt;no request / preparing failed: … / not acknowledged / applied false: …&gt;. Nothing is lost yet." At most daily; the next ack sends "The remote disk is confirming again."</li>
-<li>An ack with <code>check.ok = false</code>, or with <code>held_deletions &gt; 0</code>: a blocking owner message. For held deletions: "The remote disk held back N deletions (M% of its files). If you meant this, run <code>sm backup allow-deletes</code>." That sets a one-shot flag returned on the next <code>GET</code> as <code>allow_deletes: true</code>.</li>
+<li>An ack with <code>check.ok = false</code>: an owner message, not blocking. An ack with <code>held_deletions &gt; 0</code>: a blocking owner message. For held deletions: "The remote disk held back N deletions (M% of its files). If you meant this, run <code>sm backup allow-deletes</code>." That sets a one-shot flag returned on the next <code>GET</code> as <code>allow_deletes: true</code>.</li>
 </ul>
 <h4>L.5 The mini</h4>
 <ul>
@@ -820,7 +823,7 @@ Record: sm artifact show &lt;name&gt;</code></pre>
 <p><b>Why is the record declared at creation rather than afterwards?</b> A second command is the one agents forget, and the agent knows the consumers and the note best at the moment it starts the work. The after-the-fact path (G.3) exists for folders that bypass creation, and the steward closes it without the owner.</p>
 <p><b>Why not macOS transparent compression instead of freezing?</b> It needs no thaw, but it uses older, block-limited compressors (about 2× on the same pipeline folders that zstd shrinks 16–19×) and cannot compress a file over 2 GiB, which is where most bytes live. It also comes undone whenever a job rewrites a file. sm preserves it when moving folders (I.2) and otherwise leaves it alone.</p>
 <p><b>Why not a compressed disk image per folder?</b> Mounting dozens of images, keeping them mounted across restarts, and their read-only nature cost more than a minute's thaw, and their compression is weaker than zstd's.</p>
-<p><b>Why thaw onto the cold store, not the Mac?</b> Reads through the symlink run at SSD speed, and a thaw must never be the thing that fills the Mac. A job that writes the folder after a thaw writes there too.</p>
+<p><b>Why thaw onto the cold store, not the Mac?</b> Reads through the symlink run at SSD speed, and a thaw must never be the thing that fills the Mac. A job that writes the folder after a thaw writes there too. A thaw goes to the Mac only when the cold store cannot take it and the Mac keeps its own headroom afterwards; otherwise one large frozen artifact would pin a reserve on the cold store that the folders living there make impossible to meet.</p>
 <p><b>Why a placeholder directory rather than nothing at the path?</b> An agent reading by hand gets "No such file" for a missing path and has no clue why. A folder holding only <code>FROZEN.md</code> explains itself on <code>ls</code>.</p>
 <p><b>Why 16 GiB parts?</b> Parallel thaw (one stream of zstd decompresses at about 3.5 GB/s; several reach the disk's write speed), and one bad sector costs one part.</p>
 <p><b>Why poll the top level instead of watching filesystem events?</b> Events on macOS do not name the writing process, so they would not help attribution; a one-minute poll of a few hundred names is negligible and adds no dependency.</p>
