@@ -1,5 +1,6 @@
 package li.rajeshgo.sm.ui.watch
 
+import li.rajeshgo.sm.data.model.BackgroundJob
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.WhatRequestRecord
@@ -132,7 +133,7 @@ class WatchModelsTest {
 
     @Test
     fun backgroundWaitIsLabelledDistinctlyFromWaitingOnAHuman() {
-        assertEquals("bg-wait", activityLabel("waiting"))
+        assertEquals("background", activityLabel("waiting"))
         assertEquals("waiting", activityLabel("waiting_input"))
         assertEquals("approve", activityLabel("waiting_permission"))
     }
@@ -142,7 +143,7 @@ class WatchModelsTest {
         val session = session(status = "idle", activityState = "waiting")
 
         assertTrue(isOperationallyActive(session))
-        assertEquals("bg-wait", projectedStatusLabel(session))
+        assertEquals("background", projectedStatusLabel(session))
         assertEquals(SessionVisualState.Active, sessionVisualState(session))
     }
 
@@ -371,5 +372,14 @@ class WatchModelsTest {
             provider = "codex",
             activityState = activityState,
         )
+    }
+    @Test
+    fun backgroundJobsSayHowLongAndHowBig() {
+        val now = java.time.OffsetDateTime.parse("2026-10-19T16:20:00Z")
+        val dev = BackgroundJob(pid = 1, command = "npm run dev", startedAt = "2026-10-19T14:10:00Z", memoryBytes = 410L * 1024 * 1024)
+        assertEquals("started 2h 10m ago · 410 M", backgroundJobLine(dev, now))
+        val big = dev.copy(startedAt = "2026-10-19T16:19:00Z", memoryBytes = 3L * 1024 * 1024 * 1024 / 2)
+        assertEquals("started 1m ago · 1.5 G", backgroundJobLine(big, now))
+        assertEquals("", backgroundJobLine(BackgroundJob(command = "x"), now))
     }
 }

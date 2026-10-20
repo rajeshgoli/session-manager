@@ -114,7 +114,8 @@ pub(crate) fn alert(
     entered: i64,
     now: i64,
 ) -> Result<()> {
-    if sampled.job_type == "service" {
+    // A shell job has no log and its agent watches it from its own shell.
+    if sampled.job_type == "service" || sampled.job_type == super::shell::SHELL_JOB_TYPE {
         return Ok(());
     }
     let conn = open_queue_jobs_connection(&settings.queue_db_path)?;

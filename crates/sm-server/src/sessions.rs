@@ -17343,7 +17343,7 @@ fn fallback_activity_state(status: &str) -> String {
     }
 }
 
-fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
+pub(crate) fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
     let status = normalized_status(status);
     if status == "stopped" {
         return "stopped".to_owned();

@@ -1229,6 +1229,8 @@ private fun jobsToneColor(tone: String?): Color = when (tone) {
     "green" -> Emerald
     "amber" -> Amber
     "red" -> Rose
+    // Something the agent left running, not something waiting on you.
+    "background" -> Cyan
     else -> TextSecondary
 }
 
@@ -1692,6 +1694,25 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
             }
         }
     }
+    if (session.backgroundJobs.isNotEmpty()) {
+        Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Running in the background", style = MaterialTheme.typography.titleSmall, color = Cyan)
+                session.backgroundJobs.forEach { job ->
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            job.command,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(backgroundJobLine(job), style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                }
+            }
+        }
+    }
     val activeJobs = session.jobs.filter { it.state in listOf("pending", "running") }
     if (waiting.any { it.kind != "review" } || activeJobs.isNotEmpty()) {
         Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(10.dp)) {
@@ -2045,7 +2066,7 @@ private fun statusTint(session: ClientSession): Color = when (sessionVisualState
 private fun activityTint(state: String?): Color = when (activityLabel(state)) {
     "working" -> Emerald
     "thinking" -> Cyan
-    "bg-wait" -> Violet
+    "background" -> Cyan
     "waiting" -> Amber
     "approve" -> Fuchsia
     "stopped" -> Rose

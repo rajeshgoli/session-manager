@@ -330,6 +330,7 @@ class SessionManagerRepository(
                 obligations = obligationsById[session.id],
                 jobs = allJobs.filter { it.isAwaitedBy(session.id) },
                 facts = watchById[session.id]?.facts,
+                backgroundJobs = watchById[session.id]?.backgroundJobs.orEmpty(),
                 lastTicket = watchById[session.id]?.lastTicket,
                 attention = watchById[session.id]?.attention,
             ) } + watchById.values.filter { it.kind == "shell" }.map { it.toShellSession() }

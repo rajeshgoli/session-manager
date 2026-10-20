@@ -2,6 +2,7 @@ pub mod local_wall;
 mod opencode_messages;
 use opencode_messages::ensure_handoff_provider_bindings_resolved;
 pub mod quiet;
+pub mod shell;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -2190,6 +2191,15 @@ impl RetainedQueueStore {
             let Some(job) = get_queue_job_runtime_conn(&conn, &job_id)? else {
                 continue;
             };
+            if job.state.as_str() == "running" && job.job_type == shell::SHELL_JOB_TYPE {
+                // No wrapper or exit receipt: the agent memory guard tracks
+                // it by process group from its first pass (sm#2412).
+                let started_before_boot = boot_time
+                    .zip(job.started_at.as_deref().and_then(parse_queue_datetime))
+                    .is_some_and(|(boot, started)| started < boot);
+                shell::recover_conn(&conn, &job, message_queue_db_path, started_before_boot)?;
+                continue;
+            }
             if job.state.as_str() == "running" {
                 summary.recovered_running += 1;
                 match recover_running_queue_job_conn(
@@ -4037,6 +4047,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "stop_requested_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "stop_signal", "TEXT")?;
     ensure_column(conn, "queue_jobs", "stop_escaped_pids", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "shell_adoption_json", "TEXT")?;
     Ok(())
 }
 
@@ -4381,7 +4392,7 @@ fn write_queue_job_wrapper(
     Ok(())
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_owned();
     }
@@ -5721,7 +5732,9 @@ fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str
             job.state == "running"
                 && match job_type {
                     Some(expected) => job.job_type == expected,
-                    None => job.job_type != "review",
+                    // Review runs on its own budget; shell jobs were found
+                    // already running and take no slot (sm#2412).
+                    None => job.job_type != "review" && job.job_type != shell::SHELL_JOB_TYPE,
                 }
         })
         .count()
@@ -6496,8 +6509,9 @@ const HOST_MEMORY_GUARD_MIN_VICTIM_RSS: i64 = 512 * 1024 * 1024;
 
 /// The running job the host memory guard stops next, with its process group
 /// and resident bytes: among jobs not already being stopped, cancelled, or
-/// displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`], an
-/// owner-forced run first, then the largest.
+/// displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`], a shell job
+/// over its reservation first (sm#2412), then an owner-forced run, then the
+/// largest.
 fn host_pressure_victim<'a>(
     jobs: &'a [QueueJobRuntimeRecord],
     rss_by_pgid: &HashMap<i64, i64>,
@@ -6510,10 +6524,19 @@ fn host_pressure_victim<'a>(
             (rss >= HOST_MEMORY_GUARD_MIN_VICTIM_RSS).then_some((job, pgid, rss))
         })
         .max_by(|(a, _, a_rss), (b, _, b_rss)| {
-            // Owner-forced runs go first (sm#1627), then the largest.
-            a.owner_forced_at
-                .is_some()
-                .cmp(&b.owner_forced_at.is_some())
+            // Shell jobs over their reservation go first (sm#2412), then
+            // owner-forced runs (sm#1627), then the largest.
+            let over = |job: &QueueJobRuntimeRecord, rss: i64| {
+                job.job_type == shell::SHELL_JOB_TYPE
+                    && job.memory_bytes.is_some_and(|reserved| rss > reserved)
+            };
+            over(a, *a_rss)
+                .cmp(&over(b, *b_rss))
+                .then_with(|| {
+                    a.owner_forced_at
+                        .is_some()
+                        .cmp(&b.owner_forced_at.is_some())
+                })
                 .then_with(|| a_rss.cmp(b_rss))
                 .then_with(|| b.id.cmp(&a.id))
         })
@@ -7735,7 +7758,7 @@ fn finish_queue_job_conn_with_policy(
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
-        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')
+        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart', 'ended')
         "#,
         params![job.id, state, finished_at, exit_code],
     )?;
@@ -7763,7 +7786,7 @@ fn retry_unnotified_queue_job_completions_conn(
         r#"
         SELECT id
         FROM queue_jobs
-        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart', 'ended')
           AND completion_notification_required = 1
           AND completion_notified_at IS NULL
         ORDER BY finished_at, id
@@ -7914,8 +7937,15 @@ fn queue_job_completion_notified_at(
     let Some(message_queue_db_path) = message_queue_db_path else {
         return Ok(None);
     };
-    let text =
-        queue_job_completion_text_with_policy(job, state, exit_code, finished_at, admission_policy);
+    let text = if job.job_type == shell::SHELL_JOB_TYPE {
+        // The agent's own shell reports an ended command; only a stop is news.
+        match shell::completion_text(job, state, finished_at) {
+            Some(text) => text,
+            None => return Ok(Some(now_rfc3339())),
+        }
+    } else {
+        queue_job_completion_text_with_policy(job, state, exit_code, finished_at, admission_policy)
+    };
     let queue = RetainedQueueStore::new(message_queue_db_path.to_path_buf());
     // A revived job already sent a false completion under the plain id; its real
     // completion needs its own id or the once-only enqueue rejects it.
@@ -8906,6 +8936,7 @@ pub(crate) fn is_terminal_queue_state(state: &str) -> bool {
             | "memory_exceeded"
             | "process_limit_exceeded"
             | "host_restart"
+            | "ended"
     )
 }
 
@@ -9267,7 +9298,7 @@ fn list_queue_jobs_conn(
     if let Some(value) = filters.state {
         if value == "done" {
             where_clauses
-                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart')");
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded', 'host_restart', 'ended')");
         } else if value == "active" {
             where_clauses.push("state IN ('pending', 'running')");
         } else {
@@ -9673,7 +9704,7 @@ fn generate_record_id(prefix: &str) -> String {
     format!("{prefix}{:x}{:x}", std::process::id(), nanos as u128)
 }
 
-fn generate_queue_job_id() -> String {
+pub(crate) fn generate_queue_job_id() -> String {
     let mut bytes = [0u8; 6];
     OsRng.fill_bytes(&mut bytes);
     let suffix = bytes

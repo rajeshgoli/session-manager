@@ -1695,6 +1695,10 @@ pub struct QueueRunnerMemoryConfig {
     /// Executable names that limit never applies to, besides agent harnesses.
     #[serde(default)]
     pub agent_process_exempt_commands: Vec<String>,
+    /// Executable names never shown as an idle agent's background jobs
+    /// (sm#2412), besides the built-in helpers.
+    #[serde(default)]
+    pub background_ignore_commands: Vec<String>,
 }
 
 fn default_agent_process_max_bytes() -> i64 {
@@ -1708,6 +1712,7 @@ impl Default for QueueRunnerMemoryConfig {
             retry_interval_seconds: default_queue_runner_memory_retry_interval_seconds(),
             agent_process_max_bytes: default_agent_process_max_bytes(),
             agent_process_exempt_commands: Vec::new(),
+            background_ignore_commands: Vec::new(),
         }
     }
 }

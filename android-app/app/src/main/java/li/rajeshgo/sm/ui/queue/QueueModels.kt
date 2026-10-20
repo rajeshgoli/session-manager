@@ -80,8 +80,43 @@ fun reviewJobLine(job: SessionJob): String? = job.review?.let { review ->
     ).joinToString(" · ") + (review.why?.takeIf { it.isNotBlank() && it != "default" }?.let { "\n$it" } ?: "")
 }
 
+/** A command sm took into the queue from an agent's shell (sm#2412). */
+fun isShellJob(job: SessionJob): Boolean = job.type == "shell"
+
+/** "3G of 16G reserved", from the guard's measurement when it has one. */
+fun shellMemoryText(job: SessionJob): String? {
+    val reserved = job.shell?.reservedBytes ?: job.memoryBytes ?: return null
+    val used = job.shell?.currentBytes ?: job.usage?.memoryBytes
+    return if (used != null) "${gib(used)}G of ${gib(reserved)}G reserved" else "${gib(reserved)}G reserved"
+}
+
+/** Memory against the reservation, 0..1; the bar is full once over it. */
+fun shellProgress(job: SessionJob): Float {
+    val reserved = (job.shell?.reservedBytes ?: job.memoryBytes)?.takeIf { it > 0 } ?: return 0f
+    val used = job.shell?.currentBytes ?: job.usage?.memoryBytes ?: return 0f
+    return (used.toFloat() / reserved).coerceIn(0f, 1f)
+}
+
+fun shellOverReservation(job: SessionJob): Boolean = isShellJob(job) && job.shell?.overReservation == true
+
+/** "11.2 G now · peak 11.6 G · 8 G reserved". */
+fun shellMemoryDetail(job: SessionJob): String? {
+    val info = job.shell ?: return null
+    fun one(bytes: Long) = "%.1f G".format(bytes.toDouble() / GIB)
+    return listOfNotNull(
+        info.currentBytes?.let { "${one(it)} now" },
+        info.peakBytes?.let { "peak ${one(it)}" },
+        info.reservedBytes?.let { "${gib(it)} G reserved" },
+    ).joinToString(" · ").ifBlank { null }
+}
+
 /** "tests · 4m of 15m · 12G · cpu 25% · gpu 3%"; use is the job's share of the whole Mac. */
 fun runningLine(job: SessionJob, now: OffsetDateTime): String {
+    if (isShellJob(job)) {
+        // Its age counts from when the agent started the command.
+        val age = secondsBetween(job.queuedAt ?: job.startedAt, now)?.let(::shortDuration) ?: "-"
+        return listOfNotNull("shell", age, shellMemoryText(job)).joinToString(" · ")
+    }
     val elapsed = secondsBetween(job.startedAt, now)?.let(::shortDuration) ?: "-"
     val limit = job.timeoutSeconds?.let(::shortDuration)
     val usage = job.usage
@@ -94,8 +129,9 @@ fun runningLine(job: SessionJob, now: OffsetDateTime): String {
     ).joinToString(" · ")
 }
 
-/** Elapsed share of the job's time limit, 0..1. */
+/** Elapsed share of the job's time limit, 0..1; a shell job's memory share. */
 fun runningProgress(job: SessionJob, now: OffsetDateTime): Float {
+    if (isShellJob(job)) return shellProgress(job)
     val elapsed = secondsBetween(job.startedAt, now) ?: return 0f
     val limit = job.timeoutSeconds?.takeIf { it > 0 } ?: return 0f
     return (elapsed.toFloat() / limit).coerceIn(0f, 1f)
@@ -140,10 +176,12 @@ fun endedIcon(reason: String?): String = if (reason == "gave_up") "⌛" else "�
 
 /** "3 of 8 slots in use · tests 2/6 · perf 0/1 · background 1/2 · service 0/2". */
 fun slotsLine(slots: QueueSlots): String {
-    val types = listOf("tests", "perf", "background", "service").mapNotNull { type ->
+    val types = listOf("tests", "perf", "background", "service", "review").mapNotNull { type ->
         slots.byType[type]?.let { "$type ${it.running}/${it.max}" }
     }
-    return (listOf("${slots.running} of ${slots.max} slots in use") + types).joinToString(" · ")
+    // Shell jobs take no slot and have no limit; named only while one runs.
+    val shell = slots.byType["shell"]?.running?.takeIf { it > 0 }?.let { "shell $it" }
+    return (listOf("${slots.running} of ${slots.max} slots in use") + types + listOfNotNull(shell)).joinToString(" · ")
 }
 
 enum class Meter { LOW, MID, HIGH }

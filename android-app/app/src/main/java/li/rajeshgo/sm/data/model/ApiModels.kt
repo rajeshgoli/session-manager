@@ -249,6 +249,8 @@ data class ClientSession(
     val kind: String = "agent",
     /** From `/watch/state`, joined by id: the server's three facts and attention section (spec 1782 B). */
     val facts: AgentFacts? = null,
+    /** From `GET /watch/state` (sm#2412). */
+    @SerialName("background_jobs") val backgroundJobs: List<BackgroundJob> = emptyList(),
     val attention: AgentAttention? = null,
 )
 
@@ -267,6 +269,16 @@ data class WatchStateSession(
     @SerialName("last_ticket") val lastTicket: SessionClaim? = null,
     val facts: AgentFacts? = null,
     val attention: AgentAttention? = null,
+    @SerialName("background_jobs") val backgroundJobs: List<BackgroundJob> = emptyList(),
+)
+
+/** A command an idle agent left running outside the queue (sm#2412). */
+@Serializable
+data class BackgroundJob(
+    val pid: Long = 0,
+    val command: String = "",
+    @SerialName("started_at") val startedAt: String? = null,
+    @SerialName("memory_bytes") val memoryBytes: Long? = null,
 )
 
 @Serializable
@@ -633,6 +645,8 @@ data class SessionJob(
     val usage: JobUsage? = null,
     /** Review jobs only (sm#1768 appendix I2). */
     val review: JobReview? = null,
+    /** Shell jobs only (sm#2412): a command sm took into the queue. */
+    val shell: ShellJobInfo? = null,
 ) {
     fun isAwaitedBy(sessionId: String): Boolean =
         (notifySessionId?.takeIf(String::isNotBlank) ?: requesterSessionId) == sessionId
@@ -659,6 +673,17 @@ data class HostStatus(
     @SerialName("queue_memory_bytes") val queueMemoryBytes: Long? = null,
     @SerialName("queue_cpu_percent") val queueCpuPercent: Double? = null,
     @SerialName("queue_gpu_percent") val queueGpuPercent: Double? = null,
+)
+
+/** A shell job's reservation and measured use (sm#2412). */
+@Serializable
+data class ShellJobInfo(
+    @SerialName("reserved_bytes") val reservedBytes: Long? = null,
+    @SerialName("current_bytes") val currentBytes: Long? = null,
+    @SerialName("peak_bytes") val peakBytes: Long? = null,
+    @SerialName("over_reservation") val overReservation: Boolean = false,
+    @SerialName("adopted_at") val adoptedAt: String? = null,
+    val detached: Boolean = false,
 )
 
 /** A running queue job's live use, as share of the whole Mac (sm#1714). */
