@@ -8638,6 +8638,17 @@ impl SessionStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_test_write_lock(&self, work: impl FnOnce()) {
+        let _guard = self.write_guard().unwrap();
+        work();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_write_lock_attempts(&self) -> u64 {
+        self.write_lock_attempts.load(Ordering::Relaxed)
+    }
+
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         #[cfg(test)]
         self.write_lock_attempts.fetch_add(1, Ordering::Relaxed);

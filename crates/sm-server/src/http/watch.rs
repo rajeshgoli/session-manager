@@ -18,7 +18,7 @@ pub const WATCH_SCHEMA_VERSION: i64 = 1;
 
 const CLIENT_JS: &str = include_str!("watch_client.js");
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(super) struct WatchParams {
     #[serde(default)]
     repo: Option<String>,
@@ -63,7 +63,9 @@ pub(super) async fn get_watch_page(
             return Ok(shell);
         }
     }
-    let doc = watch_state(&state, &params)?;
+    let work_state = state.clone();
+    let work_params = params.clone();
+    let doc = blocking_http(move || watch_state(&work_state, &work_params)).await?;
     let path = if request.uri().path() == "/watch" {
         "/watch"
     } else {
@@ -97,7 +99,7 @@ pub(super) async fn get_watch_state(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
-    let doc = watch_state(&state, &params)?;
+    let doc = blocking_http(move || watch_state(&state, &params)).await?;
     Ok(([(CACHE_CONTROL, "private, no-cache".to_owned())], Json(doc)).into_response())
 }
 
@@ -115,7 +117,8 @@ fn generated_at(now: OffsetDateTime) -> String {
 /// `/session-obligations`), read in-process, in `sm watch`'s tree order.
 pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError> {
     let include_stopped = flag(&params.stopped);
-    let records = state.session_store.list_sessions(true)?;
+    let inputs = ObligationInputs::load(state)?;
+    let records = &inputs.records;
     let directory = SessionDirectory::new(records.iter().map(claims::session_info));
     let context: BTreeMap<String, Option<f64>> = records
         .iter()
@@ -144,46 +147,46 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
         .map(|record| (record.id.clone(), remote_control_payload(record)))
         .collect();
     let sessions: Vec<Value> = records
-        .into_iter()
+        .iter()
         .filter(|record| match nonempty(&params.session) {
             Some(id) => record.id == id,
             None => include_stopped || !record.is_stopped(),
         })
-        .map(|record| serde_json::to_value(session_response_with_live_activity(state, record)))
+        .map(|record| {
+            serde_json::to_value(session_response_with_live_activity(state, record.clone()))
+        })
         .collect::<Result<_, _>>()?;
 
     let last_tickets = claims::work_claim_store(state).latest_tickets()?;
-    let feed = session_obligations(state)?;
+    let feed = session_obligations_with_inputs(state, &inputs)?;
     let obligations: BTreeMap<String, Value> = array(&feed, "sessions")
         .into_iter()
         .map(|entry| (s(&entry, "session_id").to_owned(), entry))
         .collect();
-    let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
-        .join("queue_runner.db");
-    let jobs =
-        RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?;
+    let jobs = &inputs.jobs;
     let positions: BTreeMap<String, usize> = crate::queue::pending_queue_job_consideration_order(
-        &jobs,
+        jobs,
         &crate::queue::queue_ticket_ranks(&expand_home(&state.config.sm_send.db_path)),
     )
     .into_iter()
     .enumerate()
     .map(|(index, id)| (id, index + 1))
     .collect();
-    let messages: BTreeMap<String, crate::owner_messages::OwnerMessage> =
-        super::messages::obligation_messages(state)?
-            .into_iter()
-            .filter(|entry| entry.state == crate::owner_messages::OwnerMessageState::NeedsYou)
-            .map(|entry| (entry.message.id.clone(), entry.message))
-            .collect();
+    let messages: BTreeMap<String, crate::owner_messages::OwnerMessage> = inputs
+        .messages
+        .iter()
+        .filter(|entry| entry.state == crate::owner_messages::OwnerMessageState::NeedsYou)
+        .map(|entry| (entry.message.id.clone(), entry.message.clone()))
+        .collect();
     let colliding = colliding_sessions(state, &directory)?;
     let notes = crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
         .all()?;
     // 1768 I2: an author waiting on a review, and a paired reviewer's round.
-    let reviews = super::review_paired::session_fields(state).unwrap_or_else(|error| {
-        eprintln!("review fields for watch state failed: {error:#}");
-        BTreeMap::new()
-    });
+    let reviews = super::review_paired::session_fields_with_requests(state, &inputs.reviews)
+        .unwrap_or_else(|error| {
+            eprintln!("review fields for watch state failed: {error:#}");
+            BTreeMap::new()
+        });
     let finished = state
         .session_store
         .turn_message_store()

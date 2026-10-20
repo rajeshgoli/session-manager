@@ -100,8 +100,12 @@ impl BoardLinks {
         let mut docs = BTreeMap::<String, Vec<Value>>::new();
         let mut owner_reviews =
             BTreeMap::<(String, i64), (Vec<String>, Vec<(String, String)>)>::new();
-        for summary in doc_store.summaries(None, false)? {
-            let publishes = doc_store.publishes(&summary.doc.id)?;
+        let summaries = doc_store.summaries(None, false)?;
+        let doc_ids: Vec<_> = summaries.iter().map(|s| s.doc.id.clone()).collect();
+        let mut all_publishes = doc_store.publishes_for(&doc_ids)?;
+        let mut all_reviews = doc_store.reviews_for(&doc_ids)?;
+        for summary in summaries {
+            let publishes = all_publishes.remove(&summary.doc.id).unwrap_or_default();
             let Some(latest) = publishes.last() else {
                 continue;
             };
@@ -117,7 +121,7 @@ impl BoardLinks {
                 }
             }
             if let Some(pr) = latest.pr_number.or(summary.doc.pr_number) {
-                for review in doc_store.reviews(&summary.doc.id)? {
+                for review in all_reviews.remove(&summary.doc.id).unwrap_or_default() {
                     if review.status == "posted" {
                         owner_reviews
                             .entry((summary.doc.repo.clone(), pr))

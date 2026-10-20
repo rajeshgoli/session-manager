@@ -531,20 +531,29 @@ pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
             if state.shutdown().is_stopped() {
                 return;
             }
-            match state.session_store.stranded_handoff_messages() {
-                Ok(stranded) => {
-                    for (predecessor, successor) in stranded {
-                        if let Err(error) = state
-                            .session_store
-                            .hand_off_pending_messages(&predecessor, &successor)
-                        {
-                            eprintln!("moving late messages of {predecessor} failed: {error:#}");
+            let sweep_state = state.clone();
+            let work = tokio::task::spawn_blocking(move || {
+                let state = sweep_state;
+                match state.session_store.stranded_handoff_messages() {
+                    Ok(stranded) => {
+                        for (predecessor, successor) in stranded {
+                            if let Err(error) = state
+                                .session_store
+                                .hand_off_pending_messages(&predecessor, &successor)
+                            {
+                                eprintln!(
+                                    "moving late messages of {predecessor} failed: {error:#}"
+                                );
+                            }
                         }
                     }
+                    Err(error) => eprintln!("handoff message sweep failed: {error:#}"),
                 }
-                Err(error) => eprintln!("handoff message sweep failed: {error:#}"),
-            }
-            let work = match state.session_store.pending_handoff_work() {
+                state.session_store.pending_handoff_work()
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
+            let work = match work {
                 Ok(work) => work,
                 Err(error) => {
                     eprintln!("handoff sweep failed: {error:#}");
