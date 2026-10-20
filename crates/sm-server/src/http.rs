@@ -8007,7 +8007,12 @@ async fn list_queue_jobs(
     } else {
         None
     };
-    let jobs = context.jobs(filters)?;
+    let mut jobs = context.jobs(filters)?;
+    // Per-recipient retention expects oldest-first input and returns newest
+    // first. A bounded SQL list is already newest first.
+    if query.limit.is_some_and(|limit| limit > 0) && query.terminal_limit_per_session.is_some() {
+        jobs.reverse();
+    }
     // Include all active jobs even for a filtered listing: another agent's
     // test/performance job may be holding this agent's queue.
     let active = context.jobs(QueueJobFilters::default())?;
@@ -25218,12 +25223,14 @@ mod tests {
             ("/queue-jobs", vec!["history-3", "history-4"]),
             ("/queue-jobs?include_terminal=true", vec!["history-0", "history-1", "history-2", "history-3", "history-4"]),
             ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1", vec!["history-1", "history-2", "history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true&limit=200&terminal_limit_per_session=1", vec!["history-1", "history-2", "history-3", "history-4"]),
             ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1&current_sessions_only=true", vec!["history-1", "history-3", "history-4"]),
         ] {
             let response = app.clone().oneshot(local_request(Method::GET, uri, Body::empty())).await.unwrap();
             let (status, body) = response_json(response).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let mut labels = body["jobs"].as_array().unwrap().iter().map(|job| job["label"].as_str().unwrap()).collect::<Vec<_>>();
+            if uri.contains("limit=200") { assert_eq!(labels, ["history-4", "history-3", "history-2", "history-1"]); }
             labels.sort();
             assert_eq!(labels, expected, "{uri}");
             for job in body["jobs"].as_array().unwrap() {
