@@ -1,30 +1,46 @@
 // Plain shell presentation and owner actions (plain_terminal_memo, appendix C).
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, age, basename, homeRelative, navigate, Popover, Icon, toast } from './ui.js';
+import { html, api, age, basename, homeRelative, navigate, Popover, Icon, toast, stored, store } from './ui.js';
 
 export const isShell = row => row?.kind === 'shell';
+// The server allows this many characters in a shell name.
+export const SHELL_NAME_MAX = 40;
+/** A tile's title: the owner's name, else the folder. */
+export const shellTitle = shell => shell.named ? shell.name : basename(shell.working_dir || shell.repo) || shell.name;
 export function shellFact(shell, now = Date.now()) {
   const fact = shell.facts?.agent;
   const text = shell.facts?.text || fact?.text;
   return { text: text || `last input ${age(fact?.since || shell.last_activity, now) || 'now'}`, tone: 'muted' };
 }
+function ShellTile({ shell, now }) {
+  const folder = shell.working_dir || shell.repo;
+  const fact = shellFact(shell, now).text;
+  const detail = fact.startsWith('running') ? fact.replace(/^running/, 'Running') : fact.replace(/^last input/, 'Last used');
+  const href = `/terminal/${encodeURIComponent(shell.id)}`;
+  return html`<a class=${`terminal-tile${shell.hidden ? ' is-hidden' : ''}`} href=${href}
+    onClick=${event => { if (!event.metaKey && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); navigate(href); } }}>
+    <span class="terminal-tile-icon"><${Icon} name="terminal" size="22" /></span>
+    <span class="terminal-tile-content"><strong>${shellTitle(shell)}</strong>
+      <span class="terminal-tile-path" title=${folder}>${homeRelative(folder)}</span>
+      <span class="terminal-tile-fact">${detail}</span></span>
+    <${Icon} name="unfold" size="16" />
+  </a>`;
+}
+const TRAY_KEY = 'sm-terminals-hidden-open';
+/** Open shells as tiles. Hidden ones wait folded under "Hidden" until opened. */
 export function ShellTiles({ shells, now }) {
+  const [trayOpen, setTrayOpen] = useState(() => stored(TRAY_KEY, false));
   if (!shells.length) return null;
+  const shown = shells.filter(shell => !shell.hidden);
+  const hidden = shells.filter(shell => shell.hidden);
+  const toggle = () => { store(TRAY_KEY, !trayOpen); setTrayOpen(!trayOpen); };
   return html`<section class="terminal-section" aria-label="Terminals">
-    <div class="terminal-section-heading"><h2>Terminals</h2><span>${shells.length} open</span></div>
-    <div class="terminal-tiles">${shells.map(shell => {
-      const folder = shell.working_dir || shell.repo;
-      const fact = shellFact(shell, now).text;
-      const detail = fact.startsWith('running') ? fact.replace(/^running/, 'Running') : fact.replace(/^last input/, 'Last used');
-      return html`<a key=${shell.id} class="terminal-tile" href=${`/terminal/${encodeURIComponent(shell.id)}`}
-        onClick=${event => { if (!event.metaKey && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); navigate(`/terminal/${encodeURIComponent(shell.id)}`); } }}>
-        <span class="terminal-tile-icon"><${Icon} name="terminal" size="22" /></span>
-        <span class="terminal-tile-content"><strong>${basename(folder) || shell.name}</strong>
-          <span class="terminal-tile-path" title=${folder}>${homeRelative(folder)}</span>
-          <span class="terminal-tile-fact">${detail}</span></span>
-        <${Icon} name="unfold" size="16" />
-      </a>`;
-    })}</div>
+    <div class="terminal-section-heading"><h2>Terminals</h2>
+      <span>${shown.length} open${hidden.length ? ` · ${hidden.length} hidden` : ''}</span></div>
+    ${shown.length ? html`<div class="terminal-tiles">${shown.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>` : null}
+    ${hidden.length ? html`<button type="button" class="terminal-tray" aria-expanded=${trayOpen} onClick=${toggle}>
+        Hidden · ${hidden.length} ${trayOpen ? '⌄' : '›'}</button>
+      ${trayOpen ? html`<div class="terminal-tiles">${hidden.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>` : null}` : null}
   </section>`;
 }
 export function shellError(error) {
@@ -34,6 +50,7 @@ export function shellError(error) {
     const open = error.payload?.terminals || error.body?.terminals || [];
     return `Too many open shells. Retire one first.${open.length ? ` Open: ${open.map(t => `${t.id} · ${t.cwd}`).join(', ')}` : ''}`;
   }
+  if (error.message === 'name_too_long') return `Shell names are at most ${SHELL_NAME_MAX} characters.`;
   return error.message;
 }
 export async function createShell(body) {
@@ -50,23 +67,124 @@ export function awayShellCommand(route) {
   const tmux = command.indexOf(' tmux ');
   return tmux < 0 ? '' : `ssh -t studio-away${command.slice(tmux)}`;
 }
+/** PATCH a shell: `{ name }` (blank or null restores the default) or `{ hidden }`. */
+export const updateShell = (id, body) => api(`/terminals/${encodeURIComponent(id)}`, { method: 'PATCH', body });
+/** Hide or unhide. Hiding offers Undo. `then(hidden, undone)` runs after each change. */
+export async function setShellHidden(shell, hidden, then) {
+  try { await updateShell(shell.id, { hidden }); }
+  catch (error) { toast(shellError(error)); return false; }
+  if (!hidden) { toast(`${shell.name} is back in the list`); then?.(false, false); return true; }
+  let undone = false;
+  toast(`Hid ${shell.name}. It keeps running.`, null, { ms: 8000, action: { label: 'Undo', run: async () => {
+    if (undone) return;
+    undone = true;
+    try { await updateShell(shell.id, { hidden: false }); then?.(false, true); }
+    catch (error) { toast(shellError(error)); }
+  } } });
+  then?.(true, false);
+  return true;
+}
+/** Saves a name; resolves to the saved name, or null when the save failed. */
+async function saveName(shell, text) {
+  const name = text.trim();
+  if (name === shell.name) return name;
+  try {
+    const saved = await updateShell(shell.id, { name: name || null });
+    toast(name ? `Renamed to ${saved.name}` : `Name reset to ${saved.name}`);
+    return saved.name;
+  } catch (error) { toast(shellError(error)); return null; }
+}
+
+/** The shell's name in the terminal bar. A click edits it in place: Enter or leaving saves, Esc cancels. */
+export function ShellName({ shell, editing, setEditing, onSaved }) {
+  const [shown, setShown] = useState(null);
+  useEffect(() => { setShown(null); }, [shell.name]);
+  const name = shown ?? shell.name;
+  if (editing) {
+    return html`<${ShellNameField} shell=${shell} onDone=${saved => {
+      if (saved && saved !== shell.name) { setShown(saved); onSaved?.(); }
+      setEditing(false);
+    }} />`;
+  }
+  return html`<button type="button" class="shell-name t" title="Rename" aria-label=${`Rename ${name}`} onClick=${() => setEditing(true)}>
+    <span class="shell-name-text">${name}</span><${Icon} name="edit" size="13" /></button>`;
+}
+
+// Mounted fresh for each edit, so it always starts from the current name.
+function ShellNameField({ shell, onDone }) {
+  const [text, setText] = useState(shell.name);
+  const [busy, setBusy] = useState(false);
+  const input = useRef(null);
+  const done = useRef(false);
+  useEffect(() => { input.current?.focus(); input.current?.select(); }, []);
+  const finish = async (save) => {
+    if (done.current) return;
+    done.current = true;
+    if (!save) { onDone(null); return; }
+    setBusy(true);
+    const saved = await saveName(shell, text);
+    setBusy(false);
+    if (saved === null) { done.current = false; requestAnimationFrame(() => input.current?.focus()); return; }
+    onDone(saved);
+  };
+  return html`<input ref=${input} class="shell-name-input" type="text" aria-label="Shell name" maxlength=${SHELL_NAME_MAX}
+    placeholder=${`zsh · ${basename(shell.working_dir || shell.repo)}`} value=${text} readOnly=${busy}
+    size=${Math.max(12, Math.min(SHELL_NAME_MAX, text.length + 2))}
+    onInput=${event => setText(event.target.value)} onBlur=${() => finish(true)}
+    onKeyDown=${event => {
+      if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+      else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); finish(false); }
+    }} />`;
+}
+
+function RenameEditor({ shell, onSaved, onClose }) {
+  const [text, setText] = useState(shell.name);
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    setBusy(true);
+    const saved = await saveName(shell, text);
+    setBusy(false);
+    if (saved === null) return;
+    if (saved !== shell.name) onSaved?.();
+    onClose();
+  };
+  return html`<div class="note-edit">
+    <input type="text" maxlength=${SHELL_NAME_MAX} aria-label="Shell name" autofocus value=${text} disabled=${busy}
+      placeholder=${`zsh · ${basename(shell.working_dir || shell.repo)}`}
+      onInput=${(e) => setText(e.target.value)}
+      onKeyDown=${(e) => { if (e.key === 'Escape') onClose(); if (e.key === 'Enter') save(); }} />
+    <button type="button" class="btn sm" disabled=${busy || text.trim() === shell.name} onClick=${save}>Rename</button>
+    <button type="button" class="btn sm" disabled=${busy} onClick=${onClose}>Cancel</button>
+  </div>`;
+}
+
 async function copyCommand(command) {
   try { await navigator.clipboard.writeText(command); toast('SSH command copied'); }
   catch { toast(command); }
 }
 
-export function ShellMenu({ shell, away = false, small = false, align }) {
+/** ⋯ for a shell. `onRename` edits the name where it shows (the terminal bar); without it, Rename… opens an editor here. */
+export function ShellMenu({ shell, away = false, small = false, align, onSaved, onRename, onHide }) {
   const [open, setOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const close = () => { setOpen(false); setRenaming(false); };
   const action = async fn => {
     setBusy(true);
     try { await fn(); setOpen(false); }
     catch (error) { toast(shellError(error)); }
     finally { setBusy(false); }
   };
+  const live = shell.state !== 'stopped';
   return html`<span class="anchor"><button type="button" class=${small ? 'btn sm' : 'btn'} data-pop-anchor aria-label="More"
-    onClick=${() => setOpen(!open)}>⋯</button>
-    ${open ? html`<${Popover} align=${align} onClose=${() => setOpen(false)} className="menu">
+    onClick=${() => open ? close() : setOpen(true)}>⋯</button>
+    ${open && renaming ? html`<${Popover} key="rename" align=${align} onClose=${close}><${RenameEditor} shell=${shell} onSaved=${onSaved} onClose=${close} /><//>` : null}
+    ${open && !renaming ? html`<${Popover} align=${align} onClose=${close} className="menu">
+      ${live ? html`<button type="button" onClick=${() => { if (onRename) { close(); onRename(); } else setRenaming(true); }}>Rename…</button>
+        <button type="button" disabled=${busy} onClick=${() => action(async () => {
+          if (onHide) onHide(!shell.hidden);
+          else await setShellHidden(shell, !shell.hidden, () => onSaved?.());
+        })}>${shell.hidden ? 'Unhide' : 'Hide'}</button>` : null}
       <button type="button" disabled=${busy} onClick=${() => action(() => createShell({ cwd: shell.working_dir || shell.repo }))}>New shell here</button>
       <button type="button" disabled=${busy} onClick=${() => action(async () => {
         const route = await homeShellRoute(shell.id);
@@ -75,7 +193,8 @@ export function ShellMenu({ shell, away = false, small = false, align }) {
     <//>` : null}</span>`;
 }
 
-export function ShellCloseButton({ shell, onClosed }) {
+/** Closing ends the shell for good, so it reads like Retire and asks first. */
+export function ShellCloseButton({ shell, onClosed, small = true }) {
   const [asking, setAsking] = useState(false);
   const [busy, setBusy] = useState(false);
   const closeButton = useRef(null);
@@ -97,8 +216,7 @@ export function ShellCloseButton({ shell, onClosed }) {
     finally { setBusy(false); }
   };
   return html`<span class="retire-action shell-close" onClick=${event => event.stopPropagation()}>
-    <button type="button" class="btn sm" aria-label="Close shell" ref=${closeButton} onClick=${() => setAsking(true)} disabled=${busy}>
-      <${Icon} name="close" size="14" /> Close</button>
+    <button type="button" class=${`btn danger${small ? ' sm' : ''}`} aria-label="Close shell" ref=${closeButton} onClick=${() => setAsking(true)} disabled=${busy}>Close</button>
     ${asking ? html`<span class="retire-confirm shell-close-confirm" role="alertdialog" aria-label="Close this shell?">
       <strong>Close this shell?</strong><span>Any processes running in it will stop.</span>
       <span class="row"><button type="button" class="btn sm" ref=${keepButton} disabled=${busy} onClick=${() => { setAsking(false); closeButton.current?.focus(); }}>Keep open</button>

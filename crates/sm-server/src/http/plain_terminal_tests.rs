@@ -506,3 +506,66 @@ async fn plain_terminal_watch_repo_prefix_and_node_filters_match_agents() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn plain_terminal_rename_and_hide_persist_into_watch() {
+    let (state, _tmux) = plain_test_state();
+    let id = plain_new(&state).await;
+    let path = format!("/terminals/{id}");
+    let row = |watch: &Value| {
+        watch["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let watch = || plain_call(&state, Method::GET, "/watch/state", json!({}));
+
+    let shell = row(&watch().await.1);
+    assert_eq!(shell["name"], "zsh · tmp");
+    assert_eq!((shell["named"].clone(), shell["hidden"].clone()), (json!(false), json!(false)));
+
+    let (status, body) = plain_call(&state, Method::PATCH, &path, json!({"name":"  bench runner "})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"id":id,"name":"bench runner","named":true,"hidden":false}));
+    let (status, body) = plain_call(&state, Method::PATCH, &path, json!({"hidden":true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shell = row(&watch().await.1);
+    assert_eq!((shell["name"].clone(), shell["hidden"].clone()), (json!("bench runner"), json!(true)));
+    let first_hide = plain_terminals::store(&state).get(&id).unwrap().unwrap().hidden_at;
+    plain_call(&state, Method::PATCH, &path, json!({"hidden":true})).await;
+    assert_eq!(plain_terminals::store(&state).get(&id).unwrap().unwrap().hidden_at, first_hide);
+
+    // Blank restores the default; one call can change both.
+    let (_, body) = plain_call(&state, Method::PATCH, &path, json!({"name":" ","hidden":false})).await;
+    assert_eq!(body, json!({"id":id,"name":"zsh · tmp","named":false,"hidden":false}));
+    let (_, body) = plain_call(&state, Method::PATCH, &path, json!({"name":"x"})).await;
+    assert_eq!(body["named"], true);
+    let (_, body) = plain_call(&state, Method::PATCH, &path, json!({"name":null})).await;
+    assert_eq!(body["name"], "zsh · tmp");
+
+    for bad in [
+        json!({}),
+        json!({"name":"a".repeat(41)}),
+        json!({"name":"two\nlines"}),
+        json!({"name":3}),
+        json!({"hidden":"yes"}),
+    ] {
+        assert_eq!(plain_call(&state, Method::PATCH, &path, bad.clone()).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(
+        plain_call(&state, Method::PATCH, &path, json!({"name":"é".repeat(40)})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        plain_call(&state, Method::PATCH, "/terminals/term-missing", json!({"hidden":true})).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(plain_call(&state, Method::DELETE, &path, json!({})).await.0, StatusCode::OK);
+    assert_eq!(
+        plain_call(&state, Method::PATCH, &path, json!({"name":"late"})).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

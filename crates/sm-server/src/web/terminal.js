@@ -7,7 +7,7 @@ import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText,
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
-import { isShell, shellFact, ShellCloseButton, ShellAwayPanel } from './shell.js';
+import { isShell, shellFact, ShellCloseButton, ShellAwayPanel, ShellMenu, ShellName, setShellHidden } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
 import './vendor/addon-web-links.js';
@@ -44,9 +44,10 @@ export function switcherFact(agent, now = Date.now()) {
 
 /**
  * Live agents in attention sections. A collapsed Idle section keeps only the
- * current agent. `order` is the visible rows, for ⌘⌥↑ and ⌘⌥↓.
+ * current agent, and so does the Terminals group's folded Hidden tray.
+ * `order` is the visible rows, for ⌘⌥↑ and ⌘⌥↓.
  */
-export function switcherGroups(sessions, currentId, idleOpen) {
+export function switcherGroups(sessions, currentId, idleOpen, hiddenOpen = false) {
   const live = sessions.filter((s) => s.state !== 'stopped' && !(s.attention && s.attention.section === 'stopped'));
   const groups = sectionAgents(live).map(({ section, agents }) => {
     const shown = section !== 'idle' || idleOpen ? agents : agents.filter((a) => a.id === currentId);
@@ -55,9 +56,13 @@ export function switcherGroups(sessions, currentId, idleOpen) {
   const shells = live.filter(isShell).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
   if (shells.length) {
     const idle = groups.findIndex(group => group.section === 'idle');
-    groups.splice(idle < 0 ? groups.length : idle, 0, { section: 'terminals', count: shells.length, agents: shells });
+    const hidden = shells.filter(shell => shell.hidden);
+    groups.splice(idle < 0 ? groups.length : idle, 0, {
+      section: 'terminals', count: shells.length, agents: shells.filter(shell => !shell.hidden),
+      hidden: { count: hidden.length, agents: hiddenOpen ? hidden : hidden.filter(shell => shell.id === currentId) },
+    });
   }
-  return { groups, order: groups.flatMap((g) => g.agents) };
+  return { groups, order: groups.flatMap((g) => [...g.agents, ...(g.hidden?.agents || [])]) };
 }
 
 /** The row `step` away from the current one; from outside the list, the first or last. */
@@ -90,27 +95,31 @@ function useWidth(test) {
   return on;
 }
 
-function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
+function Switcher({ groups, currentId, idleOpen, toggleIdle, hiddenOpen, toggleHidden, pick, reload }) {
+  const row = (section) => (agent) => {
+    const fact = switcherFact(agent);
+    const label = fact.tone === 'cyan' ? 'read' : 'answered';
+    return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
+        class=${`sw-row${agent.id === currentId ? ' cur' : ''}${agent.hidden ? ' sw-hidden' : ''}`} onClick=${() => pick(agent)}>
+      ${isShell(agent) ? html`<span class="sw-shell muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[section]}`}></i>`}
+      <span class="sw-nm" title=${agent.name}>${agent.name}</span>
+      ${fact.dismissible
+        ? html`<button type="button" class=${`icon-btn ok ${fact.tone}`} title=${`Mark ${label}`} aria-label=${`Mark ${agent.name} ${label}`}
+            onClick=${(event) => { event.stopPropagation(); markAnswered(agent, reload); }}>✓</button>`
+        : html`<span></span>`}
+      <span class=${`sw-fact ${fact.tone}`} title=${fact.text}>${fact.text}</span>
+    </div>`;
+  };
   return html`<nav class="term-switch" aria-label="Sessions">
-    ${groups.map(({ section, count, agents }) => html`
+    ${groups.map(({ section, count, agents, hidden }) => html`
       ${section === 'idle'
         ? html`<button type="button" class="sw-sec muted" aria-expanded=${idleOpen} onClick=${toggleIdle}>
             ${SECTION_LABEL.idle} · ${count} ${idleOpen ? '⌄' : '›'}</button>`
         : html`<div class=${`sw-sec ${section === 'terminals' ? 'muted sw-terminals-heading' : SECTION_TONE[section]}`}>${section === 'terminals' ? 'Terminals' : SECTION_LABEL[section]}</div>`}
-      ${agents.map((agent) => {
-        const fact = switcherFact(agent);
-        const label = fact.tone === 'cyan' ? 'read' : 'answered';
-        return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
-            class=${`sw-row${agent.id === currentId ? ' cur' : ''}`} onClick=${() => pick(agent)}>
-          ${isShell(agent) ? html`<span class="sw-shell muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[section]}`}></i>`}
-          <span class="sw-nm" title=${agent.name}>${agent.name}</span>
-          ${fact.dismissible
-            ? html`<button type="button" class=${`icon-btn ok ${fact.tone}`} title=${`Mark ${label}`} aria-label=${`Mark ${agent.name} ${label}`}
-                onClick=${(event) => { event.stopPropagation(); markAnswered(agent, reload); }}>✓</button>`
-            : html`<span></span>`}
-          <span class=${`sw-fact ${fact.tone}`} title=${fact.text}>${fact.text}</span>
-        </div>`;
-      })}`)}
+      ${agents.map(row(section))}
+      ${hidden?.count ? html`<button type="button" class="sw-tray" aria-expanded=${hiddenOpen} onClick=${toggleHidden}>
+          Hidden · ${hidden.count} ${hiddenOpen ? '⌄' : '›'}</button>
+        ${hidden.agents.map(row(section))}` : null}`)}
   </nav>`;
 }
 
@@ -127,6 +136,8 @@ export function TerminalPage({ id, open }) {
   const [directError, setDirectError] = useState('');
   const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
   const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
+  const [hiddenOpen, setHiddenOpen] = useState(() => stored('sm-term-switcher-hidden', false));
+  const [renaming, setRenaming] = useState(false);
   const showKeys = useWidth(touchKeys);
   // Touch screens keep the phone bar and its keys, even a tablet held wide.
   const wide = !useWidth(narrow) && !showKeys;
@@ -142,7 +153,7 @@ export function TerminalPage({ id, open }) {
   const error = lookupFailed ? 'Could not load session information. Retry to check whether this terminal is still available.'
     : unavailable ? 'This terminal has ended or could not be found. The session may have stopped or been retired. Choose another session from Agents.'
     : transportError;
-  const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
+  const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen, hiddenOpen);
   // Details, and whatever it links to (a ticket, PR, doc or job), open beside the terminal.
   const split = open ? open.indexOf(':') : -1;
   const Renderer = split > 0 ? panels.get(open.slice(0, split)) : null;
@@ -150,6 +161,7 @@ export function TerminalPage({ id, open }) {
 
   const toggleSwitcher = () => { store('sm-term-switcher', !switcher); setSwitcher(!switcher); };
   const toggleIdle = () => { store('sm-term-switcher-idle', !idleOpen); setIdleOpen(!idleOpen); };
+  const toggleHidden = () => { store('sm-term-switcher-hidden', !hiddenOpen); setHiddenOpen(!hiddenOpen); };
   const pick = (next) => {
     // Below 900 px the switcher covers the terminal, so it closes once you choose.
     if (narrow() && switcher) { store('sm-term-switcher', false); setSwitcher(false); }
@@ -158,7 +170,7 @@ export function TerminalPage({ id, open }) {
   // A click on the bar gives the keyboard back to the terminal, except inside the
   // Report-a-bug dialog, which renders within the bar and has its own fields.
   const refocus = (event) => {
-    if (event?.target?.closest?.('.board-start-overlay, .pop')) return;
+    if (event?.target?.closest?.('.board-start-overlay, .pop, .shell-name, .shell-name-input, .retire-confirm')) return;
     setTimeout(() => control.current?.focus(), 0);
   };
   // A retired agent's terminal has nothing left to show, so move on to the next agent,
@@ -168,6 +180,13 @@ export function TerminalPage({ id, open }) {
     const next = rowAfterRetire(order, id);
     navigate(next ? `/terminal/${encodeURIComponent(next.id)}` : '/');
   };
+  // Hiding sends the shell to the tray like a minimised window: move on as Retire does.
+  // Undo brings it back and returns here.
+  const hideShell = (hidden) => setShellHidden(agent, hidden, (now, undone) => {
+    reload();
+    if (undone) navigate(`/terminal/${encodeURIComponent(agent.id)}`);
+    else if (now) retired(true);
+  });
 
   // ⌘\ toggles the switcher; ⌘⌥↑ and ⌘⌥↓ switch agents. xterm lets these through.
   const latest = useRef({});
@@ -444,10 +463,20 @@ export function TerminalPage({ id, open }) {
   const linked = agent?.remote_control?.url?.startsWith('https://claude.ai/code/');
   const live = connection === 'Live';
   const shellAway = away && targetKind === 'shell';
-  const retire = agent && agent.state !== 'stopped' ? html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />` : null;
+  const retire = !agent || agent.state === 'stopped' ? null
+    : shell ? (targetKind === 'shell' ? html`<${ShellCloseButton} key=${id} shell=${agent} onClosed=${() => retired(true)} />` : null)
+    : html`<${RetireButton} key=${id} agent=${agent} onRetired=${retired} small />`;
   const details = html`<button type="button" class="btn sm" onClick=${() => openPanel(`agent:${id}`)}>Details</button>`;
   // Hand off… and ⋯ live here, not in the Details panel beside this terminal (#2277).
-  const menus = (compact) => agent ? html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />` : null;
+  const menus = (compact) => !agent ? null
+    : shell ? html`<${ShellMenu} key=${id} shell=${agent} small align="right" onSaved=${reload} onRename=${() => setRenaming(true)} onHide=${hideShell} />`
+    : html`<${AgentMenus} key=${id} agent=${agent} onSaved=${reload} small compact=${compact} align="right" />`;
+  // A shell's name renames in place; Hide sits beside ⋯ so the tray is one click away.
+  const name = shell ? html`<${ShellName} key=${id} shell=${agent} editing=${renaming} setEditing=${setRenaming} onSaved=${reload} />
+      ${agent.hidden ? html`<span class="shell-hidden-pill">Hidden</span>` : null}`
+    : html`<span class="t">${agent ? agent.name : id}</span>`;
+  const hide = shell && targetKind === 'shell' ? html`<button type="button" class="btn sm" title=${agent.hidden ? 'Put this shell back in the lists' : 'Hide this shell from the lists; it keeps running'}
+    onClick=${() => hideShell(!agent.hidden)}>${agent.hidden ? 'Unhide' : 'Hide'}</button>` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
   // Desktop (#2242): who and how full on the left; connection words only when not live,
   // with the route in the dot's tooltip; actions on the right, Retire last.
@@ -455,16 +484,16 @@ export function TerminalPage({ id, open }) {
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <span class="term-who" title=${[agent?.state, connection, live && route.label ? routeText(route.label, route.samples) : ''].filter(Boolean).join(' · ')}>
         ${shell ? html`<span class="muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[agent?.attention?.section] || 'muted'}`}></i>`}
-        <span class="t">${agent ? agent.name : id}</span>
+        ${name}
         ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
       </span>
-      ${live ? null : html`<span class="term-connection" role="status">${connection}</span>`}
+      ${live || shellAway ? null : html`<span class="term-connection" role="status">${connection}</span>`}
       <span class="sp"></span>
-      ${notes}${details}${menus(false)}
+      ${notes}${details}${hide}${menus(false)}
       <span class="term-icons">
         ${linked ? html`<button type="button" class="icon-btn" title="Open in Claude" aria-label="Open in Claude"
           onClick=${() => openInClaude(agent)}><${Icon} name="external" /></button>` : null}
-        <button type="button" class="icon-btn" disabled=${!live} title="Redraw the agent's screen" aria-label="Redraw"
+        <button type="button" class="icon-btn" disabled=${!live} title=${shell ? 'Redraw the screen' : "Redraw the agent's screen"} aria-label="Redraw"
           onClick=${() => control.current?.redraw()}><${Icon} name="redraw" /></button>
         <${BugButton} page="Terminal" />
       </span>
@@ -472,17 +501,13 @@ export function TerminalPage({ id, open }) {
     </div>`;
 
   return html`<div class="term-page" data-connection=${connection}>
-    ${shell ? html`<div class="term-bar term-shell-bar" onClick=${refocus}>
-      <span class="term-who"><span class="muted">▹</span><span class="t" title=${agent.name}>${agent.name}</span></span>
-      <span class="sp"></span>
-      ${targetKind === 'shell' ? html`<${ShellCloseButton} key=${id} shell=${agent} onClosed=${() => navigate('/')} />` : null}
-    </div>` : wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
+    ${wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
       ${notes}
       ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
-      <span class="t">${agent ? agent.name : id}</span><span class="sub term-state">${agent ? agent.state : ''}</span>
-      <span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>
+      ${shell ? html`<span class="muted">▹</span>` : null}${name}${shell ? null : html`<span class="sub term-state">${agent ? agent.state : ''}</span>`}
+      ${shellAway ? null : html`<span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>`}
       ${connection === 'Live' && route.label
         ? html`<span class="term-route" title="Route and round-trip time">${routeText(route.label, route.samples)}</span>` : null}
       ${showKeys && !shell ? html`<span class="term-keys">${keys.map(([label, key]) => html`<button type="button" class="btn sm" disabled=${connection !== 'Live'}
@@ -490,6 +515,7 @@ export function TerminalPage({ id, open }) {
         <button type="button" class="btn sm" disabled=${connection !== 'Live'} onClick=${() => control.current?.model()}>/model</button></span>` : null}
       <span class="sp"></span>
       ${linked ? html`<button type="button" class="btn sm" onClick=${() => openInClaude(agent)}>Open in Claude</button>` : null}
+      ${hide}
       ${retire}
       ${menus(true)}
       <${BugButton} page="Terminal" />
@@ -500,7 +526,7 @@ export function TerminalPage({ id, open }) {
     <div class=${`term-main${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
       <div class="term-side">
         ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
-          idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
+          idleOpen=${idleOpen} toggleIdle=${toggleIdle} hiddenOpen=${hiddenOpen} toggleHidden=${toggleHidden} pick=${pick} reload=${reload} /></div>` : null}
         <button type="button" class="term-edge" title=${`${switcher ? 'Fold' : 'Unfold'} session list (⌘\\)`}
           aria-label=${`${switcher ? 'Fold' : 'Unfold'} session list`} aria-expanded=${switcher}
           onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>

@@ -197,6 +197,7 @@ fn create_locked(
         created_at: crate::plain_terminals::timestamp(),
         retired_at: None,
         retired_reason: None,
+        hidden_at: None,
     };
     store.insert(&t)?;
     let log = expand_home(&state.config.paths.state_file)
@@ -256,6 +257,81 @@ pub(super) async fn retire(
         Ok(Json(json!({"id":id,"state":"retired"})))
     })
     .await
+}
+
+/// Longest shell name, in characters; the bar and the switcher show about this much.
+pub(super) const MAX_NAME_CHARS: usize = 40;
+
+/// `PATCH /terminals/{id}`: `name` (blank or null restores the default) and `hidden`.
+/// Absent fields stay as they are.
+pub(super) async fn update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    guard(&state, &request)?;
+    ensure_core_writes_enabled(&state)?;
+    let payload = body(request).await?;
+    let invalid = |detail: &str| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: detail.into(),
+    };
+    let name = match payload.get("name") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if text.chars().count() > MAX_NAME_CHARS {
+                return Err(invalid("name_too_long"));
+            }
+            if text.chars().any(char::is_control) {
+                return Err(invalid("Shell names are a single line of text"));
+            }
+            Some((!text.is_empty()).then(|| text.to_owned()))
+        }
+        Some(_) => return Err(invalid("name must be a string or null")),
+    };
+    let hidden = match payload.get("hidden") {
+        None => None,
+        Some(Value::Bool(on)) => Some(*on),
+        Some(_) => return Err(invalid("hidden must be true or false")),
+    };
+    if name.is_none() && hidden.is_none() {
+        return Err(invalid("Nothing to change: send name or hidden"));
+    }
+    board::blocking(&state, move |state| {
+        let store = store(state);
+        let missing = || ApiError::NotFound("Terminal not found");
+        if let Some(name) = &name {
+            if !store.rename(&id, name.as_deref())? {
+                return Err(missing());
+            }
+        }
+        if let Some(hidden) = hidden {
+            if !store.set_hidden(&id, hidden)? {
+                return Err(missing());
+            }
+        }
+        let t = store.get(&id)?.ok_or_else(missing)?;
+        Ok(Json(json!({
+            "id": t.id,
+            "name": display_name(&t),
+            "named": t.name.is_some(),
+            "hidden": t.hidden_at.is_some(),
+        })))
+    })
+    .await
+}
+
+/// The owner's name for a shell, else `zsh · <folder>`.
+pub(super) fn display_name(t: &Terminal) -> String {
+    t.name.clone().unwrap_or_else(|| {
+        let folder = std::path::Path::new(&t.cwd)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        format!("zsh · {folder}")
+    })
 }
 
 pub(super) async fn route(

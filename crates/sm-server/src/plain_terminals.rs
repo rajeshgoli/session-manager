@@ -54,6 +54,8 @@ pub struct Terminal {
     pub created_at: String,
     pub retired_at: Option<String>,
     pub retired_reason: Option<String>,
+    /// Set while the owner keeps the shell out of the lists; it stays live.
+    pub hidden_at: Option<String>,
 }
 
 impl Terminal {
@@ -73,6 +75,7 @@ impl Terminal {
             created_at: row.get(10)?,
             retired_at: row.get(11)?,
             retired_reason: row.get(12)?,
+            hidden_at: row.get(14)?,
         })
     }
 
@@ -90,7 +93,7 @@ impl Terminal {
     }
 }
 
-const COLUMNS: &str = "id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,last_attach_at,last_input_at,busy_since,created_at,retired_at,retired_reason,name";
+const COLUMNS: &str = "id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,last_attach_at,last_input_at,busy_since,created_at,retired_at,retired_reason,name,hidden_at";
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -112,14 +115,17 @@ impl Store {
         ); CREATE INDEX IF NOT EXISTS plain_terminals_state ON plain_terminals(state);",
         )?;
         let conn = self.pool.get()?;
-        let has_name = conn
+        let columns = conn
             .prepare("PRAGMA table_info(plain_terminals)")?
             .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|column| column == "name");
-        if !has_name {
-            conn.execute("ALTER TABLE plain_terminals ADD COLUMN name TEXT", [])?;
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for column in ["name", "hidden_at"] {
+            if !columns.iter().any(|c| c == column) {
+                conn.execute(
+                    &format!("ALTER TABLE plain_terminals ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -148,6 +154,20 @@ impl Store {
     pub fn insert(&self, t: &Terminal) -> Result<()> {
         self.pool.get()?.execute("INSERT INTO plain_terminals (id,cwd,created_by_user,created_by_device,created_via,tmux_session,state,created_at,name) VALUES (?1,?2,?3,?4,?5,?6,'live',?7,?8)", params![t.id,t.cwd,t.created_by_user,t.created_by_device,t.created_via,t.tmux_session,t.created_at,t.name])?;
         Ok(())
+    }
+    /// `None` restores the default `zsh · <folder>` name. False when no live shell has `id`.
+    pub fn rename(&self, id: &str, name: Option<&str>) -> Result<bool> {
+        Ok(self.pool.get()?.execute(
+            "UPDATE plain_terminals SET name=?2 WHERE id=?1 AND state='live'",
+            params![id, name],
+        )? > 0)
+    }
+    /// Hiding keeps the first hide time. False when no live shell has `id`.
+    pub fn set_hidden(&self, id: &str, hidden: bool) -> Result<bool> {
+        Ok(self.pool.get()?.execute(
+            "UPDATE plain_terminals SET hidden_at=CASE WHEN ?2 THEN COALESCE(hidden_at,?3) ELSE NULL END WHERE id=?1 AND state='live'",
+            params![id, hidden, timestamp()],
+        )? > 0)
     }
     pub fn retire(&self, id: &str, reason: &str) -> Result<()> {
         self.pool.get()?.execute("UPDATE plain_terminals SET state='retired',retired_at=?2,retired_reason=?3,busy_since=NULL WHERE id=?1 AND state='live'", params![id, timestamp(), reason])?;
