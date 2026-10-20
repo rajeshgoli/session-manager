@@ -19,30 +19,9 @@ impl Drop for ScratchDir {
     }
 }
 
-/// The first of `count` consecutive ports that are all bindable now. Ports
-/// come from below macOS's ephemeral range (49152+), where any outbound
-/// connection in the parallel suite could take one between check and use.
-/// A port is handed out once per process, so two fixtures that have not yet
-/// bound cannot draw the same run.
-pub(crate) fn free_port_run(count: u16) -> u16 {
-    static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let mut issued = ISSUED.lock().unwrap();
-    for _ in 0..100 {
-        let port = 20_000 + (OsRng.next_u32() % 20_000) as u16;
-        if (port..port + count).any(|p| issued.contains(&p)) {
-            continue;
-        }
-        let listeners: Result<Vec<_>, _> = (port..port + count)
-            .map(|p| TcpListener::bind(("127.0.0.1", p)))
-            .collect();
-        if listeners.is_ok() {
-            issued.extend(port..port + count);
-            return port;
-        }
-    }
-    panic!("no run of {count} free local ports");
-}
+#[cfg(target_os = "macos")]
+#[path = "test_ports.rs"]
+mod test_ports;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -52,6 +31,8 @@ use std::{
         Arc,
     },
 };
+#[cfg(target_os = "macos")]
+pub(crate) use test_ports::{free_port_run, report_bind_failure, wait_until_port_free, PortRun};
 
 #[derive(Default)]
 struct StubState {
@@ -74,6 +55,7 @@ pub(crate) struct Stub {
     state: Arc<Mutex<StubState>>,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    fixed_port: bool,
 }
 
 impl Stub {
@@ -89,6 +71,12 @@ impl Stub {
     }
 
     pub(crate) fn new_on_port(port: u16) -> Self {
+        let fixed_port = port != 0;
+        if fixed_port {
+            // Admission's own bind probe can also be inherited before exec.
+            #[cfg(target_os = "macos")]
+            wait_until_port_free(port);
+        }
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(Mutex::new(StubState::default()));
@@ -121,6 +109,7 @@ impl Stub {
             state,
             stopped,
             worker: Some(worker),
+            fixed_port,
         }
     }
 
@@ -186,6 +175,10 @@ impl Drop for Stub {
         let wake = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         wake.shutdown(std::net::Shutdown::Write).unwrap();
         self.worker.take().unwrap().join().unwrap();
+        if self.fixed_port {
+            #[cfg(target_os = "macos")]
+            wait_until_port_free(self.port);
+        }
     }
 }
 

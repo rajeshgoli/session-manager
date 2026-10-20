@@ -1007,18 +1007,11 @@ fn check_opencode_capacity(
     Ok(())
 }
 fn reserve_opencode_port(config: &OpencodeConfig, occupied: &[SessionRecord]) -> Result<u16> {
-    for port in config.port_range[0]..=config.port_range[1] {
-        if !occupied.iter().any(|record| {
-            record
-                .opencode
-                .as_ref()
-                .is_some_and(|binding| binding.port == port)
-        }) && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
-        {
-            return Ok(port);
-        }
-    }
-    Err(crate::opencode::launch::AdmissionError("no local port free".into()).into())
+    let ports = occupied
+        .iter()
+        .filter_map(|record| record.opencode.as_ref().map(|binding| binding.port))
+        .collect();
+    crate::opencode::launch::lowest_port(config, &ports)
 }
 fn opencode_launch_record(
     record: &SessionRecord,
