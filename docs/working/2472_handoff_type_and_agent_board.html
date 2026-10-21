@@ -86,15 +86,16 @@
 
 <h2>Memo</h2>
 
-<p><b>I recommend two changes, built as one ticket each.</b> First, a handoff can name the agent type of the next agent, once, so you can move a line of work off a scarce quota (for example from Fable to Opus) without stopping it. Second, agents get the two board actions only you have today: file a ticket onto a lane, and Start an agent on it. An orchestrator then never spawns its workers. It puts work on the board, the board starts the workers, and the orchestrator talks to them with <code>sm send</code>.</p>
+<p><b>I recommend two changes, built as one ticket each.</b> First, a handoff can, on the rare occasion a quota runs low, go to a different agent type, once: for example from Claude Opus to Codex Sol, so a line of work continues on the provider that still has quota. The everyday handoff does not change and shows nothing new. Second, agents get the two board actions only you have today: file a ticket onto a lane, and Start an agent on it. An orchestrator then never spawns its workers. It puts work on the board, the board starts the workers, and the orchestrator talks to them with <code>sm send</code>.</p>
 
-<p>Neither change gives an agent a power it lacks today. Agents already pick any model with <code>sm spawn</code> and file issues with <code>gh</code>. The changes move those powers under your rules: your agent types, your board gates, and a switch to turn agent starts off.</p>
+<p>Neither change gives an agent a power it lacks today. Agents already pick any model with <code>sm spawn</code> and file issues with <code>gh</code>. The changes move those powers under your rules: your agent types, the launch configuration your board already holds for each ticket, your board gates, and a switch to turn agent starts off.</p>
 
 <dl class="vocab">
   <dt>Agent type</dt><dd>A named preset you keep in Settings → New agents: a provider, model and effort. Today: <b>Top</b> (Claude, Fable, xhigh), <b>Mid</b> (Claude, Opus 1M, high), <b>Low</b> (Claude, Sonnet, high), plus any you added, up to eight. Your board's Start sheet already picks from this list, and a ticket line <code>Tier: Mid</code> preselects one.</dd>
   <dt>Handoff</dt><dd>What <code>sm handoff</code> does: the agent writes a note, ends its turn, and sm starts a fresh agent in the same worktree with the same tickets, PRs, children and pending wakes, then retires the old one. Today the fresh agent is always the same provider, model and effort.</dd>
   <dt>Line of work</dt><dd>One agent and every successor its handoffs produced (names <code>far-2256</code>, <code>far-2256-h2</code>, <code>-h3</code>…).</dd>
   <dt>Start</dt><dd>The board's button that starts an agent on a ready ticket: it claims the ticket, sets up the worktree, writes the brief from your template, and records the start on the lane. Today only you, signed in, can press it.</dd>
+  <dt>Launch configuration</dt><dd>The agent type (or provider, model and effort) the board holds for a ticket. A ticket captures its lane's <i>Future lane default</i> when it first appears on the board; your Start sheet, a <code>Tier:</code> line, or a saved selection can change it. It is what the Start sheet preselects.</dd>
   <dt>Board agent</dt><dd>An agent created by Start. It has no parent agent; it shows on the board against its ticket.</dd>
   <dt>Orchestrator</dt><dd>Any agent whose job is to run other agents through a plan. Not a registered role; a description.</dd>
 </dl>
@@ -105,18 +106,18 @@
 <tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. Who can change the type of the next agent?</td><td><b>You and the agent.</b> You choose in <i>Hand off…</i> on web, phone and <code>sm watch</code>. The agent chooses with <code>sm handoff --type Mid</code>. If both chose, yours wins.</td><td>You manage quota; the agent knows when the remaining work is mechanical.</td></tr>
+<tr><td>1. Where does the switch live?</td><td><b>Out of the way.</b> <i>Hand off…</i> looks as it does today. One quiet line at its foot, <i>Next agent: same</i>, opens the picker. You can also tell an agent to switch, and it runs <code>sm handoff --type Sol</code>. If both chose, yours wins.</td><td>About one handoff in twenty needs it; the default path must not pay for it.</td></tr>
 <tr><td>2. How long does a choice last?</td><td><b>One handoff.</b> The choice waits for the next handoff, whether you press <i>Hand off now</i> or the context threshold triggers it, and is then used up. The new agent keeps its new type, and its own handoffs copy it. Nothing reverts automatically.</td><td>Predictable: what is running is what continues. To switch back, choose again.</td></tr>
 <tr><td>3. Which types can be chosen?</td><td><b>Only your agent types</b>, plus “Same as now”. No free-form model names.</td><td>One vocabulary across Start, auto-start and handoff; you stay in control of what may run.</td></tr>
-<tr><td>4. May agents Start tickets?</td><td><b>Yes, any agent running in sm</b>, with <code>sm board start</code>. Same gates as your Start, except an agent cannot start a ticket that is blocked, held, waiting on you, or before its start time. You get a switch, <i>Agents can start tickets</i>, default on.</td><td>Agents can already spawn; this routes the same act through your board and rules.</td></tr>
+<tr><td>4. May agents Start tickets?</td><td><b>Yes, any agent running in sm</b>, with <code>sm board start</code>. The agent does not pick the type: the ticket starts with the launch configuration your board holds for it, exactly what your Start sheet would preselect. Same gates as your Start, except an agent cannot start a ticket that is blocked, held, waiting on you, or before its start time. You get a switch, <i>Agents can start tickets</i>, default on.</td><td>Agents can already spawn; this routes the same act through your board, its types and its rules.</td></tr>
 <tr><td>5. Who is the parent of an agent an orchestrator starts?</td><td><b>Nobody.</b> It is a board agent, exactly as if you pressed Start. The board shows <i>Started by far-orch</i>, and sm wakes the orchestrator once when that agent finishes.</td><td>Workers survive the orchestrator's retirement and handoffs; the orchestrator still learns when to act.</td></tr>
-<tr><td>6. Can agents file tickets through sm?</td><td><b>Yes, <code>sm board file</code></b>: creates the GitHub issue and places it on the board in one step (lane, order, type), with <code>--start</code> to start it at once.</td><td>Today it takes <code>gh issue create</code> plus two or three <code>sm board</code> commands, and a missed step leaves the ticket off its lane.</td></tr>
+<tr><td>6. Can agents file tickets through sm?</td><td><b>Yes, <code>sm board file</code></b>: creates the GitHub issue and places it on the board in one step (lane and order), with <code>--start</code> to start it at once. The new ticket takes its lane's launch configuration; an agent cannot set a type.</td><td>Today it takes <code>gh issue create</code> plus two or three <code>sm board</code> commands, and a missed step leaves the ticket off its lane.</td></tr>
 <tr><td>7. What happens to <code>sm spawn</code>?</td><td><b>Nothing.</b> It stays for helpers that are not ticket work (a scout, a one-off research agent).</td><td>Different job; no reason to break it.</td></tr>
 </tbody>
 </table>
 
-<h3>1. Choosing the next agent's type</h3>
-<p><b>The use case is quota.</b> Fable's weekly meter is low on Tuesday and three Fable lines are mid-ticket. You open each agent's <i>Hand off…</i> menu and set <i>Next agent</i> to Mid. Each line continues on Opus at its next handoff, with its note, claims and children intact. When the week resets, you set them back to Top the same way. An agent can do the same for itself: a Top agent that has finished the design part of a ticket and has only mechanical edits left runs <code>sm handoff --type Low</code>.</p>
+<h3>1. Handing off to a different agent type</h3>
+<p><b>The use case is a provider running out of quota, and it is rare.</b> Claude's weekly meter is low on Tuesday and two Opus lines are mid-ticket. You open each agent's <i>Hand off…</i> menu, tap <i>Next agent: same</i> at its foot, and pick your Codex Sol type. Each line continues on Codex at its next handoff, in the same worktree, with its note, claims and children intact. When the week resets you switch them back the same way, or leave them. Every other handoff looks and behaves exactly as today.</p>
 
 <figure>
 <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13">
@@ -126,32 +127,30 @@
   <rect x="300" y="57" width="40" height="20" rx="10" fill="var(--blue)"/><circle cx="330" cy="67" r="8" fill="#fff"/>
   <text x="40" y="100" fill="var(--ink-2)">Hand off at   35%</text>
   <line x1="40" y1="118" x2="360" y2="118" stroke="var(--rule)"/>
-  <text x="40" y="145" font-weight="700" fill="var(--ink)">Next agent</text>
-  <rect x="40" y="157" width="96" height="30" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="52" y="177" fill="var(--ink-2)">Same (Top)</text>
-  <rect x="142" y="157" width="60" height="30" rx="6" fill="var(--blue)"/><text x="158" y="177" fill="#fff" font-weight="700">Mid</text>
-  <rect x="208" y="157" width="60" height="30" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="224" y="177" fill="var(--ink-2)">Low</text>
-  <text x="40" y="208" font-size="12" fill="var(--ink-2)">Claude · Opus 1M · high. For the next handoff only.</text>
-  <line x1="40" y1="225" x2="360" y2="225" stroke="var(--rule)"/>
-  <rect x="40" y="240" width="120" height="32" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="58" y="261" fill="var(--ink)">Hand off now</text>
+  <rect x="40" y="130" width="120" height="32" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="58" y="151" fill="var(--ink)">Hand off now</text>
+  <line x1="40" y1="180" x2="360" y2="180" stroke="var(--rule)"/>
+  <text x="40" y="205" font-size="12" fill="var(--ink-3)">Next agent: same ›</text>
+  <text x="40" y="240" font-size="12" fill="var(--ink-2)">Tapped, the line becomes a list of your types:</text>
+  <text x="40" y="262" font-size="12" fill="var(--ink-2)">Same as now (Opus) · Top · Mid · Low · Sol</text>
   <text x="400" y="40" font-weight="700" fill="var(--ink)">The agent's row, after the choice</text>
   <rect x="400" y="55" width="340" height="60" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/>
-  <text x="415" y="80" fill="var(--ink)" font-weight="700">far-2256-h2</text><text x="520" y="80" fill="var(--ink-2)">Top · 41% context</text>
-  <rect x="415" y="90" width="150" height="18" rx="9" fill="none" stroke="var(--violet)"/><text x="425" y="103" font-size="11" fill="var(--violet)">Next handoff → Mid</text>
+  <text x="415" y="80" fill="var(--ink)" font-weight="700">far-2256-h2</text><text x="520" y="80" fill="var(--ink-2)">Mid · 41% context</text>
+  <rect x="415" y="90" width="150" height="18" rx="9" fill="none" stroke="var(--violet)"/><text x="425" y="103" font-size="11" fill="var(--violet)">Next handoff → Sol</text>
   <text x="400" y="150" font-weight="700" fill="var(--ink)">The agent's own command</text>
   <rect x="400" y="160" width="340" height="80" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/>
-  <text x="412" y="182" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink)">$ sm handoff --type Low</text>
+  <text x="412" y="182" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink)">$ sm handoff --type Sol</text>
   <text x="412" y="202" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink-2)">Note saved. When your turn ends, sm starts</text>
-  <text x="412" y="218" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink-2)">far-2256-h3 as Low (Claude, Sonnet, high).</text>
+  <text x="412" y="218" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink-2)">far-2256-h3 as Sol (Codex, high).</text>
 </svg>
-<figcaption>Figure 1. The existing <i>Hand off…</i> menu gains one row. The choice shows as a chip on the agent until the handoff uses it. The phone and <code>sm watch</code> show the same row and chip.</figcaption>
+<figcaption>Figure 1. The existing <i>Hand off…</i> menu is unchanged except for one quiet line at its foot. The choice shows as a chip on the agent until the handoff uses it. The phone and <code>sm watch</code> show the same row and chip.</figcaption>
 </figure>
 
-<p><b>The agent is told before it writes its note.</b> When a choice is pending, sm's handoff request to the agent names the next type (“your successor will be Mid: Claude, Opus 1M, high”), so the note is written for that reader. A cheaper successor needs more explicit next steps.</p>
+<p><b>The agent is told before it writes its note.</b> When a choice is pending, sm's handoff request to the agent names the next type (“your successor will be Sol: Codex, high”), so the note is written for that reader.</p>
 
-<p><b>Switching provider works too.</b> A choice of a Codex type on a Claude line starts a Codex successor in the same worktree. It reads the same note and holds the same claims. Today's handoff already has a start path for each provider; the change is only which one is chosen.</p>
+<p><b>Switching provider is the main case, and it works.</b> Today's handoff already has a start path for Claude, Codex and the local models; the change is only which one it takes. The Codex successor reads the same note and holds the same claims.</p>
 
 <h3>2. Agents on the board</h3>
-<p><b>The orchestrator puts work on the board instead of spawning it.</b> Today an orchestrator calls <code>sm spawn</code>, and the worker becomes its child. Its place in the agent tree hangs on the orchestrator, and moves at every orchestrator handoff. The worker never appears as a Start on your board's lane history, and the orchestrator invents its own name and brief. With this change the orchestrator files and starts tickets, and every worker is a board agent with your name pattern, your brief template and your checkout. The orchestrator coordinates by <code>sm send</code> and hears back once when each worker finishes.</p>
+<p><b>The orchestrator puts work on the board instead of spawning it.</b> Today an orchestrator calls <code>sm spawn</code>, and the worker becomes its child. Its place in the agent tree hangs on the orchestrator, and moves at every orchestrator handoff. The worker never appears as a Start on your board's lane history, and the orchestrator invents its own name and brief. With this change the orchestrator files and starts tickets, and every worker is a board agent with the ticket's launch configuration, your name pattern, your brief template and your checkout. The orchestrator coordinates by <code>sm send</code> and hears back once when each worker finishes.</p>
 
 <figure>
 <svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13">
@@ -160,7 +159,7 @@
   <text x="95" y="106" text-anchor="middle" font-weight="700" fill="var(--ink)">Orchestrator</text><text x="95" y="124" text-anchor="middle" font-size="12" fill="var(--ink-2)">far-orch</text>
   <rect x="300" y="20" width="170" height="190" rx="8" fill="var(--surface-2)" stroke="var(--ink-3)"/>
   <text x="385" y="44" text-anchor="middle" font-weight="700" fill="var(--ink)">Board (your rules)</text>
-  <text x="315" y="72" font-size="12" fill="var(--ink-2)">• your agent types</text>
+  <text x="315" y="72" font-size="12" fill="var(--ink-2)">• lane / ticket agent type</text>
   <text x="315" y="92" font-size="12" fill="var(--ink-2)">• ready / blocked / held</text>
   <text x="315" y="112" font-size="12" fill="var(--ink-2)">• name pattern, brief</text>
   <text x="315" y="132" font-size="12" fill="var(--ink-2)">• lane history</text>
@@ -180,34 +179,35 @@
 
 <p>What an orchestrator types, and what it sees:</p>
 <pre><code>$ sm board file --title "Replay start from stage_f.pt" --body-file brief.md \
-      --under 2240 --after 2256 --type Mid --start
-Filed rajeshgoli/fractal-algo-rust#2290 under #2240, after #2256. Tier: Mid.
+      --under 2240 --after 2256 --start
+Filed rajeshgoli/fractal-algo-rust#2290 under #2240, after #2256. It starts as Mid, the lane's type.
 #2290 is blocked by #2256, so it was not started. sm board start 2290 once #2256 closes.
 
-$ sm board start 2289 --type Low
-Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
+$ sm board start 2289
+Started far-2289 (a1b2c3d4) as Mid on #2289, the type the board holds for it. sm will wake you when it finishes.
 
 [sm board] far-2289 (a1b2c3d4), which you started on #2289, finished: ran sm task-complete.</code></pre>
 
 <p><b>What you see.</b> The ticket row and lane history read <i>Started by far-orch</i> where they read <i>Started</i> today, and the agent's detail page names its starter. Settings → Board gains one switch, <i>Agents can start tickets</i>. Turning it off makes <code>sm board start</code> and <code>--start</code> fail with “Rajesh turned off agent starts”. Filing still works with the switch off.</p>
 
-<p><b>What agents cannot do.</b> They cannot start a ticket that is blocked by an open ticket, held, waiting on you, or before its not-before time. You can override all four with <i>Start anyway</i>; an agent is told to ask you. They cannot pick a model outside your agent types. They cannot close tickets from the board, reorder lanes, add or remove lanes, or change auto-start. Those stay yours.</p>
+<p><b>What agents cannot do.</b> They cannot start a ticket that is blocked by an open ticket, held, waiting on you, or before its not-before time. You can override all four with <i>Start anyway</i>; an agent is told to ask you. They cannot choose the type: the board's launch configuration for the ticket decides. If an orchestrator thinks a ticket needs a different type, it says so to you. They cannot close tickets from the board, reorder lanes, add or remove lanes, or change auto-start. Those stay yours.</p>
 
 <h3>Risks</h3>
 <table>
 <thead><tr><th style="width:30%">Risk</th><th>Answer</th></tr></thead>
 <tbody>
 <tr><td>A runaway orchestrator starts many agents and burns quota.</td><td>The same is possible today with <code>sm spawn</code>. The switch stops it in one tap. Each start is visible on the board with its starter. I recommend no per-agent cap until we see the need.</td></tr>
-<tr><td>A cheaper successor misreads a hard note.</td><td>The agent is told the successor's type before writing; the choice is yours or the agent's, never automatic.</td></tr>
+<tr><td>A different model misreads the note.</td><td>The agent is told the successor's type before writing; the switch is yours, never automatic.</td></tr>
 <tr><td>A type is removed from Settings while a choice waits for it.</td><td>The handoff uses “Same as now” and the new agent's first message says so; your chip disappears with the type.</td></tr>
 </tbody>
 </table>
 
 <h3>Build order</h3>
-<p>Two tickets, independent file sets, either order: <b>(a)</b> next-agent type at handoff (server handoff, three owner surfaces, CLI); <b>(b)</b> agent board actions (<code>sm board file</code>, <code>sm board start</code>, finish wake, switch, “Started by”). Both are Mid-tier implementation work after this memo converges.</p>
+<p>Two tickets, independent file sets, either order: <b>(a)</b> next-agent type at handoff (server handoff, three owner surfaces, CLI); <b>(b)</b> agent board actions (<code>sm board file</code>, <code>sm board start</code>, finish wake, switch, “Started by”). Both are middle-tier (Opus) implementation work after this memo converges.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>First revision. One reading to confirm: I took “handoff to another agent type as a one-time task” to mean <i>the switch applies to one handoff</i>, after which the new agent carries on as itself (decision 2). If you meant a detour, a cheaper agent does one bounded task and then the line returns to its original type, say so. That is a different feature: it needs a definition of when the detour ends, and I would design it separately.</p>
+<ul><li><b>The handoff switch is now a rare, tucked-away option</b>, framed around a provider (Claude to Codex) running low. It no longer adds a visible control to every handoff. The agent's <code>--type</code> is for when you tell it to switch.</li><li><b>Agents no longer choose a type on the board.</b> <code>sm board start</code> and <code>sm board file</code> use the launch configuration the board holds for the ticket, which comes from its lane. Lanes hold one default type today, not a list of allowed types; I recommend not adding a list.</li></ul>
+<p>One reading still to confirm: I took “handoff to another agent type as a one-time task” to mean <i>the switch applies to one handoff</i>, after which the new agent carries on as itself (decision 2). If you meant a detour, a cheaper agent does one bounded task and then the line returns to its original type, say so. That is a different feature: it needs a definition of when the detour ends, and I would design it separately.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -234,8 +234,8 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 
 <h4>A.2 Who writes it</h4>
 <ul>
-<li><b>Owner:</b> <code>PUT /sessions/{id}/handoff-policy</code> accepts <code>{"next_type": "Mid"}</code> to set and <code>{"next_type": null}</code> to clear. <code>"Same"</code> is the same as null. It can be combined with <code>ask_now: true</code> in one body; the web and phone <i>Hand off now</i> send both. Owner guard unchanged. Unknown name → 400 <code>No agent type named "X". Choose one from Settings → New agents.</code></li>
-<li><b>Agent:</b> <code>sm handoff --type NAME</code>, sent as a <code>next_type</code> field in <code>POST /sessions/{id}/handoff</code>. An agent may also run <code>sm handoff --type NAME</code> with no note change to retarget a handoff it already submitted while still in the accepted state. If an owner choice exists, the agent's is ignored and the CLI prints <code>Rajesh chose Mid for your successor; your --type Low was not used.</code> Exit 0.</li>
+<li><b>Owner:</b> <code>PUT /sessions/{id}/handoff-policy</code> accepts <code>{"next_type": "Mid"}</code> to set and <code>{"next_type": null}</code> to clear. <code>"Same"</code> is the same as null. It can be combined with <code>ask_now: true</code> in one body. Owner guard unchanged. Unknown name → 400 <code>No agent type named "X". Choose one from Settings → New agents.</code></li>
+<li><b>Agent:</b> <code>sm handoff --type NAME</code>, sent as a <code>next_type</code> field in <code>POST /sessions/{id}/handoff</code>. The CLI help says it is for when the owner asks for a different type. An agent may also run <code>sm handoff --type NAME</code> with no note change to retarget a handoff it already submitted while still in the accepted state. If an owner choice exists, the agent's is ignored and the CLI prints <code>Rajesh chose Mid for your successor; your --type Low was not used.</code> Exit 0.</li>
 <li><code>sm handoff --type</code> accepts type names case-insensitively, and <code>same</code>.</li>
 </ul>
 
@@ -264,13 +264,14 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 
 <h3 id="b">B. <code>sm board start</code> for agents</h3>
 <h4>B.1 CLI</h4>
-<pre><code>sm board start TICKET [--type NAME] [--brief-file PATH] [--name NAME] [--repo REPO]</code></pre>
+<pre><code>sm board start TICKET [--brief-file PATH] [--name NAME] [--repo REPO]</code></pre>
+<p>There is no type flag.</p>
 <p><code>TICKET</code> follows the existing <code>sm board</code> ticket syntax (plain number in the cwd repo, or <code>owner/name#N</code>). Requires a managed session (<code>CLAUDE_SESSION_MANAGER_ID</code>); from a plain shell it fails with <code>sm board start runs from an agent; on the board, press Start.</code></p>
 
 <h4>B.2 Route</h4>
-<p><code>POST /board/start</code>, session-authenticated like the other agent board routes (<code>ensure_session_allowed_from_parts</code>, <code>http/board.rs</code>). Body: <code>{repo, number, type?, brief?, name?}</code>. It calls the same <code>start()</code> as <code>/client/board/start</code> with:</p>
+<p><code>POST /board/start</code>, session-authenticated like the other agent board routes (<code>ensure_session_allowed_from_parts</code>, <code>http/board.rs</code>). Body: <code>{repo, number, brief?, name?}</code>; an unknown field (including <code>type</code>, <code>provider</code>, <code>model</code>, <code>reasoning_effort</code>) is a 400. It calls the same <code>start()</code> as <code>/client/board/start</code> with:</p>
 <ul>
-<li><b>Type resolution:</b> <code>type</code> if given (must be an agent type name, else 400). Else the ticket's <code>Tier:</code> line. Else the type the owner's Start sheet preselects for that ticket (same function, so the two never disagree). Provider, model and effort come only from the resolved type.</li>
+<li><b>Type:</b> the board's existing resolution for the ticket (<code>board/launch.rs</code> <code>resolve</code>: auto-start authorization, then the ticket's saved selection, then its <code>Tier:</code> line, then its lane's default, then global defaults). It is the same function the Start sheet preselects with, so the two never disagree. The success line names the type and its source, e.g. <code>as Mid (lane default)</code>.</li>
 <li><b>Brief:</b> the owner's message template as today, with <code>brief</code>, if given, appended under a line <code>From far-orch (8156d6df), who started you:</code>. The brief also ends with: <code>far-orch started you. Reach it with sm send far-orch; sm tells it when you finish.</code></li>
 <li><b>Name:</b> owner's name pattern unless <code>name</code> given; same uniqueness rules.</li>
 <li><b>Gates:</b> <code>validate_start</code> with <code>start_blocked=false</code>, plus: not-before must have passed (no early start), not held, not waiting on owner. Owner-only overrides are never available.</li>
@@ -300,12 +301,12 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 
 <h3 id="c">C. <code>sm board file</code></h3>
 <pre><code>sm board file --title TEXT (--body-file PATH | --body TEXT) [--under GOAL] [--after N...]
-              [--type NAME] [--start] [--repo REPO]</code></pre>
+              [--start] [--repo REPO]</code></pre>
 <p>Route <code>POST /board/issues</code>, session-authenticated. Steps, in order:</p>
 <ol>
-<li>Validate everything first: <code>--type</code> is an agent type; <code>--under</code> and each <code>--after</code> exist in the repo. Any failure → nothing is created.</li>
-<li>Create the issue through the board source's <code>create_issue</code> (the same path the owner's notes use). Body is the given body, then <code>Tier: NAME</code> if <code>--type</code>, then <code>Filed by far-orch `8156d6df` via sm.</code> Then any <code>Starts after #N</code> lines for people, as CLAUDE.md asks.</li>
-<li>Record <code>under</code> and <code>after</code> links (same code as <code>sm board under</code>/<code>after</code>).</li>
+<li>Validate everything first: <code>--under</code> and each <code>--after</code> exist in the repo. A body containing a <code>Tier:</code> line is refused (<code>Agents can't set a ticket's type; the lane decides. Remove the Tier line.</code>). Any failure → nothing is created.</li>
+<li>Create the issue through the board source's <code>create_issue</code> (the same path the owner's notes use). Body is the given body, then <code>Filed by far-orch `8156d6df` via sm.</code> Then any <code>Starts after #N</code> lines for people, as CLAUDE.md asks.</li>
+<li>Record <code>under</code> and <code>after</code> links (same code as <code>sm board under</code>/<code>after</code>). The ticket then captures its lane's default launch configuration exactly as any ticket new to the board does.</li>
 <li>If <code>--start</code>: refresh the ticket and run B.2. A refusal is not an error of <code>file</code>: exit 0, print the refusal as a second line (memo example).</li>
 </ol>
 <p>Partial failure after the issue exists (step 3 or 4): print the issue number and the failed step with the command to finish it, exit 1. No rollback; the issue stays.</p>
@@ -315,10 +316,10 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 <table>
 <thead><tr><th>Surface</th><th>Change</th><th>Code</th></tr></thead>
 <tbody>
-<tr><td>Web, Hand off… popover</td><td>“Next agent” segmented control (Same + types), caption with provider · model · effort and “For the next handoff only.” Wraps on narrow widths; selected segment uses the existing <code>btn sm on</code> style.</td><td><code>web/handoff.js</code>, <code>web/agents.js</code></td></tr>
-<tr><td>Web, agent row</td><td>Chip “Next handoff → Mid” when pending; tapping opens the popover.</td><td><code>web/agents.js</code></td></tr>
-<tr><td>Android</td><td>Same row in the handoff controls sheet, as chips; same row chip.</td><td><code>ui/handoff/HandoffControls.kt</code>, <code>HandoffViewModel</code></td></tr>
-<tr><td><code>sm watch</code></td><td>In the handoff panel, a “Next agent” line; <code>t</code> cycles types.</td><td><code>bin/watch/handoff.rs</code></td></tr>
+<tr><td>Web, Hand off… popover</td><td>One muted line at the foot, “Next agent: same ›”. Tapping expands it in place into a list: “Same as now (current type)” then each agent type with provider · model · effort, and the caption “For the next handoff only.” Collapsed again once chosen; the line then reads “Next agent: Sol ›” in the normal text colour.</td><td><code>web/handoff.js</code>, <code>web/agents.js</code></td></tr>
+<tr><td>Web, agent row</td><td>Chip “Next handoff → Sol” when pending; tapping opens the popover.</td><td><code>web/agents.js</code></td></tr>
+<tr><td>Android</td><td>Same foot line in the handoff controls sheet, expanding to a list; same row chip.</td><td><code>ui/handoff/HandoffControls.kt</code>, <code>HandoffViewModel</code></td></tr>
+<tr><td><code>sm watch</code></td><td>In the handoff panel, a dim “Next agent: same” line; <code>t</code> cycles types.</td><td><code>bin/watch/handoff.rs</code></td></tr>
 <tr><td>Board row, lane history, agent detail (web and Android)</td><td>“Started by far-orch” where an agent started it; links to the starter.</td><td><code>web/board.js</code>, <code>ui/board/BoardScreen.kt</code></td></tr>
 <tr><td>Settings → Board (web and Android)</td><td>Toggle “Agents can start tickets”, subtitle “Agents use your agent types and can't start blocked or held tickets.”</td><td><code>web/settings.js</code>, Android settings</td></tr>
 </tbody>
@@ -328,8 +329,8 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 <h3 id="e">E. Tests</h3>
 <ul>
 <li>Handoff: choice applied (provider switch claude→codex-fork; same-provider model switch); owner beats agent; deleted type falls back with brief line; cleared on success, kept on failed start; ask text includes successor type; <code>/clear</code> path converts to successor when a type is pending.</li>
-<li>Board start: each gate refusal text; switch off → 403; type resolution order; no parent; <code>board_starts</code> row; finish wake on task-complete and on retire; no wake on worker handoff; starter handoff moves the row (<code>every_session_id_column_is_classified</code> stays green).</li>
-<li>Board file: validation-before-create; body footer and Tier line; links recorded; <code>--start</code> refusal exits 0; partial failure exits 1 with instructions.</li>
+<li>Board start: each gate refusal text; switch off → 403; type equals the Start sheet's preselection for the same ticket, and a type field is a 400; no parent; <code>board_starts</code> row; finish wake on task-complete and on retire; no wake on worker handoff; starter handoff moves the row (<code>every_session_id_column_is_classified</code> stays green).</li>
+<li>Board file: validation-before-create; body footer; Tier line refused; lane default captured; links recorded; <code>--start</code> refusal exits 0; partial failure exits 1 with instructions.</li>
 <li>Owner routes unchanged: <code>/client/board/start</code> still rejects session headers.</li>
 </ul>
 
@@ -339,7 +340,8 @@ Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
 <tbody>
 <tr><td>Owner and agent choose next type; owner wins</td><td>A.2</td></tr>
 <tr><td>One handoff, no revert</td><td>A.3 (cleared on success)</td></tr>
-<tr><td>Only agent types</td><td>A.2, B.2</td></tr>
+<tr><td>Only agent types at handoff; board decides type for agent starts</td><td>A.2, B.2, C</td></tr>
+<tr><td>Switch is out of the way</td><td>D</td></tr>
 <tr><td>Agent is told before writing</td><td>A.3</td></tr>
 <tr><td>Agents start with your gates minus overrides; switch</td><td>B.2</td></tr>
 <tr><td>No parent; Started by; one finish wake</td><td>B.2, B.3, D</td></tr>
