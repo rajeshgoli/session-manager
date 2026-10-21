@@ -47,11 +47,29 @@ def validate_strings(value):
 def extract(request):
     excluded = set(request['excluded'])
     prefixes = ('[Input from: ', '[sm ', *request['harness_tags'])
-    enqueued = collections.Counter()
+    # Queued prompts no user record has consumed yet, kept until one decides.
+    enqueued = collections.defaultdict(collections.deque)
     last_codex = None
     kept = []
     size = 0
     cutoff = None
+
+    def keep(at, sequence, text):
+        nonlocal size, cutoff
+        key = (at, sequence)
+        if cutoff is not None and key <= cutoff:
+            return
+        entry = (at, sequence, text, len(text.encode('utf-8')))
+        bisect.insort(kept, entry)
+        size += entry[3]
+        # Stable timestamp order matches the final Rust merge. The cutoff
+        # preserves the first non-fitting message as a barrier even when
+        # timestamps arrive out of order. Never split the newest message.
+        while size > 80_000 and len(kept) > 1:
+            removed = kept.pop(0)
+            size -= removed[3]
+            cutoff = removed[:2]
+
     try:
         source = open(os.path.expanduser(request['path']), encoding='utf-8')
     except FileNotFoundError:
@@ -92,31 +110,30 @@ def extract(request):
             trimmed = whitespace.sub('', text, count=1) if whitespace.match(text) else text
             if not normalized or trimmed.startswith(prefixes) or normalized in excluded:
                 continue
+            at = field(event, 'timestamp')
+            at = at if isinstance(at, str) else ''
             if queue:
-                enqueued[normalized] += 1
-            elif enqueued[normalized] > 0:
-                enqueued[normalized] -= 1
+                enqueued[normalized].append((at, sequence, text))
+                continue
+            if enqueued[normalized]:
+                queued = enqueued[normalized].popleft()
+                # Claude marks prompts the harness made (a CronCreate fire, a
+                # permission grant, an image caption) isMeta: never the owner's.
+                if field(event, 'isMeta') is not True:
+                    keep(*queued)
+                continue
+            if field(event, 'isMeta') is True:
                 continue
             if kind in ('response_item', 'event_msg'):
                 if last_codex is not None and last_codex[0] != kind and last_codex[1] == normalized:
                     last_codex = None
                     continue
                 last_codex = (kind, normalized)
-            at = field(event, 'timestamp')
-            at = at if isinstance(at, str) else ''
-            key = (at, sequence)
-            if cutoff is not None and key <= cutoff:
-                continue
-            entry = (at, sequence, text, len(text.encode('utf-8')))
-            bisect.insort(kept, entry)
-            size += entry[3]
-            # Stable timestamp order matches the final Rust merge. The cutoff
-            # preserves the first non-fitting message as a barrier even when
-            # timestamps arrive out of order. Never split the newest message.
-            while size > 80_000 and len(kept) > 1:
-                removed = kept.pop(0)
-                size -= removed[3]
-                cutoff = removed[:2]
+            keep(at, sequence, text)
+    # A queued prompt Claude absorbed mid-turn has no user record.
+    for queued in enqueued.values():
+        for entry in queued:
+            keep(*entry)
     return {'messages': [[at, text] for at, _, text, _ in kept],
             'cutoff': cutoff[0] if cutoff is not None else None}
 

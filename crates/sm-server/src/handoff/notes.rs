@@ -3,6 +3,7 @@ use super::*;
 use crate::handoff::execute::HandoffNote;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
@@ -1019,8 +1020,9 @@ fn transcript_messages_reader(
     reader: impl BufRead,
     excluded: &BTreeSet<String>,
 ) -> Result<Vec<(String, String)>> {
-    let mut result: Vec<(String, String)> = vec![];
-    let mut enqueued = BTreeMap::<String, usize>::new();
+    let mut result: Vec<Option<(String, String)>> = vec![];
+    // Result slots of queued prompts no user record has consumed yet.
+    let mut enqueued = BTreeMap::<String, VecDeque<usize>>::new();
     let mut last_codex: Option<(String, String)> = None;
     for line in reader.lines() {
         let line = line?;
@@ -1073,12 +1075,20 @@ fn transcript_messages_reader(
             continue;
         }
         if queue {
-            *enqueued.entry(normalized.clone()).or_default() += 1;
-        } else if let Some(count) = enqueued.get_mut(&normalized) {
-            if *count > 0 {
-                *count -= 1;
-                continue;
+            enqueued
+                .entry(normalized.clone())
+                .or_default()
+                .push_back(result.len());
+        } else if let Some(slot) = enqueued.get_mut(&normalized).and_then(VecDeque::pop_front) {
+            // Claude marks prompts the harness made (a CronCreate fire, a
+            // permission grant, an image caption) isMeta: never the owner's.
+            if event["isMeta"] == true {
+                result[slot] = None;
             }
+            continue;
+        }
+        if event["isMeta"] == true {
+            continue;
         }
         if matches!(kind, "response_item" | "event_msg") {
             if last_codex
@@ -1092,12 +1102,12 @@ fn transcript_messages_reader(
             }
             last_codex = Some((kind.into(), normalized));
         }
-        result.push((
+        result.push(Some((
             event["timestamp"].as_str().unwrap_or_default().to_owned(),
             text,
-        ));
+        )));
     }
-    Ok(result)
+    Ok(result.into_iter().flatten().collect())
 }
 
 pub fn render_notes(view: &Value) -> String {
@@ -1655,7 +1665,11 @@ mod tests {
         let inputs = transcript_messages(&transcript, &excluded).unwrap();
         assert_eq!(
             inputs.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
-            vec!["<div>Keep my HTML</div>", "Human queued message"]
+            vec![
+                "<div>Keep my HTML</div>",
+                "Human queued message",
+                "Absorbed mid turn"
+            ]
         );
         fs::write(&transcript, "{bad json}").unwrap();
         assert!(transcript_messages(&transcript, &excluded).is_err());
