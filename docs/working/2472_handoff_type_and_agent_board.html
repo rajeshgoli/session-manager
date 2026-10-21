@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2472 — Choose the next agent; agents work the board</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2472 — Choose the next agent at handoff; let agents work the board</h1>
+<p class="sans"><small>Author: Claude (Opus 5.5) <code>8156d6df</code> · Ticket #2472 · 2026-10-21</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend two changes, built as one ticket each.</b> First, a handoff can name the agent type of the next agent, once, so you can move a line of work off a scarce quota (for example from Fable to Opus) without stopping it. Second, agents get the two board actions only you have today: file a ticket onto a lane, and Start an agent on it. An orchestrator then never spawns its workers. It puts work on the board, the board starts the workers, and the orchestrator talks to them with <code>sm send</code>.</p>
+
+<p>Neither change gives an agent a power it lacks today. Agents already pick any model with <code>sm spawn</code> and file issues with <code>gh</code>. The changes move those powers under your rules: your agent types, your board gates, and a switch to turn agent starts off.</p>
+
+<dl class="vocab">
+  <dt>Agent type</dt><dd>A named preset you keep in Settings → New agents: a provider, model and effort. Today: <b>Top</b> (Claude, Fable, xhigh), <b>Mid</b> (Claude, Opus 1M, high), <b>Low</b> (Claude, Sonnet, high), plus any you added, up to eight. Your board's Start sheet already picks from this list, and a ticket line <code>Tier: Mid</code> preselects one.</dd>
+  <dt>Handoff</dt><dd>What <code>sm handoff</code> does: the agent writes a note, ends its turn, and sm starts a fresh agent in the same worktree with the same tickets, PRs, children and pending wakes, then retires the old one. Today the fresh agent is always the same provider, model and effort.</dd>
+  <dt>Line of work</dt><dd>One agent and every successor its handoffs produced (names <code>far-2256</code>, <code>far-2256-h2</code>, <code>-h3</code>…).</dd>
+  <dt>Start</dt><dd>The board's button that starts an agent on a ready ticket: it claims the ticket, sets up the worktree, writes the brief from your template, and records the start on the lane. Today only you, signed in, can press it.</dd>
+  <dt>Board agent</dt><dd>An agent created by Start. It has no parent agent; it shows on the board against its ticket.</dd>
+  <dt>Orchestrator</dt><dd>Any agent whose job is to run other agents through a plan. Not a registered role; a description.</dd>
+</dl>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Who can change the type of the next agent?</td><td><b>You and the agent.</b> You choose in <i>Hand off…</i> on web, phone and <code>sm watch</code>. The agent chooses with <code>sm handoff --type Mid</code>. If both chose, yours wins.</td><td>You manage quota; the agent knows when the remaining work is mechanical.</td></tr>
+<tr><td>2. How long does a choice last?</td><td><b>One handoff.</b> The choice waits for the next handoff, whether you press <i>Hand off now</i> or the context threshold triggers it, and is then used up. The new agent keeps its new type, and its own handoffs copy it. Nothing reverts automatically.</td><td>Predictable: what is running is what continues. To switch back, choose again.</td></tr>
+<tr><td>3. Which types can be chosen?</td><td><b>Only your agent types</b>, plus “Same as now”. No free-form model names.</td><td>One vocabulary across Start, auto-start and handoff; you stay in control of what may run.</td></tr>
+<tr><td>4. May agents Start tickets?</td><td><b>Yes, any agent running in sm</b>, with <code>sm board start</code>. Same gates as your Start, except an agent cannot start a ticket that is blocked, held, waiting on you, or before its start time. You get a switch, <i>Agents can start tickets</i>, default on.</td><td>Agents can already spawn; this routes the same act through your board and rules.</td></tr>
+<tr><td>5. Who is the parent of an agent an orchestrator starts?</td><td><b>Nobody.</b> It is a board agent, exactly as if you pressed Start. The board shows <i>Started by far-orch</i>, and sm wakes the orchestrator once when that agent finishes.</td><td>Workers survive the orchestrator's retirement and handoffs; the orchestrator still learns when to act.</td></tr>
+<tr><td>6. Can agents file tickets through sm?</td><td><b>Yes, <code>sm board file</code></b>: creates the GitHub issue and places it on the board in one step (lane, order, type), with <code>--start</code> to start it at once.</td><td>Today it takes <code>gh issue create</code> plus two or three <code>sm board</code> commands, and a missed step leaves the ticket off its lane.</td></tr>
+<tr><td>7. What happens to <code>sm spawn</code>?</td><td><b>Nothing.</b> It stays for helpers that are not ticket work (a scout, a one-off research agent).</td><td>Different job; no reason to break it.</td></tr>
+</tbody>
+</table>
+
+<h3>1. Choosing the next agent's type</h3>
+<p><b>The use case is quota.</b> Fable's weekly meter is low on Tuesday and three Fable lines are mid-ticket. You open each agent's <i>Hand off…</i> menu and set <i>Next agent</i> to Mid. Each line continues on Opus at its next handoff, with its note, claims and children intact. When the week resets, you set them back to Top the same way. An agent can do the same for itself: a Top agent that has finished the design part of a ticket and has only mechanical edits left runs <code>sm handoff --type Low</code>.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13">
+  <rect x="20" y="10" width="360" height="280" rx="10" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="40" y="40" font-weight="700" fill="var(--ink)">Hand off — far-2256-h2</text>
+  <text x="40" y="70" fill="var(--ink-2)">Hand off automatically</text>
+  <rect x="300" y="57" width="40" height="20" rx="10" fill="var(--blue)"/><circle cx="330" cy="67" r="8" fill="#fff"/>
+  <text x="40" y="100" fill="var(--ink-2)">Hand off at   35%</text>
+  <line x1="40" y1="118" x2="360" y2="118" stroke="var(--rule)"/>
+  <text x="40" y="145" font-weight="700" fill="var(--ink)">Next agent</text>
+  <rect x="40" y="157" width="96" height="30" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="52" y="177" fill="var(--ink-2)">Same (Top)</text>
+  <rect x="142" y="157" width="60" height="30" rx="6" fill="var(--blue)"/><text x="158" y="177" fill="#fff" font-weight="700">Mid</text>
+  <rect x="208" y="157" width="60" height="30" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="224" y="177" fill="var(--ink-2)">Low</text>
+  <text x="40" y="208" font-size="12" fill="var(--ink-2)">Claude · Opus 1M · high. For the next handoff only.</text>
+  <line x1="40" y1="225" x2="360" y2="225" stroke="var(--rule)"/>
+  <rect x="40" y="240" width="120" height="32" rx="6" fill="var(--surface)" stroke="var(--rule)"/><text x="58" y="261" fill="var(--ink)">Hand off now</text>
+  <text x="400" y="40" font-weight="700" fill="var(--ink)">The agent's row, after the choice</text>
+  <rect x="400" y="55" width="340" height="60" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="415" y="80" fill="var(--ink)" font-weight="700">far-2256-h2</text><text x="520" y="80" fill="var(--ink-2)">Top · 41% context</text>
+  <rect x="415" y="90" width="150" height="18" rx="9" fill="none" stroke="var(--violet)"/><text x="425" y="103" font-size="11" fill="var(--violet)">Next handoff → Mid</text>
+  <text x="400" y="150" font-weight="700" fill="var(--ink)">The agent's own command</text>
+  <rect x="400" y="160" width="340" height="80" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/>
+  <text x="412" y="182" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink)">$ sm handoff --type Low</text>
+  <text x="412" y="202" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink-2)">Note saved. When your turn ends, sm starts</text>
+  <text x="412" y="218" font-family="ui-monospace, Menlo, monospace" font-size="11.5" fill="var(--ink-2)">far-2256-h3 as Low (Claude, Sonnet, high).</text>
+</svg>
+<figcaption>Figure 1. The existing <i>Hand off…</i> menu gains one row. The choice shows as a chip on the agent until the handoff uses it. The phone and <code>sm watch</code> show the same row and chip.</figcaption>
+</figure>
+
+<p><b>The agent is told before it writes its note.</b> When a choice is pending, sm's handoff request to the agent names the next type (“your successor will be Mid: Claude, Opus 1M, high”), so the note is written for that reader. A cheaper successor needs more explicit next steps.</p>
+
+<p><b>Switching provider works too.</b> A choice of a Codex type on a Claude line starts a Codex successor in the same worktree. It reads the same note and holds the same claims. Today's handoff already has a start path for each provider; the change is only which one is chosen.</p>
+
+<h3>2. Agents on the board</h3>
+<p><b>The orchestrator puts work on the board instead of spawning it.</b> Today an orchestrator calls <code>sm spawn</code>, and the worker becomes its child. Its place in the agent tree hangs on the orchestrator, and moves at every orchestrator handoff. The worker never appears as a Start on your board's lane history, and the orchestrator invents its own name and brief. With this change the orchestrator files and starts tickets, and every worker is a board agent with your name pattern, your brief template and your checkout. The orchestrator coordinates by <code>sm send</code> and hears back once when each worker finishes.</p>
+
+<figure>
+<svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <rect x="20" y="80" width="150" height="60" rx="8" fill="var(--surface-2)" stroke="var(--violet)" stroke-width="2"/>
+  <text x="95" y="106" text-anchor="middle" font-weight="700" fill="var(--ink)">Orchestrator</text><text x="95" y="124" text-anchor="middle" font-size="12" fill="var(--ink-2)">far-orch</text>
+  <rect x="300" y="20" width="170" height="190" rx="8" fill="var(--surface-2)" stroke="var(--ink-3)"/>
+  <text x="385" y="44" text-anchor="middle" font-weight="700" fill="var(--ink)">Board (your rules)</text>
+  <text x="315" y="72" font-size="12" fill="var(--ink-2)">• your agent types</text>
+  <text x="315" y="92" font-size="12" fill="var(--ink-2)">• ready / blocked / held</text>
+  <text x="315" y="112" font-size="12" fill="var(--ink-2)">• name pattern, brief</text>
+  <text x="315" y="132" font-size="12" fill="var(--ink-2)">• lane history</text>
+  <text x="315" y="152" font-size="12" fill="var(--ink-2)">• “Agents can start” switch</text>
+  <rect x="600" y="30" width="140" height="50" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/><text x="670" y="60" text-anchor="middle" fill="var(--ink)">far-2290 (Mid)</text>
+  <rect x="600" y="140" width="140" height="50" rx="8" fill="var(--surface-2)" stroke="var(--rule)"/><text x="670" y="170" text-anchor="middle" fill="var(--ink)">far-2291 (Low)</text>
+  <line x1="170" y1="100" x2="296" y2="80" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="185" y="72" font-size="11.5" fill="var(--ink-2)">sm board file / start</text>
+  <line x1="470" y1="70" x2="596" y2="55" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <line x1="470" y1="160" x2="596" y2="165" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="490" y="190" font-size="11.5" fill="var(--ink-2)">Start (no parent)</text>
+  <path d="M600,190 C420,240 220,220 120,142" fill="none" stroke="var(--green)" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+  <text x="250" y="226" font-size="11.5" fill="var(--green)">one [sm board] wake when a worker finishes</text>
+  <path d="M170,90 C330,0 520,0 598,40" fill="none" stroke="var(--violet)" stroke-dasharray="2 4"/>
+  <text x="520" y="16" font-size="11.5" fill="var(--violet)">sm send, both ways</text>
+</svg>
+<figcaption>Figure 2. The orchestrator never spawns. Workers are board agents; the orchestrator coordinates by message.</figcaption>
+</figure>
+
+<p>What an orchestrator types, and what it sees:</p>
+<pre><code>$ sm board file --title "Replay start from stage_f.pt" --body-file brief.md \
+      --under 2240 --after 2256 --type Mid --start
+Filed rajeshgoli/fractal-algo-rust#2290 under #2240, after #2256. Tier: Mid.
+#2290 is blocked by #2256, so it was not started. sm board start 2290 once #2256 closes.
+
+$ sm board start 2289 --type Low
+Started far-2289 (a1b2c3d4) as Low on #2289. sm will wake you when it finishes.
+
+[sm board] far-2289 (a1b2c3d4), which you started on #2289, finished: ran sm task-complete.</code></pre>
+
+<p><b>What you see.</b> The ticket row and lane history read <i>Started by far-orch</i> where they read <i>Started</i> today, and the agent's detail page names its starter. Settings → Board gains one switch, <i>Agents can start tickets</i>. Turning it off makes <code>sm board start</code> and <code>--start</code> fail with “Rajesh turned off agent starts”. Filing still works with the switch off.</p>
+
+<p><b>What agents cannot do.</b> They cannot start a ticket that is blocked by an open ticket, held, waiting on you, or before its not-before time. You can override all four with <i>Start anyway</i>; an agent is told to ask you. They cannot pick a model outside your agent types. They cannot close tickets from the board, reorder lanes, add or remove lanes, or change auto-start. Those stay yours.</p>
+
+<h3>Risks</h3>
+<table>
+<thead><tr><th style="width:30%">Risk</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>A runaway orchestrator starts many agents and burns quota.</td><td>The same is possible today with <code>sm spawn</code>. The switch stops it in one tap. Each start is visible on the board with its starter. I recommend no per-agent cap until we see the need.</td></tr>
+<tr><td>A cheaper successor misreads a hard note.</td><td>The agent is told the successor's type before writing; the choice is yours or the agent's, never automatic.</td></tr>
+<tr><td>A type is removed from Settings while a choice waits for it.</td><td>The handoff uses “Same as now” and the new agent's first message says so; your chip disappears with the type.</td></tr>
+</tbody>
+</table>
+
+<h3>Build order</h3>
+<p>Two tickets, independent file sets, either order: <b>(a)</b> next-agent type at handoff (server handoff, three owner surfaces, CLI); <b>(b)</b> agent board actions (<code>sm board file</code>, <code>sm board start</code>, finish wake, switch, “Started by”). Both are Mid-tier implementation work after this memo converges.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>First revision. One reading to confirm: I took “handoff to another agent type as a one-time task” to mean <i>the switch applies to one handoff</i>, after which the new agent carries on as itself (decision 2). If you meant a detour, a cheaper agent does one bounded task and then the line returns to its original type, say so. That is a different feature: it needs a definition of when the detour ends, and I would design it separately.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<div class="toc">
+  <div><a href="#a">A. Next-agent type at handoff</a></div>
+  <div><a href="#b">B. sm board start for agents</a></div>
+  <div><a href="#c">C. sm board file</a></div>
+  <div><a href="#d">D. Owner surfaces</a></div>
+  <div><a href="#e">E. Tests</a></div>
+  <div><a href="#f">F. Requirement trace</a></div>
+  <div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Next-agent type at handoff</h3>
+<h4>A.1 Persisted shape</h4>
+<p>A per-session pending choice, stored with the session's handoff policy override (<code>handoff/policy.rs</code> session overrides, owner-settings store):<sup>1</sup></p>
+<pre><code>next_type: {
+  name: "Mid",                 // agent type name at choice time
+  provider: "claude", model: "opus[1m]", effort: "high",   // snapshot at choice time
+  chosen_by: "owner" | "agent",
+  chosen_at: RFC3339
+} | null</code></pre>
+<p>The snapshot is resolved again by <code>name</code> at handoff time. If the name still exists, its current provider, model and effort are used. If it is gone, the choice is dropped (see A.4). The snapshot exists only to render the chip and messages if the type is later renamed.</p>
+
+<h4>A.2 Who writes it</h4>
+<ul>
+<li><b>Owner:</b> <code>PUT /sessions/{id}/handoff-policy</code> accepts <code>{"next_type": "Mid"}</code> to set and <code>{"next_type": null}</code> to clear. <code>"Same"</code> is the same as null. It can be combined with <code>ask_now: true</code> in one body; the web and phone <i>Hand off now</i> send both. Owner guard unchanged. Unknown name → 400 <code>No agent type named "X". Choose one from Settings → New agents.</code></li>
+<li><b>Agent:</b> <code>sm handoff --type NAME</code>, sent as a <code>next_type</code> field in <code>POST /sessions/{id}/handoff</code>. An agent may also run <code>sm handoff --type NAME</code> with no note change to retarget a handoff it already submitted while still in the accepted state. If an owner choice exists, the agent's is ignored and the CLI prints <code>Rajesh chose Mid for your successor; your --type Low was not used.</code> Exit 0.</li>
+<li><code>sm handoff --type</code> accepts type names case-insensitively, and <code>same</code>.</li>
+</ul>
+
+<h4>A.3 Use</h4>
+<ul>
+<li><code>claim_handoff_start</code> (<code>handoff/transfer.rs</code>) builds <code>SuccessorPlan</code> from the predecessor's provider, model and effort, then applies the resolved choice to those three fields. Worktree, node, parent and name are unchanged. <code>create_successor</code> (<code>http/handoff.rs</code>) already branches on <code>plan.provider</code>, so a provider switch takes the right start path.</li>
+<li>Node support: if the chosen provider cannot run on the predecessor's node (<code>ensure_core_runtime_request_node_supported</code>), the owner PUT and the agent's <code>--type</code> fail at choice time with the node's reason, not at handoff.</li>
+<li>The choice is cleared in the same transaction that records the successor as started. A failed start (D.6 failure path) keeps it, so a retry uses it.</li>
+<li>The successor's brief gains one line after the first: <code>You run as Mid (claude, opus[1m], high); your predecessor ran as Top (claude, fable, xhigh).</code> Only when they differ.</li>
+<li>The context-management ask text (<code>handoff/policy.rs</code> ~736, and its variants in <code>store.rs</code> and <code>notes.rs</code>) gains, when a choice is pending: <code> Your successor will be Mid (Claude, Opus 1M, high); write the note for it.</code> If the choice is set after the ask was sent, sm sends a one-line <code>[sm context management]</code> follow-up with the same sentence.</li>
+<li>The parent notice (<code>parent_notice_text</code>) names the new type when it differs.</li>
+<li>Session records already store provider, model and effort per session; nothing else about the line records types.</li>
+</ul>
+
+<h4>A.4 Edge cases</h4>
+<table>
+<thead><tr><th>Case</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td>Type deleted before handoff</td><td>Use predecessor's kind; successor brief line: <code>Rajesh's choice "Mid" no longer exists, so you run as your predecessor did.</code></td></tr>
+<tr><td>Chosen type equals current kind</td><td>Stored as null; the chip is not shown.</td></tr>
+<tr><td>Handoff by <code>/clear</code> (same session reused, opencode clear path)</td><td>When a type is pending, sm starts a successor instead of clearing in place, because the kind changes.</td></tr>
+<tr><td>Session retired with a pending choice</td><td>Choice deleted with the session.</td></tr>
+<tr><td>Owner clears the choice after the agent ran <code>sm handoff</code></td><td>Successor uses the predecessor's kind, or the agent's own <code>--type</code> if it gave one.</td></tr>
+</tbody>
+</table>
+
+<h3 id="b">B. <code>sm board start</code> for agents</h3>
+<h4>B.1 CLI</h4>
+<pre><code>sm board start TICKET [--type NAME] [--brief-file PATH] [--name NAME] [--repo REPO]</code></pre>
+<p><code>TICKET</code> follows the existing <code>sm board</code> ticket syntax (plain number in the cwd repo, or <code>owner/name#N</code>). Requires a managed session (<code>CLAUDE_SESSION_MANAGER_ID</code>); from a plain shell it fails with <code>sm board start runs from an agent; on the board, press Start.</code></p>
+
+<h4>B.2 Route</h4>
+<p><code>POST /board/start</code>, session-authenticated like the other agent board routes (<code>ensure_session_allowed_from_parts</code>, <code>http/board.rs</code>). Body: <code>{repo, number, type?, brief?, name?}</code>. It calls the same <code>start()</code> as <code>/client/board/start</code> with:</p>
+<ul>
+<li><b>Type resolution:</b> <code>type</code> if given (must be an agent type name, else 400). Else the ticket's <code>Tier:</code> line. Else the type the owner's Start sheet preselects for that ticket (same function, so the two never disagree). Provider, model and effort come only from the resolved type.</li>
+<li><b>Brief:</b> the owner's message template as today, with <code>brief</code>, if given, appended under a line <code>From far-orch (8156d6df), who started you:</code>. The brief also ends with: <code>far-orch started you. Reach it with sm send far-orch; sm tells it when you finish.</code></li>
+<li><b>Name:</b> owner's name pattern unless <code>name</code> given; same uniqueness rules.</li>
+<li><b>Gates:</b> <code>validate_start</code> with <code>start_blocked=false</code>, plus: not-before must have passed (no early start), not held, not waiting on owner. Owner-only overrides are never available.</li>
+<li><b>Switch:</b> if <code>owner_settings.board.agents_can_start</code> is false → 403 <code>Rajesh turned off agent starts. File the ticket and tell Rajesh, or ask him to turn it on.</code></li>
+<li><b>Parent:</b> <code>None</code>, as owner Start.</li>
+</ul>
+<p>Refusal texts (409 unless noted), each one sentence naming what to do:</p>
+<table>
+<thead><tr><th>Cause</th><th>Text</th></tr></thead>
+<tbody>
+<tr><td>Blocked</td><td><code>#2290 is blocked by #2256 (open). Start it once #2256 closes, or ask Rajesh to start it anyway.</code></td></tr>
+<tr><td>Held</td><td><code>#2290 is held. Only Rajesh can start it.</code></td></tr>
+<tr><td>Waiting</td><td><code>#2290 is waiting on Rajesh: &lt;waiting text&gt;.</code></td></tr>
+<tr><td>Not before</td><td><code>#2290 starts no earlier than &lt;local time&gt;.</code></td></tr>
+<tr><td>Already claimed</td><td><code>far-2290 (id) already holds #2290.</code></td></tr>
+<tr><td>Closed</td><td><code>#2290 is closed.</code></td></tr>
+</tbody>
+</table>
+
+<h4>B.3 Starter record and finish wake</h4>
+<ul>
+<li>New table <code>board_starts(session_id TEXT PRIMARY KEY, starter_session_id TEXT NOT NULL, repo, number, started_at, notified_at NULL)</code>, in the board store. Owner starts write no row.</li>
+<li><code>starter_session_id</code> is a session-id column: classify it in <code>MOVED_COLUMNS</code> (<code>handoff/execute.rs</code>) as moved, so an orchestrator's handoff carries its starter rows; the started worker's own handoffs move the <code>session_id</code> side too (lineage), so the wake fires when the <i>line</i> finishes, not at each worker handoff.</li>
+<li>Wake fires once, on the first of: the worker line runs <code>sm task-complete</code>; the worker line is retired other than by handoff. Text: <code>[sm board] far-2289 (a1b2c3d4), which you started on #2289, finished: ran sm task-complete.</code> or <code>…, was retired (&lt;reason&gt;).</code> Delivered through the normal message queue (durable, survives restart). If the starter is gone, no wake.</li>
+<li>Lane event <code>agent_started</code> records actor <code>(starter id, starter name)</code> and detail <code>started by far-orch</code>; owner starts are unchanged.</li>
+</ul>
+
+<h3 id="c">C. <code>sm board file</code></h3>
+<pre><code>sm board file --title TEXT (--body-file PATH | --body TEXT) [--under GOAL] [--after N...]
+              [--type NAME] [--start] [--repo REPO]</code></pre>
+<p>Route <code>POST /board/issues</code>, session-authenticated. Steps, in order:</p>
+<ol>
+<li>Validate everything first: <code>--type</code> is an agent type; <code>--under</code> and each <code>--after</code> exist in the repo. Any failure → nothing is created.</li>
+<li>Create the issue through the board source's <code>create_issue</code> (the same path the owner's notes use). Body is the given body, then <code>Tier: NAME</code> if <code>--type</code>, then <code>Filed by far-orch `8156d6df` via sm.</code> Then any <code>Starts after #N</code> lines for people, as CLAUDE.md asks.</li>
+<li>Record <code>under</code> and <code>after</code> links (same code as <code>sm board under</code>/<code>after</code>).</li>
+<li>If <code>--start</code>: refresh the ticket and run B.2. A refusal is not an error of <code>file</code>: exit 0, print the refusal as a second line (memo example).</li>
+</ol>
+<p>Partial failure after the issue exists (step 3 or 4): print the issue number and the failed step with the command to finish it, exit 1. No rollback; the issue stays.</p>
+<p><code>sm board file</code> is not gated by the switch. Lane ownership stays the owner's: <code>--under</code> places a ticket in an existing lane; it cannot create a lane.</p>
+
+<h3 id="d">D. Owner surfaces</h3>
+<table>
+<thead><tr><th>Surface</th><th>Change</th><th>Code</th></tr></thead>
+<tbody>
+<tr><td>Web, Hand off… popover</td><td>“Next agent” segmented control (Same + types), caption with provider · model · effort and “For the next handoff only.” Wraps on narrow widths; selected segment uses the existing <code>btn sm on</code> style.</td><td><code>web/handoff.js</code>, <code>web/agents.js</code></td></tr>
+<tr><td>Web, agent row</td><td>Chip “Next handoff → Mid” when pending; tapping opens the popover.</td><td><code>web/agents.js</code></td></tr>
+<tr><td>Android</td><td>Same row in the handoff controls sheet, as chips; same row chip.</td><td><code>ui/handoff/HandoffControls.kt</code>, <code>HandoffViewModel</code></td></tr>
+<tr><td><code>sm watch</code></td><td>In the handoff panel, a “Next agent” line; <code>t</code> cycles types.</td><td><code>bin/watch/handoff.rs</code></td></tr>
+<tr><td>Board row, lane history, agent detail (web and Android)</td><td>“Started by far-orch” where an agent started it; links to the starter.</td><td><code>web/board.js</code>, <code>ui/board/BoardScreen.kt</code></td></tr>
+<tr><td>Settings → Board (web and Android)</td><td>Toggle “Agents can start tickets”, subtitle “Agents use your agent types and can't start blocked or held tickets.”</td><td><code>web/settings.js</code>, Android settings</td></tr>
+</tbody>
+</table>
+<p>The phone APK must accept the new fields without an update breaking it: all new JSON fields are additive and optional.</p>
+
+<h3 id="e">E. Tests</h3>
+<ul>
+<li>Handoff: choice applied (provider switch claude→codex-fork; same-provider model switch); owner beats agent; deleted type falls back with brief line; cleared on success, kept on failed start; ask text includes successor type; <code>/clear</code> path converts to successor when a type is pending.</li>
+<li>Board start: each gate refusal text; switch off → 403; type resolution order; no parent; <code>board_starts</code> row; finish wake on task-complete and on retire; no wake on worker handoff; starter handoff moves the row (<code>every_session_id_column_is_classified</code> stays green).</li>
+<li>Board file: validation-before-create; body footer and Tier line; links recorded; <code>--start</code> refusal exits 0; partial failure exits 1 with instructions.</li>
+<li>Owner routes unchanged: <code>/client/board/start</code> still rejects session headers.</li>
+</ul>
+
+<h3 id="f">F. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th></tr></thead>
+<tbody>
+<tr><td>Owner and agent choose next type; owner wins</td><td>A.2</td></tr>
+<tr><td>One handoff, no revert</td><td>A.3 (cleared on success)</td></tr>
+<tr><td>Only agent types</td><td>A.2, B.2</td></tr>
+<tr><td>Agent is told before writing</td><td>A.3</td></tr>
+<tr><td>Agents start with your gates minus overrides; switch</td><td>B.2</td></tr>
+<tr><td>No parent; Started by; one finish wake</td><td>B.2, B.3, D</td></tr>
+<tr><td>File and place in one step; <code>--start</code></td><td>C</td></tr>
+<tr><td><code>sm spawn</code> unchanged</td><td>No change; dropped from tests</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not let the orchestrator be the parent?</b> Parentage ties the worker's life to the orchestrator: retirement cascades, children lists move at every orchestrator handoff, and the worker appears as the orchestrator's helper rather than as ticket work. The finish wake gives the orchestrator the one signal parentage was providing.</p>
+<p><b>Why no early start for agents?</b> A not-before time is your scheduling decision (often device contention or a quota window). An agent overriding it defeats the point.</p>
+<p><b>Why a switch rather than a role?</b> Registering orchestrators as a role adds a step every orchestrator must remember and gives you nothing the switch and the “Started by” trail don't.</p>
+
+<p style="font-size:.85rem;color:var(--ink-2)"><sup>1</sup> Code references are to <code>crates/sm-server/src</code> at <code>e6c12f2</code>: <code>handoff/transfer.rs</code> <code>claim_handoff_start</code> and <code>SuccessorPlan</code>; <code>http/handoff.rs</code> <code>create_successor</code>; <code>http/board.rs</code> <code>start</code>, <code>validate_start</code>, <code>owner_guard</code>; <code>owner_settings.rs</code> <code>AgentType</code>, <code>ticket_tier</code>; <code>handoff/execute.rs</code> <code>MOVED_COLUMNS</code>.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
