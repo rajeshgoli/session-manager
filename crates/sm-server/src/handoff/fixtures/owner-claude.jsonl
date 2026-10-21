@@ -16,4 +16,8 @@
 {"type": "user", "timestamp": "2026-10-19T01:00:00Z", "message": {"content": "<div>Keep my HTML</div>"}}
 {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-10-19T01:00:01Z", "content": "Human queued message"}
 {"type": "user", "message": {"content": "Human queued message"}}
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-10-19T01:00:02Z", "content": "Absorbed mid turn"}
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-10-19T01:00:03Z", "content": "Scheduled check prompt"}
+{"type": "user", "timestamp": "2026-10-19T01:00:03Z", "isMeta": true, "message": {"content": "Scheduled check prompt"}}
+{"type": "user", "timestamp": "2026-10-19T01:00:04Z", "isMeta": true, "message": {"content": "Permission granted for: x"}}
 {"type": "user", "message": {"content": [{"type": "tool_result", "content": "not human"}]}}
