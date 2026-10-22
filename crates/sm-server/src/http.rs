@@ -8403,7 +8403,7 @@ async fn client_queue(
     let count = |job_type: &str| {
         running
             .iter()
-            .filter(|job| job.job_type == job_type)
+            .filter(|job| job.job_type == job_type && (job.holds_slot() || job_type == crate::queue::shell::SHELL_JOB_TYPE))
             .count()
     };
     Ok(Json(json!({
@@ -8415,7 +8415,7 @@ async fn client_queue(
         "local_model": crate::local_model::queue_card_with_queue_conn(&expand_home(&state.config.queue_runner_state_dir().to_string_lossy()), context.queue.as_ref(), context.messages.as_ref())?,
         "slots": {
             // Shell jobs were found already running and take no slot.
-            "running": running.len() - count(crate::queue::shell::SHELL_JOB_TYPE),
+            "running": running.iter().filter(|job| job.holds_slot() && job.job_type != "review").count(),
             "max": policy.max_running_jobs,
             "by_type": {
                 "tests": {"running": count("tests"), "max": policy.tests_max_concurrent},
@@ -18023,6 +18023,17 @@ fn queue_job_response_with_names(
         "log_path": job.log_path,
     });
     response["pinned_at"] = json!(context.pins.get(&job.id));
+    if job.state == "running" {
+        response["holds_slot"] = json!(job.holds_slot());
+        response["near_idle_since"] = json!(job.near_idle_since);
+        if job.near_idle_since.is_some() {
+            let config = &state.config.queue_runner.near_idle;
+            response["near_idle_rule"] = json!(format!(
+                "under {}% of a core, {}% GPU and {} GiB for {} min",
+                config.cpu_percent, config.gpu_percent, config.memory_gib, config.minutes
+            ));
+        }
+    }
     if let (true, Some(conn)) = (job.state == "pending", context.queue.as_ref()) {
         if let Some(remaining) = crate::managed_artifacts::queue::remaining(
             conn,
@@ -18328,6 +18339,7 @@ mod tests {
             findings_json: None,
         };
         let job = QueueJobRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -25231,6 +25243,46 @@ mod tests {
 
         assert_eq!(body["slots"]["running"], 1);
         assert_eq!(body["slots"]["by_type"]["tests"]["running"], 1);
+        assert_eq!(body["running"][0]["holds_slot"], true);
+        assert!(body["running"][0]["near_idle_since"].is_null());
+        assert!(queued[0].get("holds_slot").is_none());
+        assert!(ended[0].get("near_idle_since").is_none());
+        crate::queue::publish_near_idle_slots(
+            &state_dir.join("queue_runner.db"),
+            std::collections::HashMap::from([(
+                running.id.clone(),
+                crate::utilization::near_idle::ReleasedSlot {
+                    since: (now.unix_timestamp_nanos() / 1_000_000) as i64,
+                    started_at: Some(at(time::Duration::minutes(-4))),
+                },
+            )]),
+        );
+        let response = app
+            .clone()
+            .oneshot(local_request(Method::GET, "/client/queue", Body::empty()))
+            .await
+            .unwrap();
+        let (_, released) = response_json(response).await;
+        assert_eq!(released["slots"]["running"], 0);
+        assert_eq!(released["slots"]["by_type"]["tests"]["running"], 0);
+        assert_eq!(released["running"][0]["holds_slot"], false);
+        assert!(released["running"][0]["near_idle_since"].is_string());
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                &format!("/queue-jobs/{}", running.id),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (_, released) = response_json(response).await;
+        assert_eq!(released["holds_slot"], false);
+        assert!(released["near_idle_since"].is_string());
+        crate::queue::publish_near_idle_slots(
+            &state_dir.join("queue_runner.db"),
+            std::collections::HashMap::new(),
+        );
         assert!(body["host"].is_object());
         assert!(body["owner_name"].is_string());
 

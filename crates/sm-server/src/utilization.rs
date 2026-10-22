@@ -17,6 +17,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+pub mod near_idle;
 pub mod quiet;
 
 use crate::queue::{active_queue_jobs_for_sampling, ActiveQueueJob};
@@ -34,6 +35,9 @@ const CPU_BUSY_ABOVE_PCT: f64 = 85.0;
 
 #[derive(Debug, Clone)]
 pub struct RecorderSettings {
+    pub near_idle: crate::config::QueueNearIdleConfig,
+    pub admission_policy: crate::queue::QueueAdmissionPolicy,
+    pub cancel_grace_seconds: u64,
     pub db_path: PathBuf,
     pub queue_db_path: PathBuf,
     pub interval: Duration,
@@ -759,6 +763,7 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
 }
 
 struct Recorder {
+    near_idle: near_idle::Detector,
     settings: RecorderSettings,
     conn: Option<Connection>,
     previous_ticks: Option<CpuTicks>,
@@ -892,6 +897,9 @@ impl Recorder {
             self.conn = None;
             return Err(error);
         }
+        if self.near_idle.tick(conn, &self.settings, &jobs, now_ms)? {
+            crate::queue::request_near_idle_admission(&self.settings);
+        }
         self.quiet.tick(conn, &self.settings, &jobs, now_ms)?;
         if self
             .last_prune
@@ -928,6 +936,7 @@ pub fn spawn_recorder(settings: RecorderSettings, shutdown: crate::handover::Shu
             last_prune: None,
             last_write_warning: None,
             quiet: quiet::Detector::default(),
+            near_idle: near_idle::Detector::default(),
         }));
         loop {
             ticker.tick().await;
@@ -2015,6 +2024,9 @@ mod tests {
         let dir = TempDir::new();
         let mut recorder = Recorder {
             settings: RecorderSettings {
+                near_idle: Default::default(),
+                admission_policy: Default::default(),
+                cancel_grace_seconds: 0,
                 db_path: dir.0.join("utilization.db"),
                 queue_db_path: dir.0.join("absent_queue.db"),
                 interval: Duration::from_secs(5),
@@ -2029,6 +2041,7 @@ mod tests {
             last_prune: None,
             last_write_warning: None,
             quiet: quiet::Detector::default(),
+            near_idle: near_idle::Detector::default(),
         };
         let samples = 120;
         let part = |name: &str, step: &mut dyn FnMut()| {
@@ -2091,6 +2104,9 @@ mod tests {
         let dir = TempDir::new();
         let mut recorder = Recorder {
             settings: RecorderSettings {
+                near_idle: Default::default(),
+                admission_policy: Default::default(),
+                cancel_grace_seconds: 0,
                 db_path: dir.0.join("utilization.db"),
                 queue_db_path: std::env::var("SM_PROBE_QUEUE_DB").unwrap().into(),
                 interval: Duration::from_secs(5),
@@ -2105,6 +2121,7 @@ mod tests {
             last_prune: None,
             last_write_warning: None,
             quiet: quiet::Detector::default(),
+            near_idle: near_idle::Detector::default(),
         };
         recorder.tick().unwrap();
         std::thread::sleep(Duration::from_secs(5));

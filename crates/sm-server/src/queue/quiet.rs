@@ -241,6 +241,9 @@ mod tests {
             ));
             fs::create_dir_all(&dir).unwrap();
             let settings = RecorderSettings {
+                near_idle: Default::default(),
+                admission_policy: Default::default(),
+                cancel_grace_seconds: 0,
                 db_path: dir.join("utilization.db"),
                 queue_db_path: dir.join("queue_runner.db"),
                 message_queue_db_path: dir.join("messages.db"),
