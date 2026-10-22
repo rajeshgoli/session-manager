@@ -196,7 +196,7 @@
 <tr><td>3. When a near-idle job wakes</td><td><b>It counts again at once. Nothing already running is stopped, paused or displaced; new starts wait until the queue is back under its limits.</b> The queue may run over 8 for a while.</td><td>Stopping a job to honour a count would lose work; the existing memory guard still refuses new starts when the Mac is short on memory.</td></tr>
 <tr><td>4. Which job types</td><td><b>All of them: background, service, tests, perf, review.</b> A near-idle perf job also lifts its quiet window, so new jobs can start while it sits idle. A near-idle job is never displaced for perf, and a near-idle test does not make perf wait.</td><td>If a job barely touches the machine for 30 minutes, others do not hurt it, and it does not hurt others.</td></tr>
 <tr><td>5. After a server restart</td><td><b>Every job holds a slot again until it re-earns near-idle (30 minutes).</b> Nothing new is saved to disk.</td><td>The safe direction to be wrong in, and a restart is rare.</td></tr>
-<tr><td>6. What you see</td><td><b>CLI and Queue page mark the job "near-idle · no slot", with since-when. A waiting job's reason counts only slot holders</b> ("2 of 8 slots held; near-idle: 7 jobs").</td><td>So "why isn't my job running" stays answerable at a glance.</td></tr>
+<tr><td>6. What you see</td><td><b>CLI marks the job near-idle with its slot released; the Queue page shows near-idle in muted job metadata and the release time in job details. A waiting job's reason counts only slot holders</b> ("2 of 8 slots held; near-idle: 7 jobs").</td><td>So "why isn't my job running" stays answerable at a glance.</td></tr>
 <tr><td>7. Stuck queue (#2480)</td><td><b>Fixed in the same PR. Services over their limit block only further service starts;</b> every other type keeps starting under the global limit.</td><td>Start-now is your override; it must never freeze the whole queue.</td></tr>
 </tbody>
 </table>
@@ -217,6 +217,7 @@
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
+<p><b>The Queue page keeps routine status understated.</b> Near-idle appears in muted metadata beneath the job name. Release time lives in the job details, and the overall slot count sits beside the Running heading.</p>
 <p><b>Thresholds are looser.</b> Near-idle now means under half a core, 10% GPU and 5 GiB (was 5%, no GPU, 2 GiB). Waking needs double (was 25%, any GPU, 4 GiB).</p>
 <p><b>Every job type is eligible,</b> including perf, whose quiet window lifts while it is near-idle (Decision 4). Tests and perf were exempt before.</p>
 <p><b>#2480 is fixed in this PR</b> rather than in a separate one first (Decision 7).</p>
@@ -291,7 +292,7 @@
 <tr><td><code>sm queue list</code></td><td>State column reads <code>running · near-idle</code> for a near-idle job.</td></tr>
 <tr><td><code>sm queue status &lt;job&gt;</code> of a near-idle job</td><td>line <code>Slot: released, near-idle since 6:01 pm (under half a core, 10% GPU and 5 GiB for 30 min).</code></td></tr>
 <tr><td>Waiting text of a job held at <code>concurrency_cap</code></td><td><code>Waiting for an available slot (global limit of 8 running jobs; 8 held). Holding slots: a, b, … Near-idle, not holding slots: c, d.</code> The near-idle list is omitted when empty.</td></tr>
-<tr><td>Web Queue page</td><td>a "near-idle · no slot" chip on the job row; the slot counter shows held / limit.</td></tr>
+<tr><td>Web Queue page</td><td>Muted "near-idle" text follows the job type and agent, without a badge. Its tooltip and the job details show when the slot was released. The Running header shows slots held / limit; the top grid retains one tile per job type. Near-idle rows omit the redundant low-CPU annotation.</td></tr>
 <tr><td>Android app</td><td>no change required; it renders the status text above.</td></tr>
 </tbody>
 </table>
@@ -330,7 +331,7 @@
 <tr><td>Global and per-type counts, perf pause, finite blockers, displacement, wake overshoot and admission request</td><td><code>crates/sm-server/src/queue.rs</code>: <code>holds_slot</code>, <code>publish_near_idle_slots</code>, <code>request_near_idle_admission</code>, tests prefixed <code>near_idle_</code> and <code>newly_near_idle_</code>. <code>utilization.rs</code>: recorder <code>tick</code> requests admission on a newly released slot.</td></tr>
 <tr><td>Service overcapacity, refreshed holds, recovery and unchanged resource guards</td><td><code>queue.rs</code>: <code>service_overcapacity_blocks_only_new_services</code>, existing memory/process guard tests. <code>crates/sm-server/tests/read_only_http.rs</code>: <code>queue_runtime_recovery_over_service_capacity_holds_only_at_applicable_limits</code>.</td></tr>
 <tr><td>Wait reasons, running-job JSON, slot counts and CLI status</td><td><code>queue.rs</code>: <code>concurrency_cap_wait_detail</code>, <code>queue_hold_explanation</code>. <code>http.rs</code>: <code>queue_job_response_with_names</code>, <code>client_queue_lists_running_queued_in_order_and_recent_stops</code>. <code>bin/sm.rs</code>: <code>near_idle_cli_marks_released_slot_only_while_running</code>.</td></tr>
-<tr><td>Queue page chip, since-when and held/limit counter</td><td><code>crates/sm-server/src/web/queue.js</code>: <code>QueuePage</code>, <code>JobRow</code>.</td></tr>
+<tr><td>Queue page metadata, release time in job details and held/limit counter</td><td><code>crates/sm-server/src/web/queue.js</code>: <code>QueuePage</code>, <code>JobRow</code>.</td></tr>
 </tbody>
 </table>
 
