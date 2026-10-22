@@ -2,6 +2,7 @@
   "schema_version": 4,
   "sessions": [
     {
+      "awaited_by": [],
       "claims": [
         {
           "claimed_at": "2100-01-01T00:00:00Z",

@@ -358,3 +358,28 @@ fn task_complete_lists_live_waiters_on_the_seat_and_its_tickets() {
     );
     assert_eq!(store.open_waits().unwrap().len(), 3);
 }
+
+#[test]
+fn handoff_moves_open_waits_to_the_successor() {
+    let (store, _db) = new_store();
+    store
+        .open_wait(WAITER, &seat(TARGET), "hashes", at(450), at(0))
+        .unwrap();
+    store
+        .open_wait("holder01", &seat(WAITER), "review", at(450), at(1))
+        .unwrap();
+    store.hand_off(WAITER, "succ0001", "far-2139").unwrap();
+    let moved: Vec<(String, Option<String>)> = store
+        .open_waits()
+        .unwrap()
+        .into_iter()
+        .map(|wait| (wait.waiter_session_id, wait.target_session_id))
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            ("succ0001".to_owned(), Some(TARGET.to_owned())),
+            ("holder01".to_owned(), Some("succ0001".to_owned())),
+        ]
+    );
+}

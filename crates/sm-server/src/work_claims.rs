@@ -1392,9 +1392,9 @@ impl WorkClaimStore {
     }
 
     /// Context handoff (sm#1651, Appendix G): re-point the predecessor's
-    /// active claims and worktree keeps to the successor in place, keeping
-    /// every other column, with one `claim.handed_off` event per claim and no
-    /// `[sm claim]` notice. Safe to repeat. Returns the claims moved.
+    /// active claims, worktree keeps and open agent waits to the successor in
+    /// place, keeping every other column, with one `claim.handed_off` event
+    /// per claim and no `[sm claim]` notice. Safe to repeat. Returns the claims moved.
     pub fn hand_off(
         &self,
         predecessor_id: &str,
@@ -1437,6 +1437,17 @@ impl WorkClaimStore {
             "UPDATE worktree_keeps SET session_id = ?2 WHERE session_id = ?1",
             params![predecessor_id, successor_id],
         )?;
+        // Open agent waits follow the work: the successor keeps waiting, and
+        // a wait on the predecessor now waits on the successor (#2477).
+        for column in ["waiter_session_id", "target_session_id"] {
+            tx.execute(
+                &format!(
+                    "UPDATE OR IGNORE agent_waits SET {column} = ?2
+                      WHERE {column} = ?1 AND ended_at IS NULL"
+                ),
+                params![predecessor_id, successor_id],
+            )?;
+        }
         tx.commit()?;
         Ok(claims.len())
     }
