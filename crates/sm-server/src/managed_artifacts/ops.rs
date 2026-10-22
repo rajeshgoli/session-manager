@@ -289,16 +289,45 @@ pub fn request(
     Ok(result)
 }
 
+/// Splits a freeze archive whose source sits on the cold store's own disk into
+/// what stays there for good and what it only borrows (sm#2488): publication
+/// removes the source, so only an archive larger than its source grows the disk.
+pub(super) fn split_archive(archive: u64, source_disk: u64) -> (u64, u64) {
+    (
+        archive.saturating_sub(source_disk),
+        archive.min(source_disk),
+    )
+}
+/// Whether the cold store takes `kept` bytes for good plus `borrowed` bytes it
+/// gets back when the operation publishes. Kept bytes must leave the floor
+/// intact; borrowed bytes need only room, so a freeze on a disk already below
+/// its floor can still run and lift it back (sm#2488).
+pub(super) fn fits_on_cold(
+    free: u64,
+    floor: u64,
+    outstanding: u64,
+    kept: u64,
+    borrowed: u64,
+) -> bool {
+    let room = free.saturating_sub(outstanding);
+    room.saturating_sub(floor) >= kept && room >= kept.saturating_add(borrowed)
+}
 /// The disk the operation writes to, or `None` while neither has room. Only a
 /// thaw may fall back to the Mac (sm#2414).
 fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<Option<&'static str>> {
     let conn = manager.store.open()?;
+    let shared_disk = queue::fs_stats(&op.root.path, manager.config.floor_percent)?.2
+        == queue::fs_stats(&op.root.cold_store, manager.config.floor_percent)?.2;
     let mut required = 0u64;
+    let mut borrowed = 0u64;
     for m in &op.members {
         let a = artifact(&conn, &op.root.path, &m.name)?;
-        let bytes = if op.kind == "thawing" {
-            archive::Manifest::read(&Path::new(&op.root.cold_store).join(".frozen").join(&m.name))?
-                .data_bytes
+        let (kept, lent) = if op.kind == "thawing" {
+            let bytes = archive::Manifest::read(
+                &Path::new(&op.root.cold_store).join(".frozen").join(&m.name),
+            )?
+            .data_bytes;
+            (bytes, 0)
         } else {
             let size = scan::measure(&source(&op.root, m)?)?;
             if op.kind == "freezing" {
@@ -306,13 +335,21 @@ fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<Option<&'static s
                     .as_f64()
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .unwrap_or(1.0);
-                (size.data_bytes as f64 / ratio * 1.2).ceil() as u64
+                let bytes = (size.data_bytes as f64 / ratio * 1.2).ceil() as u64;
+                if m.location == "cold" || shared_disk {
+                    split_archive(bytes, size.disk_bytes)
+                } else {
+                    (bytes, 0)
+                }
             } else {
-                size.disk_bytes.max(size.data_bytes)
+                (size.disk_bytes.max(size.data_bytes), 0)
             }
         };
         required = required
-            .checked_add(bytes)
+            .checked_add(kept)
+            .context("operation size overflow")?;
+        borrowed = borrowed
+            .checked_add(lent)
             .context("operation size overflow")?;
     }
     let disks = queue::disk_status(manager, &op.root)?;
@@ -320,12 +357,13 @@ fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<Option<&'static s
         .iter()
         .find(|d| d["role"] == "cold")
         .context("cold disk status")?;
-    let available = cold["free"]
-        .as_u64()
-        .unwrap_or(0)
-        .saturating_sub(cold["floor"].as_u64().unwrap_or(0))
-        .saturating_sub(cold["outstanding"].as_u64().unwrap_or(0));
-    if available >= required {
+    if fits_on_cold(
+        cold["free"].as_u64().unwrap_or(0),
+        cold["floor"].as_u64().unwrap_or(0),
+        cold["outstanding"].as_u64().unwrap_or(0),
+        required,
+        borrowed,
+    ) {
         Ok(Some("cold"))
     } else if op.kind == "thawing"
         && super::pressure::thaw_fits_on_root(&conn, manager, &op.root, required)?

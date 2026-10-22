@@ -266,6 +266,63 @@ fn managed_artifacts_ops_thaw_waits_when_no_disk_has_room() {
     assert!(!Path::new(&f.root.path).join(".sample.thawing").exists());
 }
 
+/// The cold store below its floor, with room left; the Mac on its own disk.
+fn cold_below_floor(f: &Fixture) {
+    let root = f.root.path.clone();
+    queue::TEST_DISKS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            Ok(if path == root {
+                (u64::MAX / 4, 10, 1)
+            } else {
+                (1 << 30, 1 << 40, 2)
+            })
+        }))
+    });
+}
+
+#[test]
+fn managed_artifacts_ops_freeze_on_the_cold_store_runs_below_its_floor() {
+    let f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "moving");
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["location"], "cold");
+    cold_below_floor(&f);
+    let mut op = f.op("sample", "freezing");
+    assert!(stage(&f.manager, &mut op).unwrap());
+    queue::TEST_DISKS.with(|hook| *hook.borrow_mut() = None);
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["state"], "frozen");
+    assert!(!Path::new(&f.root.cold_store).join("sample").exists());
+}
+
+#[test]
+fn managed_artifacts_ops_freeze_from_the_mac_waits_while_the_cold_store_is_below_its_floor() {
+    let f = Fixture::new();
+    f.create("sample");
+    cold_below_floor(&f);
+    let mut op = f.op("sample", "freezing");
+    assert!(!stage(&f.manager, &mut op).unwrap());
+    queue::TEST_DISKS.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!(f.detail("sample")["state"], "live");
+    f.assert_bytes("sample");
+}
+
+#[test]
+fn managed_artifacts_ops_cold_fit_keeps_the_floor_only_for_bytes_that_stay() {
+    // Borrowed bytes need room, not headroom above the floor.
+    assert!(fits_on_cold(150, 200, 0, 0, 100));
+    assert!(!fits_on_cold(150, 200, 0, 0, 151));
+    assert!(!fits_on_cold(150, 200, 60, 0, 100));
+    // Bytes that stay must leave the floor intact.
+    assert!(!fits_on_cold(150, 200, 0, 1, 0));
+    assert!(fits_on_cold(300, 200, 0, 50, 50));
+    assert!(!fits_on_cold(300, 200, 0, 101, 0));
+    // An archive larger than its source keeps only the excess.
+    assert_eq!(split_archive(120, 100), (20, 100));
+    assert_eq!(split_archive(7, 138), (0, 7));
+}
+
 #[test]
 fn managed_artifacts_ops_recovers_move_and_disposable_partial_copy() {
     let f = Fixture::new();
