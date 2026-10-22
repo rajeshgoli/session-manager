@@ -242,6 +242,20 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Pins or unpins, then refreshes so the sheet shows the new state. */
+    fun pin(job: SessionJob, pinned: Boolean) {
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            repository.pinQueueJob(url, token, job.id, pinned)
+                .onSuccess { refresh() }
+                .onFailure { error ->
+                    if (!handleAuth(error)) {
+                        _uiState.value = _uiState.value.copy(followMessage = job.id to (error.message ?: "Couldn't change the pin"))
+                    }
+                }
+        }
+    }
+
     fun follow(job: SessionJob) {
         viewModelScope.launch {
             val (url, token) = credentials() ?: return@launch

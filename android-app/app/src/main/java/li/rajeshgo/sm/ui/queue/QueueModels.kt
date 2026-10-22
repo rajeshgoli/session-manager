@@ -110,6 +110,14 @@ fun shellMemoryDetail(job: SessionJob): String? {
     ).joinToString(" · ").ifBlank { null }
 }
 
+/** What memory pressure does to [job] (sm#2475): pinned jobs go last, and only at critical pressure. */
+fun pressureText(job: SessionJob): String = when {
+    job.pinnedAt != null -> "Pinned. sm stops every other job first, and this one only at critical pressure with nothing else left."
+    job.type == "service" -> "sm stops service jobs after every other unpinned job. Pin it to keep it through anything short of critical pressure."
+    job.ownerForcedAt != null -> "You started this early, so sm stops it first and puts it back in line. Pin it to keep it running."
+    else -> "sm stops the largest unpinned job first. Pin it to keep it running."
+}
+
 /** "tests · 4m of 15m · 12G · cpu 25% · gpu 3%"; use is the job's share of the whole Mac. */
 fun runningLine(job: SessionJob, now: OffsetDateTime): String {
     if (isShellJob(job)) {
@@ -122,6 +130,7 @@ fun runningLine(job: SessionJob, now: OffsetDateTime): String {
     val usage = job.usage
     return listOfNotNull(
         job.type,
+        "pinned".takeIf { job.pinnedAt != null },
         if (limit != null) "$elapsed of $limit" else elapsed,
         usage?.memoryBytes?.let { "${gib(it)}G" },
         usage?.cpuPercent?.let { "cpu ${it.roundToLong()}%" },

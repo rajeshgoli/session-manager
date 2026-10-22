@@ -1154,6 +1154,60 @@ pub(super) async fn force_start_queue_job(
     Ok(Json(queue_job_response(&state, started)?))
 }
 
+/// Pin (sm#2475): the owner keeps a job running through memory pressure.
+/// The host memory guard stops a pinned job only at critical kernel
+/// pressure with nothing else left to stop, and perf never displaces it.
+pub(super) async fn pin_queue_job(
+    state: State<Arc<AppState>>,
+    peer_addr: ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    identifier: Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    set_queue_job_pin(state, peer_addr, uri, headers, identifier, true).await
+}
+
+pub(super) async fn unpin_queue_job(
+    state: State<Arc<AppState>>,
+    peer_addr: ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    identifier: Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    set_queue_job_pin(state, peer_addr, uri, headers, identifier, false).await
+}
+
+async fn set_queue_job_pin(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    pinned: bool,
+) -> Result<Json<Value>, ApiError> {
+    let method = if pinned { "POST" } else { "DELETE" };
+    if owner_web_guard(&state, &headers, Some(peer_addr), method)?.is_none() {
+        owner_guard(&state, &headers, peer_addr, method, &uri)?;
+        if authenticated_user(&headers, &state.config).is_none() {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Pinning is for the owner, signed in to the sm app".to_owned(),
+            });
+        }
+    }
+    let db_path = queue_runner_db_path(&state);
+    let job = RetainedQueueStore::resolve_queue_job_from_path(&db_path, &identifier)
+        .map_err(queue_lookup_error)?
+        .ok_or(ApiError::NotFound("Queue job not found"))?;
+    if pinned && !matches!(job.state.as_str(), "pending" | "running") {
+        return Err(conflict(&no_longer_waiting(&job.state)));
+    }
+    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    crate::queue::set_queue_job_pinned_in_state_dir(&queue_state_dir, &job.id, pinned)?
+        .ok_or(ApiError::NotFound("Queue job not found"))?;
+    Ok(Json(queue_job_response(&state, job)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

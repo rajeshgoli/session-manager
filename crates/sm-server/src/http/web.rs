@@ -275,7 +275,8 @@ mod tests {
         // 472,236 bytes after Notes activity (#2390), Studio terminal recovery
         // (#2389), and queue Start now (#2396). 476 KiB leaves ~3% headroom
         // for these shipped features while continuing to bound source growth.
-        const BUDGET: usize = 476 * 1024;
+        // The Queue page's per-job usage and pins (#2475) add ~10 KiB.
+        const BUDGET: usize = 488 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

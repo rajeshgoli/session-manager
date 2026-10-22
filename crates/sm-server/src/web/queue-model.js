@@ -92,3 +92,53 @@ export function reviewJobText(job) {
     why: review.why === 'default' ? null : review.why,
   };
 }
+/** Distinct job colours, in order; each is a CSS token in queue.css. */
+export const JOB_COLORS = 6;
+const GIB = 2 ** 30;
+/** A running job's live usage (sm#2475): the recorder's reading, or a shell
+ * job's own memory guard reading, which carries no CPU or GPU. */
+export function jobUsage(job) {
+  const memory = job.usage?.memory_bytes ?? (job.type === 'shell' ? job.shell?.current_bytes : null) ?? null;
+  return { memory, cpu: job.usage?.cpu_percent ?? null, gpu: job.usage?.gpu_percent ?? null };
+}
+/**
+ * Who is using the Mac right now (sm#2475): per resource, each running job's
+ * share of the machine, then everything outside the queue, then what is free.
+ * Jobs keep one colour across the three bars and the Running rows: their place
+ * in the running list. Jobs too small to see share one "smaller jobs" slice.
+ */
+export function usageBreakdown(running, host) {
+  const jobs = running.map((job, i) => ({ id: job.id, label: job.label || job.id, color: i % JOB_COLORS, ...jobUsage(job) }));
+  const mac = host && host.available !== false ? host : null;
+  const metric = (key, scale, used) => {
+    const known = jobs.filter((job) => typeof job[key] === 'number' && job[key] > 0);
+    const queue = known.reduce((sum, job) => sum + job[key], 0);
+    const visible = known.filter((job) => job[key] / scale >= .01).sort((a, b) => b[key] - a[key]);
+    const small = known.filter((job) => !visible.includes(job));
+    const segments = visible.map((job) => ({ id: job.id, label: job.label, color: job.color, value: job[key] }));
+    const smallValue = small.reduce((sum, job) => sum + job[key], 0);
+    if (small.length) segments.push({ id: null, label: `${small.length} smaller ${small.length === 1 ? 'job' : 'jobs'}`, color: 'small', value: smallValue });
+    const other = typeof used === 'number' ? Math.max(0, used - queue) : null;
+    const share = (value) => Math.max(0, Math.min(100, (value / scale) * 100));
+    return {
+      key, queue, used: typeof used === 'number' ? Math.max(used, queue) : null, scale, other,
+      segments: segments.map((s) => ({ ...s, share: share(s.value) })),
+      otherShare: other == null ? 0 : share(other),
+    };
+  };
+  const total = mac?.memory_total_bytes || 0;
+  return {
+    jobs,
+    rows: [
+      ...(total ? [metric('memory', total, mac.memory_used_bytes)] : []),
+      metric('cpu', 100, mac?.cpu_percent),
+      metric('gpu', 100, mac?.gpu_percent),
+    ],
+  };
+}
+/** "131 GB" / "512 MB" / "0.3%" for the breakdown and the Running rows. */
+export function usageText(key, value) {
+  if (typeof value !== 'number') return '—';
+  if (key === 'memory') return value >= 10 * GIB ? `${Math.round(value / GIB)} GB` : value >= GIB ? `${(value / GIB).toFixed(1)} GB` : `${Math.max(1, Math.round(value / 2 ** 20))} MB`;
+  return value >= 10 || value === 0 ? `${Math.round(value)}%` : `${value.toFixed(1)}%`;
+}

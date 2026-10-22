@@ -292,6 +292,7 @@ internal fun QueueJobSheet(
         startError = state.startNow.failed?.takeIf { it.first == current.id }?.second,
         onStartNow = { viewModel.startNow(current) },
         onFollow = { viewModel.follow(current) },
+        onPin = { pinned -> viewModel.pin(current, pinned) },
         onCancel = { note -> viewModel.cancel(current, note) { close() } },
         onAsk = { question -> viewModel.ask(current, question) },
         onOpenAgent = current.notifySessionId?.takeIf { it.isNotBlank() }?.let { sessionId ->
@@ -462,6 +463,7 @@ private fun JobSheet(
     startError: String?,
     onStartNow: () -> Unit,
     onFollow: () -> Unit,
+    onPin: (Boolean) -> Unit,
     onCancel: (String?) -> Unit,
     onAsk: (String) -> Unit,
     onOpenAgent: (() -> Unit)?,
@@ -536,9 +538,10 @@ private fun JobSheet(
             )
             if (!shell) jobLimits(job).takeIf { it.isNotBlank() }?.let { Detail("Limits", it) }
             if (job.state == "pending") job.holding?.detail?.let { Detail("Why it is waiting", it) }
-            if (job.state == "running" && job.ownerForcedAt != null) {
+            if (job.state == "running" && job.ownerForcedAt != null && job.pinnedAt == null) {
                 Detail("Started", "Early, by you. If the Mac runs low on memory, sm stops this run first and puts the job back in line.")
             }
+            if (active && !shell) Detail("If memory runs short", pressureText(job))
             job.endedSummary?.let { Detail("What happened", it) }
 
             // Also on stopped jobs: "why did it stop?" is worth asking.
@@ -587,6 +590,10 @@ private fun JobSheet(
                     OutlinedButton(onClick = { confirming = true }) { Text(if (shell) "Stop" else "Cancel", color = Rose) }
                     // The server follows only jobs that have not finished.
                     if (!shell) OutlinedButton(onClick = onFollow) { Text("Follow") }
+                    if (!shell) {
+                        if (job.pinnedAt != null) FilledTonalButton(onClick = { onPin(false) }) { Text("Pinned") }
+                        else OutlinedButton(onClick = { onPin(true) }) { Text("Pin") }
+                    }
                 }
                 onOpenAgent?.let { OutlinedButton(onClick = it) { Text("Open agent") } }
             }

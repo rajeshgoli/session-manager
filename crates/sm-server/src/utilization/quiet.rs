@@ -29,7 +29,18 @@ pub fn status(queue_db: &Path, job: &QueueJobRecord) -> Status {
                 .then(|| jobs.get(&job.id).cloned())
                 .flatten()
         })
+        .map(|status| shown(status, &job.job_type))
         .unwrap_or_default()
+}
+
+/// A service job is a watcher whose work runs elsewhere (sm#2475): an idle
+/// CPU and a still log are what it looks like when healthy, never quiet.
+fn shown(mut status: Status, job_type: &str) -> Status {
+    if job_type == "service" {
+        status.quiet_since = None;
+        status.low_cpu = false;
+    }
+    status
 }
 
 pub fn timestamp(ms: i64) -> String {
@@ -257,6 +268,24 @@ mod tests {
             footprint: None,
             rss: None,
         }
+    }
+
+    #[test]
+    fn service_jobs_are_never_quiet() {
+        let idle = Status {
+            quiet_since: Some(timestamp(0)),
+            low_cpu: true,
+            footprint_bytes: Some(1),
+            ..Status::default()
+        };
+        let service = shown(idle.clone(), "service");
+        assert_eq!((service.quiet_since, service.low_cpu), (None, false));
+        assert_eq!(service.footprint_bytes, Some(1));
+        let background = shown(idle, "background");
+        assert_eq!(
+            (background.quiet_since.is_some(), background.low_cpu),
+            (true, true)
+        );
     }
 
     #[test]

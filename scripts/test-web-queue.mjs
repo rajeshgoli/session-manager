@@ -48,3 +48,31 @@ test('usage caption names recorded time when samples cover under 95% of the rang
   assert.equal(coverageNote({ hours: 1, summary: { covered_seconds: 3420 } }), '');
   assert.equal(coverageNote(null), '');
 });
+test('breakdown names each job, lumps tiny ones, and leaves the rest to the Mac', async () => {
+  const { usageBreakdown, usageText, jobUsage } = await import('../crates/sm-server/src/web/queue-model.js');
+  const GIB = 2 ** 30;
+  const running = [
+    { id: 'w', label: '2171-wave8', type: 'service', usage: { memory_bytes: 0.2 * GIB, cpu_percent: 0, gpu_percent: 0 } },
+    { id: 's', label: '2171-iter7-score', type: 'background', usage: { memory_bytes: 131 * GIB, cpu_percent: 0.3, gpu_percent: 35 } },
+    { id: 'x', label: 'shell', type: 'shell', shell: { current_bytes: 4 * GIB } },
+    { id: 'u', label: 'no sample yet', type: 'tests' },
+  ];
+  const host = { memory_total_bytes: 256 * GIB, memory_used_bytes: 209 * GIB, cpu_percent: 64, gpu_percent: 100 };
+  const { jobs, rows } = usageBreakdown(running, host);
+  assert.deepEqual(jobs.map((j) => j.color), [0, 1, 2, 3]);
+  const [memory, cpu, gpu] = rows;
+  assert.deepEqual(memory.segments.map((s) => s.label), ['2171-iter7-score', 'shell', '1 smaller job']);
+  assert.equal(memory.segments[0].color, 1, 'colour follows the running list, not the size order');
+  assert.ok(Math.abs(memory.other - (209 - 131 - 4.2) * GIB) < 1);
+  assert.equal(cpu.segments.length, 1, 'jobs under 1% of the machine are one slice');
+  assert.equal(cpu.segments[0].color, 'small');
+  assert.equal(cpu.other, 63.7);
+  assert.equal(gpu.segments[0].share, 35);
+  assert.equal(gpu.otherShare, 65);
+  assert.equal(jobUsage(running[3]).memory, null);
+  // No host reading: jobs still show, with nothing claimed for the rest.
+  const bare = usageBreakdown(running, { available: false });
+  assert.deepEqual(bare.rows.map((r) => r.key), ['cpu', 'gpu']);
+  assert.equal(bare.rows[1].other, null);
+  assert.deepEqual([usageText('memory', 131 * GIB), usageText('memory', 1.5 * GIB), usageText('memory', 2 ** 20 * 300), usageText('cpu', 0.29), usageText('gpu', 35.2), usageText('cpu', null)], ['131 GB', '1.5 GB', '300 MB', '0.3%', '35%', '—']);
+});
