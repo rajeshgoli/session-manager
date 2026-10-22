@@ -1987,6 +1987,10 @@ pub fn router(state: AppState) -> Router {
             post(follows::force_start_queue_job),
         )
         .route(
+            "/client/queue/jobs/{job_id}/pin",
+            post(follows::pin_queue_job).delete(follows::unpin_queue_job),
+        )
+        .route(
             "/client/queue/jobs/{job_id}/usage",
             get(client_queue_job_usage),
         )
@@ -8170,6 +8174,8 @@ struct QueueResponseContext {
     messages: Option<rusqlite::Connection>,
     ticket_ranks: BTreeMap<(String, i64), crate::board::TicketRank>,
     review_authors: BTreeMap<String, String>,
+    /// Jobs the owner pinned (sm#2475), by id, with when.
+    pins: std::collections::HashMap<String, String>,
 }
 
 impl QueueResponseContext {
@@ -8195,11 +8201,17 @@ impl QueueResponseContext {
             .map(crate::board::BoardStore::ticket_ranks_conn)
             .transpose()?
             .unwrap_or_default();
+        let pins = queue
+            .as_ref()
+            .map(crate::queue::pinned_queue_jobs_conn)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             queue,
             messages,
             ticket_ranks,
             review_authors: BTreeMap::new(),
+            pins,
         })
     }
 
@@ -18010,6 +18022,7 @@ fn queue_job_response_with_names(
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     });
+    response["pinned_at"] = json!(context.pins.get(&job.id));
     if let (true, Some(conn)) = (job.state == "pending", context.queue.as_ref()) {
         if let Some(remaining) = crate::managed_artifacts::queue::remaining(
             conn,
@@ -25056,7 +25069,7 @@ mod tests {
             "peak_process_count":null, "readable_log_path":null, "log_path":null,
             "stop_grace_seconds":null, "stop_requested_at":null, "stop_signal":null, "stop_deadline_at":null,
             "review":null, "cpu_seconds":null, "gpu_seconds":null, "footprint_bytes":null, "rss_bytes":null,
-            "log_updated_at":null, "quiet_since":null, "low_cpu":false
+            "log_updated_at":null, "quiet_since":null, "low_cpu":false, "pinned_at":null
         }]}"#).unwrap();
         assert_eq!(body, golden);
         crate::queue::seed_terminal_job_history(&conn, &job.id, 16000);

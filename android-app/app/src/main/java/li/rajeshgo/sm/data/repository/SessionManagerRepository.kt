@@ -573,6 +573,13 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getQueueJobLog(jobId, lines) }
     }
 
+    /** Pins or unpins a waiting or running job for the owner (sm#2475). */
+    suspend fun pinQueueJob(baseUrl: String, token: String, jobId: String, pinned: Boolean): Result<li.rajeshgo.sm.data.model.SessionJob> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (pinned) api(baseUrl, token).pinQueueJob(jobId) else api(baseUrl, token).unpinQueueJob(jobId)
+        }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun cancelQueueJob(baseUrl: String, token: String, jobId: String, note: String?): Result<li.rajeshgo.sm.data.model.SessionJob> = withContext(Dispatchers.IO) {
         runCatching {
             api(baseUrl, token).cancelQueueJob(

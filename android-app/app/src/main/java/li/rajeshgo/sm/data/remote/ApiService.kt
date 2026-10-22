@@ -103,6 +103,12 @@ interface ApiService {
         @Body body: li.rajeshgo.sm.data.model.StartNowBody,
     ): li.rajeshgo.sm.data.model.SessionJob
 
+    @POST("client/queue/jobs/{job_id}/pin")
+    suspend fun pinQueueJob(@Path("job_id") jobId: String): li.rajeshgo.sm.data.model.SessionJob
+
+    @DELETE("client/queue/jobs/{job_id}/pin")
+    suspend fun unpinQueueJob(@Path("job_id") jobId: String): li.rajeshgo.sm.data.model.SessionJob
+
     @POST("queue-jobs/{job_id}/cancel")
     suspend fun cancelQueueJob(
         @Path("job_id") jobId: String,

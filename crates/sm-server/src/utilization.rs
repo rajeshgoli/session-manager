@@ -71,9 +71,6 @@ pub struct HostSample {
     pub local_model_bytes: Option<i64>,
     pub queue_cpu_pct: Option<f64>,
     pub queue_gpu_pct: Option<f64>,
-    /// App memory counting compressed pages at full size, the scale process
-    /// footprints use; the queue's footprint is a share of this. Not stored.
-    pub mem_app_uncompressed_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -347,8 +344,6 @@ pub struct VmPages {
     /// Anonymous (app) pages, and the purgeable ones among them.
     pub internal: i64,
     pub purgeable: i64,
-    /// Pages held in the compressor, counted uncompressed.
-    pub compressor_stored: i64,
 }
 
 /// Activity Monitor's "Memory Used": app memory, wired and compressed,
@@ -383,10 +378,6 @@ pub fn apply_memory(
         sample.mem_wired_bytes = bytes(pages.wired);
         sample.mem_compressed_bytes = bytes(pages.compressed);
         sample.mem_used_bytes = total.and_then(|total| memory_used_bytes(total, &pages));
-        sample.mem_app_uncompressed_bytes = pages
-            .internal
-            .checked_add(pages.compressor_stored)
-            .and_then(bytes);
     }
     sample.mem_available_bytes = total
         .zip(memorystatus_level.filter(|level| (0..=100).contains(level)))
@@ -514,10 +505,12 @@ pub fn job_usage(
 }
 
 /// The queue's share on the host sample: sums over running jobs, never above
-/// the host's own reading (the two are measured differently). A footprint
-/// counts compressed memory at full size while `used` counts it compressed,
-/// so memory is the queue's fraction of app memory, both at full size,
-/// applied to `used`.
+/// the host's own reading (the two are measured differently). Memory is the
+/// jobs' summed footprint, the figure each job shows on the Queue page, so
+/// the queue's share and the per-job rows agree (sm#2475). Scaling `used` by
+/// the queue's fraction of app memory instead read the whole of `used`
+/// whenever GPU-heavy jobs' footprints, which count Metal allocations that
+/// app memory does not, outgrew it.
 pub fn apply_queue_share(
     sample: &mut HostSample,
     usage: &HashMap<String, JobUsage>,
@@ -533,14 +526,7 @@ pub fn apply_queue_share(
             (value, _) => value,
         }
     }
-    let memory = sum(usage.values().map(|job| job.memory_bytes)).map(|footprint| {
-        match (sample.mem_used_bytes, sample.mem_app_uncompressed_bytes) {
-            (Some(used), Some(app)) if app > 0 => {
-                (used as f64 * (footprint as f64 / app as f64).min(1.0)) as i64
-            }
-            _ => footprint,
-        }
-    });
+    let memory = sum(usage.values().map(|job| job.memory_bytes));
     let cpu = sum(usage.values().map(|job| job.cpu_percent));
     let gpu = sum(usage.values().map(|job| job.gpu_percent));
     // With nothing running the queue's share is a known zero.
@@ -672,7 +658,6 @@ pub(crate) mod mac {
             compressed: i64::from(info.compressor_page_count),
             internal: i64::from(info.internal_page_count),
             purgeable: i64::from(info.purgeable_count),
-            compressor_stored: i64::try_from(info.total_uncompressed_pages_in_compressor).ok()?,
         })
     }
 
@@ -1603,7 +1588,6 @@ mod tests {
             compressed: 2_272_059,
             internal: 6_349_615,
             purgeable: 30_616,
-            compressor_stored: 6_407_394,
         };
         apply_memory(&mut sample, Some(274_877_906_944), Some(pages), Some(96));
         let used_gib = sample.mem_used_bytes.unwrap() as f64 / GIB as f64;
@@ -1707,10 +1691,11 @@ mod tests {
             Some(30 * GIB),
             "capped at host used"
         );
-        // 40G of footprint out of 160G of app memory at full size: a quarter of used.
-        sample.mem_app_uncompressed_bytes = Some(160 * GIB);
+        // 2026-10-22: 142G of GPU-heavy footprint against 168G of app memory
+        // read as all 209G used; the share is the footprint itself.
+        sample.mem_used_bytes = Some(209 * GIB);
         apply_queue_share(&mut sample, &usage, true);
-        assert_eq!(sample.queue_mem_bytes, Some(30 * GIB / 4));
+        assert_eq!(sample.queue_mem_bytes, Some(40 * GIB));
         assert_eq!(sample.queue_cpu_pct, Some(25.0));
         assert_eq!(sample.queue_gpu_pct, Some(10.0), "capped at host GPU");
         apply_queue_share(&mut sample, &HashMap::new(), false);

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useState, useRef } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, toast } from './ui.js';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText } from './queue-model.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText, usageBreakdown, usageText, jobUsage, JOB_COLORS } from './queue-model.js';
 
 import { requestStart } from './queue-start.js';
 
@@ -23,11 +23,12 @@ export function QueuePage() {
       const waiting = queue.queued.filter((job) => job.type === type).length;
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
     })}<div class="q-card"><span class="q-label">shell</span><strong>${queue.slots?.by_type?.shell?.running ?? 0} <small>running</small></strong><span class="muted">no limit</span></div></div>
+    <${UsageNow} running=${queue.running} />
     <${MacChart} />
     <${LocalModelCard} card=${queue.local_model} />
     ${!insightDismissed ? html`<${HeldBack} stats=${stats} insightOnly=${true} onDismiss=${() => { store('queue-limits-insight-dismissed', true); setInsightDismissed(true); }} />` : null}
     <section class="q-card"><div class="q-heading"><h2>Running</h2><span class="muted">Last 3 hours → now</span></div>
-      ${queue.running.length ? queue.running.map((job) => html`<${JobRow} key=${job.id} job=${job} now=${now} />`) : html`<p class="muted">No jobs running.</p>`}
+      ${queue.running.length ? queue.running.map((job, i) => html`<${JobRow} key=${job.id} job=${job} now=${now} color=${i % JOB_COLORS} />`) : html`<p class="muted">No jobs running.</p>`}
       <h2>Waiting · in start order</h2>
       ${waitingGroups(queue.queued).map((group) => html`<div><p class="sub">${group.caption}</p>${group.jobs.map((job) => html`<${JobRow} key=${job.id} job=${job} now=${now} />`)}</div>`)}
       ${!queue.queued.length ? html`<p class="muted">No jobs waiting.</p>` : null}
@@ -153,36 +154,128 @@ export function StartNow({ job, primary = false }) {
 
 // The details band opens after the element carrying data-open-ref, so a
 // waiting row's wrapper carries it and the band lands below the Start pill.
-function JobRow({ job, now }) {
-  if (job.state !== 'pending') return html`<${JobRowButton} job=${job} now=${now} anchor=${true} />`;
+function JobRow({ job, now, color }) {
+  if (job.state !== 'pending') return html`<${JobRowButton} job=${job} now=${now} anchor=${true} color=${color} />`;
   return html`<div class="q-job-line" data-open-ref=${`job:${job.id}`}><${JobRowButton} job=${job} now=${now} /><${StartNow} job=${job} /></div>`;
 }
 
 // A shell job (sm#2412): memory against its reservation where other jobs show time.
-function ShellJobRowButton({ job, now, anchor }) {
+function ShellJobRowButton({ job, now, anchor, color }) {
   const reserved = job.shell?.reserved_bytes ?? job.memory_bytes;
   const used = job.shell?.current_bytes ?? job.usage?.memory_bytes;
   const over = !!job.shell?.over_reservation;
   const share = reserved && used != null ? Math.min(100, (used / reserved) * 100) : 0;
   return html`<button class="q-job" type="button" data-open-ref=${anchor ? `job:${job.id}` : null} onClick=${() => openPanel(`job:${job.id}`)}>
-    <span class="q-job-title">${title(job)}<small>shell · ${jobAgentLabel(job)}</small>${over ? html`<small class="amber">${job.holding?.summary}</small>` : null}</span>
+    <span class="q-job-title"><${JobName} job=${job} color=${color} /><small>shell · ${jobAgentLabel(job)}</small>${over ? html`<small class="amber">${job.holding?.summary}</small>` : null}</span>
     <span class=${`q-membar${over ? ' over' : ''}`} role="img" aria-label=${`${gb(used)} of ${gb(reserved)} reserved`}><i style=${`width:${share}%`}></i></span>
     <span>${age(job.queued_at || job.started_at, now)} · <span class=${over ? 'amber' : ''}>${used != null ? `${gb(used)} of ` : ''}${gb(reserved)} reserved</span></span>
   </button>`;
 }
 
-function JobRowButton({ job, now, anchor = false }) {
-  if (job.type === 'shell') return html`<${ShellJobRowButton} job=${job} now=${now} anchor=${anchor} />`;
+function JobRowButton({ job, now, anchor = false, color = null }) {
+  if (job.type === 'shell') return html`<${ShellJobRowButton} job=${job} now=${now} anchor=${anchor} color=${color} />`;
   const deadline = Date.parse(job.wait_deadline_at) - now;
   const review = reviewJobText(job);
   return html`<button class="q-job" type="button" data-open-ref=${anchor ? `job:${job.id}` : null} onClick=${() => openPanel(`job:${job.id}`)}>
     ${review ? html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${review.title} <b>${review.reviewer}</b><small>${review.detail}</small>${review.why ? html`<small class="amber">${review.why}</small>` : null}</span>`
-      : html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>`}
+      : html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}<${JobName} job=${job} color=${color} /><small>${job.type} · ${jobAgentLabel(job)}</small></span>`}
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}
       ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : job.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
-      ${job.state === 'pending' && deadline < 21600000 && Number.isFinite(deadline) ? ` · gives up in ${duration(deadline / 1000)}` : ''}</span>
+      ${job.state === 'pending' && deadline < 21600000 && Number.isFinite(deadline) ? ` · gives up in ${duration(deadline / 1000)}` : ''}
+      ${job.state === 'running' ? html`<${UsageLine} job=${job} />` : null}</span>
   </button>`;
+}
+
+/** A job's name with its breakdown colour and a pin when pinned (sm#2475). */
+function JobName({ job, color }) {
+  return html`<span class="q-name">${color != null ? html`<i class=${`q-dot j${color}`} aria-hidden="true"></i>` : null}<span>${title(job)}</span>${job.pinned_at ? html`<${PinIcon} label="Pinned" />` : null}</span>`;
+}
+
+function PinIcon({ label }) {
+  return html`<svg class="q-pin" viewBox="0 0 16 16" width="13" height="13" role=${label ? 'img' : null} aria-label=${label} aria-hidden=${label ? null : 'true'}><path fill="currentColor" d="M10.2 1.3a1 1 0 0 1 1.4 0l3.1 3.1a1 1 0 0 1-.4 1.6l-1.9.7-2.3 2.3.3 3a1 1 0 0 1-1.7.8L6.4 10.5l-3.7 3.7a.7.7 0 0 1-1-1l3.7-3.7-2.3-2.3a1 1 0 0 1 .8-1.7l3 .3 2.3-2.3.7-1.9a1 1 0 0 1 .3-.3z" /></svg>`;
+}
+
+/** A running job's live usage, against its memory cap when it has one. */
+function UsageLine({ job }) {
+  const use = jobUsage(job);
+  if (use.memory == null && use.cpu == null && use.gpu == null) return null;
+  const cap = job.type === 'shell' ? null : job.memory_bytes;
+  const parts = [
+    use.memory != null ? `${usageText('memory', use.memory)}${cap ? ` of ${usageText('memory', cap)} cap` : ''}` : null,
+    use.cpu != null ? `CPU ${usageText('cpu', use.cpu)}` : null,
+    use.gpu ? `GPU ${usageText('gpu', use.gpu)}` : null,
+  ].filter(Boolean);
+  const over = cap && use.memory > cap * .85;
+  return html`<small class=${`q-use${over ? ' amber' : ''}`}>${parts.join(' · ')}</small>`;
+}
+
+const METRIC_NAMES = { memory: 'Memory', cpu: 'CPU', gpu: 'GPU' };
+
+/**
+ * Right now (sm#2475): which running job is using how much of the Mac's
+ * memory, CPU and GPU, and how much the rest of the Mac uses. Hovering a job,
+ * here or on a bar, picks out its slice on all three bars; tapping opens it.
+ */
+export function UsageNow({ running }) {
+  const [host] = usePoll(() => api('/client/host-status'), 10000);
+  const [focus, setFocus] = useState(null);
+  const { jobs, rows } = usageBreakdown(running, host);
+  // Nothing measured yet means nothing to attribute: no card.
+  if (!jobs.some((job) => job.memory != null || job.cpu != null)) return null;
+  const total = (key) => rows.find((r) => r.key === key);
+  // The legend names jobs with a visible slice, largest first; the rest share a line.
+  const shown = new Set(rows.flatMap((row) => row.segments.map((s) => s.id)));
+  const named = jobs.filter((job) => shown.has(job.id)).sort((a, b) => (b.memory || 0) - (a.memory || 0));
+  const small = jobs.filter((job) => !shown.has(job.id) && (job.memory > 0 || job.cpu > 0 || job.gpu > 0));
+  const other = Object.fromEntries(rows.map((r) => [r.key, r.other]));
+  const open = (id) => id && openPanel(`job:${id}`);
+  const dim = (id) => focus != null && focus !== id ? ' dim' : '';
+  const valueText = (row) => html`${row.used == null ? '' : row.key === 'memory' ? `${usageText('memory', row.used)} of ${usageText('memory', row.scale)}` : `${usageText(row.key, row.used)} busy`}<small>${usageText(row.key, row.queue)} in jobs</small>`;
+  return html`<section class="q-card q-now" onMouseLeave=${() => setFocus(null)}>
+    <div class="q-heading"><h2>Right now</h2><span class="muted">What each running job is using</span></div>
+    <div class="q-now-bars">${rows.map((row) => html`<div class="q-now-row">
+      <span class="q-now-name">${METRIC_NAMES[row.key]}</span>
+      <span class="q-stack" role="img" aria-label=${`${METRIC_NAMES[row.key]}: ${row.segments.map((s) => `${s.label} ${usageText(row.key, s.value)}`).concat(row.other != null ? [`rest of the Mac ${usageText(row.key, row.other)}`] : []).join(', ')}`}>
+        ${row.segments.map((s) => html`<i class=${`j${s.color}${dim(s.id ?? 'small')}`} style=${`width:${s.share}%`} title=${`${s.label} · ${usageText(row.key, s.value)}`}
+          onMouseEnter=${() => setFocus(s.id ?? 'small')} onClick=${() => open(s.id)}></i>`)}
+        ${row.otherShare ? html`<i class=${`other${dim('other')}`} style=${`width:${row.otherShare}%`} title=${`Rest of the Mac · ${usageText(row.key, row.other)}`} onMouseEnter=${() => setFocus('other')}></i>` : null}
+      </span>
+      <span class="q-now-val">${valueText(row)}</span>
+    </div>`)}</div>
+    <ul class="q-now-legend">
+      ${named.map((job) => html`<li><button type="button" class=${`q-now-key${dim(job.id)}`} onMouseEnter=${() => setFocus(job.id)} onFocus=${() => setFocus(job.id)} onBlur=${() => setFocus(null)} onClick=${() => open(job.id)}>
+        <i class=${`q-dot j${job.color}`} aria-hidden="true"></i><span class="q-now-label">${job.label}</span>
+        <span class="q-now-nums">${[job.memory > 0 && usageText('memory', job.memory), job.cpu > 0 && `CPU ${usageText('cpu', job.cpu)}`, job.gpu > 0 && `GPU ${usageText('gpu', job.gpu)}`].filter(Boolean).join(' · ')}</span>
+      </button></li>`)}
+      ${small.length ? html`<li><span class=${`q-now-key${dim('small')}`} title=${small.map((job) => job.label).join(', ')} onMouseEnter=${() => setFocus('small')}>
+        <i class="q-dot small" aria-hidden="true"></i><span class="q-now-label">${small.length} smaller ${small.length === 1 ? 'job' : 'jobs'}<small>${small.map((job) => job.label).join(', ')}</small></span>
+        <span class="q-now-nums">${usageText('memory', small.reduce((sum, job) => sum + (job.memory || 0), 0))}</span>
+      </span></li>` : null}
+      ${Object.values(other).some((v) => v > 0) ? html`<li><span class=${`q-now-key rest${dim('other')}`} onMouseEnter=${() => setFocus('other')}>
+        <i class="q-dot other" aria-hidden="true"></i><span class="q-now-label">Rest of the Mac<small>apps, agents and the system</small></span>
+        <span class="q-now-nums">${[other.memory > 0 && usageText('memory', other.memory), other.cpu > 0 && `CPU ${usageText('cpu', other.cpu)}`, other.gpu > 0 && `GPU ${usageText('gpu', other.gpu)}`].filter(Boolean).join(' · ')}</span>
+      </span></li>` : null}
+    </ul>
+    ${total('memory') ? null : html`<p class="sub">The Mac's own reading is unavailable; only the jobs' share is shown.</p>`}
+  </section>`;
+}
+
+/** Live usage in the job panel: memory, CPU and GPU as shares of the Mac. */
+function usingNow(job) {
+  const use = jobUsage(job);
+  if (use.memory == null && use.cpu == null) return 'Not measured yet';
+  return [`${usageText('memory', use.memory)} memory`, `CPU ${usageText('cpu', use.cpu)}`, `GPU ${usageText('gpu', use.gpu)} of the Mac`].join(' · ');
+}
+
+/** What the job asked for: time always, a memory cap when set, and CPU and
+ * GPU only for perf jobs, the one type that reserves them. */
+function limitsText(job) {
+  return [
+    job.timeout_seconds ? `${duration(job.timeout_seconds)} to run` : 'No time limit',
+    job.memory_bytes ? `memory cap ${usageText('memory', job.memory_bytes)}` : 'no memory cap',
+    job.type === 'perf' ? `CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} reserved` : null,
+  ].filter(Boolean).join(' · ');
 }
 
 const jobQuestions = new Map();
@@ -247,8 +340,13 @@ function JobPanel({ id, controls }) {
       <div class="q-actions">
         ${job.state === 'pending' ? html`<${StartNow} job=${job} primary=${true} />` : null}
         ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>${shell ? 'Stop' : 'Cancel'}</button>${shell ? null : html`<button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>`}` : null}
+        ${active && !shell ? html`<button class=${`btn q-pin-btn${job.pinned_at ? ' on' : ''}`} disabled=${busy} aria-pressed=${!!job.pinned_at} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/pin`, { method: job.pinned_at ? 'DELETE' : 'POST', body: {} }); toast(job.pinned_at ? `Unpinned ${title(job)}` : `Pinned ${title(job)}`); bus.emit('queue-changed'); })}><${PinIcon} />${job.pinned_at ? 'Pinned' : 'Pin'}</button>` : null}
         ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
+      ${active && !shell ? html`<p class=${`q-pin-note${job.pinned_at ? ' on' : ''}`}>${job.pinned_at
+        ? `Pinned ${clock(job.pinned_at)}. If the Mac runs short of memory, sm stops every other job first, and stops this one only at critical pressure with nothing else left.`
+        : job.type === 'service' ? 'If the Mac runs short of memory, sm stops service jobs only after every other job. Pin it to keep it through anything short of critical pressure.'
+        : 'If the Mac runs short of memory, sm stops the largest job first. Pin it to keep it running.'}</p>` : null}
       ${cancel && active ? html`<section class="q-card"><label>${shell ? `Note to ${jobAgentLabel(job)} (optional)` : 'Cancellation note (optional)'}<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>${shell ? 'Stop it' : 'Cancel job'}</button>${shell ? html`<p class="sub">sm stops the command and tells ${jobAgentLabel(job)} how to rerun it through the queue.</p>` : null}</section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}
@@ -259,7 +357,7 @@ function JobPanel({ id, controls }) {
         <dt>Reviewer</dt><dd>${job.review.reviewer_label || '—'}</dd><dt>For</dt><dd>${job.review.author_name}</dd>
         <dt>Why</dt><dd>${job.review.policy_source || 'default'} policy${job.review.why !== 'default' ? html` · <span class="amber">${job.review.why}</span>` : ''}</dd>
         <dt>Checkout</dt><dd>${job.cwd}</dd></dl>` : null}
-      ${shell ? html`<dl class="q-details"><dt>How it got here</dt><dd>${job.holding?.detail || '—'}</dd><dt>Memory</dt><dd>${job.shell?.current_bytes != null ? `${gb(job.shell.current_bytes)} now · ` : ''}${job.shell?.peak_bytes != null ? `peak ${gb(job.shell.peak_bytes)} · ` : ''}${gb(job.shell?.reserved_bytes ?? job.memory_bytes)} reserved${job.shell?.over_reservation ? html`<br /><span class="amber">Over its reservation: if the Mac runs short of memory, sm stops this first.</span>` : ''}</dd><dt>Command</dt><dd><code>${job.argv?.join(' ') || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd || '—'}</dd><dt>Started</dt><dd>${clock(job.queued_at)}</dd><dt>In the queue</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Ended</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>` : html`<dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>`}
+      ${shell ? html`<dl class="q-details"><dt>How it got here</dt><dd>${job.holding?.detail || '—'}</dd><dt>Memory</dt><dd>${job.shell?.current_bytes != null ? `${gb(job.shell.current_bytes)} now · ` : ''}${job.shell?.peak_bytes != null ? `peak ${gb(job.shell.peak_bytes)} · ` : ''}${gb(job.shell?.reserved_bytes ?? job.memory_bytes)} reserved${job.shell?.over_reservation ? html`<br /><span class="amber">Over its reservation: if the Mac runs short of memory, sm stops this first.</span>` : ''}</dd><dt>Command</dt><dd><code>${job.argv?.join(' ') || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd || '—'}</dd><dt>Started</dt><dd>${clock(job.queued_at)}</dd><dt>In the queue</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Ended</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>` : html`<dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd>${job.state === 'running' ? html`<dt>Using now</dt><dd>${usingNow(queue?.running?.find((live) => live.id === job.id) || job)}</dd>` : null}<dt>Limits</dt><dd>${limitsText(job)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>`}
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
       <div class="q-actions">${usage?.next_before_ms ? html`<button class="btn sm" onClick=${() => setBefore(usage.next_before_ms)}>Earlier samples</button>` : null}${before ? html`<button class="btn sm" onClick=${() => setBefore(null)}>Latest samples</button>` : null}</div>

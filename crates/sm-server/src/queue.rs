@@ -4087,7 +4087,59 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "stop_signal", "TEXT")?;
     ensure_column(conn, "queue_jobs", "stop_escaped_pids", "TEXT")?;
     ensure_column(conn, "queue_jobs", "shell_adoption_json", "TEXT")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queue_job_pins (
+            job_id TEXT PRIMARY KEY,
+            pinned_at TEXT NOT NULL
+        );",
+    )?;
     Ok(())
+}
+
+/// Jobs the owner pinned (sm#2475), by id, with when. The host memory guard
+/// stops a pinned job only at critical kernel pressure with nothing else
+/// left to stop, and perf never displaces one. A database from before pins
+/// has none.
+pub(crate) fn pinned_queue_jobs_conn(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut statement = match conn.prepare("SELECT job_id, pinned_at FROM queue_job_pins") {
+        Ok(statement) => statement,
+        Err(error) if error.to_string().contains("no such table") => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let pins = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(pins)
+}
+
+/// Pins or unpins a pending or running job for the owner. Returns when it is
+/// pinned (`None` once unpinned), or `Ok(None)` for a job that is not found;
+/// a job that already ended is refused.
+pub fn set_queue_job_pinned_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    pinned: bool,
+) -> Result<Option<Option<String>>> {
+    let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&conn)?;
+    let Some(job) = get_queue_job_runtime_conn(&conn, job_id)? else {
+        return Ok(None);
+    };
+    if !pinned {
+        conn.execute("DELETE FROM queue_job_pins WHERE job_id = ?1", [job_id])?;
+        return Ok(Some(None));
+    }
+    if !matches!(job.state.as_str(), "pending" | "running") {
+        bail!(
+            "{job_id} already ended ({}); only a waiting or running job can be pinned",
+            job.state
+        );
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO queue_job_pins (job_id, pinned_at) VALUES (?1, ?2)",
+        params![job_id, now_rfc3339()],
+    )?;
+    Ok(Some(pinned_queue_jobs_conn(&conn)?.remove(job_id)))
 }
 
 fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
@@ -5508,6 +5560,7 @@ const MACOS_MEMORY_RESERVE_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
 /// `kern.memorystatus_vm_pressure_level` at warn; critical is 4.
 const MACOS_PRESSURE_WARN: i64 = 2;
+const MACOS_PRESSURE_CRITICAL: i64 = 4;
 #[cfg(any(target_os = "macos", test))]
 /// Under warn or critical pressure the reserve rises to this share of
 /// physical memory (sm#2053). The kernel kills processes when its compressor
@@ -5693,6 +5746,19 @@ fn host_memory_pressure() -> Option<(i64, i64)> {
     }
 }
 
+/// Whether the kernel reports critical memory pressure, the only time the
+/// host memory guard may stop a pinned job.
+fn host_pressure_critical() -> bool {
+    #[cfg(any(target_os = "macos", test))]
+    {
+        host_memory_pressure().is_some_and(|(level, _)| level >= MACOS_PRESSURE_CRITICAL)
+    }
+    #[cfg(not(any(target_os = "macos", test)))]
+    {
+        false
+    }
+}
+
 /// `reserve`, raised to a share of physical memory while the kernel reports
 /// warn or critical pressure.
 #[cfg(any(target_os = "macos", test))]
@@ -5760,11 +5826,16 @@ fn displace_background_for_perf_conn(
     if queue_job_displacement_in_progress(jobs) {
         return Ok(false);
     }
+    let pinned = pinned_queue_jobs_conn(conn)?;
     let Some(background) = jobs
         .iter()
-        // The owner started a forced run on purpose; perf waits instead.
+        // The owner started a forced run, or pinned one, on purpose; perf
+        // waits instead.
         .filter(|job| {
-            job.state == "running" && job.job_type == "background" && job.owner_forced_at.is_none()
+            job.state == "running"
+                && job.job_type == "background"
+                && job.owner_forced_at.is_none()
+                && !pinned.contains_key(&job.id)
         })
         .min_by_key(|job| (job.started_at.as_deref().unwrap_or(&job.queued_at), &job.id))
         .cloned()
@@ -6659,13 +6730,18 @@ const HOST_MEMORY_GUARD_MIN_VICTIM_RSS: i64 = 512 * 1024 * 1024;
 /// and resident bytes: among jobs not already being stopped, cancelled, or
 /// displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`], a shell job
 /// over its reservation first (sm#2412), then an owner-forced run, then the
-/// largest.
+/// largest. Service jobs go only after every other job, and pinned jobs
+/// (sm#2475) only at critical pressure, after every unpinned job.
 fn host_pressure_victim<'a>(
     jobs: &'a [QueueJobRuntimeRecord],
     rss_by_pgid: &HashMap<i64, i64>,
+    pinned: &HashMap<String, String>,
+    critical: bool,
 ) -> Option<(&'a QueueJobRuntimeRecord, i64, i64)> {
+    let unpinned = |job: &QueueJobRuntimeRecord| !pinned.contains_key(&job.id);
     jobs.iter()
         .filter(|job| job.state == "running" && job.holding_reason.is_none())
+        .filter(|job| critical || unpinned(job))
         .filter_map(|job| {
             let pgid = job.process_group_id.or(job.pid)?;
             let rss = *rss_by_pgid.get(&pgid)?;
@@ -6678,8 +6754,11 @@ fn host_pressure_victim<'a>(
                 job.job_type == shell::SHELL_JOB_TYPE
                     && job.memory_bytes.is_some_and(|reserved| rss > reserved)
             };
-            over(a, *a_rss)
-                .cmp(&over(b, *b_rss))
+            let not_service = |job: &QueueJobRuntimeRecord| job.job_type != "service";
+            unpinned(a)
+                .cmp(&unpinned(b))
+                .then_with(|| not_service(a).cmp(&not_service(b)))
+                .then_with(|| over(a, *a_rss).cmp(&over(b, *b_rss)))
                 .then_with(|| {
                     a.owner_forced_at
                         .is_some()
@@ -6727,7 +6806,10 @@ pub(crate) fn host_memory_guard_pass(
         conn,
         &runtime_finished_since(QueueAdmissionPolicy::default()),
     )?;
-    let Some((job, pgid, rss)) = host_pressure_victim(&jobs, rss_by_pgid) else {
+    let pinned = pinned_queue_jobs_conn(conn)?;
+    let Some((job, pgid, rss)) =
+        host_pressure_victim(&jobs, rss_by_pgid, &pinned, host_pressure_critical())
+    else {
         return Ok(None);
     };
     let trip = PerfMemoryGuardTrip {
@@ -11829,6 +11911,55 @@ mod tests {
     }
 
     #[test]
+    fn host_memory_guard_stops_service_jobs_last_and_pinned_jobs_only_at_critical() {
+        // 2026-10-22: a pinned scoring run must outlast every other job, and
+        // a service watcher waiting on remote work goes after batch work.
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-pins");
+        let pinned = running_job_with_pgid(&state_dir, "background", "iter7 score", 101);
+        let service = running_job_with_pgid(&state_dir, "service", "watch8", 102);
+        let tests = running_job_with_pgid(&state_dir, "tests", "gate", 103);
+        let pinned_at = set_queue_job_pinned_in_state_dir(&state_dir, &pinned.id, true).unwrap();
+        assert!(pinned_at.unwrap().is_some());
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let rss: HashMap<i64, i64> = [(101, 130 * GIB), (102, 10 * GIB), (103, GIB)]
+            .into_iter()
+            .collect();
+        let host = Some((256 * GIB, 1));
+        // The smaller tests job goes before the larger service job...
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((tests.id.clone(), 103))
+        );
+        // ...then the service job; the pinned job never at warn.
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((service.id.clone(), 102))
+        );
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(Some((2, 256 * GIB))));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            None
+        );
+        // At critical pressure with nothing else left, the pinned job goes.
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(Some((4, 256 * GIB))));
+        let critical = host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap();
+        TEST_HOST_PRESSURE.with(|pressure| pressure.set(None));
+        assert_eq!(critical, Some((pinned.id.clone(), 101)));
+        drop(conn);
+        // Unpinning clears it; an ended job cannot be pinned.
+        assert_eq!(
+            set_queue_job_pinned_in_state_dir(&state_dir, &pinned.id, false).unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            set_queue_job_pinned_in_state_dir(&state_dir, "job_missing", true).unwrap(),
+            None
+        );
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn host_memory_guard_stops_a_job_under_kernel_warn_with_32_gib_free() {
         // 2026-10-07 11:18: 32 GiB outside "Memory Used" and the kernel at
         // warn, 48 s before it killed the largest process (sm#2053).
@@ -12437,15 +12568,29 @@ mod tests {
 
     #[test]
     fn perf_never_displaces_an_owner_forced_background_run() {
+        perf_never_displaces_an_owner_chosen_background_run(false);
+    }
+
+    #[test]
+    fn perf_never_displaces_a_pinned_background_run() {
+        perf_never_displaces_an_owner_chosen_background_run(true);
+    }
+
+    fn perf_never_displaces_an_owner_chosen_background_run(pin: bool) {
         let state_dir = unique_temp_path("forced-no-displace");
         let message_queue_db = state_dir.join("messages.db");
         let forced = running_job_with_pgid(&state_dir, "background", "forced", 999_993);
+        if pin {
+            set_queue_job_pinned_in_state_dir(&state_dir, &forced.id, true).unwrap();
+        }
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
-        conn.execute(
-            "UPDATE queue_jobs SET owner_forced_at = ?2 WHERE id = ?1",
-            params![forced.id, now_rfc3339()],
-        )
-        .unwrap();
+        if !pin {
+            conn.execute(
+                "UPDATE queue_jobs SET owner_forced_at = ?2 WHERE id = ?1",
+                params![forced.id, now_rfc3339()],
+            )
+            .unwrap();
+        }
         RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {

@@ -626,6 +626,8 @@ data class SessionJob(
     val holding: JobHolding? = null,
     /** Set while the owner's Start now run is going (sm#1627). */
     @SerialName("owner_forced_at") val ownerForcedAt: String? = null,
+    /** When the owner pinned it (sm#2475): memory pressure stops it last. */
+    @SerialName("pinned_at") val pinnedAt: String? = null,
     @SerialName("queued_at") val queuedAt: String? = null,
     @SerialName("started_at") val startedAt: String? = null,
     @SerialName("finished_at") val finishedAt: String? = null,
