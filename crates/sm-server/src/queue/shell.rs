@@ -62,7 +62,8 @@ pub const EXPECTATION_WINDOW_MS: i64 = 15 * 60 * 1000;
 /// the expectation is the larger of its peak so far and its use projected
 /// 15 minutes ahead on the last 15 minutes' trend, capped at the ceiling.
 /// `readings` are `(sampled_at_ms, bytes)` from that window, and `peak` the
-/// most it has used while running; `None` (never sampled) means the ceiling.
+/// most it has used while running. With no peak or no reading in the window,
+/// the job counts at its ceiling.
 pub fn expected_bytes(
     declared: i64,
     current: i64,
@@ -70,7 +71,9 @@ pub fn expected_bytes(
     age_ms: i64,
     readings: &[(i64, i64)],
 ) -> i64 {
-    let Some(peak) = peak.filter(|_| age_ms >= EXPECTATION_WARMUP_MS) else {
+    // No reading in the window means the recorder lost track of the job.
+    let Some(peak) = peak.filter(|_| age_ms >= EXPECTATION_WARMUP_MS && !readings.is_empty())
+    else {
         return declared;
     };
     let growth = trend_bytes_per_ms(readings).max(0.0) * EXPECTATION_WINDOW_MS as f64;

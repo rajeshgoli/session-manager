@@ -42,6 +42,11 @@ fn a_declared_ceiling_counts_in_full_until_the_job_has_history() {
         expected_bytes(192 * GIB, GIB, None, EXPECTATION_WARMUP_MS * 10, &[]),
         192 * GIB
     );
+    // A stale peak with no reading in the last 15 minutes earns no credit.
+    assert_eq!(
+        expected_bytes(192 * GIB, GIB, Some(GIB), EXPECTATION_WARMUP_MS * 10, &[]),
+        192 * GIB
+    );
 }
 
 #[test]
