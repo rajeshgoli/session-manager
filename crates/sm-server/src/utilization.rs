@@ -1049,6 +1049,39 @@ pub fn peak_running_rss(db_path: &Path, job_ids: &[String]) -> Result<Option<(i6
     Ok(peak.map(|peak| (peak, runs)))
 }
 
+/// A running queue job's memory as the recorder sampled it (sm#2490).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobMemoryHistory {
+    /// The most it used while running; `None` if never sampled.
+    pub peak: Option<i64>,
+    /// `(sampled_at_ms, bytes)` since the requested time, oldest first.
+    pub readings: Vec<(i64, i64)>,
+}
+
+pub fn job_memory_history(db_path: &Path, job_id: &str, since_ms: i64) -> Result<JobMemoryHistory> {
+    let Some(conn) = open_for_read(db_path)? else {
+        return Ok(JobMemoryHistory::default());
+    };
+    let peak = conn.query_row(
+        "SELECT MAX(COALESCE(footprint_bytes, rss_bytes)) FROM job_samples
+         WHERE job_id = ?1 AND state = 'running'",
+        [job_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT sampled_at_ms, COALESCE(footprint_bytes, rss_bytes) FROM job_samples
+         WHERE job_id = ?1 AND state = 'running' AND sampled_at_ms >= ?2
+           AND COALESCE(footprint_bytes, rss_bytes) IS NOT NULL
+         ORDER BY sampled_at_ms",
+    )?;
+    let readings = statement
+        .query_map(params![job_id, since_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(JobMemoryHistory { peak, readings })
+}
+
 pub fn queue_stats(db_path: &Path, hours: i64) -> Result<Value> {
     queue_stats_at(db_path, hours, now_ms())
 }

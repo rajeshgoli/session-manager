@@ -466,6 +466,7 @@ async fn main() -> Result<()> {
                     session_state_file: expand_home(&config.paths.state_file),
                     queue_state_dir: queue_state_dir.clone(),
                     message_queue_db_path: message_queue_db_path.clone(),
+                    utilization_db_path: expand_home(&config.utilization.db_path),
                     limit_bytes: config.queue_runner.memory.agent_process_max_bytes,
                     exempt_commands: config
                         .queue_runner
