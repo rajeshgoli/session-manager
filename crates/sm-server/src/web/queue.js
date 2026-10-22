@@ -237,7 +237,7 @@ export function UsageNow({ running }) {
     <div class="q-now-bars">${rows.map((row) => html`<div class="q-now-row">
       <span class="q-now-name">${METRIC_NAMES[row.key]}</span>
       <span class="q-stack" role="img" aria-label=${`${METRIC_NAMES[row.key]}: ${row.segments.map((s) => `${s.label} ${usageText(row.key, s.value)}`).concat(row.other != null ? [`rest of the Mac ${usageText(row.key, row.other)}`] : []).join(', ')}`}>
-        ${row.segments.map((s) => html`<i class=${`j${s.color}${dim(s.id ?? 'small')}`} style=${`width:${s.share}%`} title=${`${s.label} · ${usageText(row.key, s.value)}`}
+        ${row.segments.map((s) => html`<i class=${`${s.color === 'small' ? 'small' : `j${s.color}`}${dim(s.id ?? 'small')}`} style=${`width:${s.share}%`} title=${`${s.label} · ${usageText(row.key, s.value)}`}
           onMouseEnter=${() => setFocus(s.id ?? 'small')} onClick=${() => open(s.id)}></i>`)}
         ${row.otherShare ? html`<i class=${`other${dim('other')}`} style=${`width:${row.otherShare}%`} title=${`Rest of the Mac · ${usageText(row.key, row.other)}`} onMouseEnter=${() => setFocus('other')}></i>` : null}
       </span>
@@ -345,8 +345,9 @@ function JobPanel({ id, controls }) {
       </div>
       ${active && !shell ? html`<p class=${`q-pin-note${job.pinned_at ? ' on' : ''}`}>${job.pinned_at
         ? `Pinned ${clock(job.pinned_at)}. If the Mac runs short of memory, sm stops every other job first, and stops this one only at critical pressure with nothing else left.`
-        : job.type === 'service' ? 'If the Mac runs short of memory, sm stops service jobs only after every other job. Pin it to keep it through anything short of critical pressure.'
-        : 'If the Mac runs short of memory, sm stops the largest job first. Pin it to keep it running.'}</p>` : null}
+        : job.type === 'service' ? 'If the Mac runs short of memory, sm stops service jobs after every other unpinned job. Pin it to keep it through anything short of critical pressure.'
+        : job.owner_forced_at ? 'You started this early, so if the Mac runs short of memory, sm stops it first and puts it back in line. Pin it to keep it running.'
+        : 'If the Mac runs short of memory, sm stops the largest unpinned job first. Pin it to keep it running.'}</p>` : null}
       ${cancel && active ? html`<section class="q-card"><label>${shell ? `Note to ${jobAgentLabel(job)} (optional)` : 'Cancellation note (optional)'}<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); closePanel(); bus.emit('queue-changed'); })}>${shell ? 'Stop it' : 'Cancel job'}</button>${shell ? html`<p class="sub">sm stops the command and tells ${jobAgentLabel(job)} how to rerun it through the queue.</p>` : null}</section>` : null}
       ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
         ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}

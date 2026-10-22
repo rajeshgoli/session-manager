@@ -113,8 +113,9 @@ fun shellMemoryDetail(job: SessionJob): String? {
 /** What memory pressure does to [job] (sm#2475): pinned jobs go last, and only at critical pressure. */
 fun pressureText(job: SessionJob): String = when {
     job.pinnedAt != null -> "Pinned. sm stops every other job first, and this one only at critical pressure with nothing else left."
-    job.type == "service" -> "sm stops service jobs only after every other job. Pin it to keep it through anything short of critical pressure."
-    else -> "sm stops the largest job first. Pin it to keep it running."
+    job.type == "service" -> "sm stops service jobs after every other unpinned job. Pin it to keep it through anything short of critical pressure."
+    job.ownerForcedAt != null -> "You started this early, so sm stops it first and puts it back in line. Pin it to keep it running."
+    else -> "sm stops the largest unpinned job first. Pin it to keep it running."
 }
 
 /** "tests · 4m of 15m · 12G · cpu 25% · gpu 3%"; use is the job's share of the whole Mac. */
