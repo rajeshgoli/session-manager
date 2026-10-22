@@ -26,6 +26,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::owner_docs::{repo_name, validate_repo_slug};
 
 pub mod merge_holds;
+pub mod waits;
 pub mod worktrees;
 
 /// At most this many aliases per GraphQL call (about 20 KB of output).
@@ -37,7 +38,7 @@ pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 // Bump when this initializer or its merge-hold, loose-worktree, or board
 // schema dependencies change. The marker is published with the whole schema.
-const WORK_CLAIMS_SCHEMA_VERSION: &str = "1";
+const WORK_CLAIMS_SCHEMA_VERSION: &str = "2";
 
 fn work_claims_schema_is_current(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "work_claims_meta")? {
@@ -77,6 +78,7 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
 
 fn init_work_claims_schema_in_transaction(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
+    waits::init_schema(conn)?;
     worktrees::loose::init_schema(conn)?;
     crate::board::init_board_schema(conn)?;
     conn.execute_batch(
@@ -1305,7 +1307,8 @@ impl WorkClaimStore {
         Ok(ended)
     }
 
-    /// Retire or kill: ends every active claim of the session with `retired`.
+    /// Retire or kill: ends every active claim of the session with `retired`,
+    /// and its agent waits.
     pub fn end_claims_for_session(&self, session_id: &str) -> Result<usize> {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(0);
@@ -1320,6 +1323,7 @@ impl WorkClaimStore {
         for claim in &claims {
             end_claim(&tx, claim, "retired", None, &now)?;
         }
+        waits::end_waits_of_waiter(&tx, session_id, &now)?;
         tx.commit()?;
         Ok(claims.len())
     }
@@ -1536,6 +1540,9 @@ impl WorkClaimStore {
             SELECT l.repo, l.ticket_number FROM work_links l JOIN work_items p
                ON p.repo = l.repo AND p.number = l.pr_number
              WHERE p.state = 'open' OR p.merge_check = 'pending'
+            UNION
+            SELECT repo, number FROM agent_waits
+             WHERE ended_at IS NULL AND target_kind = 'ticket'
             ORDER BY 1, 2
             "#,
         )?;

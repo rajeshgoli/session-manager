@@ -358,6 +358,7 @@ pub enum GitHubPullRequestState {
 }
 
 mod agent_history;
+mod agent_waits;
 mod analytics;
 mod artifacts;
 mod ask;
@@ -2210,6 +2211,11 @@ pub fn router(state: AppState) -> Router {
         .route("/client/board/seen", post(board::client_board_seen))
         .route("/client/board/refresh", post(board::client_board_refresh))
         .route("/claims/release", post(claims::release_claim))
+        .route(
+            "/claims/waits",
+            get(agent_waits::list_waits).post(agent_waits::post_wait),
+        )
+        .route("/claims/waits/cancel", post(agent_waits::cancel_wait))
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/worktrees/delete", post(worktrees::post_worktree_delete))
@@ -7904,8 +7910,12 @@ fn session_obligations_with_inputs(
                 .push(serde_json::to_value(doc)?);
         }
     }
+    agent_waits::project_waits(state, session_records, &claims, &mut sessions)?;
     messages::project_messages(&mut sessions, messages, &state.config.owner_name);
     for entry in sessions.values_mut() {
+        if !entry["awaited_by"].is_array() {
+            entry["awaited_by"] = json!([]);
+        }
         set_waiting_since(entry);
     }
     projected["sessions"] = json!(sessions.into_values().collect::<Vec<_>>());
@@ -7914,7 +7924,7 @@ fn session_obligations_with_inputs(
 
 fn new_obligation_entry(session_id: &str) -> Value {
     json!({"session_id": session_id, "waiting_on": [], "review_history": [], "docs": [],
-           "claims": [], "messages": []})
+           "claims": [], "messages": [], "awaited_by": []})
 }
 
 /// The oldest `since` among what the session waits on.
@@ -10965,6 +10975,7 @@ async fn send_session_input(
             &session.id,
         )
     });
+    let wait_sender = wait_sender(&payload);
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session.id)?;
         let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -10977,6 +10988,7 @@ async fn send_session_input(
     let Some(result) = result else {
         return Err(ApiError::NotFound("Session not found"));
     };
+    agent_waits::deliver_on_send(&state, wait_sender.as_deref(), &session.id);
     let mut response = serde_json::to_value(result)?;
     if let Some(forwarded) = forwarded {
         response["forwarded"] = json!(forwarded);
@@ -11721,6 +11733,15 @@ async fn send_session_input_batch(
     }))
 }
 
+/// The claimed sender of an `sm send`, which may end the recipient's agent
+/// waits once the send is accepted (#2477).
+fn wait_sender(payload: &SendCoreInputRequest) -> Option<String> {
+    payload
+        .from_sm_send
+        .then(|| payload.sender_session_id.clone())
+        .flatten()
+}
+
 fn send_session_input_batch_one(
     state: &AppState,
     runtime: Option<&TmuxRuntime>,
@@ -11747,6 +11768,7 @@ fn send_session_input_batch_one(
         ));
     }
 
+    let wait_sender = wait_sender(&payload);
     let outcome = if let Some(runtime) = runtime {
         state
             .session_store
@@ -11772,6 +11794,7 @@ fn send_session_input_batch_one(
             format!("Session {identifier} is stopped"),
         ));
     }
+    agent_waits::deliver_on_send(state, wait_sender.as_deref(), &session.id);
     let status = if outcome.delivered {
         "delivered".to_owned()
     } else {
@@ -11906,6 +11929,7 @@ async fn task_complete(
     {
         TaskCompleteOutcome::Completed(result) => {
             claims::schedule_check_b(&state, &session_id);
+            agent_waits::schedule_task_complete_notice(&state, &session_id);
             let mut body = serde_json::to_value(result)?;
             if let Some(text) = guestbook {
                 let task_state = state.clone();

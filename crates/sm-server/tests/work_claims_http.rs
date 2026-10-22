@@ -1297,3 +1297,232 @@ async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
+
+/// `count` minutes from now, as an `until` (#2477).
+fn eta(minutes: i64) -> String {
+    (time::OffsetDateTime::now_utc() + time::Duration::minutes(minutes))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+async fn open_wait(f: &Fixture, who: &str, target: &str, until: &str) -> (StatusCode, Value) {
+    request(
+        &f.app,
+        "POST",
+        "/claims/waits",
+        Some(json!({"waiter_session_id": who, "target": target, "for": "hashes", "until": until})),
+    )
+    .await
+}
+
+fn feed_entry<'a>(feed: &'a Value, id: &str) -> &'a Value {
+    feed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["session_id"] == id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agent_waits_validate_list_and_project_into_the_feed() {
+    let f = fixture();
+    let (status, body) = open_wait(&f, "lead0001", "other001-agent", &eta(420)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["created"], true);
+    assert_eq!(body["label"], "other001-agent · hashes");
+    assert_eq!(body["target_session_id"], "other001");
+    let first_since = body["since"].clone();
+    let (status, again) = open_wait(&f, "lead0001", "other001", &eta(480)).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        (again["created"].clone(), again["id"].clone()),
+        (json!(false), body["id"].clone())
+    );
+    assert_eq!(again["since"], body["since"]);
+    for (target, until, detail) in [
+        ("lead0001", eta(60), "you cannot wait on yourself"),
+        ("nobody", eta(60), "Session nobody not found"),
+        (
+            "#3",
+            eta(60),
+            "a ticket target needs its repo: owner/repo#N",
+        ),
+        (
+            "acme/widgets#0",
+            eta(60),
+            "ticket number must be a positive integer",
+        ),
+        (
+            "other001",
+            eta(-1),
+            "until must be in the future and within 72h",
+        ),
+        (
+            "other001",
+            eta(73 * 60),
+            "until must be in the future and within 72h",
+        ),
+    ] {
+        let (status, body) = open_wait(&f, "lead0001", target, &until).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{target}: {body}");
+        assert_eq!(body["detail"], detail);
+    }
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits",
+        Some(json!({"waiter_session_id": "lead0001", "target": "other001", "for": " ", "until": eta(60)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["detail"],
+        "for must be one line of 1 to 200 characters"
+    );
+    // A ticket wait shows in awaited_by of the ticket's holder.
+    claim(&f, "eng00001", "ticket", 1, json!({})).await;
+    let (status, body) = open_wait(&f, "lead0001", "acme/widgets#1", &eta(60)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["label"], "#1 · hashes");
+    let (_, listed) = request(&f.app, "GET", "/claims/waits?session_id=lead0001", None).await;
+    assert_eq!(
+        listed["waiting_on"].as_array().unwrap().len(),
+        2,
+        "{listed}"
+    );
+    let (_, listed) = request(&f.app, "GET", "/claims/waits?session_id=eng00001", None).await;
+    assert_eq!(
+        listed["awaited_by"][0]["waiter_name"], "lead0001-agent",
+        "{listed}"
+    );
+    let (_, feed) = request(&f.app, "GET", "/session-obligations", None).await;
+    let lead = feed_entry(&feed, "lead0001");
+    let kinds: Vec<&Value> = lead["waiting_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| &w["kind"])
+        .collect();
+    assert_eq!(
+        kinds,
+        [&json!("agent_wait"), &json!("agent_wait")],
+        "{lead}"
+    );
+    assert_eq!(lead["waiting_since"], first_since);
+    assert_eq!(
+        feed_entry(&feed, "other001")["awaited_by"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        feed_entry(&feed, "eng00001")["awaited_by"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(lead["awaited_by"], json!([]));
+    // Cancel one, then the rest.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits/cancel",
+        Some(json!({"waiter_session_id": "lead0001", "target": "eng00002"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["detail"], "no open wait on eng00002");
+    let (_, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits/cancel",
+        Some(json!({"waiter_session_id": "lead0001", "target": "acme/widgets#1"})),
+    )
+    .await;
+    assert_eq!(body["cancelled"], 1);
+    let (_, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits/cancel",
+        Some(json!({"waiter_session_id": "lead0001"})),
+    )
+    .await;
+    assert_eq!(body["cancelled"], 1);
+    assert!(f.store().open_waits().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_open_wait_silences_check_c_until_the_target_delivers() {
+    // lead0001 is idle, last active long ago, and holds ticket #1.
+    let f = fixture();
+    claim(&f, "lead0001", "ticket", 1, json!({})).await;
+    open_wait(&f, "lead0001", "other001", &eta(420)).await;
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(claim_texts(&f, "lead0001").is_empty());
+    // A message from someone else delivers nothing.
+    let send = |sender: &'static str| {
+        json!({"text": "weights ready", "delivery_mode": "sequential",
+               "sender_session_id": sender, "from_sm_send": true})
+    };
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/lead0001/input",
+        Some(send("eng00001")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.store().open_waits().unwrap().len(), 1);
+    // The awaited seat's sm send ends the wait and empties waiting_on, the
+    // only thing that held Check C back.
+    request(
+        &f.app,
+        "POST",
+        "/sessions/lead0001/input",
+        Some(send("other001")),
+    )
+    .await;
+    assert!(f.store().open_waits().unwrap().is_empty());
+    let (_, feed) = request(&f.app, "GET", "/session-obligations", None).await;
+    assert_eq!(feed_entry(&feed, "lead0001")["waiting_on"], json!([]));
+}
+
+#[tokio::test]
+async fn the_sync_pass_ends_a_ticket_wait_and_task_complete_names_waiters() {
+    let f = fixture();
+    f.items.put(3, WorkKind::Ticket, "open");
+    open_wait(&f, "lead0001", "acme/widgets#3", &eta(420)).await;
+    open_wait(&f, "eng00002", "eng00001", &eta(420)).await;
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(f.store().open_waits().unwrap().len(), 2);
+    f.items.put(3, WorkKind::Ticket, "closed");
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(
+        queued_texts(&f, "lead0001"),
+        ["[sm await] #3 \"Item 3\" closed. Your wait on it for \"hashes\" ended."]
+    );
+    task_complete(&f, "eng00001").await;
+    let mut notice = Vec::new();
+    for _ in 0..200 {
+        notice = queued_texts(&f, "eng00001")
+            .into_iter()
+            .filter(|text| text.starts_with("[sm await]"))
+            .collect();
+        if !notice.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(notice.len(), 1, "{notice:?}");
+    assert!(
+        notice[0].starts_with(
+            "[sm await] At task-complete, eng00002-agent (eng00002) waits on you for \"hashes\", ETA "
+        ),
+        "{}",
+        notice[0]
+    );
+    assert_eq!(f.store().open_waits().unwrap().len(), 1);
+}

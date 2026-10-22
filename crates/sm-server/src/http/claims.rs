@@ -82,14 +82,14 @@ pub(super) fn work_claim_store(state: &AppState) -> WorkClaimStore {
     WorkClaimStore::new(expand_home(&state.config.sm_send.db_path))
 }
 
-fn is_retired(record: &SessionRecord) -> bool {
+pub(super) fn is_retired(record: &SessionRecord) -> bool {
     matches!(
         record.completion_status.as_deref(),
         Some("retired" | "killed")
     )
 }
 
-fn bad_request(detail: impl Into<String>) -> ApiError {
+pub(super) fn bad_request(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::BAD_REQUEST,
         detail: detail.into(),
@@ -177,14 +177,14 @@ fn parse_kind(kind: &str) -> Result<WorkKind, ApiError> {
     WorkKind::parse(kind.trim()).ok_or_else(|| bad_request("kind must be ticket or pr"))
 }
 
-fn validated_repo(repo: &str) -> Result<String, ApiError> {
+pub(super) fn validated_repo(repo: &str) -> Result<String, ApiError> {
     let repo = crate::work_claims::canonical_repo(repo);
     crate::owner_docs::validate_repo_slug(&repo).map_err(|error| bad_request(error.to_string()))?;
     Ok(repo)
 }
 
 /// The requesting session: it must exist and not be retired.
-fn claimant(state: &AppState, session_id: &str) -> Result<SessionRecord, ApiError> {
+pub(super) fn claimant(state: &AppState, session_id: &str) -> Result<SessionRecord, ApiError> {
     let session_id = session_id.trim();
     let Some(session) = state.session_store.get_session(session_id)? else {
         return Err(bad_request(format!("Session {session_id} not found")));
@@ -666,6 +666,9 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
             Err(error) => eprintln!("{error:#}"),
         }
     }
+    // Waits end before Check C reads the feed, so an ended wait no longer
+    // shields its seat in this pass.
+    notified.extend(store.run_wait_endings(&answered, &sessions, now)?);
     notified.extend(store.run_check_c(
         &answered,
         &idle_sessions(state)?,

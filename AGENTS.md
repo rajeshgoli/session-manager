@@ -115,6 +115,9 @@ results not yet pushed), run `sm worktree keep --reason "<why>"`.
   idle. If you're finished, merge the PR once its review is clean, make sure the
   ticket closes, and run `sm task-complete`. If not, comment on the ticket what
   remains, then continue or stand by.
+- Blocked on another agent's deliverable: run `sm await <agent or #ticket> --for
+  "<what>" --until <ETA>`, then go idle. sm wakes you when it arrives, the ticket
+  closes, the agent retires, or the ETA passes.
 
 **Record ticket order where sm can read it.** When you file the tickets for a plan, record each one's order with `sm board after <ticket> <ticket it starts after>...`, and put every ticket of the plan under the plan's goal ticket with `sm board under <ticket> <goal>`. When you find work that must land before your ticket, file it and run `sm board after <your ticket> <new ticket>`. When a ticket needed only part of yours and you have delivered that part, remove its link with `sm board after <that ticket> <yours> --remove`. Keep "Starts after #N" in the ticket text for people; the link is what sm reads. Only Rajesh orders or ends lanes.
 
