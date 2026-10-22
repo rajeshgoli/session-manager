@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2479 — Near-idle queue jobs give back their slot</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2479 — Near-idle queue jobs give back their slot</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>92ff4310</code> · Ticket #2479 · 21 Oct 2026</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Recommendation: any running queue job that has used under half a CPU core, little GPU and under 5 GiB of memory for 30 minutes stops counting against the queue's job limits, so waiting work can start. When it gets busy again (roughly double those numbers) it counts again. sm never stops or slows it.</b> Over the last 23 days this would have unblocked a waiting job in 32 of the 56 hours that some job sat waiting for a slot. 9 of the 115 jobs that went near-idle later got busy again, three of them heavily (see the risk section).</p>
+
+<p>The same change fixes #2480, which has the queue stuck right now: once start-now put a fourth service job on a service limit of 2, every admission pass refuses to start <i>any</i> job. After the fix, services over their limit block only further service starts.</p>
+
+<div class="vocab">
+<dl>
+<dt>Slot</dt>
+<dd>One unit of the queue's job limits. Two limits apply to every job: the global limit (<code>max_running_jobs</code>, 8 on this Mac) and its type's limit (background 2, service 2, tests 6, perf 1). A running job takes one slot from each. A pending job starts only when both have a free slot. A running perf job also pauses every new start while it runs (its "quiet window").</dd>
+<dt>Near-idle job</dt>
+<dd>A running job of any type that, over the last 30 minutes, averaged under 50% of one CPU core and under 10% of the GPU, and never held 5 GiB of memory or more. It holds no slot. Log output does not matter: a watcher that prints a status line every minute is still near-idle.</dd>
+<dt>Wake</dt>
+<dd>A near-idle job wakes when, over any 5 minutes, it averages above one full core or above 20% of the GPU, or when it holds more than 10 GiB. It takes its slots back at once, even if that puts the queue over its limits. Nothing already running is stopped: the queue simply starts nothing new until it is back under.</dd>
+<dt>Quiet (existing, unchanged)</dt>
+<dd>The existing "Quiet since …" alert: no CPU, GPU <i>or log output</i> for 10 minutes. It warns that a job may be hung. Near-idle is a separate, capacity-only judgment; a job can be near-idle and not quiet.</dd>
+</dl>
+</div>
+
+<h3>What the queue looks like today</h3>
+
+<figure>
+<svg viewBox="0 0 760 250" role="img" aria-label="Nine running jobs; seven would release their slot">
+  <style>
+    .t{font:12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}
+    .s{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}
+    .h{font:600 13px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}
+  </style>
+  <text class="h" x="10" y="18">The 9 running jobs at 20:37 (start-now pushed it past 8). One pending job needs 96 GiB and a slot.</text>
+  <g transform="translate(10,32)">
+    <rect x="0" y="0" width="360" height="20" fill="var(--surface-2)"/><text class="s" x="6" y="14">job (type)</text><text class="s" x="200" y="14">CPU, last 30 min</text><text class="s" x="300" y="14">memory</text>
+  </g>
+  <g transform="translate(10,56)" class="rows">
+    <text class="t" x="6" y="12">2171-wave8 (service)</text><text class="t" x="200" y="12">0.3%</text><text class="t" x="300" y="12">0.2 GiB</text>
+    <text class="t" x="6" y="30">2251-card (service)</text><text class="t" x="200" y="30">0%</text><text class="t" x="300" y="30">0.0 GiB</text>
+    <text class="t" x="6" y="48">2288-card-watch-approved (service)</text><text class="t" x="200" y="48">0%</text><text class="t" x="300" y="48">0.0 GiB</text>
+    <text class="t" x="6" y="66">2251-handover-counts (bg)</text><text class="t" x="200" y="66">0.1%</text><text class="t" x="300" y="66">0.0 GiB</text>
+    <text class="t" x="6" y="84">2289-seed2-monitored-v2 (bg)</text><text class="t" x="200" y="84">0%</text><text class="t" x="300" y="84">0.1 GiB</text>
+    <text class="t" x="6" y="102">2289-width256-monitored-v2 (bg)</text><text class="t" x="200" y="102">0%</text><text class="t" x="300" y="102">1.4 GiB</text>
+    <text class="t" x="6" y="120">2289-original2171-full-v2 (bg)</text><text class="t" x="200" y="120">0%</text><text class="t" x="300" y="120">0.1 GiB</text>
+    <text class="t" x="6" y="138">2171-watch8 (service)</text><text class="t" x="200" y="138">0.2%</text><text class="t" x="300" y="138">9.2 GiB</text>
+    <text class="t" x="6" y="156">2261-f-c079440-t (bg)</text><text class="t" x="200" y="156">108%</text><text class="t" x="300" y="156">47.1 GiB</text>
+  </g>
+  <g transform="translate(400,56)">
+    <rect x="0" y="0" width="22" height="122" rx="3" fill="var(--green)" opacity=".25"/>
+    <text class="t" x="32" y="56">near-idle — slot released</text>
+    <text class="s" x="32" y="72">7 jobs: 4 background, 3 service</text>
+    <rect x="0" y="128" width="22" height="34" rx="3" fill="var(--orange)" opacity=".35"/>
+    <text class="t" x="32" y="142">still counts</text>
+    <text class="s" x="32" y="158">watch8 holds 9.2 GiB; -t is computing</text>
+  </g>
+  <text class="s" x="10" y="238">CPU is % of one core. Memory is Activity Monitor's Memory column (footprint). Source: utilization.db job samples.</text>
+</svg>
+<figcaption>Seven of nine running jobs do almost nothing locally; they watch cloud runs. Under the rule, two jobs count against the limit of 8 and the pending 96 GiB job starts as soon as memory allows. 2171-watch8 keeps its slot because it holds 9.2 GiB.</figcaption>
+</figure>
+
+<h3>How a job moves between states</h3>
+
+<figure>
+<svg viewBox="0 0 760 150" role="img" aria-label="Counting to near-idle after 30 quiet minutes, back on wake">
+  <style>.b{font:600 13px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)} .c{font:11.5px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}</style>
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink-2)"/></marker></defs>
+  <rect x="20" y="40" width="200" height="60" rx="8" fill="var(--surface-2)" stroke="var(--orange)"/>
+  <text class="b" x="120" y="66" text-anchor="middle">Holds a slot</text><text class="c" x="120" y="84" text-anchor="middle">every job starts here</text>
+  <rect x="540" y="40" width="200" height="60" rx="8" fill="var(--surface-2)" stroke="var(--green)"/>
+  <text class="b" x="640" y="66" text-anchor="middle">Near-idle: no slot</text><text class="c" x="640" y="84" text-anchor="middle">any job type</text>
+  <path d="M220,55 L538,55" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <text class="c" x="380" y="47" text-anchor="middle">30 min: &lt;50% of a core, &lt;10% GPU, &lt;5 GiB</text>
+  <path d="M540,88 L222,88" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  <text class="c" x="380" y="106" text-anchor="middle">any 5 min: &gt;1 core, or &gt;20% GPU, or &gt;10 GiB</text>
+  <text class="c" x="380" y="138" text-anchor="middle">Server restart: every job goes back to "holds a slot" and must re-earn near-idle.</text>
+</svg>
+<figcaption>Waking takes roughly double what it took to go near-idle (half a core vs one core, 5 vs 10 GiB), so a short burst does not take the slot back.</figcaption>
+</figure>
+
+<h3>Decision surface</h3>
+
+<table>
+<thead>
+<tr><th style="width:18%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Which fix</td><td><b>Release slots held by near-idle jobs</b> (your suggestion). Rejected: (a) take service jobs off the global limit — fixes only 3 of today's 7 and lets a heavy service run uncounted (2171-watch8 peaked at 37.6 GiB); (b) admit by declared CPU and memory instead of job count — most background jobs declare no budget, so it needs every agent to change how it submits.</td><td>It judges what a job does, not what it is called, and needs nothing from submitters.</td></tr>
+<tr><td>2. Thresholds</td><td><b>Near-idle after 30 minutes under 50% of one core, under 10% of the GPU, and under 5 GiB. Wake above one core or 20% of the GPU over any 5 minutes, or above 10 GiB.</b> Every number is a config key with these defaults.</td><td>Your numbers. On 32 cores and 256 GB, half a core and 5 GiB are noise; waking needs double, so a burst does not take the slot back.</td></tr>
+<tr><td>3. When a near-idle job wakes</td><td><b>It counts again at once. Nothing already running is stopped, paused or displaced; new starts wait until the queue is back under its limits.</b> The queue may run over 8 for a while.</td><td>Stopping a job to honour a count would lose work; the existing memory guard still refuses new starts when the Mac is short on memory.</td></tr>
+<tr><td>4. Which job types</td><td><b>All of them: background, service, tests, perf, review.</b> A near-idle perf job also lifts its quiet window, so new jobs can start while it sits idle. A near-idle job is never displaced for perf, and a near-idle test does not make perf wait.</td><td>If a job barely touches the machine for 30 minutes, others do not hurt it, and it does not hurt others.</td></tr>
+<tr><td>5. After a server restart</td><td><b>Every job holds a slot again until it re-earns near-idle (30 minutes).</b> Nothing new is saved to disk.</td><td>The safe direction to be wrong in, and a restart is rare.</td></tr>
+<tr><td>6. What you see</td><td><b>CLI and Queue page mark the job "near-idle · no slot", with since-when. A waiting job's reason counts only slot holders</b> ("2 of 8 slots held; near-idle: 7 jobs").</td><td>So "why isn't my job running" stays answerable at a glance.</td></tr>
+<tr><td>7. Stuck queue (#2480)</td><td><b>Fixed in the same PR. Services over their limit block only further service starts;</b> every other type keeps starting under the global limit.</td><td>Start-now is your override; it must never freeze the whole queue.</td></tr>
+</tbody>
+</table>
+
+<h3>Risk: a near-idle job wakes up big</h3>
+<p>9 of the 115 jobs that went near-idle in the last 23 days later passed one core or 10 GiB. Six were small: five rose to 1–2 cores and one grew to 19 GiB while staying under a core. Three were real compute: <code>2171-watch</code> (31 cores, 34 GiB), <code>2221-smoke-watch</code> (29 cores, 13 GiB) and today's <code>2171-watch8</code> (20 cores, 38 GiB). These "watchers" sit quiet for over 30 minutes, then do heavy local work. Under the rule each takes its slot back when it wakes, but whatever started during its quiet spell keeps running, so for a while the Mac carries both. Memory stays protected: no job starts while free memory is under the reserve, and a job that declared <code>--memory</code> is stopped when it exceeds it. CPU does not: those spells can oversubscribe the 32 cores and slow everything running. I recommend accepting this. The alternative, holding slots for jobs that might wake, is today&rsquo;s behaviour, and it cost up to 32 hours of waiting.</p>
+
+<table>
+<thead><tr><th>Last 23 days (all job types)</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Jobs run</td><td>4,983</td></tr>
+<tr><td>Jobs that went near-idle</td><td>115 (77 background, 24 service, 14 tests, 0 perf)</td></tr>
+<tr><td>Slot-hours they held while near-idle</td><td>297</td></tr>
+<tr><td>Hours some job waited on a job limit</td><td>56</td></tr>
+<tr><td>…of which at least one slot was held by a near-idle job</td><td>32</td></tr>
+<tr><td>Near-idle jobs that later passed 1 core or 10 GiB</td><td>9 (3 above 10 cores)</td></tr>
+</tbody>
+</table>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>Thresholds are looser.</b> Near-idle now means under half a core, 10% GPU and 5 GiB (was 5%, no GPU, 2 GiB). Waking needs double (was 25%, any GPU, 4 GiB).</p>
+<p><b>Every job type is eligible,</b> including perf, whose quiet window lifts while it is near-idle (Decision 4). Tests and perf were exempt before.</p>
+<p><b>#2480 is fixed in this PR</b> rather than in a separate one first (Decision 7).</p>
+<p><b>Does waking evict anything?</b> No. The concern was a waking job pushing out work already started. Nothing is ever stopped; the queue only holds back new starts until it is under its limits again.</p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. The rule, exactly</h3>
+
+<p><b>Inputs.</b> The utilization recorder already writes one <code>job_samples</code> row per running job every 5 seconds: cumulative CPU seconds, cumulative GPU seconds, footprint bytes (RSS when footprint is missing)<sup>1</sup>. Near-idle is computed from those rows only. Log bytes are not an input.</p>
+
+<p><b>Config</b> (new block under <code>queue_runner</code>; all optional, defaults shown):</p>
+<pre><code>queue_runner:
+  near_idle:
+    enabled: true
+    minutes: 30            # idle window
+    cpu_percent: 50        # % of ONE core, averaged over the window
+    gpu_percent: 10        # % of the GPU, averaged over the window
+    memory_gib: 5          # footprint must stay below this at every sample
+    wake_minutes: 5
+    wake_cpu_percent: 100  # % of one core, averaged over any wake window
+    wake_gpu_percent: 20   # % of the GPU, averaged over any wake window
+    wake_memory_gib: 10    # footprint at any single sample</code></pre>
+<p><code>enabled: false</code> restores today's behaviour exactly. Validation: <code>cpu_percent &lt; wake_cpu_percent</code>, <code>gpu_percent &lt; wake_gpu_percent</code>, <code>memory_gib &lt; wake_memory_gib</code>, <code>minutes ≥ wake_minutes ≥ 1</code>; otherwise config load fails with a message naming the key.</p>
+
+<p><b>Entering near-idle.</b> A running job of any type except shell-adopted jobs becomes near-idle at the first sample <i>t</i> where all hold:</p>
+<ol>
+<li><i>t</i> − <code>started_at</code> ≥ <code>minutes</code>, and the recorder has samples of this job covering [<i>t</i> − <code>minutes</code>, <i>t</i>] with no gap over 60 s (the same coverage rule the existing low-CPU check uses<sup>2</sup>). A gap restarts the window.</li>
+<li>CPU growth over the window, summing only positive deltas between consecutive samples (a process exit drops the cumulative counter), is &lt; <code>cpu_percent</code>/100 × window seconds.</li>
+<li>GPU growth over the window, summed the same way, is &lt; <code>gpu_percent</code>/100 × window seconds. (GPU seconds per wall second is the share of the GPU the job used.)</li>
+<li>Every sample's footprint in the window is &lt; <code>memory_gib</code>. A missing reading (both footprint and RSS null) counts as a failure, not a pass.</li>
+</ol>
+
+<p><b>Waking.</b> A near-idle job stops being near-idle at the first sample <i>t</i> where any holds: positive CPU growth over [<i>t</i> − <code>wake_minutes</code>, <i>t</i>] &gt; <code>wake_cpu_percent</code>/100 × that span; positive GPU growth over the same span &gt; <code>wake_gpu_percent</code>/100 × that span; footprint at <i>t</i> &gt; <code>wake_memory_gib</code>. Until the job has <code>wake_minutes</code> of samples since it went near-idle, the span is whatever it has. After waking it must satisfy the entry rule again from scratch (a fresh full window starting after the wake).</p>
+
+<p><b>Worked example.</b> A watcher starts at 10:00 and spends 2 minutes at 3 cores and 6 GiB setting up, then polls a cloud API at 2% of a core and 400 MiB. At 10:32 the 30-minute window [10:02, 10:32] holds only polling: CPU 2% &lt; 50%, no GPU, 400 MiB &lt; 5 GiB. It becomes near-idle at 10:32 and an admission pass runs. At 11:40 it parses a result for one minute at 2 cores: the 5-minute average is 0.4 cores, below one core, so it stays near-idle. At 13:10 it downloads results and its footprint reaches 12 GiB: it wakes at that sample and counts again. If the queue now holds 9 slot holders against a limit of 8, nothing is stopped and nothing new starts until one finishes or something else goes near-idle. Earliest it can be near-idle again: 13:40.</p>
+
+<p><b>Not eligible:</b> shell-adopted jobs (they already take no slot<sup>3</sup>) and pending jobs.</p>
+
+<p><b>Restart.</b> The near-idle flag is held in memory by the recorder and is not persisted. On a server start every running job holds a slot. Because the window reads stored <code>job_samples</code> rows, a job whose last 30 minutes of samples straddle the restart can be near-idle at the first recorder tick, provided the coverage rule holds (a restart gap over 60 s breaks coverage, so in practice the window restarts). Either outcome is correct; no test pins which.</p>
+
+<h3>B. Admission changes</h3>
+
+<p><b>One predicate.</b> Define "holds a slot" as: <code>state == running</code>, not shell-adopted, and not near-idle. The global limit additionally ignores review jobs, as today. Every admission check that reads running jobs reads slot holders instead; the only checks that still see every running job are the memory guard and the per-job limits, because those measure real use.</p>
+<table>
+<thead><tr><th>Where</th><th>Today</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>running_queue_job_count</code><sup>4</sup></td><td>counts running non-review, non-shell (global) or running of a type</td><td>counts slot holders in both forms. This alone changes the global check and every per-type check in <code>next_admissible_queue_job_id_conn</code><sup>5</sup>, and the perf-limit check inside displacement.</td></tr>
+<tr><td>Running perf pauses new starts (<code>mark_pending_queue_jobs_behind_running_perf_conn</code><sup>12</sup> and its caller)</td><td>any running perf job</td><td>only a slot-holding perf job. When a near-idle perf job wakes, the pause resumes for jobs not yet started; jobs that started meanwhile keep running.</td></tr>
+<tr><td>Perf waits for running tests and review (<code>perf_has_finite_blockers</code><sup>13</sup>) and for tests after perf (<code>perf_blocked_by_tests_after_perf</code>)</td><td>any running tests/review job</td><td>only slot-holding ones (pending tests still count in the second check, as today).</td></tr>
+<tr><td>Perf displacement of background jobs (<code>displace_background_for_perf_conn</code><sup>14</sup>)</td><td>picks any running background job</td><td>never picks a near-idle background job. If only near-idle background jobs run, perf starts without displacing anything.</td></tr>
+<tr><td><code>concurrency_cap_wait_detail</code><sup>6</sup> and the status text builder<sup>7</sup></td><td>names all running jobs as blockers</td><td>blocker list and counts use slot holders only; adds a separate <code>near_idle</code> list (see C).</td></tr>
+<tr><td>Service reserve check<sup>8</sup> (#2480)</td><td>runs every admission pass; if running services exceed the service limit it aborts the whole pass, so nothing of any type starts</td><td><b>removed as a runtime check.</b> The config-load rule (service limit below global limit<sup>15</sup>) stays. Over-limit services then block only service starts, through the ordinary per-type check, and take global slots like any job. No pending holds are left stale.</td></tr>
+<tr><td>Memory reserve guard<sup>9</sup>, per-job memory/process limits</td><td>apply to every job</td><td><b>unchanged</b>.</td></tr>
+</tbody>
+</table>
+
+<p><b>Where the flag lives.</b> The recorder publishes a map <code>job_id → near_idle_since_ms</code> alongside the existing quiet <code>STATUS</code> map<sup>10</sup>, keyed by queue DB path the same way. Admission reads it while holding the admission lock. A job missing from the map holds a slot. If the recorder is disabled (no utilization config) the map stays empty and behaviour equals today.</p>
+
+<p><b>Triggering admission.</b> When any job turns near-idle in a recorder tick, the recorder requests an admission pass for that state dir (through the same path the existing admission retry uses<sup>11</sup>). A wake needs no pass: it only makes admission stricter.</p>
+
+<p><b>Hold reason.</b> Unchanged: a job blocked by a limit still holds <code>concurrency_cap</code>.</p>
+
+<h3>C. What the owner and agents see</h3>
+<table>
+<thead><tr><th>Surface</th><th>Shape</th></tr></thead>
+<tbody>
+<tr><td>Queue job JSON (every API that returns a running job)</td><td>new fields, present only on running jobs: <code>holds_slot: bool</code> (false exactly when near-idle) and <code>near_idle_since: RFC3339 | null</code>.</td></tr>
+<tr><td><code>sm queue list</code></td><td>State column reads <code>running · near-idle</code> for a near-idle job.</td></tr>
+<tr><td><code>sm queue status &lt;job&gt;</code> of a near-idle job</td><td>line <code>Slot: released, near-idle since 6:01 pm (under half a core, 10% GPU and 5 GiB for 30 min).</code></td></tr>
+<tr><td>Waiting text of a job held at <code>concurrency_cap</code></td><td><code>Waiting for an available slot (global limit of 8 running jobs; 8 held). Holding slots: a, b, … Near-idle, not holding slots: c, d.</code> The near-idle list is omitted when empty.</td></tr>
+<tr><td>Web Queue page</td><td>a "near-idle · no slot" chip on the job row; the slot counter shows held / limit.</td></tr>
+<tr><td>Android app</td><td>no change required; it renders the status text above.</td></tr>
+</tbody>
+</table>
+
+<h3>D. Tests</h3>
+<table>
+<thead><tr><th>Behaviour</th><th>Test (unit unless noted)</th></tr></thead>
+<tbody>
+<tr><td>Entry after full window; not before <code>minutes</code> from start</td><td>clock fed synthetic 5 s samples: near-idle at exactly 30:00, not at 29:55</td></tr>
+<tr><td>Each entry condition independently blocks: CPU 51% of a core, GPU 11%, one sample at 5 GiB, a 61 s gap, a null memory reading</td><td>table-driven clock test</td></tr>
+<tr><td>Process exit (counter drop) does not count as CPU use</td><td>clock test with a falling cumulative value</td></tr>
+<tr><td>Wake on each trigger; re-entry needs a fresh window</td><td>clock test</td></tr>
+<tr><td>Log output does not affect near-idle</td><td>clock test with growing log bytes</td></tr>
+<tr><td>Every type except shell can go near-idle</td><td>detector test over background, service, tests, perf, review</td></tr>
+<tr><td>Near-idle perf lifts the pause; a waking perf restores it for pending jobs only</td><td>admission test: running near-idle perf + pending background → admitted; flip perf to slot holder → next pending job holds <code>perf_running</code>, the started one keeps running</td></tr>
+<tr><td>Near-idle tests do not block perf; near-idle background is never displaced</td><td>admission tests</td></tr>
+<tr><td>#2480: 4 running services, service limit 2 → a pending background job is admitted, a pending service job holds <code>concurrency_cap</code></td><td>admission test (replaces the test of the old bail)</td></tr>
+<tr><td>8 running, 6 near-idle → pending background job admitted; per-type limit uses slot holders</td><td>admission test with an injected near-idle map</td></tr>
+<tr><td>Wake overshoot: 9 slot holders, limit 8 → nothing admitted, no job stopped</td><td>admission test</td></tr>
+<tr><td>Turning near-idle triggers an admission pass</td><td>recorder test asserting the request</td></tr>
+<tr><td><code>enabled: false</code> and config validation</td><td>config tests</td></tr>
+<tr><td>Wait text and <code>sm queue status</code> lines of section C</td><td>text tests; JSON field test on the HTTP read path</td></tr>
+<tr><td>Live check</td><td>after deploy, confirm <code>sm queue status</code> of today's monitors reads near-idle and a submitted background job starts</td></tr>
+</tbody>
+</table>
+
+<h3>E. How the evidence was computed</h3>
+<p>Read-only copy of <code>~/.local/share/claude-sessions/utilization.db</code>, snapshot 21 Oct evening, 554 hours of samples, all four sampled job types (review jobs are not sampled). For every running job, slide a 30-minute window over its samples and apply rule A with 50% of a core and 5 GiB; the simulation used "no GPU" because no job in the window used any. "Passed 1 core or 10 GiB" in the memo table means a later 5-minute window at or above 1 core, or a footprint at or above 10 GiB. "Hours some job waited" sums sample intervals (capped at 10 s) where any pending job had <code>holding_reason = concurrency_cap</code>; that reason covers per-type limits as well as the global one, so 32 of 56 is an upper bound on hours actually unblocked. The nine wake-ups: 2066-nq5-money (19 GiB), 2221-smoke-watch (29 cores), 2171-watch (31 cores, 34 GiB), 2171-watch8 (20 cores, 38 GiB), backup-first-run (1.3 cores), and four tests jobs at 1.3–2 cores.</p>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not just raise the global limit to 16?</b> It treats a busy 48 GiB job and a sleeping watcher alike; two more busy jobs would oversubscribe the Mac with no signal. The limit means "real work running at once"; near-idle keeps it meaning that.</p>
+<p><b>Why does memory count at all if CPU is the contended resource?</b> A job holding 9 GiB while idle (2171-watch8 today) is often between phases of real work; 2171-watch8 itself later ran 20 cores. Counting it is conservative, and the 5 GiB bar still frees every pure watcher seen today.</p>
+<p><b>Why not displace near-idle background jobs for perf?</b> Displacement exists to give perf a quiet machine. A near-idle job already leaves it quiet, and stopping a watcher can lose a cloud run's bookkeeping. If it wakes during the perf run, the perf numbers may be noisy; the submitter of a perf job reads its result in that light.</p>
+<p><b>Why not persist the flag across restarts?</b> It is derived entirely from stored samples, so there is nothing to persist that the samples do not already hold; recomputing from them is simpler and cannot go stale.</p>
+
+<h3>Footnotes</h3>
+<ol class="sans" style="font-size:.84rem">
+<li><code>crates/sm-server/src/utilization.rs</code> — <code>JobSample</code>, <code>job_samples</code> table, recorder <code>tick</code>.</li>
+<li><code>crates/sm-server/src/utilization/quiet.rs</code> — <code>Clock::observe</code>, low-CPU window.</li>
+<li><code>crates/sm-server/src/queue.rs</code> <code>running_queue_job_count</code> comment (sm#2412).</li>
+<li><code>queue.rs:5938</code>.</li>
+<li><code>queue.rs:5570</code>–<code>5600</code>.</li>
+<li><code>queue.rs:5082</code>.</li>
+<li><code>queue.rs:8347</code>, <code>queue.rs:8549</code>.</li>
+<li><code>ensure_service_capacity_reserve_before_admission</code>, <code>queue.rs:5160</code>, called at <code>queue.rs:4777</code>.</li>
+<li><code>host_below_memory_reserve</code>, checked at <code>queue.rs:4850</code>.</li>
+<li><code>utilization/quiet.rs</code> <code>STATUS</code>.</li>
+<li><code>schedule_queue_admission_retry</code>, <code>queue.rs:5201</code>.</li>
+<li><code>queue.rs:6084</code>.</li>
+<li><code>queue.rs:5790</code>; <code>perf_blocked_by_tests_after_perf</code> at <code>queue.rs:6132</code>.</li>
+<li><code>queue.rs:5806</code>.</li>
+<li><code>crates/sm-server/src/config.rs:247</code>.</li>
+</ol>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
