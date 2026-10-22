@@ -14128,7 +14128,11 @@ mod tests {
 
     #[test]
     fn service_overcapacity_blocks_only_new_services() {
-        let state_dir = unique_temp_path("service-overcapacity-deadline");
+        let state_dir = PathBuf::from(
+            env::var_os(crate::config::TEST_ISOLATION_ROOT_ENV)
+                .expect("run through scripts/test-rust-isolated.sh"),
+        )
+        .join("service-overcapacity-deadline");
         let create_job = |job_type: &str, label: &str| {
             RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
                 &state_dir,
@@ -14191,9 +14195,14 @@ mod tests {
             .unwrap()
             .started_at
             .is_some());
+        // `true` can finish immediately and trigger another admission pass,
+        // which clears hold reasons before recomputing them. Sample under the
+        // admission lock, as the utilization recorder does, to see a full pass.
+        let active = active_queue_jobs_for_sampling(&state_dir.join("queue_runner.db")).unwrap();
         assert_eq!(
-            get_queue_job_conn(&conn, &pending_service.id)
-                .unwrap()
+            active
+                .iter()
+                .find(|job| job.id == pending_service.id)
                 .unwrap()
                 .holding_reason
                 .as_deref(),
@@ -14205,7 +14214,9 @@ mod tests {
             .contains_key(&state_dir));
         release_queue_admission_retry(&state_dir);
         drop(conn);
-        fs::remove_dir_all(state_dir).unwrap();
+        // The completion monitor may still write here. The isolated test
+        // launcher's outer temporary directory owns final cleanup.
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]
