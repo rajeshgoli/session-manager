@@ -189,14 +189,17 @@ pub fn candidates(manager: &ManagedArtifacts, device: u64) -> Result<Vec<Candida
                 wait_minutes,
             };
             let live = members.iter().all(|m| m["state"] == "live");
-            let cold_available = if mounted {
+            let cold_disk = if mounted {
                 let (free, floor, dev) =
                     queue::fs_stats(&root.cold_store, manager.config.floor_percent)?;
-                free.saturating_sub(floor)
-                    .saturating_sub(queue::outstanding(&conn, manager, dev)?)
+                (free, floor, queue::outstanding(&conn, manager, dev)?)
             } else {
-                0
+                (0, 0, 0)
             };
+            let cold_available = cold_disk
+                .0
+                .saturating_sub(cold_disk.1)
+                .saturating_sub(cold_disk.2);
             let move_bytes: u64 = members
                 .iter()
                 .map(|m| m["disk_bytes"].as_u64().unwrap_or(0))
@@ -219,13 +222,20 @@ pub fn candidates(manager: &ManagedArtifacts, device: u64) -> Result<Vec<Candida
                             .is_none_or(|s| s < now().as_str())
                 })
             {
-                let archive_bytes: f64 = members
-                    .iter()
-                    .map(|m| {
-                        m["data_bytes"].as_f64().unwrap_or(0.0)
-                            / m["ratio_estimate"].as_f64().unwrap_or(1.0)
-                    })
-                    .sum();
+                let (mut kept, mut borrowed) = (0u64, 0u64);
+                for m in &members {
+                    let archive = (m["data_bytes"].as_f64().unwrap_or(0.0)
+                        / m["ratio_estimate"].as_f64().unwrap_or(1.0)
+                        * 1.2)
+                        .ceil() as u64;
+                    let (k, b) = if m["location"] == "cold" || cold_dev == Some(root_dev) {
+                        ops::split_archive(archive, m["disk_bytes"].as_u64().unwrap_or(0))
+                    } else {
+                        (archive, 0)
+                    };
+                    kept = kept.saturating_add(k);
+                    borrowed = borrowed.saturating_add(b);
+                }
                 let savings: f64 = members
                     .iter()
                     .filter(|m| on_device(m))
@@ -235,7 +245,9 @@ pub fn candidates(manager: &ManagedArtifacts, device: u64) -> Result<Vec<Candida
                                 / m["ratio_estimate"].as_f64().unwrap_or(1.0)
                     })
                     .sum();
-                if savings > 0.0 && cold_available >= (archive_bytes * 1.2).ceil() as u64 {
+                if savings > 0.0
+                    && ops::fits_on_cold(cold_disk.0, cold_disk.1, cold_disk.2, kept, borrowed)
+                {
                     let seconds: f64 = members
                         .iter()
                         .map(|m| m["data_bytes"].as_f64().unwrap_or(0.0))
