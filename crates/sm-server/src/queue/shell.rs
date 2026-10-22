@@ -46,8 +46,70 @@ pub fn reservation_for_headroom(headroom: i64) -> Option<i64> {
         .map(|(_, reservation)| *reservation)
 }
 
-/// Free memory less the reserve and what running jobs reserved but have not
-/// used yet: `(reservation, current use)` per running job with a reservation.
+/// The least headroom sm adopts a command with.
+pub fn minimum_adoption_headroom() -> i64 {
+    RESERVATION_TIERS[RESERVATION_TIERS.len() - 1].0
+}
+
+/// A queue job younger than this is expected to reach its declared memory:
+/// it has too few readings to project from (sm#2490).
+pub const EXPECTATION_WARMUP_MS: i64 = 10 * 60 * 1000;
+/// The trend window, and how far ahead it is projected.
+pub const EXPECTATION_WINDOW_MS: i64 = 15 * 60 * 1000;
+
+/// Memory a running queue job is expected to reach (sm#2490). Its declared
+/// `--memory` is a ceiling, not an expectation: past its first ten minutes
+/// the expectation is the larger of its peak so far and its use projected
+/// 15 minutes ahead on the last 15 minutes' trend, capped at the ceiling.
+/// `readings` are `(sampled_at_ms, bytes)` from that window, and `peak` the
+/// most it has used while running. With no peak or no reading in the window,
+/// the job counts at its ceiling.
+pub fn expected_bytes(
+    declared: i64,
+    current: i64,
+    peak: Option<i64>,
+    age_ms: i64,
+    readings: &[(i64, i64)],
+) -> i64 {
+    // No reading in the window means the recorder lost track of the job.
+    let Some(peak) = peak.filter(|_| age_ms >= EXPECTATION_WARMUP_MS && !readings.is_empty())
+    else {
+        return declared;
+    };
+    let growth = trend_bytes_per_ms(readings).max(0.0) * EXPECTATION_WINDOW_MS as f64;
+    let projected = current.saturating_add(growth.round() as i64);
+    peak.max(current).max(projected).min(declared)
+}
+
+/// Least-squares slope of `readings`; 0 with fewer than two distinct times.
+fn trend_bytes_per_ms(readings: &[(i64, i64)]) -> f64 {
+    let Some(&(origin, _)) = readings.first() else {
+        return 0.0;
+    };
+    let n = readings.len() as f64;
+    let points = || {
+        readings
+            .iter()
+            .map(move |&(at, bytes)| ((at - origin) as f64, bytes as f64))
+    };
+    let mean_t = points().map(|(t, _)| t).sum::<f64>() / n;
+    let mean_b = points().map(|(_, b)| b).sum::<f64>() / n;
+    let (cov, var) = points().fold((0.0, 0.0), |(cov, var), (t, b)| {
+        (
+            cov + (t - mean_t) * (b - mean_b),
+            var + (t - mean_t).powi(2),
+        )
+    });
+    if var > 0.0 {
+        cov / var
+    } else {
+        0.0
+    }
+}
+
+/// Free memory less the reserve and what running jobs are expected to use
+/// but do not use yet: `(expected, current use)` per running job, where a
+/// shell job's expectation is its reservation.
 pub fn headroom_bytes(available: i64, reserve: i64, reserved: &[(i64, i64)]) -> i64 {
     let unspent = reserved
         .iter()
@@ -190,13 +252,14 @@ pub struct RunningShellJob {
     pub session_id: String,
     pub process_group_id: i64,
     pub reservation_bytes: Option<i64>,
+    pub label: String,
 }
 
 pub fn running_shell_jobs_conn(conn: &Connection) -> Result<Vec<RunningShellJob>> {
     init_queue_jobs_schema(conn)?;
     let mut statement = conn.prepare(
         r#"
-        SELECT id, notify_session_id, process_group_id, memory_bytes
+        SELECT id, notify_session_id, process_group_id, memory_bytes, label
         FROM queue_jobs
         WHERE type = ?1 AND state = 'running' AND process_group_id IS NOT NULL
         ORDER BY started_at, id
@@ -208,6 +271,7 @@ pub fn running_shell_jobs_conn(conn: &Connection) -> Result<Vec<RunningShellJob>
             session_id: row.get(1)?,
             process_group_id: row.get(2)?,
             reservation_bytes: row.get(3)?,
+            label: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

@@ -32,6 +32,64 @@ fn headroom_subtracts_what_running_jobs_reserved_but_have_not_used() {
 }
 
 #[test]
+fn a_declared_ceiling_counts_in_full_until_the_job_has_history() {
+    // Under ten minutes old, or never sampled, a job may reach its ceiling.
+    assert_eq!(
+        expected_bytes(192 * GIB, GIB, Some(GIB), EXPECTATION_WARMUP_MS - 1, &[]),
+        192 * GIB
+    );
+    assert_eq!(
+        expected_bytes(192 * GIB, GIB, None, EXPECTATION_WARMUP_MS * 10, &[]),
+        192 * GIB
+    );
+    // A stale peak with no reading in the last 15 minutes earns no credit.
+    assert_eq!(
+        expected_bytes(192 * GIB, GIB, Some(GIB), EXPECTATION_WARMUP_MS * 10, &[]),
+        192 * GIB
+    );
+}
+
+#[test]
+fn a_flat_job_is_expected_at_its_peak_not_its_ceiling() {
+    // sm#2490: 2305-reach-full-r2 declared 192 GiB, peaked at 39, sat near 29.
+    let minute = 60 * 1000;
+    let flat: Vec<(i64, i64)> = (0..15).map(|m| (m * minute, 29 * GIB)).collect();
+    let expected = expected_bytes(192 * GIB, 29 * GIB, Some(39 * GIB), 7 * 60 * minute, &flat);
+    assert_eq!(expected, 39 * GIB);
+    // The whole incident: 170 free, 8 reserve, this job and a 16 GiB
+    // ceiling at 2.4 GiB (seven hours old, flat) leave enough to adopt.
+    let headroom = headroom_bytes(
+        170 * GIB,
+        8 * GIB,
+        &[(expected, 29 * GIB), (16 * GIB, 2 * GIB)],
+    );
+    assert_eq!(headroom, 138 * GIB);
+    assert_eq!(reservation_for_headroom(headroom), Some(16 * GIB));
+}
+
+#[test]
+fn a_growing_job_is_expected_where_its_trend_reaches_capped_at_its_ceiling() {
+    // 1 GiB a minute for the last 15 minutes, now at 40: 55 in 15 minutes.
+    let minute = 60 * 1000;
+    let growing: Vec<(i64, i64)> = (0..=15).map(|m| (m * minute, (25 + m) * GIB)).collect();
+    let age = 60 * minute;
+    assert_eq!(
+        expected_bytes(192 * GIB, 40 * GIB, Some(40 * GIB), age, &growing),
+        55 * GIB
+    );
+    assert_eq!(
+        expected_bytes(50 * GIB, 40 * GIB, Some(40 * GIB), age, &growing),
+        50 * GIB
+    );
+    // A shrinking job is not credited below its peak.
+    let shrinking: Vec<(i64, i64)> = (0..=15).map(|m| (m * minute, (40 - m) * GIB)).collect();
+    assert_eq!(
+        expected_bytes(192 * GIB, 25 * GIB, Some(40 * GIB), age, &shrinking),
+        40 * GIB
+    );
+}
+
+#[test]
 fn command_text_unwraps_each_harness_shell() {
     let claude = "/bin/zsh -c source /Users/r/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB 2>/dev/null || true && eval 'cargo test -p sm-server -- it'\\''s' < /dev/null && pwd -P >| /tmp/claude-cb45-cwd";
     assert_eq!(command_text(claude), "cargo test -p sm-server -- it's");

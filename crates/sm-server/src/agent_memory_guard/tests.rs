@@ -294,7 +294,27 @@ fn a_no_headroom_notice_says_why_and_how_to_resubmit() {
     let text = kill_notice_text(
         &kill("s1", "2026-10-08T21:37:05Z"),
         "python3.12 train.py --heads",
-        StopCause::NoHeadroom { headroom: 12 * GIB },
+        &StopCause::NoHeadroom(Headroom {
+            available: 170 * GIB,
+            reserve: 8 * GIB,
+            claims: vec![
+                Claim {
+                    label: "2305-reach-full-r2".to_owned(),
+                    expected: 192 * GIB,
+                    current: 29 * GIB,
+                },
+                Claim {
+                    label: "2288-card-watch-18".to_owned(),
+                    expected: 16 * GIB,
+                    current: 2 * GIB,
+                },
+                Claim {
+                    label: "idle".to_owned(),
+                    expected: GIB,
+                    current: 2 * GIB,
+                },
+            ],
+        }),
     );
     assert!(
         text.contains("At 21:37:05 UTC sm stopped `python3.12 train.py --heads`"),
@@ -304,7 +324,16 @@ fn a_no_headroom_notice_says_why_and_how_to_resubmit() {
         text.contains("PID 4974 and its 2 child processes"),
         "{text}"
     );
-    assert!(text.contains("only 12.0 GiB of memory to spare"), "{text}");
+    // sm#2490: a clamped "0.0 GiB" alone hid 170 GiB free and who held it.
+    assert!(
+        text.contains(
+            "while the Mac had 170.0 GiB free. sm keeps 8.0 GiB of that in reserve, \
+and running queue jobs are expected to need 177.0 GiB more than they use now \
+(`2305-reach-full-r2` 163.0 GiB, `2288-card-watch-18` 14.0 GiB), which left 0.0 GiB. \
+sm needs 20.0 GiB to set aside for a command"
+        ),
+        "{text}"
+    );
     assert!(text.contains("It was using 135.0 GiB"), "{text}");
     assert!(
         text.contains("sm queue run --type <type> --label python3-12-train-py --memory 203G -- python3.12 train.py --heads"),
@@ -314,11 +343,25 @@ fn a_no_headroom_notice_says_why_and_how_to_resubmit() {
 }
 
 #[test]
+fn an_unreadable_host_notice_does_not_claim_zero_headroom() {
+    let text = kill_notice_text(
+        &kill("s1", "2026-10-08T21:37:05Z"),
+        "python3.12 train.py --heads",
+        &StopCause::HostMemoryUnreadable,
+    );
+    assert!(
+        text.contains("could not read the Mac's free memory"),
+        "{text}"
+    );
+    assert!(!text.contains("0.0 GiB"), "{text}");
+}
+
+#[test]
 fn an_untrackable_notice_names_the_shared_group() {
     let text = kill_notice_text(
         &kill("s1", "2026-10-08T21:37:05Z"),
         "cargo test --workspace",
-        StopCause::Untrackable,
+        &StopCause::Untrackable,
     );
     assert!(
         text.contains("shares a process group with your agent program"),

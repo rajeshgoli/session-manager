@@ -70,6 +70,8 @@ pub struct AgentMemoryGuardConfig {
     pub session_state_file: PathBuf,
     pub queue_state_dir: PathBuf,
     pub message_queue_db_path: PathBuf,
+    /// The utilization recorder's database: each queue job's memory history.
+    pub utilization_db_path: PathBuf,
     /// Memory one agent-run process may use; 0 disables the guard.
     pub limit_bytes: i64,
     /// Executable names (basename) the guard never kills, besides harnesses.
@@ -145,11 +147,46 @@ pub struct AgentProcessKill {
     pub descendants: i64,
 }
 
+/// Memory a running queue job is expected to need beyond what it uses now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Claim {
+    label: String,
+    expected: i64,
+    current: i64,
+}
+
+impl Claim {
+    fn unspent(&self) -> i64 {
+        self.expected.saturating_sub(self.current).max(0)
+    }
+}
+
+/// The figures behind a headroom reading, kept to explain a stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Headroom {
+    available: i64,
+    reserve: i64,
+    claims: Vec<Claim>,
+}
+
+impl Headroom {
+    fn bytes(&self) -> i64 {
+        let pairs: Vec<(i64, i64)> = self
+            .claims
+            .iter()
+            .map(|claim| (claim.expected, claim.current))
+            .collect();
+        shell::headroom_bytes(self.available, self.reserve, &pairs)
+    }
+}
+
 /// Why a command over the limit was stopped rather than adopted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StopCause {
     /// The Mac had less headroom than the smallest reservation.
-    NoHeadroom { headroom: i64 },
+    NoHeadroom(Headroom),
+    /// sm could not read the Mac's free memory.
+    HostMemoryUnreadable,
     /// The command shares its harness's process group, so sm cannot track it.
     Untrackable,
 }
@@ -333,7 +370,8 @@ impl Guard {
             adopted.insert(pgid, job.id.clone());
         }
 
-        let mut reserved = reserved_memory(&conn, &running);
+        // Read only when a command passes the limit: it queries each job's history.
+        let mut claims: Option<Vec<Claim>> = None;
         for root in &roots {
             if adopted.contains_key(&root.pgid) {
                 continue;
@@ -365,9 +403,16 @@ impl Guard {
                 .clone()
                 .unwrap_or_else(|| executable_name(&by_pid[&root.pid].command).to_owned());
             let cause = if trackable {
-                let headroom = host_headroom(config.memory_min_free_bytes, &reserved);
-                match headroom.and_then(shell::reservation_for_headroom) {
+                let claims = claims.get_or_insert_with(|| {
+                    queue_claims(&conn, &running, &config.utilization_db_path)
+                });
+                let headroom = host_headroom(config.memory_min_free_bytes, claims);
+                match headroom
+                    .as_ref()
+                    .and_then(|headroom| shell::reservation_for_headroom(headroom.bytes()))
+                {
                     Some(reservation) => {
+                        let headroom = headroom.expect("a reservation needs a headroom reading");
                         let bytes = root
                             .pids
                             .iter()
@@ -380,11 +425,15 @@ impl Guard {
                             &command,
                             reservation,
                             (trigger_pid, trigger_bytes),
-                            headroom.unwrap_or_default(),
+                            headroom.bytes(),
                         ) {
                             Ok(job_id) => {
                                 shell::record_usage(&job_id, bytes);
-                                reserved.push((reservation, bytes));
+                                claims.push(Claim {
+                                    label: shell::label_text(&command),
+                                    expected: reservation,
+                                    current: bytes,
+                                });
                                 adopted.insert(root.pgid, job_id);
                                 continue;
                             }
@@ -393,15 +442,11 @@ impl Guard {
                                     "agent memory guard could not adopt pid {}: {error:#}",
                                     root.pid
                                 );
-                                StopCause::NoHeadroom {
-                                    headroom: headroom.unwrap_or_default(),
-                                }
+                                StopCause::NoHeadroom(headroom)
                             }
                         }
                     }
-                    None => StopCause::NoHeadroom {
-                        headroom: headroom.unwrap_or_default(),
-                    },
+                    None => headroom.map_or(StopCause::HostMemoryUnreadable, StopCause::NoHeadroom),
                 }
             } else {
                 StopCause::Untrackable
@@ -569,7 +614,7 @@ impl Guard {
         if let Err(error) = RetainedQueueStore::new(config.message_queue_db_path.clone())
             .enqueue_message_with_metadata(
                 &kill.session_id,
-                &kill_notice_text(&kill, command, cause),
+                &kill_notice_text(&kill, command, &cause),
                 "sequential",
                 QueueMessageMetadata {
                     // Retried until the agent is idle, like a queue completion.
@@ -586,18 +631,23 @@ impl Guard {
     }
 }
 
-/// (reservation, current use) of every running queue job with a
-/// reservation: shell jobs from the guard's own measurements, others from
-/// the utilization recorder's latest sample.
-fn reserved_memory(conn: &Connection, running_shell: &[shell::RunningShellJob]) -> Vec<(i64, i64)> {
-    let mut reserved: Vec<(i64, i64)> = running_shell
+/// What every running queue job with a memory figure is expected to need:
+/// a shell job its reservation, from the guard's own measurements; any other
+/// job its expectation under `shell::expected_bytes`, from the utilization
+/// recorder's readings (sm#2490).
+fn queue_claims(
+    conn: &Connection,
+    running_shell: &[shell::RunningShellJob],
+    utilization_db: &Path,
+) -> Vec<Claim> {
+    let mut claims: Vec<Claim> = running_shell
         .iter()
         .filter_map(|job| {
-            let reservation = job.reservation_bytes?;
-            Some((
-                reservation,
-                shell::usage(&job.id).map_or(0, |usage| usage.current_bytes),
-            ))
+            Some(Claim {
+                label: job.label.clone(),
+                expected: job.reservation_bytes?,
+                current: shell::usage(&job.id).map_or(0, |usage| usage.current_bytes),
+            })
         })
         .collect();
     let usage = crate::utilization::latest_job_usage()
@@ -605,32 +655,64 @@ fn reserved_memory(conn: &Connection, running_shell: &[shell::RunningShellJob]) 
         .unwrap_or_default();
     let others = conn
         .prepare(
-            "SELECT id, memory_bytes FROM queue_jobs
+            "SELECT id, COALESCE(label, id), memory_bytes, started_at FROM queue_jobs
              WHERE state = 'running' AND type != ?1 AND memory_bytes IS NOT NULL",
         )
         .and_then(|mut statement| {
             statement
                 .query_map(params![shell::SHELL_JOB_TYPE], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap_or_default();
-    for (id, reservation) in others {
+    let now = OffsetDateTime::now_utc();
+    let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+    for (id, label, declared, started_at) in others {
         let current = usage
             .get(&id)
             .and_then(|usage| usage.memory_bytes)
             .unwrap_or(0);
-        reserved.push((reservation, current));
+        let age_ms = started_at
+            .and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok())
+            .map_or(0, |at| (now - at).whole_milliseconds() as i64);
+        let history = crate::utilization::job_memory_history(
+            utilization_db,
+            &id,
+            now_ms - shell::EXPECTATION_WINDOW_MS,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("agent memory guard could not read memory history of {id}: {error:#}");
+            crate::utilization::JobMemoryHistory::default()
+        });
+        claims.push(Claim {
+            label,
+            expected: shell::expected_bytes(
+                declared,
+                current,
+                history.peak,
+                age_ms,
+                &history.readings,
+            ),
+            current,
+        });
     }
-    reserved
+    claims
 }
 
 /// Headroom for a new shell job, or `None` when host memory is unreadable.
-fn host_headroom(memory_min_free_bytes: i64, reserved: &[(i64, i64)]) -> Option<i64> {
+fn host_headroom(memory_min_free_bytes: i64, claims: &[Claim]) -> Option<Headroom> {
     let (_, available) = crate::queue::host_memory_capacity()?;
-    let reserve = crate::queue::effective_memory_reserve_bytes(memory_min_free_bytes);
-    Some(shell::headroom_bytes(available, reserve, reserved))
+    Some(Headroom {
+        available,
+        reserve: crate::queue::effective_memory_reserve_bytes(memory_min_free_bytes),
+        claims: claims.to_vec(),
+    })
 }
 
 fn is_harness(row: &ProcessRow) -> bool {
@@ -1070,18 +1152,54 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
-fn kill_notice_text(kill: &AgentProcessKill, command: &str, cause: StopCause) -> String {
+/// The largest unused claims, as " (most for `label`: 10.0 GiB, ...)".
+fn holders_text(claims: &[Claim]) -> String {
+    let mut holding: Vec<&Claim> = claims.iter().filter(|claim| claim.unspent() > 0).collect();
+    holding.sort_by_key(|claim| std::cmp::Reverse(claim.unspent()));
+    let mut parts: Vec<String> = holding
+        .iter()
+        .take(3)
+        .map(|claim| format!("`{}` {}", claim.label, memory_amount_text(claim.unspent())))
+        .collect();
+    if holding.len() > 3 {
+        parts.push(format!("{} more", holding.len() - 3));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+fn kill_notice_text(kill: &AgentProcessKill, command: &str, cause: &StopCause) -> String {
     let children = match kill.descendants {
         0 => String::new(),
         1 => " and its 1 child process".to_owned(),
         n => format!(" and its {n} child processes"),
     };
     let why = match cause {
-        StopCause::NoHeadroom { headroom } => format!(
-            "It passed {limit} while the Mac had only {headroom} of memory to spare beyond its reserve, \
-too little to set aside for it, so sm stopped it instead of taking it into the queue.",
+        StopCause::NoHeadroom(headroom) => format!(
+            "It passed {limit} while the Mac had {free} free. sm keeps {reserve} of that in reserve, \
+and running queue jobs are expected to need {held} more than they use now{holders}, which left {spare}. \
+sm needs {needed} to set aside for a command, so it stopped it instead of taking it into the queue.",
             limit = memory_amount_text(kill.limit_bytes),
-            headroom = memory_amount_text(headroom.max(0)),
+            free = memory_amount_text(headroom.available.max(0)),
+            reserve = memory_amount_text(headroom.reserve),
+            held = memory_amount_text(
+                headroom
+                    .claims
+                    .iter()
+                    .map(Claim::unspent)
+                    .fold(0, i64::saturating_add)
+            ),
+            holders = holders_text(&headroom.claims),
+            spare = memory_amount_text(headroom.bytes().max(0)),
+            needed = memory_amount_text(shell::minimum_adoption_headroom()),
+        ),
+        StopCause::HostMemoryUnreadable => format!(
+            "It passed {limit} and sm could not read the Mac's free memory, so it stopped it instead \
+of taking it into the queue.",
+            limit = memory_amount_text(kill.limit_bytes),
         ),
         StopCause::Untrackable => format!(
             "It passed {limit} and shares a process group with your agent program, so sm could not \
